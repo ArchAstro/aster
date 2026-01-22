@@ -24,7 +24,7 @@ impl Address {
     /// - `//...` - root recursive glob
     pub fn parse(s: &str) -> Result<Self> {
         if !s.starts_with("//") {
-            return Err(anyhow!("Address must start with //: got '{}'", s));
+            return Err(anyhow!("Address must start with //: got '{s}'"));
         }
 
         // Remove the // prefix
@@ -36,7 +36,7 @@ impl Address {
                 let path = &rest[..idx];
                 let target = &rest[idx + 1..];
                 if target.is_empty() {
-                    return Err(anyhow!("Target name cannot be empty after colon: got '{}'", s));
+                    return Err(anyhow!("Target name cannot be empty after colon: got '{s}'"));
                 }
                 (path, Some(target.to_string()))
             }
@@ -62,7 +62,7 @@ impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "//{}", self.path.display())?;
         if let Some(ref target) = self.target {
-            write!(f, ":{}", target)?;
+            write!(f, ":{target}")?;
         }
         Ok(())
     }

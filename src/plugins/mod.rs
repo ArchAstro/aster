@@ -33,7 +33,9 @@ pub trait LanguagePlugin: Send + Sync {
     fn parse_project(&self, root: &Path, config_path: &Path) -> Result<ProjectMetadata>;
 
     /// Extract local dependencies from native config
+    ///
     /// - config_path: path to the config file
+    ///
     /// Returns paths relative to the project directory
     fn parse_dependencies(&self, config_path: &Path) -> Result<Vec<LocalDependency>>;
 }
