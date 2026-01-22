@@ -45,5 +45,7 @@ pub mod nodejs;
 pub mod python;
 pub mod registry;
 
+pub use elixir::ElixirPlugin;
 pub use nodejs::NodeJsPlugin;
+pub use python::PythonPlugin;
 pub use registry::PluginRegistry;

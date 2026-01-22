@@ -90,4 +90,33 @@ mod tests {
         let found = registry.find_by_marker("unknown.file");
         assert!(found.is_none());
     }
+
+    #[test]
+    fn test_all_plugins_register_and_find() {
+        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin};
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(NodeJsPlugin));
+        registry.register(Box::new(ElixirPlugin));
+        registry.register(Box::new(PythonPlugin));
+
+        // Verify all three plugins are registered
+        assert_eq!(registry.plugins().len(), 3);
+
+        // Verify each can be found by its marker file
+        let nodejs = registry.find_by_marker("package.json");
+        assert!(nodejs.is_some());
+        assert_eq!(nodejs.unwrap().name(), "nodejs");
+
+        let elixir = registry.find_by_marker("mix.exs");
+        assert!(elixir.is_some());
+        assert_eq!(elixir.unwrap().name(), "elixir");
+
+        let python = registry.find_by_marker("pyproject.toml");
+        assert!(python.is_some());
+        assert_eq!(python.unwrap().name(), "python");
+
+        // Unknown marker returns None
+        assert!(registry.find_by_marker("Cargo.toml").is_none());
+    }
 }

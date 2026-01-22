@@ -9,4 +9,7 @@ pub mod plugins;
 pub use cli::{Cli, Commands};
 pub use discovery::{discover_projects, DiscoveredProject};
 pub use graph::{build_graph, find_cycle, CycleError, ProjectGraph, ProjectNode};
-pub use plugins::{LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry, ProjectMetadata};
+pub use plugins::{
+    ElixirPlugin, LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry, ProjectMetadata,
+    PythonPlugin,
+};
