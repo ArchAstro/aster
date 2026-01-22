@@ -42,6 +42,7 @@ pub trait LanguagePlugin: Send + Sync {
 
 pub mod elixir;
 pub mod nodejs;
+pub mod python;
 pub mod registry;
 
 pub use nodejs::NodeJsPlugin;
