@@ -40,6 +40,7 @@ pub trait LanguagePlugin: Send + Sync {
     fn parse_dependencies(&self, config_path: &Path) -> Result<Vec<LocalDependency>>;
 }
 
+pub mod elixir;
 pub mod nodejs;
 pub mod registry;
 
