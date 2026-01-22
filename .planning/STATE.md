@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-01-22)
 ## Current Position
 
 Phase: 3 of 4 (CLI & Git)
-Plan: 0 of 2 in current phase
-Status: Phase 2 verified, ready to plan Phase 3
-Last activity: 2026-01-22 - Phase 2 execution and verification complete
+Plan: 1 of 2 in current phase
+Status: In progress
+Last activity: 2026-01-22 - Completed 03-01-PLAN.md (Target Execution Engine)
 
-Progress: [█████░░░░░] 50%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
-- Average duration: 3m 50s
-- Total execution time: 0.32 hours
+- Total plans completed: 6
+- Average duration: 4m 18s
+- Total execution time: 0.43 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [█████░░░░░] 50%
 |-------|-------|-------|----------|
 | 01-foundation | 3 | 13m 7s | 4m 22s |
 | 02-language-plugins | 2 | 6m 26s | 3m 13s |
+| 03-cli-git | 1 | 6m 33s | 6m 33s |
 
 **Recent Trend:**
-- Last 5 plans: 01-02 (3m 1s), 01-03 (6m 41s), 02-01 (3m 12s), 02-02 (3m 14s)
+- Last 5 plans: 01-03 (6m 41s), 02-01 (3m 12s), 02-02 (3m 14s), 03-01 (6m 33s)
 - Trend: Consistent velocity
 
 *Updated after each plan completion*
@@ -63,9 +64,16 @@ Recent decisions affecting current work:
 - Target merge strategy: Custom targets override at key level, not wholesale replacement
 - CLI plugin registration: All three plugins registered by default
 
+**Phase 3 (CLI & Git):**
+- DAG level computation for parallel execution (level N runs after level N-1 completes)
+- External subcommand for targets (`aster test`, `aster build` without predefined list)
+- Continue on failure (see all failures, not just first one)
+- Skip missing targets gracefully (not an error if project doesn't define target)
+- A* with uniform cost for path finding (Dijkstra behavior)
+
 ### Pending Todos
 
-- Add `aster init` command to Phase 3 (creates root aster.toml, scans projects, creates per-project overrides, prints summary)
+None.
 
 ### Blockers/Concerns
 
@@ -74,5 +82,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-22
-Stopped at: Completed 02-02-PLAN.md (Target Resolution)
+Stopped at: Completed 03-01-PLAN.md (Target Execution Engine)
 Resume file: None
