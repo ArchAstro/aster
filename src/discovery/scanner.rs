@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{find_aster_toml, parse_aster_toml};
 use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata};
+use crate::targets::TargetResolver;
 
 /// A project discovered during workspace traversal
 #[derive(Debug, Clone)]
@@ -111,7 +112,8 @@ pub fn discover_projects(
             )
         })?;
 
-        let mut targets = HashMap::new();
+        // Collect custom targets from aster.toml (if exists)
+        let mut custom_targets = HashMap::new();
 
         // Check for aster.toml and merge overrides
         if let Some(aster_path) = find_aster_toml(project_dir) {
@@ -130,9 +132,12 @@ pub fn discover_projects(
                 });
             }
 
-            // Copy targets
-            targets = aster_config.targets;
+            // Collect custom targets for merging with defaults
+            custom_targets = aster_config.targets;
         }
+
+        // Resolve targets: defaults + aster.toml overrides
+        let targets = TargetResolver::resolve(plugin.name(), &custom_targets);
 
         // Compute relative path
         let relative_path = project_dir
@@ -212,6 +217,20 @@ mod tests {
         assert_eq!(projects[0].metadata.name, "api");
         assert_eq!(projects[0].relative_path, PathBuf::from("services/api"));
         assert_eq!(projects[0].plugin_name, "nodejs");
+
+        // Verify default targets are populated
+        assert_eq!(
+            projects[0].targets.get("test"),
+            Some(&"npm test".to_string())
+        );
+        assert_eq!(
+            projects[0].targets.get("build"),
+            Some(&"npm run build".to_string())
+        );
+        assert_eq!(
+            projects[0].targets.get("lint"),
+            Some(&"npm run lint".to_string())
+        );
     }
 
     #[test]
@@ -305,7 +324,7 @@ mod tests {
         )
         .unwrap();
 
-        // aster.toml with name override and targets
+        // aster.toml with name override and custom lint target
         std::fs::write(
             project_dir.join("aster.toml"),
             r#"
@@ -313,7 +332,7 @@ name = "api-service"
 depends_on = ["//libs/shared:build"]
 
 [targets]
-lint = "npm run lint"
+lint = "npm run lint:ci"
 "#,
         )
         .unwrap();
@@ -325,7 +344,22 @@ lint = "npm run lint"
 
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].metadata.name, "api-service"); // Name overridden
-        assert_eq!(projects[0].targets.get("lint"), Some(&"npm run lint".to_string()));
+
+        // Custom lint target overrides default
+        assert_eq!(
+            projects[0].targets.get("lint"),
+            Some(&"npm run lint:ci".to_string())
+        );
+        // Default targets still present
+        assert_eq!(
+            projects[0].targets.get("test"),
+            Some(&"npm test".to_string())
+        );
+        assert_eq!(
+            projects[0].targets.get("build"),
+            Some(&"npm run build".to_string())
+        );
+
         // depends_on should be in dependencies
         assert!(projects[0]
             .dependencies
@@ -415,5 +449,81 @@ lint = "npm run lint"
         let api_project = projects.iter().find(|p| p.metadata.name == "api").unwrap();
         assert_eq!(api_project.dependencies.len(), 1);
         assert_eq!(api_project.dependencies[0].name, "shared");
+    }
+
+    #[test]
+    fn test_discover_target_defaults_by_plugin() {
+        use crate::plugins::{ElixirPlugin, PythonPlugin};
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Node.js project
+        let node_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(
+            node_dir.join("package.json"),
+            r#"{"name": "api"}"#,
+        )
+        .unwrap();
+
+        // Elixir project
+        let elixir_dir = tmp.path().join("services/backend");
+        std::fs::create_dir_all(&elixir_dir).unwrap();
+        std::fs::write(
+            elixir_dir.join("mix.exs"),
+            r#"
+defmodule Backend.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :backend]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Python project
+        let python_dir = tmp.path().join("libs/ml");
+        std::fs::create_dir_all(&python_dir).unwrap();
+        std::fs::write(
+            python_dir.join("pyproject.toml"),
+            r#"
+[project]
+name = "ml"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        // Register all plugins
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(NodeJsPlugin));
+        registry.register(Box::new(ElixirPlugin));
+        registry.register(Box::new(PythonPlugin));
+
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 3);
+
+        // Verify Node.js targets
+        let node_project = projects.iter().find(|p| p.plugin_name == "nodejs").unwrap();
+        assert_eq!(node_project.targets.get("test"), Some(&"npm test".to_string()));
+        assert_eq!(node_project.targets.get("build"), Some(&"npm run build".to_string()));
+        assert_eq!(node_project.targets.get("lint"), Some(&"npm run lint".to_string()));
+
+        // Verify Elixir targets
+        let elixir_project = projects.iter().find(|p| p.plugin_name == "elixir").unwrap();
+        assert_eq!(elixir_project.targets.get("test"), Some(&"mix test".to_string()));
+        assert_eq!(elixir_project.targets.get("build"), Some(&"mix compile".to_string()));
+        assert_eq!(elixir_project.targets.get("lint"), Some(&"mix credo".to_string()));
+
+        // Verify Python targets
+        let python_project = projects.iter().find(|p| p.plugin_name == "python").unwrap();
+        assert_eq!(python_project.targets.get("test"), Some(&"pytest".to_string()));
+        assert_eq!(python_project.targets.get("build"), Some(&"python -m build".to_string()));
+        assert_eq!(python_project.targets.get("lint"), Some(&"ruff check .".to_string()));
     }
 }

@@ -14,3 +14,4 @@ pub use plugins::{
     ElixirPlugin, LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry, ProjectMetadata,
     PythonPlugin,
 };
+pub use targets::TargetResolver;
