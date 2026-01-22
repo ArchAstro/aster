@@ -1,1 +1,2 @@
-// Config module - implementation in Task 2
+pub mod workspace;
+pub use workspace::find_workspace_root;
