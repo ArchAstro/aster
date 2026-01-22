@@ -213,6 +213,61 @@ impl ProjectGraph {
             Vec::new()
         }
     }
+
+    /// Get projects that depend ON this project (reverse dependencies)
+    ///
+    /// Returns addresses of projects that have this project as a dependency.
+    pub fn dependents(&self, address: &str) -> Vec<String> {
+        use petgraph::Direction;
+
+        if let Some(&idx) = self.index_by_address.get(address) {
+            self.graph
+                .neighbors_directed(idx, Direction::Incoming)
+                .map(|dep_idx| self.graph[dep_idx].address.clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Return projects in dependency order for a subset
+    ///
+    /// Only includes projects from the given set, sorted so dependencies come first.
+    pub fn topological_order_subset<'b>(
+        &self,
+        projects: &[&'b DiscoveredProject],
+    ) -> Vec<&'b DiscoveredProject> {
+        // Get addresses in the subset
+        let subset_addrs: std::collections::HashSet<String> = projects
+            .iter()
+            .map(|p| format!("//{}", p.relative_path.display()))
+            .collect();
+
+        // Get full topological order
+        let full_order = self.topological_order();
+
+        // Filter to subset, maintaining order
+        // We need to return DiscoveredProject refs, but we only have ProjectNode refs
+        // So we'll collect addresses in order and let caller match them
+        let ordered_addrs: Vec<String> = full_order
+            .iter()
+            .filter(|n| subset_addrs.contains(&n.address))
+            .map(|n| n.address.clone())
+            .collect();
+
+        // Match back to the input projects
+        let mut result = Vec::new();
+        for addr in ordered_addrs {
+            for p in projects {
+                if format!("//{}", p.relative_path.display()) == addr {
+                    result.push(*p);
+                    break;
+                }
+            }
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]

@@ -28,4 +28,19 @@ pub enum Commands {
         /// Specific project to show dependencies for (//path/to/project)
         project: Option<String>,
     },
+
+    /// Show the dependency path between two projects
+    Why {
+        /// Source project (//path/to/project)
+        from: String,
+        /// Target project (//path/to/project)
+        to: String,
+    },
+
+    /// Initialize an aster workspace
+    Init,
+
+    /// Run a target on projects (catch-all for targets like test, build, lint)
+    #[command(external_subcommand)]
+    Run(Vec<String>),
 }

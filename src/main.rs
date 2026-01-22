@@ -5,11 +5,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::env;
+use std::fs;
 use std::process::ExitCode;
 
-use aster::cli::{Cli, Commands};
+use aster::cli::{expand_selection, parse_run_args, select_projects, Cli, Commands};
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
+use aster::executor::Executor;
 use aster::graph::{build_graph, find_cycle};
 use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
 
@@ -26,10 +28,16 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Find workspace root
     let cwd = env::current_dir().context("Failed to get current directory")?;
+
+    // Handle init command specially - it works even without an existing workspace
+    if matches!(cli.command, Commands::Init) {
+        return handle_init(&cwd, cli.verbose);
+    }
+
+    // For all other commands, require a workspace
     let workspace_root = find_workspace_root(&cwd)
-        .context("Not in an aster workspace (no aster.toml or .git found)")?;
+        .context("Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.")?;
 
     if cli.verbose {
         eprintln!("Workspace root: {}", workspace_root.display());
@@ -50,6 +58,7 @@ fn run() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Init => unreachable!("Init handled above"),
         Commands::List => {
             for project in &projects {
                 println!("//{}", project.relative_path.display());
@@ -86,6 +95,138 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Commands::Why { from, to } => {
+            // Build graph for path finding
+            let graph = build_graph(&projects)?;
+
+            // Placeholder for Task 3 - will implement find_path
+            if graph.get(&from).is_none() {
+                return Err(anyhow::anyhow!("Project not found: {}", from));
+            }
+            if graph.get(&to).is_none() {
+                return Err(anyhow::anyhow!("Project not found: {}", to));
+            }
+
+            // Will be replaced with actual path finding in Task 3
+            println!("Why command: {} -> {} (path finding not yet implemented)", from, to);
+        }
+        Commands::Run(args) => {
+            // Parse external subcommand args
+            let run_args = parse_run_args(args);
+
+            if run_args.target.is_empty() {
+                return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));
+            }
+
+            // Build the graph
+            let graph = build_graph(&projects)?;
+
+            // Check for cycles
+            if let Some(cycle) = find_cycle(&graph) {
+                eprintln!("error: {cycle}");
+                return Err(anyhow::anyhow!("Dependency cycle detected"));
+            }
+
+            // Select initial projects
+            let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            // Expand selection based on flags
+            let selected = expand_selection(&run_args, &initial, &graph, &projects);
+
+            // Sort by dependency order
+            let ordered = graph.topological_order_subset(&selected);
+
+            if cli.verbose {
+                eprintln!(
+                    "Running '{}' on {} projects",
+                    run_args.target,
+                    ordered.len()
+                );
+            }
+
+            // Execute target on projects
+            let executor = Executor::new(&workspace_root);
+            let results = executor.execute(&run_args.target, &ordered, &graph);
+
+            // Print summary
+            let passed = results.iter().filter(|r| r.success).count();
+            let failed = results.iter().filter(|r| !r.success).count();
+
+            println!("\n=== Summary ===");
+            println!(
+                "Ran '{}' on {} projects: {} passed, {} failed",
+                run_args.target,
+                results.len(),
+                passed,
+                failed
+            );
+
+            if failed > 0 {
+                println!("\nFailed projects:");
+                for result in results.iter().filter(|r| !r.success) {
+                    println!("  - {}", result.address);
+                }
+                return Err(anyhow::anyhow!("{} project(s) failed", failed));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the init command
+///
+/// Creates aster.toml in either:
+/// - The existing workspace root (if in a git repo)
+/// - The current directory (if no workspace exists)
+fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
+    // Try to find an existing workspace root (git repo or existing aster.toml)
+    let workspace_root = find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+
+    // Check if aster.toml already exists
+    let aster_toml_path = workspace_root.join("aster.toml");
+    if aster_toml_path.exists() {
+        return Err(anyhow::anyhow!(
+            "aster.toml already exists at {}",
+            aster_toml_path.display()
+        ));
+    }
+
+    if verbose {
+        eprintln!("Workspace root: {}", workspace_root.display());
+    }
+
+    // Write minimal aster.toml
+    let content = r#"# Aster workspace configuration
+# This file marks the root of an aster workspace.
+# See https://github.com/archastro/aster for documentation.
+"#;
+    fs::write(&aster_toml_path, content)
+        .with_context(|| format!("Failed to write {}", aster_toml_path.display()))?;
+
+    println!("Created {}", aster_toml_path.display());
+
+    // Set up plugin registry
+    let mut registry = PluginRegistry::new();
+    registry.register(Box::new(NodeJsPlugin));
+    registry.register(Box::new(ElixirPlugin));
+    registry.register(Box::new(PythonPlugin));
+
+    // Discover projects
+    let projects = discover_projects(&workspace_root, &registry)
+        .context("Failed to discover projects")?;
+
+    // Print discovery summary
+    if projects.is_empty() {
+        println!("No projects discovered yet.");
+    } else {
+        print!("Found {} projects: ", projects.len());
+        let addrs: Vec<String> = projects
+            .iter()
+            .map(|p| format!("//{}", p.relative_path.display()))
+            .collect();
+        println!("{}", addrs.join(", "));
     }
 
     Ok(())
