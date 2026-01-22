@@ -23,12 +23,12 @@ Aster delivers a zero-config build dependency graph tool for polyglot monorepos 
   3. If a cycle exists, aster reports the exact cycle path and exits with error
   4. User can place `aster.toml` in a project to override name, add dependencies, or define custom targets
   5. Node.js `file:` dependencies in package.json are correctly parsed into graph edges
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
-- [ ] 01-03: TBD
+- [ ] 01-01-PLAN.md — Core infrastructure: Rust project, workspace detection, address parsing, plugin trait
+- [ ] 01-02-PLAN.md — Discovery system: Node.js plugin, aster.toml parsing, project scanner
+- [ ] 01-03-PLAN.md — Graph engine and CLI: dependency graph, cycle detection, list/graph commands
 
 ### Phase 2: Language Plugins
 **Goal**: Users can build dependency graphs from Elixir and Python projects alongside Node.js
@@ -78,7 +78,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 0/3 | Not started | - |
+| 1. Foundation | 0/3 | Planned | - |
 | 2. Language Plugins | 0/1 | Not started | - |
 | 3. CLI & Git | 0/2 | Not started | - |
 | 4. Output & Testing | 0/1 | Not started | - |
