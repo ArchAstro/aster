@@ -137,7 +137,10 @@ impl ProjectGraph {
 
         let sorted = toposort(&self.graph, None).expect("Graph has cycles - should have been checked");
 
-        sorted.iter().map(|idx| &self.graph[*idx]).collect()
+        // toposort returns nodes in order where edges point forward,
+        // but our edges point from dependent -> dependency,
+        // so we reverse to get dependencies before dependents
+        sorted.iter().rev().map(|idx| &self.graph[*idx]).collect()
     }
 
     /// Get a project node by address
