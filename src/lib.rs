@@ -3,4 +3,4 @@ pub mod config;
 pub mod plugins;
 
 // Re-export core types for convenience
-pub use plugins::{LanguagePlugin, LocalDependency, PluginRegistry, ProjectMetadata};
+pub use plugins::{LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry, ProjectMetadata};
