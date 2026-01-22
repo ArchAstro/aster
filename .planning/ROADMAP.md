@@ -54,11 +54,11 @@ Plans:
   3. User can run `aster why //a //b` and see the dependency path between two projects
   4. Flags --no-deps, --dependents, --all work as expected to control execution scope
   5. `aster list` and `aster graph` show project information for introspection
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
+- [ ] 03-01-PLAN.md — Execution engine: parallel command runner, CLI with run/why/init commands, project selection flags
+- [ ] 03-02-PLAN.md — Git integration: affected detection with git2, file-to-project mapping, affected command
 
 ### Phase 4: Output & Testing
 **Goal**: Users get polished terminal output and the tool is validated against a real monorepo
