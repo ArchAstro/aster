@@ -7,7 +7,7 @@ Aster delivers a zero-config build dependency graph tool for polyglot monorepos 
 ## Phases
 
 - [x] **Phase 1: Foundation** - Graph engine, discovery, config system, Node.js plugin
-- [ ] **Phase 2: Language Plugins** - Elixir and Python plugins, target mapping
+- [x] **Phase 2: Language Plugins** - Elixir and Python plugins, target mapping
 - [ ] **Phase 3: CLI & Git** - Full command surface, affected detection
 - [ ] **Phase 4: Output & Testing** - Terminal UI, JSON output, integration tests
 
@@ -41,8 +41,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Elixir and Python plugins: regex-based mix.exs parsing, TOML-based pyproject.toml parsing
-- [ ] 02-02-PLAN.md — Target resolver: per-language default commands, aster.toml override merging, integration tests
+- [x] 02-01-PLAN.md — Elixir and Python plugins: regex-based mix.exs parsing, TOML-based pyproject.toml parsing
+- [x] 02-02-PLAN.md — Target resolver: per-language default commands, aster.toml override merging, integration tests
 
 ### Phase 3: CLI & Git
 **Goal**: Users can run targets on projects with full CLI options and git-aware affected detection
@@ -80,7 +80,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation | 3/3 | Complete | 2026-01-22 |
-| 2. Language Plugins | 0/2 | Planned | - |
+| 2. Language Plugins | 2/2 | Complete | 2026-01-22 |
 | 3. CLI & Git | 0/2 | Not started | - |
 | 4. Output & Testing | 0/1 | Not started | - |
 

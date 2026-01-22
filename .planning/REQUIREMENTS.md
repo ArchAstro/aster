@@ -23,9 +23,9 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Language Plugins
 
 - [x] **PLUG-01**: Node.js plugin parses package.json and extracts file: dependencies
-- [ ] **PLUG-02**: Elixir plugin parses mix.exs and extracts path: dependencies
-- [ ] **PLUG-03**: Python plugin parses pyproject.toml and extracts Poetry path dependencies
-- [ ] **PLUG-04**: Plugins map standard targets (test, build, lint) to native commands
+- [x] **PLUG-02**: Elixir plugin parses mix.exs and extracts path: dependencies
+- [x] **PLUG-03**: Python plugin parses pyproject.toml and extracts Poetry path dependencies
+- [x] **PLUG-04**: Plugins map standard targets (test, build, lint) to native commands
 - [x] **PLUG-05**: Plugin trait enables adding new languages
 
 ### Git Integration
@@ -114,9 +114,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DISC-03 | Phase 1 | Complete |
 | DISC-04 | Phase 1 | Complete |
 | PLUG-01 | Phase 1 | Complete |
-| PLUG-02 | Phase 2 | Pending |
-| PLUG-03 | Phase 2 | Pending |
-| PLUG-04 | Phase 2 | Pending |
+| PLUG-02 | Phase 2 | Complete |
+| PLUG-03 | Phase 2 | Complete |
+| PLUG-04 | Phase 2 | Complete |
 | PLUG-05 | Phase 1 | Complete |
 | GIT-01 | Phase 3 | Pending |
 | GIT-02 | Phase 3 | Pending |
@@ -149,4 +149,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2025-01-22*
-*Last updated: 2026-01-22 after Phase 1 completion*
+*Last updated: 2026-01-22 after Phase 2 completion*
