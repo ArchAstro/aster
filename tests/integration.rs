@@ -26,6 +26,20 @@ fn write_aster_toml(tmp: &TempDir, path: &str, content: &str) {
     fs::write(full_path, content).unwrap();
 }
 
+/// Write a mix.exs file at the given path
+fn write_mix_exs(tmp: &TempDir, path: &str, content: &str) {
+    let full_path = tmp.path().join(path);
+    fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+    fs::write(full_path, content).unwrap();
+}
+
+/// Write a pyproject.toml file at the given path
+fn write_pyproject_toml(tmp: &TempDir, path: &str, content: &str) {
+    let full_path = tmp.path().join(path);
+    fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+    fs::write(full_path, content).unwrap();
+}
+
 #[test]
 fn test_list_shows_projects() {
     let tmp = TempDir::new().unwrap();
@@ -236,5 +250,286 @@ fn test_not_in_workspace() {
         stderr.contains("workspace") || stderr.contains("aster.toml") || stderr.contains(".git"),
         "Expected workspace error message: {}",
         stderr
+    );
+}
+
+// ============================================================================
+// Phase 2 Integration Tests: Language Plugins
+// ============================================================================
+
+#[test]
+fn test_discover_elixir_project() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create Elixir project with path dependency
+    write_mix_exs(
+        &tmp,
+        "libs/core/mix.exs",
+        r#"
+defmodule Core.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :core]
+  end
+end
+"#,
+    );
+
+    write_mix_exs(
+        &tmp,
+        "services/api/mix.exs",
+        r#"
+defmodule Api.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :api]
+  end
+
+  defp deps do
+    [{:core, path: "../../libs/core"}]
+  end
+end
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("graph")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify projects discovered
+    assert!(
+        stdout.contains("//libs/core"),
+        "Expected //libs/core in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected //services/api in output: {}",
+        stdout
+    );
+
+    // Verify dependency is detected
+    assert!(
+        stdout.contains("-> //libs/core"),
+        "Expected dependency arrow to //libs/core: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_discover_python_project() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create Python project with Poetry path dependency
+    write_pyproject_toml(
+        &tmp,
+        "libs/utils/pyproject.toml",
+        r#"
+[project]
+name = "utils"
+version = "1.0.0"
+"#,
+    );
+
+    write_pyproject_toml(
+        &tmp,
+        "services/ml/pyproject.toml",
+        r#"
+[project]
+name = "ml"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+utils = {path = "../../libs/utils"}
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("graph")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify projects discovered
+    assert!(
+        stdout.contains("//libs/utils"),
+        "Expected //libs/utils in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//services/ml"),
+        "Expected //services/ml in output: {}",
+        stdout
+    );
+
+    // Verify dependency is detected
+    assert!(
+        stdout.contains("-> //libs/utils"),
+        "Expected dependency arrow to //libs/utils: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_discover_polyglot_workspace() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Node.js project
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "version": "1.0.0"}"#,
+    );
+
+    // Elixir project
+    write_mix_exs(
+        &tmp,
+        "services/backend/mix.exs",
+        r#"
+defmodule Backend.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :backend]
+  end
+end
+"#,
+    );
+
+    // Python project
+    write_pyproject_toml(
+        &tmp,
+        "libs/ml/pyproject.toml",
+        r#"
+[project]
+name = "ml"
+version = "1.0.0"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("list")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify all three projects discovered
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected Node.js project //services/api: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//services/backend"),
+        "Expected Elixir project //services/backend: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//libs/ml"),
+        "Expected Python project //libs/ml: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_graph_with_mixed_languages() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Shared library (Node.js)
+    write_package_json(
+        &tmp,
+        "libs/shared/package.json",
+        r#"{"name": "shared"}"#,
+    );
+
+    // Elixir service depending on shared via aster.toml (cross-language)
+    write_mix_exs(
+        &tmp,
+        "services/elixir-api/mix.exs",
+        r#"
+defmodule ElixirApi.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :elixir_api]
+  end
+end
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "services/elixir-api/aster.toml",
+        r#"depends_on = ["//libs/shared"]"#,
+    );
+
+    // Python service depending on shared via aster.toml (cross-language)
+    write_pyproject_toml(
+        &tmp,
+        "services/python-api/pyproject.toml",
+        r#"
+[project]
+name = "python-api"
+version = "1.0.0"
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "services/python-api/aster.toml",
+        r#"depends_on = ["//libs/shared"]"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("graph")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify all projects discovered
+    assert!(stdout.contains("//libs/shared"), "Expected //libs/shared: {}", stdout);
+    assert!(
+        stdout.contains("//services/elixir-api"),
+        "Expected //services/elixir-api: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//services/python-api"),
+        "Expected //services/python-api: {}",
+        stdout
+    );
+
+    // Verify cross-language dependencies via aster.toml
+    // Both should depend on //libs/shared
+    let lines: Vec<&str> = stdout.lines().collect();
+    let shared_deps: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.contains("-> //libs/shared"))
+        .copied()
+        .collect();
+
+    assert!(
+        shared_deps.len() >= 2,
+        "Expected at least 2 dependencies to //libs/shared, found {}: {}",
+        shared_deps.len(),
+        stdout
     );
 }

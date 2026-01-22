@@ -11,7 +11,7 @@ use aster::cli::{Cli, Commands};
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::graph::{build_graph, find_cycle};
-use aster::plugins::{NodeJsPlugin, PluginRegistry};
+use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
 
 fn main() -> ExitCode {
     match run() {
@@ -35,9 +35,11 @@ fn run() -> Result<()> {
         eprintln!("Workspace root: {}", workspace_root.display());
     }
 
-    // Set up plugin registry
+    // Set up plugin registry with all language plugins
     let mut registry = PluginRegistry::new();
     registry.register(Box::new(NodeJsPlugin));
+    registry.register(Box::new(ElixirPlugin));
+    registry.register(Box::new(PythonPlugin));
 
     // Discover projects
     let projects = discover_projects(&workspace_root, &registry)
