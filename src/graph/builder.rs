@@ -68,8 +68,7 @@ pub fn build_graph(projects: &[DiscoveredProject]) -> anyhow::Result<ProjectGrap
                 // Dependency not found - warn but continue
                 // This can happen with cross-language dependencies
                 eprintln!(
-                    "warning: dependency {} from {} not found in workspace",
-                    dep_address, from_address
+                    "warning: dependency {dep_address} from {from_address} not found in workspace"
                 );
             }
         }
@@ -85,6 +84,7 @@ pub fn build_graph(projects: &[DiscoveredProject]) -> anyhow::Result<ProjectGrap
 ///
 /// Dependencies can be:
 /// - Already an address: //libs/shared or //libs/shared:build
+/// - An absolute path: /workspace/libs/shared (from Node.js file: deps)
 /// - A relative file path: ../../libs/shared
 fn resolve_dependency_address(project: &DiscoveredProject, dep: &crate::plugins::LocalDependency) -> String {
     let path_str = dep.path.to_string_lossy();
@@ -98,6 +98,28 @@ fn resolve_dependency_address(project: &DiscoveredProject, dep: &crate::plugins:
         return path_str.to_string();
     }
 
+    // If it's an absolute path, normalize it and derive workspace-relative path
+    if dep.path.is_absolute() {
+        // Normalize the absolute path (handle .. components)
+        let normalized_abs = normalize_absolute_path(&dep.path);
+
+        // Derive workspace root from project's root and relative_path
+        // project.root = /workspace/services/api, relative_path = services/api
+        // workspace_root = /workspace
+        let mut workspace_root = project.root.clone();
+        for _ in project.relative_path.components() {
+            workspace_root.pop();
+        }
+
+        // Try to strip workspace root from the normalized dependency path
+        if let Ok(relative) = normalized_abs.strip_prefix(&workspace_root) {
+            return format!("//{}", relative.display());
+        }
+
+        // Couldn't resolve - return the normalized path (will fail lookup)
+        return format!("//{}", normalized_abs.display());
+    }
+
     // Otherwise, resolve relative path from project's directory
     let project_dir = &project.relative_path;
     let resolved = project_dir.join(&dep.path);
@@ -108,7 +130,7 @@ fn resolve_dependency_address(project: &DiscoveredProject, dep: &crate::plugins:
     format!("//{}", normalized.display())
 }
 
-/// Normalize a path by resolving .. components
+/// Normalize a relative path by resolving .. components
 fn normalize_path(path: &std::path::Path) -> PathBuf {
     let mut components = Vec::new();
 
@@ -126,6 +148,33 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
     }
 
     components.iter().collect()
+}
+
+/// Normalize an absolute path by resolving .. components while preserving the root
+fn normalize_absolute_path(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut result = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                result.push("/");
+            }
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(c) => {
+                result.push(c);
+            }
+            Component::CurDir => {}
+            Component::Prefix(p) => {
+                result.push(p.as_os_str());
+            }
+        }
+    }
+
+    result
 }
 
 impl ProjectGraph {

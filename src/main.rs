@@ -72,7 +72,7 @@ fn run() -> Result<()> {
                         println!("  -> {}", dep.address);
                     }
                 } else {
-                    return Err(anyhow::anyhow!("Project not found: {}", addr));
+                    return Err(anyhow::anyhow!("Project not found: {addr}"));
                 }
             } else {
                 // Show full graph as tree
