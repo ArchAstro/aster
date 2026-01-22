@@ -1,0 +1,419 @@
+//! Project discovery via WalkBuilder
+//!
+//! Uses the `ignore` crate to traverse the workspace while respecting
+//! .gitignore patterns. Finds projects by their marker files (e.g., package.json)
+//! and merges aster.toml overrides.
+
+use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::config::{find_aster_toml, parse_aster_toml};
+use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata};
+
+/// A project discovered during workspace traversal
+#[derive(Debug, Clone)]
+pub struct DiscoveredProject {
+    /// Absolute path to project directory
+    pub root: PathBuf,
+    /// Path to the native config file (e.g., package.json)
+    pub config_path: PathBuf,
+    /// Metadata from native config (possibly overridden by aster.toml)
+    pub metadata: ProjectMetadata,
+    /// Dependencies from native config + aster.toml depends_on
+    pub dependencies: Vec<LocalDependency>,
+    /// Custom targets from aster.toml
+    pub targets: HashMap<String, String>,
+    /// Which plugin discovered this project
+    pub plugin_name: String,
+    /// Path relative to workspace root (for addressing)
+    pub relative_path: PathBuf,
+}
+
+/// Discover all projects in the workspace
+///
+/// Walks the directory tree from workspace_root, respecting .gitignore patterns.
+/// For each marker file found (e.g., package.json), the corresponding plugin
+/// parses the project. If an aster.toml exists, its overrides are merged.
+///
+/// Name collisions are resolved by appending the plugin name suffix (e.g., core-nodejs).
+pub fn discover_projects(
+    workspace_root: &Path,
+    registry: &PluginRegistry,
+) -> Result<Vec<DiscoveredProject>> {
+    // Collect all marker files we're looking for
+    let marker_files: Vec<&str> = registry
+        .plugins()
+        .iter()
+        .flat_map(|p| p.marker_files().iter().copied())
+        .collect();
+
+    let mut projects: Vec<DiscoveredProject> = Vec::new();
+
+    // Walk the directory tree, respecting gitignore
+    let walker = WalkBuilder::new(workspace_root)
+        .hidden(false) // Don't skip hidden dirs (except .git itself)
+        .git_ignore(true) // Honor .gitignore
+        .git_exclude(true) // Honor .git/info/exclude
+        .git_global(true) // Honor global gitignore
+        .build();
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue, // Skip entries we can't read
+        };
+
+        // Only process files
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        // Check if this is a marker file
+        let file_name = match entry.file_name().to_str() {
+            Some(name) => name,
+            None => continue,
+        };
+
+        if !marker_files.contains(&file_name) {
+            continue;
+        }
+
+        // Find the plugin that handles this marker
+        let plugin = match registry.find_by_marker(file_name) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let config_path = entry.path().to_path_buf();
+        let project_dir = match config_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Parse the project using the plugin
+        let mut metadata = plugin
+            .parse_project(workspace_root, &config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to parse {} project at {}",
+                    plugin.name(),
+                    config_path.display()
+                )
+            })?;
+
+        // Parse dependencies
+        let mut dependencies = plugin.parse_dependencies(&config_path).with_context(|| {
+            format!(
+                "Failed to parse dependencies from {}",
+                config_path.display()
+            )
+        })?;
+
+        let mut targets = HashMap::new();
+
+        // Check for aster.toml and merge overrides
+        if let Some(aster_path) = find_aster_toml(project_dir) {
+            let aster_config = parse_aster_toml(&aster_path)?;
+
+            // Override name if specified
+            if let Some(name) = aster_config.name {
+                metadata.name = name;
+            }
+
+            // Add depends_on as LocalDependency (with empty path for now, resolved later)
+            for dep_addr in aster_config.depends_on {
+                dependencies.push(LocalDependency {
+                    name: dep_addr.clone(),
+                    path: PathBuf::from(dep_addr), // Address string stored as path
+                });
+            }
+
+            // Copy targets
+            targets = aster_config.targets;
+        }
+
+        // Compute relative path
+        let relative_path = project_dir
+            .strip_prefix(workspace_root)
+            .unwrap_or(project_dir)
+            .to_path_buf();
+
+        projects.push(DiscoveredProject {
+            root: project_dir.to_path_buf(),
+            config_path,
+            metadata,
+            dependencies,
+            targets,
+            plugin_name: plugin.name().to_string(),
+            relative_path,
+        });
+    }
+
+    // Handle name collisions
+    resolve_name_collisions(&mut projects);
+
+    Ok(projects)
+}
+
+/// Resolve name collisions by appending plugin suffix
+///
+/// If two projects have the same name, both get renamed to {name}-{plugin}
+fn resolve_name_collisions(projects: &mut [DiscoveredProject]) {
+    // Build a map of name -> indices
+    let mut name_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, project) in projects.iter().enumerate() {
+        name_to_indices
+            .entry(project.metadata.name.clone())
+            .or_default()
+            .push(idx);
+    }
+
+    // Rename colliding projects
+    for (name, indices) in name_to_indices {
+        if indices.len() > 1 {
+            // Collision detected - rename all with this name
+            for idx in indices {
+                let project = &mut projects[idx];
+                project.metadata.name = format!("{}-{}", name, project.plugin_name);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::NodeJsPlugin;
+
+    fn setup_registry() -> PluginRegistry {
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(NodeJsPlugin));
+        registry
+    }
+
+    #[test]
+    fn test_discover_single_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&services_dir).unwrap();
+
+        let pkg_json = services_dir.join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "api", "version": "1.0.0"}"#).unwrap();
+
+        // Create .git to mark workspace root (for gitignore handling)
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
+        assert_eq!(projects[0].relative_path, PathBuf::from("services/api"));
+        assert_eq!(projects[0].plugin_name, "nodejs");
+    }
+
+    #[test]
+    fn test_discover_multiple_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Project 1
+        let dir1 = tmp.path().join("services/api");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project 2
+        let dir2 = tmp.path().join("services/web");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("package.json"),
+            r#"{"name": "web", "version": "2.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project 3 - nested
+        let dir3 = tmp.path().join("libs/shared");
+        std::fs::create_dir_all(&dir3).unwrap();
+        std::fs::write(
+            dir3.join("package.json"),
+            r#"{"name": "shared", "version": "0.1.0"}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 3);
+        let names: Vec<&str> = projects.iter().map(|p| p.metadata.name.as_str()).collect();
+        assert!(names.contains(&"api"));
+        assert!(names.contains(&"web"));
+        assert!(names.contains(&"shared"));
+    }
+
+    #[test]
+    fn test_discover_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Regular project
+        let dir1 = tmp.path().join("services/api");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project in ignored directory
+        let dir2 = tmp.path().join("node_modules/some-dep");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("package.json"),
+            r#"{"name": "some-dep", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create .git and .gitignore
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "node_modules/\n").unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // Only the api project should be found, not the one in node_modules
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
+    }
+
+    #[test]
+    fn test_discover_merges_aster_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let project_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // package.json with original name
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // aster.toml with name override and targets
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+name = "api-service"
+depends_on = ["//libs/shared:build"]
+
+[targets]
+lint = "npm run lint"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api-service"); // Name overridden
+        assert_eq!(projects[0].targets.get("lint"), Some(&"npm run lint".to_string()));
+        // depends_on should be in dependencies
+        assert!(projects[0]
+            .dependencies
+            .iter()
+            .any(|d| d.name == "//libs/shared:build"));
+    }
+
+    #[test]
+    fn test_discover_name_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Two projects with same name "core"
+        let dir1 = tmp.path().join("services/core");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("package.json"),
+            r#"{"name": "core", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let dir2 = tmp.path().join("libs/core");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("package.json"),
+            r#"{"name": "core", "version": "2.0.0"}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 2);
+        // Both should be renamed to core-nodejs
+        for project in &projects {
+            assert_eq!(project.metadata.name, "core-nodejs");
+        }
+    }
+
+    #[test]
+    fn test_discover_empty_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn test_discover_with_file_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Shared lib
+        let lib_dir = tmp.path().join("libs/shared");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("package.json"),
+            r#"{"name": "shared", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project depending on shared
+        let api_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("package.json"),
+            r#"{
+                "name": "api",
+                "version": "1.0.0",
+                "dependencies": {
+                    "shared": "file:../../libs/shared"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 2);
+
+        let api_project = projects.iter().find(|p| p.metadata.name == "api").unwrap();
+        assert_eq!(api_project.dependencies.len(), 1);
+        assert_eq!(api_project.dependencies[0].name, "shared");
+    }
+}
