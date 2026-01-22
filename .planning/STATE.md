@@ -5,33 +5,33 @@
 See: .planning/PROJECT.md (updated 2026-01-22)
 
 **Core value:** Auto-detect the dependency graph from native configs. If the tool can't figure it out from mix.exs/package.json/pyproject.toml, something is wrong.
-**Current focus:** Phase 2 - Language Plugins
+**Current focus:** Phase 3 - Execution Engine (ready to start)
 
 ## Current Position
 
 Phase: 2 of 4 (Language Plugins)
-Plan: 1 of 1 in current phase
+Plan: 2 of 2 in current phase
 Status: Phase 2 complete
-Last activity: 2026-01-22 - Completed 02-01-PLAN.md (Language Plugins)
+Last activity: 2026-01-22 - Completed 02-02-PLAN.md (Target Resolution)
 
-Progress: [█████░░░░░] 50%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 4m 4s
-- Total execution time: 0.27 hours
+- Total plans completed: 5
+- Average duration: 3m 50s
+- Total execution time: 0.32 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-foundation | 3 | 13m 7s | 4m 22s |
-| 02-language-plugins | 1 | 3m 12s | 3m 12s |
+| 02-language-plugins | 2 | 6m 26s | 3m 13s |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3m 25s), 01-02 (3m 1s), 01-03 (6m 41s), 02-01 (3m 12s)
+- Last 5 plans: 01-02 (3m 1s), 01-03 (6m 41s), 02-01 (3m 12s), 02-02 (3m 14s)
 - Trend: Consistent velocity
 
 *Updated after each plan completion*
@@ -60,6 +60,8 @@ Recent decisions affecting current work:
 - Python: PEP 621 project.name takes priority over tool.poetry.name
 - Python: Serde untagged enum for Poetry dependency variants (Version/Table)
 - Both plugins implement Send + Sync per LanguagePlugin trait requirement
+- Target merge strategy: Custom targets override at key level, not wholesale replacement
+- CLI plugin registration: All three plugins registered by default
 
 ### Pending Todos
 
@@ -72,5 +74,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-22
-Stopped at: Completed 02-01-PLAN.md (Language Plugins)
+Stopped at: Completed 02-02-PLAN.md (Target Resolution)
 Resume file: None
