@@ -32,7 +32,8 @@ pub struct ExecutionResult {
 
 /// Executor for running target commands on projects
 pub struct Executor<'a> {
-    /// Workspace root directory
+    /// Workspace root directory (reserved for future use)
+    #[allow(dead_code)]
     workspace_root: &'a Path,
 }
 

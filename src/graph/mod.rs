@@ -5,6 +5,8 @@
 
 pub mod builder;
 pub mod cycles;
+pub mod path;
 
 pub use builder::{build_graph, ProjectGraph, ProjectNode};
 pub use cycles::{find_cycle, CycleError};
+pub use path::{find_path, format_path};

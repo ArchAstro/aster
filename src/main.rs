@@ -12,7 +12,7 @@ use aster::cli::{expand_selection, parse_run_args, select_projects, Cli, Command
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::executor::Executor;
-use aster::graph::{build_graph, find_cycle};
+use aster::graph::{build_graph, find_cycle, find_path, format_path};
 use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
 
 fn main() -> ExitCode {
@@ -99,7 +99,7 @@ fn run() -> Result<()> {
             // Build graph for path finding
             let graph = build_graph(&projects)?;
 
-            // Placeholder for Task 3 - will implement find_path
+            // Validate projects exist
             if graph.get(&from).is_none() {
                 return Err(anyhow::anyhow!("Project not found: {}", from));
             }
@@ -107,8 +107,15 @@ fn run() -> Result<()> {
                 return Err(anyhow::anyhow!("Project not found: {}", to));
             }
 
-            // Will be replaced with actual path finding in Task 3
-            println!("Why command: {} -> {} (path finding not yet implemented)", from, to);
+            // Find path
+            match find_path(&graph, &from, &to) {
+                Some(path) => {
+                    println!("{}", format_path(&path));
+                }
+                None => {
+                    println!("No dependency path found between {} and {}", from, to);
+                }
+            }
         }
         Commands::Run(args) => {
             // Parse external subcommand args
