@@ -1,0 +1,93 @@
+use super::LanguagePlugin;
+
+/// Registry of available language plugins
+pub struct PluginRegistry {
+    plugins: Vec<Box<dyn LanguagePlugin>>,
+}
+
+impl PluginRegistry {
+    pub fn new() -> Self {
+        Self { plugins: Vec::new() }
+    }
+
+    /// Register a plugin
+    pub fn register(&mut self, plugin: Box<dyn LanguagePlugin>) {
+        self.plugins.push(plugin);
+    }
+
+    /// Get all registered plugins
+    pub fn plugins(&self) -> &[Box<dyn LanguagePlugin>] {
+        &self.plugins
+    }
+
+    /// Find plugin that handles a given marker file
+    pub fn find_by_marker(&self, filename: &str) -> Option<&dyn LanguagePlugin> {
+        self.plugins
+            .iter()
+            .find(|p| p.marker_files().contains(&filename))
+            .map(|p| p.as_ref())
+    }
+}
+
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::{LocalDependency, ProjectMetadata};
+    use anyhow::Result;
+    use std::path::Path;
+
+    // Mock plugin for testing
+    struct MockPlugin {
+        name: &'static str,
+        markers: Vec<&'static str>,
+    }
+
+    impl LanguagePlugin for MockPlugin {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn marker_files(&self) -> &[&str] {
+            &self.markers
+        }
+
+        fn parse_project(&self, _root: &Path, _config_path: &Path) -> Result<ProjectMetadata> {
+            Ok(ProjectMetadata {
+                name: "mock-project".to_string(),
+                version: Some("1.0.0".to_string()),
+            })
+        }
+
+        fn parse_dependencies(&self, _config_path: &Path) -> Result<Vec<LocalDependency>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn test_register_and_find() {
+        let mut registry = PluginRegistry::new();
+
+        let plugin = MockPlugin {
+            name: "nodejs",
+            markers: vec!["package.json"],
+        };
+        registry.register(Box::new(plugin));
+
+        let found = registry.find_by_marker("package.json");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name(), "nodejs");
+    }
+
+    #[test]
+    fn test_find_unknown_marker() {
+        let registry = PluginRegistry::new();
+        let found = registry.find_by_marker("unknown.file");
+        assert!(found.is_none());
+    }
+}
