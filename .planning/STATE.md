@@ -65,7 +65,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-None yet.
+- Add `aster init` command to Phase 3 (creates root aster.toml, scans projects, creates per-project overrides, prints summary)
 
 ### Blockers/Concerns
 
