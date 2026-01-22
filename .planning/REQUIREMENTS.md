@@ -9,24 +9,24 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Core Graph Engine
 
-- [ ] **GRAPH-01**: Build dependency graph from parsed project configs
-- [ ] **GRAPH-02**: Detect cycles and report clear error with exact cycle path
-- [ ] **GRAPH-03**: Topological sort for dependency-ordered execution
+- [x] **GRAPH-01**: Build dependency graph from parsed project configs
+- [x] **GRAPH-02**: Detect cycles and report clear error with exact cycle path
+- [x] **GRAPH-03**: Topological sort for dependency-ordered execution
 
 ### Project Discovery
 
-- [ ] **DISC-01**: Auto-discover projects by scanning for config files (package.json, mix.exs, pyproject.toml, aster.toml)
-- [ ] **DISC-02**: Bazel/Buck-style addressing (//path/to/project:target)
-- [ ] **DISC-03**: Recursive glob support (//services/... matches all projects under path)
-- [ ] **DISC-04**: Workspace root detection (walk up to find aster.toml or .git)
+- [x] **DISC-01**: Auto-discover projects by scanning for config files (package.json, mix.exs, pyproject.toml, aster.toml)
+- [x] **DISC-02**: Bazel/Buck-style addressing (//path/to/project:target)
+- [x] **DISC-03**: Recursive glob support (//services/... matches all projects under path)
+- [x] **DISC-04**: Workspace root detection (walk up to find aster.toml or .git)
 
 ### Language Plugins
 
-- [ ] **PLUG-01**: Node.js plugin parses package.json and extracts file: dependencies
+- [x] **PLUG-01**: Node.js plugin parses package.json and extracts file: dependencies
 - [ ] **PLUG-02**: Elixir plugin parses mix.exs and extracts path: dependencies
 - [ ] **PLUG-03**: Python plugin parses pyproject.toml and extracts Poetry path dependencies
 - [ ] **PLUG-04**: Plugins map standard targets (test, build, lint) to native commands
-- [ ] **PLUG-05**: Plugin trait enables adding new languages
+- [x] **PLUG-05**: Plugin trait enables adding new languages
 
 ### Git Integration
 
@@ -56,14 +56,14 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Override & Extension
 
-- [ ] **EXT-01**: `aster.toml` in project directory for manual configuration
-- [ ] **EXT-02**: Declare cross-language dependencies in aster.toml
-- [ ] **EXT-03**: Override project name (instead of inferring from package config)
-- [ ] **EXT-04**: Define custom targets with arbitrary commands
+- [x] **EXT-01**: `aster.toml` in project directory for manual configuration
+- [x] **EXT-02**: Declare cross-language dependencies in aster.toml
+- [x] **EXT-03**: Override project name (instead of inferring from package config)
+- [x] **EXT-04**: Define custom targets with arbitrary commands
 
 ### Testing & Quality
 
-- [ ] **TEST-01**: Comprehensive unit tests for all components
+- [x] **TEST-01**: Comprehensive unit tests for all components
 - [ ] **TEST-02**: Integration tests against ~/archastro/firstlanding-wt9
 
 ## v2 Requirements
@@ -106,18 +106,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| GRAPH-01 | Phase 1 | Pending |
-| GRAPH-02 | Phase 1 | Pending |
-| GRAPH-03 | Phase 1 | Pending |
-| DISC-01 | Phase 1 | Pending |
-| DISC-02 | Phase 1 | Pending |
-| DISC-03 | Phase 1 | Pending |
-| DISC-04 | Phase 1 | Pending |
-| PLUG-01 | Phase 1 | Pending |
+| GRAPH-01 | Phase 1 | Complete |
+| GRAPH-02 | Phase 1 | Complete |
+| GRAPH-03 | Phase 1 | Complete |
+| DISC-01 | Phase 1 | Complete |
+| DISC-02 | Phase 1 | Complete |
+| DISC-03 | Phase 1 | Complete |
+| DISC-04 | Phase 1 | Complete |
+| PLUG-01 | Phase 1 | Complete |
 | PLUG-02 | Phase 2 | Pending |
 | PLUG-03 | Phase 2 | Pending |
 | PLUG-04 | Phase 2 | Pending |
-| PLUG-05 | Phase 1 | Pending |
+| PLUG-05 | Phase 1 | Complete |
 | GIT-01 | Phase 3 | Pending |
 | GIT-02 | Phase 3 | Pending |
 | CLI-01 | Phase 3 | Pending |
@@ -135,11 +135,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | OUT-04 | Phase 4 | Pending |
 | OUT-05 | Phase 4 | Pending |
 | OUT-06 | Phase 4 | Pending |
-| EXT-01 | Phase 1 | Pending |
-| EXT-02 | Phase 1 | Pending |
-| EXT-03 | Phase 1 | Pending |
-| EXT-04 | Phase 1 | Pending |
-| TEST-01 | Phase 1 | Pending |
+| EXT-01 | Phase 1 | Complete |
+| EXT-02 | Phase 1 | Complete |
+| EXT-03 | Phase 1 | Complete |
+| EXT-04 | Phase 1 | Complete |
+| TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 4 | Pending |
 
 **Coverage:**
@@ -149,4 +149,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2025-01-22*
-*Last updated: 2026-01-22 after roadmap creation*
+*Last updated: 2026-01-22 after Phase 1 completion*

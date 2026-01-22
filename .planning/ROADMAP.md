@@ -6,7 +6,7 @@ Aster delivers a zero-config build dependency graph tool for polyglot monorepos 
 
 ## Phases
 
-- [ ] **Phase 1: Foundation** - Graph engine, discovery, config system, Node.js plugin
+- [x] **Phase 1: Foundation** - Graph engine, discovery, config system, Node.js plugin
 - [ ] **Phase 2: Language Plugins** - Elixir and Python plugins, target mapping
 - [ ] **Phase 3: CLI & Git** - Full command surface, affected detection
 - [ ] **Phase 4: Output & Testing** - Terminal UI, JSON output, integration tests
@@ -26,9 +26,9 @@ Aster delivers a zero-config build dependency graph tool for polyglot monorepos 
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Core infrastructure: Rust project, workspace detection, address parsing, plugin trait
-- [ ] 01-02-PLAN.md — Discovery system: Node.js plugin, aster.toml parsing, project scanner
-- [ ] 01-03-PLAN.md — Graph engine and CLI: dependency graph, cycle detection, list/graph commands
+- [x] 01-01-PLAN.md — Core infrastructure: Rust project, workspace detection, address parsing, plugin trait
+- [x] 01-02-PLAN.md — Discovery system: Node.js plugin, aster.toml parsing, project scanner
+- [x] 01-03-PLAN.md — Graph engine and CLI: dependency graph, cycle detection, list/graph commands
 
 ### Phase 2: Language Plugins
 **Goal**: Users can build dependency graphs from Elixir and Python projects alongside Node.js
@@ -78,7 +78,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 0/3 | Planned | - |
+| 1. Foundation | 3/3 | ✓ Complete | 2026-01-22 |
 | 2. Language Plugins | 0/1 | Not started | - |
 | 3. CLI & Git | 0/2 | Not started | - |
 | 4. Output & Testing | 0/1 | Not started | - |
