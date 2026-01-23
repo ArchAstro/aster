@@ -12,6 +12,7 @@ use aster::cli::{
     build_execution_output, expand_selection, output_json, parse_run_args, print_summary,
     select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectInfo, WhyOutput,
 };
+use aster::executor::logs::LogStore;
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::executor::Executor;
@@ -236,6 +237,88 @@ fn run() -> Result<()> {
                 }
             }
             // Quiet mode: no output for why
+        }
+        Commands::Logs { target } => {
+            let log_store = LogStore::new(&workspace_root);
+
+            if let Some(ref target_addr) = target {
+                // Specific target: show full output
+                // Support both "//project:target" and "//project target" formats
+                let normalized_addr = if target_addr.contains(':') {
+                    target_addr.clone()
+                } else if target_addr.contains(' ') {
+                    // "//project target" format - convert to "//project:target"
+                    let parts: Vec<&str> = target_addr.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        format!("{}:{}", parts[0], parts[1])
+                    } else {
+                        target_addr.clone()
+                    }
+                } else {
+                    target_addr.clone()
+                };
+
+                match log_store.get_target_log(&normalized_addr)? {
+                    Some(target_log) => {
+                        if output_mode == OutputMode::Json {
+                            output_json(&target_log)?;
+                        } else {
+                            println!("--- {} ---", target_log.address);
+                            if !target_log.output.is_empty() {
+                                print!("{}", target_log.output);
+                                if !target_log.output.ends_with('\n') {
+                                    println!();
+                                }
+                            }
+                            println!(
+                                "[{}] {} ({}ms)",
+                                target_log.status.to_uppercase(),
+                                target_log.address,
+                                target_log.duration_ms
+                            );
+                        }
+                    }
+                    None => {
+                        // Exit silently for missing target (per CONTEXT.md - not an error)
+                        if output_mode == OutputMode::Json {
+                            // Output empty object for consistency
+                            println!("{{}}");
+                        }
+                    }
+                }
+            } else {
+                // No target: show summary of last run
+                match log_store.load_latest()? {
+                    Some(run) => {
+                        if output_mode == OutputMode::Json {
+                            output_json(&run)?;
+                        } else {
+                            use aster::ui::colors::{status_fail, status_pass, status_skip};
+
+                            println!("Last run: {} ({})", run.target, run.timestamp);
+                            println!();
+                            for result in &run.results {
+                                let status_icon = match result.status.as_str() {
+                                    "passed" => status_pass(),
+                                    "failed" => status_fail(),
+                                    _ => status_skip(),
+                                };
+                                println!("  {} {}", status_icon, result.address);
+                            }
+                            println!();
+                            println!("Use `aster logs <target>` to view full output");
+                        }
+                    }
+                    None => {
+                        if output_mode == OutputMode::Json {
+                            // Output empty object for no previous run
+                            println!("{{}}");
+                        } else {
+                            println!("No previous run found");
+                        }
+                    }
+                }
+            }
         }
         Commands::Affected {
             target,

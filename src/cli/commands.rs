@@ -83,6 +83,12 @@ pub enum Commands {
         dependents: bool,
     },
 
+    /// View logs from the last run
+    Logs {
+        /// Specific target to view (e.g., //services/api:test)
+        target: Option<String>,
+    },
+
     /// Run a target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
     Run(Vec<String>),
