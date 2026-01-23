@@ -47,12 +47,12 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### CLI Output
 
-- [ ] **OUT-01**: `--json` flag outputs machine-readable JSON for all commands
-- [ ] **OUT-02**: Terminal UI with progress indication
-- [ ] **OUT-03**: Organized error output (hide success, show failures clearly)
-- [ ] **OUT-04**: `--verbose` flag streams all output
-- [ ] **OUT-05**: `--quiet` flag shows only final pass/fail
-- [ ] **OUT-06**: `--help` flag with clear usage for all commands
+- [x] **OUT-01**: `--json` flag outputs machine-readable JSON for all commands
+- [x] **OUT-02**: Terminal UI with progress indication
+- [x] **OUT-03**: Organized error output (hide success, show failures clearly)
+- [x] **OUT-04**: `--verbose` flag streams all output
+- [x] **OUT-05**: `--quiet` flag shows only final pass/fail
+- [x] **OUT-06**: `--help` flag with clear usage for all commands
 
 ### Override & Extension
 
@@ -64,7 +64,7 @@ Requirements for initial release. Each maps to roadmap phases.
 ### Testing & Quality
 
 - [x] **TEST-01**: Comprehensive unit tests for all components
-- [ ] **TEST-02**: Integration tests against ~/archastro/firstlanding-wt9
+- [x] **TEST-02**: Integration tests against ~/archastro/firstlanding-wt9
 
 ## v2 Requirements
 
@@ -129,18 +129,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLI-07 | Phase 3 | Complete |
 | CLI-08 | Phase 3 | Complete |
 | CLI-09 | Phase 3 | Complete |
-| OUT-01 | Phase 4 | Pending |
-| OUT-02 | Phase 4 | Pending |
-| OUT-03 | Phase 4 | Pending |
-| OUT-04 | Phase 4 | Pending |
-| OUT-05 | Phase 4 | Pending |
-| OUT-06 | Phase 4 | Pending |
+| OUT-01 | Phase 4 | Complete |
+| OUT-02 | Phase 4 | Complete |
+| OUT-03 | Phase 4 | Complete |
+| OUT-04 | Phase 4 | Complete |
+| OUT-05 | Phase 4 | Complete |
+| OUT-06 | Phase 4 | Complete |
 | EXT-01 | Phase 1 | Complete |
 | EXT-02 | Phase 1 | Complete |
 | EXT-03 | Phase 1 | Complete |
 | EXT-04 | Phase 1 | Complete |
 | TEST-01 | Phase 1 | Complete |
-| TEST-02 | Phase 4 | Pending |
+| TEST-02 | Phase 4 | Complete |
 
 **Coverage:**
 - v1 requirements: 35 total
@@ -149,4 +149,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2025-01-22*
-*Last updated: 2026-01-22 after Phase 3 completion*
+*Last updated: 2026-01-23 after Phase 4 completion - v1 complete*

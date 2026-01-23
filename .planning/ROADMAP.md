@@ -9,7 +9,7 @@ Aster delivers a zero-config build dependency graph tool for polyglot monorepos 
 - [x] **Phase 1: Foundation** - Graph engine, discovery, config system, Node.js plugin
 - [x] **Phase 2: Language Plugins** - Elixir and Python plugins, target mapping
 - [x] **Phase 3: CLI & Git** - Full command surface, affected detection
-- [ ] **Phase 4: Output & Testing** - Terminal UI, JSON output, integration tests
+- [x] **Phase 4: Output & Testing** - Terminal UI, JSON output, integration tests
 
 ## Phase Details
 
@@ -73,9 +73,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — Global CLI flags and JSON output for all commands
-- [ ] 04-02-PLAN.md — Progress display with indicatif and log storage
-- [ ] 04-03-PLAN.md — Logs command and real monorepo integration tests
+- [x] 04-01-PLAN.md — Global CLI flags and JSON output for all commands
+- [x] 04-02-PLAN.md — Progress display with indicatif and log storage
+- [x] 04-03-PLAN.md — Logs command and real monorepo integration tests
 
 ## Progress
 
@@ -84,7 +84,7 @@ Plans:
 | 1. Foundation | 3/3 | Complete | 2026-01-22 |
 | 2. Language Plugins | 2/2 | Complete | 2026-01-22 |
 | 3. CLI & Git | 2/2 | Complete | 2026-01-22 |
-| 4. Output & Testing | 0/3 | In progress | - |
+| 4. Output & Testing | 3/3 | Complete | 2026-01-23 |
 
 ---
 *Roadmap created: 2026-01-22*
