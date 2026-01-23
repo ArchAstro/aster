@@ -18,7 +18,7 @@ use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
-use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, TargetCapability};
+use aster::plugins::{ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, TargetCapability};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -56,6 +56,7 @@ fn run() -> Result<()> {
     registry.register(Box::new(NodeJsPlugin));
     registry.register(Box::new(ElixirPlugin));
     registry.register(Box::new(PythonPlugin));
+    registry.register(Box::new(GoPlugin));
 
     // Discover projects
     let projects = discover_projects(&workspace_root, &registry)
@@ -494,6 +495,7 @@ fn run() -> Result<()> {
                 registry.register(Box::new(NodeJsPlugin));
                 registry.register(Box::new(PythonPlugin));
                 registry.register(Box::new(ElixirPlugin));
+                registry.register(Box::new(GoPlugin));
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
@@ -1007,6 +1009,7 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     registry.register(Box::new(NodeJsPlugin));
     registry.register(Box::new(ElixirPlugin));
     registry.register(Box::new(PythonPlugin));
+    registry.register(Box::new(GoPlugin));
 
     // Discover projects
     let projects = discover_projects(&workspace_root, &registry)

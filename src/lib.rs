@@ -14,8 +14,8 @@ pub use cli::{Cli, Commands};
 pub use discovery::{discover_projects, DiscoveredProject};
 pub use graph::{build_graph, find_cycle, CycleError, ProjectGraph, ProjectNode};
 pub use plugins::{
-    ElixirPlugin, LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry, ProjectMetadata,
-    PythonPlugin,
+    ElixirPlugin, GoPlugin, LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry,
+    ProjectMetadata, PythonPlugin,
 };
 pub use targets::TargetResolver;
 pub use executor::{ExecutionResult, Executor};

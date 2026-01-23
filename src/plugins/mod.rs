@@ -115,11 +115,13 @@ pub trait LanguagePlugin: Send + Sync {
 }
 
 pub mod elixir;
+pub mod go;
 pub mod nodejs;
 pub mod python;
 pub mod registry;
 
 pub use elixir::ElixirPlugin;
+pub use go::GoPlugin;
 pub use nodejs::NodeJsPlugin;
 pub use python::PythonPlugin;
 pub use registry::PluginRegistry;
