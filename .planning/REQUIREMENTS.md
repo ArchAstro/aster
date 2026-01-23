@@ -30,20 +30,20 @@ Requirements for initial release. Each maps to roadmap phases.
 
 ### Git Integration
 
-- [ ] **GIT-01**: Detect affected projects between git refs (uncommitted, base..head)
-- [ ] **GIT-02**: Map changed files to owning projects
+- [x] **GIT-01**: Detect affected projects between git refs (uncommitted, base..head)
+- [x] **GIT-02**: Map changed files to owning projects
 
 ### CLI Commands
 
-- [ ] **CLI-01**: `aster <target> [projects...]` runs target on specified projects
-- [ ] **CLI-02**: `--no-deps` flag skips running dependencies
-- [ ] **CLI-03**: `--dependents` flag also runs projects that depend on targets
-- [ ] **CLI-04**: `--all` flag runs on entire repository
-- [ ] **CLI-05**: `aster affected <target>` runs on projects affected by git changes
-- [ ] **CLI-06**: `--base` and `--head` flags for affected ref range
-- [ ] **CLI-07**: `aster list` shows all discovered projects
-- [ ] **CLI-08**: `aster graph [project]` visualizes the dependency DAG
-- [ ] **CLI-09**: `aster why //a //b` shows dependency path between projects
+- [x] **CLI-01**: `aster <target> [projects...]` runs target on specified projects
+- [x] **CLI-02**: `--no-deps` flag skips running dependencies
+- [x] **CLI-03**: `--dependents` flag also runs projects that depend on targets
+- [x] **CLI-04**: `--all` flag runs on entire repository
+- [x] **CLI-05**: `aster affected <target>` runs on projects affected by git changes
+- [x] **CLI-06**: `--base` and `--head` flags for affected ref range
+- [x] **CLI-07**: `aster list` shows all discovered projects
+- [x] **CLI-08**: `aster graph [project]` visualizes the dependency DAG
+- [x] **CLI-09**: `aster why //a //b` shows dependency path between projects
 
 ### CLI Output
 
@@ -118,17 +118,17 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PLUG-03 | Phase 2 | Complete |
 | PLUG-04 | Phase 2 | Complete |
 | PLUG-05 | Phase 1 | Complete |
-| GIT-01 | Phase 3 | Pending |
-| GIT-02 | Phase 3 | Pending |
-| CLI-01 | Phase 3 | Pending |
-| CLI-02 | Phase 3 | Pending |
-| CLI-03 | Phase 3 | Pending |
-| CLI-04 | Phase 3 | Pending |
-| CLI-05 | Phase 3 | Pending |
-| CLI-06 | Phase 3 | Pending |
-| CLI-07 | Phase 3 | Pending |
-| CLI-08 | Phase 3 | Pending |
-| CLI-09 | Phase 3 | Pending |
+| GIT-01 | Phase 3 | Complete |
+| GIT-02 | Phase 3 | Complete |
+| CLI-01 | Phase 3 | Complete |
+| CLI-02 | Phase 3 | Complete |
+| CLI-03 | Phase 3 | Complete |
+| CLI-04 | Phase 3 | Complete |
+| CLI-05 | Phase 3 | Complete |
+| CLI-06 | Phase 3 | Complete |
+| CLI-07 | Phase 3 | Complete |
+| CLI-08 | Phase 3 | Complete |
+| CLI-09 | Phase 3 | Complete |
 | OUT-01 | Phase 4 | Pending |
 | OUT-02 | Phase 4 | Pending |
 | OUT-03 | Phase 4 | Pending |
@@ -149,4 +149,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2025-01-22*
-*Last updated: 2026-01-22 after Phase 2 completion*
+*Last updated: 2026-01-22 after Phase 3 completion*
