@@ -104,6 +104,10 @@ pub enum Commands {
         /// Also run dependents of affected projects
         #[arg(long)]
         dependents: bool,
+
+        /// Show what would run without executing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// View logs from the last run

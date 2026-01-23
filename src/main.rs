@@ -325,6 +325,7 @@ fn run() -> Result<()> {
             base,
             head,
             dependents,
+            dry_run,
         } => {
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)
@@ -401,19 +402,52 @@ fn run() -> Result<()> {
                 );
             }
 
-            // Print affected projects list (unless quiet or json)
-            if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
-                println!(
-                    "Affected projects ({}):",
-                    if dependents {
-                        "including dependents"
-                    } else {
-                        "directly affected only"
+            // Print affected projects list (unless quiet or json without dry_run)
+            if output_mode != OutputMode::Quiet && (output_mode != OutputMode::Json || dry_run) {
+                if output_mode != OutputMode::Json {
+                    println!(
+                        "Affected projects ({}):",
+                        if dependents {
+                            "including dependents"
+                        } else {
+                            "directly affected only"
+                        }
+                    );
+                    for p in &ordered {
+                        println!("  //{}", p.relative_path.display());
                     }
-                );
-                for p in &ordered {
-                    println!("  //{}", p.relative_path.display());
                 }
+            }
+
+            // Dry run: just show what would run
+            if dry_run {
+                if output_mode == OutputMode::Json {
+                    // Output JSON list of affected projects
+                    #[derive(serde::Serialize)]
+                    struct DryRunOutput {
+                        target: String,
+                        base: String,
+                        head: Option<String>,
+                        affected: Vec<String>,
+                        count: usize,
+                    }
+                    let affected: Vec<String> = ordered
+                        .iter()
+                        .map(|p| format!("//{}", p.relative_path.display()))
+                        .collect();
+                    let output = DryRunOutput {
+                        target: target.clone(),
+                        base: base.clone(),
+                        head: head.clone(),
+                        count: affected.len(),
+                        affected,
+                    };
+                    output_json(&output)?;
+                } else if output_mode != OutputMode::Quiet {
+                    println!();
+                    println!("Would run '{}' on {} projects", target, ordered.len());
+                }
+                return Ok(());
             }
 
             // Execute target on projects
