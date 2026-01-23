@@ -3,6 +3,8 @@
 //! These tests create temporary workspaces with various project configurations
 //! and verify the CLI commands work correctly.
 
+mod cli_tests;
+
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;

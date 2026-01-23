@@ -1,0 +1,253 @@
+//! JSON output validation tests
+//!
+//! Tests that all commands with --json flag produce valid, parseable JSON output.
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use serde_json::Value;
+use tempfile::TempDir;
+
+use super::{setup_workspace, write_package_json};
+
+/// Helper to create a workspace with multiple Node.js projects
+fn setup_workspace_with_projects() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create two projects: core and api (api depends on core)
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}}"#,
+    );
+
+    tmp
+}
+
+#[test]
+fn test_list_json_outputs_valid_json() {
+    let tmp = setup_workspace_with_projects();
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+
+    // Verify stdout is valid JSON array
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<Value> = serde_json::from_str(&stdout).expect("Should be valid JSON array");
+
+    // Should have at least 2 projects
+    assert!(
+        parsed.len() >= 2,
+        "Expected at least 2 projects, got {}",
+        parsed.len()
+    );
+
+    // Verify structure of each project
+    for project in &parsed {
+        assert!(project.get("address").is_some(), "Missing 'address' field");
+        assert!(project.get("path").is_some(), "Missing 'path' field");
+        assert!(project.get("plugin").is_some(), "Missing 'plugin' field");
+        assert!(project.get("targets").is_some(), "Missing 'targets' field");
+    }
+}
+
+#[test]
+fn test_list_json_empty_workspace() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<Value> = serde_json::from_str(&stdout).expect("Should be valid JSON array");
+
+    assert!(parsed.is_empty(), "Expected empty array for empty workspace");
+}
+
+#[test]
+fn test_graph_json_outputs_valid_json() {
+    let tmp = setup_workspace_with_projects();
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "graph"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
+
+    // Verify structure has "nodes" and "edges" keys
+    assert!(parsed.get("nodes").is_some(), "Missing 'nodes' key");
+    assert!(parsed.get("edges").is_some(), "Missing 'edges' key");
+
+    // Nodes should be an array
+    let nodes = parsed.get("nodes").unwrap();
+    assert!(nodes.is_array(), "nodes should be an array");
+
+    // Edges should be an object (map of address -> dependencies)
+    let edges = parsed.get("edges").unwrap();
+    assert!(edges.is_object(), "edges should be an object");
+}
+
+#[test]
+fn test_why_json_outputs_valid_json() {
+    let tmp = setup_workspace_with_projects();
+
+    // Use target addresses (with :target suffix)
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "why",
+            "//services/api:deps",
+            "//libs/core:deps",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
+
+    // Verify structure has "from", "to", "path" keys
+    assert!(parsed.get("from").is_some(), "Missing 'from' key");
+    assert!(parsed.get("to").is_some(), "Missing 'to' key");
+    assert!(parsed.get("path").is_some(), "Missing 'path' key");
+}
+
+#[test]
+fn test_why_json_no_path_found() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Two unrelated projects
+    write_package_json(&tmp, "a/package.json", r#"{"name": "a"}"#);
+    write_package_json(&tmp, "b/package.json", r#"{"name": "b"}"#);
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "why", "//a:deps", "//b:deps"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
+
+    // path should be null when no path exists
+    assert_eq!(
+        parsed.get("path").unwrap(),
+        &Value::Null,
+        "path should be null when no path exists"
+    );
+}
+
+#[test]
+fn test_logs_json_no_previous_run() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "logs"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should output empty object for no previous run
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    assert!(
+        parsed.is_object() || parsed.is_null(),
+        "Should be object or null for no previous run"
+    );
+}
+
+#[test]
+fn test_logs_json_specific_target_not_found() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "logs", "//nonexistent:target"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command should succeed even for missing target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should output empty object for not found target
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    assert!(parsed.is_object(), "Should be object for missing target");
+}
+
+#[test]
+fn test_json_flag_before_subcommand() {
+    let tmp = setup_workspace_with_projects();
+
+    // --json must come before the subcommand (global flag)
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    cmd.current_dir(tmp.path())
+        .args(["--json", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("["));
+}
+
+#[test]
+fn test_json_flag_produces_valid_json_for_all_commands() {
+    let tmp = setup_workspace_with_projects();
+
+    // Test all commands that support JSON output
+    let test_cases = vec![
+        vec!["--json", "list"],
+        vec!["--json", "graph"],
+        vec!["--json", "logs"],
+    ];
+
+    for args in test_cases {
+        let mut cmd = Command::cargo_bin("aster").unwrap();
+        let output = cmd
+            .current_dir(tmp.path())
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "Command {:?} failed: {:?}",
+            args,
+            output
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("Command {:?} did not produce valid JSON: {}", args, e));
+    }
+}
