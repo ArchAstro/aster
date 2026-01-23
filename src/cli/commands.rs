@@ -28,7 +28,11 @@ EXAMPLES:
     aster test //libs/core            # Test core and its dependencies
     aster test //libs/core --no-deps  # Test only core, skip dependencies
     aster build //app --dependents    # Build app and everything that uses it
-    aster affected test --base=main   # Test projects changed since main"#)]
+    aster affected test --base=main   # Test projects changed since main
+
+HETEROGENEOUS RUNS:
+    aster run //a:test //b:build //c:lint   # Run different targets on different projects
+    aster run //a:test //b:test --no-deps   # Run without unlisted dependencies"#)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -108,7 +112,21 @@ pub enum Commands {
         target: Option<String>,
     },
 
-    /// Run a target on projects (catch-all for targets like test, build, lint)
+    /// Run a heterogeneous set of targets
+    ///
+    /// Execute multiple project:target pairs in dependency order.
+    /// Useful when you need to run different targets on different projects.
+    Run {
+        /// Targets to run (//project:target format)
+        #[arg(required = true)]
+        targets: Vec<String>,
+
+        /// Skip dependencies not explicitly listed
+        #[arg(long)]
+        no_deps: bool,
+    },
+
+    /// Run a single target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
-    Run(Vec<String>),
+    Target(Vec<String>),
 }
