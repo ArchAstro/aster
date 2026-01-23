@@ -132,4 +132,31 @@ mod tests {
         // Unknown marker returns None
         assert!(registry.find_by_marker("Cargo.toml").is_none());
     }
+
+    #[test]
+    fn test_find_by_name() {
+        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin};
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(NodeJsPlugin));
+        registry.register(Box::new(ElixirPlugin));
+        registry.register(Box::new(PythonPlugin));
+
+        // Find by name
+        let nodejs = registry.find_by_name("nodejs");
+        assert!(nodejs.is_some());
+        assert_eq!(nodejs.unwrap().name(), "nodejs");
+
+        let elixir = registry.find_by_name("elixir");
+        assert!(elixir.is_some());
+        assert_eq!(elixir.unwrap().name(), "elixir");
+
+        let python = registry.find_by_name("python");
+        assert!(python.is_some());
+        assert_eq!(python.unwrap().name(), "python");
+
+        // Unknown name returns None
+        assert!(registry.find_by_name("rust").is_none());
+        assert!(registry.find_by_name("").is_none());
+    }
 }

@@ -520,4 +520,84 @@ mod tests {
         // deps is always present
         assert!(targets.get("deps").is_some());
     }
+
+    #[test]
+    fn test_with_files_list_filters_test_files() {
+        let plugin = NodeJsPlugin;
+        let files = vec![
+            PathBuf::from("src/index.ts"),
+            PathBuf::from("src/utils.test.ts"),
+            PathBuf::from("src/helpers.spec.js"),
+            PathBuf::from("__tests__/integration.js"),
+            PathBuf::from("package.json"),
+        ];
+
+        let result = plugin.with_files_list("test", "npm test", &files);
+
+        assert!(result.is_some());
+        let cmd = result.unwrap();
+        assert!(cmd.starts_with("npm test -- "));
+        assert!(cmd.contains("utils.test.ts"));
+        assert!(cmd.contains("helpers.spec.js"));
+        assert!(cmd.contains("__tests__/integration.js"));
+        assert!(!cmd.contains("index.ts"));
+        assert!(!cmd.contains("package.json"));
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_for_non_test_target() {
+        let plugin = NodeJsPlugin;
+        let files = vec![PathBuf::from("src/index.test.ts")];
+
+        let result = plugin.with_files_list("build", "npm run build", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_when_no_test_files() {
+        let plugin = NodeJsPlugin;
+        let files = vec![
+            PathBuf::from("src/index.ts"),
+            PathBuf::from("src/utils.ts"),
+            PathBuf::from("package.json"),
+        ];
+
+        let result = plugin.with_files_list("test", "npm test", &files);
+
+        // No test files, so run full suite
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_with_files_list_empty_files() {
+        let plugin = NodeJsPlugin;
+        let files: Vec<PathBuf> = vec![];
+
+        let result = plugin.with_files_list("test", "npm test", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_test_target_has_files_list_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"test": "jest"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let test_target = targets.get("test").unwrap();
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+
+        // build should not have the capability
+        let deps_target = targets.get("deps").unwrap();
+        assert!(!deps_target.capabilities.contains(&TargetCapability::FilesList));
+    }
 }

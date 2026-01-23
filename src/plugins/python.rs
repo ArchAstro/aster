@@ -680,4 +680,78 @@ python = "^3.11"
         // Poetry projects use "poetry install" for deps
         assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"poetry install".to_string()));
     }
+
+    #[test]
+    fn test_with_files_list_filters_test_files() {
+        let plugin = PythonPlugin;
+        let files = vec![
+            PathBuf::from("src/main.py"),
+            PathBuf::from("tests/test_main.py"),
+            PathBuf::from("tests/test_utils.py"),
+            PathBuf::from("src/utils_test.py"),
+            PathBuf::from("pyproject.toml"),
+        ];
+
+        let result = plugin.with_files_list("test", "pytest", &files);
+
+        assert!(result.is_some());
+        let cmd = result.unwrap();
+        assert!(cmd.starts_with("pytest "));
+        assert!(cmd.contains("test_main.py"));
+        assert!(cmd.contains("test_utils.py"));
+        assert!(cmd.contains("utils_test.py"));
+        assert!(!cmd.contains("src/main.py"));
+        assert!(!cmd.contains("pyproject.toml"));
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_for_non_test_target() {
+        let plugin = PythonPlugin;
+        let files = vec![PathBuf::from("tests/test_main.py")];
+
+        let result = plugin.with_files_list("build", "python -m build", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_when_no_test_files() {
+        let plugin = PythonPlugin;
+        let files = vec![
+            PathBuf::from("src/main.py"),
+            PathBuf::from("src/utils.py"),
+            PathBuf::from("pyproject.toml"),
+        ];
+
+        let result = plugin.with_files_list("test", "pytest", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_test_target_has_files_list_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let test_target = targets.get("test").unwrap();
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+
+        let deps_target = targets.get("deps").unwrap();
+        assert!(!deps_target.capabilities.contains(&TargetCapability::FilesList));
+    }
 }

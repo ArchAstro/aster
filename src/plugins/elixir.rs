@@ -570,4 +570,80 @@ end
         // lint NOT available (no credo)
         assert_eq!(targets.get("lint"), None);
     }
+
+    #[test]
+    fn test_with_files_list_filters_test_files() {
+        let plugin = ElixirPlugin;
+        let files = vec![
+            PathBuf::from("lib/my_app.ex"),
+            PathBuf::from("test/my_app_test.exs"),
+            PathBuf::from("test/support/helper.ex"),
+            PathBuf::from("mix.exs"),
+        ];
+
+        let result = plugin.with_files_list("test", "mix test", &files);
+
+        assert!(result.is_some());
+        let cmd = result.unwrap();
+        assert!(cmd.starts_with("mix test "));
+        assert!(cmd.contains("my_app_test.exs"));
+        assert!(cmd.contains("test/support/helper.ex")); // In test/ directory
+        assert!(!cmd.contains("lib/my_app.ex"));
+        assert!(!cmd.contains("mix.exs"));
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_for_non_test_target() {
+        let plugin = ElixirPlugin;
+        let files = vec![PathBuf::from("test/my_app_test.exs")];
+
+        let result = plugin.with_files_list("build", "mix compile", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_with_files_list_returns_none_when_no_test_files() {
+        let plugin = ElixirPlugin;
+        let files = vec![
+            PathBuf::from("lib/my_app.ex"),
+            PathBuf::from("lib/my_app/utils.ex"),
+            PathBuf::from("mix.exs"),
+        ];
+
+        let result = plugin.with_files_list("test", "mix test", &files);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_test_target_has_files_list_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let test_target = targets.get("test").unwrap();
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+
+        let deps_target = targets.get("deps").unwrap();
+        assert!(!deps_target.capabilities.contains(&TargetCapability::FilesList));
+
+        let build_target = targets.get("build").unwrap();
+        assert!(!build_target.capabilities.contains(&TargetCapability::FilesList));
+    }
 }
