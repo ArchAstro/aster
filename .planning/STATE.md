@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-22)
 
 **Core value:** Auto-detect the dependency graph from native configs. If the tool can't figure it out from mix.exs/package.json/pyproject.toml, something is wrong.
-**Current focus:** Phase 3 - CLI & Git
+**Current focus:** Phase 3 - CLI & Git (COMPLETE)
 
 ## Current Position
 
 Phase: 3 of 4 (CLI & Git)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-01-22 - Completed 03-01-PLAN.md (Target Execution Engine)
+Plan: 2 of 2 in current phase
+Status: Phase complete
+Last activity: 2026-01-22 - Completed 03-02-PLAN.md (Git-Aware Affected Detection)
 
-Progress: [██████░░░░] 60%
+Progress: [███████░░░] 70%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
-- Average duration: 4m 18s
-- Total execution time: 0.43 hours
+- Total plans completed: 7
+- Average duration: 4m 30s
+- Total execution time: 0.53 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [██████░░░░] 60%
 |-------|-------|-------|----------|
 | 01-foundation | 3 | 13m 7s | 4m 22s |
 | 02-language-plugins | 2 | 6m 26s | 3m 13s |
-| 03-cli-git | 1 | 6m 33s | 6m 33s |
+| 03-cli-git | 2 | 12m 22s | 6m 11s |
 
 **Recent Trend:**
-- Last 5 plans: 01-03 (6m 41s), 02-01 (3m 12s), 02-02 (3m 14s), 03-01 (6m 33s)
+- Last 5 plans: 02-01 (3m 12s), 02-02 (3m 14s), 03-01 (6m 33s), 03-02 (5m 49s)
 - Trend: Consistent velocity
 
 *Updated after each plan completion*
@@ -70,6 +70,11 @@ Recent decisions affecting current work:
 - Continue on failure (see all failures, not just first one)
 - Skip missing targets gracefully (not an error if project doesn't define target)
 - A* with uniform cost for path finding (Dijkstra behavior)
+- git2 for native git integration (no subprocess spawning)
+- Uncommitted changes included by default (Nx-style behavior)
+- Head ref omission = base..HEAD + uncommitted
+- Longest path match for nested project ownership
+- BFS for transitive dependent expansion
 
 ### Pending Todos
 
@@ -82,5 +87,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-01-22
-Stopped at: Completed 03-01-PLAN.md (Target Execution Engine)
+Stopped at: Completed 03-02-PLAN.md (Git-Aware Affected Detection)
 Resume file: None
