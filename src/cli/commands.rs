@@ -40,6 +40,24 @@ pub enum Commands {
     /// Initialize an aster workspace
     Init,
 
+    /// Run a target on projects affected by git changes
+    Affected {
+        /// Target to run (test, build, lint, etc.)
+        target: String,
+
+        /// Base ref for comparison (default: main)
+        #[arg(long, default_value = "main")]
+        base: String,
+
+        /// Head ref for comparison (default: HEAD + uncommitted)
+        #[arg(long)]
+        head: Option<String>,
+
+        /// Also run dependents of affected projects
+        #[arg(long)]
+        dependents: bool,
+    },
+
     /// Run a target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
     Run(Vec<String>),

@@ -12,6 +12,7 @@ use aster::cli::{expand_selection, parse_run_args, select_projects, Cli, Command
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::executor::Executor;
+use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, find_cycle, find_path, format_path};
 use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
 
@@ -115,6 +116,119 @@ fn run() -> Result<()> {
                 None => {
                     println!("No dependency path found between {} and {}", from, to);
                 }
+            }
+        }
+        Commands::Affected {
+            target,
+            base,
+            head,
+            dependents,
+        } => {
+            // Create affected detector from workspace (requires git)
+            let detector = AffectedDetector::new(&workspace_root)
+                .context("Not in a git repository. The 'affected' command requires git.")?;
+
+            // Get changed files
+            let changed_files = detector
+                .all_affected_files(&base, head.as_deref())
+                .with_context(|| {
+                    format!(
+                        "Failed to detect changed files between '{}' and '{}'",
+                        base,
+                        head.as_deref().unwrap_or("HEAD + uncommitted")
+                    )
+                })?;
+
+            if cli.verbose {
+                eprintln!("Found {} changed files", changed_files.len());
+                for file in &changed_files {
+                    eprintln!("  - {}", file.display());
+                }
+            }
+
+            // Map files to projects
+            let directly_affected = files_to_projects(&changed_files, &projects);
+
+            if cli.verbose {
+                eprintln!("Directly affected: {:?}", directly_affected);
+            }
+
+            // Build the graph
+            let graph = build_graph(&projects)?;
+
+            // Check for cycles
+            if let Some(cycle) = find_cycle(&graph) {
+                eprintln!("error: {cycle}");
+                return Err(anyhow::anyhow!("Dependency cycle detected"));
+            }
+
+            // Expand with dependents if requested
+            let affected_addrs = if dependents {
+                affected_with_dependents(directly_affected, &graph)
+            } else {
+                directly_affected
+            };
+
+            // Find DiscoveredProject refs for affected addresses
+            let affected_projects: Vec<_> = projects
+                .iter()
+                .filter(|p| {
+                    let addr = format!("//{}", p.relative_path.display());
+                    affected_addrs.contains(&addr)
+                })
+                .collect();
+
+            if affected_projects.is_empty() {
+                println!("No projects affected");
+                return Ok(());
+            }
+
+            // Sort by dependency order
+            let ordered = graph.topological_order_subset(&affected_projects);
+
+            if cli.verbose {
+                eprintln!(
+                    "Running '{}' on {} affected projects",
+                    target,
+                    ordered.len()
+                );
+            }
+
+            println!(
+                "Affected projects ({}):",
+                if dependents {
+                    "including dependents"
+                } else {
+                    "directly affected only"
+                }
+            );
+            for p in &ordered {
+                println!("  //{}", p.relative_path.display());
+            }
+
+            // Execute target on projects
+            let executor = Executor::new(&workspace_root);
+            let results = executor.execute(&target, &ordered, &graph);
+
+            // Print summary
+            let passed = results.iter().filter(|r| r.success).count();
+            let failed = results.iter().filter(|r| !r.success).count();
+
+            println!("\n=== Summary ===");
+            println!(
+                "Ran '{}' on {} affected projects: {} passed, {} failed",
+                target,
+                results.len(),
+                passed,
+                failed
+            );
+
+            if failed > 0 {
+                println!("\nFailed projects:");
+                for result in results.iter().filter(|r| !r.success) {
+                    println!("  - {}", result.address);
+                }
+                return Err(anyhow::anyhow!("{} project(s) failed", failed));
             }
         }
         Commands::Run(args) => {

@@ -533,3 +533,243 @@ version = "1.0.0"
         stdout
     );
 }
+
+// ============================================================================
+// Phase 3 Integration Tests: Affected Command
+// ============================================================================
+
+/// Set up a real git repo (not just .git marker) for affected tests
+fn setup_git_repo(tmp: &TempDir) {
+    let path = tmp.path();
+
+    // Initialize repo
+    Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+
+    // Configure git user for commits
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+}
+
+/// Create an initial commit with the current state
+fn git_commit(tmp: &TempDir, message: &str) {
+    let path = tmp.path();
+
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .output()
+        .unwrap();
+
+    Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(path)
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn test_affected_requires_git_repo() {
+    let tmp = TempDir::new().unwrap();
+    // Only .git marker, not a real git repo
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test"])
+        .output()
+        .unwrap();
+
+    // Should fail because it's not a real git repo
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("git") || stderr.contains("repository"),
+        "Expected git error message: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_affected_no_changes() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
+    git_commit(&tmp, "Initial commit");
+
+    // No changes since last commit
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No projects affected"),
+        "Expected 'No projects affected': {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_affected_detects_uncommitted_changes() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    git_commit(&tmp, "Initial commit");
+
+    // Make uncommitted change to one project
+    fs::write(
+        tmp.path().join("services/api/new_file.txt"),
+        "new content",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    // Note: Command may fail because npm test isn't defined, but we just want to verify
+    // the correct projects are detected
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should detect api as affected (has uncommitted file)
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected //services/api in output: {}",
+        stdout
+    );
+    // Should NOT detect core (no changes)
+    assert!(
+        !stdout.contains("//libs/core"),
+        "Expected //libs/core NOT in output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_affected_detects_committed_changes() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    git_commit(&tmp, "Initial commit");
+
+    // Make change and commit
+    fs::write(
+        tmp.path().join("libs/core/index.js"),
+        "console.log('hello');",
+    )
+    .unwrap();
+    git_commit(&tmp, "Add index.js to core");
+
+    // Check affected between HEAD~1 and HEAD
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD~1", "--head=HEAD"])
+        .output()
+        .unwrap();
+
+    // Note: Command may fail because npm test isn't defined, but we just want to verify
+    // the correct projects are detected
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should detect core as affected
+    assert!(
+        stdout.contains("//libs/core"),
+        "Expected //libs/core in output: {}",
+        stdout
+    );
+    // Should NOT detect api
+    assert!(
+        !stdout.contains("//services/api"),
+        "Expected //services/api NOT in output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_affected_with_dependents_flag() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // api depends on core
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}}"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    // Make change to core
+    fs::write(
+        tmp.path().join("libs/core/index.js"),
+        "console.log('hello');",
+    )
+    .unwrap();
+
+    // Without --dependents, only core should be affected
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    // Note: Command may fail because npm test isn't defined, but we just want to verify
+    // the correct projects are detected
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("//libs/core"));
+    assert!(stdout.contains("directly affected only"));
+
+    // With --dependents, both core and api should be affected
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--dependents"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("//libs/core"),
+        "Expected //libs/core with --dependents: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected //services/api with --dependents: {}",
+        stdout
+    );
+    assert!(stdout.contains("including dependents"));
+}
+
+#[test]
+fn test_affected_help_shows_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["affected", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--base"));
+    assert!(stdout.contains("--head"));
+    assert!(stdout.contains("--dependents"));
+}
