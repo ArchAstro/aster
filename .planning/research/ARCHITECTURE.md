@@ -127,20 +127,61 @@ pub struct WorkspaceConfig {
 - Support built-in plugins (Elixir, Node, Python) compiled in
 - Future: support external plugins via subprocess or WASM
 
+**Key design principle:** Plugins own all language-specific logic including:
+- Parsing native configs (metadata, dependencies)
+- Resolving relative paths to project addresses
+- Determining cross-project target dependencies (e.g., `test` depends on `:build` of dependency projects)
+
 ```rust
+/// Context passed to plugins for target detection
+pub struct TargetContext<'a> {
+    /// Path to the native config file (e.g., package.json, mix.exs)
+    pub config_path: &'a Path,
+    /// Project directory (parent of config_path)
+    pub project_dir: &'a Path,
+    /// Workspace root directory
+    pub workspace_root: &'a Path,
+    /// Dependencies parsed from native config (raw paths, not yet resolved)
+    pub dependencies: &'a [LocalDependency],
+}
+
 pub trait LanguagePlugin: Send + Sync {
+    /// Plugin identifier (e.g., "nodejs", "elixir")
+    fn name(&self) -> &str;
+
     /// Files that identify this project type
     fn marker_files(&self) -> &[&str];
 
     /// Parse native config to extract project metadata
-    fn parse_project(&self, path: &Path) -> Result<ProjectMetadata>;
+    fn parse_project(&self, root: &Path, config_path: &Path) -> Result<ProjectMetadata>;
 
-    /// Extract dependencies from native config
-    fn parse_dependencies(&self, path: &Path) -> Result<Vec<Dependency>>;
+    /// Extract dependencies from native config (returns raw relative paths)
+    fn parse_dependencies(&self, config_path: &Path) -> Result<Vec<LocalDependency>>;
 
-    /// Available targets for this project type
-    fn available_targets(&self) -> &[TargetDefinition];
+    /// Detect available targets with their dependencies
+    ///
+    /// Plugin receives raw context and is responsible for:
+    /// - Resolving dependency paths to project addresses
+    /// - Determining what cross-project dependencies each target needs
+    /// - Returning fully-specified Target.depends_on lists
+    fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>>;
 }
+```
+
+**Path resolution flow:**
+```
+Scanner finds marker file
+    ↓
+Plugin.parse_dependencies() returns raw paths (e.g., "../../libs/core")
+    ↓
+Scanner creates TargetContext with raw dependencies
+    ↓
+Plugin.detect_targets(ctx) resolves paths internally:
+    - ctx.project_dir.join(dep.path).canonicalize()
+    - strip workspace_root prefix → "//libs/core"
+    - Add ":build" suffix for cross-project deps
+    ↓
+Returns HashMap<target_name, Target { command, depends_on }>
 ```
 
 **Built-in plugins:**
@@ -246,41 +287,60 @@ impl AffectedAnalyzer {
 - Shared files (workspace root) affect all projects
 - Config file changes may affect all projects using that config
 
-### 7. Task Graph (`tasks`)
+### 7. Target Graph (`graph::targets`)
 
-- **Responsibility**: Transform project graph + targets into executable task graph
-- **Inputs**: Project graph, target names, filter/affected results
-- **Outputs**: `TaskGraph` (execution DAG)
-- **Dependencies**: Project Graph, Affected (optional)
+- **Responsibility**: Build DAG of target dependencies for execution planning
+- **Inputs**: Discovered projects with resolved targets
+- **Outputs**: `TargetGraph` (execution DAG at target level)
+- **Dependencies**: Discovery (provides projects with targets)
 
 **Key insight from Nx:**
 > "The task graph and project graph aren't isomorphic. For example, even though apps depend on a lib, testing app1 doesn't depend on testing lib."
 
-Task dependencies are defined by:
-1. **Same-project dependencies**: `build` before `test` in same project
-2. **Cross-project dependencies**: `build` depends on dependency's `build`
+**Two graph types:**
+1. **ProjectGraph** - Project-level dependencies (//project → //project)
+   - Used for: `affected` analysis, high-level visualization
+2. **TargetGraph** - Target-level dependencies (//project:target → //project:target)
+   - Used for: execution ordering, `aster graph`, `aster why`
+
+Target dependencies are already resolved by plugins:
+- `//services/api:test` → `[//services/api:deps, //libs/core:build]`
+- `//services/api:build` → `[//services/api:deps, //libs/core:build]`
+- `//services/api:deps` → `[]`
 
 ```rust
-pub struct Task {
-    pub id: TaskId,
-    pub project: ProjectId,
-    pub target: String,
-    pub command: Command,
+pub struct TargetNode {
+    /// Full target address (//path/to/project:target)
+    pub address: String,
+    /// Project address (//path/to/project)
+    pub project_address: String,
+    /// Target name (test, build, deps, etc.)
+    pub target_name: String,
+    /// Command to execute
+    pub command: String,
 }
 
-pub struct TaskGraph {
-    tasks: HashMap<TaskId, Task>,
-    edges: HashMap<TaskId, Vec<TaskId>>,  // task -> dependencies
+pub struct TargetGraph {
+    graph: DiGraph<TargetNode, ()>,
+    index_by_address: HashMap<String, NodeIndex>,
 }
 
-impl TaskGraph {
-    /// Get tasks ready to execute (all dependencies complete)
-    pub fn ready_tasks(&self, completed: &HashSet<TaskId>) -> Vec<TaskId>;
+impl TargetGraph {
+    /// Get direct dependencies of a target
+    pub fn dependencies(&self, address: &str) -> Vec<&TargetNode>;
 
-    /// Topological sort respecting dependencies
-    pub fn execution_order(&self) -> Result<Vec<TaskId>, CycleError>;
+    /// Find shortest dependency path between two targets
+    pub fn find_path(&self, from: &str, to: &str) -> Option<Vec<String>>;
+
+    /// Check for cycles
+    pub fn find_cycle(&self) -> Option<CycleError>;
 }
 ```
+
+**CLI commands using TargetGraph:**
+- `aster graph` - Shows all targets grouped by project with dependencies
+- `aster graph //project:target` - Shows specific target's dependencies
+- `aster why //a:test //b:deps` - Shows dependency path between targets
 
 ### 8. Task Scheduler (`scheduler`)
 
@@ -394,24 +454,64 @@ pub trait OutputHandler: Send {
 
 ## Data Flow
 
-1. **Startup**: CLI parses args, loads config from workspace root
-2. **Plugin Registration**: Load language plugins based on config
-3. **Discovery**: Walk filesystem, identify projects using plugin markers
-4. **Project Parsing**: Parse each project's native config via appropriate plugin
-5. **Graph Building**: Resolve dependencies, build project DAG
-6. **Affected Analysis** (if `--affected`): Git diff -> changed files -> affected projects
-7. **Target Resolution**: Map requested targets to tasks across (filtered) projects
-8. **Task Graph**: Build execution DAG with proper task dependencies
-9. **Scheduling**: Topological sort, parallel execution respecting dependencies
-10. **Execution**: Spawn subprocesses, capture output
-11. **Output**: Stream results to terminal or JSON
+1. **Startup**: CLI parses args, finds workspace root
+2. **Plugin Registration**: Register built-in language plugins
+3. **Discovery**: Walk filesystem using `ignore` crate, find marker files
+4. **Project Parsing**: For each marker file:
+   - Plugin parses metadata (`parse_project`)
+   - Plugin parses raw dependencies (`parse_dependencies`)
+   - Scanner creates `TargetContext` with raw paths
+   - Plugin detects targets with resolved dependencies (`detect_targets`)
+   - TargetResolver merges with aster.toml overrides, resolves `//self:`
+5. **Graph Building**:
+   - `ProjectGraph`: project-level DAG from dependencies
+   - `TargetGraph`: target-level DAG from `Target.depends_on`
+6. **Affected Analysis** (if `--affected`): Git diff → changed files → affected projects
+7. **Execution**: Execute targets in DAG order (deps before dependents)
+8. **Output**: Stream results to terminal
 
 ```
-Args → Config → Plugins → Discovery → Projects → Graph → Tasks → Schedule → Execute → Output
-                              ↑                      ↑
-                              |                      |
-                         Language                Affected
-                         Plugins                 Analysis
+                              ┌─────────────────┐
+                              │  CLI Entry      │
+                              └────────┬────────┘
+                                       │
+                              ┌────────▼────────┐
+                              │  Plugin         │
+                              │  Registry       │
+                              └────────┬────────┘
+                                       │
+                              ┌────────▼────────┐
+                              │  Scanner        │◄──── Finds marker files
+                              └────────┬────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    ▼                  ▼                  ▼
+             ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+             │ NodeJsPlugin│   │ElixirPlugin │   │PythonPlugin │
+             │             │   │             │   │             │
+             │ parse_*     │   │ parse_*     │   │ parse_*     │
+             │ detect_*    │   │ detect_*    │   │ detect_*    │
+             └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+                    │                 │                 │
+                    └─────────────────┼─────────────────┘
+                                      ▼
+                              ┌───────────────┐
+                              │TargetResolver │◄──── Merges aster.toml
+                              │ (//self: → //)│      overrides
+                              └───────┬───────┘
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+             ┌─────────────┐                    ┌─────────────┐
+             │ProjectGraph │                    │ TargetGraph │
+             │ (projects)  │                    │ (targets)   │
+             └──────┬──────┘                    └──────┬──────┘
+                    │                                  │
+                    ▼                                  ▼
+             ┌─────────────┐                    ┌─────────────┐
+             │  Affected   │                    │  Executor   │
+             │  Analysis   │                    │ (DAG order) │
+             └─────────────┘                    └─────────────┘
 ```
 
 ## Build Order
@@ -499,17 +599,22 @@ Primary extension point. New languages added by implementing `LanguagePlugin`:
 pub trait LanguagePlugin: Send + Sync {
     fn name(&self) -> &str;
     fn marker_files(&self) -> &[&str];
-    fn parse_project(&self, path: &Path) -> Result<ProjectMetadata>;
-    fn parse_dependencies(&self, path: &Path) -> Result<Vec<Dependency>>;
-    fn available_targets(&self) -> &[TargetDefinition];
-    fn target_command(&self, target: &str, project: &Project) -> Option<Command>;
+    fn parse_project(&self, root: &Path, config_path: &Path) -> Result<ProjectMetadata>;
+    fn parse_dependencies(&self, config_path: &Path) -> Result<Vec<LocalDependency>>;
+    fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>>;
 }
 ```
 
+**Plugin responsibilities:**
+- Parse native config files for metadata and dependencies
+- Resolve relative dependency paths to workspace addresses
+- Determine cross-project target dependencies (e.g., `:test` depends on dependency's `:build`)
+- Map standard targets to native commands
+
 **Initial built-in plugins:**
-- Elixir (`mix.exs`)
-- Node (`package.json`)
-- Python (`pyproject.toml`)
+- Elixir (`mix.exs`) - `mix test`, `mix compile`, `mix deps.get`, `mix credo`
+- Node (`package.json`) - maps npm scripts to targets
+- Python (`pyproject.toml`) - `pytest`, `python -m build`, `ruff`, `poetry install`
 
 **Future extension approaches:**
 1. **Compiled-in**: Add more plugins to core binary
