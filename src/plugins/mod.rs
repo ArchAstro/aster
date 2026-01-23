@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Metadata extracted from a project's native config file
@@ -20,6 +20,14 @@ pub struct LocalDependency {
     pub path: PathBuf,
 }
 
+/// Capabilities that a target may support
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TargetCapability {
+    /// Target can accept a list of files to operate on
+    /// (e.g., run tests only for specific files)
+    FilesList,
+}
+
 /// A build target with its command and dependencies
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Target {
@@ -28,6 +36,8 @@ pub struct Target {
     /// Target addresses that must run before this one (e.g., "//libs/shared:build", "//self:deps")
     /// Use "//self:target" to reference targets in the same project
     pub depends_on: Vec<String>,
+    /// Capabilities this target supports
+    pub capabilities: HashSet<TargetCapability>,
 }
 
 /// Context passed to plugins for target detection
@@ -81,6 +91,27 @@ pub trait LanguagePlugin: Send + Sync {
     /// It is responsible for resolving relative paths to project addresses
     /// and determining what cross-project dependencies are needed.
     fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>>;
+
+    /// Modify a command to operate on specific files
+    ///
+    /// Called when a target has the FilesList capability and files are provided.
+    /// The plugin can filter/transform files as appropriate for its tooling.
+    ///
+    /// - target_name: name of the target (e.g., "test")
+    /// - command: the original command
+    /// - files: list of file paths (relative to project directory)
+    ///
+    /// Returns Some(modified_command) if files should be passed,
+    /// or None to run the original command unchanged.
+    fn with_files_list(
+        &self,
+        _target_name: &str,
+        _command: &str,
+        _files: &[PathBuf],
+    ) -> Option<String> {
+        // Default: don't modify command (run full target)
+        None
+    }
 }
 
 pub mod elixir;

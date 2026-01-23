@@ -108,6 +108,14 @@ pub enum Commands {
         /// Show what would run without executing
         #[arg(long)]
         dry_run: bool,
+
+        /// Pass affected files to targets that support it
+        ///
+        /// For targets with FilesList capability, passes only the changed files
+        /// instead of running the full target. Useful for running tests only
+        /// on files that changed.
+        #[arg(long)]
+        only_affected_files: bool,
     },
 
     /// View logs from the last run

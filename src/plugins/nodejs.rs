@@ -2,10 +2,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
+use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext};
 
 /// Internal representation of package.json for serde deserialization
 #[derive(Deserialize)]
@@ -92,6 +92,7 @@ impl LanguagePlugin for NodeJsPlugin {
             Target {
                 command: "npm install".to_string(),
                 depends_on: vec![],
+                capabilities: HashSet::new(),
             },
         );
 
@@ -110,11 +111,14 @@ impl LanguagePlugin for NodeJsPlugin {
             // Map npm scripts to aster targets
             // Only add targets for scripts that actually exist
             if scripts.contains_key("test") {
+                let mut test_caps = HashSet::new();
+                test_caps.insert(TargetCapability::FilesList);
                 targets.insert(
                     "test".to_string(),
                     Target {
                         command: "npm test".to_string(),
                         depends_on: base_deps.clone(),
+                        capabilities: test_caps,
                     },
                 );
             }
@@ -124,6 +128,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     Target {
                         command: "npm run build".to_string(),
                         depends_on: base_deps.clone(),
+                        capabilities: HashSet::new(),
                     },
                 );
             }
@@ -133,6 +138,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     Target {
                         command: "npm run lint".to_string(),
                         depends_on: base_deps.clone(),
+                        capabilities: HashSet::new(),
                     },
                 );
             }
@@ -144,6 +150,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         Target {
                             command: format!("npm run {}", script_name),
                             depends_on: base_deps.clone(),
+                            capabilities: HashSet::new(),
                         },
                     );
                 }
@@ -151,6 +158,45 @@ impl LanguagePlugin for NodeJsPlugin {
         }
 
         Ok(targets)
+    }
+
+    fn with_files_list(
+        &self,
+        target_name: &str,
+        command: &str,
+        files: &[PathBuf],
+    ) -> Option<String> {
+        // Only test target supports file list
+        if target_name != "test" {
+            return None;
+        }
+
+        // Filter to test files only (*.test.*, *.spec.*, __tests__/*)
+        let test_files: Vec<&PathBuf> = files
+            .iter()
+            .filter(|f| {
+                let name = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let path_str = f.to_string_lossy();
+                name.contains(".test.")
+                    || name.contains(".spec.")
+                    || name.contains("_test.")
+                    || path_str.contains("__tests__")
+                    || path_str.contains("tests/")
+            })
+            .collect();
+
+        if test_files.is_empty() {
+            // No test files in the change set - run full test suite
+            return None;
+        }
+
+        // npm test -- file1 file2 (-- passes args through to the underlying test runner)
+        let file_args: Vec<String> = test_files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect();
+
+        Some(format!("{} -- {}", command, file_args.join(" ")))
     }
 }
 

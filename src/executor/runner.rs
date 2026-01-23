@@ -77,6 +77,29 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         _graph: &ProjectGraph,
     ) -> Vec<ExecutionResult> {
+        self.execute_internal(target, projects, None)
+    }
+
+    /// Execute a target with command overrides for specific targets
+    ///
+    /// The `command_overrides` map allows replacing the command for specific target addresses.
+    /// This is used when --only-affected-files is enabled to pass file lists to targets.
+    pub fn execute_with_command_overrides(
+        &self,
+        target: &str,
+        projects: &[&DiscoveredProject],
+        command_overrides: &HashMap<String, String>,
+    ) -> Vec<ExecutionResult> {
+        self.execute_internal(target, projects, Some(command_overrides))
+    }
+
+    /// Internal execution method that supports optional command overrides
+    fn execute_internal(
+        &self,
+        target: &str,
+        projects: &[&DiscoveredProject],
+        command_overrides: Option<&HashMap<String, String>>,
+    ) -> Vec<ExecutionResult> {
         if projects.is_empty() {
             return Vec::new();
         }
@@ -121,7 +144,7 @@ impl<'a> Executor<'a> {
         // Execute each level in parallel
         for level in levels {
             let level_results =
-                self.execute_target_level(&level, &project_map, &mut progress, show_progress);
+                self.execute_target_level(&level, &project_map, &mut progress, show_progress, command_overrides);
             all_results.extend(level_results);
         }
 
@@ -148,6 +171,7 @@ impl<'a> Executor<'a> {
         project_map: &HashMap<String, &DiscoveredProject>,
         progress: &mut ProgressDisplay,
         show_progress: bool,
+        command_overrides: Option<&HashMap<String, String>>,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
@@ -166,25 +190,48 @@ impl<'a> Executor<'a> {
             };
 
             // Get the command for this target
-            let command = match project.targets.get(&target_name) {
-                Some(t) => t.command.clone(),
-                None => {
-                    // No target defined - skip
-                    let result = ExecutionResult {
-                        address: target_addr.clone(),
-                        success: true, // Not an error, just skipped
-                        skipped: true,
-                        output: format!("Skipped: no '{}' target defined", target_name),
-                        duration_ms: 0,
-                    };
-
-                    // Mark as skipped in progress display (no spinner shown)
-                    if show_progress {
-                        progress.mark_skipped(target_addr);
+            // Check for command override first (used with --only-affected-files)
+            let command = if let Some(overrides) = command_overrides {
+                if let Some(override_cmd) = overrides.get(target_addr) {
+                    override_cmd.clone()
+                } else {
+                    match project.targets.get(&target_name) {
+                        Some(t) => t.command.clone(),
+                        None => {
+                            // No target defined - skip
+                            let result = ExecutionResult {
+                                address: target_addr.clone(),
+                                success: true,
+                                skipped: true,
+                                output: format!("Skipped: no '{}' target defined", target_name),
+                                duration_ms: 0,
+                            };
+                            if show_progress {
+                                progress.mark_skipped(target_addr);
+                            }
+                            let _ = tx.send(result);
+                            continue;
+                        }
                     }
-
-                    let _ = tx.send(result);
-                    continue;
+                }
+            } else {
+                match project.targets.get(&target_name) {
+                    Some(t) => t.command.clone(),
+                    None => {
+                        // No target defined - skip
+                        let result = ExecutionResult {
+                            address: target_addr.clone(),
+                            success: true, // Not an error, just skipped
+                            skipped: true,
+                            output: format!("Skipped: no '{}' target defined", target_name),
+                            duration_ms: 0,
+                        };
+                        if show_progress {
+                            progress.mark_skipped(target_addr);
+                        }
+                        let _ = tx.send(result);
+                        continue;
+                    }
                 }
             };
 
@@ -506,7 +553,17 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
 mod tests {
     use super::*;
     use crate::plugins::{ProjectMetadata, Target};
+    use std::collections::HashSet;
     use std::path::PathBuf;
+
+    /// Helper to create a Target with empty capabilities
+    fn target(command: &str, depends_on: Vec<&str>) -> Target {
+        Target {
+            command: command.to_string(),
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+            capabilities: HashSet::new(),
+        }
+    }
 
     fn make_project_with_targets(
         relative_path: &str,
@@ -541,13 +598,7 @@ mod tests {
     #[test]
     fn test_compute_target_levels_single() {
         let mut targets = HashMap::new();
-        targets.insert(
-            "test".to_string(),
-            Target {
-                command: "npm test".to_string(),
-                depends_on: vec![],
-            },
-        );
+        targets.insert("test".to_string(), target("npm test", vec![]));
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
 
@@ -569,20 +620,8 @@ mod tests {
     fn test_compute_target_levels_with_deps_target() {
         // test depends on deps in same project
         let mut targets = HashMap::new();
-        targets.insert(
-            "deps".to_string(),
-            Target {
-                command: "npm install".to_string(),
-                depends_on: vec![],
-            },
-        );
-        targets.insert(
-            "test".to_string(),
-            Target {
-                command: "npm test".to_string(),
-                depends_on: vec!["//a:deps".to_string()],
-            },
-        );
+        targets.insert("deps".to_string(), target("npm install", vec![]));
+        targets.insert("test".to_string(), target("npm test", vec!["//a:deps"]));
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
 
@@ -606,22 +645,10 @@ mod tests {
     fn test_compute_target_levels_cross_project() {
         // //b:test depends on //a:build
         let mut targets_a = HashMap::new();
-        targets_a.insert(
-            "build".to_string(),
-            Target {
-                command: "npm run build".to_string(),
-                depends_on: vec![],
-            },
-        );
+        targets_a.insert("build".to_string(), target("npm run build", vec![]));
 
         let mut targets_b = HashMap::new();
-        targets_b.insert(
-            "test".to_string(),
-            Target {
-                command: "npm test".to_string(),
-                depends_on: vec!["//a:build".to_string()],
-            },
-        );
+        targets_b.insert("test".to_string(), target("npm test", vec!["//a:build"]));
 
         let project_a = make_project_with_targets("a", targets_a);
         let project_b = make_project_with_targets("b", targets_b);
@@ -646,27 +673,9 @@ mod tests {
     #[test]
     fn test_collect_target_deps() {
         let mut targets = HashMap::new();
-        targets.insert(
-            "deps".to_string(),
-            Target {
-                command: "npm install".to_string(),
-                depends_on: vec![],
-            },
-        );
-        targets.insert(
-            "build".to_string(),
-            Target {
-                command: "npm run build".to_string(),
-                depends_on: vec!["//a:deps".to_string()],
-            },
-        );
-        targets.insert(
-            "test".to_string(),
-            Target {
-                command: "npm test".to_string(),
-                depends_on: vec!["//a:build".to_string()],
-            },
-        );
+        targets.insert("deps".to_string(), target("npm install", vec![]));
+        targets.insert("build".to_string(), target("npm run build", vec!["//a:deps"]));
+        targets.insert("test".to_string(), target("npm test", vec!["//a:build"]));
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
 
@@ -687,34 +696,10 @@ mod tests {
     fn test_compute_target_levels_diamond() {
         // deps -> build and lint -> test (test depends on both build and lint)
         let mut targets = HashMap::new();
-        targets.insert(
-            "deps".to_string(),
-            Target {
-                command: "npm install".to_string(),
-                depends_on: vec![],
-            },
-        );
-        targets.insert(
-            "build".to_string(),
-            Target {
-                command: "npm run build".to_string(),
-                depends_on: vec!["//a:deps".to_string()],
-            },
-        );
-        targets.insert(
-            "lint".to_string(),
-            Target {
-                command: "npm run lint".to_string(),
-                depends_on: vec!["//a:deps".to_string()],
-            },
-        );
-        targets.insert(
-            "test".to_string(),
-            Target {
-                command: "npm test".to_string(),
-                depends_on: vec!["//a:build".to_string(), "//a:lint".to_string()],
-            },
-        );
+        targets.insert("deps".to_string(), target("npm install", vec![]));
+        targets.insert("build".to_string(), target("npm run build", vec!["//a:deps"]));
+        targets.insert("lint".to_string(), target("npm run lint", vec!["//a:deps"]));
+        targets.insert("test".to_string(), target("npm test", vec!["//a:build", "//a:lint"]));
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
 

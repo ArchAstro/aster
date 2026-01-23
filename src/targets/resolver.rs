@@ -3,7 +3,7 @@
 //! Plugins detect available targets from native config files.
 //! Custom targets from aster.toml override detected targets at the key level.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::plugins::Target;
 
@@ -52,28 +52,31 @@ impl TargetResolver {
                 Target {
                     command: target.command.clone(),
                     depends_on: resolved_deps,
+                    capabilities: target.capabilities.clone(),
                 },
             );
         }
 
-        // Custom targets override command but preserve depends_on (if target exists)
+        // Custom targets override command but preserve depends_on and capabilities (if target exists)
         for (name, command) in custom_targets {
             if let Some(existing) = targets.get(name) {
-                // Override command, keep depends_on
+                // Override command, keep depends_on and capabilities
                 targets.insert(
                     name.clone(),
                     Target {
                         command: command.clone(),
                         depends_on: existing.depends_on.clone(),
+                        capabilities: existing.capabilities.clone(),
                     },
                 );
             } else {
-                // New target with empty depends_on
+                // New target with empty depends_on and capabilities
                 targets.insert(
                     name.clone(),
                     Target {
                         command: command.clone(),
                         depends_on: vec![],
+                        capabilities: HashSet::new(),
                     },
                 );
             }
@@ -91,6 +94,7 @@ mod tests {
         Target {
             command: command.to_string(),
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+            capabilities: HashSet::new(),
         }
     }
 

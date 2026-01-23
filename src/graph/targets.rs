@@ -242,6 +242,7 @@ mod tests {
                                     }
                                 })
                                 .collect(),
+                            capabilities: std::collections::HashSet::new(),
                         },
                     )
                 })

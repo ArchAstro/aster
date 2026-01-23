@@ -27,6 +27,14 @@ impl PluginRegistry {
             .find(|p| p.marker_files().contains(&filename))
             .map(|p| p.as_ref())
     }
+
+    /// Find plugin by name
+    pub fn find_by_name(&self, name: &str) -> Option<&dyn LanguagePlugin> {
+        self.plugins
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
+    }
 }
 
 impl Default for PluginRegistry {

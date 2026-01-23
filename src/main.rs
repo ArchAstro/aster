@@ -18,8 +18,9 @@ use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
-use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
+use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, TargetCapability};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 fn main() -> ExitCode {
     match run() {
@@ -326,6 +327,7 @@ fn run() -> Result<()> {
             head,
             dependents,
             dry_run,
+            only_affected_files,
         } => {
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)
@@ -452,7 +454,59 @@ fn run() -> Result<()> {
 
             // Execute target on projects
             let executor = Executor::with_output_mode(&workspace_root, output_mode);
-            let results = executor.execute(&target, &ordered, &graph);
+            let results = if only_affected_files {
+                // Build command overrides for targets that support files-list
+                let mut command_overrides: HashMap<String, String> = HashMap::new();
+
+                // Create plugin registry to call with_files_list
+                let mut registry = PluginRegistry::new();
+                registry.register(Box::new(NodeJsPlugin));
+                registry.register(Box::new(PythonPlugin));
+                registry.register(Box::new(ElixirPlugin));
+
+                for project in &ordered {
+                    let project_addr = format!("//{}", project.relative_path.display());
+                    let target_addr = format!("{}:{}", project_addr, target);
+
+                    // Check if target has FilesList capability
+                    if let Some(target_def) = project.targets.get(&target) {
+                        if target_def.capabilities.contains(&TargetCapability::FilesList) {
+                            // Get files that belong to this project
+                            let project_files: Vec<PathBuf> = changed_files
+                                .iter()
+                                .filter(|f| f.starts_with(&project.relative_path))
+                                .map(|f| {
+                                    // Make path relative to project directory
+                                    f.strip_prefix(&project.relative_path)
+                                        .unwrap_or(f)
+                                        .to_path_buf()
+                                })
+                                .collect();
+
+                            // Call plugin's with_files_list to get modified command
+                            if !project_files.is_empty() {
+                                if let Some(plugin) = registry.find_by_name(&project.plugin_name) {
+                                    if let Some(modified_cmd) = plugin.with_files_list(
+                                        &target,
+                                        &target_def.command,
+                                        &project_files,
+                                    ) {
+                                        command_overrides.insert(target_addr, modified_cmd);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if output_mode == OutputMode::Verbose && !command_overrides.is_empty() {
+                    eprintln!("[aster] Using modified commands for {} targets", command_overrides.len());
+                }
+
+                executor.execute_with_command_overrides(&target, &ordered, &command_overrides)
+            } else {
+                executor.execute(&target, &ordered, &graph)
+            };
 
             // Output results based on mode
             if output_mode == OutputMode::Json {

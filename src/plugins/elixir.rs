@@ -2,11 +2,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
+use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext};
 
 /// Regex to extract app name from `app: :name` in mix.exs project definition
 static APP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -103,6 +103,7 @@ impl LanguagePlugin for ElixirPlugin {
             Target {
                 command: "mix deps.get".to_string(),
                 depends_on: vec![],
+                capabilities: HashSet::new(),
             },
         );
 
@@ -118,11 +119,14 @@ impl LanguagePlugin for ElixirPlugin {
         }
 
         // mix test and mix compile are always available for Elixir projects
+        let mut test_caps = HashSet::new();
+        test_caps.insert(TargetCapability::FilesList);
         targets.insert(
             "test".to_string(),
             Target {
                 command: "mix test".to_string(),
                 depends_on: base_deps.clone(),
+                capabilities: test_caps,
             },
         );
         targets.insert(
@@ -130,6 +134,7 @@ impl LanguagePlugin for ElixirPlugin {
             Target {
                 command: "mix compile".to_string(),
                 depends_on: base_deps.clone(),
+                capabilities: HashSet::new(),
             },
         );
 
@@ -140,11 +145,47 @@ impl LanguagePlugin for ElixirPlugin {
                 Target {
                     command: "mix credo".to_string(),
                     depends_on: base_deps,
+                    capabilities: HashSet::new(),
                 },
             );
         }
 
         Ok(targets)
+    }
+
+    fn with_files_list(
+        &self,
+        target_name: &str,
+        command: &str,
+        files: &[PathBuf],
+    ) -> Option<String> {
+        // Only test target supports file list
+        if target_name != "test" {
+            return None;
+        }
+
+        // Filter to Elixir test files only (*_test.exs in test/ directory)
+        let test_files: Vec<&PathBuf> = files
+            .iter()
+            .filter(|f| {
+                let name = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let path_str = f.to_string_lossy();
+                name.ends_with("_test.exs") || path_str.contains("test/")
+            })
+            .collect();
+
+        if test_files.is_empty() {
+            // No test files in the change set - run full test suite
+            return None;
+        }
+
+        // mix test file1_test.exs file2_test.exs (mix test accepts file paths directly)
+        let file_args: Vec<String> = test_files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect();
+
+        Some(format!("{} {}", command, file_args.join(" ")))
     }
 }
 
