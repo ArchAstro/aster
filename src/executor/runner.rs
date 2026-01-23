@@ -9,15 +9,21 @@
 //! Each level executes in parallel, waiting for completion before the next level.
 
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+use chrono::Utc;
+use console::style;
+
 use crate::cli::OutputMode;
 use crate::discovery::DiscoveredProject;
+use crate::executor::logs::{LogStore, RunLog, TargetLog};
 use crate::graph::ProjectGraph;
+use crate::ui::ProgressDisplay;
 
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
@@ -36,8 +42,7 @@ pub struct ExecutionResult {
 
 /// Executor for running target commands on projects
 pub struct Executor<'a> {
-    /// Workspace root directory (reserved for future use)
-    #[allow(dead_code)]
+    /// Workspace root directory
     workspace_root: &'a Path,
     /// Output mode for controlling what gets printed
     output_mode: OutputMode,
@@ -76,6 +81,14 @@ impl<'a> Executor<'a> {
             return Vec::new();
         }
 
+        // Determine if we should show progress spinners
+        // Only show when: Normal mode AND stdout is a terminal
+        let show_progress = self.output_mode == OutputMode::Normal && std::io::stderr().is_terminal();
+        let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
+
+        // Create progress display
+        let mut progress = ProgressDisplay::new(show_progress);
+
         // Build address -> project map (for all discovered projects, not just selected)
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -102,8 +115,19 @@ impl<'a> Executor<'a> {
 
         // Execute each level in parallel
         for level in levels {
-            let level_results = self.execute_target_level(&level, &project_map);
+            let level_results =
+                self.execute_target_level(&level, &project_map, &mut progress, show_progress);
             all_results.extend(level_results);
+        }
+
+        // Store logs (only in Normal mode)
+        if self.output_mode == OutputMode::Normal {
+            self.store_logs(target, &all_results);
+        }
+
+        // Print failure details (only in Normal or Verbose mode)
+        if show_output {
+            self.print_failure_details(&all_results, &progress);
         }
 
         all_results
@@ -114,11 +138,12 @@ impl<'a> Executor<'a> {
         &self,
         target_addrs: &[String],
         project_map: &HashMap<String, &DiscoveredProject>,
+        progress: &mut ProgressDisplay,
+        show_progress: bool,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
         let mut handles = Vec::new();
-        let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 
         for target_addr in target_addrs {
             // Parse target address: //path/to/project:target_name
@@ -144,53 +169,144 @@ impl<'a> Executor<'a> {
                         output: format!("Skipped: no '{}' target defined", target_name),
                         duration_ms: 0,
                     };
-                    if show_output {
-                        println!("\n--- {} ---", target_addr);
-                        println!("{}", result.output);
+
+                    // Mark as skipped in progress display
+                    if show_progress {
+                        progress.add_running(target_addr);
+                        progress.mark_complete(target_addr, true, true, 0);
                     }
+
                     let _ = tx.send(result);
                     continue;
                 }
             };
 
+            // Add spinner for this target
+            if show_progress {
+                progress.add_running(target_addr);
+            }
+
             let addr = target_addr.clone();
             let project_root = project.root.clone();
+            let tx_clone = tx.clone();
 
             let handle = thread::spawn(move || {
                 let result = run_command(&addr, &command, &project_root);
-                (result, show_output)
+                let _ = tx_clone.send(result.clone());
+                result
             });
 
-            handles.push(handle);
+            handles.push((target_addr.clone(), handle));
         }
 
         // Drop our sender so rx.iter() completes after all threads finish
         drop(tx);
 
-        // Wait for all threads and collect results, printing output if needed
+        // Collect results from channel and update progress
         let mut results = Vec::new();
-        for handle in handles {
-            if let Ok((result, should_print)) = handle.join() {
-                if should_print {
-                    println!("\n--- {} ---", result.address);
-                    if !result.output.is_empty() {
-                        println!("{}", result.output);
-                    }
-                    println!(
-                        "[{}] {} ({}ms)",
-                        if result.success { "OK" } else { "FAIL" },
-                        result.address,
-                        result.duration_ms
-                    );
-                }
-                results.push(result);
+        for result in rx.iter() {
+            if show_progress {
+                progress.mark_complete(&result.address, result.success, result.skipped, result.duration_ms);
             }
+            results.push(result);
         }
 
-        // Also collect any results from skipped targets
-        results.extend(rx.iter());
+        // Wait for all threads to complete (they should already be done since we drained the channel)
+        for (_, handle) in handles {
+            let _ = handle.join();
+        }
 
         results
+    }
+
+    /// Store execution logs to .aster/logs/latest.json
+    fn store_logs(&self, target: &str, results: &[ExecutionResult]) {
+        let log_store = LogStore::new(self.workspace_root);
+
+        let target_logs: Vec<TargetLog> = results
+            .iter()
+            .map(|r| TargetLog {
+                address: r.address.clone(),
+                status: if r.skipped {
+                    "skipped".to_string()
+                } else if r.success {
+                    "passed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                exit_code: if r.skipped {
+                    None
+                } else {
+                    Some(if r.success { 0 } else { 1 })
+                },
+                duration_ms: r.duration_ms,
+                output: r.output.clone(),
+            })
+            .collect();
+
+        let run_log = RunLog {
+            timestamp: Utc::now().to_rfc3339(),
+            target: target.to_string(),
+            results: target_logs,
+        };
+
+        if let Err(e) = log_store.store(&run_log) {
+            eprintln!("[aster] Warning: Failed to store logs: {}", e);
+        }
+    }
+
+    /// Print failure details for failed targets
+    fn print_failure_details(&self, results: &[ExecutionResult], progress: &ProgressDisplay) {
+        let failed: Vec<_> = results.iter().filter(|r| !r.success && !r.skipped).collect();
+
+        if failed.is_empty() {
+            return;
+        }
+
+        for result in failed {
+            // Print blank line
+            if progress.is_enabled() {
+                progress.println("");
+            } else {
+                eprintln!();
+            }
+
+            // Print "FAILED //project:target" in red
+            let header = format!("{} {}", style("FAILED").red().bold(), result.address);
+            if progress.is_enabled() {
+                progress.println(&header);
+            } else {
+                eprintln!("{}", header);
+            }
+
+            // Print last 10-15 lines of output (indented)
+            let lines: Vec<&str> = result.output.lines().collect();
+            let tail_lines = if lines.len() > 15 {
+                &lines[lines.len() - 15..]
+            } else {
+                &lines[..]
+            };
+
+            for line in tail_lines {
+                let indented = format!("    {}", line);
+                if progress.is_enabled() {
+                    progress.println(&indented);
+                } else {
+                    eprintln!("{}", indented);
+                }
+            }
+
+            // Print hint for full output
+            let hint = format!(
+                "    {}",
+                style(format!("Run `aster logs {}` for full output", result.address)).dim()
+            );
+            if progress.is_enabled() {
+                progress.println(&hint);
+            } else {
+                eprintln!("{}", hint);
+            }
+        }
     }
 }
 
