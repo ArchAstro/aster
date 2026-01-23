@@ -7,6 +7,7 @@ pub mod git;
 pub mod graph;
 pub mod plugins;
 pub mod targets;
+pub mod ui;
 
 // Re-export core types for convenience
 pub use cli::{Cli, Commands};
@@ -19,3 +20,4 @@ pub use plugins::{
 pub use targets::TargetResolver;
 pub use executor::{ExecutionResult, Executor};
 pub use git::AffectedDetector;
+pub use ui::ProgressDisplay;
