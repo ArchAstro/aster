@@ -9,8 +9,8 @@ use std::fs;
 use std::process::ExitCode;
 
 use aster::cli::{
-    expand_selection, output_json, parse_run_args, select_projects, Cli, Commands, GraphOutput,
-    OutputMode, ProjectInfo, WhyOutput,
+    build_execution_output, expand_selection, output_json, parse_run_args, print_summary,
+    select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectInfo, WhyOutput,
 };
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
@@ -298,7 +298,12 @@ fn run() -> Result<()> {
                 .collect();
 
             if affected_projects.is_empty() {
-                println!("No projects affected");
+                if output_mode == OutputMode::Json {
+                    let output = build_execution_output(&[]);
+                    output_json(&output)?;
+                } else if output_mode != OutputMode::Quiet {
+                    println!("No projects affected");
+                }
                 return Ok(());
             }
 
@@ -313,52 +318,36 @@ fn run() -> Result<()> {
                 );
             }
 
-            println!(
-                "Affected projects ({}):",
-                if dependents {
-                    "including dependents"
-                } else {
-                    "directly affected only"
+            // Print affected projects list (unless quiet or json)
+            if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
+                println!(
+                    "Affected projects ({}):",
+                    if dependents {
+                        "including dependents"
+                    } else {
+                        "directly affected only"
+                    }
+                );
+                for p in &ordered {
+                    println!("  //{}", p.relative_path.display());
                 }
-            );
-            for p in &ordered {
-                println!("  //{}", p.relative_path.display());
             }
 
             // Execute target on projects
-            let executor = Executor::new(&workspace_root);
+            let executor = Executor::with_output_mode(&workspace_root, output_mode);
             let results = executor.execute(&target, &ordered, &graph);
 
-            // Print summary
-            let skipped = results.iter().filter(|r| r.skipped).count();
-            let passed = results.iter().filter(|r| r.success && !r.skipped).count();
-            let failed = results.iter().filter(|r| !r.success).count();
-
-            println!("\n=== Summary ===");
-            if skipped > 0 {
-                println!(
-                    "Ran '{}' on {} affected projects: {} passed, {} failed, {} skipped (no target)",
-                    target,
-                    results.len(),
-                    passed,
-                    failed,
-                    skipped
-                );
+            // Output results based on mode
+            if output_mode == OutputMode::Json {
+                let output = build_execution_output(&results);
+                output_json(&output)?;
             } else {
-                println!(
-                    "Ran '{}' on {} affected projects: {} passed, {} failed",
-                    target,
-                    results.len(),
-                    passed,
-                    failed
-                );
+                print_summary(&results, &target, output_mode, true);
             }
 
+            // Return error if any failed (for exit code)
+            let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
-                println!("\nFailed projects:");
-                for result in results.iter().filter(|r| !r.success) {
-                    println!("  - {}", result.address);
-                }
                 return Err(anyhow::anyhow!("{} project(s) failed", failed));
             }
         }
@@ -398,39 +387,20 @@ fn run() -> Result<()> {
             }
 
             // Execute target on projects
-            let executor = Executor::new(&workspace_root);
+            let executor = Executor::with_output_mode(&workspace_root, output_mode);
             let results = executor.execute(&run_args.target, &ordered, &graph);
 
-            // Print summary
-            let skipped = results.iter().filter(|r| r.skipped).count();
-            let passed = results.iter().filter(|r| r.success && !r.skipped).count();
-            let failed = results.iter().filter(|r| !r.success).count();
-
-            println!("\n=== Summary ===");
-            if skipped > 0 {
-                println!(
-                    "Ran '{}' on {} projects: {} passed, {} failed, {} skipped (no target)",
-                    run_args.target,
-                    results.len(),
-                    passed,
-                    failed,
-                    skipped
-                );
+            // Output results based on mode
+            if output_mode == OutputMode::Json {
+                let output = build_execution_output(&results);
+                output_json(&output)?;
             } else {
-                println!(
-                    "Ran '{}' on {} projects: {} passed, {} failed",
-                    run_args.target,
-                    results.len(),
-                    passed,
-                    failed
-                );
+                print_summary(&results, &run_args.target, output_mode, false);
             }
 
+            // Return error if any failed (for exit code)
+            let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
-                println!("\nFailed projects:");
-                for result in results.iter().filter(|r| !r.success) {
-                    println!("  - {}", result.address);
-                }
                 return Err(anyhow::anyhow!("{} project(s) failed", failed));
             }
         }

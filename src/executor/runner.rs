@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+use crate::cli::OutputMode;
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 
@@ -38,12 +39,25 @@ pub struct Executor<'a> {
     /// Workspace root directory (reserved for future use)
     #[allow(dead_code)]
     workspace_root: &'a Path,
+    /// Output mode for controlling what gets printed
+    output_mode: OutputMode,
 }
 
 impl<'a> Executor<'a> {
-    /// Create a new executor
+    /// Create a new executor with default output mode (Normal)
     pub fn new(workspace_root: &'a Path) -> Self {
-        Self { workspace_root }
+        Self {
+            workspace_root,
+            output_mode: OutputMode::Normal,
+        }
+    }
+
+    /// Create a new executor with specified output mode
+    pub fn with_output_mode(workspace_root: &'a Path, output_mode: OutputMode) -> Self {
+        Self {
+            workspace_root,
+            output_mode,
+        }
     }
 
     /// Execute a target on selected projects in dependency order
@@ -104,6 +118,7 @@ impl<'a> Executor<'a> {
         let (tx, rx) = mpsc::channel();
 
         let mut handles = Vec::new();
+        let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 
         for target_addr in target_addrs {
             // Parse target address: //path/to/project:target_name
@@ -121,7 +136,7 @@ impl<'a> Executor<'a> {
             let command = match project.targets.get(&target_name) {
                 Some(t) => t.command.clone(),
                 None => {
-                    // No target defined - print message and skip
+                    // No target defined - skip
                     let result = ExecutionResult {
                         address: target_addr.clone(),
                         success: true, // Not an error, just skipped
@@ -129,8 +144,10 @@ impl<'a> Executor<'a> {
                         output: format!("Skipped: no '{}' target defined", target_name),
                         duration_ms: 0,
                     };
-                    println!("\n--- {} ---", target_addr);
-                    println!("{}", result.output);
+                    if show_output {
+                        println!("\n--- {} ---", target_addr);
+                        println!("{}", result.output);
+                    }
                     let _ = tx.send(result);
                     continue;
                 }
@@ -138,24 +155,10 @@ impl<'a> Executor<'a> {
 
             let addr = target_addr.clone();
             let project_root = project.root.clone();
-            let tx = tx.clone();
 
             let handle = thread::spawn(move || {
                 let result = run_command(&addr, &command, &project_root);
-
-                // Print grouped output
-                println!("\n--- {} ---", result.address);
-                if !result.output.is_empty() {
-                    println!("{}", result.output);
-                }
-                println!(
-                    "[{}] {} ({}ms)",
-                    if result.success { "OK" } else { "FAIL" },
-                    result.address,
-                    result.duration_ms
-                );
-
-                let _ = tx.send(result);
+                (result, show_output)
             });
 
             handles.push(handle);
@@ -164,13 +167,30 @@ impl<'a> Executor<'a> {
         // Drop our sender so rx.iter() completes after all threads finish
         drop(tx);
 
-        // Wait for all threads
+        // Wait for all threads and collect results, printing output if needed
+        let mut results = Vec::new();
         for handle in handles {
-            let _ = handle.join();
+            if let Ok((result, should_print)) = handle.join() {
+                if should_print {
+                    println!("\n--- {} ---", result.address);
+                    if !result.output.is_empty() {
+                        println!("{}", result.output);
+                    }
+                    println!(
+                        "[{}] {} ({}ms)",
+                        if result.success { "OK" } else { "FAIL" },
+                        result.address,
+                        result.duration_ms
+                    );
+                }
+                results.push(result);
+            }
         }
 
-        // Collect results
-        rx.iter().collect()
+        // Also collect any results from skipped targets
+        results.extend(rx.iter());
+
+        results
     }
 }
 
