@@ -1,6 +1,9 @@
 //! Progress display for multi-project execution
 //!
-//! Shows a status bar with counts and spinners for running targets.
+//! Supports two display modes:
+//! - Concise (default): Status bar with counts, spinners for running targets
+//! - Verbose: Shows each target with PASS/FAIL/SKIP and duration
+//!
 //! Writes to stderr so JSON output on stdout remains clean.
 
 use std::collections::HashMap;
@@ -15,12 +18,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 pub struct ProgressDisplay {
     /// Multi-progress manager for coordinating spinners
     multi: MultiProgress,
-    /// Status bar showing overall progress
+    /// Status bar showing overall progress (concise mode only)
     status_bar: Option<ProgressBar>,
     /// Active progress bars keyed by target address
     bars: HashMap<String, ProgressBar>,
     /// Whether progress display is enabled
     enabled: bool,
+    /// Verbose mode shows each item with PASS/FAIL/SKIP
+    verbose: bool,
     /// Counters for status display
     total: Arc<AtomicUsize>,
     passed: Arc<AtomicUsize>,
@@ -35,6 +40,14 @@ impl ProgressDisplay {
     /// If not enabled, creates with hidden draw target (no output).
     /// When enabled, draws to stderr to not interfere with JSON on stdout.
     pub fn new(enabled: bool) -> Self {
+        Self::with_verbose(enabled, false)
+    }
+
+    /// Create a new progress display with verbose mode option
+    ///
+    /// - Concise mode (verbose=false): Status bar with counts, clean output
+    /// - Verbose mode (verbose=true): Shows each target with PASS/FAIL/SKIP and duration
+    pub fn with_verbose(enabled: bool, verbose: bool) -> Self {
         let multi = if enabled {
             MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
         } else {
@@ -46,6 +59,7 @@ impl ProgressDisplay {
             status_bar: None,
             bars: HashMap::new(),
             enabled,
+            verbose,
             total: Arc::new(AtomicUsize::new(0)),
             passed: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicUsize::new(0)),
@@ -58,8 +72,8 @@ impl ProgressDisplay {
     pub fn set_total(&mut self, total: usize) {
         self.total.store(total, Ordering::SeqCst);
 
-        if self.enabled {
-            // Create status bar at the top
+        // Only create status bar in concise mode (not verbose)
+        if self.enabled && !self.verbose {
             let status = self.multi.add(ProgressBar::new_spinner());
             let style = ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -128,9 +142,15 @@ impl ProgressDisplay {
 
         let pb = self.multi.add(ProgressBar::new_spinner());
 
+        let template = if self.verbose {
+            "{prefix:.bold.cyan} [{spinner:.yellow}]"
+        } else {
+            "  {spinner:.yellow} {prefix:.dim}"
+        };
+
         let style = ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("  {spinner:.yellow} {prefix:.dim}")
+            .template(template)
             .expect("Invalid progress template");
 
         pb.set_style(style);
@@ -141,33 +161,64 @@ impl ProgressDisplay {
     }
 
     /// Mark a target as skipped (no spinner shown, just count)
-    pub fn mark_skipped(&mut self, _address: &str) {
+    pub fn mark_skipped(&mut self, address: &str) {
         self.skipped.fetch_add(1, Ordering::SeqCst);
         self.refresh_status();
+
+        // In verbose mode, show the skip
+        if self.enabled && self.verbose {
+            let msg = format!("{} {}", style("SKIP").yellow(), address);
+            let _ = self.multi.println(msg);
+        }
     }
 
     /// Mark a target as complete
     ///
-    /// Removes spinner and updates counts. Only failures are shown briefly.
-    pub fn mark_complete(&mut self, address: &str, success: bool, skipped: bool, _duration_ms: u128) {
+    /// Updates counts and removes spinner. Behavior differs by mode:
+    /// - Concise: Only failures shown briefly, passes/skips cleared silently
+    /// - Verbose: Shows PASS/FAIL with duration for each target
+    pub fn mark_complete(&mut self, address: &str, success: bool, skipped: bool, duration_ms: u128) {
+        // Skipped items are handled by mark_skipped(), don't process again
+        if skipped {
+            return;
+        }
+
+        // Decrement running count (only for non-skipped items that had spinners)
         self.running.fetch_sub(1, Ordering::SeqCst);
 
-        if skipped {
-            self.skipped.fetch_add(1, Ordering::SeqCst);
-        } else if success {
+        if success {
             self.passed.fetch_add(1, Ordering::SeqCst);
         } else {
             self.failed.fetch_add(1, Ordering::SeqCst);
         }
 
-        // Remove the spinner - completed items don't stay on screen
+        // Remove the spinner and show appropriate output
         if let Some(pb) = self.bars.remove(address) {
-            if !success && !skipped {
-                // Show failures briefly before clearing
-                pb.finish_with_message(format!("{} {}", style("✗").red(), address));
+            if self.verbose {
+                // Verbose mode: show each result with duration
+                let duration_str = format_duration(duration_ms);
+                if success {
+                    pb.finish_with_message(format!(
+                        "{} {} ({})",
+                        style("PASS").green(),
+                        address,
+                        style(duration_str).dim()
+                    ));
+                } else {
+                    pb.finish_with_message(format!(
+                        "{} {} ({})",
+                        style("FAIL").red(),
+                        address,
+                        style(duration_str).dim()
+                    ));
+                }
             } else {
-                // Just clear - don't show passes or skips
-                pb.finish_and_clear();
+                // Concise mode: clear passes, show failures briefly
+                if !success {
+                    pb.finish_with_message(format!("{} {}", style("✗").red(), address));
+                } else {
+                    pb.finish_and_clear();
+                }
             }
         }
 
@@ -190,7 +241,13 @@ impl ProgressDisplay {
 
     /// Finish the progress display
     pub fn finish(&self) {
+        // Clear any remaining spinners
+        for (_, pb) in &self.bars {
+            pb.finish_and_clear();
+        }
+
         if let Some(ref bar) = self.status_bar {
+            // Concise mode: update status bar with final summary
             let passed = self.passed.load(Ordering::SeqCst);
             let failed = self.failed.load(Ordering::SeqCst);
 
@@ -209,11 +266,11 @@ impl ProgressDisplay {
 
             bar.finish_with_message(format!("{} {}", status_icon, parts.join(", ")));
         }
+    }
 
-        // Clear any remaining spinners
-        for (_, pb) in &self.bars {
-            pb.finish_and_clear();
-        }
+    /// Check if verbose mode is enabled
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
     }
 }
 

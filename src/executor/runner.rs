@@ -82,12 +82,14 @@ impl<'a> Executor<'a> {
         }
 
         // Determine if we should show progress spinners
-        // Only show when: Normal mode AND stdout is a terminal
-        let show_progress = self.output_mode == OutputMode::Normal && std::io::stderr().is_terminal();
+        // Show in Normal or Verbose mode when stderr is a terminal
+        let is_terminal = std::io::stderr().is_terminal();
+        let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose) && is_terminal;
+        let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 
-        // Create progress display
-        let mut progress = ProgressDisplay::new(show_progress);
+        // Create progress display (verbose mode shows each item with PASS/FAIL/SKIP)
+        let mut progress = ProgressDisplay::with_verbose(show_progress, verbose_progress);
 
         // Build address -> project map (for all discovered projects, not just selected)
         let project_map: HashMap<String, &DiscoveredProject> = projects
