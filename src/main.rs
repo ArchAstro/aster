@@ -13,7 +13,7 @@ use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
-use aster::graph::{build_graph, find_cycle, find_path, format_path};
+use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
 
 fn main() -> ExitCode {
@@ -63,53 +63,89 @@ fn run() -> Result<()> {
         Commands::List => {
             for project in &projects {
                 println!("//{}", project.relative_path.display());
+
+                if !project.targets.is_empty() {
+                    // Sort targets for consistent output
+                    let mut target_names: Vec<&str> =
+                        project.targets.keys().map(|s| s.as_str()).collect();
+                    target_names.sort();
+
+                    for name in target_names {
+                        let target = &project.targets[name];
+                        if target.depends_on.is_empty() {
+                            println!("  {}: {}", name, target.command);
+                        } else {
+                            println!(
+                                "  {}: {} -> [{}]",
+                                name,
+                                target.command,
+                                target.depends_on.join(", ")
+                            );
+                        }
+                    }
+                }
             }
         }
-        Commands::Graph { project } => {
-            // Build the graph
-            let graph = build_graph(&projects)?;
+        Commands::Graph { target } => {
+            // Build the target graph
+            let graph = build_target_graph(&projects);
 
             // Check for cycles
-            if let Some(cycle) = find_cycle(&graph) {
+            if let Some(cycle) = graph.find_cycle() {
                 eprintln!("error: {cycle}");
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
             // Display graph
-            if let Some(addr) = project {
-                // Show deps for specific project
+            if let Some(addr) = target {
+                // Show deps for specific target
                 if let Some(node) = graph.get(&addr) {
                     println!("{}", node.address);
                     for dep in graph.dependencies(&addr) {
                         println!("  -> {}", dep.address);
                     }
                 } else {
-                    return Err(anyhow::anyhow!("Project not found: {addr}"));
+                    return Err(anyhow::anyhow!("Target not found: {addr}"));
                 }
             } else {
-                // Show full graph as tree
-                for node in graph.projects() {
-                    println!("{}", node.address);
-                    for dep in graph.dependencies(&node.address) {
-                        println!("  -> {}", dep.address);
+                // Show full graph grouped by project
+                let mut current_project = String::new();
+                let mut targets: Vec<_> = graph.targets().collect();
+                targets.sort_by(|a, b| a.address.cmp(&b.address));
+
+                for node in targets {
+                    if node.project_address != current_project {
+                        if !current_project.is_empty() {
+                            println!();
+                        }
+                        current_project = node.project_address.clone();
+                        println!("{}", current_project);
+                    }
+                    print!("  :{}", node.target_name);
+                    let deps = graph.dependencies(&node.address);
+                    if deps.is_empty() {
+                        println!();
+                    } else {
+                        let dep_strs: Vec<&str> = deps.iter().map(|d| d.address.as_str()).collect();
+                        println!(" -> [{}]", dep_strs.join(", "));
                     }
                 }
             }
         }
         Commands::Why { from, to } => {
-            // Build graph for path finding
-            let graph = build_graph(&projects)?;
+            // Build target graph for path finding
+            let graph = build_target_graph(&projects);
 
-            // Validate projects exist
+            // Validate targets exist
             if graph.get(&from).is_none() {
-                return Err(anyhow::anyhow!("Project not found: {}", from));
+                return Err(anyhow::anyhow!("Target not found: {}", from));
             }
             if graph.get(&to).is_none() {
-                return Err(anyhow::anyhow!("Project not found: {}", to));
+                return Err(anyhow::anyhow!("Target not found: {}", to));
             }
 
             // Find path
-            match find_path(&graph, &from, &to) {
+            match graph.find_path(&from, &to) {
                 Some(path) => {
                     println!("{}", format_path(&path));
                 }
@@ -211,17 +247,29 @@ fn run() -> Result<()> {
             let results = executor.execute(&target, &ordered, &graph);
 
             // Print summary
-            let passed = results.iter().filter(|r| r.success).count();
+            let skipped = results.iter().filter(|r| r.skipped).count();
+            let passed = results.iter().filter(|r| r.success && !r.skipped).count();
             let failed = results.iter().filter(|r| !r.success).count();
 
             println!("\n=== Summary ===");
-            println!(
-                "Ran '{}' on {} affected projects: {} passed, {} failed",
-                target,
-                results.len(),
-                passed,
-                failed
-            );
+            if skipped > 0 {
+                println!(
+                    "Ran '{}' on {} affected projects: {} passed, {} failed, {} skipped (no target)",
+                    target,
+                    results.len(),
+                    passed,
+                    failed,
+                    skipped
+                );
+            } else {
+                println!(
+                    "Ran '{}' on {} affected projects: {} passed, {} failed",
+                    target,
+                    results.len(),
+                    passed,
+                    failed
+                );
+            }
 
             if failed > 0 {
                 println!("\nFailed projects:");
@@ -271,17 +319,29 @@ fn run() -> Result<()> {
             let results = executor.execute(&run_args.target, &ordered, &graph);
 
             // Print summary
-            let passed = results.iter().filter(|r| r.success).count();
+            let skipped = results.iter().filter(|r| r.skipped).count();
+            let passed = results.iter().filter(|r| r.success && !r.skipped).count();
             let failed = results.iter().filter(|r| !r.success).count();
 
             println!("\n=== Summary ===");
-            println!(
-                "Ran '{}' on {} projects: {} passed, {} failed",
-                run_args.target,
-                results.len(),
-                passed,
-                failed
-            );
+            if skipped > 0 {
+                println!(
+                    "Ran '{}' on {} projects: {} passed, {} failed, {} skipped (no target)",
+                    run_args.target,
+                    results.len(),
+                    passed,
+                    failed,
+                    skipped
+                );
+            } else {
+                println!(
+                    "Ran '{}' on {} projects: {} passed, {} failed",
+                    run_args.target,
+                    results.len(),
+                    passed,
+                    failed
+                );
+            }
 
             if failed > 0 {
                 println!("\nFailed projects:");

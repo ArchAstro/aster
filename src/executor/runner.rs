@@ -1,9 +1,10 @@
 //! Parallel command execution with grouped output
 //!
-//! Executes commands in dependency order using DAG levels:
-//! - Level 0: projects with no dependencies
-//! - Level 1: projects depending only on level 0
-//! - Level N: projects depending on level 0..N-1
+//! Executes commands in dependency order using DAG levels based on target dependencies:
+//! - Collects all target dependencies transitively (e.g., test depends on deps)
+//! - Level 0: targets with no dependencies
+//! - Level 1: targets depending only on level 0
+//! - Level N: targets depending on level 0..N-1
 //!
 //! Each level executes in parallel, waiting for completion before the next level.
 
@@ -20,10 +21,12 @@ use crate::graph::ProjectGraph;
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
-    /// Project address (//path/to/project)
+    /// Target address (//path/to/project:target)
     pub address: String,
     /// Whether the command succeeded (exit code 0)
     pub success: bool,
+    /// Whether the project was skipped (no target defined)
+    pub skipped: bool,
     /// Combined stdout+stderr output
     pub output: String,
     /// Execution duration in milliseconds
@@ -45,8 +48,9 @@ impl<'a> Executor<'a> {
 
     /// Execute a target on selected projects in dependency order
     ///
-    /// Projects are grouped into DAG levels and each level is executed in parallel.
-    /// Output is buffered per-project and printed as a group when complete.
+    /// Respects target dependencies from Target.depends_on (fully resolved by TargetResolver).
+    /// Targets are grouped into DAG levels and each level is executed in parallel.
+    /// Output is buffered per-target and printed as a group when complete.
     /// Execution continues on failure, collecting all results.
     pub fn execute(
         &self,
@@ -58,62 +62,81 @@ impl<'a> Executor<'a> {
             return Vec::new();
         }
 
-        // Build address -> project map
+        // Build address -> project map (for all discovered projects, not just selected)
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
             .map(|p| (format!("//{}", p.relative_path.display()), *p))
             .collect();
 
-        // Compute DAG levels
-        let levels = compute_levels(projects, _graph);
+        // Collect all targets to execute (requested targets + their dependencies)
+        let mut targets_to_run: HashSet<String> = HashSet::new();
+        for project in projects {
+            let project_addr = format!("//{}", project.relative_path.display());
+            let target_addr = format!("{}:{}", project_addr, target);
+
+            // Add the requested target
+            targets_to_run.insert(target_addr.clone());
+
+            // Recursively collect target dependencies
+            collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+        }
+
+        // Compute DAG levels based on target dependencies
+        let levels = compute_target_levels(&targets_to_run, &project_map);
 
         let mut all_results = Vec::new();
 
         // Execute each level in parallel
         for level in levels {
-            let level_results = self.execute_level(target, &level, &project_map);
+            let level_results = self.execute_target_level(&level, &project_map);
             all_results.extend(level_results);
         }
 
         all_results
     }
 
-    /// Execute all projects in a single level in parallel
-    fn execute_level(
+    /// Execute all targets in a single level in parallel
+    fn execute_target_level(
         &self,
-        target: &str,
-        addresses: &[String],
+        target_addrs: &[String],
         project_map: &HashMap<String, &DiscoveredProject>,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
         let mut handles = Vec::new();
 
-        for address in addresses {
-            let project = match project_map.get(address) {
+        for target_addr in target_addrs {
+            // Parse target address: //path/to/project:target_name
+            let (project_addr, target_name) = match parse_target_address(target_addr) {
+                Some((p, t)) => (p, t),
+                None => continue,
+            };
+
+            let project = match project_map.get(&project_addr) {
                 Some(p) => *p,
                 None => continue,
             };
 
             // Get the command for this target
-            let command = match project.targets.get(target) {
-                Some(cmd) => cmd.clone(),
+            let command = match project.targets.get(&target_name) {
+                Some(t) => t.command.clone(),
                 None => {
                     // No target defined - print message and skip
                     let result = ExecutionResult {
-                        address: address.clone(),
+                        address: target_addr.clone(),
                         success: true, // Not an error, just skipped
-                        output: format!("Skipped: no '{}' target defined", target),
+                        skipped: true,
+                        output: format!("Skipped: no '{}' target defined", target_name),
                         duration_ms: 0,
                     };
-                    println!("\n--- {} ---", address);
+                    println!("\n--- {} ---", target_addr);
                     println!("{}", result.output);
                     let _ = tx.send(result);
                     continue;
                 }
             };
 
-            let addr = address.clone();
+            let addr = target_addr.clone();
             let project_root = project.root.clone();
             let tx = tx.clone();
 
@@ -151,6 +174,130 @@ impl<'a> Executor<'a> {
     }
 }
 
+/// Parse a target address like "//path/to/project:target" into (project_addr, target_name)
+fn parse_target_address(addr: &str) -> Option<(String, String)> {
+    let colon_pos = addr.rfind(':')?;
+    let project_addr = addr[..colon_pos].to_string();
+    let target_name = addr[colon_pos + 1..].to_string();
+    Some((project_addr, target_name))
+}
+
+/// Recursively collect all target dependencies for a given target
+///
+/// Follows Target.depends_on which should already be fully resolved by TargetResolver
+/// (including cross-project :build dependencies).
+fn collect_target_deps(
+    target_addr: &str,
+    project_map: &HashMap<String, &DiscoveredProject>,
+    collected: &mut HashSet<String>,
+) {
+    let (project_addr, target_name) = match parse_target_address(target_addr) {
+        Some((p, t)) => (p, t),
+        None => return,
+    };
+
+    let project = match project_map.get(&project_addr) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let target = match project.targets.get(&target_name) {
+        Some(t) => t,
+        None => return,
+    };
+
+    for dep in &target.depends_on {
+        if collected.insert(dep.clone()) {
+            collect_target_deps(dep, project_map, collected);
+        }
+    }
+}
+
+/// Compute DAG levels for target execution
+///
+/// Level 0 = targets with no dependencies (in our set)
+/// Level N = targets whose dependencies are all in levels 0..N-1
+fn compute_target_levels(
+    targets: &HashSet<String>,
+    project_map: &HashMap<String, &DiscoveredProject>,
+) -> Vec<Vec<String>> {
+    // Build dependency map for targets in our set
+    let mut deps_map: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for target_addr in targets {
+        let (project_addr, target_name) = match parse_target_address(target_addr) {
+            Some((p, t)) => (p, t),
+            None => continue,
+        };
+
+        let project = match project_map.get(&project_addr) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let target_deps: HashSet<String> = project
+            .targets
+            .get(&target_name)
+            .map(|t| {
+                t.depends_on
+                    .iter()
+                    .filter(|d| targets.contains(*d))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        deps_map.insert(target_addr.clone(), target_deps);
+    }
+
+    // Track which level each target is assigned to
+    let mut level_of: HashMap<String, usize> = HashMap::new();
+    let mut remaining: HashSet<String> = targets.clone();
+    let mut current_level = 0;
+
+    while !remaining.is_empty() {
+        let mut this_level = Vec::new();
+
+        for addr in &remaining {
+            let deps = deps_map.get(addr).cloned().unwrap_or_default();
+
+            // Check if all deps are assigned to previous levels
+            let all_deps_assigned = deps
+                .iter()
+                .all(|d| level_of.get(d).map(|l| *l < current_level).unwrap_or(false));
+
+            let no_deps = deps.is_empty();
+
+            if all_deps_assigned || no_deps {
+                this_level.push(addr.clone());
+            }
+        }
+
+        // If we made no progress, there's a cycle - just add remaining
+        if this_level.is_empty() && !remaining.is_empty() {
+            this_level = remaining.iter().cloned().collect();
+        }
+
+        // Assign levels and remove from remaining
+        for addr in &this_level {
+            level_of.insert(addr.clone(), current_level);
+            remaining.remove(addr);
+        }
+
+        current_level += 1;
+    }
+
+    // Build level vectors
+    let max_level = level_of.values().max().copied().unwrap_or(0);
+    let mut levels: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
+
+    for (addr, level) in level_of {
+        levels[level].push(addr);
+    }
+
+    levels
+}
+
 /// Run a command in a directory and capture output
 fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionResult {
     let start = Instant::now();
@@ -161,6 +308,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
         return ExecutionResult {
             address: address.to_string(),
             success: false,
+            skipped: false,
             output: "Empty command".to_string(),
             duration_ms: 0,
         };
@@ -196,6 +344,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
             ExecutionResult {
                 address: address.to_string(),
                 success: output.status.success(),
+                skipped: false,
                 output: combined,
                 duration_ms,
             }
@@ -203,227 +352,262 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
         Err(e) => ExecutionResult {
             address: address.to_string(),
             success: false,
+            skipped: false,
             output: format!("Failed to execute command: {}", e),
             duration_ms,
         },
     }
 }
 
-/// Compute DAG levels for parallel execution
-///
-/// Level 0 = projects with no dependencies (in selection)
-/// Level N = projects whose dependencies are all in levels 0..N-1
-fn compute_levels(projects: &[&DiscoveredProject], graph: &ProjectGraph) -> Vec<Vec<String>> {
-    // Build set of addresses in selection
-    let selected: HashSet<String> = projects
-        .iter()
-        .map(|p| format!("//{}", p.relative_path.display()))
-        .collect();
-
-    // Track which level each project is assigned to
-    let mut level_of: HashMap<String, usize> = HashMap::new();
-
-    // Iterate until all projects are assigned
-    let mut remaining: HashSet<String> = selected.clone();
-    let mut current_level = 0;
-
-    while !remaining.is_empty() {
-        let mut this_level = Vec::new();
-
-        for addr in &remaining {
-            // Get dependencies that are in our selection
-            let deps_in_selection: Vec<String> = graph
-                .dependencies(addr)
-                .iter()
-                .map(|n| n.address.clone())
-                .filter(|d| selected.contains(d))
-                .collect();
-
-            // If all dependencies are assigned to previous levels, this project goes in current level
-            let all_deps_assigned = deps_in_selection
-                .iter()
-                .all(|d| level_of.get(d).map(|l| *l < current_level).unwrap_or(false));
-
-            // Or if no dependencies in selection
-            let no_deps = deps_in_selection.is_empty();
-
-            if all_deps_assigned || no_deps {
-                this_level.push(addr.clone());
-            }
-        }
-
-        // If we made no progress, there's a cycle (shouldn't happen if graph is checked)
-        if this_level.is_empty() && !remaining.is_empty() {
-            // Fallback: just add remaining projects
-            this_level = remaining.iter().cloned().collect();
-        }
-
-        // Assign levels and remove from remaining
-        for addr in &this_level {
-            level_of.insert(addr.clone(), current_level);
-            remaining.remove(addr);
-        }
-
-        current_level += 1;
-        if !this_level.is_empty() {
-            // Levels will be collected
-        }
-    }
-
-    // Build level vectors
-    let max_level = level_of.values().max().copied().unwrap_or(0);
-    let mut levels: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
-
-    for (addr, level) in level_of {
-        levels[level].push(addr);
-    }
-
-    levels
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::build_graph;
-    use crate::plugins::{LocalDependency, ProjectMetadata};
+    use crate::plugins::{ProjectMetadata, Target};
     use std::path::PathBuf;
 
-    fn make_project(
-        name: &str,
+    fn make_project_with_targets(
         relative_path: &str,
-        deps: Vec<(&str, &str)>,
-        targets: Vec<(&str, &str)>,
+        targets: HashMap<String, Target>,
     ) -> DiscoveredProject {
         DiscoveredProject {
             root: PathBuf::from(format!("/workspace/{}", relative_path)),
             config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
             metadata: ProjectMetadata {
-                name: name.to_string(),
+                name: relative_path.to_string(),
                 version: Some("1.0.0".to_string()),
             },
-            dependencies: deps
-                .into_iter()
-                .map(|(name, path)| LocalDependency {
-                    name: name.to_string(),
-                    path: PathBuf::from(path),
-                })
-                .collect(),
-            targets: targets
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            dependencies: vec![],
+            targets,
             plugin_name: "nodejs".to_string(),
             relative_path: PathBuf::from(relative_path),
         }
     }
 
     #[test]
-    fn test_compute_levels_single() {
-        let projects = vec![make_project("a", "a", vec![], vec![("test", "echo test")])];
-        let refs: Vec<&DiscoveredProject> = projects.iter().collect();
-        let graph = build_graph(&projects).unwrap();
+    fn test_parse_target_address() {
+        let result = parse_target_address("//apps/web:test");
+        assert_eq!(result, Some(("//apps/web".to_string(), "test".to_string())));
 
-        let levels = compute_levels(&refs, &graph);
+        let result = parse_target_address("//a:deps");
+        assert_eq!(result, Some(("//a".to_string(), "deps".to_string())));
+
+        let result = parse_target_address("invalid");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_compute_target_levels_single() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            Target {
+                command: "npm test".to_string(),
+                depends_on: vec![],
+            },
+        );
+        let project = make_project_with_targets("a", targets);
+        let projects = vec![project];
+
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let mut targets_to_run = HashSet::new();
+        targets_to_run.insert("//a:test".to_string());
+
+        let levels = compute_target_levels(&targets_to_run, &project_map);
 
         assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0], vec!["//a".to_string()]);
+        assert!(levels[0].contains(&"//a:test".to_string()));
     }
 
     #[test]
-    fn test_compute_levels_linear_chain() {
-        // C depends on B, B depends on A
-        let projects = vec![
-            make_project("a", "a", vec![], vec![("test", "echo a")]),
-            make_project("b", "b", vec![("a", "//a")], vec![("test", "echo b")]),
-            make_project("c", "c", vec![("b", "//b")], vec![("test", "echo c")]),
-        ];
-        let refs: Vec<&DiscoveredProject> = projects.iter().collect();
-        let graph = build_graph(&projects).unwrap();
+    fn test_compute_target_levels_with_deps_target() {
+        // test depends on deps in same project
+        let mut targets = HashMap::new();
+        targets.insert(
+            "deps".to_string(),
+            Target {
+                command: "npm install".to_string(),
+                depends_on: vec![],
+            },
+        );
+        targets.insert(
+            "test".to_string(),
+            Target {
+                command: "npm test".to_string(),
+                depends_on: vec!["//a:deps".to_string()],
+            },
+        );
+        let project = make_project_with_targets("a", targets);
+        let projects = vec![project];
 
-        let levels = compute_levels(&refs, &graph);
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
 
-        assert_eq!(levels.len(), 3);
-        assert!(levels[0].contains(&"//a".to_string()));
-        assert!(levels[1].contains(&"//b".to_string()));
-        assert!(levels[2].contains(&"//c".to_string()));
-    }
+        let mut targets_to_run = HashSet::new();
+        targets_to_run.insert("//a:test".to_string());
+        targets_to_run.insert("//a:deps".to_string());
 
-    #[test]
-    fn test_compute_levels_parallel() {
-        // B and C both depend on A (B and C can run in parallel after A)
-        let projects = vec![
-            make_project("a", "a", vec![], vec![("test", "echo a")]),
-            make_project("b", "b", vec![("a", "//a")], vec![("test", "echo b")]),
-            make_project("c", "c", vec![("a", "//a")], vec![("test", "echo c")]),
-        ];
-        let refs: Vec<&DiscoveredProject> = projects.iter().collect();
-        let graph = build_graph(&projects).unwrap();
-
-        let levels = compute_levels(&refs, &graph);
+        let levels = compute_target_levels(&targets_to_run, &project_map);
 
         assert_eq!(levels.len(), 2);
-        assert!(levels[0].contains(&"//a".to_string()));
-        assert!(levels[1].contains(&"//b".to_string()));
-        assert!(levels[1].contains(&"//c".to_string()));
+        assert!(levels[0].contains(&"//a:deps".to_string()));
+        assert!(levels[1].contains(&"//a:test".to_string()));
     }
 
     #[test]
-    fn test_compute_levels_diamond() {
-        // D depends on B and C, both B and C depend on A
-        let projects = vec![
-            make_project("a", "a", vec![], vec![("test", "echo a")]),
-            make_project("b", "b", vec![("a", "//a")], vec![("test", "echo b")]),
-            make_project("c", "c", vec![("a", "//a")], vec![("test", "echo c")]),
-            make_project(
-                "d",
-                "d",
-                vec![("b", "//b"), ("c", "//c")],
-                vec![("test", "echo d")],
-            ),
-        ];
-        let refs: Vec<&DiscoveredProject> = projects.iter().collect();
-        let graph = build_graph(&projects).unwrap();
+    fn test_compute_target_levels_cross_project() {
+        // //b:test depends on //a:build
+        let mut targets_a = HashMap::new();
+        targets_a.insert(
+            "build".to_string(),
+            Target {
+                command: "npm run build".to_string(),
+                depends_on: vec![],
+            },
+        );
 
-        let levels = compute_levels(&refs, &graph);
+        let mut targets_b = HashMap::new();
+        targets_b.insert(
+            "test".to_string(),
+            Target {
+                command: "npm test".to_string(),
+                depends_on: vec!["//a:build".to_string()],
+            },
+        );
 
-        assert_eq!(levels.len(), 3);
-        assert!(levels[0].contains(&"//a".to_string()));
-        assert!(levels[1].contains(&"//b".to_string()));
-        assert!(levels[1].contains(&"//c".to_string()));
-        assert!(levels[2].contains(&"//d".to_string()));
-    }
+        let project_a = make_project_with_targets("a", targets_a);
+        let project_b = make_project_with_targets("b", targets_b);
+        let projects = vec![project_a, project_b];
 
-    #[test]
-    fn test_compute_levels_subset() {
-        // Full graph: C -> B -> A
-        // But we only select B and A
-        let projects = vec![
-            make_project("a", "a", vec![], vec![("test", "echo a")]),
-            make_project("b", "b", vec![("a", "//a")], vec![("test", "echo b")]),
-            make_project("c", "c", vec![("b", "//b")], vec![("test", "echo c")]),
-        ];
-        let graph = build_graph(&projects).unwrap();
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
 
-        // Only select A and B
-        let subset: Vec<&DiscoveredProject> = projects.iter().take(2).collect();
-        let levels = compute_levels(&subset, &graph);
+        let mut targets_to_run = HashSet::new();
+        targets_to_run.insert("//a:build".to_string());
+        targets_to_run.insert("//b:test".to_string());
+
+        let levels = compute_target_levels(&targets_to_run, &project_map);
 
         assert_eq!(levels.len(), 2);
-        assert!(levels[0].contains(&"//a".to_string()));
-        assert!(levels[1].contains(&"//b".to_string()));
+        assert!(levels[0].contains(&"//a:build".to_string()));
+        assert!(levels[1].contains(&"//b:test".to_string()));
+    }
+
+    #[test]
+    fn test_collect_target_deps() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "deps".to_string(),
+            Target {
+                command: "npm install".to_string(),
+                depends_on: vec![],
+            },
+        );
+        targets.insert(
+            "build".to_string(),
+            Target {
+                command: "npm run build".to_string(),
+                depends_on: vec!["//a:deps".to_string()],
+            },
+        );
+        targets.insert(
+            "test".to_string(),
+            Target {
+                command: "npm test".to_string(),
+                depends_on: vec!["//a:build".to_string()],
+            },
+        );
+        let project = make_project_with_targets("a", targets);
+        let projects = vec![project];
+
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let mut collected = HashSet::new();
+        collect_target_deps("//a:test", &project_map, &mut collected);
+
+        // Should collect build and deps (transitively)
+        assert!(collected.contains("//a:build"));
+        assert!(collected.contains("//a:deps"));
+    }
+
+    #[test]
+    fn test_compute_target_levels_diamond() {
+        // deps -> build and lint -> test (test depends on both build and lint)
+        let mut targets = HashMap::new();
+        targets.insert(
+            "deps".to_string(),
+            Target {
+                command: "npm install".to_string(),
+                depends_on: vec![],
+            },
+        );
+        targets.insert(
+            "build".to_string(),
+            Target {
+                command: "npm run build".to_string(),
+                depends_on: vec!["//a:deps".to_string()],
+            },
+        );
+        targets.insert(
+            "lint".to_string(),
+            Target {
+                command: "npm run lint".to_string(),
+                depends_on: vec!["//a:deps".to_string()],
+            },
+        );
+        targets.insert(
+            "test".to_string(),
+            Target {
+                command: "npm test".to_string(),
+                depends_on: vec!["//a:build".to_string(), "//a:lint".to_string()],
+            },
+        );
+        let project = make_project_with_targets("a", targets);
+        let projects = vec![project];
+
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let mut targets_to_run = HashSet::new();
+        targets_to_run.insert("//a:deps".to_string());
+        targets_to_run.insert("//a:build".to_string());
+        targets_to_run.insert("//a:lint".to_string());
+        targets_to_run.insert("//a:test".to_string());
+
+        let levels = compute_target_levels(&targets_to_run, &project_map);
+
+        assert_eq!(levels.len(), 3);
+        assert!(levels[0].contains(&"//a:deps".to_string()));
+        assert!(levels[1].contains(&"//a:build".to_string()));
+        assert!(levels[1].contains(&"//a:lint".to_string()));
+        assert!(levels[2].contains(&"//a:test".to_string()));
     }
 
     #[test]
     fn test_execution_result_struct() {
         let result = ExecutionResult {
-            address: "//test".to_string(),
+            address: "//test:build".to_string(),
             success: true,
+            skipped: false,
             output: "test output".to_string(),
             duration_ms: 100,
         };
 
-        assert_eq!(result.address, "//test");
+        assert_eq!(result.address, "//test:build");
         assert!(result.success);
+        assert!(!result.skipped);
         assert_eq!(result.output, "test output");
         assert_eq!(result.duration_ms, 100);
     }

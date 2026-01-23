@@ -22,6 +22,8 @@ pub struct RunArgs {
     pub dependents: bool,
     /// Run on all projects
     pub all: bool,
+    /// Use current directory to find project (triggered by "." argument)
+    pub use_cwd: bool,
 }
 
 /// Parse external subcommand args into RunArgs
@@ -40,12 +42,17 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut no_deps = false;
     let mut dependents = false;
     let mut all = false;
+    let mut use_cwd = false;
 
     for arg in args {
         match arg.as_str() {
             "--no-deps" => no_deps = true,
             "--dependents" => dependents = true,
             "--all" => all = true,
+            "." => {
+                // Current directory - use cwd detection
+                use_cwd = true;
+            }
             _ if arg.starts_with("--") => {
                 // Unknown flag - ignore for now
             }
@@ -70,6 +77,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         no_deps,
         dependents,
         all,
+        use_cwd,
     }
 }
 
@@ -120,11 +128,25 @@ pub fn select_projects<'a>(
 
     // Try to detect project from cwd
     if let Ok(relative_cwd) = cwd.strip_prefix(workspace_root) {
-        // Find a project whose root matches or contains cwd
+        // Find the most specific project whose root matches or contains cwd
+        // (prefer longer paths to avoid matching workspace root for everything)
+        let mut best_match: Option<&DiscoveredProject> = None;
+        let mut best_match_len = 0;
+
         for project in discovered {
-            if relative_cwd.starts_with(&project.relative_path) {
-                return Ok(vec![project]);
+            let proj_path = &project.relative_path;
+            // Check if cwd is within this project's directory
+            if relative_cwd.starts_with(proj_path) {
+                let path_len = proj_path.as_os_str().len();
+                if path_len > best_match_len || best_match.is_none() {
+                    best_match = Some(project);
+                    best_match_len = path_len;
+                }
             }
+        }
+
+        if let Some(project) = best_match {
+            return Ok(vec![project]);
         }
     }
 
@@ -201,6 +223,7 @@ mod tests {
         assert!(!args.no_deps);
         assert!(!args.dependents);
         assert!(!args.all);
+        assert!(!args.use_cwd);
     }
 
     #[test]
@@ -273,5 +296,14 @@ mod tests {
 
         assert_eq!(args.target, "");
         assert!(args.projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_run_args_with_dot() {
+        let args = parse_run_args(vec!["test".to_string(), ".".to_string()]);
+
+        assert_eq!(args.target, "test");
+        assert!(args.projects.is_empty());
+        assert!(args.use_cwd);
     }
 }

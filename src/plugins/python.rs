@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata};
+use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
 
 /// Regex to extract path from PEP 621 format: `pkg @ file:../path`
 static PEP621_FILE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -157,6 +157,98 @@ impl LanguagePlugin for PythonPlugin {
 
         Ok(deps)
     }
+
+    fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>> {
+        let content = std::fs::read_to_string(ctx.config_path)
+            .with_context(|| format!("Failed to read {}", ctx.config_path.display()))?;
+
+        let mut targets = HashMap::new();
+
+        // Detect deps command based on tool (poetry vs pip)
+        let deps_command = if content.contains("[tool.poetry]") {
+            "poetry install".to_string()
+        } else {
+            "pip install -e .".to_string()
+        };
+
+        targets.insert(
+            "deps".to_string(),
+            Target {
+                command: deps_command,
+                depends_on: vec![],
+            },
+        );
+
+        // Resolve dependency paths to project addresses
+        let dependency_addresses = resolve_dependency_addresses(ctx);
+
+        // Build dependencies for non-deps targets:
+        // - //self:deps (install our own dependencies first)
+        // - :build for each project dependency (they must be built first)
+        let mut base_deps = vec!["//self:deps".to_string()];
+        for dep_addr in &dependency_addresses {
+            base_deps.push(format!("{}:build", dep_addr));
+        }
+
+        // Check for pytest configuration
+        if content.contains("[tool.pytest")
+            || content.contains("pytest")
+            || content.contains("[project.optional-dependencies]")
+        {
+            targets.insert(
+                "test".to_string(),
+                Target {
+                    command: "pytest".to_string(),
+                    depends_on: base_deps.clone(),
+                },
+            );
+        }
+
+        // Check for build system
+        if content.contains("[build-system]") {
+            targets.insert(
+                "build".to_string(),
+                Target {
+                    command: "python -m build".to_string(),
+                    depends_on: base_deps.clone(),
+                },
+            );
+        }
+
+        // Check for ruff
+        if content.contains("[tool.ruff]") || content.contains("ruff") {
+            targets.insert(
+                "lint".to_string(),
+                Target {
+                    command: "ruff check .".to_string(),
+                    depends_on: base_deps,
+                },
+            );
+        }
+
+        Ok(targets)
+    }
+}
+
+/// Resolve LocalDependency paths to project addresses
+fn resolve_dependency_addresses(ctx: &TargetContext) -> Vec<String> {
+    ctx.dependencies
+        .iter()
+        .filter_map(|dep| {
+            let path_str = dep.path.to_string_lossy();
+            if path_str.starts_with("//") {
+                // Already an address - strip any target suffix
+                let addr = path_str.split(':').next().unwrap_or(&path_str);
+                Some(addr.to_string())
+            } else {
+                // Resolve relative path to address
+                let resolved = ctx.project_dir.join(&dep.path);
+                let normalized = resolved.canonicalize().ok()?;
+                let dep_relative = normalized.strip_prefix(ctx.workspace_root).ok()?;
+                Some(format!("//{}", dep_relative.display()))
+            }
+        })
+        .collect()
 }
 
 /// Extract name and path from PEP 621 file dependency format: `pkg @ file:../path`
@@ -173,6 +265,19 @@ fn extract_pep621_file_path(dep: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_context<'a>(
+        config_path: &'a Path,
+        workspace_root: &'a Path,
+        dependencies: &'a [LocalDependency],
+    ) -> TargetContext<'a> {
+        TargetContext {
+            config_path,
+            project_dir: config_path.parent().unwrap(),
+            workspace_root,
+            dependencies,
+        }
+    }
 
     #[test]
     fn test_parse_pep621_project() {
@@ -420,5 +525,115 @@ poetry-lib = {path = "../poetry-lib"}
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"pep621-lib"));
         assert!(names.contains(&"poetry-lib"));
+    }
+
+    #[test]
+    fn test_detect_targets_with_all_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[build-system]
+requires = ["setuptools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
+        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"python -m build".to_string()));
+        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"ruff check .".to_string()));
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+
+        // Check dependencies
+        assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
+        assert!(targets.get("deps").unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_detect_targets_only_pytest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+        assert_eq!(targets.get("build"), None);
+        assert_eq!(targets.get("lint"), None);
+    }
+
+    #[test]
+    fn test_detect_targets_no_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // deps is always present
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+    }
+
+    #[test]
+    fn test_detect_targets_poetry_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[tool.poetry]
+name = "my-app"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Poetry projects use "poetry install" for deps
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"poetry install".to_string()));
     }
 }

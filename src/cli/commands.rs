@@ -23,17 +23,17 @@ pub enum Commands {
     /// List all discovered projects in the workspace
     List,
 
-    /// Show the dependency graph
+    /// Show the target dependency graph
     Graph {
-        /// Specific project to show dependencies for (//path/to/project)
-        project: Option<String>,
+        /// Specific target to show dependencies for (//path/to/project:target)
+        target: Option<String>,
     },
 
-    /// Show the dependency path between two projects
+    /// Show the dependency path between two targets
     Why {
-        /// Source project (//path/to/project)
+        /// Source target (//path/to/project:target)
         from: String,
-        /// Target project (//path/to/project)
+        /// Destination target (//path/to/project:target)
         to: String,
     },
 

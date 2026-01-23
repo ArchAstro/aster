@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{find_aster_toml, parse_aster_toml};
-use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata};
+use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata, Target, TargetContext};
 use crate::targets::TargetResolver;
 
 /// A project discovered during workspace traversal
@@ -24,8 +24,8 @@ pub struct DiscoveredProject {
     pub metadata: ProjectMetadata,
     /// Dependencies from native config + aster.toml depends_on
     pub dependencies: Vec<LocalDependency>,
-    /// Custom targets from aster.toml
-    pub targets: HashMap<String, String>,
+    /// Resolved targets with commands and dependencies
+    pub targets: HashMap<String, Target>,
     /// Which plugin discovered this project
     pub plugin_name: String,
     /// Path relative to workspace root (for addressing)
@@ -132,18 +132,38 @@ pub fn discover_projects(
                 });
             }
 
-            // Collect custom targets for merging with defaults
+            // Collect custom targets for merging with detected
             custom_targets = aster_config.targets;
         }
 
-        // Resolve targets: defaults + aster.toml overrides
-        let targets = TargetResolver::resolve(plugin.name(), &custom_targets);
-
-        // Compute relative path
+        // Compute relative path (needed for target resolution)
         let relative_path = project_dir
             .strip_prefix(workspace_root)
             .unwrap_or(project_dir)
             .to_path_buf();
+
+        // Compute project address for //self: resolution
+        let project_address = format!("//{}", relative_path.display());
+
+        // Detect available targets from native config
+        // Plugin receives full context and handles path resolution internally
+        let target_ctx = TargetContext {
+            config_path: &config_path,
+            project_dir,
+            workspace_root,
+            dependencies: &dependencies,
+        };
+        let detected_targets = plugin
+            .detect_targets(&target_ctx)
+            .with_context(|| {
+                format!(
+                    "Failed to detect targets from {}",
+                    config_path.display()
+                )
+            })?;
+
+        // Resolve targets: detected + aster.toml overrides, resolving //self: references
+        let targets = TargetResolver::resolve(&detected_targets, &custom_targets, &project_address);
 
         projects.push(DiscoveredProject {
             root: project_dir.to_path_buf(),
@@ -205,7 +225,7 @@ mod tests {
         std::fs::create_dir_all(&services_dir).unwrap();
 
         let pkg_json = services_dir.join("package.json");
-        std::fs::write(&pkg_json, r#"{"name": "api", "version": "1.0.0"}"#).unwrap();
+        std::fs::write(&pkg_json, r#"{"name": "api", "version": "1.0.0", "scripts": {"test": "jest", "build": "tsc"}}"#).unwrap();
 
         // Create .git to mark workspace root (for gitignore handling)
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
@@ -218,19 +238,47 @@ mod tests {
         assert_eq!(projects[0].relative_path, PathBuf::from("services/api"));
         assert_eq!(projects[0].plugin_name, "nodejs");
 
-        // Verify default targets are populated
+        // Verify only detected targets are populated (from scripts)
         assert_eq!(
-            projects[0].targets.get("test"),
+            projects[0].targets.get("test").map(|t| &t.command),
             Some(&"npm test".to_string())
         );
         assert_eq!(
-            projects[0].targets.get("build"),
+            projects[0].targets.get("build").map(|t| &t.command),
             Some(&"npm run build".to_string())
         );
+        // deps is always present
         assert_eq!(
-            projects[0].targets.get("lint"),
-            Some(&"npm run lint".to_string())
+            projects[0].targets.get("deps").map(|t| &t.command),
+            Some(&"npm install".to_string())
         );
+        // lint is not in scripts, so not present
+        assert_eq!(projects[0].targets.get("lint"), None);
+
+        // Check that //self: references are resolved to project address
+        let test_target = projects[0].targets.get("test").unwrap();
+        assert_eq!(test_target.depends_on, vec!["//services/api:deps".to_string()]);
+    }
+
+    #[test]
+    fn test_discover_project_no_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&services_dir).unwrap();
+
+        let pkg_json = services_dir.join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "api", "version": "1.0.0"}"#).unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
+        // Only deps target is defined (no scripts)
+        assert_eq!(projects[0].targets.len(), 1);
+        assert!(projects[0].targets.contains_key("deps"));
     }
 
     #[test]
@@ -317,10 +365,10 @@ mod tests {
         let project_dir = tmp.path().join("services/api");
         std::fs::create_dir_all(&project_dir).unwrap();
 
-        // package.json with original name
+        // package.json with scripts
         std::fs::write(
             project_dir.join("package.json"),
-            r#"{"name": "api", "version": "1.0.0"}"#,
+            r#"{"name": "api", "version": "1.0.0", "scripts": {"test": "jest", "build": "tsc", "lint": "eslint ."}}"#,
         )
         .unwrap();
 
@@ -345,18 +393,18 @@ lint = "npm run lint:ci"
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].metadata.name, "api-service"); // Name overridden
 
-        // Custom lint target overrides default
+        // Custom lint target from aster.toml overrides detected
         assert_eq!(
-            projects[0].targets.get("lint"),
+            projects[0].targets.get("lint").map(|t| &t.command),
             Some(&"npm run lint:ci".to_string())
         );
-        // Default targets still present
+        // Detected targets still present
         assert_eq!(
-            projects[0].targets.get("test"),
+            projects[0].targets.get("test").map(|t| &t.command),
             Some(&"npm test".to_string())
         );
         assert_eq!(
-            projects[0].targets.get("build"),
+            projects[0].targets.get("build").map(|t| &t.command),
             Some(&"npm run build".to_string())
         );
 
@@ -365,6 +413,52 @@ lint = "npm run lint:ci"
             .dependencies
             .iter()
             .any(|d| d.name == "//libs/shared:build"));
+    }
+
+    #[test]
+    fn test_discover_aster_toml_adds_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let project_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // package.json with only test script
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name": "api", "scripts": {"test": "jest"}}"#,
+        )
+        .unwrap();
+
+        // aster.toml adds deploy target
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+[targets]
+deploy = "npm run deploy"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+
+        // Detected test target present
+        assert_eq!(
+            projects[0].targets.get("test").map(|t| &t.command),
+            Some(&"npm test".to_string())
+        );
+        // Custom deploy target from aster.toml added (with empty depends_on)
+        assert_eq!(
+            projects[0].targets.get("deploy").map(|t| &t.command),
+            Some(&"npm run deploy".to_string())
+        );
+        assert!(projects[0].targets.get("deploy").unwrap().depends_on.is_empty());
+        // Total: test (detected) + deps (detected) + deploy (custom) = 3
+        assert_eq!(projects[0].targets.len(), 3);
     }
 
     #[test]
@@ -452,21 +546,21 @@ lint = "npm run lint:ci"
     }
 
     #[test]
-    fn test_discover_target_defaults_by_plugin() {
+    fn test_discover_target_detection_by_plugin() {
         use crate::plugins::{ElixirPlugin, PythonPlugin};
 
         let tmp = tempfile::tempdir().unwrap();
 
-        // Node.js project
+        // Node.js project with scripts
         let node_dir = tmp.path().join("services/api");
         std::fs::create_dir_all(&node_dir).unwrap();
         std::fs::write(
             node_dir.join("package.json"),
-            r#"{"name": "api"}"#,
+            r#"{"name": "api", "scripts": {"test": "jest", "build": "tsc"}}"#,
         )
         .unwrap();
 
-        // Elixir project
+        // Elixir project (test and build always available, lint only if credo present)
         let elixir_dir = tmp.path().join("services/backend");
         std::fs::create_dir_all(&elixir_dir).unwrap();
         std::fs::write(
@@ -478,12 +572,16 @@ defmodule Backend.MixProject do
   def project do
     [app: :backend]
   end
+
+  defp deps do
+    [{:credo, "~> 1.7"}]
+  end
 end
 "#,
         )
         .unwrap();
 
-        // Python project
+        // Python project with pytest and build config
         let python_dir = tmp.path().join("libs/ml");
         std::fs::create_dir_all(&python_dir).unwrap();
         std::fs::write(
@@ -492,6 +590,15 @@ end
 [project]
 name = "ml"
 version = "1.0.0"
+
+[build-system]
+requires = ["setuptools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
 "#,
         )
         .unwrap();
@@ -508,22 +615,71 @@ version = "1.0.0"
 
         assert_eq!(projects.len(), 3);
 
-        // Verify Node.js targets
+        // Verify Node.js targets (detected from scripts)
         let node_project = projects.iter().find(|p| p.plugin_name == "nodejs").unwrap();
-        assert_eq!(node_project.targets.get("test"), Some(&"npm test".to_string()));
-        assert_eq!(node_project.targets.get("build"), Some(&"npm run build".to_string()));
-        assert_eq!(node_project.targets.get("lint"), Some(&"npm run lint".to_string()));
+        assert_eq!(node_project.targets.get("test").map(|t| &t.command), Some(&"npm test".to_string()));
+        assert_eq!(node_project.targets.get("build").map(|t| &t.command), Some(&"npm run build".to_string()));
+        assert_eq!(node_project.targets.get("deps").map(|t| &t.command), Some(&"npm install".to_string()));
+        // lint not in scripts, so not present
+        assert_eq!(node_project.targets.get("lint"), None);
 
-        // Verify Elixir targets
+        // Verify Elixir targets (test/build/deps always, lint if credo present)
         let elixir_project = projects.iter().find(|p| p.plugin_name == "elixir").unwrap();
-        assert_eq!(elixir_project.targets.get("test"), Some(&"mix test".to_string()));
-        assert_eq!(elixir_project.targets.get("build"), Some(&"mix compile".to_string()));
-        assert_eq!(elixir_project.targets.get("lint"), Some(&"mix credo".to_string()));
+        assert_eq!(elixir_project.targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
+        assert_eq!(elixir_project.targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
+        assert_eq!(elixir_project.targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        assert_eq!(elixir_project.targets.get("lint").map(|t| &t.command), Some(&"mix credo".to_string()));
 
-        // Verify Python targets
+        // Verify Python targets (detected from config sections)
         let python_project = projects.iter().find(|p| p.plugin_name == "python").unwrap();
-        assert_eq!(python_project.targets.get("test"), Some(&"pytest".to_string()));
-        assert_eq!(python_project.targets.get("build"), Some(&"python -m build".to_string()));
-        assert_eq!(python_project.targets.get("lint"), Some(&"ruff check .".to_string()));
+        assert_eq!(python_project.targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
+        assert_eq!(python_project.targets.get("build").map(|t| &t.command), Some(&"python -m build".to_string()));
+        assert_eq!(python_project.targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+        assert_eq!(python_project.targets.get("lint").map(|t| &t.command), Some(&"ruff check .".to_string()));
+    }
+
+    #[test]
+    fn test_discover_elixir_no_credo() {
+        use crate::plugins::ElixirPlugin;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Elixir project without credo
+        let elixir_dir = tmp.path().join("services/backend");
+        std::fs::create_dir_all(&elixir_dir).unwrap();
+        std::fs::write(
+            elixir_dir.join("mix.exs"),
+            r#"
+defmodule Backend.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :backend]
+  end
+
+  defp deps do
+    [{:jason, "~> 1.4"}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(ElixirPlugin));
+
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        let project = &projects[0];
+
+        // test, build, and deps always available
+        assert_eq!(project.targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
+        assert_eq!(project.targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
+        assert_eq!(project.targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        // lint NOT available (no credo)
+        assert_eq!(project.targets.get("lint"), None);
     }
 }

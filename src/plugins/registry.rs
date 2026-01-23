@@ -38,8 +38,9 @@ impl Default for PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::{LocalDependency, ProjectMetadata};
+    use crate::plugins::{LocalDependency, ProjectMetadata, Target, TargetContext};
     use anyhow::Result;
+    use std::collections::HashMap;
     use std::path::Path;
 
     // Mock plugin for testing
@@ -66,6 +67,10 @@ mod tests {
 
         fn parse_dependencies(&self, _config_path: &Path) -> Result<Vec<LocalDependency>> {
             Ok(vec![])
+        }
+
+        fn detect_targets(&self, _ctx: &TargetContext) -> Result<HashMap<String, Target>> {
+            Ok(HashMap::new())
         }
     }
 

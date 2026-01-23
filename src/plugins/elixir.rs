@@ -2,10 +2,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata};
+use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
 
 /// Regex to extract app name from `app: :name` in mix.exs project definition
 static APP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -89,6 +90,83 @@ impl LanguagePlugin for ElixirPlugin {
 
         Ok(deps)
     }
+
+    fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>> {
+        let content = std::fs::read_to_string(ctx.config_path)
+            .with_context(|| format!("Failed to read {}", ctx.config_path.display()))?;
+
+        let mut targets = HashMap::new();
+
+        // Always add deps target for mix deps.get (no cross-project dependencies)
+        targets.insert(
+            "deps".to_string(),
+            Target {
+                command: "mix deps.get".to_string(),
+                depends_on: vec![],
+            },
+        );
+
+        // Resolve dependency paths to project addresses
+        let dependency_addresses = resolve_dependency_addresses(ctx);
+
+        // Build dependencies for non-deps targets:
+        // - //self:deps (install our own dependencies first)
+        // - :build for each project dependency (they must be built first)
+        let mut base_deps = vec!["//self:deps".to_string()];
+        for dep_addr in &dependency_addresses {
+            base_deps.push(format!("{}:build", dep_addr));
+        }
+
+        // mix test and mix compile are always available for Elixir projects
+        targets.insert(
+            "test".to_string(),
+            Target {
+                command: "mix test".to_string(),
+                depends_on: base_deps.clone(),
+            },
+        );
+        targets.insert(
+            "build".to_string(),
+            Target {
+                command: "mix compile".to_string(),
+                depends_on: base_deps.clone(),
+            },
+        );
+
+        // Only add lint if credo is a dependency
+        if content.contains(":credo") {
+            targets.insert(
+                "lint".to_string(),
+                Target {
+                    command: "mix credo".to_string(),
+                    depends_on: base_deps,
+                },
+            );
+        }
+
+        Ok(targets)
+    }
+}
+
+/// Resolve LocalDependency paths to project addresses
+fn resolve_dependency_addresses(ctx: &TargetContext) -> Vec<String> {
+    ctx.dependencies
+        .iter()
+        .filter_map(|dep| {
+            let path_str = dep.path.to_string_lossy();
+            if path_str.starts_with("//") {
+                // Already an address - strip any target suffix
+                let addr = path_str.split(':').next().unwrap_or(&path_str);
+                Some(addr.to_string())
+            } else {
+                // Resolve relative path to address
+                let resolved = ctx.project_dir.join(&dep.path);
+                let normalized = resolved.canonicalize().ok()?;
+                let dep_relative = normalized.strip_prefix(ctx.workspace_root).ok()?;
+                Some(format!("//{}", dep_relative.display()))
+            }
+        })
+        .collect()
 }
 
 /// Normalize whitespace in mix.exs content to handle multiline dependency declarations
@@ -364,5 +442,91 @@ end
         let deps = plugin.parse_dependencies(&mix_exs).unwrap();
 
         assert!(deps.is_empty());
+    }
+
+    fn make_context<'a>(
+        config_path: &'a Path,
+        workspace_root: &'a Path,
+        dependencies: &'a [LocalDependency],
+    ) -> TargetContext<'a> {
+        TargetContext {
+            config_path,
+            project_dir: config_path.parent().unwrap(),
+            workspace_root,
+            dependencies,
+        }
+    }
+
+    #[test]
+    fn test_detect_targets_with_credo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+
+  defp deps do
+    [{:credo, "~> 1.7", only: [:dev, :test]}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // test, build, deps always available
+        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
+        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        // lint available because credo is a dependency
+        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"mix credo".to_string()));
+
+        // Check dependencies
+        assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
+        assert_eq!(targets.get("build").unwrap().depends_on, vec!["//self:deps"]);
+        assert!(targets.get("deps").unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_detect_targets_without_credo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+
+  defp deps do
+    [{:jason, "~> 1.4"}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // test, build, deps always available
+        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
+        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
+        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        // lint NOT available (no credo)
+        assert_eq!(targets.get("lint"), None);
     }
 }
