@@ -69,7 +69,10 @@ impl Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// List all discovered projects in the workspace
-    List,
+    List {
+        /// Directory to scope listing to (e.g., "services/" or ".")
+        path: Option<String>,
+    },
 
     /// Show the target dependency graph
     Graph {

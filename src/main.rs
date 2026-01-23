@@ -70,10 +70,33 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init => unreachable!("Init handled above"),
-        Commands::List => {
+        Commands::List { path } => {
+            // Filter projects by path if specified
+            let filtered_projects: Vec<&DiscoveredProject> = if let Some(ref filter_path) = path {
+                // Resolve the filter path relative to cwd
+                let filter_path = if filter_path == "." {
+                    // Current directory relative to workspace root
+                    cwd.strip_prefix(&workspace_root)
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default()
+                } else {
+                    // Normalize the path (remove trailing slashes, handle ./)
+                    let p = filter_path.trim_end_matches('/');
+                    let p = p.strip_prefix("./").unwrap_or(p);
+                    PathBuf::from(p)
+                };
+
+                projects
+                    .iter()
+                    .filter(|p| p.relative_path.starts_with(&filter_path))
+                    .collect()
+            } else {
+                projects.iter().collect()
+            };
+
             if output_mode == OutputMode::Json {
                 // JSON output: array of ProjectInfo
-                let project_infos: Vec<ProjectInfo> = projects
+                let project_infos: Vec<ProjectInfo> = filtered_projects
                     .iter()
                     .map(|p| {
                         let targets: HashMap<String, String> = p
@@ -92,7 +115,7 @@ fn run() -> Result<()> {
                 output_json(&project_infos)?;
             } else if output_mode != OutputMode::Quiet {
                 // Normal or Verbose: text output
-                for project in &projects {
+                for project in &filtered_projects {
                     println!("//{}", project.relative_path.display());
 
                     if !project.targets.is_empty() {
