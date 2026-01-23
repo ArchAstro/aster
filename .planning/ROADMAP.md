@@ -70,10 +70,12 @@ Plans:
   3. Failures are clearly displayed while successful outputs are organized (not noisy)
   4. `--verbose`, `--quiet`, and `--help` flags work on all commands
   5. Integration tests pass against ~/archastro/firstlanding-wt9 monorepo
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 04-01: TBD
+- [ ] 04-01-PLAN.md — Global CLI flags and JSON output for all commands
+- [ ] 04-02-PLAN.md — Progress display with indicatif and log storage
+- [ ] 04-03-PLAN.md — Logs command and real monorepo integration tests
 
 ## Progress
 
@@ -82,7 +84,7 @@ Plans:
 | 1. Foundation | 3/3 | Complete | 2026-01-22 |
 | 2. Language Plugins | 2/2 | Complete | 2026-01-22 |
 | 3. CLI & Git | 2/2 | Complete | 2026-01-22 |
-| 4. Output & Testing | 0/1 | Not started | - |
+| 4. Output & Testing | 0/3 | In progress | - |
 
 ---
 *Roadmap created: 2026-01-22*
