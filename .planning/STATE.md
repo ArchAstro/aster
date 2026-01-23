@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-22)
 
 **Core value:** Auto-detect the dependency graph from native configs. If the tool can't figure it out from mix.exs/package.json/pyproject.toml, something is wrong.
-**Current focus:** Phase 4 - Output & Testing
+**Current focus:** Phase 4 - Output & Testing (Complete)
 
 ## Current Position
 
 Phase: 4 of 4 (Output & Testing)
-Plan: 1 of 1 in current phase
-Status: Phase 4 Plan 1 complete
-Last activity: 2026-01-23 - Completed 04-01-PLAN.md (Output Modes & JSON)
+Plan: 2 of 2 in current phase
+Status: Phase 4 complete
+Last activity: 2026-01-23 - Completed 04-02-PLAN.md (Progress Display & Log Storage)
 
 Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
-- Average duration: 4m 44s
-- Total execution time: 0.63 hours
+- Total plans completed: 9
+- Average duration: 4m 38s
+- Total execution time: 0.70 hours
 
 **By Phase:**
 
@@ -30,10 +30,10 @@ Progress: [██████████] 100%
 | 01-foundation | 3 | 13m 7s | 4m 22s |
 | 02-language-plugins | 2 | 6m 26s | 3m 13s |
 | 03-cli-git | 2 | 12m 22s | 6m 11s |
-| 04-output-testing | 1 | 7m 47s | 7m 47s |
+| 04-output-testing | 2 | 11m 59s | 6m 00s |
 
 **Recent Trend:**
-- Last 5 plans: 02-02 (3m 14s), 03-01 (6m 33s), 03-02 (5m 49s), 04-01 (7m 47s)
+- Last 5 plans: 03-01 (6m 33s), 03-02 (5m 49s), 04-01 (7m 47s), 04-02 (4m 12s)
 - Trend: Consistent velocity
 
 *Updated after each plan completion*
@@ -82,6 +82,10 @@ Recent decisions affecting current work:
 - Global flags (--json, --quiet, --verbose) must precede external subcommand
 - Terminal detection for pretty vs compact JSON output
 - OutputMode enum for consistent output handling
+- Progress spinners write to stderr (keeps stdout clean)
+- Spinners only when stderr is a terminal (no spinners for CI/piped output)
+- Show last 15 lines of failure output inline
+- Log storage at .aster/logs/latest.json
 
 ### Pending Todos
 
@@ -94,5 +98,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-01-23
-Stopped at: Completed 04-01-PLAN.md (Output Modes & JSON)
+Stopped at: Completed 04-02-PLAN.md (Progress Display & Log Storage)
 Resume file: None
