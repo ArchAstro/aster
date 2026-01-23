@@ -423,19 +423,40 @@ fn run() -> Result<()> {
 
             // Dry run: just show what would run
             if dry_run {
+                // Build map of project -> affected files
+                let mut files_per_project: HashMap<String, Vec<String>> = HashMap::new();
+                for project in &ordered {
+                    let project_addr = format!("//{}", project.relative_path.display());
+                    let project_files: Vec<String> = changed_files
+                        .iter()
+                        .filter(|f| f.starts_with(&project.relative_path))
+                        .map(|f| f.to_string_lossy().to_string())
+                        .collect();
+                    files_per_project.insert(project_addr, project_files);
+                }
+
                 if output_mode == OutputMode::Json {
-                    // Output JSON list of affected projects
+                    // Output JSON list of affected projects with files
+                    #[derive(serde::Serialize)]
+                    struct AffectedProject {
+                        address: String,
+                        files: Vec<String>,
+                    }
                     #[derive(serde::Serialize)]
                     struct DryRunOutput {
                         target: String,
                         base: String,
                         head: Option<String>,
-                        affected: Vec<String>,
+                        affected: Vec<AffectedProject>,
                         count: usize,
                     }
-                    let affected: Vec<String> = ordered
+                    let affected: Vec<AffectedProject> = ordered
                         .iter()
-                        .map(|p| format!("//{}", p.relative_path.display()))
+                        .map(|p| {
+                            let addr = format!("//{}", p.relative_path.display());
+                            let files = files_per_project.get(&addr).cloned().unwrap_or_default();
+                            AffectedProject { address: addr, files }
+                        })
                         .collect();
                     let output = DryRunOutput {
                         target: target.clone(),
@@ -447,7 +468,17 @@ fn run() -> Result<()> {
                     output_json(&output)?;
                 } else if output_mode != OutputMode::Quiet {
                     println!();
-                    println!("Would run '{}' on {} projects", target, ordered.len());
+                    println!("Would run '{}' on {} projects:", target, ordered.len());
+                    println!();
+                    for project in &ordered {
+                        let addr = format!("//{}", project.relative_path.display());
+                        println!("  {}", addr);
+                        if let Some(files) = files_per_project.get(&addr) {
+                            for file in files {
+                                println!("    - {}", file);
+                            }
+                        }
+                    }
                 }
                 return Ok(());
             }
