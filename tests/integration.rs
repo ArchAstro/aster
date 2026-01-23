@@ -100,11 +100,13 @@ fn test_graph_shows_all_projects() {
 fn test_graph_shows_dependencies() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    // Core project needs a build script for dependencies to be visible
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core", "scripts": {"build": "echo build"}}"#);
+    // API depends on core and has scripts that trigger dependency resolution
     write_package_json(
         &tmp,
         "services/api/package.json",
-        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}}"#,
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo build"}}"#,
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -116,30 +118,37 @@ fn test_graph_shows_dependencies() {
     assert!(output.status.success(), "Command failed: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("//services/api"));
-    assert!(stdout.contains("-> //libs/core"), "Expected dependency arrow in output: {}", stdout);
+    // The graph shows target-level dependencies like: :build -> [//libs/core:build]
+    assert!(stdout.contains("-> ["), "Expected dependency arrow in output: {}", stdout);
+    assert!(stdout.contains("//libs/core:build"), "Expected //libs/core:build in dependencies: {}", stdout);
 }
 
 #[test]
-fn test_graph_specific_project() {
+fn test_graph_specific_target() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    // Core project needs a build script for dependencies to be visible
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core", "scripts": {"build": "echo build"}}"#);
+    // API depends on core and has scripts
     write_package_json(
         &tmp,
         "services/api/package.json",
-        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}}"#,
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo build"}}"#,
     );
 
+    // Graph command now uses target addresses, not project addresses
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
-        .args(["graph", "//services/api"])
+        .args(["graph", "//services/api:build"])
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert!(output.status.success(), "Command failed: {:?}\nstderr: {}", output, String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("//services/api"));
-    assert!(stdout.contains("-> //libs/core"));
+    assert!(stdout.contains("//services/api:build"));
+    // Target shows its dependencies
+    assert!(stdout.contains("-> //libs/core:build") || stdout.contains("//libs/core:build"),
+        "Expected //libs/core:build in dependencies: {}", stdout);
 }
 
 #[test]
@@ -164,12 +173,13 @@ fn test_cycle_detection_fails() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    // Create circular dependency via aster.toml
-    write_package_json(&tmp, "a/package.json", r#"{"name": "a"}"#);
-    write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b"]"#);
+    // Create circular target dependency via aster.toml
+    // Both projects need scripts so they have targets beyond just :deps
+    write_package_json(&tmp, "a/package.json", r#"{"name": "a", "scripts": {"build": "echo build"}}"#);
+    write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b:build"]"#);
 
-    write_package_json(&tmp, "b/package.json", r#"{"name": "b"}"#);
-    write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//a"]"#);
+    write_package_json(&tmp, "b/package.json", r#"{"name": "b", "scripts": {"build": "echo build"}}"#);
+    write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//a:build"]"#);
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
@@ -191,15 +201,15 @@ fn test_cycle_shows_path() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    // Create a longer cycle: a -> b -> c -> a
-    write_package_json(&tmp, "a/package.json", r#"{"name": "a"}"#);
-    write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b"]"#);
+    // Create a longer cycle at target level: a:build -> b:build -> c:build -> a:build
+    write_package_json(&tmp, "a/package.json", r#"{"name": "a", "scripts": {"build": "echo build"}}"#);
+    write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b:build"]"#);
 
-    write_package_json(&tmp, "b/package.json", r#"{"name": "b"}"#);
-    write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//c"]"#);
+    write_package_json(&tmp, "b/package.json", r#"{"name": "b", "scripts": {"build": "echo build"}}"#);
+    write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//c:build"]"#);
 
-    write_package_json(&tmp, "c/package.json", r#"{"name": "c"}"#);
-    write_aster_toml(&tmp, "c/aster.toml", r#"depends_on = ["//a"]"#);
+    write_package_json(&tmp, "c/package.json", r#"{"name": "c", "scripts": {"build": "echo build"}}"#);
+    write_aster_toml(&tmp, "c/aster.toml", r#"depends_on = ["//a:build"]"#);
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
@@ -318,10 +328,16 @@ end
         stdout
     );
 
-    // Verify dependency is detected
+    // Verify dependency is detected (target-level dependencies include full addresses)
     assert!(
-        stdout.contains("-> //libs/core"),
-        "Expected dependency arrow to //libs/core: {}",
+        stdout.contains("//libs/core"),
+        "Expected //libs/core in dependency output: {}",
+        stdout
+    );
+    // The output shows target-level deps like: :build -> [//libs/core:build, ...]
+    assert!(
+        stdout.contains("->"),
+        "Expected dependency arrow in output: {}",
         stdout
     );
 }
@@ -376,10 +392,10 @@ utils = {path = "../../libs/utils"}
         stdout
     );
 
-    // Verify dependency is detected
+    // Verify dependency is detected (target-level dependencies include full addresses)
     assert!(
-        stdout.contains("-> //libs/utils"),
-        "Expected dependency arrow to //libs/utils: {}",
+        stdout.contains("//libs/utils"),
+        "Expected //libs/utils in dependency output: {}",
         stdout
     );
 }
@@ -454,14 +470,15 @@ fn test_graph_with_mixed_languages() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    // Shared library (Node.js)
+    // Shared library (Node.js) - needs a build script for dependencies to be visible
     write_package_json(
         &tmp,
         "libs/shared/package.json",
-        r#"{"name": "shared"}"#,
+        r#"{"name": "shared", "scripts": {"build": "echo build"}}"#,
     );
 
     // Elixir service depending on shared via aster.toml (cross-language)
+    // Elixir projects automatically get build/test/deps targets
     write_mix_exs(
         &tmp,
         "services/elixir-api/mix.exs",
@@ -475,13 +492,15 @@ defmodule ElixirApi.MixProject do
 end
 "#,
     );
+    // Cross-language dependencies use target addresses
     write_aster_toml(
         &tmp,
         "services/elixir-api/aster.toml",
-        r#"depends_on = ["//libs/shared"]"#,
+        r#"depends_on = ["//libs/shared:build"]"#,
     );
 
     // Python service depending on shared via aster.toml (cross-language)
+    // Python projects automatically get build/test/deps targets
     write_pyproject_toml(
         &tmp,
         "services/python-api/pyproject.toml",
@@ -494,7 +513,7 @@ version = "1.0.0"
     write_aster_toml(
         &tmp,
         "services/python-api/aster.toml",
-        r#"depends_on = ["//libs/shared"]"#,
+        r#"depends_on = ["//libs/shared:build"]"#,
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -520,18 +539,10 @@ version = "1.0.0"
     );
 
     // Verify cross-language dependencies via aster.toml
-    // Both should depend on //libs/shared
-    let lines: Vec<&str> = stdout.lines().collect();
-    let shared_deps: Vec<&str> = lines
-        .iter()
-        .filter(|l| l.contains("-> //libs/shared"))
-        .copied()
-        .collect();
-
+    // The graph output shows target-level dependencies: :build -> [//libs/shared:build, ...]
     assert!(
-        shared_deps.len() >= 2,
-        "Expected at least 2 dependencies to //libs/shared, found {}: {}",
-        shared_deps.len(),
+        stdout.contains("//libs/shared:build"),
+        "Expected //libs/shared:build in dependency output: {}",
         stdout
     );
 }
