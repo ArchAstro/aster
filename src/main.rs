@@ -8,13 +8,17 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use aster::cli::{expand_selection, parse_run_args, select_projects, Cli, Commands};
+use aster::cli::{
+    expand_selection, output_json, parse_run_args, select_projects, Cli, Commands, GraphOutput,
+    OutputMode, ProjectInfo, WhyOutput,
+};
 use aster::config::find_workspace_root;
 use aster::discovery::discover_projects;
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::{ElixirPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin};
+use std::collections::HashMap;
 
 fn main() -> ExitCode {
     match run() {
@@ -28,6 +32,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let output_mode = cli.output_mode();
 
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
@@ -40,8 +45,8 @@ fn run() -> Result<()> {
     let workspace_root = find_workspace_root(&cwd)
         .context("Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.")?;
 
-    if cli.verbose {
-        eprintln!("Workspace root: {}", workspace_root.display());
+    if output_mode == OutputMode::Verbose {
+        eprintln!("[aster] Workspace root: {}", workspace_root.display());
     }
 
     // Set up plugin registry with all language plugins
@@ -54,37 +59,60 @@ fn run() -> Result<()> {
     let projects = discover_projects(&workspace_root, &registry)
         .context("Failed to discover projects")?;
 
-    if cli.verbose {
-        eprintln!("Discovered {} projects", projects.len());
+    if output_mode == OutputMode::Verbose {
+        eprintln!("[aster] Discovered {} projects", projects.len());
     }
 
     match cli.command {
         Commands::Init => unreachable!("Init handled above"),
         Commands::List => {
-            for project in &projects {
-                println!("//{}", project.relative_path.display());
+            if output_mode == OutputMode::Json {
+                // JSON output: array of ProjectInfo
+                let project_infos: Vec<ProjectInfo> = projects
+                    .iter()
+                    .map(|p| {
+                        let targets: HashMap<String, String> = p
+                            .targets
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.command.clone()))
+                            .collect();
+                        ProjectInfo {
+                            address: format!("//{}", p.relative_path.display()),
+                            path: p.relative_path.display().to_string(),
+                            plugin: p.plugin_name.clone(),
+                            targets,
+                        }
+                    })
+                    .collect();
+                output_json(&project_infos)?;
+            } else if output_mode != OutputMode::Quiet {
+                // Normal or Verbose: text output
+                for project in &projects {
+                    println!("//{}", project.relative_path.display());
 
-                if !project.targets.is_empty() {
-                    // Sort targets for consistent output
-                    let mut target_names: Vec<&str> =
-                        project.targets.keys().map(|s| s.as_str()).collect();
-                    target_names.sort();
+                    if !project.targets.is_empty() {
+                        // Sort targets for consistent output
+                        let mut target_names: Vec<&str> =
+                            project.targets.keys().map(|s| s.as_str()).collect();
+                        target_names.sort();
 
-                    for name in target_names {
-                        let target = &project.targets[name];
-                        if target.depends_on.is_empty() {
-                            println!("  {}: {}", name, target.command);
-                        } else {
-                            println!(
-                                "  {}: {} -> [{}]",
-                                name,
-                                target.command,
-                                target.depends_on.join(", ")
-                            );
+                        for name in target_names {
+                            let target = &project.targets[name];
+                            if target.depends_on.is_empty() {
+                                println!("  {}: {}", name, target.command);
+                            } else {
+                                println!(
+                                    "  {}: {} -> [{}]",
+                                    name,
+                                    target.command,
+                                    target.depends_on.join(", ")
+                                );
+                            }
                         }
                     }
                 }
             }
+            // Quiet mode: no output for list
         }
         Commands::Graph { target } => {
             // Build the target graph
@@ -96,38 +124,80 @@ fn run() -> Result<()> {
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
-            // Display graph
-            if let Some(addr) = target {
-                // Show deps for specific target
-                if let Some(node) = graph.get(&addr) {
-                    println!("{}", node.address);
-                    for dep in graph.dependencies(&addr) {
-                        println!("  -> {}", dep.address);
+            if output_mode == OutputMode::Json {
+                // JSON output: nodes and edges
+                let (nodes, edges) = if let Some(ref addr) = target {
+                    // Specific target: show its subgraph (target + dependencies)
+                    if graph.get(addr).is_none() {
+                        return Err(anyhow::anyhow!("Target not found: {addr}"));
+                    }
+
+                    let mut nodes = vec![addr.clone()];
+                    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+
+                    let deps = graph.dependencies(addr);
+                    let dep_addrs: Vec<String> = deps.iter().map(|d| d.address.clone()).collect();
+
+                    if !dep_addrs.is_empty() {
+                        edges.insert(addr.clone(), dep_addrs.clone());
+                        nodes.extend(dep_addrs);
+                    } else {
+                        edges.insert(addr.clone(), vec![]);
+                    }
+
+                    (nodes, edges)
+                } else {
+                    // Full graph
+                    let nodes: Vec<String> = graph.targets().map(|t| t.address.clone()).collect();
+                    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+
+                    for node in graph.targets() {
+                        let deps = graph.dependencies(&node.address);
+                        let dep_addrs: Vec<String> = deps.iter().map(|d| d.address.clone()).collect();
+                        edges.insert(node.address.clone(), dep_addrs);
+                    }
+
+                    (nodes, edges)
+                };
+
+                let output = GraphOutput { nodes, edges };
+                output_json(&output)?;
+            } else if output_mode == OutputMode::Quiet {
+                // Quiet mode: no output for graph
+            } else {
+                // Normal/Verbose: text output
+                if let Some(addr) = target {
+                    // Show deps for specific target
+                    if let Some(node) = graph.get(&addr) {
+                        println!("{}", node.address);
+                        for dep in graph.dependencies(&addr) {
+                            println!("  -> {}", dep.address);
+                        }
+                    } else {
+                        return Err(anyhow::anyhow!("Target not found: {addr}"));
                     }
                 } else {
-                    return Err(anyhow::anyhow!("Target not found: {addr}"));
-                }
-            } else {
-                // Show full graph grouped by project
-                let mut current_project = String::new();
-                let mut targets: Vec<_> = graph.targets().collect();
-                targets.sort_by(|a, b| a.address.cmp(&b.address));
+                    // Show full graph grouped by project
+                    let mut current_project = String::new();
+                    let mut targets: Vec<_> = graph.targets().collect();
+                    targets.sort_by(|a, b| a.address.cmp(&b.address));
 
-                for node in targets {
-                    if node.project_address != current_project {
-                        if !current_project.is_empty() {
-                            println!();
+                    for node in targets {
+                        if node.project_address != current_project {
+                            if !current_project.is_empty() {
+                                println!();
+                            }
+                            current_project = node.project_address.clone();
+                            println!("{}", current_project);
                         }
-                        current_project = node.project_address.clone();
-                        println!("{}", current_project);
-                    }
-                    print!("  :{}", node.target_name);
-                    let deps = graph.dependencies(&node.address);
-                    if deps.is_empty() {
-                        println!();
-                    } else {
-                        let dep_strs: Vec<&str> = deps.iter().map(|d| d.address.as_str()).collect();
-                        println!(" -> [{}]", dep_strs.join(", "));
+                        print!("  :{}", node.target_name);
+                        let deps = graph.dependencies(&node.address);
+                        if deps.is_empty() {
+                            println!();
+                        } else {
+                            let dep_strs: Vec<&str> = deps.iter().map(|d| d.address.as_str()).collect();
+                            println!(" -> [{}]", dep_strs.join(", "));
+                        }
                     }
                 }
             }
@@ -145,14 +215,27 @@ fn run() -> Result<()> {
             }
 
             // Find path
-            match graph.find_path(&from, &to) {
-                Some(path) => {
-                    println!("{}", format_path(&path));
-                }
-                None => {
-                    println!("No dependency path found between {} and {}", from, to);
+            let path = graph.find_path(&from, &to);
+
+            if output_mode == OutputMode::Json {
+                let output = WhyOutput {
+                    from: from.clone(),
+                    to: to.clone(),
+                    path,
+                };
+                output_json(&output)?;
+            } else if output_mode != OutputMode::Quiet {
+                // Normal/Verbose: text output
+                match path {
+                    Some(p) => {
+                        println!("{}", format_path(&p));
+                    }
+                    None => {
+                        println!("No dependency path found between {} and {}", from, to);
+                    }
                 }
             }
+            // Quiet mode: no output for why
         }
         Commands::Affected {
             target,
@@ -175,8 +258,8 @@ fn run() -> Result<()> {
                     )
                 })?;
 
-            if cli.verbose {
-                eprintln!("Found {} changed files", changed_files.len());
+            if output_mode == OutputMode::Verbose {
+                eprintln!("[aster] Found {} changed files", changed_files.len());
                 for file in &changed_files {
                     eprintln!("  - {}", file.display());
                 }
@@ -185,8 +268,8 @@ fn run() -> Result<()> {
             // Map files to projects
             let directly_affected = files_to_projects(&changed_files, &projects);
 
-            if cli.verbose {
-                eprintln!("Directly affected: {:?}", directly_affected);
+            if output_mode == OutputMode::Verbose {
+                eprintln!("[aster] Directly affected: {:?}", directly_affected);
             }
 
             // Build the graph
@@ -222,9 +305,9 @@ fn run() -> Result<()> {
             // Sort by dependency order
             let ordered = graph.topological_order_subset(&affected_projects);
 
-            if cli.verbose {
+            if output_mode == OutputMode::Verbose {
                 eprintln!(
-                    "Running '{}' on {} affected projects",
+                    "[aster] Running '{}' on {} affected projects",
                     target,
                     ordered.len()
                 );
@@ -306,9 +389,9 @@ fn run() -> Result<()> {
             // Sort by dependency order
             let ordered = graph.topological_order_subset(&selected);
 
-            if cli.verbose {
+            if output_mode == OutputMode::Verbose {
                 eprintln!(
-                    "Running '{}' on {} projects",
+                    "[aster] Running '{}' on {} projects",
                     run_args.target,
                     ordered.len()
                 );
