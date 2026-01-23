@@ -111,6 +111,9 @@ impl<'a> Executor<'a> {
         // Compute DAG levels based on target dependencies
         let levels = compute_target_levels(&targets_to_run, &project_map);
 
+        // Set total count for progress display
+        progress.set_total(targets_to_run.len());
+
         let mut all_results = Vec::new();
 
         // Execute each level in parallel
@@ -119,6 +122,9 @@ impl<'a> Executor<'a> {
                 self.execute_target_level(&level, &project_map, &mut progress, show_progress);
             all_results.extend(level_results);
         }
+
+        // Finish the progress display
+        progress.finish();
 
         // Store logs (only in Normal mode)
         if self.output_mode == OutputMode::Normal {
@@ -170,10 +176,9 @@ impl<'a> Executor<'a> {
                         duration_ms: 0,
                     };
 
-                    // Mark as skipped in progress display
+                    // Mark as skipped in progress display (no spinner shown)
                     if show_progress {
-                        progress.add_running(target_addr);
-                        progress.mark_complete(target_addr, true, true, 0);
+                        progress.mark_skipped(target_addr);
                     }
 
                     let _ = tx.send(result);
