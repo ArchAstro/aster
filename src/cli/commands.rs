@@ -4,6 +4,8 @@
 
 use clap::{Parser, Subcommand};
 
+use super::output::OutputMode;
+
 /// Build orchestration for polyglot monorepos
 #[derive(Parser)]
 #[command(name = "aster")]
@@ -13,8 +15,31 @@ pub struct Cli {
     pub command: Commands,
 
     /// Enable verbose output
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "quiet")]
     pub verbose: bool,
+
+    /// Suppress per-project output, show only summary
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+
+    /// Output in JSON format for machine consumption
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+impl Cli {
+    /// Determine the output mode based on flags
+    pub fn output_mode(&self) -> OutputMode {
+        if self.json {
+            OutputMode::Json
+        } else if self.verbose {
+            OutputMode::Verbose
+        } else if self.quiet {
+            OutputMode::Quiet
+        } else {
+            OutputMode::Normal
+        }
+    }
 }
 
 /// Available commands
