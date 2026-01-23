@@ -9,8 +9,8 @@ use std::fs;
 use std::process::ExitCode;
 
 use aster::cli::{
-    build_execution_output, expand_selection, output_json, parse_run_args, print_summary,
-    select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectInfo, WhyOutput,
+    build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
+    print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectInfo, WhyOutput,
 };
 use aster::executor::logs::LogStore;
 use aster::config::find_workspace_root;
@@ -440,6 +440,11 @@ fn run() -> Result<()> {
 
             if run_args.target.is_empty() {
                 return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));
+            }
+
+            // Check for reserved command conflicts
+            if let Some(err_msg) = check_reserved_target(&run_args.target) {
+                return Err(anyhow::anyhow!("{}", err_msg));
             }
 
             // Build the graph

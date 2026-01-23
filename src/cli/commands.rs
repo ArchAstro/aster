@@ -10,6 +10,25 @@ use super::output::OutputMode;
 #[derive(Parser)]
 #[command(name = "aster")]
 #[command(version, about, long_about = None)]
+#[command(after_help = r#"RUNNING TARGETS:
+  Run any target (test, build, lint, etc.) on your projects:
+
+    aster test --all              Run tests on all projects
+    aster test //services/api     Run tests on specific project (+ dependencies)
+    aster build //a //b           Run build on multiple projects
+    aster lint .                  Run lint on project in current directory
+
+  Flags for target execution:
+    --all          Run on all projects in the workspace
+    --no-deps      Skip running dependencies first
+    --dependents   Also run projects that depend on selected ones
+
+EXAMPLES:
+    aster test --all                  # Test everything
+    aster test //libs/core            # Test core and its dependencies
+    aster test //libs/core --no-deps  # Test only core, skip dependencies
+    aster build //app --dependents    # Build app and everything that uses it
+    aster affected test --base=main   # Test projects changed since main"#)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

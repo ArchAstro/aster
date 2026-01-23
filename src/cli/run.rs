@@ -9,6 +9,11 @@ use std::path::Path;
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 
+/// Reserved command names that cannot be used as targets
+pub const RESERVED_COMMANDS: &[&str] = &[
+    "list", "graph", "why", "init", "affected", "logs", "help",
+];
+
 /// Parsed arguments for the run command
 #[derive(Debug, Clone)]
 pub struct RunArgs {
@@ -24,6 +29,22 @@ pub struct RunArgs {
     pub all: bool,
     /// Use current directory to find project (triggered by "." argument)
     pub use_cwd: bool,
+}
+
+/// Check if a target name conflicts with a reserved command
+///
+/// Returns an error message if the target is reserved, None otherwise.
+pub fn check_reserved_target(target: &str) -> Option<String> {
+    if RESERVED_COMMANDS.contains(&target) {
+        Some(format!(
+            "'{target}' is a reserved command. If you have a target named '{target}', \
+             rename it to avoid conflicts (e.g., 'run-{target}' or '{target}-all').\n\n\
+             Reserved commands: {}",
+            RESERVED_COMMANDS.join(", ")
+        ))
+    } else {
+        None
+    }
 }
 
 /// Parse external subcommand args into RunArgs
@@ -305,5 +326,24 @@ mod tests {
         assert_eq!(args.target, "test");
         assert!(args.projects.is_empty());
         assert!(args.use_cwd);
+    }
+
+    #[test]
+    fn test_check_reserved_target_allows_normal_targets() {
+        assert!(check_reserved_target("test").is_none());
+        assert!(check_reserved_target("build").is_none());
+        assert!(check_reserved_target("lint").is_none());
+        assert!(check_reserved_target("custom-target").is_none());
+    }
+
+    #[test]
+    fn test_check_reserved_target_blocks_reserved_commands() {
+        assert!(check_reserved_target("list").is_some());
+        assert!(check_reserved_target("graph").is_some());
+        assert!(check_reserved_target("why").is_some());
+        assert!(check_reserved_target("init").is_some());
+        assert!(check_reserved_target("affected").is_some());
+        assert!(check_reserved_target("logs").is_some());
+        assert!(check_reserved_target("help").is_some());
     }
 }
