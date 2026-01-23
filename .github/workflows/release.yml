@@ -110,19 +110,19 @@ jobs:
             on_macos do
               on_arm do
                 url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-arm64.tar.gz",
-                    using: :github_private_release
+                    using: GitHubPrivateRepositoryReleaseDownloadStrategy
                 sha256 "${SHA_DARWIN_ARM64}"
               end
               on_intel do
                 url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-x64.tar.gz",
-                    using: :github_private_release
+                    using: GitHubPrivateRepositoryReleaseDownloadStrategy
                 sha256 "${SHA_DARWIN_X64}"
               end
             end
 
             on_linux do
               url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-linux-x64.tar.gz",
-                  using: :github_private_release
+                  using: GitHubPrivateRepositoryReleaseDownloadStrategy
               sha256 "${SHA_LINUX_X64}"
             end
 
