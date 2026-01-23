@@ -46,14 +46,10 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    fn make_project(
-        name: &str,
-        relative_path: &str,
-        deps: Vec<(&str, &str)>,
-    ) -> DiscoveredProject {
+    fn make_project(name: &str, relative_path: &str, deps: Vec<(&str, &str)>) -> DiscoveredProject {
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
                 name: name.to_string(),
                 version: Some("1.0.0".to_string()),

@@ -7,12 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext};
+use super::{
+    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+};
 
 /// Regex to extract path from PEP 621 format: `pkg @ file:../path`
-static PEP621_FILE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\S+)\s*@\s*file:(.+)$").expect("Invalid PEP621_FILE_REGEX")
-});
+static PEP621_FILE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\S+)\s*@\s*file:(.+)$").expect("Invalid PEP621_FILE_REGEX"));
 
 /// Root structure for pyproject.toml
 #[derive(Deserialize, Default)]
@@ -189,7 +190,7 @@ impl LanguagePlugin for PythonPlugin {
         // - :build for each project dependency (they must be built first)
         let mut base_deps = vec!["//self:deps".to_string()];
         for dep_addr in &dependency_addresses {
-            base_deps.push(format!("{}:build", dep_addr));
+            base_deps.push(format!("{dep_addr}:build"));
         }
 
         // Check for pytest configuration
@@ -205,7 +206,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "pytest".to_string(),
                     depends_on: base_deps.clone(),
                     capabilities: test_caps,
-                files_glob: None,
+                    files_glob: None,
                 },
             );
         }
@@ -218,7 +219,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "python -m build".to_string(),
                     depends_on: base_deps.clone(),
                     capabilities: HashSet::new(),
-                files_glob: None,
+                    files_glob: None,
                 },
             );
         }
@@ -231,7 +232,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "ruff check .".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
-                files_glob: None,
+                    files_glob: None,
                 },
             );
         }
@@ -254,7 +255,10 @@ impl LanguagePlugin for PythonPlugin {
         let test_files: Vec<&PathBuf> = files
             .iter()
             .filter(|f| {
-                let name = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 let path_str = f.to_string_lossy();
                 name.starts_with("test_")
                     || name.ends_with("_test.py")
@@ -601,10 +605,22 @@ line-length = 100
         let ctx = make_context(&pyproject, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
-        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"python -m build".to_string()));
-        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"ruff check .".to_string()));
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"pytest".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"python -m build".to_string())
+        );
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"ruff check .".to_string())
+        );
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"pip install -e .".to_string())
+        );
 
         // Check dependencies
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
@@ -631,8 +647,14 @@ testpaths = ["tests"]
         let ctx = make_context(&pyproject, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"pytest".to_string())
+        );
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"pip install -e .".to_string())
+        );
         assert_eq!(targets.get("build"), None);
         assert_eq!(targets.get("lint"), None);
     }
@@ -657,7 +679,10 @@ version = "1.0.0"
 
         // deps is always present
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"pip install -e .".to_string())
+        );
     }
 
     #[test]
@@ -682,7 +707,10 @@ python = "^3.11"
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // Poetry projects use "poetry install" for deps
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"poetry install".to_string()));
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"poetry install".to_string())
+        );
     }
 
     #[test]
@@ -753,9 +781,13 @@ testpaths = ["tests"]
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         let test_target = targets.get("test").unwrap();
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
 
         let deps_target = targets.get("deps").unwrap();
-        assert!(!deps_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(!deps_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
     }
 }

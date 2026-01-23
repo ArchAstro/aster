@@ -83,8 +83,8 @@ mod tests {
 
     fn make_project(name: &str, relative_path: &str, deps: Vec<(&str, &str)>) -> DiscoveredProject {
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
                 name: name.to_string(),
                 version: Some("1.0.0".to_string()),
@@ -298,12 +298,10 @@ mod tests {
         let graph = build_graph(&projects).unwrap();
 
         // Both core and web are directly affected
-        let directly_affected: HashSet<String> = vec![
-            "//libs/core".to_string(),
-            "//services/web".to_string(),
-        ]
-        .into_iter()
-        .collect();
+        let directly_affected: HashSet<String> =
+            vec!["//libs/core".to_string(), "//services/web".to_string()]
+                .into_iter()
+                .collect();
 
         let result = affected_with_dependents(directly_affected, &graph);
 

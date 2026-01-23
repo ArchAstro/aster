@@ -12,12 +12,12 @@ pub mod ui;
 // Re-export core types for convenience
 pub use cli::{Cli, Commands};
 pub use discovery::{discover_projects, DiscoveredProject};
+pub use executor::{ExecutionResult, Executor};
+pub use git::AffectedDetector;
 pub use graph::{build_graph, find_cycle, CycleError, ProjectGraph, ProjectNode};
 pub use plugins::{
     ElixirPlugin, GoPlugin, LanguagePlugin, LocalDependency, NodeJsPlugin, PluginRegistry,
     ProjectMetadata, PythonPlugin,
 };
 pub use targets::TargetResolver;
-pub use executor::{ExecutionResult, Executor};
-pub use git::AffectedDetector;
 pub use ui::ProgressDisplay;

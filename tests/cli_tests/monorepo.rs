@@ -68,7 +68,7 @@ fn test_real_monorepo_discovery() {
 
     // Count discovered projects
     let project_count = stdout.lines().filter(|l| l.starts_with("//")).count();
-    eprintln!("Discovered {} projects in monorepo", project_count);
+    eprintln!("Discovered {project_count} projects in monorepo");
     assert!(project_count > 0, "Should discover at least one project");
 }
 
@@ -92,7 +92,8 @@ fn test_real_monorepo_list_json() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Vec<Value> = serde_json::from_str(&stdout).expect("Should produce valid JSON array");
+    let parsed: Vec<Value> =
+        serde_json::from_str(&stdout).expect("Should produce valid JSON array");
 
     eprintln!("Discovered {} projects via JSON", parsed.len());
     assert!(!parsed.is_empty(), "Should discover at least one project");
@@ -101,23 +102,19 @@ fn test_real_monorepo_list_json() {
     for project in &parsed {
         assert!(
             project.get("address").is_some(),
-            "Project missing 'address': {:?}",
-            project
+            "Project missing 'address': {project:?}"
         );
         assert!(
             project.get("path").is_some(),
-            "Project missing 'path': {:?}",
-            project
+            "Project missing 'path': {project:?}"
         );
         assert!(
             project.get("plugin").is_some(),
-            "Project missing 'plugin': {:?}",
-            project
+            "Project missing 'plugin': {project:?}"
         );
         assert!(
             project.get("targets").is_some(),
-            "Project missing 'targets': {:?}",
-            project
+            "Project missing 'targets': {project:?}"
         );
     }
 }
@@ -145,8 +142,7 @@ fn test_real_monorepo_graph_completes() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.to_lowercase().contains("cycle"),
-        "Graph detected a cycle: {}",
-        stderr
+        "Graph detected a cycle: {stderr}"
     );
 }
 
@@ -205,11 +201,10 @@ fn test_real_monorepo_affected_read_only() {
     // Should not fail with git errors
     assert!(
         !stderr.contains("Not in a git repository"),
-        "Should be in a git repo: {}",
-        stderr
+        "Should be in a git repo: {stderr}"
     );
 
-    eprintln!("Affected command output:\n{}", stdout);
+    eprintln!("Affected command output:\n{stdout}");
     if stdout.contains("No projects affected") {
         eprintln!("No uncommitted changes detected (expected)");
     }
@@ -239,8 +234,7 @@ fn test_real_monorepo_logs_command() {
     // Either shows "No previous run found" or a list of targets
     assert!(
         stdout.contains("No previous run found") || stdout.contains("Last run:"),
-        "Expected logs output: {}",
-        stdout
+        "Expected logs output: {stdout}"
     );
 }
 
@@ -287,18 +281,25 @@ fn test_real_monorepo_polyglot_detection() {
     // Collect plugin types
     let mut plugins: Vec<String> = parsed
         .iter()
-        .filter_map(|p| p.get("plugin").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|p| {
+            p.get("plugin")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
     plugins.sort();
     plugins.dedup();
 
-    eprintln!("Detected plugin types: {:?}", plugins);
+    eprintln!("Detected plugin types: {plugins:?}");
 
     // A polyglot monorepo should have multiple language types
     // (but we don't strictly require it - just informational)
     if plugins.len() > 1 {
-        eprintln!("Confirmed polyglot: {} different project types", plugins.len());
+        eprintln!(
+            "Confirmed polyglot: {} different project types",
+            plugins.len()
+        );
     } else {
-        eprintln!("Monorepo appears to be single-language: {:?}", plugins);
+        eprintln!("Monorepo appears to be single-language: {plugins:?}");
     }
 }

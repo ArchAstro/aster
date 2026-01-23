@@ -36,7 +36,7 @@ fn test_list_json_outputs_valid_json() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
 
     // Verify stdout is valid JSON array
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -75,7 +75,10 @@ fn test_list_json_empty_workspace() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Vec<Value> = serde_json::from_str(&stdout).expect("Should be valid JSON array");
 
-    assert!(parsed.is_empty(), "Expected empty array for empty workspace");
+    assert!(
+        parsed.is_empty(),
+        "Expected empty array for empty workspace"
+    );
 }
 
 #[test]
@@ -89,7 +92,7 @@ fn test_graph_json_outputs_valid_json() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
@@ -115,16 +118,11 @@ fn test_why_json_outputs_valid_json() {
     let mut cmd = Command::cargo_bin("aster").unwrap();
     let output = cmd
         .current_dir(tmp.path())
-        .args([
-            "--json",
-            "why",
-            "//services/api:deps",
-            "//libs/core:deps",
-        ])
+        .args(["--json", "why", "//services/api:deps", "//libs/core:deps"])
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
@@ -151,7 +149,7 @@ fn test_why_json_no_path_found() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
@@ -176,7 +174,7 @@ fn test_logs_json_no_previous_run() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should output empty object for no previous run
@@ -199,7 +197,10 @@ fn test_logs_json_specific_target_not_found() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command should succeed even for missing target");
+    assert!(
+        output.status.success(),
+        "Command should succeed even for missing target"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should output empty object for not found target
@@ -233,21 +234,15 @@ fn test_json_flag_produces_valid_json_for_all_commands() {
 
     for args in test_cases {
         let mut cmd = Command::cargo_bin("aster").unwrap();
-        let output = cmd
-            .current_dir(tmp.path())
-            .args(&args)
-            .output()
-            .unwrap();
+        let output = cmd.current_dir(tmp.path()).args(&args).output().unwrap();
 
         assert!(
             output.status.success(),
-            "Command {:?} failed: {:?}",
-            args,
-            output
+            "Command {args:?} failed: {output:?}"
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let _: Value = serde_json::from_str(&stdout)
-            .unwrap_or_else(|e| panic!("Command {:?} did not produce valid JSON: {}", args, e));
+            .unwrap_or_else(|e| panic!("Command {args:?} did not produce valid JSON: {e}"));
     }
 }

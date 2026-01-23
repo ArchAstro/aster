@@ -155,12 +155,7 @@ pub fn discover_projects(
         };
         let detected_targets = plugin
             .detect_targets(&target_ctx)
-            .with_context(|| {
-                format!(
-                    "Failed to detect targets from {}",
-                    config_path.display()
-                )
-            })?;
+            .with_context(|| format!("Failed to detect targets from {}", config_path.display()))?;
 
         // Resolve targets: detected + aster.toml overrides, resolving //self: references
         let targets = TargetResolver::resolve(&detected_targets, &custom_targets, &project_address);
@@ -225,7 +220,11 @@ mod tests {
         std::fs::create_dir_all(&services_dir).unwrap();
 
         let pkg_json = services_dir.join("package.json");
-        std::fs::write(&pkg_json, r#"{"name": "api", "version": "1.0.0", "scripts": {"test": "jest", "build": "tsc"}}"#).unwrap();
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "api", "version": "1.0.0", "scripts": {"test": "jest", "build": "tsc"}}"#,
+        )
+        .unwrap();
 
         // Create .git to mark workspace root (for gitignore handling)
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
@@ -257,7 +256,10 @@ mod tests {
 
         // Check that //self: references are resolved to project address
         let test_target = projects[0].targets.get("test").unwrap();
-        assert_eq!(test_target.depends_on, vec!["//services/api:deps".to_string()]);
+        assert_eq!(
+            test_target.depends_on,
+            vec!["//services/api:deps".to_string()]
+        );
     }
 
     #[test]
@@ -456,7 +458,12 @@ deploy = "npm run deploy"
             projects[0].targets.get("deploy").map(|t| &t.command),
             Some(&"npm run deploy".to_string())
         );
-        assert!(projects[0].targets.get("deploy").unwrap().depends_on.is_empty());
+        assert!(projects[0]
+            .targets
+            .get("deploy")
+            .unwrap()
+            .depends_on
+            .is_empty());
         // Total: test (detected) + deps (detected) + deploy (custom) = 3
         assert_eq!(projects[0].targets.len(), 3);
     }
@@ -617,25 +624,58 @@ line-length = 100
 
         // Verify Node.js targets (detected from scripts)
         let node_project = projects.iter().find(|p| p.plugin_name == "nodejs").unwrap();
-        assert_eq!(node_project.targets.get("test").map(|t| &t.command), Some(&"npm test".to_string()));
-        assert_eq!(node_project.targets.get("build").map(|t| &t.command), Some(&"npm run build".to_string()));
-        assert_eq!(node_project.targets.get("deps").map(|t| &t.command), Some(&"npm install".to_string()));
+        assert_eq!(
+            node_project.targets.get("test").map(|t| &t.command),
+            Some(&"npm test".to_string())
+        );
+        assert_eq!(
+            node_project.targets.get("build").map(|t| &t.command),
+            Some(&"npm run build".to_string())
+        );
+        assert_eq!(
+            node_project.targets.get("deps").map(|t| &t.command),
+            Some(&"npm install".to_string())
+        );
         // lint not in scripts, so not present
         assert_eq!(node_project.targets.get("lint"), None);
 
         // Verify Elixir targets (test/build/deps always, lint if credo present)
         let elixir_project = projects.iter().find(|p| p.plugin_name == "elixir").unwrap();
-        assert_eq!(elixir_project.targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
-        assert_eq!(elixir_project.targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
-        assert_eq!(elixir_project.targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
-        assert_eq!(elixir_project.targets.get("lint").map(|t| &t.command), Some(&"mix credo".to_string()));
+        assert_eq!(
+            elixir_project.targets.get("test").map(|t| &t.command),
+            Some(&"mix test".to_string())
+        );
+        assert_eq!(
+            elixir_project.targets.get("build").map(|t| &t.command),
+            Some(&"mix compile".to_string())
+        );
+        assert_eq!(
+            elixir_project.targets.get("deps").map(|t| &t.command),
+            Some(&"mix deps.get".to_string())
+        );
+        assert_eq!(
+            elixir_project.targets.get("lint").map(|t| &t.command),
+            Some(&"mix credo".to_string())
+        );
 
         // Verify Python targets (detected from config sections)
         let python_project = projects.iter().find(|p| p.plugin_name == "python").unwrap();
-        assert_eq!(python_project.targets.get("test").map(|t| &t.command), Some(&"pytest".to_string()));
-        assert_eq!(python_project.targets.get("build").map(|t| &t.command), Some(&"python -m build".to_string()));
-        assert_eq!(python_project.targets.get("deps").map(|t| &t.command), Some(&"pip install -e .".to_string()));
-        assert_eq!(python_project.targets.get("lint").map(|t| &t.command), Some(&"ruff check .".to_string()));
+        assert_eq!(
+            python_project.targets.get("test").map(|t| &t.command),
+            Some(&"pytest".to_string())
+        );
+        assert_eq!(
+            python_project.targets.get("build").map(|t| &t.command),
+            Some(&"python -m build".to_string())
+        );
+        assert_eq!(
+            python_project.targets.get("deps").map(|t| &t.command),
+            Some(&"pip install -e .".to_string())
+        );
+        assert_eq!(
+            python_project.targets.get("lint").map(|t| &t.command),
+            Some(&"ruff check .".to_string())
+        );
     }
 
     #[test]
@@ -676,9 +716,18 @@ end
         let project = &projects[0];
 
         // test, build, and deps always available
-        assert_eq!(project.targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
-        assert_eq!(project.targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
-        assert_eq!(project.targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        assert_eq!(
+            project.targets.get("test").map(|t| &t.command),
+            Some(&"mix test".to_string())
+        );
+        assert_eq!(
+            project.targets.get("build").map(|t| &t.command),
+            Some(&"mix compile".to_string())
+        );
+        assert_eq!(
+            project.targets.get("deps").map(|t| &t.command),
+            Some(&"mix deps.get".to_string())
+        );
         // lint NOT available (no credo)
         assert_eq!(project.targets.get("lint"), None);
     }

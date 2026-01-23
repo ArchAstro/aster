@@ -10,9 +10,8 @@ use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 
 /// Reserved command names that cannot be used as targets
-pub const RESERVED_COMMANDS: &[&str] = &[
-    "list", "graph", "why", "init", "affected", "logs", "help",
-];
+pub const RESERVED_COMMANDS: &[&str] =
+    &["list", "graph", "why", "init", "affected", "logs", "help"];
 
 /// Parsed arguments for the run command
 #[derive(Debug, Clone)]
@@ -141,7 +140,7 @@ pub fn select_projects<'a>(
                     }
                 }
             } else {
-                return Err(format!("Project not found: {}", addr));
+                return Err(format!("Project not found: {addr}"));
             }
         }
         return Ok(result);
@@ -173,7 +172,10 @@ pub fn select_projects<'a>(
 
     // No projects selected - return error or empty?
     // For usability, if no projects and no --all, show an error
-    Err("No projects specified. Use --all to run on all projects, or specify project addresses.".to_string())
+    Err(
+        "No projects specified. Use --all to run on all projects, or specify project addresses."
+            .to_string(),
+    )
 }
 
 /// Expand project selection based on flags

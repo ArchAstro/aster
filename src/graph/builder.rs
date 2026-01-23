@@ -86,7 +86,10 @@ pub fn build_graph(projects: &[DiscoveredProject]) -> anyhow::Result<ProjectGrap
 /// - Already an address: //libs/shared or //libs/shared:build
 /// - An absolute path: /workspace/libs/shared (from Node.js file: deps)
 /// - A relative file path: ../../libs/shared
-fn resolve_dependency_address(project: &DiscoveredProject, dep: &crate::plugins::LocalDependency) -> String {
+fn resolve_dependency_address(
+    project: &DiscoveredProject,
+    dep: &crate::plugins::LocalDependency,
+) -> String {
     let path_str = dep.path.to_string_lossy();
 
     // If it already looks like an address, use it (strip any target suffix)
@@ -184,7 +187,8 @@ impl ProjectGraph {
     pub fn topological_order(&self) -> Vec<&ProjectNode> {
         use petgraph::algo::toposort;
 
-        let sorted = toposort(&self.graph, None).expect("Graph has cycles - should have been checked");
+        let sorted =
+            toposort(&self.graph, None).expect("Graph has cycles - should have been checked");
 
         // toposort returns nodes in order where edges point forward,
         // but our edges point from dependent -> dependency,
@@ -194,7 +198,9 @@ impl ProjectGraph {
 
     /// Get a project node by address
     pub fn get(&self, address: &str) -> Option<&ProjectNode> {
-        self.index_by_address.get(address).map(|idx| &self.graph[*idx])
+        self.index_by_address
+            .get(address)
+            .map(|idx| &self.graph[*idx])
     }
 
     /// Get all project nodes
@@ -278,8 +284,8 @@ mod tests {
 
     fn make_project(name: &str, relative_path: &str, deps: Vec<(&str, &str)>) -> DiscoveredProject {
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
                 name: name.to_string(),
                 version: Some("1.0.0".to_string()),

@@ -120,7 +120,7 @@ impl TargetResolver {
         deps.iter()
             .map(|dep| {
                 if let Some(target_name) = dep.strip_prefix("//self:") {
-                    format!("{}:{}", project_address, target_name)
+                    format!("{project_address}:{target_name}")
                 } else {
                     dep.clone()
                 }
@@ -157,7 +157,12 @@ mod tests {
         TargetConfig::Simple(command.to_string())
     }
 
-    fn rich(command: &str, depends_on: Vec<&str>, capabilities: Vec<&str>, files_glob: Option<&str>) -> TargetConfig {
+    fn rich(
+        command: &str,
+        depends_on: Vec<&str>,
+        capabilities: Vec<&str>,
+        files_glob: Option<&str>,
+    ) -> TargetConfig {
         TargetConfig::Rich(RichTargetConfig {
             command: command.to_string(),
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
@@ -170,12 +175,21 @@ mod tests {
     fn test_detected_targets_only() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
-        detected.insert("build".to_string(), target("npm run build", vec!["//self:deps"]));
+        detected.insert(
+            "build".to_string(),
+            target("npm run build", vec!["//self:deps"]),
+        );
 
         let targets = TargetResolver::resolve(&detected, &HashMap::new(), "//apps/web");
 
-        assert_eq!(targets.get(TARGET_TEST).map(|t| &t.command), Some(&"npm test".to_string()));
-        assert_eq!(targets.get(TARGET_BUILD).map(|t| &t.command), Some(&"npm run build".to_string()));
+        assert_eq!(
+            targets.get(TARGET_TEST).map(|t| &t.command),
+            Some(&"npm test".to_string())
+        );
+        assert_eq!(
+            targets.get(TARGET_BUILD).map(|t| &t.command),
+            Some(&"npm run build".to_string())
+        );
         assert_eq!(targets.get(TARGET_LINT), None);
         assert_eq!(targets.len(), 2);
     }
@@ -197,7 +211,10 @@ mod tests {
     fn test_simple_override_preserves_depends_on() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
-        detected.insert("build".to_string(), target("npm run build", vec!["//self:deps"]));
+        detected.insert(
+            "build".to_string(),
+            target("npm run build", vec!["//self:deps"]),
+        );
 
         let mut custom = HashMap::new();
         custom.insert("test".to_string(), simple("npm run test:ci"));
@@ -210,7 +227,10 @@ mod tests {
         assert_eq!(test_target.depends_on, vec!["//apps/web:deps".to_string()]);
 
         // build keeps detected values
-        assert_eq!(targets.get(TARGET_BUILD).map(|t| &t.command), Some(&"npm run build".to_string()));
+        assert_eq!(
+            targets.get(TARGET_BUILD).map(|t| &t.command),
+            Some(&"npm run build".to_string())
+        );
     }
 
     #[test]
@@ -224,7 +244,10 @@ mod tests {
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
 
         // Detected target still there
-        assert_eq!(targets.get(TARGET_TEST).map(|t| &t.command), Some(&"npm test".to_string()));
+        assert_eq!(
+            targets.get(TARGET_TEST).map(|t| &t.command),
+            Some(&"npm test".to_string())
+        );
         // Custom target added with empty depends_on
         let deploy = targets.get("deploy").unwrap();
         assert_eq!(deploy.command, "npm run deploy");
@@ -256,7 +279,10 @@ mod tests {
     fn test_simple_completely_overrides_detected() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("pytest", vec!["//self:deps"]));
-        detected.insert("lint".to_string(), target("ruff check .", vec!["//self:deps"]));
+        detected.insert(
+            "lint".to_string(),
+            target("ruff check .", vec!["//self:deps"]),
+        );
 
         let mut custom = HashMap::new();
         custom.insert("test".to_string(), simple("python -m pytest --cov"));
@@ -266,11 +292,23 @@ mod tests {
         let targets = TargetResolver::resolve(&detected, &custom, "//libs/ml");
 
         // Commands are overridden
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"python -m pytest --cov".to_string()));
-        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"mypy .".to_string()));
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"python -m pytest --cov".to_string())
+        );
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"mypy .".to_string())
+        );
         // But depends_on is preserved for existing targets
-        assert_eq!(targets.get("test").unwrap().depends_on, vec!["//libs/ml:deps".to_string()]);
-        assert_eq!(targets.get("lint").unwrap().depends_on, vec!["//libs/ml:deps".to_string()]);
+        assert_eq!(
+            targets.get("test").unwrap().depends_on,
+            vec!["//libs/ml:deps".to_string()]
+        );
+        assert_eq!(
+            targets.get("lint").unwrap().depends_on,
+            vec!["//libs/ml:deps".to_string()]
+        );
         // New target has empty depends_on
         assert!(targets.get("typecheck").unwrap().depends_on.is_empty());
         assert_eq!(targets.len(), 3);
@@ -284,15 +322,25 @@ mod tests {
         let mut custom = HashMap::new();
         custom.insert(
             "test".to_string(),
-            rich("pytest {files}", vec!["//self:deps", "//libs/shared:build"], vec!["files_list"], Some("*_test.py")),
+            rich(
+                "pytest {files}",
+                vec!["//self:deps", "//libs/shared:build"],
+                vec!["files_list"],
+                Some("*_test.py"),
+            ),
         );
 
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
 
         let test_target = targets.get("test").unwrap();
         assert_eq!(test_target.command, "pytest {files}");
-        assert_eq!(test_target.depends_on, vec!["//apps/api:deps", "//libs/shared:build"]);
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(
+            test_target.depends_on,
+            vec!["//apps/api:deps", "//libs/shared:build"]
+        );
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
         assert_eq!(test_target.files_glob, Some("*_test.py".to_string()));
     }
 
@@ -300,7 +348,9 @@ mod tests {
     fn test_rich_target_preserves_unspecified_fields() {
         let mut detected = HashMap::new();
         let mut detected_target = target("npm test", vec!["//self:deps"]);
-        detected_target.capabilities.insert(TargetCapability::FilesList);
+        detected_target
+            .capabilities
+            .insert(TargetCapability::FilesList);
         detected_target.files_glob = Some("*.test.ts".to_string());
         detected.insert("test".to_string(), detected_target);
 
@@ -317,7 +367,9 @@ mod tests {
         assert_eq!(test_target.command, "npm run test:ci");
         // These should be preserved from detected
         assert_eq!(test_target.depends_on, vec!["//apps/web:deps".to_string()]);
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
         assert_eq!(test_target.files_glob, Some("*.test.ts".to_string()));
     }
 
@@ -328,15 +380,28 @@ mod tests {
         let mut custom = HashMap::new();
         custom.insert(
             "integration".to_string(),
-            rich("go test -tags=integration ./...", vec!["//self:build"], vec!["files_list"], Some("*_test.go")),
+            rich(
+                "go test -tags=integration ./...",
+                vec!["//self:build"],
+                vec!["files_list"],
+                Some("*_test.go"),
+            ),
         );
 
         let targets = TargetResolver::resolve(&detected, &custom, "//services/api");
 
         let integration_target = targets.get("integration").unwrap();
-        assert_eq!(integration_target.command, "go test -tags=integration ./...");
-        assert_eq!(integration_target.depends_on, vec!["//services/api:build".to_string()]);
-        assert!(integration_target.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(
+            integration_target.command,
+            "go test -tags=integration ./..."
+        );
+        assert_eq!(
+            integration_target.depends_on,
+            vec!["//services/api:build".to_string()]
+        );
+        assert!(integration_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
         assert_eq!(integration_target.files_glob, Some("*_test.go".to_string()));
     }
 
@@ -347,7 +412,12 @@ mod tests {
         let mut custom = HashMap::new();
         custom.insert(
             "test".to_string(),
-            rich("pytest", vec![], vec!["files_list", "unknown_cap", "another_unknown"], None),
+            rich(
+                "pytest",
+                vec![],
+                vec!["files_list", "unknown_cap", "another_unknown"],
+                None,
+            ),
         );
 
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
@@ -355,6 +425,8 @@ mod tests {
         let test_target = targets.get("test").unwrap();
         // Only files_list should be in capabilities
         assert_eq!(test_target.capabilities.len(), 1);
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
     }
 }

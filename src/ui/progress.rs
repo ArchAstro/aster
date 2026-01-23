@@ -102,7 +102,11 @@ impl ProgressDisplay {
         }
 
         if passed > 0 {
-            parts.push(format!("{} {}", style(passed).green(), style("passed").green()));
+            parts.push(format!(
+                "{} {}",
+                style(passed).green(),
+                style("passed").green()
+            ));
         }
 
         if failed > 0 {
@@ -177,7 +181,13 @@ impl ProgressDisplay {
     /// Updates counts and removes spinner. Behavior differs by mode:
     /// - Concise: Only failures shown briefly, passes/skips cleared silently
     /// - Verbose: Shows PASS/FAIL with duration for each target
-    pub fn mark_complete(&mut self, address: &str, success: bool, skipped: bool, duration_ms: u128) {
+    pub fn mark_complete(
+        &mut self,
+        address: &str,
+        success: bool,
+        skipped: bool,
+        duration_ms: u128,
+    ) {
         // Skipped items are handled by mark_skipped(), don't process again
         if skipped {
             return;
@@ -242,7 +252,7 @@ impl ProgressDisplay {
     /// Finish the progress display
     pub fn finish(&self) {
         // Clear any remaining spinners
-        for (_, pb) in &self.bars {
+        for pb in self.bars.values() {
             pb.finish_and_clear();
         }
 
@@ -277,13 +287,13 @@ impl ProgressDisplay {
 /// Format duration in human-readable form
 pub fn format_duration(duration_ms: u128) -> String {
     if duration_ms < 1000 {
-        format!("{}ms", duration_ms)
+        format!("{duration_ms}ms")
     } else if duration_ms < 60_000 {
         format!("{:.1}s", duration_ms as f64 / 1000.0)
     } else {
         let minutes = duration_ms / 60_000;
         let seconds = (duration_ms % 60_000) / 1000;
-        format!("{}m{}s", minutes, seconds)
+        format!("{minutes}m{seconds}s")
     }
 }
 

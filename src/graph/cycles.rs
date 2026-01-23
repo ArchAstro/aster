@@ -33,7 +33,8 @@ pub fn find_cycle(graph: &ProjectGraph) -> Option<CycleError> {
     // Try starting DFS from each unvisited node
     for node_idx in graph.graph.node_indices() {
         if !visited.contains(&node_idx) {
-            if let Some(cycle) = dfs_cycle(graph, node_idx, &mut visited, &mut rec_stack, &mut rec_set)
+            if let Some(cycle) =
+                dfs_cycle(graph, node_idx, &mut visited, &mut rec_stack, &mut rec_set)
             {
                 return Some(cycle);
             }
@@ -103,8 +104,8 @@ mod tests {
 
     fn make_project(name: &str, relative_path: &str, deps: Vec<(&str, &str)>) -> DiscoveredProject {
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
                 name: name.to_string(),
                 version: Some("1.0.0".to_string()),

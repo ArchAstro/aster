@@ -141,9 +141,9 @@ pub fn print_summary(
     if mode == OutputMode::Quiet {
         // Single line summary for quiet mode
         if failed > 0 {
-            eprintln!("{} passed, {} failed", passed, failed);
+            eprintln!("{passed} passed, {failed} failed");
         } else {
-            eprintln!("{} passed", passed);
+            eprintln!("{passed} passed");
         }
         return;
     }
@@ -152,16 +152,12 @@ pub fn print_summary(
     println!("\n=== Summary ===");
     if skipped > 0 {
         println!(
-            "Ran '{}' on {} {}: {} passed, {} failed, {} skipped (no target)",
-            target, total, context, passed, failed, skipped
+            "Ran '{target}' on {total} {context}: {passed} passed, {failed} failed, {skipped} skipped (no target)"
         );
     } else {
-        println!(
-            "Ran '{}' on {} {}: {} passed, {} failed",
-            target, total, context, passed, failed
-        );
+        println!("Ran '{target}' on {total} {context}: {passed} passed, {failed} failed");
     }
-    println!("Total time: {}ms", total_duration);
+    println!("Total time: {total_duration}ms");
 
     if failed > 0 {
         println!("\nFailed projects:");
@@ -252,10 +248,7 @@ mod tests {
     #[test]
     fn test_graph_output_serialization() {
         let mut edges = HashMap::new();
-        edges.insert(
-            "//a:test".to_string(),
-            vec!["//a:deps".to_string()],
-        );
+        edges.insert("//a:test".to_string(), vec!["//a:deps".to_string()]);
 
         let output = GraphOutput {
             nodes: vec!["//a:test".to_string(), "//a:deps".to_string()],
@@ -272,7 +265,11 @@ mod tests {
         let output = WhyOutput {
             from: "//a".to_string(),
             to: "//b".to_string(),
-            path: Some(vec!["//a".to_string(), "//c".to_string(), "//b".to_string()]),
+            path: Some(vec![
+                "//a".to_string(),
+                "//c".to_string(),
+                "//b".to_string(),
+            ]),
         };
 
         let json = serde_json::to_string(&output).unwrap();

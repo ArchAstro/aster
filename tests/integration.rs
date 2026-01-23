@@ -55,10 +55,16 @@ fn test_list_shows_projects() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("//services/api"), "Expected //services/api in output: {}", stdout);
-    assert!(stdout.contains("//libs/core"), "Expected //libs/core in output: {}", stdout);
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected //services/api in output: {stdout}"
+    );
+    assert!(
+        stdout.contains("//libs/core"),
+        "Expected //libs/core in output: {stdout}"
+    );
 }
 
 #[test]
@@ -90,7 +96,7 @@ fn test_graph_shows_all_projects() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("//libs/core"));
     assert!(stdout.contains("//services/api"));
@@ -101,7 +107,11 @@ fn test_graph_shows_dependencies() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
     // Core project needs a build script for dependencies to be visible
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "echo build"}}"#,
+    );
     // API depends on core and has scripts that trigger dependency resolution
     write_package_json(
         &tmp,
@@ -115,12 +125,18 @@ fn test_graph_shows_dependencies() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("//services/api"));
     // The graph shows target-level dependencies like: :build -> [//libs/core:build]
-    assert!(stdout.contains("-> ["), "Expected dependency arrow in output: {}", stdout);
-    assert!(stdout.contains("//libs/core:build"), "Expected //libs/core:build in dependencies: {}", stdout);
+    assert!(
+        stdout.contains("-> ["),
+        "Expected dependency arrow in output: {stdout}"
+    );
+    assert!(
+        stdout.contains("//libs/core:build"),
+        "Expected //libs/core:build in dependencies: {stdout}"
+    );
 }
 
 #[test]
@@ -128,7 +144,11 @@ fn test_graph_specific_target() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
     // Core project needs a build script for dependencies to be visible
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "echo build"}}"#,
+    );
     // API depends on core and has scripts
     write_package_json(
         &tmp,
@@ -143,12 +163,19 @@ fn test_graph_specific_target() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}\nstderr: {}", output, String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {:?}\nstderr: {}",
+        output,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("//services/api:build"));
     // Target shows its dependencies
-    assert!(stdout.contains("-> //libs/core:build") || stdout.contains("//libs/core:build"),
-        "Expected //libs/core:build in dependencies: {}", stdout);
+    assert!(
+        stdout.contains("-> //libs/core:build") || stdout.contains("//libs/core:build"),
+        "Expected //libs/core:build in dependencies: {stdout}"
+    );
 }
 
 #[test]
@@ -175,10 +202,18 @@ fn test_cycle_detection_fails() {
 
     // Create circular target dependency via aster.toml
     // Both projects need scripts so they have targets beyond just :deps
-    write_package_json(&tmp, "a/package.json", r#"{"name": "a", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "a/package.json",
+        r#"{"name": "a", "scripts": {"build": "echo build"}}"#,
+    );
     write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b:build"]"#);
 
-    write_package_json(&tmp, "b/package.json", r#"{"name": "b", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "b/package.json",
+        r#"{"name": "b", "scripts": {"build": "echo build"}}"#,
+    );
     write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//a:build"]"#);
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -187,12 +222,14 @@ fn test_cycle_detection_fails() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "Expected command to fail on cycle");
+    assert!(
+        !output.status.success(),
+        "Expected command to fail on cycle"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.to_lowercase().contains("cycle"),
-        "Expected 'cycle' in error message: {}",
-        stderr
+        "Expected 'cycle' in error message: {stderr}"
     );
 }
 
@@ -202,13 +239,25 @@ fn test_cycle_shows_path() {
     setup_workspace(&tmp);
 
     // Create a longer cycle at target level: a:build -> b:build -> c:build -> a:build
-    write_package_json(&tmp, "a/package.json", r#"{"name": "a", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "a/package.json",
+        r#"{"name": "a", "scripts": {"build": "echo build"}}"#,
+    );
     write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b:build"]"#);
 
-    write_package_json(&tmp, "b/package.json", r#"{"name": "b", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "b/package.json",
+        r#"{"name": "b", "scripts": {"build": "echo build"}}"#,
+    );
     write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//c:build"]"#);
 
-    write_package_json(&tmp, "c/package.json", r#"{"name": "c", "scripts": {"build": "echo build"}}"#);
+    write_package_json(
+        &tmp,
+        "c/package.json",
+        r#"{"name": "c", "scripts": {"build": "echo build"}}"#,
+    );
     write_aster_toml(&tmp, "c/aster.toml", r#"depends_on = ["//a:build"]"#);
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -222,8 +271,7 @@ fn test_cycle_shows_path() {
     // Check that the cycle path is shown with arrows
     assert!(
         stderr.contains("->"),
-        "Expected cycle path with arrows in error: {}",
-        stderr
+        "Expected cycle path with arrows in error: {stderr}"
     );
 }
 
@@ -260,8 +308,7 @@ fn test_not_in_workspace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("workspace") || stderr.contains("aster.toml") || stderr.contains(".git"),
-        "Expected workspace error message: {}",
-        stderr
+        "Expected workspace error message: {stderr}"
     );
 }
 
@@ -313,32 +360,28 @@ end
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify projects discovered
     assert!(
         stdout.contains("//libs/core"),
-        "Expected //libs/core in output: {}",
-        stdout
+        "Expected //libs/core in output: {stdout}"
     );
     assert!(
         stdout.contains("//services/api"),
-        "Expected //services/api in output: {}",
-        stdout
+        "Expected //services/api in output: {stdout}"
     );
 
     // Verify dependency is detected (target-level dependencies include full addresses)
     assert!(
         stdout.contains("//libs/core"),
-        "Expected //libs/core in dependency output: {}",
-        stdout
+        "Expected //libs/core in dependency output: {stdout}"
     );
     // The output shows target-level deps like: :build -> [//libs/core:build, ...]
     assert!(
         stdout.contains("->"),
-        "Expected dependency arrow in output: {}",
-        stdout
+        "Expected dependency arrow in output: {stdout}"
     );
 }
 
@@ -377,26 +420,23 @@ utils = {path = "../../libs/utils"}
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify projects discovered
     assert!(
         stdout.contains("//libs/utils"),
-        "Expected //libs/utils in output: {}",
-        stdout
+        "Expected //libs/utils in output: {stdout}"
     );
     assert!(
         stdout.contains("//services/ml"),
-        "Expected //services/ml in output: {}",
-        stdout
+        "Expected //services/ml in output: {stdout}"
     );
 
     // Verify dependency is detected (target-level dependencies include full addresses)
     assert!(
         stdout.contains("//libs/utils"),
-        "Expected //libs/utils in dependency output: {}",
-        stdout
+        "Expected //libs/utils in dependency output: {stdout}"
     );
 }
 
@@ -444,24 +484,21 @@ version = "1.0.0"
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify all three projects discovered
     assert!(
         stdout.contains("//services/api"),
-        "Expected Node.js project //services/api: {}",
-        stdout
+        "Expected Node.js project //services/api: {stdout}"
     );
     assert!(
         stdout.contains("//services/backend"),
-        "Expected Elixir project //services/backend: {}",
-        stdout
+        "Expected Elixir project //services/backend: {stdout}"
     );
     assert!(
         stdout.contains("//libs/ml"),
-        "Expected Python project //libs/ml: {}",
-        stdout
+        "Expected Python project //libs/ml: {stdout}"
     );
 }
 
@@ -522,28 +559,28 @@ version = "1.0.0"
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify all projects discovered
-    assert!(stdout.contains("//libs/shared"), "Expected //libs/shared: {}", stdout);
+    assert!(
+        stdout.contains("//libs/shared"),
+        "Expected //libs/shared: {stdout}"
+    );
     assert!(
         stdout.contains("//services/elixir-api"),
-        "Expected //services/elixir-api: {}",
-        stdout
+        "Expected //services/elixir-api: {stdout}"
     );
     assert!(
         stdout.contains("//services/python-api"),
-        "Expected //services/python-api: {}",
-        stdout
+        "Expected //services/python-api: {stdout}"
     );
 
     // Verify cross-language dependencies via aster.toml
     // The graph output shows target-level dependencies: :build -> [//libs/shared:build, ...]
     assert!(
         stdout.contains("//libs/shared:build"),
-        "Expected //libs/shared:build in dependency output: {}",
-        stdout
+        "Expected //libs/shared:build in dependency output: {stdout}"
     );
 }
 
@@ -610,8 +647,7 @@ fn test_affected_requires_git_repo() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("git") || stderr.contains("repository"),
-        "Expected git error message: {}",
-        stderr
+        "Expected git error message: {stderr}"
     );
 }
 
@@ -629,12 +665,11 @@ fn test_affected_no_changes() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("No projects affected"),
-        "Expected 'No projects affected': {}",
-        stdout
+        "Expected 'No projects affected': {stdout}"
     );
 }
 
@@ -647,11 +682,7 @@ fn test_affected_detects_uncommitted_changes() {
     git_commit(&tmp, "Initial commit");
 
     // Make uncommitted change to one project
-    fs::write(
-        tmp.path().join("services/api/new_file.txt"),
-        "new content",
-    )
-    .unwrap();
+    fs::write(tmp.path().join("services/api/new_file.txt"), "new content").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
@@ -666,14 +697,12 @@ fn test_affected_detects_uncommitted_changes() {
     // Should detect api as affected (has uncommitted file)
     assert!(
         stdout.contains("//services/api"),
-        "Expected //services/api in output: {}",
-        stdout
+        "Expected //services/api in output: {stdout}"
     );
     // Should NOT detect core (no changes)
     assert!(
         !stdout.contains("//libs/core"),
-        "Expected //libs/core NOT in output: {}",
-        stdout
+        "Expected //libs/core NOT in output: {stdout}"
     );
 }
 
@@ -707,14 +736,12 @@ fn test_affected_detects_committed_changes() {
     // Should detect core as affected
     assert!(
         stdout.contains("//libs/core"),
-        "Expected //libs/core in output: {}",
-        stdout
+        "Expected //libs/core in output: {stdout}"
     );
     // Should NOT detect api
     assert!(
         !stdout.contains("//services/api"),
-        "Expected //services/api NOT in output: {}",
-        stdout
+        "Expected //services/api NOT in output: {stdout}"
     );
 }
 
@@ -762,13 +789,11 @@ fn test_affected_with_dependents_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("//libs/core"),
-        "Expected //libs/core with --dependents: {}",
-        stdout
+        "Expected //libs/core with --dependents: {stdout}"
     );
     assert!(
         stdout.contains("//services/api"),
-        "Expected //services/api with --dependents: {}",
-        stdout
+        "Expected //services/api with --dependents: {stdout}"
     );
     assert!(stdout.contains("including dependents"));
 }
@@ -780,7 +805,7 @@ fn test_affected_help_shows_command() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--base"));
     assert!(stdout.contains("--head"));

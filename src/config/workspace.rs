@@ -43,7 +43,10 @@ mod tests {
 
         let result = find_workspace_root(root);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -56,7 +59,10 @@ mod tests {
 
         let result = find_workspace_root(root);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -71,7 +77,10 @@ mod tests {
         let result = find_workspace_root(root);
         assert!(result.is_some());
         // Should find it at root level (aster.toml checked first)
-        assert_eq!(result.unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -88,7 +97,10 @@ mod tests {
 
         let result = find_workspace_root(&nested);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
     }
 
     #[test]

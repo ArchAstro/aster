@@ -32,28 +32,24 @@ impl AffectedDetector {
     /// Get files changed between two git refs
     ///
     /// Returns paths relative to the repository root.
-    pub fn changed_files_between_refs(
-        &self,
-        base: &str,
-        head: &str,
-    ) -> Result<HashSet<PathBuf>> {
+    pub fn changed_files_between_refs(&self, base: &str, head: &str) -> Result<HashSet<PathBuf>> {
         let base_obj = self
             .repo
             .revparse_single(base)
-            .with_context(|| format!("Git ref '{}' not found. Check your --base value.", base))?;
+            .with_context(|| format!("Git ref '{base}' not found. Check your --base value."))?;
 
         let head_obj = self
             .repo
             .revparse_single(head)
-            .with_context(|| format!("Git ref '{}' not found. Check your --head value.", head))?;
+            .with_context(|| format!("Git ref '{head}' not found. Check your --head value."))?;
 
         let base_tree = base_obj
             .peel_to_tree()
-            .with_context(|| format!("Could not get tree for ref '{}'", base))?;
+            .with_context(|| format!("Could not get tree for ref '{base}'"))?;
 
         let head_tree = head_obj
             .peel_to_tree()
-            .with_context(|| format!("Could not get tree for ref '{}'", head))?;
+            .with_context(|| format!("Could not get tree for ref '{head}'"))?;
 
         let mut opts = DiffOptions::new();
         let diff = self
@@ -108,11 +104,7 @@ impl AffectedDetector {
     ///
     /// This matches Nx default behavior where uncommitted changes are included
     /// unless an explicit head ref is specified.
-    pub fn all_affected_files(
-        &self,
-        base: &str,
-        head: Option<&str>,
-    ) -> Result<HashSet<PathBuf>> {
+    pub fn all_affected_files(&self, base: &str, head: Option<&str>) -> Result<HashSet<PathBuf>> {
         match head {
             Some(head_ref) => {
                 // Only compare committed changes between refs
@@ -133,8 +125,8 @@ impl AffectedDetector {
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::TempDir;
     use std::process::Command;
+    use tempfile::TempDir;
 
     /// Helper to create a git repo with initial commit
     fn setup_git_repo(tmp: &TempDir) {
@@ -272,9 +264,7 @@ mod tests {
         let detector = AffectedDetector::new(path).unwrap();
 
         // With explicit head, should NOT include uncommitted
-        let changes = detector
-            .all_affected_files("HEAD~1", Some("HEAD"))
-            .unwrap();
+        let changes = detector.all_affected_files("HEAD~1", Some("HEAD")).unwrap();
 
         assert!(changes.contains(&PathBuf::from("feature.txt")));
         assert!(!changes.contains(&PathBuf::from("uncommitted.txt")));

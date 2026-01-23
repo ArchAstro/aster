@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext};
+use super::{
+    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+};
 
 /// Regex to extract app name from `app: :name` in mix.exs project definition
-static APP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"app:\s*:(\w+)").expect("Invalid APP_REGEX")
-});
+static APP_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"app:\s*:(\w+)").expect("Invalid APP_REGEX"));
 
 /// Regex to match path dependencies: `{:name, path: "../path"}`
 /// Also handles optional in_umbrella: true at the end
@@ -84,7 +85,7 @@ impl LanguagePlugin for ElixirPlugin {
             // in_umbrella: true implies the sibling is in ../name relative to current app
             deps.push(LocalDependency {
                 name: name.to_string(),
-                path: PathBuf::from(format!("../{}", name)),
+                path: PathBuf::from(format!("../{name}")),
             });
         }
 
@@ -116,7 +117,7 @@ impl LanguagePlugin for ElixirPlugin {
         // - :build for each project dependency (they must be built first)
         let mut base_deps = vec!["//self:deps".to_string()];
         for dep_addr in &dependency_addresses {
-            base_deps.push(format!("{}:build", dep_addr));
+            base_deps.push(format!("{dep_addr}:build"));
         }
 
         // mix test and mix compile are always available for Elixir projects
@@ -149,7 +150,7 @@ impl LanguagePlugin for ElixirPlugin {
                     command: "mix credo".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
-                files_glob: None,
+                    files_glob: None,
                 },
             );
         }
@@ -172,7 +173,10 @@ impl LanguagePlugin for ElixirPlugin {
         let test_files: Vec<&PathBuf> = files
             .iter()
             .filter(|f| {
-                let name = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 let path_str = f.to_string_lossy();
                 name.ends_with("_test.exs") || path_str.contains("test/")
             })
@@ -529,15 +533,30 @@ end
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // test, build, deps always available
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
-        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"mix test".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"mix compile".to_string())
+        );
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"mix deps.get".to_string())
+        );
         // lint available because credo is a dependency
-        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"mix credo".to_string()));
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"mix credo".to_string())
+        );
 
         // Check dependencies
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
-        assert_eq!(targets.get("build").unwrap().depends_on, vec!["//self:deps"]);
+        assert_eq!(
+            targets.get("build").unwrap().depends_on,
+            vec!["//self:deps"]
+        );
         assert!(targets.get("deps").unwrap().depends_on.is_empty());
     }
 
@@ -568,9 +587,18 @@ end
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // test, build, deps always available
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"mix test".to_string()));
-        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"mix compile".to_string()));
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"mix deps.get".to_string()));
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"mix test".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"mix compile".to_string())
+        );
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"mix deps.get".to_string())
+        );
         // lint NOT available (no credo)
         assert_eq!(targets.get("lint"), None);
     }
@@ -642,12 +670,18 @@ end
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         let test_target = targets.get("test").unwrap();
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
 
         let deps_target = targets.get("deps").unwrap();
-        assert!(!deps_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(!deps_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
 
         let build_target = targets.get("build").unwrap();
-        assert!(!build_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(!build_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
     }
 }

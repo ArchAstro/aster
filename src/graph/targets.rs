@@ -44,7 +44,7 @@ pub fn build_target_graph(projects: &[DiscoveredProject]) -> TargetGraph {
         let project_address = format!("//{}", project.relative_path.display());
 
         for (target_name, target) in &project.targets {
-            let target_address = format!("{}:{}", project_address, target_name);
+            let target_address = format!("{project_address}:{target_name}");
 
             let node = TargetNode {
                 address: target_address.clone(),
@@ -63,7 +63,7 @@ pub fn build_target_graph(projects: &[DiscoveredProject]) -> TargetGraph {
         let project_address = format!("//{}", project.relative_path.display());
 
         for (target_name, target) in &project.targets {
-            let from_address = format!("{}:{}", project_address, target_name);
+            let from_address = format!("{project_address}:{target_name}");
 
             if let Some(&from_idx) = index_by_address.get(&from_address) {
                 for dep_address in &target.depends_on {
@@ -129,13 +129,7 @@ impl TargetGraph {
         let from_idx = self.index_by_address.get(from)?;
         let to_idx = self.index_by_address.get(to)?;
 
-        let result = astar(
-            &self.graph,
-            *from_idx,
-            |node| node == *to_idx,
-            |_| 1,
-            |_| 0,
-        );
+        let result = astar(&self.graph, *from_idx, |node| node == *to_idx, |_| 1, |_| 0);
 
         result.map(|(_, path)| {
             path.iter()
@@ -199,7 +193,7 @@ impl std::fmt::Display for CycleError {
             if i > 0 {
                 write!(f, " -> ")?;
             }
-            write!(f, "{}", addr)?;
+            write!(f, "{addr}")?;
         }
         write!(f, " -> {}", self.cycle[0])
     }
@@ -215,12 +209,12 @@ mod tests {
         relative_path: &str,
         targets: Vec<(&str, &str, Vec<&str>)>,
     ) -> DiscoveredProject {
-        let project_address = format!("//{}", relative_path);
+        let project_address = format!("//{relative_path}");
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
-                name: relative_path.split('/').last().unwrap().to_string(),
+                name: relative_path.split('/').next_back().unwrap().to_string(),
                 version: Some("1.0.0".to_string()),
             },
             dependencies: vec![],
@@ -303,7 +297,11 @@ mod tests {
                 "services/api",
                 vec![
                     ("deps", "npm install", vec![]),
-                    ("build", "npm run build", vec!["//self:deps", "//libs/core:build"]),
+                    (
+                        "build",
+                        "npm run build",
+                        vec!["//self:deps", "//libs/core:build"],
+                    ),
                     ("test", "npm test", vec!["//self:deps", "//libs/core:build"]),
                 ],
             ),

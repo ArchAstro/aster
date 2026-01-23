@@ -6,17 +6,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext};
+use super::{
+    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+};
 
 /// Regex to extract module path from go.mod: `module github.com/user/project`
-static MODULE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^module\s+(\S+)").expect("Invalid MODULE_REGEX")
-});
+static MODULE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^module\s+(\S+)").expect("Invalid MODULE_REGEX"));
 
 /// Regex to extract local replace directives: `replace old => ../path`
 /// Captures: (1) module being replaced, (2) local path (starting with . or /)
 static REPLACE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^replace\s+(\S+)(?:\s+\S+)?\s+=>\s+(\.\.?[^\s]+|/[^\s]+)").expect("Invalid REPLACE_REGEX")
+    Regex::new(r"(?m)^replace\s+(\S+)(?:\s+\S+)?\s+=>\s+(\.\.?[^\s]+|/[^\s]+)")
+        .expect("Invalid REPLACE_REGEX")
 });
 
 /// Go plugin for discovering and parsing Go modules
@@ -48,11 +50,7 @@ impl LanguagePlugin for GoPlugin {
 
         // Extract just the last component of the module path as the project name
         // e.g., "github.com/user/myproject" -> "myproject"
-        let short_name = name
-            .rsplit('/')
-            .next()
-            .unwrap_or(&name)
-            .to_string();
+        let short_name = name.rsplit('/').next().unwrap_or(&name).to_string();
 
         Ok(ProjectMetadata {
             name: short_name,
@@ -102,7 +100,7 @@ impl LanguagePlugin for GoPlugin {
         // - :build for each project dependency (they must be built first)
         let mut base_deps = vec!["//self:deps".to_string()];
         for dep_addr in &dependency_addresses {
-            base_deps.push(format!("{}:build", dep_addr));
+            base_deps.push(format!("{dep_addr}:build"));
         }
 
         // build target: compile all packages
@@ -130,7 +128,12 @@ impl LanguagePlugin for GoPlugin {
         );
 
         // lint target: only if golangci-lint config exists
-        let lint_configs = [".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json"];
+        let lint_configs = [
+            ".golangci.yml",
+            ".golangci.yaml",
+            ".golangci.toml",
+            ".golangci.json",
+        ];
         let has_lint_config = lint_configs
             .iter()
             .any(|config| ctx.project_dir.join(config).exists());
@@ -142,7 +145,7 @@ impl LanguagePlugin for GoPlugin {
                     command: "golangci-lint run".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
-                files_glob: None,
+                    files_glob: None,
                 },
             );
         }
@@ -165,7 +168,10 @@ impl LanguagePlugin for GoPlugin {
         let test_files: Vec<&PathBuf> = files
             .iter()
             .filter(|f| {
-                let name = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 name.ends_with("_test.go")
             })
             .collect();
@@ -179,10 +185,7 @@ impl LanguagePlugin for GoPlugin {
         // Go test runs on packages (directories), not individual files
         let mut test_dirs: Vec<String> = test_files
             .iter()
-            .filter_map(|f| {
-                f.parent()
-                    .map(|p| format!("./{}", p.display()))
-            })
+            .filter_map(|f| f.parent().map(|p| format!("./{}", p.display())))
             .collect();
         test_dirs.sort();
         test_dirs.dedup();
@@ -406,14 +409,26 @@ go 1.21
         let ctx = make_context(&go_mod, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        assert_eq!(targets.get("deps").map(|t| &t.command), Some(&"go mod download".to_string()));
-        assert_eq!(targets.get("build").map(|t| &t.command), Some(&"go build ./...".to_string()));
-        assert_eq!(targets.get("test").map(|t| &t.command), Some(&"go test ./...".to_string()));
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"go mod download".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"go build ./...".to_string())
+        );
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"go test ./...".to_string())
+        );
         assert!(targets.get("lint").is_none()); // No lint config
 
         // Check dependencies
         assert!(targets.get("deps").unwrap().depends_on.is_empty());
-        assert_eq!(targets.get("build").unwrap().depends_on, vec!["//self:deps"]);
+        assert_eq!(
+            targets.get("build").unwrap().depends_on,
+            vec!["//self:deps"]
+        );
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
     }
 
@@ -431,13 +446,20 @@ go 1.21
         .unwrap();
 
         // Create golangci-lint config
-        std::fs::write(tmp.path().join(".golangci.yml"), "linters:\n  enable:\n    - gofmt\n").unwrap();
+        std::fs::write(
+            tmp.path().join(".golangci.yml"),
+            "linters:\n  enable:\n    - gofmt\n",
+        )
+        .unwrap();
 
         let plugin = GoPlugin;
         let ctx = make_context(&go_mod, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        assert_eq!(targets.get("lint").map(|t| &t.command), Some(&"golangci-lint run".to_string()));
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"golangci-lint run".to_string())
+        );
     }
 
     #[test]
@@ -544,9 +566,13 @@ go 1.21
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         let test_target = targets.get("test").unwrap();
-        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
 
         let build_target = targets.get("build").unwrap();
-        assert!(!build_target.capabilities.contains(&TargetCapability::FilesList));
+        assert!(!build_target
+            .capabilities
+            .contains(&TargetCapability::FilesList));
     }
 }

@@ -107,7 +107,8 @@ impl<'a> Executor<'a> {
         // Determine if we should show progress spinners
         // Show in Normal or Verbose mode when stderr is a terminal
         let is_terminal = std::io::stderr().is_terminal();
-        let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose) && is_terminal;
+        let show_progress =
+            matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose) && is_terminal;
         let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 
@@ -124,7 +125,7 @@ impl<'a> Executor<'a> {
         let mut targets_to_run: HashSet<String> = HashSet::new();
         for project in projects {
             let project_addr = format!("//{}", project.relative_path.display());
-            let target_addr = format!("{}:{}", project_addr, target);
+            let target_addr = format!("{project_addr}:{target}");
 
             // Add the requested target
             targets_to_run.insert(target_addr.clone());
@@ -143,8 +144,13 @@ impl<'a> Executor<'a> {
 
         // Execute each level in parallel
         for level in levels {
-            let level_results =
-                self.execute_target_level(&level, &project_map, &mut progress, show_progress, command_overrides);
+            let level_results = self.execute_target_level(
+                &level,
+                &project_map,
+                &mut progress,
+                show_progress,
+                command_overrides,
+            );
             all_results.extend(level_results);
         }
 
@@ -203,7 +209,7 @@ impl<'a> Executor<'a> {
                                 address: target_addr.clone(),
                                 success: true,
                                 skipped: true,
-                                output: format!("Skipped: no '{}' target defined", target_name),
+                                output: format!("Skipped: no '{target_name}' target defined"),
                                 duration_ms: 0,
                             };
                             if show_progress {
@@ -223,7 +229,7 @@ impl<'a> Executor<'a> {
                             address: target_addr.clone(),
                             success: true, // Not an error, just skipped
                             skipped: true,
-                            output: format!("Skipped: no '{}' target defined", target_name),
+                            output: format!("Skipped: no '{target_name}' target defined"),
                             duration_ms: 0,
                         };
                         if show_progress {
@@ -260,7 +266,12 @@ impl<'a> Executor<'a> {
         let mut results = Vec::new();
         for result in rx.iter() {
             if show_progress {
-                progress.mark_complete(&result.address, result.success, result.skipped, result.duration_ms);
+                progress.mark_complete(
+                    &result.address,
+                    result.success,
+                    result.skipped,
+                    result.duration_ms,
+                );
             }
             results.push(result);
         }
@@ -305,13 +316,16 @@ impl<'a> Executor<'a> {
         };
 
         if let Err(e) = log_store.store(&run_log) {
-            eprintln!("[aster] Warning: Failed to store logs: {}", e);
+            eprintln!("[aster] Warning: Failed to store logs: {e}");
         }
     }
 
     /// Print failure details for failed targets
     fn print_failure_details(&self, results: &[ExecutionResult], progress: &ProgressDisplay) {
-        let failed: Vec<_> = results.iter().filter(|r| !r.success && !r.skipped).collect();
+        let failed: Vec<_> = results
+            .iter()
+            .filter(|r| !r.success && !r.skipped)
+            .collect();
 
         if failed.is_empty() {
             return;
@@ -330,7 +344,7 @@ impl<'a> Executor<'a> {
             if progress.is_enabled() {
                 progress.println(&header);
             } else {
-                eprintln!("{}", header);
+                eprintln!("{header}");
             }
 
             // Print last 10-15 lines of output (indented)
@@ -342,23 +356,27 @@ impl<'a> Executor<'a> {
             };
 
             for line in tail_lines {
-                let indented = format!("    {}", line);
+                let indented = format!("    {line}");
                 if progress.is_enabled() {
                     progress.println(&indented);
                 } else {
-                    eprintln!("{}", indented);
+                    eprintln!("{indented}");
                 }
             }
 
             // Print hint for full output
             let hint = format!(
                 "    {}",
-                style(format!("Run `aster logs {}` for full output", result.address)).dim()
+                style(format!(
+                    "Run `aster logs {}` for full output",
+                    result.address
+                ))
+                .dim()
             );
             if progress.is_enabled() {
                 progress.println(&hint);
             } else {
-                eprintln!("{}", hint);
+                eprintln!("{hint}");
             }
         }
     }
@@ -543,7 +561,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
             address: address.to_string(),
             success: false,
             skipped: false,
-            output: format!("Failed to execute command: {}", e),
+            output: format!("Failed to execute command: {e}"),
             duration_ms,
         },
     }
@@ -571,8 +589,8 @@ mod tests {
         targets: HashMap<String, Target>,
     ) -> DiscoveredProject {
         DiscoveredProject {
-            root: PathBuf::from(format!("/workspace/{}", relative_path)),
-            config_path: PathBuf::from(format!("/workspace/{}/package.json", relative_path)),
+            root: PathBuf::from(format!("/workspace/{relative_path}")),
+            config_path: PathBuf::from(format!("/workspace/{relative_path}/package.json")),
             metadata: ProjectMetadata {
                 name: relative_path.to_string(),
                 version: Some("1.0.0".to_string()),
@@ -675,7 +693,10 @@ mod tests {
     fn test_collect_target_deps() {
         let mut targets = HashMap::new();
         targets.insert("deps".to_string(), target("npm install", vec![]));
-        targets.insert("build".to_string(), target("npm run build", vec!["//a:deps"]));
+        targets.insert(
+            "build".to_string(),
+            target("npm run build", vec!["//a:deps"]),
+        );
         targets.insert("test".to_string(), target("npm test", vec!["//a:build"]));
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
@@ -698,9 +719,15 @@ mod tests {
         // deps -> build and lint -> test (test depends on both build and lint)
         let mut targets = HashMap::new();
         targets.insert("deps".to_string(), target("npm install", vec![]));
-        targets.insert("build".to_string(), target("npm run build", vec!["//a:deps"]));
+        targets.insert(
+            "build".to_string(),
+            target("npm run build", vec!["//a:deps"]),
+        );
         targets.insert("lint".to_string(), target("npm run lint", vec!["//a:deps"]));
-        targets.insert("test".to_string(), target("npm test", vec!["//a:build", "//a:lint"]));
+        targets.insert(
+            "test".to_string(),
+            target("npm test", vec!["//a:build", "//a:lint"]),
+        );
         let project = make_project_with_targets("a", targets);
         let projects = vec![project];
 

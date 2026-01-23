@@ -13,13 +13,15 @@ use aster::cli::{
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
     ProjectInfo, WhyOutput,
 };
-use aster::executor::logs::LogStore;
 use aster::config::find_workspace_root;
 use aster::discovery::{discover_projects, DiscoveredProject};
+use aster::executor::logs::LogStore;
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
-use aster::plugins::{ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability};
+use aster::plugins::{
+    ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability,
+};
 use globset::{Glob, GlobMatcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,8 +48,9 @@ fn run() -> Result<()> {
     }
 
     // For all other commands, require a workspace
-    let workspace_root = find_workspace_root(&cwd)
-        .context("Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.")?;
+    let workspace_root = find_workspace_root(&cwd).context(
+        "Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.",
+    )?;
 
     if output_mode == OutputMode::Verbose {
         eprintln!("[aster] Workspace root: {}", workspace_root.display());
@@ -61,8 +64,8 @@ fn run() -> Result<()> {
     registry.register(Box::new(GoPlugin));
 
     // Discover projects
-    let projects = discover_projects(&workspace_root, &registry)
-        .context("Failed to discover projects")?;
+    let projects =
+        discover_projects(&workspace_root, &registry).context("Failed to discover projects")?;
 
     if output_mode == OutputMode::Verbose {
         eprintln!("[aster] Discovered {} projects", projects.len());
@@ -181,7 +184,8 @@ fn run() -> Result<()> {
 
                     for node in graph.targets() {
                         let deps = graph.dependencies(&node.address);
-                        let dep_addrs: Vec<String> = deps.iter().map(|d| d.address.clone()).collect();
+                        let dep_addrs: Vec<String> =
+                            deps.iter().map(|d| d.address.clone()).collect();
                         edges.insert(node.address.clone(), dep_addrs);
                     }
 
@@ -216,14 +220,15 @@ fn run() -> Result<()> {
                                 println!();
                             }
                             current_project = node.project_address.clone();
-                            println!("{}", current_project);
+                            println!("{current_project}");
                         }
                         print!("  :{}", node.target_name);
                         let deps = graph.dependencies(&node.address);
                         if deps.is_empty() {
                             println!();
                         } else {
-                            let dep_strs: Vec<&str> = deps.iter().map(|d| d.address.as_str()).collect();
+                            let dep_strs: Vec<&str> =
+                                deps.iter().map(|d| d.address.as_str()).collect();
                             println!(" -> [{}]", dep_strs.join(", "));
                         }
                     }
@@ -236,10 +241,10 @@ fn run() -> Result<()> {
 
             // Validate targets exist
             if graph.get(&from).is_none() {
-                return Err(anyhow::anyhow!("Target not found: {}", from));
+                return Err(anyhow::anyhow!("Target not found: {from}"));
             }
             if graph.get(&to).is_none() {
-                return Err(anyhow::anyhow!("Target not found: {}", to));
+                return Err(anyhow::anyhow!("Target not found: {to}"));
             }
 
             // Find path
@@ -259,7 +264,7 @@ fn run() -> Result<()> {
                         println!("{}", format_path(&p));
                     }
                     None => {
-                        println!("No dependency path found between {} and {}", from, to);
+                        println!("No dependency path found between {from} and {to}");
                     }
                 }
             }
@@ -381,7 +386,7 @@ fn run() -> Result<()> {
             let directly_affected = files_to_projects(&changed_files, &projects);
 
             if output_mode == OutputMode::Verbose {
-                eprintln!("[aster] Directly affected: {:?}", directly_affected);
+                eprintln!("[aster] Directly affected: {directly_affected:?}");
             }
 
             // Build the graph
@@ -432,18 +437,16 @@ fn run() -> Result<()> {
 
             // Print affected projects list (unless quiet or json without dry_run)
             if output_mode != OutputMode::Quiet && (output_mode != OutputMode::Json || dry_run) {
-                if output_mode != OutputMode::Json {
-                    println!(
-                        "Affected projects ({}):",
-                        if dependents {
-                            "including dependents"
-                        } else {
-                            "directly affected only"
-                        }
-                    );
-                    for p in &ordered {
-                        println!("  //{}", p.relative_path.display());
+                println!(
+                    "Affected projects ({}):",
+                    if dependents {
+                        "including dependents"
+                    } else {
+                        "directly affected only"
                     }
+                );
+                for p in &ordered {
+                    println!("  //{}", p.relative_path.display());
                 }
             }
 
@@ -481,7 +484,10 @@ fn run() -> Result<()> {
                         .map(|p| {
                             let addr = format!("//{}", p.relative_path.display());
                             let files = files_per_project.get(&addr).cloned().unwrap_or_default();
-                            AffectedProject { address: addr, files }
+                            AffectedProject {
+                                address: addr,
+                                files,
+                            }
                         })
                         .collect();
                     let output = DryRunOutput {
@@ -498,10 +504,10 @@ fn run() -> Result<()> {
                     println!();
                     for project in &ordered {
                         let addr = format!("//{}", project.relative_path.display());
-                        println!("  {}", addr);
+                        println!("  {addr}");
                         if let Some(files) = files_per_project.get(&addr) {
                             for file in files {
-                                println!("    - {}", file);
+                                println!("    - {file}");
                             }
                         }
                     }
@@ -524,11 +530,14 @@ fn run() -> Result<()> {
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
-                    let target_addr = format!("{}:{}", project_addr, target);
+                    let target_addr = format!("{project_addr}:{target}");
 
                     // Check if target has FilesList capability
                     if let Some(target_def) = project.targets.get(&target) {
-                        if target_def.capabilities.contains(&TargetCapability::FilesList) {
+                        if target_def
+                            .capabilities
+                            .contains(&TargetCapability::FilesList)
+                        {
                             // Get files that belong to this project
                             let project_files: Vec<PathBuf> = changed_files
                                 .iter()
@@ -556,7 +565,10 @@ fn run() -> Result<()> {
                 }
 
                 if output_mode == OutputMode::Verbose && !command_overrides.is_empty() {
-                    eprintln!("[aster] Using modified commands for {} targets", command_overrides.len());
+                    eprintln!(
+                        "[aster] Using modified commands for {} targets",
+                        command_overrides.len()
+                    );
                 }
 
                 executor.execute_with_command_overrides(&target, &ordered, &command_overrides)
@@ -575,7 +587,7 @@ fn run() -> Result<()> {
             // Return error if any failed (for exit code)
             let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
-                return Err(anyhow::anyhow!("{} project(s) failed", failed));
+                return Err(anyhow::anyhow!("{failed} project(s) failed"));
             }
         }
         Commands::Run { targets, no_deps } => {
@@ -593,9 +605,9 @@ fn run() -> Result<()> {
             let mut invalid_targets = Vec::new();
             for target in &targets {
                 if !target.contains(':') {
-                    invalid_targets.push(format!("{} (missing :target suffix)", target));
+                    invalid_targets.push(format!("{target} (missing :target suffix)"));
                 } else if target_graph.get(target).is_none() {
-                    invalid_targets.push(format!("{} (not found)", target));
+                    invalid_targets.push(format!("{target} (not found)"));
                 }
             }
 
@@ -607,7 +619,8 @@ fn run() -> Result<()> {
             }
 
             // Collect all targets to run (and optionally their dependencies)
-            let mut targets_to_run: std::collections::HashSet<String> = targets.iter().cloned().collect();
+            let mut targets_to_run: std::collections::HashSet<String> =
+                targets.iter().cloned().collect();
 
             if !no_deps {
                 // Add dependencies of each target
@@ -626,9 +639,13 @@ fn run() -> Result<()> {
             let levels = compute_heterogeneous_levels(&targets_to_run, &project_map);
 
             if output_mode == OutputMode::Verbose {
-                eprintln!("[aster] Running {} targets across {} levels", targets_to_run.len(), levels.len());
+                eprintln!(
+                    "[aster] Running {} targets across {} levels",
+                    targets_to_run.len(),
+                    levels.len()
+                );
                 for (i, level) in levels.iter().enumerate() {
-                    eprintln!("[aster] Level {}: {:?}", i, level);
+                    eprintln!("[aster] Level {i}: {level:?}");
                 }
             }
 
@@ -647,7 +664,7 @@ fn run() -> Result<()> {
             // Return error if any failed (for exit code)
             let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
             if failed > 0 {
-                return Err(anyhow::anyhow!("{} target(s) failed", failed));
+                return Err(anyhow::anyhow!("{failed} target(s) failed"));
             }
         }
         Commands::Project { command } => {
@@ -663,7 +680,7 @@ fn run() -> Result<()> {
 
             // Check for reserved command conflicts
             if let Some(err_msg) = check_reserved_target(&run_args.target) {
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(anyhow::anyhow!("{err_msg}"));
             }
 
             // Build the graph
@@ -677,7 +694,7 @@ fn run() -> Result<()> {
 
             // Select initial projects
             let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             // Expand selection based on flags
             let selected = expand_selection(&run_args, &initial, &graph, &projects);
@@ -708,7 +725,7 @@ fn run() -> Result<()> {
             // Return error if any failed (for exit code)
             let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
-                return Err(anyhow::anyhow!("{} project(s) failed", failed));
+                return Err(anyhow::anyhow!("{failed} project(s) failed"));
             }
         }
     }
@@ -863,7 +880,7 @@ fn execute_heterogeneous(
                         address: target_addr.clone(),
                         success: true,
                         skipped: true,
-                        output: format!("Skipped: no '{}' target defined", target_name),
+                        output: format!("Skipped: no '{target_name}' target defined"),
                         duration_ms: 0,
                     };
                     if show_progress {
@@ -930,7 +947,7 @@ fn execute_heterogeneous(
                             address: addr,
                             success: false,
                             skipped: false,
-                            output: format!("Failed to execute: {}", e),
+                            output: format!("Failed to execute: {e}"),
                             duration_ms,
                         },
                     }
@@ -947,7 +964,12 @@ fn execute_heterogeneous(
 
         for result in rx.iter() {
             if show_progress {
-                progress.mark_complete(&result.address, result.success, result.skipped, result.duration_ms);
+                progress.mark_complete(
+                    &result.address,
+                    result.success,
+                    result.skipped,
+                    result.duration_ms,
+                );
             }
             all_results.push(result);
         }
@@ -972,7 +994,7 @@ fn print_heterogeneous_summary(
     let skipped = results.iter().filter(|r| r.skipped).count();
 
     if output_mode == OutputMode::Quiet {
-        println!("{} passed, {} failed", passed, failed);
+        println!("{passed} passed, {failed} failed");
         return;
     }
 
@@ -981,20 +1003,39 @@ fn print_heterogeneous_summary(
         eprintln!();
         eprintln!("{} {}", style("FAILED").red().bold(), result.address);
         let lines: Vec<&str> = result.output.lines().collect();
-        let tail = if lines.len() > 15 { &lines[lines.len() - 15..] } else { &lines[..] };
+        let tail = if lines.len() > 15 {
+            &lines[lines.len() - 15..]
+        } else {
+            &lines[..]
+        };
         for line in tail {
-            eprintln!("    {}", line);
+            eprintln!("    {line}");
         }
-        eprintln!("    {}", style(format!("Run `aster logs {}` for full output", result.address)).dim());
+        eprintln!(
+            "    {}",
+            style(format!(
+                "Run `aster logs {}` for full output",
+                result.address
+            ))
+            .dim()
+        );
     }
 
     println!();
     println!(
         "{} {} passed, {} failed{}",
-        if failed > 0 { style("✗").red() } else { style("✓").green() },
+        if failed > 0 {
+            style("✗").red()
+        } else {
+            style("✓").green()
+        },
         passed,
         failed,
-        if skipped > 0 { format!(", {} skipped", skipped) } else { String::new() }
+        if skipped > 0 {
+            format!(", {skipped} skipped")
+        } else {
+            String::new()
+        }
     );
 }
 
@@ -1038,8 +1079,8 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     registry.register(Box::new(GoPlugin));
 
     // Discover projects
-    let projects = discover_projects(&workspace_root, &registry)
-        .context("Failed to discover projects")?;
+    let projects =
+        discover_projects(&workspace_root, &registry).context("Failed to discover projects")?;
 
     // Print discovery summary
     if projects.is_empty() {
@@ -1120,7 +1161,7 @@ fn handle_project_init(
     if output_mode != OutputMode::Quiet {
         println!("Created {}", aster_toml_path.display());
         if let Some(plugin) = detected_plugin {
-            println!("Detected language: {}", plugin);
+            println!("Detected language: {plugin}");
         } else {
             println!("No language detected - using generic template");
         }
@@ -1160,7 +1201,10 @@ fn generate_aster_toml_content(
 
     // Add project name section
     if let Some(project) = existing_project {
-        content.push_str(&format!("# Detected project name: \"{}\"\n", project.metadata.name));
+        content.push_str(&format!(
+            "# Detected project name: \"{}\"\n",
+            project.metadata.name
+        ));
         content.push_str("# Uncomment to override:\n");
         content.push_str(&format!("# name = \"{}\"\n", project.metadata.name));
     } else {
@@ -1175,7 +1219,8 @@ fn generate_aster_toml_content(
 
     // Add language-specific target examples
     let target_examples = match detected_plugin {
-        Some("nodejs") => r#"# Target configuration
+        Some("nodejs") => {
+            r#"# Target configuration
 # Simple format - just override the command:
 # [targets]
 # test = "npm run test:ci"
@@ -1191,8 +1236,10 @@ fn generate_aster_toml_content(
 # [targets.typecheck]
 # command = "tsc --noEmit"
 # depends_on = ["//self:deps"]
-"#,
-        Some("go") => r#"# Target configuration
+"#
+        }
+        Some("go") => {
+            r#"# Target configuration
 # Simple format - just override the command:
 # [targets]
 # test = "go test -race ./..."
@@ -1208,8 +1255,10 @@ fn generate_aster_toml_content(
 # [targets.integration]
 # command = "go test -tags=integration ./..."
 # depends_on = ["//self:build", "//services/db:up"]
-"#,
-        Some("python") => r#"# Target configuration
+"#
+        }
+        Some("python") => {
+            r#"# Target configuration
 # Simple format - just override the command:
 # [targets]
 # test = "pytest -v"
@@ -1225,8 +1274,10 @@ fn generate_aster_toml_content(
 # [targets.typecheck]
 # command = "mypy ."
 # depends_on = ["//self:deps"]
-"#,
-        Some("elixir") => r#"# Target configuration
+"#
+        }
+        Some("elixir") => {
+            r#"# Target configuration
 # Simple format - just override the command:
 # [targets]
 # test = "mix test --cover"
@@ -1242,8 +1293,10 @@ fn generate_aster_toml_content(
 # [targets.dialyzer]
 # command = "mix dialyzer"
 # depends_on = ["//self:build"]
-"#,
-        _ => r#"# Target configuration
+"#
+        }
+        _ => {
+            r#"# Target configuration
 # Define custom targets for your project:
 
 # Simple format - just a command:
@@ -1262,7 +1315,8 @@ fn generate_aster_toml_content(
 # [targets.deploy]
 # command = "./scripts/deploy.sh"
 # depends_on = ["//self:build", "//self:test"]
-"#,
+"#
+        }
     };
 
     content.push_str(target_examples);

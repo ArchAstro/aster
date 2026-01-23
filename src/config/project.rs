@@ -102,8 +102,8 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
-    let config: AsterToml = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let config: AsterToml =
+        toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
     // Validate depends_on entries are valid addresses
     for dep in &config.depends_on {
@@ -182,8 +182,14 @@ typecheck = "tsc --noEmit"
         let config = parse_aster_toml(&toml_path).unwrap();
 
         assert_eq!(config.targets.len(), 2);
-        assert_eq!(config.targets.get("lint").map(|t| t.command()), Some("npm run eslint"));
-        assert_eq!(config.targets.get("typecheck").map(|t| t.command()), Some("tsc --noEmit"));
+        assert_eq!(
+            config.targets.get("lint").map(|t| t.command()),
+            Some("npm run eslint")
+        );
+        assert_eq!(
+            config.targets.get("typecheck").map(|t| t.command()),
+            Some("tsc --noEmit")
+        );
         // Simple format has empty depends_on and capabilities
         assert!(config.targets.get("lint").unwrap().depends_on().is_empty());
     }
@@ -214,7 +220,10 @@ depends_on = ["//self:deps"]
 
         let test_target = config.targets.get("test").unwrap();
         assert_eq!(test_target.command(), "pytest {files}");
-        assert_eq!(test_target.depends_on(), &["//self:deps", "//libs/shared:build"]);
+        assert_eq!(
+            test_target.depends_on(),
+            &["//self:deps", "//libs/shared:build"]
+        );
         assert_eq!(test_target.capabilities(), &["files_list"]);
         assert_eq!(test_target.files_glob(), Some("*_test.py"));
 
@@ -245,8 +254,14 @@ capabilities = ["files_list"]
         let config = parse_aster_toml(&toml_path).unwrap();
 
         assert_eq!(config.targets.len(), 2);
-        assert_eq!(config.targets.get("lint").map(|t| t.command()), Some("npm run lint"));
-        assert_eq!(config.targets.get("test").map(|t| t.command()), Some("npm test {files}"));
+        assert_eq!(
+            config.targets.get("lint").map(|t| t.command()),
+            Some("npm run lint")
+        );
+        assert_eq!(
+            config.targets.get("test").map(|t| t.command()),
+            Some("npm test {files}")
+        );
     }
 
     #[test]
@@ -277,11 +292,7 @@ test = "npm test"
     fn test_parse_invalid_address() {
         let tmp = tempfile::tempdir().unwrap();
         let toml_path = tmp.path().join("aster.toml");
-        std::fs::write(
-            &toml_path,
-            r#"depends_on = ["invalid-address-no-slashes"]"#,
-        )
-        .unwrap();
+        std::fs::write(&toml_path, r#"depends_on = ["invalid-address-no-slashes"]"#).unwrap();
 
         let result = parse_aster_toml(&toml_path);
 

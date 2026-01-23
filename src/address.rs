@@ -36,7 +36,9 @@ impl Address {
                 let path = &rest[..idx];
                 let target = &rest[idx + 1..];
                 if target.is_empty() {
-                    return Err(anyhow!("Target name cannot be empty after colon: got '{s}'"));
+                    return Err(anyhow!(
+                        "Target name cannot be empty after colon: got '{s}'"
+                    ));
                 }
                 (path, Some(target.to_string()))
             }
@@ -89,7 +91,10 @@ mod tests {
     #[test]
     fn test_parse_nested_path() {
         let addr = Address::parse("//src/ts/platform-sdk/examples/nextjs:dev").unwrap();
-        assert_eq!(addr.path, PathBuf::from("src/ts/platform-sdk/examples/nextjs"));
+        assert_eq!(
+            addr.path,
+            PathBuf::from("src/ts/platform-sdk/examples/nextjs")
+        );
         assert_eq!(addr.target, Some("dev".to_string()));
     }
 
@@ -111,7 +116,10 @@ mod tests {
     fn test_parse_invalid_no_prefix() {
         let result = Address::parse("services/api");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must start with //"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must start with //"));
     }
 
     #[test]
@@ -120,7 +128,7 @@ mod tests {
             path: PathBuf::from("services/api"),
             target: None,
         };
-        assert_eq!(format!("{}", addr), "//services/api");
+        assert_eq!(format!("{addr}"), "//services/api");
     }
 
     #[test]
@@ -129,6 +137,6 @@ mod tests {
             path: PathBuf::from("services/api"),
             target: Some("build".to_string()),
         };
-        assert_eq!(format!("{}", addr), "//services/api:build");
+        assert_eq!(format!("{addr}"), "//services/api:build");
     }
 }
