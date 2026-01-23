@@ -22,9 +22,77 @@ pub struct AsterToml {
     #[serde(default)]
     pub depends_on: Vec<String>,
 
-    /// Custom targets: { "lint": "npm run eslint", "typecheck": "tsc --noEmit" }
+    /// Custom targets - supports both simple and rich formats:
+    /// Simple: `lint = "npm run lint"`
+    /// Rich: `[targets.test]` with command, depends_on, capabilities, files_glob
     #[serde(default)]
-    pub targets: HashMap<String, String>,
+    pub targets: HashMap<String, TargetConfig>,
+}
+
+/// Target configuration - supports both simple command string and rich format
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TargetConfig {
+    /// Simple format: just a command string
+    /// e.g., `lint = "npm run lint"`
+    Simple(String),
+
+    /// Rich format with full configuration
+    /// e.g., `[targets.test]` with command, depends_on, etc.
+    Rich(RichTargetConfig),
+}
+
+/// Rich target configuration with all options
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RichTargetConfig {
+    /// The command to execute (may contain {files} placeholder)
+    pub command: String,
+
+    /// Target dependencies: ["//self:deps", "//libs/shared:build"]
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+
+    /// Capabilities: ["files_list"]
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+
+    /// Glob pattern to filter files for files_list capability
+    /// e.g., "*_test.py" or "*.spec.ts"
+    pub files_glob: Option<String>,
+}
+
+impl TargetConfig {
+    /// Get the command string
+    pub fn command(&self) -> &str {
+        match self {
+            TargetConfig::Simple(cmd) => cmd,
+            TargetConfig::Rich(rich) => &rich.command,
+        }
+    }
+
+    /// Get depends_on (empty for simple format)
+    pub fn depends_on(&self) -> &[String] {
+        match self {
+            TargetConfig::Simple(_) => &[],
+            TargetConfig::Rich(rich) => &rich.depends_on,
+        }
+    }
+
+    /// Get capabilities (empty for simple format)
+    pub fn capabilities(&self) -> &[String] {
+        match self {
+            TargetConfig::Simple(_) => &[],
+            TargetConfig::Rich(rich) => &rich.capabilities,
+        }
+    }
+
+    /// Get files_glob (None for simple format)
+    pub fn files_glob(&self) -> Option<&str> {
+        match self {
+            TargetConfig::Simple(_) => None,
+            TargetConfig::Rich(rich) => rich.files_glob.as_deref(),
+        }
+    }
 }
 
 /// Parse an aster.toml file from the given path
@@ -98,7 +166,7 @@ depends_on = [
     }
 
     #[test]
-    fn test_parse_targets() {
+    fn test_parse_targets_simple() {
         let tmp = tempfile::tempdir().unwrap();
         let toml_path = tmp.path().join("aster.toml");
         std::fs::write(
@@ -114,8 +182,71 @@ typecheck = "tsc --noEmit"
         let config = parse_aster_toml(&toml_path).unwrap();
 
         assert_eq!(config.targets.len(), 2);
-        assert_eq!(config.targets.get("lint"), Some(&"npm run eslint".to_string()));
-        assert_eq!(config.targets.get("typecheck"), Some(&"tsc --noEmit".to_string()));
+        assert_eq!(config.targets.get("lint").map(|t| t.command()), Some("npm run eslint"));
+        assert_eq!(config.targets.get("typecheck").map(|t| t.command()), Some("tsc --noEmit"));
+        // Simple format has empty depends_on and capabilities
+        assert!(config.targets.get("lint").unwrap().depends_on().is_empty());
+    }
+
+    #[test]
+    fn test_parse_targets_rich() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest {files}"
+depends_on = ["//self:deps", "//libs/shared:build"]
+capabilities = ["files_list"]
+files_glob = "*_test.py"
+
+[targets.build]
+command = "python -m build"
+depends_on = ["//self:deps"]
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        assert_eq!(config.targets.len(), 2);
+
+        let test_target = config.targets.get("test").unwrap();
+        assert_eq!(test_target.command(), "pytest {files}");
+        assert_eq!(test_target.depends_on(), &["//self:deps", "//libs/shared:build"]);
+        assert_eq!(test_target.capabilities(), &["files_list"]);
+        assert_eq!(test_target.files_glob(), Some("*_test.py"));
+
+        let build_target = config.targets.get("build").unwrap();
+        assert_eq!(build_target.command(), "python -m build");
+        assert_eq!(build_target.depends_on(), &["//self:deps"]);
+        assert!(build_target.capabilities().is_empty());
+        assert_eq!(build_target.files_glob(), None);
+    }
+
+    #[test]
+    fn test_parse_targets_mixed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets]
+lint = "npm run lint"
+
+[targets.test]
+command = "npm test {files}"
+capabilities = ["files_list"]
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets.get("lint").map(|t| t.command()), Some("npm run lint"));
+        assert_eq!(config.targets.get("test").map(|t| t.command()), Some("npm test {files}"));
     }
 
     #[test]

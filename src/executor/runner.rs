@@ -562,6 +562,7 @@ mod tests {
             command: command.to_string(),
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             capabilities: HashSet::new(),
+            files_glob: None,
         }
     }
 

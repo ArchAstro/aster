@@ -102,6 +102,7 @@ dependencies = [
  "console 0.16.2",
  "dirs",
  "git2",
+ "globset",
  "ignore",
  "indicatif",
  "petgraph",

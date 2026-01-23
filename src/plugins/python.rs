@@ -177,6 +177,7 @@ impl LanguagePlugin for PythonPlugin {
                 command: deps_command,
                 depends_on: vec![],
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -204,6 +205,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "pytest".to_string(),
                     depends_on: base_deps.clone(),
                     capabilities: test_caps,
+                files_glob: None,
                 },
             );
         }
@@ -216,6 +218,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "python -m build".to_string(),
                     depends_on: base_deps.clone(),
                     capabilities: HashSet::new(),
+                files_glob: None,
                 },
             );
         }
@@ -228,6 +231,7 @@ impl LanguagePlugin for PythonPlugin {
                     command: "ruff check .".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
+                files_glob: None,
                 },
             );
         }

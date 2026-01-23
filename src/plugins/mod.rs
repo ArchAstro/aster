@@ -32,12 +32,16 @@ pub enum TargetCapability {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Target {
     /// The command to execute for this target
+    /// May contain {files} placeholder for file injection
     pub command: String,
     /// Target addresses that must run before this one (e.g., "//libs/shared:build", "//self:deps")
     /// Use "//self:target" to reference targets in the same project
     pub depends_on: Vec<String>,
     /// Capabilities this target supports
     pub capabilities: HashSet<TargetCapability>,
+    /// Optional glob pattern to filter files for FilesList capability
+    /// e.g., "*_test.go" or "*.spec.ts"
+    pub files_glob: Option<String>,
 }
 
 /// Context passed to plugins for target detection

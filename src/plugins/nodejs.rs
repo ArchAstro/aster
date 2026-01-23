@@ -93,6 +93,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 command: "npm install".to_string(),
                 depends_on: vec![],
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -119,6 +120,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         command: "npm test".to_string(),
                         depends_on: base_deps.clone(),
                         capabilities: test_caps,
+                files_glob: None,
                     },
                 );
             }
@@ -129,6 +131,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         command: "npm run build".to_string(),
                         depends_on: base_deps.clone(),
                         capabilities: HashSet::new(),
+                files_glob: None,
                     },
                 );
             }
@@ -139,6 +142,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         command: "npm run lint".to_string(),
                         depends_on: base_deps.clone(),
                         capabilities: HashSet::new(),
+                files_glob: None,
                     },
                 );
             }
@@ -151,6 +155,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             command: format!("npm run {}", script_name),
                             depends_on: base_deps.clone(),
                             capabilities: HashSet::new(),
+                files_glob: None,
                         },
                     );
                 }

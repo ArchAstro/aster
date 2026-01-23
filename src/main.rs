@@ -10,7 +10,8 @@ use std::process::ExitCode;
 
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
-    print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectInfo, WhyOutput,
+    print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
+    ProjectInfo, WhyOutput,
 };
 use aster::executor::logs::LogStore;
 use aster::config::find_workspace_root;
@@ -18,9 +19,10 @@ use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
-use aster::plugins::{ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, TargetCapability};
+use aster::plugins::{ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability};
+use globset::{Glob, GlobMatcher};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> ExitCode {
     match run() {
@@ -516,17 +518,15 @@ fn run() -> Result<()> {
                                 })
                                 .collect();
 
-                            // Call plugin's with_files_list to get modified command
-                            if !project_files.is_empty() {
-                                if let Some(plugin) = registry.find_by_name(&project.plugin_name) {
-                                    if let Some(modified_cmd) = plugin.with_files_list(
-                                        &target,
-                                        &target_def.command,
-                                        &project_files,
-                                    ) {
-                                        command_overrides.insert(target_addr, modified_cmd);
-                                    }
-                                }
+                            // Try to get modified command with files
+                            if let Some(modified_cmd) = apply_files_to_command(
+                                target_def,
+                                &project_files,
+                                &target,
+                                &project.plugin_name,
+                                &registry,
+                            ) {
+                                command_overrides.insert(target_addr, modified_cmd);
                             }
                         }
                     }
@@ -626,6 +626,9 @@ fn run() -> Result<()> {
             if failed > 0 {
                 return Err(anyhow::anyhow!("{} target(s) failed", failed));
             }
+        }
+        Commands::Project { command } => {
+            handle_project_command(command, &workspace_root, &projects, output_mode)?;
         }
         Commands::Target(args) => {
             // Parse external subcommand args
@@ -1028,4 +1031,280 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Handle project subcommands
+fn handle_project_command(
+    command: ProjectCommands,
+    workspace_root: &Path,
+    projects: &[DiscoveredProject],
+    output_mode: OutputMode,
+) -> Result<()> {
+    match command {
+        ProjectCommands::Init { path, force } => {
+            handle_project_init(&path, workspace_root, projects, force, output_mode)
+        }
+    }
+}
+
+/// Handle `aster project init` command
+fn handle_project_init(
+    path: &str,
+    workspace_root: &Path,
+    projects: &[DiscoveredProject],
+    force: bool,
+    output_mode: OutputMode,
+) -> Result<()> {
+    // Resolve the target directory
+    let target_dir = if path == "." {
+        env::current_dir().context("Failed to get current directory")?
+    } else {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            env::current_dir()?.join(p)
+        }
+    };
+
+    let aster_toml_path = target_dir.join("aster.toml");
+
+    // Check if aster.toml already exists
+    if aster_toml_path.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "aster.toml already exists at {}. Use --force to overwrite.",
+            aster_toml_path.display()
+        ));
+    }
+
+    // Find if there's already a discovered project at this path
+    let relative_path = target_dir
+        .strip_prefix(workspace_root)
+        .unwrap_or(&target_dir);
+
+    let existing_project = projects.iter().find(|p| p.relative_path == relative_path);
+
+    // Detect language plugin by looking for marker files
+    let detected_plugin = detect_plugin_for_directory(&target_dir);
+
+    // Generate the aster.toml content
+    let content = generate_aster_toml_content(existing_project, detected_plugin.as_deref());
+
+    // Write the file
+    fs::write(&aster_toml_path, &content)
+        .with_context(|| format!("Failed to write {}", aster_toml_path.display()))?;
+
+    if output_mode != OutputMode::Quiet {
+        println!("Created {}", aster_toml_path.display());
+        if let Some(plugin) = detected_plugin {
+            println!("Detected language: {}", plugin);
+        } else {
+            println!("No language detected - using generic template");
+        }
+    }
+
+    Ok(())
+}
+
+/// Detect which language plugin applies to a directory
+fn detect_plugin_for_directory(dir: &Path) -> Option<String> {
+    let markers = [
+        ("package.json", "nodejs"),
+        ("go.mod", "go"),
+        ("pyproject.toml", "python"),
+        ("mix.exs", "elixir"),
+    ];
+
+    for (marker, plugin_name) in markers {
+        if dir.join(marker).exists() {
+            return Some(plugin_name.to_string());
+        }
+    }
+
+    None
+}
+
+/// Generate aster.toml content based on detected language
+fn generate_aster_toml_content(
+    existing_project: Option<&DiscoveredProject>,
+    detected_plugin: Option<&str>,
+) -> String {
+    let mut content = String::new();
+
+    content.push_str("# Project configuration for aster\n");
+    content.push_str("# See https://github.com/archastro/aster for documentation\n");
+    content.push('\n');
+
+    // Add project name section
+    if let Some(project) = existing_project {
+        content.push_str(&format!("# Detected project name: \"{}\"\n", project.metadata.name));
+        content.push_str("# Uncomment to override:\n");
+        content.push_str(&format!("# name = \"{}\"\n", project.metadata.name));
+    } else {
+        content.push_str("# Override the auto-detected project name\n");
+        content.push_str("# name = \"my-project\"\n");
+    }
+
+    content.push('\n');
+    content.push_str("# Add explicit dependencies on other projects\n");
+    content.push_str("# depends_on = [\"//libs/shared\", \"//libs/utils:build\"]\n");
+    content.push('\n');
+
+    // Add language-specific target examples
+    let target_examples = match detected_plugin {
+        Some("nodejs") => r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "npm run test:ci"
+# lint = "npm run lint -- --fix"
+
+# Rich format - full control over target behavior:
+# [targets.test]
+# command = "npm test -- {files}"
+# depends_on = ["//self:deps", "//libs/shared:build"]
+# capabilities = ["files_list"]
+# files_glob = "*.test.ts"
+
+# [targets.typecheck]
+# command = "tsc --noEmit"
+# depends_on = ["//self:deps"]
+"#,
+        Some("go") => r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "go test -race ./..."
+# build = "go build -o bin/app ./cmd/app"
+
+# Rich format - full control over target behavior:
+# [targets.test]
+# command = "go test {files}"
+# depends_on = ["//self:deps"]
+# capabilities = ["files_list"]
+# files_glob = "*_test.go"
+
+# [targets.integration]
+# command = "go test -tags=integration ./..."
+# depends_on = ["//self:build", "//services/db:up"]
+"#,
+        Some("python") => r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "pytest -v"
+# lint = "ruff check --fix ."
+
+# Rich format - full control over target behavior:
+# [targets.test]
+# command = "pytest {files}"
+# depends_on = ["//self:deps"]
+# capabilities = ["files_list"]
+# files_glob = "*_test.py"
+
+# [targets.typecheck]
+# command = "mypy ."
+# depends_on = ["//self:deps"]
+"#,
+        Some("elixir") => r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "mix test --cover"
+# lint = "mix credo --strict"
+
+# Rich format - full control over target behavior:
+# [targets.test]
+# command = "mix test {files}"
+# depends_on = ["//self:deps"]
+# capabilities = ["files_list"]
+# files_glob = "*_test.exs"
+
+# [targets.dialyzer]
+# command = "mix dialyzer"
+# depends_on = ["//self:build"]
+"#,
+        _ => r#"# Target configuration
+# Define custom targets for your project:
+
+# Simple format - just a command:
+# [targets]
+# test = "make test"
+# build = "make build"
+# lint = "make lint"
+
+# Rich format - full control over target behavior:
+# [targets.test]
+# command = "make test ARGS='{files}'"
+# depends_on = ["//self:build"]
+# capabilities = ["files_list"]
+# files_glob = "*_test.*"
+
+# [targets.deploy]
+# command = "./scripts/deploy.sh"
+# depends_on = ["//self:build", "//self:test"]
+"#,
+    };
+
+    content.push_str(target_examples);
+    content
+}
+
+/// Apply files to a command, handling both {files} placeholder and plugin-based file injection
+///
+/// Returns Some(modified_command) if files were applied, None to use original command.
+fn apply_files_to_command(
+    target: &Target,
+    files: &[PathBuf],
+    target_name: &str,
+    plugin_name: &str,
+    registry: &PluginRegistry,
+) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+
+    // Filter files by files_glob if specified
+    let filtered_files: Vec<PathBuf> = if let Some(glob_pattern) = &target.files_glob {
+        match Glob::new(glob_pattern) {
+            Ok(glob) => {
+                let matcher: GlobMatcher = glob.compile_matcher();
+                files
+                    .iter()
+                    .filter(|f| {
+                        // Match against filename only
+                        f.file_name()
+                            .map(|name| matcher.is_match(name))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            Err(_) => files.to_vec(), // Invalid glob, use all files
+        }
+    } else {
+        files.to_vec()
+    };
+
+    if filtered_files.is_empty() {
+        return None;
+    }
+
+    // Check if command uses {files} placeholder
+    if target.command.contains("{files}") {
+        let file_list = filtered_files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Replace {files} with file list (may be empty, which results in trimmed command)
+        let modified = target.command.replace("{files}", &file_list);
+        // Trim extra whitespace that may result from empty replacement
+        let modified = modified.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Some(modified);
+    }
+
+    // Fall back to plugin's with_files_list for language-specific handling
+    if let Some(plugin) = registry.find_by_name(plugin_name) {
+        return plugin.with_files_list(target_name, &target.command, &filtered_files);
+    }
+
+    None
 }

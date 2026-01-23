@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::plugins::Target;
+use crate::config::TargetConfig;
+use crate::plugins::{Target, TargetCapability};
 
 /// Standard target names
 pub const TARGET_TEST: &str = "test";
@@ -19,33 +20,24 @@ pub struct TargetResolver;
 impl TargetResolver {
     /// Resolve targets by merging detected targets with custom overrides
     ///
-    /// Custom targets from aster.toml override the command but preserve
-    /// detected dependencies. New targets are added with empty depends_on.
+    /// Custom targets from aster.toml override detected targets. For simple format
+    /// (just a command string), the command is overridden but depends_on/capabilities
+    /// are preserved from detected. For rich format, all specified fields are used.
     ///
     /// # Arguments
     /// * `detected_targets` - Targets detected from native config by the plugin
-    /// * `custom_targets` - Custom targets from aster.toml (command strings only)
+    /// * `custom_targets` - Custom targets from aster.toml (simple or rich format)
     /// * `project_address` - The project's address, used to resolve //self: references
     pub fn resolve(
         detected_targets: &HashMap<String, Target>,
-        custom_targets: &HashMap<String, String>,
+        custom_targets: &HashMap<String, TargetConfig>,
         project_address: &str,
     ) -> HashMap<String, Target> {
         let mut targets = HashMap::new();
 
         // Start with detected targets, resolving //self: references
         for (name, target) in detected_targets {
-            let resolved_deps: Vec<String> = target
-                .depends_on
-                .iter()
-                .map(|dep| {
-                    if let Some(target_name) = dep.strip_prefix("//self:") {
-                        format!("{}:{}", project_address, target_name)
-                    } else {
-                        dep.clone()
-                    }
-                })
-                .collect();
+            let resolved_deps = Self::resolve_self_references(&target.depends_on, project_address);
 
             targets.insert(
                 name.clone(),
@@ -53,49 +45,125 @@ impl TargetResolver {
                     command: target.command.clone(),
                     depends_on: resolved_deps,
                     capabilities: target.capabilities.clone(),
+                    files_glob: target.files_glob.clone(),
                 },
             );
         }
 
-        // Custom targets override command but preserve depends_on and capabilities (if target exists)
-        for (name, command) in custom_targets {
-            if let Some(existing) = targets.get(name) {
-                // Override command, keep depends_on and capabilities
-                targets.insert(
-                    name.clone(),
-                    Target {
-                        command: command.clone(),
-                        depends_on: existing.depends_on.clone(),
-                        capabilities: existing.capabilities.clone(),
-                    },
-                );
-            } else {
-                // New target with empty depends_on and capabilities
-                targets.insert(
-                    name.clone(),
-                    Target {
-                        command: command.clone(),
-                        depends_on: vec![],
-                        capabilities: HashSet::new(),
-                    },
-                );
+        // Custom targets override or add to detected targets
+        for (name, config) in custom_targets {
+            let existing = targets.get(name);
+
+            match config {
+                TargetConfig::Simple(command) => {
+                    // Simple format: override command, preserve existing depends_on/capabilities
+                    if let Some(existing) = existing {
+                        targets.insert(
+                            name.clone(),
+                            Target {
+                                command: command.clone(),
+                                depends_on: existing.depends_on.clone(),
+                                capabilities: existing.capabilities.clone(),
+                                files_glob: existing.files_glob.clone(),
+                            },
+                        );
+                    } else {
+                        // New target with empty depends_on and capabilities
+                        targets.insert(
+                            name.clone(),
+                            Target {
+                                command: command.clone(),
+                                depends_on: vec![],
+                                capabilities: HashSet::new(),
+                                files_glob: None,
+                            },
+                        );
+                    }
+                }
+                TargetConfig::Rich(rich) => {
+                    // Rich format: use all specified fields, fall back to existing for unspecified
+                    let depends_on = if rich.depends_on.is_empty() {
+                        existing.map(|e| e.depends_on.clone()).unwrap_or_default()
+                    } else {
+                        Self::resolve_self_references(&rich.depends_on, project_address)
+                    };
+
+                    let capabilities = if rich.capabilities.is_empty() {
+                        existing.map(|e| e.capabilities.clone()).unwrap_or_default()
+                    } else {
+                        Self::parse_capabilities(&rich.capabilities)
+                    };
+
+                    let files_glob = rich
+                        .files_glob
+                        .clone()
+                        .or_else(|| existing.and_then(|e| e.files_glob.clone()));
+
+                    targets.insert(
+                        name.clone(),
+                        Target {
+                            command: rich.command.clone(),
+                            depends_on,
+                            capabilities,
+                            files_glob,
+                        },
+                    );
+                }
             }
         }
 
         targets
+    }
+
+    /// Resolve //self: references to the actual project address
+    fn resolve_self_references(deps: &[String], project_address: &str) -> Vec<String> {
+        deps.iter()
+            .map(|dep| {
+                if let Some(target_name) = dep.strip_prefix("//self:") {
+                    format!("{}:{}", project_address, target_name)
+                } else {
+                    dep.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// Parse capability strings into TargetCapability enum values
+    fn parse_capabilities(caps: &[String]) -> HashSet<TargetCapability> {
+        caps.iter()
+            .filter_map(|cap| match cap.as_str() {
+                "files_list" => Some(TargetCapability::FilesList),
+                _ => None, // Unknown capabilities are ignored
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RichTargetConfig;
 
     fn target(command: &str, depends_on: Vec<&str>) -> Target {
         Target {
             command: command.to_string(),
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             capabilities: HashSet::new(),
+            files_glob: None,
         }
+    }
+
+    fn simple(command: &str) -> TargetConfig {
+        TargetConfig::Simple(command.to_string())
+    }
+
+    fn rich(command: &str, depends_on: Vec<&str>, capabilities: Vec<&str>, files_glob: Option<&str>) -> TargetConfig {
+        TargetConfig::Rich(RichTargetConfig {
+            command: command.to_string(),
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+            capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
+            files_glob: files_glob.map(|s| s.to_string()),
+        })
     }
 
     #[test]
@@ -126,13 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_override_preserves_depends_on() {
+    fn test_simple_override_preserves_depends_on() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
         detected.insert("build".to_string(), target("npm run build", vec!["//self:deps"]));
 
         let mut custom = HashMap::new();
-        custom.insert("test".to_string(), "npm run test:ci".to_string());
+        custom.insert("test".to_string(), simple("npm run test:ci"));
 
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
 
@@ -146,12 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_addition() {
+    fn test_simple_addition() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("npm test", vec![]));
 
         let mut custom = HashMap::new();
-        custom.insert("deploy".to_string(), "npm run deploy".to_string());
+        custom.insert("deploy".to_string(), simple("npm run deploy"));
 
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
 
@@ -168,7 +236,7 @@ mod tests {
     fn test_empty_detected_with_custom() {
         let detected = HashMap::new();
         let mut custom = HashMap::new();
-        custom.insert("test".to_string(), "make test".to_string());
+        custom.insert("test".to_string(), simple("make test"));
 
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
 
@@ -185,15 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_completely_overrides_detected() {
+    fn test_simple_completely_overrides_detected() {
         let mut detected = HashMap::new();
         detected.insert("test".to_string(), target("pytest", vec!["//self:deps"]));
         detected.insert("lint".to_string(), target("ruff check .", vec!["//self:deps"]));
 
         let mut custom = HashMap::new();
-        custom.insert("test".to_string(), "python -m pytest --cov".to_string());
-        custom.insert("lint".to_string(), "mypy .".to_string());
-        custom.insert("typecheck".to_string(), "pyright .".to_string());
+        custom.insert("test".to_string(), simple("python -m pytest --cov"));
+        custom.insert("lint".to_string(), simple("mypy ."));
+        custom.insert("typecheck".to_string(), simple("pyright ."));
 
         let targets = TargetResolver::resolve(&detected, &custom, "//libs/ml");
 
@@ -206,5 +274,87 @@ mod tests {
         // New target has empty depends_on
         assert!(targets.get("typecheck").unwrap().depends_on.is_empty());
         assert_eq!(targets.len(), 3);
+    }
+
+    #[test]
+    fn test_rich_target_with_all_fields() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "test".to_string(),
+            rich("pytest {files}", vec!["//self:deps", "//libs/shared:build"], vec!["files_list"], Some("*_test.py")),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let test_target = targets.get("test").unwrap();
+        assert_eq!(test_target.command, "pytest {files}");
+        assert_eq!(test_target.depends_on, vec!["//apps/api:deps", "//libs/shared:build"]);
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(test_target.files_glob, Some("*_test.py".to_string()));
+    }
+
+    #[test]
+    fn test_rich_target_preserves_unspecified_fields() {
+        let mut detected = HashMap::new();
+        let mut detected_target = target("npm test", vec!["//self:deps"]);
+        detected_target.capabilities.insert(TargetCapability::FilesList);
+        detected_target.files_glob = Some("*.test.ts".to_string());
+        detected.insert("test".to_string(), detected_target);
+
+        let mut custom = HashMap::new();
+        // Rich format with only command - should preserve depends_on, capabilities, files_glob
+        custom.insert(
+            "test".to_string(),
+            rich("npm run test:ci", vec![], vec![], None),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
+
+        let test_target = targets.get("test").unwrap();
+        assert_eq!(test_target.command, "npm run test:ci");
+        // These should be preserved from detected
+        assert_eq!(test_target.depends_on, vec!["//apps/web:deps".to_string()]);
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(test_target.files_glob, Some("*.test.ts".to_string()));
+    }
+
+    #[test]
+    fn test_rich_target_new_target() {
+        let detected = HashMap::new();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "integration".to_string(),
+            rich("go test -tags=integration ./...", vec!["//self:build"], vec!["files_list"], Some("*_test.go")),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//services/api");
+
+        let integration_target = targets.get("integration").unwrap();
+        assert_eq!(integration_target.command, "go test -tags=integration ./...");
+        assert_eq!(integration_target.depends_on, vec!["//services/api:build".to_string()]);
+        assert!(integration_target.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(integration_target.files_glob, Some("*_test.go".to_string()));
+    }
+
+    #[test]
+    fn test_unknown_capability_ignored() {
+        let detected = HashMap::new();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "test".to_string(),
+            rich("pytest", vec![], vec!["files_list", "unknown_cap", "another_unknown"], None),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let test_target = targets.get("test").unwrap();
+        // Only files_list should be in capabilities
+        assert_eq!(test_target.capabilities.len(), 1);
+        assert!(test_target.capabilities.contains(&TargetCapability::FilesList));
     }
 }

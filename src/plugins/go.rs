@@ -90,6 +90,7 @@ impl LanguagePlugin for GoPlugin {
                 command: "go mod download".to_string(),
                 depends_on: vec![],
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -111,6 +112,7 @@ impl LanguagePlugin for GoPlugin {
                 command: "go build ./...".to_string(),
                 depends_on: base_deps.clone(),
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -123,6 +125,7 @@ impl LanguagePlugin for GoPlugin {
                 command: "go test ./...".to_string(),
                 depends_on: base_deps.clone(),
                 capabilities: test_caps,
+                files_glob: None,
             },
         );
 
@@ -139,6 +142,7 @@ impl LanguagePlugin for GoPlugin {
                     command: "golangci-lint run".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
+                files_glob: None,
                 },
             );
         }

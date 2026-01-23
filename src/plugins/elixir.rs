@@ -104,6 +104,7 @@ impl LanguagePlugin for ElixirPlugin {
                 command: "mix deps.get".to_string(),
                 depends_on: vec![],
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -127,6 +128,7 @@ impl LanguagePlugin for ElixirPlugin {
                 command: "mix test".to_string(),
                 depends_on: base_deps.clone(),
                 capabilities: test_caps,
+                files_glob: None,
             },
         );
         targets.insert(
@@ -135,6 +137,7 @@ impl LanguagePlugin for ElixirPlugin {
                 command: "mix compile".to_string(),
                 depends_on: base_deps.clone(),
                 capabilities: HashSet::new(),
+                files_glob: None,
             },
         );
 
@@ -146,6 +149,7 @@ impl LanguagePlugin for ElixirPlugin {
                     command: "mix credo".to_string(),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
+                files_glob: None,
                 },
             );
         }

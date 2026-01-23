@@ -138,7 +138,32 @@ pub enum Commands {
         no_deps: bool,
     },
 
+    /// Project-level commands
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
+
     /// Run a single target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
     Target(Vec<String>),
+}
+
+/// Project-level subcommands
+#[derive(Subcommand)]
+pub enum ProjectCommands {
+    /// Initialize an aster.toml config file in the current project
+    ///
+    /// Creates a project configuration file with helpful examples based on
+    /// the detected language. If no language is detected, provides a generic
+    /// template for custom targets.
+    Init {
+        /// Path to project directory (default: current directory)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Overwrite existing aster.toml
+        #[arg(long)]
+        force: bool,
+    },
 }
