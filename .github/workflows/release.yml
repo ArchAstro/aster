@@ -52,8 +52,14 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -65,3 +71,70 @@ jobs:
         with:
           files: artifacts/**/*.tar.gz
           generate_release_notes: true
+
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums
+        id: checksums
+        run: |
+          echo "darwin_arm64=$(sha256sum artifacts/aster-darwin-arm64/aster-darwin-arm64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "darwin_x64=$(sha256sum artifacts/aster-darwin-x64/aster-darwin-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "linux_x64=$(sha256sum artifacts/aster-linux-x64/aster-linux-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA_DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
+          SHA_DARWIN_X64: ${{ steps.checksums.outputs.darwin_x64 }}
+          SHA_LINUX_X64: ${{ steps.checksums.outputs.linux_x64 }}
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/ArchAstro/homebrew-tap.git
+          cd homebrew-tap
+
+          cat > Formula/aster.rb << EOF
+          class Aster < Formula
+            desc "Build orchestration for polyglot monorepos"
+            homepage "https://github.com/ArchAstro/aster"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-arm64.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-x64.tar.gz"
+                sha256 "${SHA_DARWIN_X64}"
+              end
+            end
+
+            on_linux do
+              url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-linux-x64.tar.gz"
+              sha256 "${SHA_LINUX_X64}"
+            end
+
+            def install
+              bin.install "aster"
+            end
+
+            test do
+              system "#{bin}/aster", "--version"
+            end
+          end
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/aster.rb
+          git commit -m "Update aster to ${VERSION}"
+          git push
