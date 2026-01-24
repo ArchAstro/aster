@@ -588,7 +588,7 @@ end
         )
         .unwrap();
 
-        // Python project with pytest and build config
+        // Python project with pytest and ruff
         let python_dir = tmp.path().join("libs/ml");
         std::fs::create_dir_all(&python_dir).unwrap();
         std::fs::write(
@@ -597,9 +597,6 @@ end
 [project]
 name = "ml"
 version = "1.0.0"
-
-[build-system]
-requires = ["setuptools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -664,10 +661,8 @@ line-length = 100
             python_project.targets.get("test").map(|t| &t.command),
             Some(&"pytest".to_string())
         );
-        assert_eq!(
-            python_project.targets.get("build").map(|t| &t.command),
-            Some(&"python -m build".to_string())
-        );
+        // Python has no auto-detected build target (use aster.toml if needed)
+        assert_eq!(python_project.targets.get("build"), None);
         assert_eq!(
             python_project.targets.get("deps").map(|t| &t.command),
             Some(&"pip install -e .".to_string())

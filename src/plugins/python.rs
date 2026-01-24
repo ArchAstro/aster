@@ -211,19 +211,6 @@ impl LanguagePlugin for PythonPlugin {
             );
         }
 
-        // Check for build system
-        if content.contains("[build-system]") {
-            targets.insert(
-                "build".to_string(),
-                Target {
-                    command: "python -m build".to_string(),
-                    depends_on: base_deps.clone(),
-                    capabilities: HashSet::new(),
-                    files_glob: None,
-                },
-            );
-        }
-
         // Check for ruff
         if content.contains("[tool.ruff]") || content.contains("ruff") {
             targets.insert(
@@ -238,7 +225,7 @@ impl LanguagePlugin for PythonPlugin {
         }
 
         // format target: prefer ruff, fall back to black
-        let format_deps = vec!["//self:deps".to_string(), "//self:build".to_string()];
+        let format_deps = vec!["//self:deps".to_string()];
         if content.contains("[tool.ruff]") {
             targets.insert(
                 "format".to_string(),
@@ -613,9 +600,6 @@ poetry-lib = {path = "../poetry-lib"}
 [project]
 name = "my-app"
 
-[build-system]
-requires = ["setuptools"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -634,10 +618,6 @@ line-length = 100
             Some(&"pytest".to_string())
         );
         assert_eq!(
-            targets.get("build").map(|t| &t.command),
-            Some(&"python -m build".to_string())
-        );
-        assert_eq!(
             targets.get("lint").map(|t| &t.command),
             Some(&"ruff check .".to_string())
         );
@@ -645,6 +625,8 @@ line-length = 100
             targets.get("deps").map(|t| &t.command),
             Some(&"pip install -e .".to_string())
         );
+        // No build target for Python (use aster.toml if needed)
+        assert_eq!(targets.get("build"), None);
 
         // Check dependencies
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
@@ -763,11 +745,9 @@ line-length = 100
             Some(&"ruff format .".to_string())
         );
 
-        // Check dependencies
+        // Check dependencies (only deps, no build for Python)
         let format_deps = &targets.get("format").unwrap().depends_on;
-        assert!(format_deps.contains(&"//self:deps".to_string()));
-        assert!(format_deps.contains(&"//self:build".to_string()));
-        assert_eq!(format_deps.len(), 2);
+        assert_eq!(format_deps, &vec!["//self:deps".to_string()]);
     }
 
     #[test]
