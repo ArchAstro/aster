@@ -123,6 +123,7 @@ impl LanguagePlugin for ElixirPlugin {
         // mix test and mix compile are always available for Elixir projects
         let mut test_caps = HashSet::new();
         test_caps.insert(TargetCapability::FilesList);
+        test_caps.insert(TargetCapability::WarningsAsErrors);
         targets.insert(
             "test".to_string(),
             Target {
@@ -132,12 +133,14 @@ impl LanguagePlugin for ElixirPlugin {
                 files_glob: None,
             },
         );
+        let mut build_caps = HashSet::new();
+        build_caps.insert(TargetCapability::WarningsAsErrors);
         targets.insert(
             "build".to_string(),
             Target {
                 command: "mix compile".to_string(),
                 depends_on: base_deps.clone(),
-                capabilities: HashSet::new(),
+                capabilities: build_caps,
                 files_glob: None,
             },
         );
@@ -207,6 +210,14 @@ impl LanguagePlugin for ElixirPlugin {
             .collect();
 
         Some(format!("{} {}", command, file_args.join(" ")))
+    }
+
+    fn with_warnings_as_errors(&self, target_name: &str, command: &str) -> Option<String> {
+        // Both mix compile and mix test support --warnings-as-errors
+        match target_name {
+            "build" | "test" => Some(format!("{} --warnings-as-errors", command)),
+            _ => None,
+        }
     }
 }
 
@@ -766,5 +777,63 @@ end
         assert!(!build_target
             .capabilities
             .contains(&TargetCapability::FilesList));
+    }
+
+    #[test]
+    fn test_build_and_test_targets_have_warnings_as_errors_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let test_target = targets.get("test").unwrap();
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::WarningsAsErrors));
+
+        let build_target = targets.get("build").unwrap();
+        assert!(build_target
+            .capabilities
+            .contains(&TargetCapability::WarningsAsErrors));
+
+        let deps_target = targets.get("deps").unwrap();
+        assert!(!deps_target
+            .capabilities
+            .contains(&TargetCapability::WarningsAsErrors));
+    }
+
+    #[test]
+    fn test_with_warnings_as_errors_for_build() {
+        let plugin = ElixirPlugin;
+        let result = plugin.with_warnings_as_errors("build", "mix compile");
+        assert_eq!(result, Some("mix compile --warnings-as-errors".to_string()));
+    }
+
+    #[test]
+    fn test_with_warnings_as_errors_for_test() {
+        let plugin = ElixirPlugin;
+        let result = plugin.with_warnings_as_errors("test", "mix test");
+        assert_eq!(result, Some("mix test --warnings-as-errors".to_string()));
+    }
+
+    #[test]
+    fn test_with_warnings_as_errors_returns_none_for_unsupported_target() {
+        let plugin = ElixirPlugin;
+        let result = plugin.with_warnings_as_errors("deps", "mix deps.get");
+        assert_eq!(result, None);
     }
 }

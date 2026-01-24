@@ -119,6 +119,13 @@ pub enum Commands {
         /// on files that changed.
         #[arg(long)]
         only_affected_files: bool,
+
+        /// Treat warnings as errors for targets that support it
+        ///
+        /// For targets with WarningsAsErrors capability, modifies the command
+        /// to fail on warnings. Useful for CI to catch potential issues.
+        #[arg(long)]
+        warnings_as_errors: bool,
     },
 
     /// View logs from the last run

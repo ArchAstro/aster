@@ -200,6 +200,7 @@ impl LanguagePlugin for PythonPlugin {
         {
             let mut test_caps = HashSet::new();
             test_caps.insert(TargetCapability::FilesList);
+            test_caps.insert(TargetCapability::WarningsAsErrors);
             targets.insert(
                 "test".to_string(),
                 Target {
@@ -290,6 +291,15 @@ impl LanguagePlugin for PythonPlugin {
             .collect();
 
         Some(format!("{} {}", command, file_args.join(" ")))
+    }
+
+    fn with_warnings_as_errors(&self, target_name: &str, command: &str) -> Option<String> {
+        // pytest supports -W error to treat warnings as errors
+        if target_name == "test" {
+            Some(format!("{} -W error", command))
+        } else {
+            None
+        }
     }
 }
 
@@ -905,5 +915,50 @@ testpaths = ["tests"]
         assert!(!deps_target
             .capabilities
             .contains(&TargetCapability::FilesList));
+    }
+
+    #[test]
+    fn test_test_target_has_warnings_as_errors_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let test_target = targets.get("test").unwrap();
+        assert!(test_target
+            .capabilities
+            .contains(&TargetCapability::WarningsAsErrors));
+
+        let deps_target = targets.get("deps").unwrap();
+        assert!(!deps_target
+            .capabilities
+            .contains(&TargetCapability::WarningsAsErrors));
+    }
+
+    #[test]
+    fn test_with_warnings_as_errors_for_test() {
+        let plugin = PythonPlugin;
+        let result = plugin.with_warnings_as_errors("test", "pytest");
+        assert_eq!(result, Some("pytest -W error".to_string()));
+    }
+
+    #[test]
+    fn test_with_warnings_as_errors_returns_none_for_unsupported_target() {
+        let plugin = PythonPlugin;
+        let result = plugin.with_warnings_as_errors("deps", "pip install -e .");
+        assert_eq!(result, None);
     }
 }

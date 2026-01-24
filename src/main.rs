@@ -372,6 +372,7 @@ fn run() -> Result<()> {
             dependents,
             dry_run,
             only_affected_files,
+            warnings_as_errors,
         } => {
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)
@@ -530,11 +531,12 @@ fn run() -> Result<()> {
 
             // Execute target on projects
             let executor = Executor::with_output_mode(&workspace_root, output_mode);
-            let results = if only_affected_files {
-                // Build command overrides for targets that support files-list
+
+            // Build command overrides for files-list and warnings-as-errors
+            let results = if only_affected_files || warnings_as_errors {
                 let mut command_overrides: HashMap<String, String> = HashMap::new();
 
-                // Create plugin registry to call with_files_list
+                // Create plugin registry for capability handling
                 let mut registry = PluginRegistry::new();
                 registry.register(Box::new(NodeJsPlugin));
                 registry.register(Box::new(PythonPlugin));
@@ -545,34 +547,61 @@ fn run() -> Result<()> {
                     let project_addr = format!("//{}", project.relative_path.display());
                     let target_addr = format!("{project_addr}:{target}");
 
-                    // Check if target has FilesList capability
                     if let Some(target_def) = project.targets.get(&target) {
-                        if target_def
-                            .capabilities
-                            .contains(&TargetCapability::FilesList)
+                        let mut modified_cmd: Option<String> = None;
+
+                        // Apply files-list if requested and supported
+                        if only_affected_files
+                            && target_def
+                                .capabilities
+                                .contains(&TargetCapability::FilesList)
                         {
-                            // Get files that belong to this project
                             let project_files: Vec<PathBuf> = changed_files
                                 .iter()
                                 .filter(|f| f.starts_with(&project.relative_path))
                                 .map(|f| {
-                                    // Make path relative to project directory
                                     f.strip_prefix(&project.relative_path)
                                         .unwrap_or(f)
                                         .to_path_buf()
                                 })
                                 .collect();
 
-                            // Try to get modified command with files
-                            if let Some(modified_cmd) = apply_files_to_command(
+                            modified_cmd = apply_files_to_command(
                                 target_def,
                                 &project_files,
                                 &target,
                                 &project.plugin_name,
                                 &registry,
+                            );
+                        }
+
+                        // Apply warnings-as-errors if requested and supported
+                        if warnings_as_errors
+                            && target_def
+                                .capabilities
+                                .contains(&TargetCapability::WarningsAsErrors)
+                        {
+                            // Build a temporary target with possibly modified command
+                            let cmd_to_modify = modified_cmd
+                                .as_ref()
+                                .unwrap_or(&target_def.command)
+                                .clone();
+                            let temp_target = Target {
+                                command: cmd_to_modify,
+                                ..target_def.clone()
+                            };
+                            if let Some(warnings_cmd) = apply_warnings_as_errors(
+                                &temp_target,
+                                &target,
+                                &project.plugin_name,
+                                &registry,
                             ) {
-                                command_overrides.insert(target_addr, modified_cmd);
+                                modified_cmd = Some(warnings_cmd);
                             }
+                        }
+
+                        if let Some(cmd) = modified_cmd {
+                            command_overrides.insert(target_addr, cmd);
                         }
                     }
                 }
@@ -725,7 +754,49 @@ fn run() -> Result<()> {
 
             // Execute target on projects
             let executor = Executor::with_output_mode(&workspace_root, output_mode);
-            let results = executor.execute(&run_args.target, &ordered, &graph);
+
+            let results = if run_args.warnings_as_errors {
+                // Build command overrides for warnings-as-errors
+                let mut command_overrides: HashMap<String, String> = HashMap::new();
+
+                // Create plugin registry for capability handling
+                let mut registry = PluginRegistry::new();
+                registry.register(Box::new(NodeJsPlugin));
+                registry.register(Box::new(PythonPlugin));
+                registry.register(Box::new(ElixirPlugin));
+                registry.register(Box::new(GoPlugin));
+
+                for project in &ordered {
+                    let project_addr = format!("//{}", project.relative_path.display());
+                    let target_addr = format!("{project_addr}:{}", run_args.target);
+
+                    if let Some(target_def) = project.targets.get(&run_args.target) {
+                        if let Some(modified_cmd) = apply_warnings_as_errors(
+                            target_def,
+                            &run_args.target,
+                            &project.plugin_name,
+                            &registry,
+                        ) {
+                            command_overrides.insert(target_addr, modified_cmd);
+                        }
+                    }
+                }
+
+                if output_mode == OutputMode::Verbose && !command_overrides.is_empty() {
+                    eprintln!(
+                        "[aster] Using warnings-as-errors for {} targets",
+                        command_overrides.len()
+                    );
+                }
+
+                executor.execute_with_command_overrides(
+                    &run_args.target,
+                    &ordered,
+                    &command_overrides,
+                )
+            } else {
+                executor.execute(&run_args.target, &ordered, &graph)
+            };
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
@@ -1394,6 +1465,32 @@ fn apply_files_to_command(
     // Fall back to plugin's with_files_list for language-specific handling
     if let Some(plugin) = registry.find_by_name(plugin_name) {
         return plugin.with_files_list(target_name, &target.command, &filtered_files);
+    }
+
+    None
+}
+
+/// Apply warnings-as-errors to a command
+///
+/// Returns Some(modified_command) if the target supports warnings-as-errors,
+/// None otherwise.
+fn apply_warnings_as_errors(
+    target: &Target,
+    target_name: &str,
+    plugin_name: &str,
+    registry: &PluginRegistry,
+) -> Option<String> {
+    // Check if target has WarningsAsErrors capability
+    if !target
+        .capabilities
+        .contains(&TargetCapability::WarningsAsErrors)
+    {
+        return None;
+    }
+
+    // Use plugin's with_warnings_as_errors for language-specific handling
+    if let Some(plugin) = registry.find_by_name(plugin_name) {
+        return plugin.with_warnings_as_errors(target_name, &target.command);
     }
 
     None

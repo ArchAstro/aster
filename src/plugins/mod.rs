@@ -26,6 +26,9 @@ pub enum TargetCapability {
     /// Target can accept a list of files to operate on
     /// (e.g., run tests only for specific files)
     FilesList,
+    /// Target can treat warnings as errors
+    /// (e.g., fail build on compiler warnings)
+    WarningsAsErrors,
 }
 
 /// A build target with its command and dependencies
@@ -114,6 +117,21 @@ pub trait LanguagePlugin: Send + Sync {
         _files: &[PathBuf],
     ) -> Option<String> {
         // Default: don't modify command (run full target)
+        None
+    }
+
+    /// Modify a command to treat warnings as errors
+    ///
+    /// Called when a target has the WarningsAsErrors capability and
+    /// --warnings-as-errors is passed on the command line.
+    ///
+    /// - target_name: name of the target (e.g., "build", "lint", "test")
+    /// - command: the original command
+    ///
+    /// Returns Some(modified_command) if the target supports warnings-as-errors,
+    /// or None if not supported for this target.
+    fn with_warnings_as_errors(&self, _target_name: &str, _command: &str) -> Option<String> {
+        // Default: don't modify command (not supported)
         None
     }
 }

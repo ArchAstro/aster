@@ -28,6 +28,8 @@ pub struct RunArgs {
     pub all: bool,
     /// Use current directory to find project (triggered by "." argument)
     pub use_cwd: bool,
+    /// Treat warnings as errors for targets that support it
+    pub warnings_as_errors: bool,
 }
 
 /// Check if a target name conflicts with a reserved command
@@ -63,12 +65,14 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut dependents = false;
     let mut all = false;
     let mut use_cwd = false;
+    let mut warnings_as_errors = false;
 
     for arg in args {
         match arg.as_str() {
             "--no-deps" => no_deps = true,
             "--dependents" => dependents = true,
             "--all" => all = true,
+            "--warnings-as-errors" => warnings_as_errors = true,
             "." => {
                 // Current directory - use cwd detection
                 use_cwd = true;
@@ -98,6 +102,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         dependents,
         all,
         use_cwd,
+        warnings_as_errors,
     }
 }
 
@@ -247,6 +252,7 @@ mod tests {
         assert!(!args.dependents);
         assert!(!args.all);
         assert!(!args.use_cwd);
+        assert!(!args.warnings_as_errors);
     }
 
     #[test]
@@ -347,5 +353,18 @@ mod tests {
         assert!(check_reserved_target("affected").is_some());
         assert!(check_reserved_target("logs").is_some());
         assert!(check_reserved_target("help").is_some());
+    }
+
+    #[test]
+    fn test_parse_run_args_with_warnings_as_errors() {
+        let args = parse_run_args(vec![
+            "build".to_string(),
+            "--all".to_string(),
+            "--warnings-as-errors".to_string(),
+        ]);
+
+        assert_eq!(args.target, "build");
+        assert!(args.all);
+        assert!(args.warnings_as_errors);
     }
 }
