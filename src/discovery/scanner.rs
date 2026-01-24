@@ -5,13 +5,27 @@
 //! and merges aster.toml overrides.
 
 use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{find_aster_toml, parse_aster_toml};
+use crate::config::{find_aster_toml, parse_aster_toml, WorkspaceConfig};
 use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata, Target, TargetContext};
 use crate::targets::TargetResolver;
+
+/// Build a GlobSet from ignore patterns
+fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern)
+            .with_context(|| format!("Invalid ignore pattern: {}", pattern))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .context("Failed to build ignore pattern set")
+}
 
 /// A project discovered during workspace traversal
 #[derive(Debug, Clone)]
@@ -43,6 +57,10 @@ pub fn discover_projects(
     workspace_root: &Path,
     registry: &PluginRegistry,
 ) -> Result<Vec<DiscoveredProject>> {
+    // Load workspace config for ignore patterns
+    let workspace_config = WorkspaceConfig::load(workspace_root)?;
+    let ignore_set = build_ignore_set(&workspace_config.ignore)?;
+
     // Collect all marker files we're looking for
     let marker_files: Vec<&str> = registry
         .plugins()
@@ -92,6 +110,14 @@ pub fn discover_projects(
             Some(p) => p,
             None => continue,
         };
+
+        // Check if this path should be ignored
+        let relative_path = project_dir
+            .strip_prefix(workspace_root)
+            .unwrap_or(project_dir);
+        if ignore_set.is_match(relative_path) {
+            continue;
+        }
 
         // Parse the project using the plugin
         let mut metadata = plugin
@@ -725,5 +751,119 @@ end
         );
         // lint NOT available (no credo)
         assert_eq!(project.targets.get("lint"), None);
+    }
+
+    #[test]
+    fn test_discover_ignores_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create workspace aster.toml with ignore patterns
+        std::fs::write(
+            tmp.path().join("aster.toml"),
+            r#"
+ignore = [
+    "vendor/**",
+    "examples/**",
+]
+"#,
+        )
+        .unwrap();
+
+        // Project that should be discovered
+        let api_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project in vendor (should be ignored)
+        let vendor_dir = tmp.path().join("vendor/some-lib");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        std::fs::write(
+            vendor_dir.join("package.json"),
+            r#"{"name": "some-lib", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project in examples (should be ignored)
+        let example_dir = tmp.path().join("examples/demo");
+        std::fs::create_dir_all(&example_dir).unwrap();
+        std::fs::write(
+            example_dir.join("package.json"),
+            r#"{"name": "demo", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // Only the api project should be discovered
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
+    }
+
+    #[test]
+    fn test_discover_ignores_nested_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Ignore all node_modules anywhere
+        std::fs::write(
+            tmp.path().join("aster.toml"),
+            r#"
+ignore = ["**/node_modules/**"]
+"#,
+        )
+        .unwrap();
+
+        // Normal project
+        let api_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Project inside node_modules (should be ignored)
+        let nm_dir = tmp.path().join("services/api/node_modules/some-pkg");
+        std::fs::create_dir_all(&nm_dir).unwrap();
+        std::fs::write(
+            nm_dir.join("package.json"),
+            r#"{"name": "some-pkg", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // Only api should be discovered
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
+    }
+
+    #[test]
+    fn test_discover_no_ignore_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Empty aster.toml (no ignore patterns)
+        std::fs::write(tmp.path().join("aster.toml"), "").unwrap();
+
+        let api_dir = tmp.path().join("services/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(
+            api_dir.join("package.json"),
+            r#"{"name": "api", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let registry = setup_registry();
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].metadata.name, "api");
     }
 }

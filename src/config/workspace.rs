@@ -1,4 +1,34 @@
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+/// Workspace-level configuration from the root aster.toml
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Glob patterns for paths to ignore during project discovery
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+impl WorkspaceConfig {
+    /// Load workspace config from the root aster.toml
+    /// Returns default config if file doesn't exist or has no workspace settings
+    pub fn load(workspace_root: &Path) -> Result<Self> {
+        let config_path = workspace_root.join("aster.toml");
+
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+        // Parse TOML - workspace config fields are at the top level
+        let config: WorkspaceConfig = toml::from_str(&content).unwrap_or_default();
+
+        Ok(config)
+    }
+}
 
 /// Find the workspace root by walking up from the start directory.
 ///
@@ -101,6 +131,46 @@ mod tests {
             result.unwrap().canonicalize().unwrap(),
             root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn test_workspace_config_load_with_ignore() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("aster.toml"),
+            r#"
+ignore = ["vendor/**", "examples/**"]
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert_eq!(config.ignore.len(), 2);
+        assert!(config.ignore.contains(&"vendor/**".to_string()));
+        assert!(config.ignore.contains(&"examples/**".to_string()));
+    }
+
+    #[test]
+    fn test_workspace_config_load_empty() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("aster.toml"), "").unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert!(config.ignore.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_config_load_no_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // No aster.toml file
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert!(config.ignore.is_empty());
     }
 
     #[test]
