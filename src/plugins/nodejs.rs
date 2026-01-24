@@ -110,6 +110,8 @@ impl LanguagePlugin for NodeJsPlugin {
             base_deps.push(format!("{dep_addr}:build"));
         }
 
+        let format_deps = vec!["//self:deps".to_string(), "//self:build".to_string()];
+
         if let Some(scripts) = pkg.scripts {
             // Map npm scripts to aster targets
             // Only add targets for scripts that actually exist
@@ -148,6 +150,17 @@ impl LanguagePlugin for NodeJsPlugin {
                     },
                 );
             }
+            if scripts.contains_key("format") {
+                targets.insert(
+                    "format".to_string(),
+                    Target {
+                        command: "npm run format".to_string(),
+                        depends_on: format_deps.clone(),
+                        capabilities: HashSet::new(),
+                        files_glob: None,
+                    },
+                );
+            }
             // Also map any other scripts as targets (with same dependencies)
             for (script_name, _) in scripts {
                 if !targets.contains_key(&script_name) {
@@ -161,6 +174,38 @@ impl LanguagePlugin for NodeJsPlugin {
                         },
                     );
                 }
+            }
+        }
+
+        // If no format script, check for Prettier config
+        if !targets.contains_key("format") {
+            let prettier_configs = [
+                ".prettierrc",
+                ".prettierrc.json",
+                ".prettierrc.js",
+                ".prettierrc.cjs",
+                ".prettierrc.mjs",
+                ".prettierrc.yml",
+                ".prettierrc.yaml",
+                ".prettierrc.toml",
+                "prettier.config.js",
+                "prettier.config.cjs",
+                "prettier.config.mjs",
+            ];
+            let has_prettier = prettier_configs
+                .iter()
+                .any(|config| ctx.project_dir.join(config).exists());
+
+            if has_prettier {
+                targets.insert(
+                    "format".to_string(),
+                    Target {
+                        command: "npx prettier --write .".to_string(),
+                        depends_on: format_deps,
+                        capabilities: HashSet::new(),
+                        files_glob: None,
+                    },
+                );
             }
         }
 
@@ -554,6 +599,115 @@ mod tests {
         assert_eq!(targets.get("build"), None);
         // deps is always present
         assert!(targets.get("deps").is_some());
+    }
+
+    #[test]
+    fn test_detect_targets_format_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"format": "prettier --write ."}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format uses npm run format
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"npm run format".to_string())
+        );
+
+        // Check dependencies
+        let format_deps = &targets.get("format").unwrap().depends_on;
+        assert!(format_deps.contains(&"//self:deps".to_string()));
+        assert!(format_deps.contains(&"//self:build".to_string()));
+        assert_eq!(format_deps.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_targets_format_prettier_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "my-app"}"#).unwrap();
+
+        // Create .prettierrc
+        std::fs::write(tmp.path().join(".prettierrc"), r#"{"semi": false}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format uses npx prettier
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"npx prettier --write .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_format_prettier_config_js() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "my-app"}"#).unwrap();
+
+        // Create prettier.config.js
+        std::fs::write(
+            tmp.path().join("prettier.config.js"),
+            "module.exports = { semi: false };",
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format uses npx prettier
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"npx prettier --write .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_format_script_preferred_over_prettier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"format": "biome format --write ."}}"#,
+        )
+        .unwrap();
+
+        // Also create .prettierrc
+        std::fs::write(tmp.path().join(".prettierrc"), r#"{"semi": false}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format script takes priority over prettier config
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"npm run format".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_no_format_without_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "my-app"}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // no format target (no script or prettier config)
+        assert_eq!(targets.get("format"), None);
     }
 
     #[test]

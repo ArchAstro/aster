@@ -237,6 +237,30 @@ impl LanguagePlugin for PythonPlugin {
             );
         }
 
+        // format target: prefer ruff, fall back to black
+        let format_deps = vec!["//self:deps".to_string(), "//self:build".to_string()];
+        if content.contains("[tool.ruff]") {
+            targets.insert(
+                "format".to_string(),
+                Target {
+                    command: "ruff format .".to_string(),
+                    depends_on: format_deps,
+                    capabilities: HashSet::new(),
+                    files_glob: None,
+                },
+            );
+        } else if content.contains("[tool.black]") {
+            targets.insert(
+                "format".to_string(),
+                Target {
+                    command: "black .".to_string(),
+                    depends_on: format_deps,
+                    capabilities: HashSet::new(),
+                    files_glob: None,
+                },
+            );
+        }
+
         Ok(targets)
     }
 
@@ -711,6 +735,118 @@ python = "^3.11"
             targets.get("deps").map(|t| &t.command),
             Some(&"poetry install".to_string())
         );
+    }
+
+    #[test]
+    fn test_detect_targets_format_with_ruff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.ruff]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format uses ruff
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"ruff format .".to_string())
+        );
+
+        // Check dependencies
+        let format_deps = &targets.get("format").unwrap().depends_on;
+        assert!(format_deps.contains(&"//self:deps".to_string()));
+        assert!(format_deps.contains(&"//self:build".to_string()));
+        assert_eq!(format_deps.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_targets_format_with_black() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.black]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format uses black (no ruff)
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"black .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_format_prefers_ruff_over_black() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format prefers ruff over black
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"ruff format .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_no_format_without_formatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // no format target (no ruff or black)
+        assert_eq!(targets.get("format"), None);
     }
 
     #[test]

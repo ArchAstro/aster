@@ -127,6 +127,17 @@ impl LanguagePlugin for GoPlugin {
             },
         );
 
+        // format target: always available (built-in)
+        targets.insert(
+            "format".to_string(),
+            Target {
+                command: "go fmt ./...".to_string(),
+                depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
+                capabilities: HashSet::new(),
+                files_glob: None,
+            },
+        );
+
         // lint target: only if golangci-lint config exists
         let lint_configs = [
             ".golangci.yml",
@@ -430,6 +441,43 @@ go 1.21
             vec!["//self:deps"]
         );
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
+    }
+
+    #[test]
+    fn test_detect_targets_has_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go_mod = tmp.path().join("go.mod");
+        std::fs::write(
+            &go_mod,
+            r#"module myapp
+
+go 1.21
+"#,
+        )
+        .unwrap();
+
+        let plugin = GoPlugin;
+        let ctx = make_context(&go_mod, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format is always available for Go projects
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"go fmt ./...".to_string())
+        );
+
+        // Check dependencies - only self:deps and self:build
+        let format_deps = &targets.get("format").unwrap().depends_on;
+        assert!(format_deps.contains(&"//self:deps".to_string()));
+        assert!(format_deps.contains(&"//self:build".to_string()));
+        assert_eq!(format_deps.len(), 2);
+
+        // No FilesList capability
+        assert!(!targets
+            .get("format")
+            .unwrap()
+            .capabilities
+            .contains(&TargetCapability::FilesList));
     }
 
     #[test]

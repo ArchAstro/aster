@@ -155,6 +155,19 @@ impl LanguagePlugin for ElixirPlugin {
             );
         }
 
+        // format target: only if .formatter.exs exists
+        if ctx.project_dir.join(".formatter.exs").exists() {
+            targets.insert(
+                "format".to_string(),
+                Target {
+                    command: "mix format".to_string(),
+                    depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
+                    capabilities: HashSet::new(),
+                    files_glob: None,
+                },
+            );
+        }
+
         Ok(targets)
     }
 
@@ -558,6 +571,76 @@ end
             vec!["//self:deps"]
         );
         assert!(targets.get("deps").unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_detect_targets_with_formatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Create .formatter.exs
+        std::fs::write(
+            tmp.path().join(".formatter.exs"),
+            r#"[inputs: ["{config,lib,test}/**/*.{ex,exs}"]]"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format available because .formatter.exs exists
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"mix format".to_string())
+        );
+
+        // Check dependencies
+        let format_deps = &targets.get("format").unwrap().depends_on;
+        assert!(format_deps.contains(&"//self:deps".to_string()));
+        assert!(format_deps.contains(&"//self:build".to_string()));
+        assert_eq!(format_deps.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_targets_without_formatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // No .formatter.exs
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // format NOT available (no .formatter.exs)
+        assert_eq!(targets.get("format"), None);
     }
 
     #[test]
