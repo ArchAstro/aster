@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use console::style;
 use std::env;
 use std::fs;
 use std::process::ExitCode;
@@ -117,9 +118,12 @@ fn run() -> Result<()> {
                     .collect();
                 output_json(&project_infos)?;
             } else if output_mode != OutputMode::Quiet {
-                // Normal or Verbose: text output
+                // Normal or Verbose: text output with colors
                 for project in &filtered_projects {
-                    println!("//{}", project.relative_path.display());
+                    println!(
+                        "{}",
+                        style(format!("//{}", project.relative_path.display())).cyan().bold()
+                    );
 
                     if !project.targets.is_empty() {
                         // Sort targets for consistent output
@@ -130,13 +134,18 @@ fn run() -> Result<()> {
                         for name in target_names {
                             let target = &project.targets[name];
                             if target.depends_on.is_empty() {
-                                println!("  {}: {}", name, target.command);
+                                println!(
+                                    "  {}: {}",
+                                    style(name).yellow(),
+                                    target.command
+                                );
                             } else {
                                 println!(
-                                    "  {}: {} -> [{}]",
-                                    name,
+                                    "  {}: {} {} {}",
+                                    style(name).yellow(),
                                     target.command,
-                                    target.depends_on.join(", ")
+                                    style("→").dim(),
+                                    style(format!("[{}]", target.depends_on.join(", "))).dim()
                                 );
                             }
                         }
@@ -197,13 +206,13 @@ fn run() -> Result<()> {
             } else if output_mode == OutputMode::Quiet {
                 // Quiet mode: no output for graph
             } else {
-                // Normal/Verbose: text output
+                // Normal/Verbose: text output with colors
                 if let Some(addr) = target {
                     // Show deps for specific target
                     if let Some(node) = graph.get(&addr) {
-                        println!("{}", node.address);
+                        println!("{}", style(&node.address).cyan().bold());
                         for dep in graph.dependencies(&addr) {
-                            println!("  -> {}", dep.address);
+                            println!("  {} {}", style("→").dim(), style(&dep.address).dim());
                         }
                     } else {
                         return Err(anyhow::anyhow!("Target not found: {addr}"));
@@ -220,16 +229,20 @@ fn run() -> Result<()> {
                                 println!();
                             }
                             current_project = node.project_address.clone();
-                            println!("{current_project}");
+                            println!("{}", style(&current_project).cyan().bold());
                         }
-                        print!("  :{}", node.target_name);
                         let deps = graph.dependencies(&node.address);
                         if deps.is_empty() {
-                            println!();
+                            println!("  {}", style(format!(":{}", node.target_name)).yellow());
                         } else {
                             let dep_strs: Vec<&str> =
                                 deps.iter().map(|d| d.address.as_str()).collect();
-                            println!(" -> [{}]", dep_strs.join(", "));
+                            println!(
+                                "  {} {} {}",
+                                style(format!(":{}", node.target_name)).yellow(),
+                                style("→").dim(),
+                                style(format!("[{}]", dep_strs.join(", "))).dim()
+                            );
                         }
                     }
                 }
