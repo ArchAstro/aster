@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit hook to check Rust formatting
+
+# Check if cargo fmt would make changes
+if ! cargo fmt --check > /dev/null 2>&1; then
+    echo "error: Rust code is not formatted"
+    echo ""
+    echo "Run 'cargo fmt' to fix formatting, then commit again."
+    exit 1
+fi
+
+exit 0

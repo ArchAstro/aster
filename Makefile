@@ -1,4 +1,4 @@
-.PHONY: all build build-release install test clean release
+.PHONY: all build build-release install test clean release setup
 
 # Default target
 all: build
@@ -55,3 +55,9 @@ lint:
 # Check (fast compile check without codegen)
 check:
 	cargo check
+
+# Setup development environment (install git hooks)
+setup:
+	cp scripts/pre-commit .git/hooks/pre-commit
+	chmod +x .git/hooks/pre-commit
+	@echo "Git hooks installed"
