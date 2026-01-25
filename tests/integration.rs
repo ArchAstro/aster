@@ -130,7 +130,7 @@ fn test_graph_shows_dependencies() {
     assert!(stdout.contains("//services/api"));
     // The graph shows target-level dependencies like: :build -> [//libs/core:build]
     assert!(
-        stdout.contains("-> ["),
+        stdout.contains("→ ["),
         "Expected dependency arrow in output: {stdout}"
     );
     assert!(
@@ -378,9 +378,9 @@ end
         stdout.contains("//libs/core"),
         "Expected //libs/core in dependency output: {stdout}"
     );
-    // The output shows target-level deps like: :build -> [//libs/core:build, ...]
+    // The output shows target-level deps like: :build → [//libs/core:build, ...]
     assert!(
-        stdout.contains("->"),
+        stdout.contains("→"),
         "Expected dependency arrow in output: {stdout}"
     );
 }

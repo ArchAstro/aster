@@ -122,7 +122,9 @@ fn run() -> Result<()> {
                 for project in &filtered_projects {
                     println!(
                         "{}",
-                        style(format!("//{}", project.relative_path.display())).cyan().bold()
+                        style(format!("//{}", project.relative_path.display()))
+                            .cyan()
+                            .bold()
                     );
 
                     if !project.targets.is_empty() {
@@ -134,11 +136,7 @@ fn run() -> Result<()> {
                         for name in target_names {
                             let target = &project.targets[name];
                             if target.depends_on.is_empty() {
-                                println!(
-                                    "  {}: {}",
-                                    style(name).yellow(),
-                                    target.command
-                                );
+                                println!("  {}: {}", style(name).yellow(), target.command);
                             } else {
                                 println!(
                                     "  {}: {} {} {}",
@@ -582,10 +580,8 @@ fn run() -> Result<()> {
                                 .contains(&TargetCapability::WarningsAsErrors)
                         {
                             // Build a temporary target with possibly modified command
-                            let cmd_to_modify = modified_cmd
-                                .as_ref()
-                                .unwrap_or(&target_def.command)
-                                .clone();
+                            let cmd_to_modify =
+                                modified_cmd.as_ref().unwrap_or(&target_def.command).clone();
                             let temp_target = Target {
                                 command: cmd_to_modify,
                                 ..target_def.clone()

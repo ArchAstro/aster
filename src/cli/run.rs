@@ -18,8 +18,10 @@ pub const RESERVED_COMMANDS: &[&str] =
 pub struct RunArgs {
     /// Target to run (e.g., "test", "build", "lint")
     pub target: String,
-    /// Explicit projects to run on (//path/to/project)
+    /// Explicit projects to run on (//path/to/project, //prefix/..., ./...)
     pub projects: Vec<String>,
+    /// Projects to exclude (-//path/to/project, -//prefix/...)
+    pub exclusions: Vec<String>,
     /// Skip dependencies (run only specified projects)
     pub no_deps: bool,
     /// Include projects that depend on selected projects
@@ -52,15 +54,24 @@ pub fn check_reserved_target(target: &str) -> Option<String> {
 ///
 /// Args format: [target] [projects...] [--no-deps] [--dependents] [--all]
 ///
+/// Project patterns:
+///   //path/to/project  - exact project match
+///   //path/prefix/...  - all projects under prefix
+///   //...              - all projects (same as --all)
+///   ./...              - all projects under current directory
+///   -//path/...        - exclude from selection
+///
 /// Examples:
 ///   ["test"]                     -> target=test, all projects
 ///   ["test", "//a", "//b"]       -> target=test, projects a and b (+ deps)
 ///   ["test", "--all"]            -> target=test, all projects
 ///   ["test", "//a", "--no-deps"] -> target=test, only project a
 ///   ["test", "//a", "--dependents"] -> target=test, a + its dependents
+///   ["test", "//...", "-//vendor/..."] -> all projects except under vendor/
 pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut target = String::new();
     let mut projects = Vec::new();
+    let mut exclusions = Vec::new();
     let mut no_deps = false;
     let mut dependents = false;
     let mut all = false;
@@ -80,8 +91,16 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
             _ if arg.starts_with("--") => {
                 // Unknown flag - ignore for now
             }
+            _ if arg.starts_with("-//") => {
+                // Exclusion pattern (e.g., -//vendor/...)
+                exclusions.push(arg[1..].to_string()); // Strip leading "-"
+            }
             _ if arg.starts_with("//") => {
-                // Project address
+                // Project address or glob
+                projects.push(arg);
+            }
+            _ if arg.starts_with("./") => {
+                // Relative path pattern (e.g., ./...)
                 projects.push(arg);
             }
             _ if target.is_empty() => {
@@ -98,6 +117,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     RunArgs {
         target,
         projects,
+        exclusions,
         no_deps,
         dependents,
         all,
@@ -109,9 +129,16 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
 /// Select initial projects based on args
 ///
 /// Priority:
-/// 1. If --all: return all projects
-/// 2. If explicit projects given: return those
+/// 1. If --all or //...: return all projects (minus exclusions)
+/// 2. If explicit projects given: return those (supports glob syntax)
 /// 3. Otherwise: try to find project in cwd
+///
+/// Glob syntax:
+/// - `//path/to/project` - exact match
+/// - `//path/prefix/...` - all projects under that path prefix
+/// - `//...` - all projects
+/// - `./...` - all projects under current directory
+/// - `-//path/...` - exclude from selection (in args.exclusions)
 pub fn select_projects<'a>(
     args: &RunArgs,
     graph: &'a ProjectGraph,
@@ -125,62 +152,128 @@ pub fn select_projects<'a>(
         .map(|p| (format!("//{}", p.relative_path.display()), p))
         .collect();
 
-    if args.all {
-        // Return all projects
-        return Ok(discovered.iter().collect());
-    }
+    // Get cwd relative to workspace for ./... pattern
+    let relative_cwd = cwd.strip_prefix(workspace_root).ok();
 
-    if !args.projects.is_empty() {
+    // Helper to check if a pattern matches a project address
+    let matches_pattern = |pattern: &str, project_addr: &str| -> bool {
+        if pattern == "//..." {
+            // Match all projects
+            true
+        } else if let Some(prefix) = pattern.strip_suffix("/...") {
+            // Glob pattern: //prefix/... or ./...
+            let abs_prefix = if prefix == "." {
+                // ./... - use cwd
+                relative_cwd
+                    .map(|p| format!("//{}", p.display()))
+                    .unwrap_or_default()
+            } else if prefix.starts_with("./") {
+                // ./path/... - relative to cwd
+                relative_cwd
+                    .map(|p| format!("//{}/{}", p.display(), &prefix[2..]))
+                    .unwrap_or_default()
+            } else {
+                prefix.to_string()
+            };
+
+            if abs_prefix.is_empty() {
+                return false;
+            }
+
+            let prefix_with_slash = format!("{}/", abs_prefix);
+            project_addr == abs_prefix || project_addr.starts_with(&prefix_with_slash)
+        } else {
+            // Exact match
+            project_addr == pattern
+        }
+    };
+
+    // Check for //... in projects (means all)
+    let select_all = args.all || args.projects.iter().any(|p| p == "//...");
+
+    let mut result: Vec<&DiscoveredProject>;
+    let mut seen = HashSet::new();
+
+    if select_all {
+        // Start with all projects
+        result = discovered.iter().collect();
+        for p in &result {
+            seen.insert(format!("//{}", p.relative_path.display()));
+        }
+    } else if !args.projects.is_empty() {
         // Return explicitly specified projects
-        let mut result = Vec::new();
-        for addr in &args.projects {
-            if let Some(project) = project_by_addr.get(addr) {
-                result.push(*project);
-            } else if graph.get(addr).is_some() {
-                // Address exists in graph but not in our map - find by address
-                for p in discovered {
-                    if format!("//{}", p.relative_path.display()) == *addr {
+        result = Vec::new();
+
+        for pattern in &args.projects {
+            if pattern == "//..." {
+                continue; // Already handled above
+            }
+
+            let mut found_any = false;
+
+            for p in discovered {
+                let project_addr = format!("//{}", p.relative_path.display());
+
+                if matches_pattern(pattern, &project_addr) {
+                    if seen.insert(project_addr) {
                         result.push(p);
-                        break;
+                        found_any = true;
                     }
                 }
-            } else {
-                return Err(format!("Project not found: {addr}"));
             }
-        }
-        return Ok(result);
-    }
 
-    // Try to detect project from cwd
-    if let Ok(relative_cwd) = cwd.strip_prefix(workspace_root) {
-        // Find the most specific project whose root matches or contains cwd
-        // (prefer longer paths to avoid matching workspace root for everything)
-        let mut best_match: Option<&DiscoveredProject> = None;
-        let mut best_match_len = 0;
-
-        for project in discovered {
-            let proj_path = &project.relative_path;
-            // Check if cwd is within this project's directory
-            if relative_cwd.starts_with(proj_path) {
-                let path_len = proj_path.as_os_str().len();
-                if path_len > best_match_len || best_match.is_none() {
-                    best_match = Some(project);
-                    best_match_len = path_len;
+            // For exact matches (non-glob), verify the project exists
+            if !found_any && !pattern.ends_with("/...") {
+                // Check if it's in the graph but just not matched
+                if graph.get(pattern).is_none() && !project_by_addr.contains_key(pattern) {
+                    return Err(format!("Project not found: {pattern}"));
                 }
             }
+
+            if !found_any && pattern.ends_with("/...") {
+                return Err(format!("No projects found matching: {pattern}"));
+            }
+        }
+    } else {
+        // Try to detect project from cwd
+        if let Some(rel_cwd) = relative_cwd {
+            let mut best_match: Option<&DiscoveredProject> = None;
+            let mut best_match_len = 0;
+
+            for project in discovered {
+                let proj_path = &project.relative_path;
+                if rel_cwd.starts_with(proj_path) {
+                    let path_len = proj_path.as_os_str().len();
+                    if path_len > best_match_len || best_match.is_none() {
+                        best_match = Some(project);
+                        best_match_len = path_len;
+                    }
+                }
+            }
+
+            if let Some(project) = best_match {
+                return Ok(vec![project]);
+            }
         }
 
-        if let Some(project) = best_match {
-            return Ok(vec![project]);
-        }
+        return Err(
+            "No projects specified. Use --all to run on all projects, or specify project addresses."
+                .to_string(),
+        );
     }
 
-    // No projects selected - return error or empty?
-    // For usability, if no projects and no --all, show an error
-    Err(
-        "No projects specified. Use --all to run on all projects, or specify project addresses."
-            .to_string(),
-    )
+    // Apply exclusions
+    if !args.exclusions.is_empty() {
+        result.retain(|p| {
+            let project_addr = format!("//{}", p.relative_path.display());
+            !args
+                .exclusions
+                .iter()
+                .any(|excl| matches_pattern(excl, &project_addr))
+        });
+    }
+
+    Ok(result)
 }
 
 /// Expand project selection based on flags
@@ -366,5 +459,348 @@ mod tests {
         assert_eq!(args.target, "build");
         assert!(args.all);
         assert!(args.warnings_as_errors);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_glob_pattern() {
+        let args = parse_run_args(vec!["test".to_string(), "//src/ts/...".to_string()]);
+
+        assert_eq!(args.target, "test");
+        assert_eq!(args.projects, vec!["//src/ts/..."]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_multiple_glob_patterns() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "//src/ts/...".to_string(),
+            "//libs/...".to_string(),
+        ]);
+
+        assert_eq!(args.target, "test");
+        assert_eq!(args.projects, vec!["//src/ts/...", "//libs/..."]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_exclusions() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "//...".to_string(),
+            "-//vendor/...".to_string(),
+            "-//generated".to_string(),
+        ]);
+
+        assert_eq!(args.target, "test");
+        assert_eq!(args.projects, vec!["//..."]);
+        assert_eq!(args.exclusions, vec!["//vendor/...", "//generated"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_relative_glob() {
+        let args = parse_run_args(vec!["test".to_string(), "./...".to_string()]);
+
+        assert_eq!(args.target, "test");
+        assert_eq!(args.projects, vec!["./..."]);
+    }
+
+    mod select_projects_tests {
+        use super::*;
+        use crate::discovery::DiscoveredProject;
+        use crate::graph::build_graph;
+        use crate::plugins::ProjectMetadata;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn make_project(name: &str, relative_path: &str) -> DiscoveredProject {
+            DiscoveredProject {
+                root: PathBuf::from("/workspace").join(relative_path),
+                config_path: PathBuf::from("/workspace")
+                    .join(relative_path)
+                    .join("package.json"),
+                metadata: ProjectMetadata {
+                    name: name.to_string(),
+                    version: None,
+                },
+                dependencies: vec![],
+                targets: HashMap::new(),
+                plugin_name: "nodejs".to_string(),
+                relative_path: PathBuf::from(relative_path),
+            }
+        }
+
+        #[test]
+        fn test_select_projects_glob_matches_prefix() {
+            let projects = vec![
+                make_project("ts-app", "src/ts/app"),
+                make_project("ts-lib", "src/ts/lib"),
+                make_project("go-service", "src/go/service"),
+                make_project("shared", "libs/shared"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//src/ts/...".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"ts-app"));
+            assert!(names.contains(&"ts-lib"));
+        }
+
+        #[test]
+        fn test_select_projects_glob_no_matches_returns_error() {
+            let projects = vec![
+                make_project("app", "src/app"),
+                make_project("lib", "src/lib"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//nonexistent/...".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let result = select_projects(&args, &graph, &projects, cwd, workspace_root);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("No projects found matching"));
+        }
+
+        #[test]
+        fn test_select_projects_glob_matches_exact_prefix() {
+            // Test that //libs/... also matches //libs (exact match at prefix level)
+            let projects = vec![
+                make_project("libs-root", "libs"),
+                make_project("libs-sub", "libs/shared"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//libs/...".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"libs-root"));
+            assert!(names.contains(&"libs-sub"));
+        }
+
+        #[test]
+        fn test_select_projects_mixed_glob_and_exact() {
+            let projects = vec![
+                make_project("ts-app", "src/ts/app"),
+                make_project("ts-lib", "src/ts/lib"),
+                make_project("specific", "other/specific"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//src/ts/...".to_string(), "//other/specific".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 3);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"ts-app"));
+            assert!(names.contains(&"ts-lib"));
+            assert!(names.contains(&"specific"));
+        }
+
+        #[test]
+        fn test_select_projects_glob_deduplicates() {
+            let projects = vec![
+                make_project("app", "src/app"),
+                make_project("lib", "src/lib"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            // Use overlapping patterns that would match the same projects
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec![
+                    "//src/...".to_string(),
+                    "//src/app".to_string(), // Already included in //src/...
+                ],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            // Should only have 2 projects, not 3
+            assert_eq!(selected.len(), 2);
+        }
+
+        #[test]
+        fn test_select_projects_all_shorthand() {
+            // //... should select all projects
+            let projects = vec![
+                make_project("app", "src/app"),
+                make_project("lib", "libs/lib"),
+                make_project("other", "other"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//...".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 3);
+        }
+
+        #[test]
+        fn test_select_projects_exclusion() {
+            // //... with exclusion -//libs/...
+            let projects = vec![
+                make_project("app", "src/app"),
+                make_project("lib", "libs/lib"),
+                make_project("util", "libs/util"),
+                make_project("other", "other"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//...".to_string()],
+                exclusions: vec!["//libs/...".to_string()],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"app"));
+            assert!(names.contains(&"other"));
+            assert!(!names.contains(&"lib"));
+            assert!(!names.contains(&"util"));
+        }
+
+        #[test]
+        fn test_select_projects_exclusion_exact() {
+            // Exclude a specific project
+            let projects = vec![
+                make_project("app", "src/app"),
+                make_project("lib", "src/lib"),
+                make_project("slow", "src/slow"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["//src/...".to_string()],
+                exclusions: vec!["//src/slow".to_string()],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"app"));
+            assert!(names.contains(&"lib"));
+            assert!(!names.contains(&"slow"));
+        }
+
+        #[test]
+        fn test_select_projects_relative_glob() {
+            // ./... from within src/ts should select src/ts projects
+            let projects = vec![
+                make_project("ts-app", "src/ts/app"),
+                make_project("ts-lib", "src/ts/lib"),
+                make_project("go-svc", "src/go/svc"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace/src/ts");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec!["./...".to_string()],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: false,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"ts-app"));
+            assert!(names.contains(&"ts-lib"));
+        }
     }
 }

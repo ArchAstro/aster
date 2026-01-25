@@ -17,18 +17,31 @@ use super::output::OutputMode;
     aster test //services/api     Run tests on specific project (+ dependencies)
     aster build //a //b           Run build on multiple projects
     aster lint .                  Run lint on project in current directory
+    aster test //src/ts/...       Run tests on all projects under src/ts/
+
+  Project selection patterns:
+    //path/to/project     Exact project match
+    //path/prefix/...     All projects under path prefix
+    //...                 All projects (same as --all)
+    ./...                 All projects under current directory
+    -//path/prefix/...    Exclude projects matching pattern
 
   Flags for target execution:
-    --all          Run on all projects in the workspace
-    --no-deps      Skip running dependencies first
-    --dependents   Also run projects that depend on selected ones
+    --all                 Run on all projects in the workspace
+    --no-deps             Skip running dependencies first
+    --dependents          Also run projects that depend on selected ones
+    --warnings-as-errors  Treat warnings as errors (for supported targets)
 
 EXAMPLES:
-    aster test --all                  # Test everything
-    aster test //libs/core            # Test core and its dependencies
-    aster test //libs/core --no-deps  # Test only core, skip dependencies
-    aster build //app --dependents    # Build app and everything that uses it
-    aster affected test --base=main   # Test projects changed since main
+    aster test --all                     # Test everything
+    aster test //...                     # Same as above
+    aster test //libs/core               # Test core and its dependencies
+    aster test //libs/core --no-deps     # Test only core, skip dependencies
+    aster test //src/ts/...              # Test all projects under src/ts/
+    aster test ./...                     # Test all projects under cwd
+    aster test //... -//vendor/...       # Test all except vendor projects
+    aster build //app --dependents       # Build app and everything that uses it
+    aster affected test --base=main      # Test projects changed since main
 
 HETEROGENEOUS RUNS:
     aster run //a:test //b:build //c:lint   # Run different targets on different projects
