@@ -99,6 +99,56 @@ impl<'a> Executor<'a> {
         self.execute_internal(target, projects, Some(command_overrides), primary_projects)
     }
 
+    /// Execute a target with streaming output (for long-running processes like dev servers)
+    ///
+    /// Output is streamed directly to stdout/stderr instead of being captured.
+    /// Only supports running on a single project - returns error if multiple projects.
+    /// Progress UI is disabled in streaming mode.
+    pub fn execute_streaming(
+        &self,
+        target: &str,
+        project: &DiscoveredProject,
+    ) -> Result<i32, String> {
+        use std::process::Stdio;
+
+        let project_addr = format!("//{}", project.relative_path.display());
+        let target_addr = format!("{project_addr}:{target}");
+
+        // Get the command for this target
+        let command = match project.targets.get(target) {
+            Some(t) => &t.command,
+            None => {
+                return Err(format!("No '{target}' target defined for {project_addr}"));
+            }
+        };
+
+        if self.output_mode == OutputMode::Verbose {
+            eprintln!("[aster] Running: {command}");
+            eprintln!("[aster] Working directory: {}", project.root.display());
+        }
+
+        // Split command by whitespace
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err("Empty command".to_string());
+        }
+
+        let program = parts[0];
+        let args = &parts[1..];
+
+        // Run with inherited stdio for streaming
+        let status = Command::new(program)
+            .args(args)
+            .current_dir(&project.root)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to execute {target_addr}: {e}"))?;
+
+        Ok(status.code().unwrap_or(1))
+    }
+
     /// Internal execution method that supports optional command overrides
     fn execute_internal(
         &self,
@@ -599,6 +649,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             capabilities: HashSet::new(),
             files_glob: None,
+            stream: false,
         }
     }
 

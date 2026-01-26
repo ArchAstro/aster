@@ -46,6 +46,7 @@ impl TargetResolver {
                     depends_on: resolved_deps,
                     capabilities: target.capabilities.clone(),
                     files_glob: target.files_glob.clone(),
+                    stream: target.stream,
                 },
             );
         }
@@ -65,6 +66,7 @@ impl TargetResolver {
                                 depends_on: existing.depends_on.clone(),
                                 capabilities: existing.capabilities.clone(),
                                 files_glob: existing.files_glob.clone(),
+                                stream: existing.stream,
                             },
                         );
                     } else {
@@ -76,6 +78,7 @@ impl TargetResolver {
                                 depends_on: vec![],
                                 capabilities: HashSet::new(),
                                 files_glob: None,
+                                stream: false,
                             },
                         );
                     }
@@ -99,6 +102,9 @@ impl TargetResolver {
                         .clone()
                         .or_else(|| existing.and_then(|e| e.files_glob.clone()));
 
+                    // stream is explicit in rich config, no fallback to existing
+                    let stream = rich.stream;
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -106,6 +112,7 @@ impl TargetResolver {
                             depends_on,
                             capabilities,
                             files_glob,
+                            stream,
                         },
                     );
                 }
@@ -150,6 +157,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             capabilities: HashSet::new(),
             files_glob: None,
+            stream: false,
         }
     }
 
@@ -168,6 +176,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
             capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
             files_glob: files_glob.map(|s| s.to_string()),
+            stream: false,
         })
     }
 

@@ -89,6 +89,7 @@ impl LanguagePlugin for GoPlugin {
                 depends_on: vec![],
                 capabilities: HashSet::new(),
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -111,6 +112,7 @@ impl LanguagePlugin for GoPlugin {
                 depends_on: base_deps.clone(),
                 capabilities: HashSet::new(),
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -124,6 +126,7 @@ impl LanguagePlugin for GoPlugin {
                 depends_on: base_deps.clone(),
                 capabilities: test_caps,
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -135,6 +138,7 @@ impl LanguagePlugin for GoPlugin {
                 depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
                 capabilities: HashSet::new(),
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -157,6 +161,7 @@ impl LanguagePlugin for GoPlugin {
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         }

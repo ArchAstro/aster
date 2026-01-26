@@ -106,6 +106,7 @@ impl LanguagePlugin for ElixirPlugin {
                 depends_on: vec![],
                 capabilities: HashSet::new(),
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -131,6 +132,7 @@ impl LanguagePlugin for ElixirPlugin {
                 depends_on: base_deps.clone(),
                 capabilities: test_caps,
                 files_glob: None,
+                stream: false,
             },
         );
         let mut build_caps = HashSet::new();
@@ -142,6 +144,7 @@ impl LanguagePlugin for ElixirPlugin {
                 depends_on: base_deps.clone(),
                 capabilities: build_caps,
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -154,6 +157,7 @@ impl LanguagePlugin for ElixirPlugin {
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         }
@@ -167,6 +171,7 @@ impl LanguagePlugin for ElixirPlugin {
                     depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         }

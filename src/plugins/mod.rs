@@ -45,6 +45,8 @@ pub struct Target {
     /// Optional glob pattern to filter files for FilesList capability
     /// e.g., "*_test.go" or "*.spec.ts"
     pub files_glob: Option<String>,
+    /// Stream output to stdout in real-time (for long-running processes like dev servers)
+    pub stream: bool,
 }
 
 /// Context passed to plugins for target detection

@@ -59,6 +59,10 @@ pub struct RichTargetConfig {
     /// Glob pattern to filter files for files_list capability
     /// e.g., "*_test.py" or "*.spec.ts"
     pub files_glob: Option<String>,
+
+    /// Stream output to stdout in real-time (for long-running processes like dev servers)
+    #[serde(default)]
+    pub stream: bool,
 }
 
 impl TargetConfig {
@@ -91,6 +95,14 @@ impl TargetConfig {
         match self {
             TargetConfig::Simple(_) => None,
             TargetConfig::Rich(rich) => rich.files_glob.as_deref(),
+        }
+    }
+
+    /// Get stream flag (false for simple format)
+    pub fn stream(&self) -> bool {
+        match self {
+            TargetConfig::Simple(_) => false,
+            TargetConfig::Rich(rich) => rich.stream,
         }
     }
 }
@@ -286,6 +298,36 @@ test = "npm test"
         assert_eq!(config.name, Some("api-service".to_string()));
         assert_eq!(config.depends_on.len(), 2);
         assert_eq!(config.targets.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_target_with_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.run-dev]
+command = "poetry run scrape-server"
+stream = true
+
+[targets.test]
+command = "pytest"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        assert_eq!(config.targets.len(), 2);
+        // run-dev should have stream=true
+        let run_dev = config.targets.get("run-dev").unwrap();
+        assert_eq!(run_dev.command(), "poetry run scrape-server");
+        assert!(run_dev.stream());
+        // test should have stream=false (default)
+        let test = config.targets.get("test").unwrap();
+        assert_eq!(test.command(), "pytest");
+        assert!(!test.stream());
     }
 
     #[test]

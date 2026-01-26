@@ -32,6 +32,8 @@ pub struct RunArgs {
     pub use_cwd: bool,
     /// Treat warnings as errors for targets that support it
     pub warnings_as_errors: bool,
+    /// Stream override: Some(true) = force stream, Some(false) = force no-stream, None = use target config
+    pub stream_override: Option<bool>,
 }
 
 /// Check if a target name conflicts with a reserved command
@@ -77,6 +79,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut all = false;
     let mut use_cwd = false;
     let mut warnings_as_errors = false;
+    let mut stream_override = None;
 
     for arg in args {
         match arg.as_str() {
@@ -84,6 +87,8 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
             "--dependents" => dependents = true,
             "--all" => all = true,
             "--warnings-as-errors" => warnings_as_errors = true,
+            "--stream" => stream_override = Some(true),
+            "--no-stream" => stream_override = Some(false),
             "." => {
                 // Current directory - use cwd detection
                 use_cwd = true;
@@ -123,6 +128,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         all,
         use_cwd,
         warnings_as_errors,
+        stream_override,
     }
 }
 
@@ -507,6 +513,34 @@ mod tests {
         assert_eq!(args.projects, vec!["./..."]);
     }
 
+    #[test]
+    fn test_parse_run_args_with_stream_flag() {
+        let args = parse_run_args(vec![
+            "run-dev".to_string(),
+            ".".to_string(),
+            "--stream".to_string(),
+        ]);
+
+        assert_eq!(args.target, "run-dev");
+        assert!(args.use_cwd);
+        assert_eq!(args.stream_override, Some(true));
+    }
+
+    #[test]
+    fn test_parse_run_args_with_no_stream_flag() {
+        let args = parse_run_args(vec!["run-dev".to_string(), "--no-stream".to_string()]);
+
+        assert_eq!(args.target, "run-dev");
+        assert_eq!(args.stream_override, Some(false));
+    }
+
+    #[test]
+    fn test_parse_run_args_default_stream_override_is_none() {
+        let args = parse_run_args(vec!["test".to_string()]);
+
+        assert_eq!(args.stream_override, None);
+    }
+
     mod select_projects_tests {
         use super::*;
         use crate::discovery::DiscoveredProject;
@@ -553,6 +587,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -582,6 +617,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let result = select_projects(&args, &graph, &projects, cwd, workspace_root);
@@ -610,6 +646,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -640,6 +677,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -674,6 +712,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -703,6 +742,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -732,6 +772,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -765,6 +806,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -797,6 +839,7 @@ mod tests {
                 all: false,
                 use_cwd: false,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -828,6 +871,7 @@ mod tests {
                 all: false,
                 use_cwd: true,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
@@ -857,6 +901,7 @@ mod tests {
                 all: false,
                 use_cwd: true,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let result = select_projects(&args, &graph, &projects, cwd, workspace_root);
@@ -885,6 +930,7 @@ mod tests {
                 all: false,
                 use_cwd: true,
                 warnings_as_errors: false,
+                stream_override: None,
             };
 
             let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();

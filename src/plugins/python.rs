@@ -187,6 +187,7 @@ impl LanguagePlugin for PythonPlugin {
                 depends_on: vec![],
                 capabilities: HashSet::new(),
                 files_glob: None,
+                stream: false,
             },
         );
 
@@ -216,6 +217,7 @@ impl LanguagePlugin for PythonPlugin {
                     depends_on: base_deps.clone(),
                     capabilities: test_caps,
                     files_glob: None,
+                    stream: false,
                 },
             );
         }
@@ -229,6 +231,7 @@ impl LanguagePlugin for PythonPlugin {
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         }
@@ -243,6 +246,7 @@ impl LanguagePlugin for PythonPlugin {
                     depends_on: format_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         } else if content.contains("[tool.black]") {
@@ -253,6 +257,7 @@ impl LanguagePlugin for PythonPlugin {
                     depends_on: format_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
+                    stream: false,
                 },
             );
         }

@@ -756,8 +756,46 @@ fn run() -> Result<()> {
                 );
             }
 
+            // Determine if streaming is enabled for this target
+            // CLI override takes precedence, otherwise use target config
+            let should_stream = if let Some(override_val) = run_args.stream_override {
+                override_val
+            } else {
+                // Check if the target has stream=true in any primary project
+                initial.iter().any(|p| {
+                    p.targets
+                        .get(&run_args.target)
+                        .map(|t| t.stream)
+                        .unwrap_or(false)
+                })
+            };
+
             // Execute target on projects
             let executor = Executor::with_output_mode(&workspace_root, output_mode);
+
+            // Handle streaming execution (single project only, output to terminal)
+            if should_stream {
+                if initial.len() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "Streaming mode only supports running on a single project.\n\
+                        Found {} projects selected. Use a more specific selector or --no-stream.",
+                        initial.len()
+                    ));
+                }
+
+                let project = initial[0];
+                match executor.execute_streaming(&run_args.target, project) {
+                    Ok(exit_code) => {
+                        if exit_code != 0 {
+                            return Err(anyhow::anyhow!("Process exited with code {exit_code}"));
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("{e}"));
+                    }
+                }
+            }
 
             let results = if run_args.warnings_as_errors {
                 // Build command overrides for warnings-as-errors
