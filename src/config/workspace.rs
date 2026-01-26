@@ -32,29 +32,37 @@ impl WorkspaceConfig {
 
 /// Find the workspace root by walking up from the start directory.
 ///
-/// Looks for `aster.toml` first (explicit marker), then `.git` as fallback boundary.
+/// Prefers `.git` as the workspace boundary (monorepo root), falling back to
+/// the highest `aster.toml` without a `.git` above it. This ensures project-level
+/// aster.toml files don't incorrectly stop the search.
+///
 /// Returns None if neither marker is found (reached filesystem root).
 pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     // Canonicalize to resolve symlinks
     let mut current = start.canonicalize().ok()?;
+    let mut highest_aster_toml: Option<PathBuf> = None;
 
     loop {
-        // Check for aster.toml first (explicit workspace marker)
-        if current.join("aster.toml").exists() {
+        // Check for .git - this is the definitive workspace boundary
+        if current.join(".git").exists() {
             return Some(current);
         }
 
-        // Check for .git as fallback boundary
-        if current.join(".git").exists() {
-            return Some(current);
+        // Track aster.toml as fallback (in case there's no .git)
+        // Keep updating so we get the highest one (closest to filesystem root)
+        if current.join("aster.toml").exists() {
+            highest_aster_toml = Some(current.clone());
         }
 
         // Move up to parent directory
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
-            None => return None, // Reached filesystem root
+            None => break, // Reached filesystem root
         }
     }
+
+    // No .git found - use the highest aster.toml we encountered
+    highest_aster_toml
 }
 
 #[cfg(test)]
@@ -96,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_workspace_root_prefers_aster_toml() {
+    fn test_find_workspace_root_prefers_git() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
 
@@ -106,7 +114,7 @@ mod tests {
 
         let result = find_workspace_root(root);
         assert!(result.is_some());
-        // Should find it at root level (aster.toml checked first)
+        // Should find it at root level (.git is the definitive boundary)
         assert_eq!(
             result.unwrap().canonicalize().unwrap(),
             root.canonicalize().unwrap()
@@ -171,6 +179,50 @@ ignore = ["vendor/**", "examples/**"]
         // No aster.toml file
         let config = WorkspaceConfig::load(root).unwrap();
         assert!(config.ignore.is_empty());
+    }
+
+    #[test]
+    fn test_find_workspace_root_ignores_project_aster_toml() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create .git at root (workspace boundary)
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // Create project-level aster.toml in a subdirectory
+        let project_dir = root.join("services").join("api");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("aster.toml"), "[project]\nname = \"api\"").unwrap();
+
+        // Starting from project dir should find root (with .git), not project dir
+        let result = find_workspace_root(&project_dir);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_find_workspace_root_uses_highest_aster_toml_without_git() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create workspace aster.toml at root (no .git)
+        fs::write(root.join("aster.toml"), "# workspace").unwrap();
+
+        // Create project-level aster.toml in subdirectory
+        let project_dir = root.join("services").join("api");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("aster.toml"), "[project]\nname = \"api\"").unwrap();
+
+        // Starting from project dir should find root aster.toml (highest), not project dir
+        let result = find_workspace_root(&project_dir);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
     }
 
     #[test]
