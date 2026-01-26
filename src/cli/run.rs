@@ -180,7 +180,7 @@ pub fn select_projects<'a>(
                 return false;
             }
 
-            let prefix_with_slash = format!("{}/", abs_prefix);
+            let prefix_with_slash = format!("{abs_prefix}/");
             project_addr == abs_prefix || project_addr.starts_with(&prefix_with_slash)
         } else {
             // Exact match
@@ -214,11 +214,9 @@ pub fn select_projects<'a>(
             for p in discovered {
                 let project_addr = format!("//{}", p.relative_path.display());
 
-                if matches_pattern(pattern, &project_addr) {
-                    if seen.insert(project_addr) {
-                        result.push(p);
-                        found_any = true;
-                    }
+                if matches_pattern(pattern, &project_addr) && seen.insert(project_addr) {
+                    result.push(p);
+                    found_any = true;
                 }
             }
 

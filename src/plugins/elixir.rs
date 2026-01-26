@@ -215,7 +215,7 @@ impl LanguagePlugin for ElixirPlugin {
     fn with_warnings_as_errors(&self, target_name: &str, command: &str) -> Option<String> {
         // Both mix compile and mix test support --warnings-as-errors
         match target_name {
-            "build" | "test" => Some(format!("{} --warnings-as-errors", command)),
+            "build" | "test" => Some(format!("{command} --warnings-as-errors")),
             _ => None,
         }
     }

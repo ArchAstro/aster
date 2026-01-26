@@ -19,7 +19,7 @@ fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let glob =
-            Glob::new(pattern).with_context(|| format!("Invalid ignore pattern: {}", pattern))?;
+            Glob::new(pattern).with_context(|| format!("Invalid ignore pattern: {pattern}"))?;
         builder.add(glob);
     }
     builder

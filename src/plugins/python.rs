@@ -296,7 +296,7 @@ impl LanguagePlugin for PythonPlugin {
     fn with_warnings_as_errors(&self, target_name: &str, command: &str) -> Option<String> {
         // pytest supports -W error to treat warnings as errors
         if target_name == "test" {
-            Some(format!("{} -W error", command))
+            Some(format!("{command} -W error"))
         } else {
             None
         }
