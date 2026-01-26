@@ -165,17 +165,25 @@ impl LanguagePlugin for PythonPlugin {
 
         let mut targets = HashMap::new();
 
-        // Detect deps command based on tool (poetry vs pip)
-        let deps_command = if content.contains("[tool.poetry]") {
-            "poetry install".to_string()
+        // Detect package manager and set up command wrapper
+        // Poetry projects use `poetry run` to execute commands in the venv
+        // uv projects use `uv run` to execute commands in the venv
+        let is_poetry = content.contains("[tool.poetry]");
+        let has_uv_lock = ctx.project_dir.join("uv.lock").exists();
+
+        let (deps_command, cmd_prefix) = if is_poetry {
+            ("poetry install", "poetry run ")
+        } else if has_uv_lock {
+            ("uv sync", "uv run ")
         } else {
-            "pip install -e .".to_string()
+            ("pip install -e .", "")
         };
+        let wrap_cmd = |cmd: &str| format!("{cmd_prefix}{cmd}");
 
         targets.insert(
             "deps".to_string(),
             Target {
-                command: deps_command,
+                command: deps_command.to_string(),
                 depends_on: vec![],
                 capabilities: HashSet::new(),
                 files_glob: None,
@@ -204,7 +212,7 @@ impl LanguagePlugin for PythonPlugin {
             targets.insert(
                 "test".to_string(),
                 Target {
-                    command: "pytest".to_string(),
+                    command: wrap_cmd("pytest"),
                     depends_on: base_deps.clone(),
                     capabilities: test_caps,
                     files_glob: None,
@@ -217,7 +225,7 @@ impl LanguagePlugin for PythonPlugin {
             targets.insert(
                 "lint".to_string(),
                 Target {
-                    command: "ruff check .".to_string(),
+                    command: wrap_cmd("ruff check ."),
                     depends_on: base_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
@@ -231,7 +239,7 @@ impl LanguagePlugin for PythonPlugin {
             targets.insert(
                 "format".to_string(),
                 Target {
-                    command: "ruff format .".to_string(),
+                    command: wrap_cmd("ruff format ."),
                     depends_on: format_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
@@ -241,7 +249,7 @@ impl LanguagePlugin for PythonPlugin {
             targets.insert(
                 "format".to_string(),
                 Target {
-                    command: "black .".to_string(),
+                    command: wrap_cmd("black ."),
                     depends_on: format_deps,
                     capabilities: HashSet::new(),
                     files_glob: None,
@@ -714,6 +722,12 @@ version = "1.0.0"
 
 [tool.poetry.dependencies]
 python = "^3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
 "#,
         )
         .unwrap();
@@ -726,6 +740,68 @@ python = "^3.11"
         assert_eq!(
             targets.get("deps").map(|t| &t.command),
             Some(&"poetry install".to_string())
+        );
+
+        // Poetry projects wrap tool commands with "poetry run"
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"poetry run pytest".to_string())
+        );
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"poetry run ruff check .".to_string())
+        );
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"poetry run ruff format .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_targets_uv_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-app"
+version = "1.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        // Create uv.lock to indicate uv project
+        std::fs::write(tmp.path().join("uv.lock"), "").unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // uv projects use "uv sync" for deps
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"uv sync".to_string())
+        );
+
+        // uv projects wrap tool commands with "uv run"
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"uv run pytest".to_string())
+        );
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"uv run ruff check .".to_string())
+        );
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"uv run ruff format .".to_string())
         );
     }
 

@@ -441,6 +441,101 @@ utils = {path = "../../libs/utils"}
 }
 
 #[test]
+fn test_python_poetry_wraps_commands() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create Poetry Python project with tools configured
+    write_pyproject_toml(
+        &tmp,
+        "services/api/pyproject.toml",
+        r#"
+[tool.poetry]
+name = "api"
+version = "1.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Poetry projects should wrap commands with "poetry run"
+    assert!(
+        stdout.contains("poetry run pytest"),
+        "Expected 'poetry run pytest' for test command: {stdout}"
+    );
+    assert!(
+        stdout.contains("poetry run ruff"),
+        "Expected 'poetry run ruff' for lint/format commands: {stdout}"
+    );
+    assert!(
+        stdout.contains("poetry install"),
+        "Expected 'poetry install' for deps command: {stdout}"
+    );
+}
+
+#[test]
+fn test_python_uv_wraps_commands() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create uv Python project (has uv.lock file)
+    write_pyproject_toml(
+        &tmp,
+        "services/api/pyproject.toml",
+        r#"
+[project]
+name = "api"
+version = "1.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+"#,
+    );
+
+    // Create uv.lock to indicate uv project
+    fs::write(tmp.path().join("services/api/uv.lock"), "").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // uv projects should wrap commands with "uv run"
+    assert!(
+        stdout.contains("uv run pytest"),
+        "Expected 'uv run pytest' for test command: {stdout}"
+    );
+    assert!(
+        stdout.contains("uv run ruff"),
+        "Expected 'uv run ruff' for lint/format commands: {stdout}"
+    );
+    assert!(
+        stdout.contains("uv sync"),
+        "Expected 'uv sync' for deps command: {stdout}"
+    );
+}
+
+#[test]
 fn test_discover_polyglot_workspace() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
