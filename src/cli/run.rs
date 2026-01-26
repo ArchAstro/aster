@@ -240,7 +240,13 @@ pub fn select_projects<'a>(
 
             for project in discovered {
                 let proj_path = &project.relative_path;
-                if rel_cwd.starts_with(proj_path) {
+                // Handle root project (empty path) specially - only match if we're at root
+                let is_match = if proj_path.as_os_str().is_empty() {
+                    rel_cwd.as_os_str().is_empty()
+                } else {
+                    rel_cwd.starts_with(proj_path)
+                };
+                if is_match {
                     let path_len = proj_path.as_os_str().len();
                     if path_len > best_match_len || best_match.is_none() {
                         best_match = Some(project);
@@ -799,6 +805,93 @@ mod tests {
             let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
             assert!(names.contains(&"ts-app"));
             assert!(names.contains(&"ts-lib"));
+        }
+
+        #[test]
+        fn test_select_projects_cwd_detection_prefers_nested_over_root() {
+            // When in a subdirectory, should NOT match root project with empty path
+            let projects = vec![
+                make_project("root", ""), // Root project with empty path
+                make_project("nested", "services/api"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace/services/api");
+
+            // No explicit projects - rely on cwd detection
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec![],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: true,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            // Should select nested project, NOT root
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].metadata.name, "nested");
+        }
+
+        #[test]
+        fn test_select_projects_cwd_detection_no_match_returns_error() {
+            // When in a subdirectory with no matching project, should error not match root
+            let projects = vec![
+                make_project("root", ""), // Root project with empty path
+                make_project("other", "other/project"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace/services/api"); // No project here
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec![],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: true,
+                warnings_as_errors: false,
+            };
+
+            let result = select_projects(&args, &graph, &projects, cwd, workspace_root);
+
+            // Should error, not match root
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_select_projects_cwd_detection_at_root_matches_root() {
+            // When at workspace root, should match root project
+            let projects = vec![
+                make_project("root", ""),
+                make_project("nested", "services/api"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace"); // At root
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                projects: vec![],
+                exclusions: vec![],
+                no_deps: true,
+                dependents: false,
+                all: false,
+                use_cwd: true,
+                warnings_as_errors: false,
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            // Should select root project
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].metadata.name, "root");
         }
     }
 }
