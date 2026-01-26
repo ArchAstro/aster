@@ -1117,3 +1117,100 @@ fn test_no_deps_skips_all_dependency_targets() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ============================================================================
+// Full Logs Tests
+// ============================================================================
+
+#[test]
+fn test_full_logs_flag_on_affected() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // Create a project with a test that outputs many lines and fails
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "for i in $(seq 1 30); do echo line_$i; done && exit 1"}}"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    // Make a change to trigger affected
+    fs::write(tmp.path().join("services/api/new_file.txt"), "change").unwrap();
+
+    // Without --full-logs, output is truncated to 15 lines
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    let stderr_without = String::from_utf8_lossy(&output.stderr);
+
+    // Should NOT contain early lines (they are truncated)
+    assert!(
+        !stderr_without.contains("line_1\n") || stderr_without.contains("line_16"),
+        "Without --full-logs, early lines should be truncated"
+    );
+
+    // With --full-logs, should see all lines
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--full-logs"])
+        .output()
+        .unwrap();
+
+    let stderr_with = String::from_utf8_lossy(&output.stderr);
+
+    // Should contain early lines
+    assert!(
+        stderr_with.contains("line_1"),
+        "With --full-logs, should show line_1: {stderr_with}"
+    );
+    assert!(
+        stderr_with.contains("line_30"),
+        "With --full-logs, should show line_30: {stderr_with}"
+    );
+}
+
+#[test]
+fn test_full_logs_flag_position() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "echo test_output && exit 1"}}"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    fs::write(tmp.path().join("services/api/new_file.txt"), "change").unwrap();
+
+    // Test --full-logs before subcommand
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--full-logs", "affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    // Should not fail with "unknown flag" error
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "Flag before subcommand should work: {stderr}"
+    );
+
+    // Test --full-logs after subcommand args
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--full-logs"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "Flag after subcommand should work: {stderr}"
+    );
+}
