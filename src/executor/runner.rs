@@ -175,8 +175,8 @@ impl<'a> Executor<'a> {
         // Finish the progress display
         progress.finish();
 
-        // Store logs (only in Normal mode)
-        if self.output_mode == OutputMode::Normal {
+        // Store logs (in all modes except JSON, which is meant for machine processing)
+        if self.output_mode != OutputMode::Json {
             self.store_logs(target, &all_results);
         }
 
