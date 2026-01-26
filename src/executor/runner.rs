@@ -46,6 +46,8 @@ pub struct Executor<'a> {
     workspace_root: &'a Path,
     /// Output mode for controlling what gets printed
     output_mode: OutputMode,
+    /// Whether to show full logs for failures instead of truncated output
+    full_logs: bool,
 }
 
 impl<'a> Executor<'a> {
@@ -54,6 +56,7 @@ impl<'a> Executor<'a> {
         Self {
             workspace_root,
             output_mode: OutputMode::Normal,
+            full_logs: false,
         }
     }
 
@@ -62,6 +65,20 @@ impl<'a> Executor<'a> {
         Self {
             workspace_root,
             output_mode,
+            full_logs: false,
+        }
+    }
+
+    /// Create a new executor with specified output mode and full_logs option
+    pub fn with_options(
+        workspace_root: &'a Path,
+        output_mode: OutputMode,
+        full_logs: bool,
+    ) -> Self {
+        Self {
+            workspace_root,
+            output_mode,
+            full_logs,
         }
     }
 
@@ -415,15 +432,21 @@ impl<'a> Executor<'a> {
                 eprintln!("{header}");
             }
 
-            // Print last 10-15 lines of output (indented)
+            // Print output (full or truncated based on full_logs flag)
             let lines: Vec<&str> = result.output.lines().collect();
-            let tail_lines = if lines.len() > 15 {
-                &lines[lines.len() - 15..]
-            } else {
+            let output_lines = if self.full_logs {
+                // Full output mode - show all lines
                 &lines[..]
+            } else {
+                // Truncated mode - show last 15 lines
+                if lines.len() > 15 {
+                    &lines[lines.len() - 15..]
+                } else {
+                    &lines[..]
+                }
             };
 
-            for line in tail_lines {
+            for line in output_lines {
                 let indented = format!("    {line}");
                 if progress.is_enabled() {
                     progress.println(&indented);
@@ -432,19 +455,21 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            // Print hint for full output
-            let hint = format!(
-                "    {}",
-                style(format!(
-                    "Run `aster logs {}` for full output",
-                    result.address
-                ))
-                .dim()
-            );
-            if progress.is_enabled() {
-                progress.println(&hint);
-            } else {
-                eprintln!("{hint}");
+            // Print hint for full output (only if not already showing full logs)
+            if !self.full_logs {
+                let hint = format!(
+                    "    {}",
+                    style(format!(
+                        "Run `aster logs {}` for full output",
+                        result.address
+                    ))
+                    .dim()
+                );
+                if progress.is_enabled() {
+                    progress.println(&hint);
+                } else {
+                    eprintln!("{hint}");
+                }
             }
         }
     }

@@ -61,6 +61,13 @@ pub struct Cli {
     /// Output in JSON format for machine consumption
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Show full output for failed targets instead of truncated logs
+    ///
+    /// By default, only the last 15 lines of output are shown for failures.
+    /// Use this flag to see the complete output, useful for CI environments.
+    #[arg(long, global = true)]
+    pub full_logs: bool,
 }
 
 impl Cli {
@@ -75,6 +82,11 @@ impl Cli {
         } else {
             OutputMode::Normal
         }
+    }
+
+    /// Check if full logs should be shown for failures
+    pub fn full_logs(&self) -> bool {
+        self.full_logs
     }
 }
 

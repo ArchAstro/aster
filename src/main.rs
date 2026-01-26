@@ -40,6 +40,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let output_mode = cli.output_mode();
+    let full_logs = cli.full_logs();
 
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
@@ -528,7 +529,7 @@ fn run() -> Result<()> {
             }
 
             // Execute target on projects
-            let executor = Executor::with_output_mode(&workspace_root, output_mode);
+            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
 
             // Build command overrides for files-list and warnings-as-errors
             let results = if only_affected_files || warnings_as_errors {
@@ -688,15 +689,16 @@ fn run() -> Result<()> {
             }
 
             // Execute using the executor's infrastructure
-            let executor = Executor::with_output_mode(&workspace_root, output_mode);
-            let results = execute_heterogeneous(&executor, &levels, &project_map, output_mode);
+            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
+            let results =
+                execute_heterogeneous(&executor, &levels, &project_map, output_mode, full_logs);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
                 let output = build_execution_output(&results);
                 output_json(&output)?;
             } else {
-                print_heterogeneous_summary(&results, output_mode);
+                print_heterogeneous_summary(&results, output_mode, full_logs);
             }
 
             // Return error if any failed (for exit code)
@@ -771,7 +773,7 @@ fn run() -> Result<()> {
             };
 
             // Execute target on projects
-            let executor = Executor::with_output_mode(&workspace_root, output_mode);
+            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
 
             // Handle streaming execution (single project only, output to terminal)
             if should_stream {
@@ -969,6 +971,7 @@ fn execute_heterogeneous(
     levels: &[Vec<String>],
     project_map: &std::collections::HashMap<String, &DiscoveredProject>,
     output_mode: OutputMode,
+    _full_logs: bool,
 ) -> Vec<aster::executor::ExecutionResult> {
     use std::io::IsTerminal;
     use std::process::Command;
@@ -1113,6 +1116,7 @@ fn execute_heterogeneous(
 fn print_heterogeneous_summary(
     results: &[aster::executor::ExecutionResult],
     output_mode: OutputMode,
+    full_logs: bool,
 ) {
     use console::style;
 
@@ -1130,22 +1134,31 @@ fn print_heterogeneous_summary(
         eprintln!();
         eprintln!("{} {}", style("FAILED").red().bold(), result.address);
         let lines: Vec<&str> = result.output.lines().collect();
-        let tail = if lines.len() > 15 {
-            &lines[lines.len() - 15..]
-        } else {
+        let output_lines = if full_logs {
+            // Full output mode - show all lines
             &lines[..]
+        } else {
+            // Truncated mode - show last 15 lines
+            if lines.len() > 15 {
+                &lines[lines.len() - 15..]
+            } else {
+                &lines[..]
+            }
         };
-        for line in tail {
+        for line in output_lines {
             eprintln!("    {line}");
         }
-        eprintln!(
-            "    {}",
-            style(format!(
-                "Run `aster logs {}` for full output",
-                result.address
-            ))
-            .dim()
-        );
+        // Only show hint if not already showing full logs
+        if !full_logs {
+            eprintln!(
+                "    {}",
+                style(format!(
+                    "Run `aster logs {}` for full output",
+                    result.address
+                ))
+                .dim()
+            );
+        }
     }
 
     println!();
