@@ -536,6 +536,44 @@ line-length = 100
 }
 
 #[test]
+fn test_nodejs_skips_npm_placeholder_test() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Create Node.js project with npm's default placeholder test script
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"build": "echo build", "test": "echo \"Error: no test specified\" && exit 1"}}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should have deps target (always present)
+    assert!(
+        stdout.contains("\"deps\""),
+        "Expected deps target in output: {stdout}"
+    );
+    // Should have build target (explicitly defined)
+    assert!(
+        stdout.contains("\"build\""),
+        "Expected build target in output: {stdout}"
+    );
+    // Should NOT have test target (placeholder should be skipped)
+    assert!(
+        !stdout.contains("\"test\""),
+        "Expected NO test target for npm placeholder script: {stdout}"
+    );
+}
+
+#[test]
 fn test_discover_polyglot_workspace() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

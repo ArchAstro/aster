@@ -113,20 +113,30 @@ impl LanguagePlugin for NodeJsPlugin {
         let format_deps = vec!["//self:deps".to_string(), "//self:build".to_string()];
 
         if let Some(scripts) = pkg.scripts {
+            // Track scripts to skip entirely (e.g., npm placeholder scripts)
+            let mut skip_scripts: HashSet<&str> = HashSet::new();
+
             // Map npm scripts to aster targets
             // Only add targets for scripts that actually exist
-            if scripts.contains_key("test") {
-                let mut test_caps = HashSet::new();
-                test_caps.insert(TargetCapability::FilesList);
-                targets.insert(
-                    "test".to_string(),
-                    Target {
-                        command: "npm test".to_string(),
-                        depends_on: base_deps.clone(),
-                        capabilities: test_caps,
-                        files_glob: None,
-                    },
-                );
+            // Skip npm's default "no test specified" placeholder
+            if let Some(test_script) = scripts.get("test") {
+                let is_placeholder = test_script.contains("no test specified")
+                    || test_script.contains("Error: no test");
+                if is_placeholder {
+                    skip_scripts.insert("test");
+                } else {
+                    let mut test_caps = HashSet::new();
+                    test_caps.insert(TargetCapability::FilesList);
+                    targets.insert(
+                        "test".to_string(),
+                        Target {
+                            command: "npm test".to_string(),
+                            depends_on: base_deps.clone(),
+                            capabilities: test_caps,
+                            files_glob: None,
+                        },
+                    );
+                }
             }
             if scripts.contains_key("build") {
                 targets.insert(
@@ -163,7 +173,9 @@ impl LanguagePlugin for NodeJsPlugin {
             }
             // Also map any other scripts as targets (with same dependencies)
             for (script_name, _) in scripts {
-                if !targets.contains_key(&script_name) {
+                if !targets.contains_key(&script_name)
+                    && !skip_scripts.contains(script_name.as_str())
+                {
                     targets.insert(
                         script_name.clone(),
                         Target {
@@ -792,5 +804,46 @@ mod tests {
         assert!(!deps_target
             .capabilities
             .contains(&TargetCapability::FilesList));
+    }
+
+    #[test]
+    fn test_skip_npm_placeholder_test_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        // This is the default npm init test script that should be ignored
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // test target should NOT be created for placeholder script
+        assert_eq!(targets.get("test"), None);
+
+        // deps is always present
+        assert!(targets.get("deps").is_some());
+    }
+
+    #[test]
+    fn test_skip_npm_placeholder_test_script_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        // Another variant of the placeholder
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"test": "echo 'Error: no test' && exit 1"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // test target should NOT be created for placeholder script
+        assert_eq!(targets.get("test"), None);
     }
 }
