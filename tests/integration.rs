@@ -811,3 +811,176 @@ fn test_affected_help_shows_command() {
     assert!(stdout.contains("--head"));
     assert!(stdout.contains("--dependents"));
 }
+
+// ============================================================================
+// Target Execution Tests: Primary vs Dependency Projects
+// ============================================================================
+
+#[test]
+fn test_target_only_runs_on_primary_projects() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Core library - test target FAILS (this proves it didn't run if overall succeeds)
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "echo core_build", "test": "exit 1"}}"#,
+    );
+
+    // API service depends on core - test target succeeds
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo api_build", "test": "echo api_test"}}"#,
+    );
+
+    // Run test ONLY on api project - should SUCCEED because core:test shouldn't run
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "//services/api"])
+        .output()
+        .unwrap();
+
+    // If core:test ran, this would fail (exit 1). Success proves only api:test ran.
+    assert!(
+        output.status.success(),
+        "Command should succeed - core:test should not run. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_target_on_all_runs_all_tests() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Core library - test target FAILS
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "echo core_build", "test": "exit 1"}}"#,
+    );
+
+    // API service (independent, no deps)
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"build": "echo api_build", "test": "echo api_test"}}"#,
+    );
+
+    // Run test on ALL projects - should FAIL because core:test fails
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "--all"])
+        .output()
+        .unwrap();
+
+    // With --all, core:test runs and fails
+    assert!(
+        !output.status.success(),
+        "Command should fail - core:test should run with --all and it fails"
+    );
+}
+
+#[test]
+fn test_verbose_shows_primary_project_count() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Core library
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "echo build", "test": "echo test"}}"#,
+    );
+
+    // API depends on core
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo build", "test": "echo test"}}"#,
+    );
+
+    // Run with verbose to check message
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--verbose", "test", "//services/api"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Verbose message should show 1 project (primary only), not 2
+    assert!(
+        stderr.contains("Running 'test' on 1 project"),
+        "Expected 'Running test on 1 project' (primary only), got: {stderr}"
+    );
+}
+
+#[test]
+fn test_dependency_build_targets_still_run() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Core library - build FAILS (to prove it runs)
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "exit 1", "test": "echo test"}}"#,
+    );
+
+    // API depends on core
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo build", "test": "echo test"}}"#,
+    );
+
+    // Run test on api - should FAIL because core:build fails (it's a target-level dep)
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "//services/api"])
+        .output()
+        .unwrap();
+
+    // core:build should still run (target-level dep of api:test) and fail
+    assert!(
+        !output.status.success(),
+        "Command should fail - core:build is a target-level dep and it fails"
+    );
+}
+
+#[test]
+fn test_no_deps_skips_all_dependency_targets() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Core library - both build and test FAIL
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"build": "exit 1", "test": "exit 1"}}"#,
+    );
+
+    // API depends on core
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"build": "echo build", "test": "echo test"}}"#,
+    );
+
+    // Run test on api with --no-deps - should SUCCEED because nothing from core runs
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "//services/api", "--no-deps"])
+        .output()
+        .unwrap();
+
+    // With --no-deps, core is completely excluded, so api:test runs alone
+    assert!(
+        output.status.success(),
+        "Command should succeed with --no-deps - core targets should not run. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

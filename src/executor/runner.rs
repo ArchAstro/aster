@@ -71,13 +71,18 @@ impl<'a> Executor<'a> {
     /// Targets are grouped into DAG levels and each level is executed in parallel.
     /// Output is buffered per-target and printed as a group when complete.
     /// Execution continues on failure, collecting all results.
+    ///
+    /// The `primary_projects` set specifies which projects should run the requested target.
+    /// Dependency projects are included for target-level dependency resolution (e.g., :build)
+    /// but won't run the requested target unless they're in the primary set.
     pub fn execute(
         &self,
         target: &str,
         projects: &[&DiscoveredProject],
         _graph: &ProjectGraph,
+        primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, None)
+        self.execute_internal(target, projects, None, primary_projects)
     }
 
     /// Execute a target with command overrides for specific targets
@@ -89,8 +94,9 @@ impl<'a> Executor<'a> {
         target: &str,
         projects: &[&DiscoveredProject],
         command_overrides: &HashMap<String, String>,
+        primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, Some(command_overrides))
+        self.execute_internal(target, projects, Some(command_overrides), primary_projects)
     }
 
     /// Internal execution method that supports optional command overrides
@@ -99,6 +105,7 @@ impl<'a> Executor<'a> {
         target: &str,
         projects: &[&DiscoveredProject],
         command_overrides: Option<&HashMap<String, String>>,
+        primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
         if projects.is_empty() {
             return Vec::new();
@@ -122,16 +129,27 @@ impl<'a> Executor<'a> {
             .collect();
 
         // Collect all targets to execute (requested targets + their dependencies)
+        // Only run the requested target on primary projects; dependency projects are included
+        // for target-level dependency resolution (e.g., :build) but won't run the requested target
         let mut targets_to_run: HashSet<String> = HashSet::new();
         for project in projects {
             let project_addr = format!("//{}", project.relative_path.display());
-            let target_addr = format!("{project_addr}:{target}");
 
-            // Add the requested target
-            targets_to_run.insert(target_addr.clone());
+            // Only add the requested target for primary projects
+            // If primary_projects is None, treat all projects as primary (backwards compat)
+            let is_primary = primary_projects
+                .map(|p| p.contains(&project_addr))
+                .unwrap_or(true);
 
-            // Recursively collect target dependencies
-            collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+            if is_primary {
+                let target_addr = format!("{project_addr}:{target}");
+
+                // Add the requested target
+                targets_to_run.insert(target_addr.clone());
+
+                // Recursively collect target dependencies
+                collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+            }
         }
 
         // Compute DAG levels based on target dependencies

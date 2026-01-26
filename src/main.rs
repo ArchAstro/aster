@@ -24,7 +24,7 @@ use aster::plugins::{
     ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability,
 };
 use globset::{Glob, GlobMatcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn main() -> ExitCode {
@@ -609,9 +609,9 @@ fn run() -> Result<()> {
                     );
                 }
 
-                executor.execute_with_command_overrides(&target, &ordered, &command_overrides)
+                executor.execute_with_command_overrides(&target, &ordered, &command_overrides, None)
             } else {
-                executor.execute(&target, &ordered, &graph)
+                executor.execute(&target, &ordered, &graph, None)
             };
 
             // Output results based on mode
@@ -734,6 +734,14 @@ fn run() -> Result<()> {
             let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+            // Build set of primary projects (originally selected, before expansion)
+            // Only these will run the requested target; dependency projects are included
+            // for target-level dependency resolution but won't run the requested target
+            let primary_projects: HashSet<String> = initial
+                .iter()
+                .map(|p| format!("//{}", p.relative_path.display()))
+                .collect();
+
             // Expand selection based on flags
             let selected = expand_selection(&run_args, &initial, &graph, &projects);
 
@@ -744,7 +752,7 @@ fn run() -> Result<()> {
                 eprintln!(
                     "[aster] Running '{}' on {} projects",
                     run_args.target,
-                    ordered.len()
+                    primary_projects.len()
                 );
             }
 
@@ -789,9 +797,10 @@ fn run() -> Result<()> {
                     &run_args.target,
                     &ordered,
                     &command_overrides,
+                    Some(&primary_projects),
                 )
             } else {
-                executor.execute(&run_args.target, &ordered, &graph)
+                executor.execute(&run_args.target, &ordered, &graph, Some(&primary_projects))
             };
 
             // Output results based on mode
