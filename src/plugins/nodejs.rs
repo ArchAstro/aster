@@ -242,6 +242,11 @@ impl LanguagePlugin for NodeJsPlugin {
             }
         }
 
+        // Add clean target
+        if let Some(clean) = self.clean_target(ctx) {
+            targets.insert("clean".to_string(), clean);
+        }
+
         Ok(targets)
     }
 
@@ -318,6 +323,36 @@ impl LanguagePlugin for NodeJsPlugin {
         }
 
         inputs
+    }
+
+    fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
+        let mut dirs_to_clean = vec!["node_modules"];
+
+        // Detect framework-specific directories
+        if ctx.project_dir.join(".next").exists() {
+            dirs_to_clean.push(".next");
+        }
+        if ctx.project_dir.join("dist").exists() {
+            dirs_to_clean.push("dist");
+        }
+        if ctx.project_dir.join(".turbo").exists() {
+            dirs_to_clean.push(".turbo");
+        }
+        if ctx.project_dir.join("build").exists() {
+            dirs_to_clean.push("build");
+        }
+
+        let command = format!("rm -rf {}", dirs_to_clean.join(" "));
+
+        Some(Target {
+            command,
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+        })
     }
 }
 
@@ -625,12 +660,13 @@ mod tests {
         let ctx = make_context(&pkg_json, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        // deps target is always present
-        assert_eq!(targets.len(), 1);
+        // deps and clean targets are always present
+        assert_eq!(targets.len(), 2);
         assert_eq!(
             targets.get("deps").map(|t| &t.command),
             Some(&"npm install".to_string())
         );
+        assert!(targets.get("clean").is_some());
     }
 
     #[test]
@@ -899,5 +935,39 @@ mod tests {
 
         // test target should NOT be created for placeholder script
         assert_eq!(targets.get("test"), None);
+    }
+
+    #[test]
+    fn test_detect_targets_has_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "my-app"}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert_eq!(clean.command, "rm -rf node_modules");
+        assert!(clean.depends_on.is_empty());
+        assert!(clean.invalidates_cache);
+    }
+
+    #[test]
+    fn test_clean_target_detects_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "my-app"}"#).unwrap();
+
+        // Create .next directory
+        std::fs::create_dir(tmp.path().join(".next")).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert!(clean.command.contains("node_modules"));
+        assert!(clean.command.contains(".next"));
     }
 }
