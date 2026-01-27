@@ -166,6 +166,16 @@ pub trait LanguagePlugin: Send + Sync {
         // Default: empty inputs (no caching without plugin support)
         CacheInputs::default()
     }
+
+    /// Provide the default clean target for this language
+    ///
+    /// Returns None if the language doesn't have a standard clean operation.
+    /// The returned target should have `invalidates_cache: true` set.
+    ///
+    /// - ctx: Target context with project paths and dependencies
+    fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
+        None
+    }
 }
 
 pub mod elixir;
