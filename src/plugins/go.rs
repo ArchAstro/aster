@@ -176,6 +176,11 @@ impl LanguagePlugin for GoPlugin {
             );
         }
 
+        // Add clean target
+        if let Some(clean) = self.clean_target(ctx) {
+            targets.insert("clean".to_string(), clean);
+        }
+
         Ok(targets)
     }
 
@@ -237,6 +242,18 @@ impl LanguagePlugin for GoPlugin {
                 "CI".to_string(),
             ],
         }
+    }
+
+    fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
+        Some(Target {
+            command: "go clean".to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+        })
     }
 }
 
@@ -651,5 +668,27 @@ go 1.21
         assert!(!build_target
             .capabilities
             .contains(&TargetCapability::FilesList));
+    }
+
+    #[test]
+    fn test_detect_targets_has_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go_mod = tmp.path().join("go.mod");
+        std::fs::write(
+            &go_mod,
+            r#"module myapp
+
+go 1.21
+"#,
+        )
+        .unwrap();
+
+        let plugin = GoPlugin;
+        let ctx = make_context(&go_mod, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert_eq!(clean.command, "go clean");
+        assert!(clean.invalidates_cache);
     }
 }
