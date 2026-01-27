@@ -182,7 +182,24 @@ impl LanguagePlugin for RustPlugin {
             },
         );
 
+        // Add clean target
+        if let Some(clean) = self.clean_target(ctx) {
+            targets.insert("clean".to_string(), clean);
+        }
+
         Ok(targets)
+    }
+
+    fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
+        Some(Target {
+            command: "cargo clean".to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+        })
     }
 
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
@@ -473,5 +490,28 @@ version = "0.1.0"
 
         assert!(inputs.source_globs.contains(&"tests/**/*.rs".to_string()));
         assert!(inputs.source_globs.contains(&"benches/**/*.rs".to_string()));
+    }
+
+    #[test]
+    fn test_detect_targets_has_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo_toml = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo_toml,
+            r#"
+[package]
+name = "my-crate"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let plugin = RustPlugin;
+        let ctx = make_context(&cargo_toml, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert_eq!(clean.command, "cargo clean");
+        assert!(clean.invalidates_cache);
     }
 }
