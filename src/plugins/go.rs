@@ -91,6 +91,7 @@ impl LanguagePlugin for GoPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -115,6 +116,7 @@ impl LanguagePlugin for GoPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -130,6 +132,7 @@ impl LanguagePlugin for GoPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -143,6 +146,7 @@ impl LanguagePlugin for GoPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -167,6 +171,7 @@ impl LanguagePlugin for GoPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }

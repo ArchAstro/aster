@@ -48,6 +48,7 @@ impl TargetResolver {
                     files_glob: target.files_glob.clone(),
                     stream: target.stream,
                     cache: target.cache.clone(),
+                    invalidates_cache: target.invalidates_cache,
                 },
             );
         }
@@ -69,6 +70,7 @@ impl TargetResolver {
                                 files_glob: existing.files_glob.clone(),
                                 stream: existing.stream,
                                 cache: existing.cache.clone(),
+                                invalidates_cache: existing.invalidates_cache,
                             },
                         );
                     } else {
@@ -82,6 +84,7 @@ impl TargetResolver {
                                 files_glob: None,
                                 stream: false,
                                 cache: None,
+                                invalidates_cache: false,
                             },
                         );
                     }
@@ -114,6 +117,10 @@ impl TargetResolver {
                         .clone()
                         .or_else(|| existing.and_then(|e| e.cache.clone()));
 
+                    // invalidates_cache: preserve from existing or default to false
+                    // (rich.invalidates_cache will be available after Task 2)
+                    let invalidates_cache = existing.map(|e| e.invalidates_cache).unwrap_or(false);
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -123,6 +130,7 @@ impl TargetResolver {
                             files_glob,
                             stream,
                             cache,
+                            invalidates_cache,
                         },
                     );
                 }
@@ -169,6 +177,7 @@ mod tests {
             files_glob: None,
             stream: false,
             cache: None,
+            invalidates_cache: false,
         }
     }
 

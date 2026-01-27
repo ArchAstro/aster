@@ -240,6 +240,7 @@ mod tests {
                             files_glob: None,
                             stream: false,
                             cache: None,
+                            invalidates_cache: false,
                         },
                     )
                 })

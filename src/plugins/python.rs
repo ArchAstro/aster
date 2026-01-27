@@ -189,6 +189,7 @@ impl LanguagePlugin for PythonPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -220,6 +221,7 @@ impl LanguagePlugin for PythonPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }
@@ -235,6 +237,7 @@ impl LanguagePlugin for PythonPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }
@@ -251,6 +254,7 @@ impl LanguagePlugin for PythonPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         } else if content.contains("[tool.black]") {
@@ -263,6 +267,7 @@ impl LanguagePlugin for PythonPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }

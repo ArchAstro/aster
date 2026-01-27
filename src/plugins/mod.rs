@@ -63,6 +63,8 @@ pub struct Target {
     pub stream: bool,
     /// Cache configuration overrides from aster.toml
     pub cache: Option<crate::config::CacheConfig>,
+    /// When true, invalidates all cache entries for this project after successful execution
+    pub invalidates_cache: bool,
 }
 
 /// Context passed to plugins for target detection

@@ -98,6 +98,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -138,6 +139,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             files_glob: None,
                             stream: false,
                             cache: None,
+                            invalidates_cache: false,
                         },
                     );
                 }
@@ -152,6 +154,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         files_glob: None,
                         stream: false,
                         cache: None,
+                        invalidates_cache: false,
                     },
                 );
             }
@@ -165,6 +168,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         files_glob: None,
                         stream: false,
                         cache: None,
+                        invalidates_cache: false,
                     },
                 );
             }
@@ -178,6 +182,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         files_glob: None,
                         stream: false,
                         cache: None,
+                        invalidates_cache: false,
                     },
                 );
             }
@@ -195,6 +200,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             files_glob: None,
                             stream: false,
                             cache: None,
+                            invalidates_cache: false,
                         },
                     );
                 }
@@ -230,6 +236,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         files_glob: None,
                         stream: false,
                         cache: None,
+                        invalidates_cache: false,
                     },
                 );
             }

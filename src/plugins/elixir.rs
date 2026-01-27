@@ -108,6 +108,7 @@ impl LanguagePlugin for ElixirPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -135,6 +136,7 @@ impl LanguagePlugin for ElixirPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
         let mut build_caps = HashSet::new();
@@ -148,6 +150,7 @@ impl LanguagePlugin for ElixirPlugin {
                 files_glob: None,
                 stream: false,
                 cache: None,
+                invalidates_cache: false,
             },
         );
 
@@ -162,6 +165,7 @@ impl LanguagePlugin for ElixirPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }
@@ -177,6 +181,7 @@ impl LanguagePlugin for ElixirPlugin {
                     files_glob: None,
                     stream: false,
                     cache: None,
+                    invalidates_cache: false,
                 },
             );
         }
