@@ -186,6 +186,11 @@ impl LanguagePlugin for ElixirPlugin {
             );
         }
 
+        // Add clean target
+        if let Some(clean) = self.clean_target(ctx) {
+            targets.insert("clean".to_string(), clean);
+        }
+
         Ok(targets)
     }
 
@@ -251,6 +256,18 @@ impl LanguagePlugin for ElixirPlugin {
         }
 
         inputs
+    }
+
+    fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
+        Some(Target {
+            command: "mix clean".to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+        })
     }
 }
 
@@ -868,5 +885,32 @@ end
         let plugin = ElixirPlugin;
         let result = plugin.with_warnings_as_errors("deps", "mix deps.get");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_detect_targets_has_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert_eq!(clean.command, "mix clean");
+        assert!(clean.depends_on.is_empty());
+        assert!(clean.invalidates_cache);
     }
 }
