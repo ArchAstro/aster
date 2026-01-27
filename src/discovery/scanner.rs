@@ -304,9 +304,10 @@ mod tests {
 
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].metadata.name, "api");
-        // Only deps target is defined (no scripts)
-        assert_eq!(projects[0].targets.len(), 1);
+        // deps and clean targets are defined (no scripts)
+        assert_eq!(projects[0].targets.len(), 2);
         assert!(projects[0].targets.contains_key("deps"));
+        assert!(projects[0].targets.contains_key("clean"));
     }
 
     #[test]
@@ -490,8 +491,8 @@ deploy = "npm run deploy"
             .unwrap()
             .depends_on
             .is_empty());
-        // Total: test (detected) + deps (detected) + deploy (custom) = 3
-        assert_eq!(projects[0].targets.len(), 3);
+        // Total: test (detected) + deps (detected) + deploy (custom) + clean (detected) = 4
+        assert_eq!(projects[0].targets.len(), 4);
     }
 
     #[test]

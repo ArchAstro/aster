@@ -476,7 +476,7 @@ impl<'a> Executor<'a> {
                                 }
 
                                 // Update cache store
-                                let store = CacheStore::new(&workspace_root);
+                                let store = CacheStore::new(workspace_root);
                                 let entry = CacheEntry {
                                     hash,
                                     timestamp: Utc::now().to_rfc3339(),
