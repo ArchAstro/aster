@@ -254,7 +254,7 @@ impl<'a> Executor<'a> {
         } else {
             None
         };
-        let plugin_registry = PluginRegistry::new();
+        let plugin_registry = PluginRegistry::with_all_plugins();
 
         // Track computed hashes for hash chaining (shared across levels)
         let computed_hashes: Arc<Mutex<HashMap<String, String>>> =
@@ -442,7 +442,7 @@ impl<'a> Executor<'a> {
                 if result.success && cache_store_path.is_some() {
                     if let Some(workspace_root) = cache_store_path {
                         // Compute hash for storing
-                        let plugin_reg = PluginRegistry::new();
+                        let plugin_reg = PluginRegistry::with_all_plugins();
                         if let Some(plugin) = plugin_reg.find_by_name(&plugin_name) {
                             let plugin_inputs = plugin.cache_inputs(&target_name_clone);
                             let hasher = CacheHasher::new(&project_root);

@@ -1,4 +1,4 @@
-use super::LanguagePlugin;
+use super::{ElixirPlugin, GoPlugin, LanguagePlugin, NodeJsPlugin, PythonPlugin, RustPlugin};
 
 /// Registry of available language plugins
 pub struct PluginRegistry {
@@ -10,6 +10,17 @@ impl PluginRegistry {
         Self {
             plugins: Vec::new(),
         }
+    }
+
+    /// Create a registry with all built-in language plugins pre-registered
+    pub fn with_all_plugins() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(NodeJsPlugin));
+        registry.register(Box::new(ElixirPlugin));
+        registry.register(Box::new(PythonPlugin));
+        registry.register(Box::new(GoPlugin));
+        registry.register(Box::new(RustPlugin));
+        registry
     }
 
     /// Register a plugin
