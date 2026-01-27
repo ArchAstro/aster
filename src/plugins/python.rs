@@ -272,6 +272,11 @@ impl LanguagePlugin for PythonPlugin {
             );
         }
 
+        // Add clean target
+        if let Some(clean) = self.clean_target(ctx) {
+            targets.insert("clean".to_string(), clean);
+        }
+
         Ok(targets)
     }
 
@@ -346,6 +351,33 @@ impl LanguagePlugin for PythonPlugin {
         }
 
         inputs
+    }
+
+    fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
+        let mut dirs_to_clean = vec![
+            "__pycache__",
+            ".pytest_cache",
+            "*.egg-info",
+            "dist",
+            "build",
+        ];
+
+        // Add .venv if it exists
+        if ctx.project_dir.join(".venv").exists() {
+            dirs_to_clean.insert(0, ".venv");
+        }
+
+        let command = format!("rm -rf {}", dirs_to_clean.join(" "));
+
+        Some(Target {
+            command,
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+        })
     }
 }
 
@@ -739,12 +771,13 @@ version = "1.0.0"
         let ctx = make_context(&pyproject, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
-        // deps is always present
-        assert_eq!(targets.len(), 1);
+        // deps and clean are always present
+        assert_eq!(targets.len(), 2);
         assert_eq!(
             targets.get("deps").map(|t| &t.command),
             Some(&"pip install -e .".to_string())
         );
+        assert!(targets.contains_key("clean"));
     }
 
     #[test]
@@ -1074,5 +1107,52 @@ testpaths = ["tests"]
         let plugin = PythonPlugin;
         let result = plugin.with_warnings_as_errors("deps", "pip install -e .");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_detect_targets_has_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "mypackage"
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert!(clean.command.contains("__pycache__"));
+        assert!(clean.command.contains(".pytest_cache"));
+        assert!(clean.invalidates_cache);
+    }
+
+    #[test]
+    fn test_clean_target_detects_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "mypackage"
+"#,
+        )
+        .unwrap();
+
+        // Create .venv directory
+        std::fs::create_dir(tmp.path().join(".venv")).unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let clean = targets.get("clean").unwrap();
+        assert!(clean.command.contains(".venv"));
     }
 }
