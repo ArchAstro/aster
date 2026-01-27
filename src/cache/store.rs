@@ -233,4 +233,34 @@ mod tests {
         assert_eq!(state.targets.len(), 1);
         assert!(state.targets.contains_key("//other:build"));
     }
+
+    #[test]
+    fn test_invalidate_project_clears_all_project_targets() {
+        let tmp = TempDir::new().unwrap();
+        let store = CacheStore::new(tmp.path());
+
+        // Set up cache entries for multiple projects
+        let entry = CacheEntry {
+            hash: "abc123".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            success: true,
+        };
+
+        store.set("//apps/web:build", entry.clone()).unwrap();
+        store.set("//apps/web:test", entry.clone()).unwrap();
+        store.set("//apps/web:lint", entry.clone()).unwrap();
+        store.set("//libs/shared:build", entry.clone()).unwrap();
+        store.set("//libs/shared:test", entry).unwrap();
+
+        // Invalidate //apps/web
+        let removed = store.clear_matching("//apps/web").unwrap();
+        assert_eq!(removed, 3);
+
+        // Verify only //libs/shared entries remain
+        let state = store.load().unwrap();
+        assert_eq!(state.targets.len(), 2);
+        assert!(state.targets.contains_key("//libs/shared:build"));
+        assert!(state.targets.contains_key("//libs/shared:test"));
+        assert!(!state.targets.contains_key("//apps/web:build"));
+    }
 }
