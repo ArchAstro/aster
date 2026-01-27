@@ -107,6 +107,7 @@ impl LanguagePlugin for ElixirPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -133,6 +134,7 @@ impl LanguagePlugin for ElixirPlugin {
                 capabilities: test_caps,
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
         let mut build_caps = HashSet::new();
@@ -145,6 +147,7 @@ impl LanguagePlugin for ElixirPlugin {
                 capabilities: build_caps,
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -158,6 +161,7 @@ impl LanguagePlugin for ElixirPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -172,6 +176,7 @@ impl LanguagePlugin for ElixirPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -223,6 +228,24 @@ impl LanguagePlugin for ElixirPlugin {
             "build" | "test" => Some(format!("{command} --warnings-as-errors")),
             _ => None,
         }
+    }
+
+    fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        let mut inputs = super::CacheInputs {
+            source_globs: vec!["lib/**/*.ex".to_string(), "lib/**/*.exs".to_string()],
+            config_files: vec![
+                "mix.exs".to_string(),
+                "mix.lock".to_string(),
+                "config/*.exs".to_string(),
+            ],
+            env_vars: vec!["MIX_ENV".to_string(), "CI".to_string()],
+        };
+
+        if target_name == "test" {
+            inputs.source_globs.push("test/**/*.exs".to_string());
+        }
+
+        inputs
     }
 }
 

@@ -20,6 +20,20 @@ pub struct LocalDependency {
     pub path: PathBuf,
 }
 
+/// Cache inputs provided by a language plugin
+///
+/// Defines the files and environment variables that should be included
+/// in the cache key for targets of this language type.
+#[derive(Debug, Clone, Default)]
+pub struct CacheInputs {
+    /// Glob patterns for source files (e.g., ["src/**/*.ts", "lib/**/*.ts"])
+    pub source_globs: Vec<String>,
+    /// Specific config/lock files to include (e.g., ["package.json", "package-lock.json"])
+    pub config_files: Vec<String>,
+    /// Environment variables to track (e.g., ["NODE_ENV", "CI"])
+    pub env_vars: Vec<String>,
+}
+
 /// Capabilities that a target may support
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetCapability {
@@ -47,6 +61,8 @@ pub struct Target {
     pub files_glob: Option<String>,
     /// Stream output to stdout in real-time (for long-running processes like dev servers)
     pub stream: bool,
+    /// Cache configuration overrides from aster.toml
+    pub cache: Option<crate::config::CacheConfig>,
 }
 
 /// Context passed to plugins for target detection
@@ -136,6 +152,18 @@ pub trait LanguagePlugin: Send + Sync {
         // Default: don't modify command (not supported)
         None
     }
+
+    /// Provide cache inputs for a target
+    ///
+    /// Returns the default files and environment variables that should be
+    /// included in the cache key for targets of this language type.
+    /// Users can extend or override these via aster.toml.
+    ///
+    /// - target_name: name of the target (e.g., "test", "build")
+    fn cache_inputs(&self, _target_name: &str) -> CacheInputs {
+        // Default: empty inputs (no caching without plugin support)
+        CacheInputs::default()
+    }
 }
 
 pub mod elixir;
@@ -149,3 +177,6 @@ pub use go::GoPlugin;
 pub use nodejs::NodeJsPlugin;
 pub use python::PythonPlugin;
 pub use registry::PluginRegistry;
+
+// Re-export CacheInputs for use by cache module
+pub use self::CacheInputs as PluginCacheInputs;

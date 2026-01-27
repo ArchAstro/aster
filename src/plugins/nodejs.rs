@@ -97,6 +97,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -136,6 +137,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             capabilities: test_caps,
                             files_glob: None,
                             stream: false,
+                            cache: None,
                         },
                     );
                 }
@@ -149,6 +151,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         capabilities: HashSet::new(),
                         files_glob: None,
                         stream: false,
+                        cache: None,
                     },
                 );
             }
@@ -161,6 +164,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         capabilities: HashSet::new(),
                         files_glob: None,
                         stream: false,
+                        cache: None,
                     },
                 );
             }
@@ -173,6 +177,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         capabilities: HashSet::new(),
                         files_glob: None,
                         stream: false,
+                        cache: None,
                     },
                 );
             }
@@ -189,6 +194,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             capabilities: HashSet::new(),
                             files_glob: None,
                             stream: false,
+                            cache: None,
                         },
                     );
                 }
@@ -223,6 +229,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         capabilities: HashSet::new(),
                         files_glob: None,
                         stream: false,
+                        cache: None,
                     },
                 );
             }
@@ -271,6 +278,39 @@ impl LanguagePlugin for NodeJsPlugin {
             .collect();
 
         Some(format!("{} -- {}", command, file_args.join(" ")))
+    }
+
+    fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        let mut inputs = super::CacheInputs {
+            source_globs: vec![
+                "src/**/*.ts".to_string(),
+                "src/**/*.tsx".to_string(),
+                "src/**/*.js".to_string(),
+                "src/**/*.jsx".to_string(),
+                "lib/**/*.ts".to_string(),
+                "lib/**/*.js".to_string(),
+            ],
+            config_files: vec![
+                "package.json".to_string(),
+                "package-lock.json".to_string(),
+                "yarn.lock".to_string(),
+                "pnpm-lock.yaml".to_string(),
+                "tsconfig.json".to_string(),
+            ],
+            env_vars: vec!["NODE_ENV".to_string(), "CI".to_string()],
+        };
+
+        // Add test files for test target
+        if target_name == "test" {
+            inputs.source_globs.push("test/**/*.ts".to_string());
+            inputs.source_globs.push("test/**/*.js".to_string());
+            inputs.source_globs.push("__tests__/**/*.ts".to_string());
+            inputs.source_globs.push("__tests__/**/*.js".to_string());
+            inputs.source_globs.push("**/*.test.ts".to_string());
+            inputs.source_globs.push("**/*.spec.ts".to_string());
+        }
+
+        inputs
     }
 }
 

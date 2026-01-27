@@ -15,8 +15,11 @@ regex = "1.10"
 git2 = "0.19"
 console = "0.16"
 indicatif = "0.17"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
 globset = "0.4"
+fs2 = "0.4"
+sha2 = "0.10"
+walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"

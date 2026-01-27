@@ -90,6 +90,7 @@ impl LanguagePlugin for GoPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -113,6 +114,7 @@ impl LanguagePlugin for GoPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -127,6 +129,7 @@ impl LanguagePlugin for GoPlugin {
                 capabilities: test_caps,
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -139,6 +142,7 @@ impl LanguagePlugin for GoPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -162,6 +166,7 @@ impl LanguagePlugin for GoPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -213,6 +218,20 @@ impl LanguagePlugin for GoPlugin {
         // Replace ./... with specific directories
         let base_command = command.trim_end_matches("./...");
         Some(format!("{}{}", base_command, test_dirs.join(" ")))
+    }
+
+    fn cache_inputs(&self, _target_name: &str) -> super::CacheInputs {
+        // Go test files (*_test.go) are already included by **/*.go
+        super::CacheInputs {
+            source_globs: vec!["**/*.go".to_string()],
+            config_files: vec!["go.mod".to_string(), "go.sum".to_string()],
+            env_vars: vec![
+                "GOOS".to_string(),
+                "GOARCH".to_string(),
+                "CGO_ENABLED".to_string(),
+                "CI".to_string(),
+            ],
+        }
     }
 }
 

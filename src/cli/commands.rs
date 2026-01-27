@@ -68,6 +68,10 @@ pub struct Cli {
     /// Use this flag to see the complete output, useful for CI environments.
     #[arg(long, global = true)]
     pub full_logs: bool,
+
+    /// Disable caching, force re-run of all targets
+    #[arg(long, global = true)]
+    pub no_cache: bool,
 }
 
 impl Cli {
@@ -179,9 +183,32 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
+    /// Manage the build cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+
     /// Run a single target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
     Target(Vec<String>),
+}
+
+/// Cache subcommands
+#[derive(Subcommand)]
+pub enum CacheCommands {
+    /// Clear cached results
+    Clear {
+        /// Specific target to clear (e.g., //services/api:test)
+        /// If not specified, clears all cache
+        target: Option<String>,
+    },
+
+    /// Show cache status
+    Status {
+        /// Specific target to show (e.g., //services/api:test)
+        target: Option<String>,
+    },
 }
 
 /// Project-level subcommands

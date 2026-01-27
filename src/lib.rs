@@ -1,4 +1,5 @@
 pub mod address;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod discovery;

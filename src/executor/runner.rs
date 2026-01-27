@@ -13,16 +13,20 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use chrono::Utc;
 use console::style;
 
+use crate::cache::{CacheEntry, CacheHasher, CacheStore};
 use crate::cli::OutputMode;
+use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::logs::{LogStore, RunLog, TargetLog};
 use crate::graph::ProjectGraph;
+use crate::plugins::PluginRegistry;
 use crate::ui::ProgressDisplay;
 
 /// Result of executing a target command on a project
@@ -34,6 +38,8 @@ pub struct ExecutionResult {
     pub success: bool,
     /// Whether the project was skipped (no target defined)
     pub skipped: bool,
+    /// Whether execution was skipped due to cache hit
+    pub cached: bool,
     /// Combined stdout+stderr output
     pub output: String,
     /// Execution duration in milliseconds
@@ -48,6 +54,8 @@ pub struct Executor<'a> {
     output_mode: OutputMode,
     /// Whether to show full logs for failures instead of truncated output
     full_logs: bool,
+    /// Whether to use caching
+    use_cache: bool,
 }
 
 impl<'a> Executor<'a> {
@@ -57,6 +65,7 @@ impl<'a> Executor<'a> {
             workspace_root,
             output_mode: OutputMode::Normal,
             full_logs: false,
+            use_cache: true,
         }
     }
 
@@ -66,6 +75,7 @@ impl<'a> Executor<'a> {
             workspace_root,
             output_mode,
             full_logs: false,
+            use_cache: true,
         }
     }
 
@@ -79,6 +89,22 @@ impl<'a> Executor<'a> {
             workspace_root,
             output_mode,
             full_logs,
+            use_cache: true,
+        }
+    }
+
+    /// Create a new executor with all options including cache control
+    pub fn with_all_options(
+        workspace_root: &'a Path,
+        output_mode: OutputMode,
+        full_logs: bool,
+        use_cache: bool,
+    ) -> Self {
+        Self {
+            workspace_root,
+            output_mode,
+            full_logs,
+            use_cache,
         }
     }
 
@@ -225,6 +251,21 @@ impl<'a> Executor<'a> {
         // Set total count for progress display
         progress.set_total(targets_to_run.len());
 
+        // Initialize cache infrastructure
+        let cache_store = if self.use_cache {
+            Some(CacheStore::new(self.workspace_root))
+        } else {
+            None
+        };
+        let plugin_registry = PluginRegistry::new();
+
+        // Track computed hashes for hash chaining (shared across levels)
+        let computed_hashes: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Capture current environment for cache key computation
+        let env_snapshot: HashMap<String, String> = std::env::vars().collect();
+
         let mut all_results = Vec::new();
 
         // Execute each level in parallel
@@ -235,6 +276,10 @@ impl<'a> Executor<'a> {
                 &mut progress,
                 show_progress,
                 command_overrides,
+                cache_store.as_ref(),
+                &plugin_registry,
+                &computed_hashes,
+                &env_snapshot,
             );
             all_results.extend(level_results);
         }
@@ -256,6 +301,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Execute all targets in a single level in parallel
+    #[allow(clippy::too_many_arguments)]
     fn execute_target_level(
         &self,
         target_addrs: &[String],
@@ -263,6 +309,10 @@ impl<'a> Executor<'a> {
         progress: &mut ProgressDisplay,
         show_progress: bool,
         command_overrides: Option<&HashMap<String, String>>,
+        cache_store: Option<&CacheStore>,
+        plugin_registry: &PluginRegistry,
+        computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
+        env_snapshot: &HashMap<String, String>,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
@@ -294,6 +344,7 @@ impl<'a> Executor<'a> {
                                 address: target_addr.clone(),
                                 success: true,
                                 skipped: true,
+                                cached: false,
                                 output: format!("Skipped: no '{target_name}' target defined"),
                                 duration_ms: 0,
                             };
@@ -314,6 +365,7 @@ impl<'a> Executor<'a> {
                             address: target_addr.clone(),
                             success: true, // Not an error, just skipped
                             skipped: true,
+                            cached: false,
                             output: format!("Skipped: no '{target_name}' target defined"),
                             duration_ms: 0,
                         };
@@ -326,6 +378,40 @@ impl<'a> Executor<'a> {
                 }
             };
 
+            // Check cache if enabled
+            if let Some(store) = cache_store {
+                if let Some((cache_hit, _current_hash)) = check_cache(
+                    target_addr,
+                    &target_name,
+                    &command,
+                    project,
+                    store,
+                    plugin_registry,
+                    computed_hashes,
+                    env_snapshot,
+                ) {
+                    if cache_hit {
+                        // Cache hit - skip execution
+                        let result = ExecutionResult {
+                            address: target_addr.clone(),
+                            success: true,
+                            skipped: false,
+                            cached: true,
+                            output: String::new(),
+                            duration_ms: 0,
+                        };
+                        if show_progress {
+                            progress.mark_cached(target_addr);
+                        }
+                        let _ = tx.send(result);
+                        continue;
+                    } else {
+                        // Cache miss - store hash for later update after execution
+                        // The hash will be stored if execution succeeds
+                    }
+                }
+            }
+
             // Add spinner for this target
             if show_progress {
                 progress.add_running(target_addr);
@@ -334,9 +420,75 @@ impl<'a> Executor<'a> {
             let addr = target_addr.clone();
             let project_root = project.root.clone();
             let tx_clone = tx.clone();
+            let computed_hashes_clone = Arc::clone(computed_hashes);
+            let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
+            let target_name_clone = target_name.clone();
+            let command_clone = command.clone();
+            let plugin_name = project.plugin_name.clone();
+            let env_snapshot_clone = env_snapshot.clone();
+            // Get target's depends_on for dependency hash lookup
+            let target_deps: Vec<String> = project
+                .targets
+                .get(&target_name)
+                .map(|t| t.depends_on.clone())
+                .unwrap_or_default();
+            // Get user cache config
+            let target_cache_config = project
+                .targets
+                .get(&target_name)
+                .and_then(|t| t.cache.clone());
 
             let handle = thread::spawn(move || {
-                let result = run_command(&addr, &command, &project_root);
+                let result = run_command(&addr, &command_clone, &project_root);
+
+                // Update cache if execution succeeded and caching is enabled
+                if result.success && cache_store_path.is_some() {
+                    if let Some(workspace_root) = cache_store_path {
+                        // Compute hash for storing
+                        let plugin_reg = PluginRegistry::new();
+                        if let Some(plugin) = plugin_reg.find_by_name(&plugin_name) {
+                            let plugin_inputs = plugin.cache_inputs(&target_name_clone);
+                            let hasher = CacheHasher::new(&project_root);
+
+                            // Get dependency hashes from previously computed targets
+                            let hashes_guard = computed_hashes_clone.lock().unwrap();
+                            let dep_hashes: Vec<&str> = target_deps
+                                .iter()
+                                .filter_map(|dep| hashes_guard.get(dep).map(|s| s.as_str()))
+                                .collect();
+
+                            if let Ok(hash) = hasher.compute_hash(
+                                &plugin_inputs,
+                                target_cache_config.as_ref(),
+                                &command_clone,
+                                &dep_hashes,
+                                &env_snapshot_clone,
+                            ) {
+                                drop(hashes_guard);
+
+                                // Store hash
+                                {
+                                    let mut hashes = computed_hashes_clone.lock().unwrap();
+                                    hashes.insert(addr.clone(), hash.clone());
+                                }
+
+                                // Update cache store
+                                let store = CacheStore::new(&workspace_root);
+                                let entry = CacheEntry {
+                                    hash,
+                                    timestamp: Utc::now().to_rfc3339(),
+                                    success: true,
+                                };
+                                if let Err(e) = store.set(&addr, entry) {
+                                    eprintln!(
+                                        "[aster] Warning: Failed to update cache for {addr}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let _ = tx_clone.send(result.clone());
                 result
             });
@@ -350,7 +502,7 @@ impl<'a> Executor<'a> {
         // Collect results from channel and update progress
         let mut results = Vec::new();
         for result in rx.iter() {
-            if show_progress {
+            if show_progress && !result.cached {
                 progress.mark_complete(
                     &result.address,
                     result.success,
@@ -599,6 +751,75 @@ fn compute_target_levels(
     levels
 }
 
+/// Check if a target is cached and return (cache_hit, current_hash)
+///
+/// Returns Some((true, hash)) if cache hit, Some((false, hash)) if cache miss,
+/// or None if caching cannot be performed for this target.
+#[allow(clippy::too_many_arguments)]
+fn check_cache(
+    target_addr: &str,
+    target_name: &str,
+    command: &str,
+    project: &DiscoveredProject,
+    cache_store: &CacheStore,
+    plugin_registry: &PluginRegistry,
+    computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
+    env_snapshot: &HashMap<String, String>,
+) -> Option<(bool, String)> {
+    // Get plugin for cache inputs
+    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
+    let plugin_inputs = plugin.cache_inputs(target_name);
+
+    // If plugin provides no cache inputs, don't cache this target
+    if plugin_inputs.source_globs.is_empty()
+        && plugin_inputs.config_files.is_empty()
+        && plugin_inputs.env_vars.is_empty()
+    {
+        return None;
+    }
+
+    // Get user cache config from project's target configuration
+    let target = project.targets.get(target_name)?;
+    let user_config: Option<&CacheConfig> = target.cache.as_ref();
+
+    // Get dependency hashes from previously computed targets
+    let hashes_guard = computed_hashes.lock().ok()?;
+    let dep_hashes: Vec<&str> = target
+        .depends_on
+        .iter()
+        .filter_map(|dep| hashes_guard.get(dep).map(|s| s.as_str()))
+        .collect();
+
+    // Compute current hash
+    let hasher = CacheHasher::new(&project.root);
+    let current_hash = hasher
+        .compute_hash(
+            &plugin_inputs,
+            user_config,
+            command,
+            &dep_hashes,
+            env_snapshot,
+        )
+        .ok()?;
+
+    drop(hashes_guard);
+
+    // Check if cached entry matches
+    if let Ok(Some(entry)) = cache_store.get(target_addr) {
+        if entry.hash == current_hash && entry.success {
+            // Store computed hash for dependents
+            {
+                let mut hashes = computed_hashes.lock().ok()?;
+                hashes.insert(target_addr.to_string(), current_hash.clone());
+            }
+            return Some((true, current_hash));
+        }
+    }
+
+    // Cache miss
+    Some((false, current_hash))
+}
+
 /// Run a command in a directory and capture output
 fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionResult {
     let start = Instant::now();
@@ -610,6 +831,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
             address: address.to_string(),
             success: false,
             skipped: false,
+            cached: false,
             output: "Empty command".to_string(),
             duration_ms: 0,
         };
@@ -646,6 +868,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
                 address: address.to_string(),
                 success: output.status.success(),
                 skipped: false,
+                cached: false,
                 output: combined,
                 duration_ms,
             }
@@ -654,6 +877,7 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
             address: address.to_string(),
             success: false,
             skipped: false,
+            cached: false,
             output: format!("Failed to execute command: {e}"),
             duration_ms,
         },
@@ -675,6 +899,7 @@ mod tests {
             capabilities: HashSet::new(),
             files_glob: None,
             stream: false,
+            cache: None,
         }
     }
 
@@ -851,6 +1076,7 @@ mod tests {
             address: "//test:build".to_string(),
             success: true,
             skipped: false,
+            cached: false,
             output: "test output".to_string(),
             duration_ms: 100,
         };
@@ -858,6 +1084,7 @@ mod tests {
         assert_eq!(result.address, "//test:build");
         assert!(result.success);
         assert!(!result.skipped);
+        assert!(!result.cached);
         assert_eq!(result.output, "test output");
         assert_eq!(result.duration_ms, 100);
     }

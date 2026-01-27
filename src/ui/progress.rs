@@ -31,6 +31,7 @@ pub struct ProgressDisplay {
     passed: Arc<AtomicUsize>,
     failed: Arc<AtomicUsize>,
     skipped: Arc<AtomicUsize>,
+    cached: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
 }
 
@@ -64,6 +65,7 @@ impl ProgressDisplay {
             passed: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicUsize::new(0)),
             skipped: Arc::new(AtomicUsize::new(0)),
+            cached: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -91,8 +93,9 @@ impl ProgressDisplay {
         let total = self.total.load(Ordering::SeqCst);
         let passed = self.passed.load(Ordering::SeqCst);
         let failed = self.failed.load(Ordering::SeqCst);
+        let cached = self.cached.load(Ordering::SeqCst);
         let running = self.running.load(Ordering::SeqCst);
-        let completed = passed + failed + self.skipped.load(Ordering::SeqCst);
+        let completed = passed + failed + cached + self.skipped.load(Ordering::SeqCst);
         let remaining = total.saturating_sub(completed).saturating_sub(running);
 
         let mut parts = Vec::new();
@@ -106,6 +109,14 @@ impl ProgressDisplay {
                 "{} {}",
                 style(passed).green(),
                 style("passed").green()
+            ));
+        }
+
+        if cached > 0 {
+            parts.push(format!(
+                "{} {}",
+                style(cached).cyan(),
+                style("cached").cyan()
             ));
         }
 
@@ -172,6 +183,23 @@ impl ProgressDisplay {
         // In verbose mode, show the skip
         if self.enabled && self.verbose {
             let msg = format!("{} {}", style("SKIP").yellow(), address);
+            let _ = self.multi.println(msg);
+        }
+    }
+
+    /// Mark a target as cached (no execution needed)
+    pub fn mark_cached(&mut self, address: &str) {
+        self.cached.fetch_add(1, Ordering::SeqCst);
+        self.refresh_status();
+
+        // Show cached status (in both modes - it's useful to see)
+        if self.enabled {
+            let msg = format!(
+                "{} {} {}",
+                style("✓").cyan(),
+                address,
+                style("cached").cyan()
+            );
             let _ = self.multi.println(msg);
         }
     }
@@ -260,6 +288,7 @@ impl ProgressDisplay {
             // Concise mode: update status bar with final summary
             let passed = self.passed.load(Ordering::SeqCst);
             let failed = self.failed.load(Ordering::SeqCst);
+            let cached = self.cached.load(Ordering::SeqCst);
 
             let status_icon = if failed > 0 {
                 style("✗").red()
@@ -269,6 +298,10 @@ impl ProgressDisplay {
 
             let mut parts = Vec::new();
             parts.push(format!("{} passed", style(passed).green()));
+
+            if cached > 0 {
+                parts.push(format!("{} cached", style(cached).cyan()));
+            }
 
             if failed > 0 {
                 parts.push(format!("{} failed", style(failed).red()));

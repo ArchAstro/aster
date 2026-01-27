@@ -42,6 +42,23 @@ pub enum TargetConfig {
     Rich(RichTargetConfig),
 }
 
+/// Cache configuration for a target
+///
+/// Allows users to customize which files and environment variables
+/// are included in the cache key for a target.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct CacheConfig {
+    /// Additional files/globs to include in cache key
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Files/globs to exclude from cache key
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Additional environment variables to track
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
 /// Rich target configuration with all options
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RichTargetConfig {
@@ -63,6 +80,10 @@ pub struct RichTargetConfig {
     /// Stream output to stdout in real-time (for long-running processes like dev servers)
     #[serde(default)]
     pub stream: bool,
+
+    /// Cache configuration overrides
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
 }
 
 impl TargetConfig {
@@ -103,6 +124,14 @@ impl TargetConfig {
         match self {
             TargetConfig::Simple(_) => false,
             TargetConfig::Rich(rich) => rich.stream,
+        }
+    }
+
+    /// Get cache configuration (None for simple format)
+    pub fn cache(&self) -> Option<&CacheConfig> {
+        match self {
+            TargetConfig::Simple(_) => None,
+            TargetConfig::Rich(rich) => rich.cache.as_ref(),
         }
     }
 }

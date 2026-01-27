@@ -47,6 +47,7 @@ impl TargetResolver {
                     capabilities: target.capabilities.clone(),
                     files_glob: target.files_glob.clone(),
                     stream: target.stream,
+                    cache: target.cache.clone(),
                 },
             );
         }
@@ -67,6 +68,7 @@ impl TargetResolver {
                                 capabilities: existing.capabilities.clone(),
                                 files_glob: existing.files_glob.clone(),
                                 stream: existing.stream,
+                                cache: existing.cache.clone(),
                             },
                         );
                     } else {
@@ -79,6 +81,7 @@ impl TargetResolver {
                                 capabilities: HashSet::new(),
                                 files_glob: None,
                                 stream: false,
+                                cache: None,
                             },
                         );
                     }
@@ -105,6 +108,12 @@ impl TargetResolver {
                     // stream is explicit in rich config, no fallback to existing
                     let stream = rich.stream;
 
+                    // cache config from rich format takes precedence
+                    let cache = rich
+                        .cache
+                        .clone()
+                        .or_else(|| existing.and_then(|e| e.cache.clone()));
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -113,6 +122,7 @@ impl TargetResolver {
                             capabilities,
                             files_glob,
                             stream,
+                            cache,
                         },
                     );
                 }
@@ -158,6 +168,7 @@ mod tests {
             capabilities: HashSet::new(),
             files_glob: None,
             stream: false,
+            cache: None,
         }
     }
 
@@ -177,6 +188,7 @@ mod tests {
             capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
             files_glob: files_glob.map(|s| s.to_string()),
             stream: false,
+            cache: None,
         })
     }
 

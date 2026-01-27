@@ -90,7 +90,9 @@ pub struct TargetResult {
     pub address: String,
     /// Execution status
     pub status: String,
-    /// Exit code (None if skipped)
+    /// Whether result was from cache
+    pub cached: bool,
+    /// Exit code (None if skipped or cached)
     pub exit_code: Option<i32>,
     /// Duration in milliseconds
     pub duration_ms: u128,
@@ -110,6 +112,8 @@ pub struct ExecutionSummary {
     pub failed: usize,
     /// Number of targets that were skipped
     pub skipped: usize,
+    /// Number of targets that hit cache
+    pub cached: usize,
     /// Total duration in milliseconds
     pub duration_ms: u128,
 }
@@ -174,13 +178,15 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
         .map(|r| {
             let status = if r.skipped {
                 "skipped".to_string()
+            } else if r.cached {
+                "cached".to_string()
             } else if r.success {
                 "passed".to_string()
             } else {
                 "failed".to_string()
             };
 
-            let exit_code = if r.skipped {
+            let exit_code = if r.skipped || r.cached {
                 None
             } else {
                 Some(if r.success { 0 } else { 1 })
@@ -189,6 +195,7 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
             TargetResult {
                 address: r.address.clone(),
                 status,
+                cached: r.cached,
                 exit_code,
                 duration_ms: r.duration_ms,
                 output: if r.output.is_empty() {
@@ -202,7 +209,11 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
 
     let total = results.len();
     let skipped = results.iter().filter(|r| r.skipped).count();
-    let passed = results.iter().filter(|r| r.success && !r.skipped).count();
+    let cached = results.iter().filter(|r| r.cached).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.success && !r.skipped && !r.cached)
+        .count();
     let failed = results.iter().filter(|r| !r.success).count();
     let total_duration: u128 = results.iter().map(|r| r.duration_ms).sum();
 
@@ -213,6 +224,7 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
             passed,
             failed,
             skipped,
+            cached,
             duration_ms: total_duration,
         },
     }
@@ -296,6 +308,7 @@ mod tests {
             passed: 8,
             failed: 1,
             skipped: 1,
+            cached: 0,
             duration_ms: 5000,
         };
 
@@ -311,6 +324,7 @@ mod tests {
                 address: "//a:test".to_string(),
                 success: true,
                 skipped: false,
+                cached: false,
                 output: "test output".to_string(),
                 duration_ms: 100,
             },
@@ -318,6 +332,7 @@ mod tests {
                 address: "//b:test".to_string(),
                 success: false,
                 skipped: false,
+                cached: false,
                 output: "error".to_string(),
                 duration_ms: 50,
             },
@@ -325,6 +340,7 @@ mod tests {
                 address: "//c:test".to_string(),
                 success: true,
                 skipped: true,
+                cached: false,
                 output: "".to_string(),
                 duration_ms: 0,
             },

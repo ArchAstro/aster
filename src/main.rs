@@ -23,9 +23,13 @@ use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, Tar
 use aster::plugins::{
     ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability,
 };
+use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Number of characters to show when displaying truncated cache hashes
+const CACHE_HASH_DISPLAY_LENGTH: usize = 8;
 
 fn main() -> ExitCode {
     match run() {
@@ -529,7 +533,8 @@ fn run() -> Result<()> {
             }
 
             // Execute target on projects
-            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
+            let executor =
+                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
 
             // Build command overrides for files-list and warnings-as-errors
             let results = if only_affected_files || warnings_as_errors {
@@ -689,7 +694,8 @@ fn run() -> Result<()> {
             }
 
             // Execute using the executor's infrastructure
-            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
+            let executor =
+                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
             let results =
                 execute_heterogeneous(&executor, &levels, &project_map, output_mode, full_logs);
 
@@ -709,6 +715,67 @@ fn run() -> Result<()> {
         }
         Commands::Project { command } => {
             handle_project_command(command, &workspace_root, &projects, output_mode)?;
+        }
+        Commands::Cache { command } => {
+            use aster::cache::CacheStore;
+            use aster::cli::CacheCommands;
+
+            let cache_store = CacheStore::new(&workspace_root);
+
+            match command {
+                CacheCommands::Clear { target } => {
+                    if let Some(pattern) = target {
+                        let removed = cache_store.clear_matching(&pattern)?;
+                        if output_mode != OutputMode::Quiet {
+                            println!("Cleared {removed} cache entries matching {pattern}");
+                        }
+                    } else {
+                        cache_store.clear()?;
+                        if output_mode != OutputMode::Quiet {
+                            println!("Cache cleared");
+                        }
+                    }
+                }
+                CacheCommands::Status { target } => {
+                    let state = cache_store.load()?;
+
+                    if let Some(addr) = target {
+                        // Show specific target
+                        if let Some(entry) = state.targets.get(&addr) {
+                            if output_mode == OutputMode::Json {
+                                output_json(&entry)?;
+                            } else {
+                                let hash_display =
+                                    &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
+                                let time_display = format_relative_time(&entry.timestamp);
+                                println!("{addr}: {hash_display} ({time_display})");
+                            }
+                        } else if output_mode == OutputMode::Json {
+                            println!("null");
+                        } else {
+                            println!("{addr}: not cached");
+                        }
+                    } else {
+                        // Show all
+                        if output_mode == OutputMode::Json {
+                            output_json(&state)?;
+                        } else if state.targets.is_empty() {
+                            println!("No cached targets");
+                        } else {
+                            println!("Cached targets ({}):", state.targets.len());
+                            let mut addrs: Vec<_> = state.targets.keys().collect();
+                            addrs.sort();
+                            for addr in addrs {
+                                let entry = &state.targets[addr];
+                                let hash_display =
+                                    &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
+                                let time_display = format_relative_time(&entry.timestamp);
+                                println!("  {addr}: {hash_display} ({time_display})");
+                            }
+                        }
+                    }
+                }
+            }
         }
         Commands::Target(args) => {
             // Parse external subcommand args
@@ -773,7 +840,8 @@ fn run() -> Result<()> {
             };
 
             // Execute target on projects
-            let executor = Executor::with_options(&workspace_root, output_mode, full_logs);
+            let executor =
+                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
 
             // Handle streaming execution (single project only, output to terminal)
             if should_stream {
@@ -1010,6 +1078,7 @@ fn execute_heterogeneous(
                         address: target_addr.clone(),
                         success: true,
                         skipped: true,
+                        cached: false,
                         output: format!("Skipped: no '{target_name}' target defined"),
                         duration_ms: 0,
                     };
@@ -1039,6 +1108,7 @@ fn execute_heterogeneous(
                         address: addr.clone(),
                         success: false,
                         skipped: false,
+                        cached: false,
                         output: "Empty command".to_string(),
                         duration_ms: 0,
                     }
@@ -1069,6 +1139,7 @@ fn execute_heterogeneous(
                                 address: addr,
                                 success: out.status.success(),
                                 skipped: false,
+                                cached: false,
                                 output: combined,
                                 duration_ms,
                             }
@@ -1077,6 +1148,7 @@ fn execute_heterogeneous(
                             address: addr,
                             success: false,
                             skipped: false,
+                            cached: false,
                             output: format!("Failed to execute: {e}"),
                             duration_ms,
                         },
@@ -1550,4 +1622,59 @@ fn apply_warnings_as_errors(
     }
 
     None
+}
+
+/// Format a timestamp as a human-readable relative time
+///
+/// Parses an RFC3339 timestamp and returns a string like "2 minutes ago"
+/// Falls back to the raw timestamp if parsing fails.
+fn format_relative_time(timestamp: &str) -> String {
+    let parsed: Result<DateTime<Utc>, _> = timestamp.parse();
+    match parsed {
+        Ok(dt) => {
+            let now = Utc::now();
+            let duration = now.signed_duration_since(dt);
+
+            if duration.num_seconds() < 0 {
+                // Future time (shouldn't happen, but handle gracefully)
+                return timestamp.to_string();
+            }
+
+            let seconds = duration.num_seconds();
+            if seconds < 60 {
+                return "just now".to_string();
+            }
+
+            let minutes = duration.num_minutes();
+            if minutes < 60 {
+                return if minutes == 1 {
+                    "1 minute ago".to_string()
+                } else {
+                    format!("{minutes} minutes ago")
+                };
+            }
+
+            let hours = duration.num_hours();
+            if hours < 24 {
+                return if hours == 1 {
+                    "1 hour ago".to_string()
+                } else {
+                    format!("{hours} hours ago")
+                };
+            }
+
+            let days = duration.num_days();
+            if days < 30 {
+                return if days == 1 {
+                    "1 day ago".to_string()
+                } else {
+                    format!("{days} days ago")
+                };
+            }
+
+            // Fall back to date for older entries
+            dt.format("%Y-%m-%d").to_string()
+        }
+        Err(_) => timestamp.to_string(),
+    }
 }

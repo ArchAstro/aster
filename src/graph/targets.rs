@@ -239,6 +239,7 @@ mod tests {
                             capabilities: std::collections::HashSet::new(),
                             files_glob: None,
                             stream: false,
+                            cache: None,
                         },
                     )
                 })

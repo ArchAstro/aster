@@ -188,6 +188,7 @@ impl LanguagePlugin for PythonPlugin {
                 capabilities: HashSet::new(),
                 files_glob: None,
                 stream: false,
+                cache: None,
             },
         );
 
@@ -218,6 +219,7 @@ impl LanguagePlugin for PythonPlugin {
                     capabilities: test_caps,
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -232,6 +234,7 @@ impl LanguagePlugin for PythonPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -247,6 +250,7 @@ impl LanguagePlugin for PythonPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         } else if content.contains("[tool.black]") {
@@ -258,6 +262,7 @@ impl LanguagePlugin for PythonPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
+                    cache: None,
                 },
             );
         }
@@ -313,6 +318,29 @@ impl LanguagePlugin for PythonPlugin {
         } else {
             None
         }
+    }
+
+    fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        let mut inputs = super::CacheInputs {
+            source_globs: vec!["src/**/*.py".to_string(), "**/*.py".to_string()],
+            config_files: vec![
+                "pyproject.toml".to_string(),
+                "poetry.lock".to_string(),
+                "uv.lock".to_string(),
+                "requirements.txt".to_string(),
+                "setup.py".to_string(),
+                "setup.cfg".to_string(),
+            ],
+            env_vars: vec!["PYTHONPATH".to_string(), "CI".to_string()],
+        };
+
+        if target_name == "test" {
+            inputs.source_globs.push("tests/**/*.py".to_string());
+            inputs.source_globs.push("*_test.py".to_string());
+            inputs.source_globs.push("test_*.py".to_string());
+        }
+
+        inputs
     }
 }
 
