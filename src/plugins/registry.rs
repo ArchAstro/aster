@@ -108,15 +108,16 @@ mod tests {
 
     #[test]
     fn test_all_plugins_register_and_find() {
-        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin};
+        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin, RustPlugin};
 
         let mut registry = PluginRegistry::new();
         registry.register(Box::new(NodeJsPlugin));
         registry.register(Box::new(ElixirPlugin));
         registry.register(Box::new(PythonPlugin));
+        registry.register(Box::new(RustPlugin));
 
-        // Verify all three plugins are registered
-        assert_eq!(registry.plugins().len(), 3);
+        // Verify all four plugins are registered
+        assert_eq!(registry.plugins().len(), 4);
 
         // Verify each can be found by its marker file
         let nodejs = registry.find_by_marker("package.json");
@@ -131,18 +132,23 @@ mod tests {
         assert!(python.is_some());
         assert_eq!(python.unwrap().name(), "python");
 
+        let rust = registry.find_by_marker("Cargo.toml");
+        assert!(rust.is_some());
+        assert_eq!(rust.unwrap().name(), "rust");
+
         // Unknown marker returns None
-        assert!(registry.find_by_marker("Cargo.toml").is_none());
+        assert!(registry.find_by_marker("unknown.toml").is_none());
     }
 
     #[test]
     fn test_find_by_name() {
-        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin};
+        use crate::plugins::{ElixirPlugin, NodeJsPlugin, PythonPlugin, RustPlugin};
 
         let mut registry = PluginRegistry::new();
         registry.register(Box::new(NodeJsPlugin));
         registry.register(Box::new(ElixirPlugin));
         registry.register(Box::new(PythonPlugin));
+        registry.register(Box::new(RustPlugin));
 
         // Find by name
         let nodejs = registry.find_by_name("nodejs");
@@ -157,8 +163,12 @@ mod tests {
         assert!(python.is_some());
         assert_eq!(python.unwrap().name(), "python");
 
+        let rust = registry.find_by_name("rust");
+        assert!(rust.is_some());
+        assert_eq!(rust.unwrap().name(), "rust");
+
         // Unknown name returns None
-        assert!(registry.find_by_name("rust").is_none());
+        assert!(registry.find_by_name("unknown").is_none());
         assert!(registry.find_by_name("").is_none());
     }
 }

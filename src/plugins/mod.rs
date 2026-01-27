@@ -171,12 +171,14 @@ pub mod go;
 pub mod nodejs;
 pub mod python;
 pub mod registry;
+pub mod rust;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;
 pub use nodejs::NodeJsPlugin;
 pub use python::PythonPlugin;
 pub use registry::PluginRegistry;
+pub use rust::RustPlugin;
 
 // Re-export CacheInputs for use by cache module
 pub use self::CacheInputs as PluginCacheInputs;

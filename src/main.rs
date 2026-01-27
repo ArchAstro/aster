@@ -21,7 +21,8 @@ use aster::executor::Executor;
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
 use aster::plugins::{
-    ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, Target, TargetCapability,
+    ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, RustPlugin, Target,
+    TargetCapability,
 };
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
@@ -68,6 +69,7 @@ fn run() -> Result<()> {
     registry.register(Box::new(ElixirPlugin));
     registry.register(Box::new(PythonPlugin));
     registry.register(Box::new(GoPlugin));
+    registry.register(Box::new(RustPlugin));
 
     // Discover projects
     let projects =
@@ -546,6 +548,7 @@ fn run() -> Result<()> {
                 registry.register(Box::new(PythonPlugin));
                 registry.register(Box::new(ElixirPlugin));
                 registry.register(Box::new(GoPlugin));
+                registry.register(Box::new(RustPlugin));
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
@@ -877,6 +880,7 @@ fn run() -> Result<()> {
                 registry.register(Box::new(PythonPlugin));
                 registry.register(Box::new(ElixirPlugin));
                 registry.register(Box::new(GoPlugin));
+                registry.register(Box::new(RustPlugin));
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
@@ -1289,6 +1293,7 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     registry.register(Box::new(ElixirPlugin));
     registry.register(Box::new(PythonPlugin));
     registry.register(Box::new(GoPlugin));
+    registry.register(Box::new(RustPlugin));
 
     // Discover projects
     let projects =
