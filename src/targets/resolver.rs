@@ -117,9 +117,8 @@ impl TargetResolver {
                         .clone()
                         .or_else(|| existing.and_then(|e| e.cache.clone()));
 
-                    // invalidates_cache: preserve from existing or default to false
-                    // (rich.invalidates_cache will be available after Task 2)
-                    let invalidates_cache = existing.map(|e| e.invalidates_cache).unwrap_or(false);
+                    // invalidates_cache from rich config (no fallback - explicit only)
+                    let invalidates_cache = rich.invalidates_cache;
 
                     targets.insert(
                         name.clone(),
