@@ -9,7 +9,6 @@
 //! Each level executes in parallel, waiting for completion before the next level.
 
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
@@ -204,11 +203,9 @@ impl<'a> Executor<'a> {
             return Vec::new();
         }
 
-        // Determine if we should show progress spinners
-        // Show in Normal or Verbose mode when stderr is a terminal
-        let is_terminal = std::io::stderr().is_terminal();
-        let show_progress =
-            matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose) && is_terminal;
+        // Determine if we should show progress output
+        // Show in Normal or Verbose mode (ProgressDisplay handles terminal vs CI mode internally)
+        let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
         let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 

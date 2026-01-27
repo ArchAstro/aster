@@ -1041,7 +1041,6 @@ fn execute_heterogeneous(
     output_mode: OutputMode,
     _full_logs: bool,
 ) -> Vec<aster::executor::ExecutionResult> {
-    use std::io::IsTerminal;
     use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
@@ -1049,7 +1048,8 @@ fn execute_heterogeneous(
 
     use aster::ui::ProgressDisplay;
 
-    let show_progress = output_mode == OutputMode::Normal && std::io::stderr().is_terminal();
+    // Show progress in Normal mode (ProgressDisplay handles terminal vs CI mode internally)
+    let show_progress = output_mode == OutputMode::Normal;
     let mut progress = ProgressDisplay::new(show_progress);
     let mut all_results = Vec::new();
 
