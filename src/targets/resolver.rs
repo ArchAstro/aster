@@ -198,6 +198,7 @@ mod tests {
             files_glob: files_glob.map(|s| s.to_string()),
             stream: false,
             cache: None,
+            invalidates_cache: false,
         })
     }
 

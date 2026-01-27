@@ -84,6 +84,10 @@ pub struct RichTargetConfig {
     /// Cache configuration overrides
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+
+    /// Invalidate all project cache entries after successful execution
+    #[serde(default)]
+    pub invalidates_cache: bool,
 }
 
 impl TargetConfig {
@@ -132,6 +136,14 @@ impl TargetConfig {
         match self {
             TargetConfig::Simple(_) => None,
             TargetConfig::Rich(rich) => rich.cache.as_ref(),
+        }
+    }
+
+    /// Get invalidates_cache flag (false for simple format)
+    pub fn invalidates_cache(&self) -> bool {
+        match self {
+            TargetConfig::Simple(_) => false,
+            TargetConfig::Rich(rich) => rich.invalidates_cache,
         }
     }
 }
@@ -404,5 +416,33 @@ command = "pytest"
         assert!(config.name.is_none());
         assert!(config.depends_on.is_empty());
         assert!(config.targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_target_with_invalidates_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.clean]
+command = "rm -rf node_modules"
+invalidates_cache = true
+
+[targets.build]
+command = "npm run build"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let clean = config.targets.get("clean").unwrap();
+        assert_eq!(clean.command(), "rm -rf node_modules");
+        assert!(clean.invalidates_cache());
+
+        let build = config.targets.get("build").unwrap();
+        assert_eq!(build.command(), "npm run build");
+        assert!(!build.invalidates_cache());
     }
 }
