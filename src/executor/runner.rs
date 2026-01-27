@@ -434,13 +434,19 @@ impl<'a> Executor<'a> {
                 .targets
                 .get(&target_name)
                 .and_then(|t| t.cache.clone());
+            // Get invalidates_cache flag for cache invalidation after execution
+            let invalidates_cache = project
+                .targets
+                .get(&target_name)
+                .map(|t| t.invalidates_cache)
+                .unwrap_or(false);
 
             let handle = thread::spawn(move || {
                 let result = run_command(&addr, &command_clone, &project_root);
 
                 // Update cache if execution succeeded and caching is enabled
                 if result.success && cache_store_path.is_some() {
-                    if let Some(workspace_root) = cache_store_path {
+                    if let Some(ref workspace_root) = cache_store_path {
                         // Compute hash for storing
                         let plugin_reg = PluginRegistry::with_all_plugins();
                         if let Some(plugin) = plugin_reg.find_by_name(&plugin_name) {
@@ -482,6 +488,21 @@ impl<'a> Executor<'a> {
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+
+                // Invalidate project cache if target has invalidates_cache flag
+                if result.success && invalidates_cache {
+                    if let Some(ref workspace_root) = cache_store_path {
+                        let store = CacheStore::new(workspace_root);
+                        // Extract project address from target address (//project:target -> //project)
+                        let project_addr =
+                            addr.rsplit_once(':').map(|(proj, _)| proj).unwrap_or(&addr);
+                        if let Err(e) = store.clear_matching(project_addr) {
+                            eprintln!(
+                                "[aster] Warning: Failed to invalidate cache for {project_addr}: {e}"
+                            );
                         }
                     }
                 }
