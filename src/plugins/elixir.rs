@@ -14,6 +14,11 @@ use super::{
 static APP_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"app:\s*:(\w+)").expect("Invalid APP_REGEX"));
 
+/// Regex to detect umbrella projects via `apps_path:` in mix.exs
+/// Umbrella roots define apps_path instead of app - they aren't buildable projects themselves
+static APPS_PATH_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"apps_path:\s*").expect("Invalid APPS_PATH_REGEX"));
+
 /// Regex to match path dependencies: `{:name, path: "../path"}`
 /// Also handles optional in_umbrella: true at the end
 static PATH_DEP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -39,10 +44,31 @@ impl LanguagePlugin for ElixirPlugin {
         &["mix.exs"]
     }
 
+    fn should_skip(&self, _config_path: &Path) -> bool {
+        // Don't skip umbrella roots - we handle them specially in parse_project() and detect_targets()
+        // Umbrella roots get only a deps target, children get transformed commands
+        false
+    }
+
     fn parse_project(&self, _root: &Path, config_path: &Path) -> Result<ProjectMetadata> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
+        // Check if this is an umbrella root (has apps_path: but no app:)
+        if APPS_PATH_REGEX.is_match(&content) {
+            // Use a synthetic name based on directory name
+            let dir_name = config_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("umbrella");
+            return Ok(ProjectMetadata {
+                name: format!("{}_umbrella", dir_name),
+                version: None,
+            });
+        }
+
+        // Regular app - extract app name
         let name = APP_REGEX
             .captures(&content)
             .and_then(|c| c.get(1))
@@ -79,13 +105,14 @@ impl LanguagePlugin for ElixirPlugin {
             });
         }
 
-        // Extract in_umbrella: true dependencies (implicit path: "../name")
+        // Extract in_umbrella: true dependencies
+        // Use special prefix to mark these for post-discovery resolution
+        // (app names often differ from directory names in umbrella projects)
         for caps in IN_UMBRELLA_REGEX.captures_iter(&normalized) {
             let name = caps.get(1).unwrap().as_str();
-            // in_umbrella: true implies the sibling is in ../name relative to current app
             deps.push(LocalDependency {
                 name: name.to_string(),
-                path: PathBuf::from(format!("../{name}")),
+                path: PathBuf::from(format!("in_umbrella:{name}")),
             });
         }
 
@@ -96,102 +123,36 @@ impl LanguagePlugin for ElixirPlugin {
         let content = std::fs::read_to_string(ctx.config_path)
             .with_context(|| format!("Failed to read {}", ctx.config_path.display()))?;
 
-        let mut targets = HashMap::new();
-
-        // Always add deps target for mix deps.get (no cross-project dependencies)
-        targets.insert(
-            "deps".to_string(),
-            Target {
-                command: "mix deps.get".to_string(),
-                depends_on: vec![],
-                capabilities: HashSet::new(),
-                files_glob: None,
-                stream: false,
-                cache: None,
-                invalidates_cache: false,
-            },
-        );
-
-        // Resolve dependency paths to project addresses
-        let dependency_addresses = resolve_dependency_addresses(ctx);
-
-        // Build dependencies for non-deps targets:
-        // - //self:deps (install our own dependencies first)
-        // - :build for each project dependency (they must be built first)
-        let mut base_deps = vec!["//self:deps".to_string()];
-        for dep_addr in &dependency_addresses {
-            base_deps.push(format!("{dep_addr}:build"));
-        }
-
-        // mix test and mix compile are always available for Elixir projects
-        let mut test_caps = HashSet::new();
-        test_caps.insert(TargetCapability::FilesList);
-        test_caps.insert(TargetCapability::WarningsAsErrors);
-        targets.insert(
-            "test".to_string(),
-            Target {
-                command: "mix test".to_string(),
-                depends_on: base_deps.clone(),
-                capabilities: test_caps,
-                files_glob: None,
-                stream: false,
-                cache: None,
-                invalidates_cache: false,
-            },
-        );
-        let mut build_caps = HashSet::new();
-        build_caps.insert(TargetCapability::WarningsAsErrors);
-        targets.insert(
-            "build".to_string(),
-            Target {
-                command: "mix compile".to_string(),
-                depends_on: base_deps.clone(),
-                capabilities: build_caps,
-                files_glob: None,
-                stream: false,
-                cache: None,
-                invalidates_cache: false,
-            },
-        );
-
-        // Only add lint if credo is a dependency
-        if content.contains(":credo") {
+        // Check if this is an umbrella root (has apps_path:)
+        if APPS_PATH_REGEX.is_match(&content) {
+            // Umbrella root: only deps target
+            let mut targets = HashMap::new();
             targets.insert(
-                "lint".to_string(),
+                "deps".to_string(),
                 Target {
-                    command: "mix credo".to_string(),
-                    depends_on: base_deps,
+                    command: "mix deps.get".to_string(),
+                    depends_on: vec![],
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
                     cache: None,
                     invalidates_cache: false,
+                    working_dir: None,
                 },
             );
+            return Ok(targets);
         }
 
-        // format target: only if .formatter.exs exists
-        if ctx.project_dir.join(".formatter.exs").exists() {
-            targets.insert(
-                "format".to_string(),
-                Target {
-                    command: "mix format".to_string(),
-                    depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
-                    capabilities: HashSet::new(),
-                    files_glob: None,
-                    stream: false,
-                    cache: None,
-                    invalidates_cache: false,
-                },
-            );
+        // Check if this is an umbrella child
+        let umbrella_root = find_umbrella_root(ctx.project_dir);
+
+        if let Some(ref umbrella_path) = umbrella_root {
+            // Umbrella child: use mix cmd --app and run from umbrella root
+            return detect_umbrella_child_targets(ctx, &content, umbrella_path);
         }
 
-        // Add clean target
-        if let Some(clean) = self.clean_target(ctx) {
-            targets.insert("clean".to_string(), clean);
-        }
-
-        Ok(targets)
+        // Regular standalone Elixir project
+        detect_standalone_targets(ctx, &content)
     }
 
     fn with_files_list(
@@ -267,6 +228,7 @@ impl LanguagePlugin for ElixirPlugin {
             stream: false,
             cache: None,
             invalidates_cache: true,
+            working_dir: None,
         })
     }
 }
@@ -298,6 +260,276 @@ fn normalize_whitespace(content: &str) -> String {
     static WS_REGEX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\s+").expect("Invalid whitespace regex"));
     WS_REGEX.replace_all(content, " ").to_string()
+}
+
+/// Check if a project is a child of an umbrella project
+/// Returns Some(umbrella_root_path) if this is an umbrella child, None otherwise
+///
+/// Checks both parent and grandparent directories to handle both:
+/// - apps_path: "." (children directly in umbrella root)
+/// - apps_path: "apps" (children in apps/ subdirectory)
+fn find_umbrella_root(project_dir: &Path) -> Option<PathBuf> {
+    // Check parent directory for umbrella mix.exs (apps_path: ".")
+    let parent = project_dir.parent()?;
+    let parent_mix = parent.join("mix.exs");
+    if parent_mix.exists() {
+        let content = std::fs::read_to_string(&parent_mix).ok()?;
+        if APPS_PATH_REGEX.is_match(&content) {
+            return Some(parent.to_path_buf());
+        }
+    }
+
+    // Check grandparent directory for umbrella mix.exs (apps_path: "apps")
+    let grandparent = parent.parent()?;
+    let grandparent_mix = grandparent.join("mix.exs");
+    if grandparent_mix.exists() {
+        let content = std::fs::read_to_string(&grandparent_mix).ok()?;
+        if APPS_PATH_REGEX.is_match(&content) {
+            return Some(grandparent.to_path_buf());
+        }
+    }
+
+    None
+}
+
+/// Detect targets for umbrella child apps
+/// Commands are transformed to use `mix cmd --app <name>` and run from umbrella root
+fn detect_umbrella_child_targets(
+    ctx: &TargetContext,
+    content: &str,
+    umbrella_root: &Path,
+) -> Result<HashMap<String, Target>> {
+    let mut targets = HashMap::new();
+
+    // Extract app name for mix cmd --app
+    let app_name = APP_REGEX
+        .captures(content)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not find 'app: :name' in {}",
+                ctx.config_path.display()
+            )
+        })?;
+
+    // Compute umbrella deps address (e.g., "//src/elixir:deps")
+    let umbrella_rel = umbrella_root
+        .strip_prefix(ctx.workspace_root)
+        .unwrap_or(umbrella_root);
+    let umbrella_deps = format!("//{}:deps", umbrella_rel.display());
+
+    // Resolve dependency paths to project addresses
+    let dependency_addresses = resolve_dependency_addresses(ctx);
+
+    // Base deps: umbrella deps + cross-project builds
+    let mut base_deps = vec![umbrella_deps.clone()];
+    for dep_addr in &dependency_addresses {
+        base_deps.push(format!("{dep_addr}:build"));
+    }
+
+    // build target
+    let mut build_caps = HashSet::new();
+    build_caps.insert(TargetCapability::WarningsAsErrors);
+    targets.insert(
+        "build".to_string(),
+        Target {
+            command: format!("mix cmd --app {} mix compile", app_name),
+            depends_on: base_deps.clone(),
+            capabilities: build_caps,
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: Some(umbrella_root.to_path_buf()),
+        },
+    );
+
+    // test target
+    let mut test_caps = HashSet::new();
+    test_caps.insert(TargetCapability::FilesList);
+    test_caps.insert(TargetCapability::WarningsAsErrors);
+    targets.insert(
+        "test".to_string(),
+        Target {
+            command: format!("mix cmd --app {} mix test", app_name),
+            depends_on: base_deps.clone(),
+            capabilities: test_caps,
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: Some(umbrella_root.to_path_buf()),
+        },
+    );
+
+    // format target (depends on build)
+    targets.insert(
+        "format".to_string(),
+        Target {
+            command: format!("mix cmd --app {} mix format", app_name),
+            depends_on: vec![umbrella_deps.clone(), "//self:build".to_string()],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: Some(umbrella_root.to_path_buf()),
+        },
+    );
+
+    // lint target (if credo present)
+    if content.contains(":credo") {
+        targets.insert(
+            "lint".to_string(),
+            Target {
+                command: format!("mix cmd --app {} mix credo", app_name),
+                depends_on: base_deps,
+                capabilities: HashSet::new(),
+                files_glob: None,
+                stream: false,
+                cache: None,
+                invalidates_cache: false,
+                working_dir: Some(umbrella_root.to_path_buf()),
+            },
+        );
+    }
+
+    // clean target (no deps, invalidates cache)
+    targets.insert(
+        "clean".to_string(),
+        Target {
+            command: format!("mix cmd --app {} mix clean", app_name),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+            working_dir: Some(umbrella_root.to_path_buf()),
+        },
+    );
+
+    Ok(targets)
+}
+
+/// Detect targets for standalone (non-umbrella) Elixir projects
+fn detect_standalone_targets(
+    ctx: &TargetContext,
+    content: &str,
+) -> Result<HashMap<String, Target>> {
+    let mut targets = HashMap::new();
+
+    // Always add deps target for mix deps.get (no cross-project dependencies)
+    targets.insert(
+        "deps".to_string(),
+        Target {
+            command: "mix deps.get".to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: None,
+        },
+    );
+
+    // Resolve dependency paths to project addresses
+    let dependency_addresses = resolve_dependency_addresses(ctx);
+
+    // Build dependencies for non-deps targets:
+    // - //self:deps (install our own dependencies first)
+    // - :build for each project dependency (they must be built first)
+    let mut base_deps = vec!["//self:deps".to_string()];
+    for dep_addr in &dependency_addresses {
+        base_deps.push(format!("{dep_addr}:build"));
+    }
+
+    // mix test and mix compile are always available for Elixir projects
+    let mut test_caps = HashSet::new();
+    test_caps.insert(TargetCapability::FilesList);
+    test_caps.insert(TargetCapability::WarningsAsErrors);
+    targets.insert(
+        "test".to_string(),
+        Target {
+            command: "mix test".to_string(),
+            depends_on: base_deps.clone(),
+            capabilities: test_caps,
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: None,
+        },
+    );
+
+    let mut build_caps = HashSet::new();
+    build_caps.insert(TargetCapability::WarningsAsErrors);
+    targets.insert(
+        "build".to_string(),
+        Target {
+            command: "mix compile".to_string(),
+            depends_on: base_deps.clone(),
+            capabilities: build_caps,
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: None,
+        },
+    );
+
+    // Only add lint if credo is a dependency
+    if content.contains(":credo") {
+        targets.insert(
+            "lint".to_string(),
+            Target {
+                command: "mix credo".to_string(),
+                depends_on: base_deps,
+                capabilities: HashSet::new(),
+                files_glob: None,
+                stream: false,
+                cache: None,
+                invalidates_cache: false,
+                working_dir: None,
+            },
+        );
+    }
+
+    // format target: only if .formatter.exs exists
+    if ctx.project_dir.join(".formatter.exs").exists() {
+        targets.insert(
+            "format".to_string(),
+            Target {
+                command: "mix format".to_string(),
+                depends_on: vec!["//self:deps".to_string(), "//self:build".to_string()],
+                capabilities: HashSet::new(),
+                files_glob: None,
+                stream: false,
+                cache: None,
+                invalidates_cache: false,
+                working_dir: None,
+            },
+        );
+    }
+
+    // Add clean target
+    targets.insert(
+        "clean".to_string(),
+        Target {
+            command: "mix clean".to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: true,
+            working_dir: None,
+        },
+    );
+
+    Ok(targets)
 }
 
 #[cfg(test)]
@@ -436,7 +668,8 @@ end
 
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "sibling_app");
-        assert_eq!(deps[0].path, PathBuf::from("../sibling_app"));
+        // in_umbrella deps are marked for post-discovery resolution
+        assert_eq!(deps[0].path, PathBuf::from("in_umbrella:sibling_app"));
     }
 
     #[test]
@@ -533,6 +766,133 @@ end
             .unwrap_err()
             .to_string()
             .contains("Could not find 'app: :name'"));
+    }
+
+    #[test]
+    fn test_should_not_skip_umbrella_root() {
+        // Umbrella roots are no longer skipped - they get a deps target only
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule ArchAstro.Umbrella.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      apps_path: ".",
+      config_path: "umbrella.config.exs",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
+  end
+
+  defp deps do
+    []
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        assert!(!plugin.should_skip(&mix_exs));
+    }
+
+    #[test]
+    fn test_should_not_skip_umbrella_with_apps_dir() {
+        // Umbrella roots are no longer skipped - they get a deps target only
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyUmbrella.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      apps_path: "apps",
+      version: "0.1.0",
+      deps: deps()
+    ]
+  end
+
+  defp deps do
+    []
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        assert!(!plugin.should_skip(&mix_exs));
+    }
+
+    #[test]
+    fn test_should_not_skip_regular_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :my_app,
+      version: "0.1.0",
+      elixir: "~> 1.14",
+      deps: deps()
+    ]
+  end
+
+  defp deps do
+    []
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        assert!(!plugin.should_skip(&mix_exs));
+    }
+
+    #[test]
+    fn test_should_not_skip_umbrella_child_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule ArchAstroCore.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :archastro_core,
+      version: "0.1.0",
+      deps: deps()
+    ]
+  end
+
+  defp deps do
+    [
+      {:archastro_config, in_umbrella: true},
+      {:archastro_workflow, in_umbrella: true}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let plugin = ElixirPlugin;
+        assert!(!plugin.should_skip(&mix_exs));
     }
 
     #[test]

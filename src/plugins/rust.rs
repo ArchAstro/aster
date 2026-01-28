@@ -98,6 +98,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -123,6 +124,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -137,6 +139,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -151,6 +154,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -165,6 +169,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -179,6 +184,7 @@ impl LanguagePlugin for RustPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -199,6 +205,7 @@ impl LanguagePlugin for RustPlugin {
             stream: false,
             cache: None,
             invalidates_cache: true,
+            working_dir: None,
         })
     }
 

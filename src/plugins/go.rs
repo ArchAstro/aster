@@ -92,6 +92,7 @@ impl LanguagePlugin for GoPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -117,6 +118,7 @@ impl LanguagePlugin for GoPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -133,6 +135,7 @@ impl LanguagePlugin for GoPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -147,6 +150,7 @@ impl LanguagePlugin for GoPlugin {
                 stream: false,
                 cache: None,
                 invalidates_cache: false,
+                working_dir: None,
             },
         );
 
@@ -172,6 +176,7 @@ impl LanguagePlugin for GoPlugin {
                     stream: false,
                     cache: None,
                     invalidates_cache: false,
+                    working_dir: None,
                 },
             );
         }
@@ -253,6 +258,7 @@ impl LanguagePlugin for GoPlugin {
             stream: false,
             cache: None,
             invalidates_cache: true,
+            working_dir: None,
         })
     }
 }

@@ -49,6 +49,7 @@ impl TargetResolver {
                     stream: target.stream,
                     cache: target.cache.clone(),
                     invalidates_cache: target.invalidates_cache,
+                    working_dir: target.working_dir.clone(),
                 },
             );
         }
@@ -71,6 +72,7 @@ impl TargetResolver {
                                 stream: existing.stream,
                                 cache: existing.cache.clone(),
                                 invalidates_cache: existing.invalidates_cache,
+                                working_dir: existing.working_dir.clone(),
                             },
                         );
                     } else {
@@ -85,6 +87,7 @@ impl TargetResolver {
                                 stream: false,
                                 cache: None,
                                 invalidates_cache: false,
+                                working_dir: None,
                             },
                         );
                     }
@@ -120,6 +123,9 @@ impl TargetResolver {
                     // invalidates_cache from rich config (no fallback - explicit only)
                     let invalidates_cache = rich.invalidates_cache;
 
+                    // working_dir preserved from existing (not configurable via aster.toml)
+                    let working_dir = existing.and_then(|e| e.working_dir.clone());
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -130,6 +136,7 @@ impl TargetResolver {
                             stream,
                             cache,
                             invalidates_cache,
+                            working_dir,
                         },
                     );
                 }
@@ -177,6 +184,7 @@ mod tests {
             stream: false,
             cache: None,
             invalidates_cache: false,
+            working_dir: None,
         }
     }
 

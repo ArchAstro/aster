@@ -156,17 +156,21 @@ impl<'a> Executor<'a> {
         let project_addr = format!("//{}", project.relative_path.display());
         let target_addr = format!("{project_addr}:{target}");
 
-        // Get the command for this target
-        let command = match project.targets.get(target) {
-            Some(t) => &t.command,
+        // Get the target and command
+        let target_def = match project.targets.get(target) {
+            Some(t) => t,
             None => {
                 return Err(format!("No '{target}' target defined for {project_addr}"));
             }
         };
+        let command = &target_def.command;
+
+        // Use target's working_dir if set, otherwise use project root
+        let working_dir = target_def.working_dir.as_ref().unwrap_or(&project.root);
 
         if self.output_mode == OutputMode::Verbose {
             eprintln!("[aster] Running: {command}");
-            eprintln!("[aster] Working directory: {}", project.root.display());
+            eprintln!("[aster] Working directory: {}", working_dir.display());
         }
 
         // Split command by whitespace
@@ -181,7 +185,7 @@ impl<'a> Executor<'a> {
         // Run with inherited stdio for streaming
         let status = Command::new(program)
             .args(args)
-            .current_dir(&project.root)
+            .current_dir(working_dir)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -416,6 +420,12 @@ impl<'a> Executor<'a> {
 
             let addr = target_addr.clone();
             let project_root = project.root.clone();
+            // Use target's working_dir if set, otherwise use project root
+            let working_dir = project
+                .targets
+                .get(&target_name)
+                .and_then(|t| t.working_dir.clone())
+                .unwrap_or_else(|| project_root.clone());
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
@@ -442,7 +452,7 @@ impl<'a> Executor<'a> {
                 .unwrap_or(false);
 
             let handle = thread::spawn(move || {
-                let result = run_command(&addr, &command_clone, &project_root);
+                let result = run_command(&addr, &command_clone, &working_dir);
 
                 // Update cache if execution succeeded and caching is enabled
                 if result.success && cache_store_path.is_some() {
@@ -919,6 +929,7 @@ mod tests {
             stream: false,
             cache: None,
             invalidates_cache: false,
+            working_dir: None,
         }
     }
 

@@ -65,6 +65,9 @@ pub struct Target {
     pub cache: Option<crate::config::CacheConfig>,
     /// When true, invalidates all cache entries for this project after successful execution
     pub invalidates_cache: bool,
+    /// Override working directory for this target (absolute path)
+    /// If None, uses the project's root directory
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Context passed to plugins for target detection
@@ -91,6 +94,17 @@ pub trait LanguagePlugin: Send + Sync {
 
     /// Files that identify this project type (e.g., ["package.json"])
     fn marker_files(&self) -> &[&str];
+
+    /// Check if this config file should be skipped during discovery
+    ///
+    /// Some marker files don't represent buildable projects. For example,
+    /// Elixir umbrella roots have a mix.exs but aren't projects themselves -
+    /// only their child apps are projects.
+    ///
+    /// Returns true if this config file should be skipped.
+    fn should_skip(&self, _config_path: &Path) -> bool {
+        false
+    }
 
     /// Parse native config to extract project metadata
     /// - root: workspace root directory

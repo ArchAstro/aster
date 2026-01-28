@@ -46,6 +46,17 @@ pub struct DiscoveredProject {
     pub relative_path: PathBuf,
 }
 
+/// Intermediate struct for first-pass discovery (before target detection)
+struct PartialProject {
+    root: PathBuf,
+    config_path: PathBuf,
+    metadata: ProjectMetadata,
+    dependencies: Vec<LocalDependency>,
+    custom_targets: HashMap<String, crate::config::TargetConfig>,
+    plugin_name: String,
+    relative_path: PathBuf,
+}
+
 /// Discover all projects in the workspace
 ///
 /// Walks the directory tree from workspace_root, respecting .gitignore patterns.
@@ -68,9 +79,9 @@ pub fn discover_projects(
         .flat_map(|p| p.marker_files().iter().copied())
         .collect();
 
-    let mut projects: Vec<DiscoveredProject> = Vec::new();
+    let mut partial_projects: Vec<PartialProject> = Vec::new();
 
-    // Walk the directory tree, respecting gitignore
+    // Phase 1: Walk the directory tree and collect project metadata + dependencies
     let walker = WalkBuilder::new(workspace_root)
         .hidden(false) // Don't skip hidden dirs (except .git itself)
         .git_ignore(true) // Honor .gitignore
@@ -116,6 +127,12 @@ pub fn discover_projects(
             .strip_prefix(workspace_root)
             .unwrap_or(project_dir);
         if ignore_set.is_match(relative_path) {
+            continue;
+        }
+
+        // Check if the plugin wants to skip this config file
+        // (e.g., Elixir umbrella roots aren't buildable projects)
+        if plugin.should_skip(&config_path) {
             continue;
         }
 
@@ -168,36 +185,61 @@ pub fn discover_projects(
             .unwrap_or(project_dir)
             .to_path_buf();
 
-        // Compute project address for //self: resolution
-        let project_address = format!("//{}", relative_path.display());
-
-        // Detect available targets from native config
-        // Plugin receives full context and handles path resolution internally
-        let target_ctx = TargetContext {
-            config_path: &config_path,
-            project_dir,
-            workspace_root,
-            dependencies: &dependencies,
-        };
-        let detected_targets = plugin
-            .detect_targets(&target_ctx)
-            .with_context(|| format!("Failed to detect targets from {}", config_path.display()))?;
-
-        // Resolve targets: detected + aster.toml overrides, resolving //self: references
-        let targets = TargetResolver::resolve(&detected_targets, &custom_targets, &project_address);
-
-        projects.push(DiscoveredProject {
+        partial_projects.push(PartialProject {
             root: project_dir.to_path_buf(),
             config_path,
             metadata,
             dependencies,
-            targets,
+            custom_targets,
             plugin_name: plugin.name().to_string(),
             relative_path,
         });
     }
 
-    // Handle name collisions
+    // Phase 2: Resolve in_umbrella dependencies for Elixir projects
+    // This must happen BEFORE target detection so dependencies are resolved correctly
+    resolve_umbrella_dependencies_partial(&mut partial_projects);
+
+    // Phase 3: Detect targets with resolved dependencies
+    let mut projects: Vec<DiscoveredProject> = Vec::new();
+    for partial in partial_projects {
+        let plugin = registry
+            .find_by_name(&partial.plugin_name)
+            .expect("Plugin should exist");
+
+        // Compute project address for //self: resolution
+        let project_address = format!("//{}", partial.relative_path.display());
+
+        // Detect available targets from native config
+        let target_ctx = TargetContext {
+            config_path: &partial.config_path,
+            project_dir: &partial.root,
+            workspace_root,
+            dependencies: &partial.dependencies,
+        };
+        let detected_targets = plugin.detect_targets(&target_ctx).with_context(|| {
+            format!(
+                "Failed to detect targets from {}",
+                partial.config_path.display()
+            )
+        })?;
+
+        // Resolve targets: detected + aster.toml overrides, resolving //self: references
+        let targets =
+            TargetResolver::resolve(&detected_targets, &partial.custom_targets, &project_address);
+
+        projects.push(DiscoveredProject {
+            root: partial.root,
+            config_path: partial.config_path,
+            metadata: partial.metadata,
+            dependencies: partial.dependencies,
+            targets,
+            plugin_name: partial.plugin_name,
+            relative_path: partial.relative_path,
+        });
+    }
+
+    // Phase 4: Handle name collisions
     resolve_name_collisions(&mut projects);
 
     Ok(projects)
@@ -223,6 +265,43 @@ fn resolve_name_collisions(projects: &mut [DiscoveredProject]) {
             for idx in indices {
                 let project = &mut projects[idx];
                 project.metadata.name = format!("{}-{}", name, project.plugin_name);
+            }
+        }
+    }
+}
+
+/// Resolve in_umbrella dependencies for Elixir projects (partial discovery phase)
+///
+/// In Elixir umbrella projects, `{:dep_name, in_umbrella: true}` dependencies
+/// use app names that may differ from directory names. This function resolves
+/// these by looking up the app name in discovered projects.
+fn resolve_umbrella_dependencies_partial(projects: &mut [PartialProject]) {
+    // Build a map of Elixir app name -> project address
+    let app_to_address: HashMap<String, String> = projects
+        .iter()
+        .filter(|p| p.plugin_name == "elixir")
+        .map(|p| {
+            (
+                p.metadata.name.clone(),
+                format!("//{}", p.relative_path.display()),
+            )
+        })
+        .collect();
+
+    // Resolve in_umbrella: dependencies
+    for project in projects.iter_mut() {
+        if project.plugin_name != "elixir" {
+            continue;
+        }
+
+        for dep in &mut project.dependencies {
+            let path_str = dep.path.to_string_lossy();
+            if let Some(app_name) = path_str.strip_prefix("in_umbrella:") {
+                // Look up the app name in discovered projects
+                if let Some(address) = app_to_address.get(app_name) {
+                    dep.path = PathBuf::from(address.clone());
+                }
+                // If not found, keep the original path (will fail to resolve later)
             }
         }
     }
@@ -866,5 +945,276 @@ ignore = ["**/node_modules/**"]
 
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].metadata.name, "api");
+    }
+
+    #[test]
+    fn test_discover_skips_elixir_umbrella_root() {
+        use crate::plugins::ElixirPlugin;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Umbrella root - should be skipped
+        let umbrella_dir = tmp.path().join("src/elixir");
+        std::fs::create_dir_all(&umbrella_dir).unwrap();
+        std::fs::write(
+            umbrella_dir.join("mix.exs"),
+            r#"
+defmodule ArchAstro.Umbrella.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      apps_path: ".",
+      config_path: "umbrella.config.exs",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Child app 1 - should be discovered
+        let core_dir = umbrella_dir.join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("mix.exs"),
+            r#"
+defmodule ArchAstroCore.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :archastro_core,
+      version: "0.1.0",
+      deps: deps()
+    ]
+  end
+
+  defp deps do
+    [{:archastro_config, in_umbrella: true}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Child app 2 - should be discovered
+        let config_dir = umbrella_dir.join("config_app");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("mix.exs"),
+            r#"
+defmodule ArchAstroConfig.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :archastro_config,
+      version: "0.1.0"
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(ElixirPlugin));
+
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // Should find 3 projects: umbrella root + 2 child apps
+        assert_eq!(projects.len(), 3);
+
+        let names: Vec<&str> = projects.iter().map(|p| p.metadata.name.as_str()).collect();
+        assert!(names.contains(&"archastro_core"));
+        assert!(names.contains(&"archastro_config"));
+        // Umbrella root should be in the list with synthetic name
+        assert!(names.contains(&"elixir_umbrella"));
+
+        // Umbrella root should only have deps target
+        let umbrella = projects
+            .iter()
+            .find(|p| p.metadata.name == "elixir_umbrella")
+            .unwrap();
+        assert_eq!(umbrella.targets.len(), 1);
+        assert!(umbrella.targets.contains_key("deps"));
+    }
+
+    #[test]
+    fn test_discover_umbrella_child_dependencies() {
+        use crate::plugins::ElixirPlugin;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Umbrella root
+        let umbrella_dir = tmp.path().join("src/elixir");
+        std::fs::create_dir_all(&umbrella_dir).unwrap();
+        std::fs::write(
+            umbrella_dir.join("mix.exs"),
+            r#"
+defmodule MyUmbrella.MixProject do
+  use Mix.Project
+  def project do
+    [apps_path: "."]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Child app with in_umbrella dependency
+        let app_dir = umbrella_dir.join("my_app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mix.exs"),
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app, version: "0.1.0", deps: deps()]
+  end
+
+  defp deps do
+    [{:my_lib, in_umbrella: true}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Dependency app
+        let lib_dir = umbrella_dir.join("my_lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("mix.exs"),
+            r#"
+defmodule MyLib.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_lib, version: "0.1.0"]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(ElixirPlugin));
+
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // 3 projects: umbrella root + 2 child apps
+        assert_eq!(projects.len(), 3);
+
+        // Find the app that depends on the lib
+        let my_app = projects
+            .iter()
+            .find(|p| p.metadata.name == "my_app")
+            .unwrap();
+
+        // Verify it has the in_umbrella dependency resolved to the project address
+        assert_eq!(my_app.dependencies.len(), 1);
+        assert_eq!(my_app.dependencies[0].name, "my_lib");
+        // in_umbrella dependencies are resolved to project addresses (//path)
+        assert_eq!(
+            my_app.dependencies[0].path,
+            std::path::PathBuf::from("//src/elixir/my_lib")
+        );
+    }
+
+    #[test]
+    fn test_discover_umbrella_mismatched_names() {
+        use crate::plugins::ElixirPlugin;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Umbrella root
+        let umbrella_dir = tmp.path().join("src/elixir");
+        std::fs::create_dir_all(&umbrella_dir).unwrap();
+        std::fs::write(
+            umbrella_dir.join("mix.exs"),
+            r#"
+defmodule MyUmbrella.MixProject do
+  use Mix.Project
+  def project do
+    [apps_path: "."]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Child app depending on app with different directory name
+        let app_dir = umbrella_dir.join("core");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mix.exs"),
+            r#"
+defmodule Core.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :archastro_core, version: "0.1.0", deps: deps()]
+  end
+
+  defp deps do
+    [{:archastro_config, in_umbrella: true}]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Dependency app with different directory name than app name
+        // Directory: "config" but app: :archastro_config
+        let config_dir = umbrella_dir.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("mix.exs"),
+            r#"
+defmodule Config.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :archastro_config, version: "0.1.0"]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(ElixirPlugin));
+
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+
+        // 3 projects: umbrella root + 2 child apps
+        assert_eq!(projects.len(), 3);
+
+        // Find the core app
+        let core = projects
+            .iter()
+            .find(|p| p.metadata.name == "archastro_core")
+            .unwrap();
+
+        // Verify in_umbrella dependency is resolved by app name, not directory name
+        assert_eq!(core.dependencies.len(), 1);
+        assert_eq!(core.dependencies[0].name, "archastro_config");
+        // Resolved to the actual project path (config directory)
+        assert_eq!(
+            core.dependencies[0].path,
+            std::path::PathBuf::from("//src/elixir/config")
+        );
     }
 }
