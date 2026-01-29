@@ -1117,10 +1117,48 @@ fn execute_heterogeneous(
                         duration_ms: 0,
                     }
                 } else {
-                    let output = Command::new(parts[0])
-                        .args(&parts[1..])
-                        .current_dir(&project_root)
-                        .output();
+                    // Parse environment variables (VAR=value prefix pattern)
+                    let mut env_vars: Vec<(&str, &str)> = Vec::new();
+                    let mut cmd_start = 0;
+                    for (i, part) in parts.iter().enumerate() {
+                        if let Some(eq_pos) = part.find('=') {
+                            let name = &part[..eq_pos];
+                            if !name.is_empty()
+                                && name
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.is_ascii_alphabetic() || c == '_')
+                                    .unwrap_or(false)
+                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                let value = &part[eq_pos + 1..];
+                                env_vars.push((name, value));
+                                cmd_start = i + 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if cmd_start >= parts.len() {
+                        return aster::executor::ExecutionResult {
+                            address: addr,
+                            success: false,
+                            skipped: false,
+                            cached: false,
+                            output: "Empty command (only environment variables)".to_string(),
+                            duration_ms: 0,
+                        };
+                    }
+
+                    let mut cmd = Command::new(parts[cmd_start]);
+                    cmd.args(&parts[cmd_start + 1..]).current_dir(&project_root);
+                    for (name, value) in env_vars {
+                        cmd.env(name, value);
+                    }
+                    let output = cmd.output();
 
                     let duration_ms = start.elapsed().as_millis();
 

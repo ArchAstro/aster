@@ -147,7 +147,7 @@ impl LanguagePlugin for ElixirPlugin {
         let umbrella_root = find_umbrella_root(ctx.project_dir);
 
         if let Some(ref umbrella_path) = umbrella_root {
-            // Umbrella child: use mix cmd --app and run from umbrella root
+            // Umbrella child: use mix do --app and run from umbrella root
             return detect_umbrella_child_targets(ctx, &content, umbrella_path);
         }
 
@@ -293,7 +293,7 @@ fn find_umbrella_root(project_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Detect targets for umbrella child apps
-/// Commands are transformed to use `mix cmd --app <name>` and run from umbrella root
+/// Commands are transformed to use `mix do --app <name>` and run from umbrella root
 fn detect_umbrella_child_targets(
     ctx: &TargetContext,
     content: &str,
@@ -301,7 +301,7 @@ fn detect_umbrella_child_targets(
 ) -> Result<HashMap<String, Target>> {
     let mut targets = HashMap::new();
 
-    // Extract app name for mix cmd --app
+    // Extract app name for mix do --app
     let app_name = APP_REGEX
         .captures(content)
         .and_then(|c| c.get(1))
@@ -334,7 +334,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "build".to_string(),
         Target {
-            command: format!("mix cmd --app {} mix compile", app_name),
+            command: format!("mix do --app {} compile", app_name),
             depends_on: base_deps.clone(),
             capabilities: build_caps,
             files_glob: None,
@@ -352,7 +352,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "test".to_string(),
         Target {
-            command: format!("mix cmd --app {} mix test", app_name),
+            command: format!("MIX_ENV=test mix do --app {} test", app_name),
             depends_on: base_deps.clone(),
             capabilities: test_caps,
             files_glob: None,
@@ -367,7 +367,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "format".to_string(),
         Target {
-            command: format!("mix cmd --app {} mix format", app_name),
+            command: format!("mix do --app {} format", app_name),
             depends_on: vec![umbrella_deps.clone(), "//self:build".to_string()],
             capabilities: HashSet::new(),
             files_glob: None,
@@ -383,7 +383,7 @@ fn detect_umbrella_child_targets(
         targets.insert(
             "lint".to_string(),
             Target {
-                command: format!("mix cmd --app {} mix credo", app_name),
+                command: format!("mix do --app {} credo", app_name),
                 depends_on: base_deps,
                 capabilities: HashSet::new(),
                 files_glob: None,
@@ -399,7 +399,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "clean".to_string(),
         Target {
-            command: format!("mix cmd --app {} mix clean", app_name),
+            command: format!("mix do --app {} clean", app_name),
             depends_on: vec![],
             capabilities: HashSet::new(),
             files_glob: None,

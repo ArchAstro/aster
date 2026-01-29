@@ -179,16 +179,51 @@ impl<'a> Executor<'a> {
             return Err("Empty command".to_string());
         }
 
-        let program = parts[0];
-        let args = &parts[1..];
+        // Parse environment variables (VAR=value prefix pattern)
+        let mut env_vars: Vec<(&str, &str)> = Vec::new();
+        let mut cmd_start = 0;
+        for (i, part) in parts.iter().enumerate() {
+            if let Some(eq_pos) = part.find('=') {
+                let name = &part[..eq_pos];
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_alphabetic() || c == '_')
+                        .unwrap_or(false)
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    let value = &part[eq_pos + 1..];
+                    env_vars.push((name, value));
+                    cmd_start = i + 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if cmd_start >= parts.len() {
+            return Err("Empty command (only environment variables)".to_string());
+        }
+
+        let program = parts[cmd_start];
+        let args = &parts[cmd_start + 1..];
 
         // Run with inherited stdio for streaming
-        let status = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .current_dir(working_dir)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        for (name, value) in env_vars {
+            cmd.env(name, value);
+        }
+
+        let status = cmd
             .status()
             .map_err(|e| format!("Failed to execute {target_addr}: {e}"))?;
 
@@ -865,13 +900,56 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
         };
     }
 
-    let program = parts[0];
-    let args = &parts[1..];
+    // Parse environment variables (VAR=value prefix pattern)
+    // Environment variable names must start with a letter or underscore
+    let mut env_vars: Vec<(&str, &str)> = Vec::new();
+    let mut cmd_start = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if let Some(eq_pos) = part.find('=') {
+            let name = &part[..eq_pos];
+            // Check if it looks like an env var name (starts with letter/underscore, contains only alphanumeric/underscore)
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic() || c == '_')
+                    .unwrap_or(false)
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                let value = &part[eq_pos + 1..];
+                env_vars.push((name, value));
+                cmd_start = i + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 
-    let result = Command::new(program)
-        .args(args)
-        .current_dir(working_dir)
-        .output();
+    if cmd_start >= parts.len() {
+        return ExecutionResult {
+            address: address.to_string(),
+            success: false,
+            skipped: false,
+            cached: false,
+            output: "Empty command (only environment variables)".to_string(),
+            duration_ms: 0,
+        };
+    }
+
+    let program = parts[cmd_start];
+    let args = &parts[cmd_start + 1..];
+
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(working_dir);
+
+    // Set environment variables
+    for (name, value) in env_vars {
+        cmd.env(name, value);
+    }
+
+    let result = cmd.output();
 
     let duration_ms = start.elapsed().as_millis();
 
