@@ -233,27 +233,6 @@ impl LanguagePlugin for ElixirPlugin {
     }
 }
 
-/// Resolve LocalDependency paths to project addresses
-fn resolve_dependency_addresses(ctx: &TargetContext) -> Vec<String> {
-    ctx.dependencies
-        .iter()
-        .filter_map(|dep| {
-            let path_str = dep.path.to_string_lossy();
-            if path_str.starts_with("//") {
-                // Already an address - strip any target suffix
-                let addr = path_str.split(':').next().unwrap_or(&path_str);
-                Some(addr.to_string())
-            } else {
-                // Resolve relative path to address
-                let resolved = ctx.project_dir.join(&dep.path);
-                let normalized = resolved.canonicalize().ok()?;
-                let dep_relative = normalized.strip_prefix(ctx.workspace_root).ok()?;
-                Some(format!("//{}", dep_relative.display()))
-            }
-        })
-        .collect()
-}
-
 /// Normalize whitespace in mix.exs content to handle multiline dependency declarations
 /// This replaces sequences of whitespace (including newlines) with single spaces
 fn normalize_whitespace(content: &str) -> String {
@@ -319,13 +298,27 @@ fn detect_umbrella_child_targets(
         .unwrap_or(umbrella_root);
     let umbrella_deps = format!("//{}:deps", umbrella_rel.display());
 
-    // Resolve dependency paths to project addresses
-    let dependency_addresses = resolve_dependency_addresses(ctx);
-
-    // Base deps: umbrella deps + cross-project builds
+    // Base deps: umbrella deps + cross-language deps from aster.toml
+    // Note: We intentionally do NOT add Elixir-to-Elixir :build dependencies here.
+    // Mix handles internal dependency compilation automatically - adding explicit
+    // target dependencies would cause double builds. Project-level dependencies
+    // are still tracked via parse_dependencies() for affected analysis.
+    //
+    // However, cross-language dependencies (from aster.toml, with // prefix) ARE added
+    // as target dependencies since Mix doesn't manage those.
     let mut base_deps = vec![umbrella_deps.clone()];
-    for dep_addr in &dependency_addresses {
-        base_deps.push(format!("{dep_addr}:build"));
+    for dep in ctx.dependencies {
+        let path_str = dep.path.to_string_lossy();
+        // Only add cross-language deps (those with // prefix from aster.toml)
+        // Skip Elixir deps (relative paths or in_umbrella: prefix from mix.exs)
+        if path_str.starts_with("//") {
+            // Ensure we're referencing the :build target
+            if path_str.contains(':') {
+                base_deps.push(path_str.to_string());
+            } else {
+                base_deps.push(format!("{path_str}:build"));
+            }
+        }
     }
 
     // build target
@@ -435,15 +428,27 @@ fn detect_standalone_targets(
         },
     );
 
-    // Resolve dependency paths to project addresses
-    let dependency_addresses = resolve_dependency_addresses(ctx);
-
-    // Build dependencies for non-deps targets:
-    // - //self:deps (install our own dependencies first)
-    // - :build for each project dependency (they must be built first)
+    // Base deps: our own deps + cross-language deps from aster.toml
+    // Note: We intentionally do NOT add Elixir-to-Elixir :build dependencies here.
+    // Mix handles internal dependency compilation automatically - adding explicit
+    // target dependencies would cause double builds. Project-level dependencies
+    // are still tracked via parse_dependencies() for affected analysis.
+    //
+    // However, cross-language dependencies (from aster.toml, with // prefix) ARE added
+    // as target dependencies since Mix doesn't manage those.
     let mut base_deps = vec!["//self:deps".to_string()];
-    for dep_addr in &dependency_addresses {
-        base_deps.push(format!("{dep_addr}:build"));
+    for dep in ctx.dependencies {
+        let path_str = dep.path.to_string_lossy();
+        // Only add cross-language deps (those with // prefix from aster.toml)
+        // Skip Elixir deps (relative paths or in_umbrella: prefix from mix.exs)
+        if path_str.starts_with("//") {
+            // Ensure we're referencing the :build target
+            if path_str.contains(':') {
+                base_deps.push(path_str.to_string());
+            } else {
+                base_deps.push(format!("{path_str}:build"));
+            }
+        }
     }
 
     // mix test and mix compile are always available for Elixir projects
@@ -1272,5 +1277,167 @@ end
         assert_eq!(clean.command, "mix clean");
         assert!(clean.depends_on.is_empty());
         assert!(clean.invalidates_cache);
+    }
+
+    #[test]
+    fn test_elixir_deps_not_added_to_target_depends_on() {
+        // Elixir-to-Elixir dependencies (from mix.exs) should NOT be added
+        // to target depends_on because Mix handles internal compilation
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Simulate Elixir deps from mix.exs (relative paths)
+        let elixir_deps = vec![
+            LocalDependency {
+                name: "core".to_string(),
+                path: PathBuf::from("../core"),
+            },
+            LocalDependency {
+                name: "shared".to_string(),
+                path: PathBuf::from("in_umbrella:shared"),
+            },
+        ];
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &elixir_deps);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Should only have //self:deps, NOT the Elixir dependencies
+        assert_eq!(
+            targets.get("build").unwrap().depends_on,
+            vec!["//self:deps"],
+            "Elixir-to-Elixir deps should not be in target depends_on"
+        );
+        assert_eq!(
+            targets.get("test").unwrap().depends_on,
+            vec!["//self:deps"],
+            "Elixir-to-Elixir deps should not be in target depends_on"
+        );
+    }
+
+    #[test]
+    fn test_cross_language_deps_added_to_target_depends_on() {
+        // Cross-language dependencies (from aster.toml, with // prefix)
+        // SHOULD be added to target depends_on since Mix doesn't manage them
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Simulate cross-language deps from aster.toml (// prefix)
+        let cross_lang_deps = vec![
+            LocalDependency {
+                name: "//libs/shared:build".to_string(),
+                path: PathBuf::from("//libs/shared:build"),
+            },
+            LocalDependency {
+                name: "//libs/utils".to_string(),
+                path: PathBuf::from("//libs/utils"),
+            },
+        ];
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &cross_lang_deps);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Should have //self:deps AND the cross-language dependencies
+        let build_deps = &targets.get("build").unwrap().depends_on;
+        assert!(
+            build_deps.contains(&"//self:deps".to_string()),
+            "Should have //self:deps"
+        );
+        assert!(
+            build_deps.contains(&"//libs/shared:build".to_string()),
+            "Should have cross-language dep with explicit target"
+        );
+        assert!(
+            build_deps.contains(&"//libs/utils:build".to_string()),
+            "Should add :build suffix to cross-language dep without target"
+        );
+    }
+
+    #[test]
+    fn test_mixed_deps_only_cross_language_in_target_depends_on() {
+        // When both Elixir and cross-language deps exist, only cross-language
+        // should be in target depends_on
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(
+            &mix_exs,
+            r#"
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :my_app]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        // Mix of Elixir deps and cross-language deps
+        let mixed_deps = vec![
+            // Elixir dep (relative path) - should NOT be added
+            LocalDependency {
+                name: "core".to_string(),
+                path: PathBuf::from("../core"),
+            },
+            // Cross-language dep (// prefix) - SHOULD be added
+            LocalDependency {
+                name: "//libs/nodejs-lib:build".to_string(),
+                path: PathBuf::from("//libs/nodejs-lib:build"),
+            },
+            // Elixir umbrella dep - should NOT be added
+            LocalDependency {
+                name: "shared".to_string(),
+                path: PathBuf::from("in_umbrella:shared"),
+            },
+        ];
+
+        let plugin = ElixirPlugin;
+        let ctx = make_context(&mix_exs, tmp.path(), &mixed_deps);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        let build_deps = &targets.get("build").unwrap().depends_on;
+
+        // Should have exactly 2 deps: //self:deps and the cross-language dep
+        assert_eq!(build_deps.len(), 2, "Should have exactly 2 dependencies");
+        assert!(build_deps.contains(&"//self:deps".to_string()));
+        assert!(build_deps.contains(&"//libs/nodejs-lib:build".to_string()));
+
+        // Should NOT contain Elixir deps
+        assert!(
+            !build_deps.iter().any(|d| d.contains("core")),
+            "Should not contain Elixir dep 'core'"
+        );
+        assert!(
+            !build_deps.iter().any(|d| d.contains("shared")),
+            "Should not contain Elixir umbrella dep 'shared'"
+        );
     }
 }
