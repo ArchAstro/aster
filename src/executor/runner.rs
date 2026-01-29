@@ -691,7 +691,7 @@ impl<'a> Executor<'a> {
 }
 
 /// Parse a target address like "//path/to/project:target" into (project_addr, target_name)
-fn parse_target_address(addr: &str) -> Option<(String, String)> {
+pub fn parse_target_address(addr: &str) -> Option<(String, String)> {
     let colon_pos = addr.rfind(':')?;
     let project_addr = addr[..colon_pos].to_string();
     let target_name = addr[colon_pos + 1..].to_string();
@@ -702,7 +702,7 @@ fn parse_target_address(addr: &str) -> Option<(String, String)> {
 ///
 /// Follows Target.depends_on which should already be fully resolved by TargetResolver
 /// (including cross-project :build dependencies).
-fn collect_target_deps(
+pub fn collect_target_deps(
     target_addr: &str,
     project_map: &HashMap<String, &DiscoveredProject>,
     collected: &mut HashSet<String>,
@@ -733,7 +733,7 @@ fn collect_target_deps(
 ///
 /// Level 0 = targets with no dependencies (in our set)
 /// Level N = targets whose dependencies are all in levels 0..N-1
-fn compute_target_levels(
+pub fn compute_target_levels(
     targets: &HashSet<String>,
     project_map: &HashMap<String, &DiscoveredProject>,
 ) -> Vec<Vec<String>> {

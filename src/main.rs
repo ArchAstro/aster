@@ -17,7 +17,7 @@ use aster::cli::{
 use aster::config::find_workspace_root;
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
-use aster::executor::Executor;
+use aster::executor::{collect_target_deps, compute_target_levels, parse_target_address, Executor};
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
 use aster::plugins::{
@@ -417,12 +417,18 @@ fn run() -> Result<()> {
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
+            // Keep a copy of directly affected for rationale tracking in dry-run
+            let directly_affected_addrs = directly_affected.clone();
+
             // Expand with dependents if requested
             let affected_addrs = if dependents {
                 affected_with_dependents(directly_affected, &graph)
             } else {
                 directly_affected
             };
+
+            // Primary projects are the affected ones (only these run the requested target)
+            let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
 
             // Find DiscoveredProject refs for affected addresses
             let affected_projects: Vec<_> = projects
@@ -469,25 +475,60 @@ fn run() -> Result<()> {
                 }
             }
 
-            // Dry run: just show what would run
+            // Dry run: show the full execution graph with rationale
             if dry_run {
+                // Build project map from ALL projects (same as executor would)
+                let all_project_map: HashMap<String, &DiscoveredProject> = projects
+                    .iter()
+                    .map(|p| (format!("//{}", p.relative_path.display()), p))
+                    .collect();
+
+                // Compute targets_to_run (same logic as executor)
+                let mut targets_to_run: HashSet<String> = HashSet::new();
+                for addr in &primary_addrs {
+                    let target_addr = format!("{addr}:{target}");
+                    targets_to_run.insert(target_addr.clone());
+                    collect_target_deps(&target_addr, &all_project_map, &mut targets_to_run);
+                }
+
+                // Compute DAG levels for execution order
+                let levels = compute_target_levels(&targets_to_run, &all_project_map);
+
                 // Build map of project -> affected files
                 let mut files_per_project: HashMap<String, Vec<String>> = HashMap::new();
-                for project in &ordered {
+                for project in &projects {
                     let project_addr = format!("//{}", project.relative_path.display());
                     let project_files: Vec<String> = changed_files
                         .iter()
                         .filter(|f| f.starts_with(&project.relative_path))
                         .map(|f| f.to_string_lossy().to_string())
                         .collect();
-                    files_per_project.insert(project_addr, project_files);
+                    if !project_files.is_empty() {
+                        files_per_project.insert(project_addr, project_files);
+                    }
                 }
 
+                // Categorize each target's rationale
+                let rationale_for = |target_addr: &str| -> &'static str {
+                    if let Some((project_addr, target_name)) = parse_target_address(target_addr) {
+                        if target_name == target {
+                            // This is the requested target
+                            if directly_affected_addrs.contains(&project_addr) {
+                                return "affected";
+                            } else if primary_addrs.contains(&project_addr) {
+                                // In primary but not directly affected = added by --dependents
+                                return "dependent";
+                            }
+                        }
+                    }
+                    "target dependency"
+                };
+
                 if output_mode == OutputMode::Json {
-                    // Output JSON list of affected projects with files
                     #[derive(serde::Serialize)]
-                    struct AffectedProject {
+                    struct DryRunTarget {
                         address: String,
+                        reason: String,
                         files: Vec<String>,
                     }
                     #[derive(serde::Serialize)]
@@ -495,38 +536,75 @@ fn run() -> Result<()> {
                         target: String,
                         base: String,
                         head: Option<String>,
-                        affected: Vec<AffectedProject>,
+                        targets: Vec<DryRunTarget>,
                         count: usize,
                     }
-                    let affected: Vec<AffectedProject> = ordered
-                        .iter()
-                        .map(|p| {
-                            let addr = format!("//{}", p.relative_path.display());
-                            let files = files_per_project.get(&addr).cloned().unwrap_or_default();
-                            AffectedProject {
-                                address: addr,
+                    let mut all_targets = Vec::new();
+                    for level in &levels {
+                        for target_addr in level {
+                            let reason = rationale_for(target_addr).to_string();
+                            let project_addr = parse_target_address(target_addr)
+                                .map(|(p, _)| p)
+                                .unwrap_or_default();
+                            let files = if reason == "affected" {
+                                files_per_project
+                                    .get(&project_addr)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            } else {
+                                vec![]
+                            };
+                            all_targets.push(DryRunTarget {
+                                address: target_addr.clone(),
+                                reason,
                                 files,
-                            }
-                        })
-                        .collect();
+                            });
+                        }
+                    }
+                    let count = all_targets.len();
                     let output = DryRunOutput {
                         target: target.clone(),
                         base: base.clone(),
                         head: head.clone(),
-                        count: affected.len(),
-                        affected,
+                        targets: all_targets,
+                        count,
                     };
                     output_json(&output)?;
                 } else if output_mode != OutputMode::Quiet {
+                    // Count targets by category
+                    let dep_count = targets_to_run
+                        .iter()
+                        .filter(|t| rationale_for(t) == "target dependency")
+                        .count();
+
                     println!();
-                    println!("Would run '{}' on {} projects:", target, ordered.len());
+                    if dep_count > 0 {
+                        println!(
+                            "Would run '{}' on {} projects (+{} dependency targets):",
+                            target,
+                            primary_addrs.len(),
+                            dep_count
+                        );
+                    } else {
+                        println!(
+                            "Would run '{}' on {} projects:",
+                            target,
+                            primary_addrs.len()
+                        );
+                    }
                     println!();
-                    for project in &ordered {
-                        let addr = format!("//{}", project.relative_path.display());
-                        println!("  {addr}");
-                        if let Some(files) = files_per_project.get(&addr) {
-                            for file in files {
-                                println!("    - {file}");
+                    for level in &levels {
+                        for target_addr in level {
+                            let reason = rationale_for(target_addr);
+                            println!("  {target_addr}  ({reason})");
+                            if reason == "affected" {
+                                if let Some((project_addr, _)) = parse_target_address(target_addr) {
+                                    if let Some(files) = files_per_project.get(&project_addr) {
+                                        for file in files {
+                                            println!("    - {file}");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -535,8 +613,12 @@ fn run() -> Result<()> {
             }
 
             // Execute target on projects
+            // Pass ALL projects so executor can resolve target-level dependencies
+            // (e.g., //app:build depends on //lib:build). Only primary (affected)
+            // projects will run the requested target.
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
+            let all_project_refs: Vec<_> = projects.iter().collect();
 
             // Build command overrides for files-list and warnings-as-errors
             let results = if only_affected_files || warnings_as_errors {
@@ -618,9 +700,14 @@ fn run() -> Result<()> {
                     );
                 }
 
-                executor.execute_with_command_overrides(&target, &ordered, &command_overrides, None)
+                executor.execute_with_command_overrides(
+                    &target,
+                    &all_project_refs,
+                    &command_overrides,
+                    Some(&primary_addrs),
+                )
             } else {
-                executor.execute(&target, &ordered, &graph, None)
+                executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
             };
 
             // Output results based on mode

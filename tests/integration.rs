@@ -1119,6 +1119,251 @@ fn test_no_deps_skips_all_dependency_targets() {
 }
 
 // ============================================================================
+// Affected: Target-Level Dependency Resolution
+// ============================================================================
+
+#[test]
+fn test_affected_resolves_target_level_dependencies() {
+    // Regression test: the affected command must resolve target-level dependencies
+    // even for projects that are NOT directly affected.
+    //
+    // Scenario: app:build depends on sdk:build (target-level dep via file: dependency).
+    // Only app has changes (sdk is NOT affected). The executor must still run sdk:build
+    // because it's a target-level dependency of app:build.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // SDK library - build FAILS (proves it runs even when not directly affected)
+    write_package_json(
+        &tmp,
+        "libs/sdk/package.json",
+        r#"{"name": "sdk", "scripts": {"build": "exit 1"}}"#,
+    );
+
+    // App depends on SDK (creates target-level dep: app:build -> sdk:build)
+    write_package_json(
+        &tmp,
+        "services/app/package.json",
+        r#"{"name": "app", "dependencies": {"sdk": "file:../../libs/sdk"}, "scripts": {"build": "echo app_build"}}"#,
+    );
+
+    git_commit(&tmp, "Initial commit");
+
+    // Only change the app project (sdk is NOT directly affected)
+    fs::write(tmp.path().join("services/app/new_file.txt"), "change").unwrap();
+
+    // Run affected build - should FAIL because sdk:build fails
+    // sdk:build is a target-level dep of app:build, even though sdk isn't directly affected
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "Should fail because sdk:build (target-level dep) runs even though sdk isn't directly affected. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_affected_with_dependents_resolves_target_deps() {
+    // When --dependents is used, the full graph should include:
+    // 1. Directly affected projects
+    // 2. Their ProjectGraph dependents (reverse deps)
+    // 3. Target-level dependencies for ALL of the above
+    //
+    // Scenario: sdk changed. With --dependents, app (which depends on sdk) is added.
+    // Both run build. sdk:build is also a target-level dep of app:build, but it's
+    // already primary so it runs the requested target directly.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // SDK library - build succeeds
+    write_package_json(
+        &tmp,
+        "libs/sdk/package.json",
+        r#"{"name": "sdk", "scripts": {"build": "echo sdk_build"}}"#,
+    );
+
+    // Unrelated library - build FAILS (proves it runs when it's a target dep of a dependent)
+    write_package_json(
+        &tmp,
+        "libs/infra/package.json",
+        r#"{"name": "infra", "scripts": {"build": "exit 1"}}"#,
+    );
+
+    // App depends on both sdk and infra
+    write_package_json(
+        &tmp,
+        "services/app/package.json",
+        r#"{"name": "app", "dependencies": {"sdk": "file:../../libs/sdk", "infra": "file:../../libs/infra"}, "scripts": {"build": "echo app_build"}}"#,
+    );
+
+    git_commit(&tmp, "Initial commit");
+
+    // Only change sdk (app is NOT directly affected, but IS a dependent)
+    fs::write(tmp.path().join("libs/sdk/new_file.txt"), "change").unwrap();
+
+    // Run affected build with --dependents
+    // - sdk is directly affected → primary
+    // - app is a dependent of sdk → primary (runs build)
+    // - infra is a target-level dep of app:build → should also run
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD", "--dependents"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify affected projects are listed
+    assert!(
+        stdout.contains("//libs/sdk"),
+        "Expected //libs/sdk in affected output: {stdout}"
+    );
+    assert!(
+        stdout.contains("//services/app"),
+        "Expected //services/app (dependent) in affected output: {stdout}"
+    );
+
+    // infra:build should have run (target-level dep of app:build) and failed
+    assert!(
+        !output.status.success(),
+        "Should fail because infra:build (target-level dep of dependent app) fails. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ============================================================================
+// Dry Run: Full Execution Graph with Rationale
+// ============================================================================
+
+#[test]
+fn test_dry_run_shows_full_target_graph_with_rationale() {
+    // Dry run should show ALL targets that would execute (not just affected projects),
+    // with rationale: affected (files changed), dependent, or target dependency.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // SDK library (will NOT be directly affected, but IS a target dependency)
+    write_package_json(
+        &tmp,
+        "libs/sdk/package.json",
+        r#"{"name": "sdk", "scripts": {"build": "echo sdk_build"}}"#,
+    );
+
+    // App depends on SDK
+    write_package_json(
+        &tmp,
+        "services/app/package.json",
+        r#"{"name": "app", "dependencies": {"sdk": "file:../../libs/sdk"}, "scripts": {"build": "echo app_build"}}"#,
+    );
+
+    git_commit(&tmp, "Initial commit");
+
+    // Only change the app project
+    fs::create_dir_all(tmp.path().join("services/app/src")).unwrap();
+    fs::write(
+        tmp.path().join("services/app/src/index.ts"),
+        "export default 1;",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Dry run failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should show the affected target with rationale
+    assert!(
+        stdout.contains("//services/app:build") && stdout.contains("affected"),
+        "Expected //services/app:build marked as affected: {stdout}"
+    );
+
+    // Should show target dependencies (sdk:build needed by app:build)
+    assert!(
+        stdout.contains("//libs/sdk:build") && stdout.contains("target dependency"),
+        "Expected //libs/sdk:build marked as target dependency: {stdout}"
+    );
+
+    // Should show the changed file (git may show directory for new untracked dirs)
+    assert!(
+        stdout.contains("services/app/src"),
+        "Expected changed file listed: {stdout}"
+    );
+
+    // Should show dependency target count
+    assert!(
+        stdout.contains("dependency targets"),
+        "Expected 'dependency targets' in summary: {stdout}"
+    );
+}
+
+#[test]
+fn test_dry_run_shows_dependents_rationale() {
+    // With --dependents, dependent projects should be labeled as "dependent"
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // SDK library
+    write_package_json(
+        &tmp,
+        "libs/sdk/package.json",
+        r#"{"name": "sdk", "scripts": {"build": "echo sdk_build"}}"#,
+    );
+
+    // App depends on SDK
+    write_package_json(
+        &tmp,
+        "services/app/package.json",
+        r#"{"name": "app", "dependencies": {"sdk": "file:../../libs/sdk"}, "scripts": {"build": "echo app_build"}}"#,
+    );
+
+    git_commit(&tmp, "Initial commit");
+
+    // Change SDK (app will be added as a dependent)
+    fs::create_dir_all(tmp.path().join("libs/sdk/src")).unwrap();
+    fs::write(
+        tmp.path().join("libs/sdk/src/index.ts"),
+        "export default 1;",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "build",
+            "--base=HEAD",
+            "--dependents",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Dry run failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // SDK should be marked as affected
+    assert!(
+        stdout.contains("//libs/sdk:build") && stdout.contains("affected"),
+        "Expected //libs/sdk:build marked as affected: {stdout}"
+    );
+
+    // App should be marked as dependent
+    assert!(
+        stdout.contains("//services/app:build") && stdout.contains("dependent"),
+        "Expected //services/app:build marked as dependent: {stdout}"
+    );
+}
+
+// ============================================================================
 // Full Logs Tests
 // ============================================================================
 
