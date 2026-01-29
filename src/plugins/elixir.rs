@@ -63,7 +63,7 @@ impl LanguagePlugin for ElixirPlugin {
                 .and_then(|n| n.to_str())
                 .unwrap_or("umbrella");
             return Ok(ProjectMetadata {
-                name: format!("{}_umbrella", dir_name),
+                name: format!("{dir_name}_umbrella"),
                 version: None,
             });
         }
@@ -327,7 +327,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "build".to_string(),
         Target {
-            command: format!("mix do --app {} compile", app_name),
+            command: format!("mix do --app {app_name} compile"),
             depends_on: base_deps.clone(),
             capabilities: build_caps,
             files_glob: None,
@@ -345,7 +345,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "test".to_string(),
         Target {
-            command: format!("MIX_ENV=test mix do --app {} test", app_name),
+            command: format!("MIX_ENV=test mix do --app {app_name} test"),
             depends_on: base_deps.clone(),
             capabilities: test_caps,
             files_glob: None,
@@ -360,7 +360,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "format".to_string(),
         Target {
-            command: format!("mix do --app {} format", app_name),
+            command: format!("mix do --app {app_name} format"),
             depends_on: vec![umbrella_deps.clone(), "//self:build".to_string()],
             capabilities: HashSet::new(),
             files_glob: None,
@@ -376,7 +376,7 @@ fn detect_umbrella_child_targets(
         targets.insert(
             "lint".to_string(),
             Target {
-                command: format!("mix do --app {} credo", app_name),
+                command: format!("mix do --app {app_name} credo"),
                 depends_on: base_deps,
                 capabilities: HashSet::new(),
                 files_glob: None,
@@ -392,7 +392,7 @@ fn detect_umbrella_child_targets(
     targets.insert(
         "clean".to_string(),
         Target {
-            command: format!("mix do --app {} clean", app_name),
+            command: format!("mix do --app {app_name} clean"),
             depends_on: vec![],
             capabilities: HashSet::new(),
             files_glob: None,
