@@ -333,6 +333,21 @@ impl LanguagePlugin for NodeJsPlugin {
     }
 
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        // deps target only cares about dependency specification files,
+        // not source code — source changes shouldn't re-install dependencies
+        if target_name == "deps" {
+            return super::CacheInputs {
+                source_globs: vec![],
+                config_files: vec![
+                    "package.json".to_string(),
+                    "package-lock.json".to_string(),
+                    "yarn.lock".to_string(),
+                    "pnpm-lock.yaml".to_string(),
+                ],
+                env_vars: vec!["NODE_ENV".to_string()],
+            };
+        }
+
         let mut inputs = super::CacheInputs {
             source_globs: vec![
                 "src/**/*.ts".to_string(),

@@ -336,6 +336,23 @@ impl LanguagePlugin for PythonPlugin {
     }
 
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        // deps target only cares about dependency specification files,
+        // not source code — source changes shouldn't re-install dependencies
+        if target_name == "deps" {
+            return super::CacheInputs {
+                source_globs: vec![],
+                config_files: vec![
+                    "pyproject.toml".to_string(),
+                    "poetry.lock".to_string(),
+                    "uv.lock".to_string(),
+                    "requirements.txt".to_string(),
+                    "setup.py".to_string(),
+                    "setup.cfg".to_string(),
+                ],
+                env_vars: vec!["PYTHONPATH".to_string()],
+            };
+        }
+
         let mut inputs = super::CacheInputs {
             source_globs: vec!["src/**/*.py".to_string(), "**/*.py".to_string()],
             config_files: vec![

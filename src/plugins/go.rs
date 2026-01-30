@@ -235,7 +235,17 @@ impl LanguagePlugin for GoPlugin {
         Some(format!("{}{}", base_command, test_dirs.join(" ")))
     }
 
-    fn cache_inputs(&self, _target_name: &str) -> super::CacheInputs {
+    fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        // deps target only cares about dependency specification files,
+        // not source code — source changes shouldn't re-download modules
+        if target_name == "deps" {
+            return super::CacheInputs {
+                source_globs: vec![],
+                config_files: vec!["go.mod".to_string(), "go.sum".to_string()],
+                env_vars: vec!["GOOS".to_string(), "GOARCH".to_string()],
+            };
+        }
+
         // Go test files (*_test.go) are already included by **/*.go
         super::CacheInputs {
             source_globs: vec!["**/*.go".to_string()],

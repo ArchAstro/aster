@@ -202,6 +202,16 @@ impl LanguagePlugin for ElixirPlugin {
     }
 
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        // deps target only cares about dependency specification files,
+        // not source code — source changes shouldn't re-fetch dependencies
+        if target_name == "deps" {
+            return super::CacheInputs {
+                source_globs: vec![],
+                config_files: vec!["mix.exs".to_string(), "mix.lock".to_string()],
+                env_vars: vec!["MIX_ENV".to_string()],
+            };
+        }
+
         let mut inputs = super::CacheInputs {
             source_globs: vec!["lib/**/*.ex".to_string(), "lib/**/*.exs".to_string()],
             config_files: vec![

@@ -210,6 +210,16 @@ impl LanguagePlugin for RustPlugin {
     }
 
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
+        // deps target only cares about dependency specification files,
+        // not source code — source changes shouldn't re-fetch dependencies
+        if target_name == "deps" {
+            return super::CacheInputs {
+                source_globs: vec![],
+                config_files: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
+                env_vars: vec![],
+            };
+        }
+
         let mut inputs = super::CacheInputs {
             source_globs: vec!["src/**/*.rs".to_string(), "build.rs".to_string()],
             config_files: vec![
