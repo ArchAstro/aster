@@ -29,13 +29,28 @@ pub struct AsterToml {
     pub targets: HashMap<String, TargetConfig>,
 }
 
-/// Target configuration - supports both simple command string and rich format
+/// Alias target configuration - references another target in the same project
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AliasTargetConfig {
+    /// The target name to alias (bare name or //self:name)
+    pub alias: String,
+
+    /// Additional dependencies appended to the aliased target's deps
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// Target configuration - supports simple command string, alias, and rich format
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TargetConfig {
     /// Simple format: just a command string
     /// e.g., `lint = "npm run lint"`
     Simple(String),
+
+    /// Alias format: references another target in the same project
+    /// e.g., `check = { alias = "test" }`
+    Alias(AliasTargetConfig),
 
     /// Rich format with full configuration
     /// e.g., `[targets.test]` with command, depends_on, etc.
@@ -91,59 +106,74 @@ pub struct RichTargetConfig {
 }
 
 impl TargetConfig {
-    /// Get the command string
+    /// Get the command string (empty for alias — resolved later)
     pub fn command(&self) -> &str {
         match self {
             TargetConfig::Simple(cmd) => cmd,
+            TargetConfig::Alias(_) => "",
             TargetConfig::Rich(rich) => &rich.command,
         }
     }
 
-    /// Get depends_on (empty for simple format)
+    /// Get depends_on (empty for simple/alias format — alias deps resolved later)
     pub fn depends_on(&self) -> &[String] {
         match self {
             TargetConfig::Simple(_) => &[],
+            TargetConfig::Alias(alias) => &alias.depends_on,
             TargetConfig::Rich(rich) => &rich.depends_on,
         }
     }
 
-    /// Get capabilities (empty for simple format)
+    /// Get capabilities (empty for simple/alias format)
     pub fn capabilities(&self) -> &[String] {
         match self {
-            TargetConfig::Simple(_) => &[],
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => &[],
             TargetConfig::Rich(rich) => &rich.capabilities,
         }
     }
 
-    /// Get files_glob (None for simple format)
+    /// Get files_glob (None for simple/alias format)
     pub fn files_glob(&self) -> Option<&str> {
         match self {
-            TargetConfig::Simple(_) => None,
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => None,
             TargetConfig::Rich(rich) => rich.files_glob.as_deref(),
         }
     }
 
-    /// Get stream flag (false for simple format)
+    /// Get stream flag (false for simple/alias format)
     pub fn stream(&self) -> bool {
         match self {
-            TargetConfig::Simple(_) => false,
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => false,
             TargetConfig::Rich(rich) => rich.stream,
         }
     }
 
-    /// Get cache configuration (None for simple format)
+    /// Get cache configuration (None for simple/alias format)
     pub fn cache(&self) -> Option<&CacheConfig> {
         match self {
-            TargetConfig::Simple(_) => None,
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => None,
             TargetConfig::Rich(rich) => rich.cache.as_ref(),
         }
     }
 
-    /// Get invalidates_cache flag (false for simple format)
+    /// Get invalidates_cache flag (false for simple/alias format)
     pub fn invalidates_cache(&self) -> bool {
         match self {
-            TargetConfig::Simple(_) => false,
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => false,
             TargetConfig::Rich(rich) => rich.invalidates_cache,
+        }
+    }
+
+    /// Check if this is an alias target
+    pub fn is_alias(&self) -> bool {
+        matches!(self, TargetConfig::Alias(_))
+    }
+
+    /// Get the alias target name, if this is an alias
+    pub fn alias_target(&self) -> Option<&str> {
+        match self {
+            TargetConfig::Alias(alias) => Some(&alias.alias),
+            _ => None,
         }
     }
 }
@@ -369,6 +399,71 @@ command = "pytest"
         let test = config.targets.get("test").unwrap();
         assert_eq!(test.command(), "pytest");
         assert!(!test.stream());
+    }
+
+    #[test]
+    fn test_parse_alias_bare_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets]
+check = { alias = "test" }
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let check = config.targets.get("check").unwrap();
+        assert!(check.is_alias());
+        assert_eq!(check.alias_target(), Some("test"));
+        assert!(check.depends_on().is_empty());
+        // Alias returns defaults for other accessors
+        assert_eq!(check.command(), "");
+    }
+
+    #[test]
+    fn test_parse_alias_with_self_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets]
+check = { alias = "//self:test" }
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let check = config.targets.get("check").unwrap();
+        assert!(check.is_alias());
+        assert_eq!(check.alias_target(), Some("//self:test"));
+    }
+
+    #[test]
+    fn test_parse_alias_with_extra_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.ci]
+alias = "test"
+depends_on = ["//self:lint", "//self:typecheck"]
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let ci = config.targets.get("ci").unwrap();
+        assert!(ci.is_alias());
+        assert_eq!(ci.alias_target(), Some("test"));
+        assert_eq!(ci.depends_on(), &["//self:lint", "//self:typecheck"]);
     }
 
     #[test]

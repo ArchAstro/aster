@@ -127,6 +127,15 @@ depends_on = ["//self:build", "//libs/core:build"]
 command = "npm test -- {files}"
 files_glob = "**/*.test.ts"
 capabilities = ["FilesList"]
+
+# Alias another target (clones command, deps, capabilities, etc.)
+[targets]
+check = { alias = "test" }
+
+# Alias with additional dependencies
+[targets.ci]
+alias = "test"
+depends_on = ["//self:lint", "//self:typecheck"]
 ```
 
 Generate a starter config:

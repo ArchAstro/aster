@@ -54,12 +54,11 @@ impl TargetResolver {
             );
         }
 
-        // Custom targets override or add to detected targets
+        // First pass: process Simple and Rich custom targets
         for (name, config) in custom_targets {
-            let existing = targets.get(name);
-
             match config {
                 TargetConfig::Simple(command) => {
+                    let existing = targets.get(name);
                     // Simple format: override command, preserve existing depends_on/capabilities
                     if let Some(existing) = existing {
                         targets.insert(
@@ -93,6 +92,7 @@ impl TargetResolver {
                     }
                 }
                 TargetConfig::Rich(rich) => {
+                    let existing = targets.get(name);
                     // Rich format: use all specified fields, fall back to existing for unspecified
                     let depends_on = if rich.depends_on.is_empty() {
                         existing.map(|e| e.depends_on.clone()).unwrap_or_default()
@@ -138,6 +138,50 @@ impl TargetResolver {
                             invalidates_cache,
                             working_dir,
                         },
+                    );
+                }
+                TargetConfig::Alias(_) => {
+                    // Handled in second pass
+                }
+            }
+        }
+
+        // Second pass: resolve alias targets by cloning from already-resolved targets
+        for (name, config) in custom_targets {
+            if let TargetConfig::Alias(alias_config) = config {
+                // Resolve the alias reference: strip //self: prefix if present
+                let aliased_name = alias_config
+                    .alias
+                    .strip_prefix("//self:")
+                    .unwrap_or(&alias_config.alias);
+
+                if let Some(source_target) = targets.get(aliased_name).cloned() {
+                    // Clone the source target and append extra depends_on
+                    let mut depends_on = source_target.depends_on.clone();
+                    if !alias_config.depends_on.is_empty() {
+                        let extra_deps = Self::resolve_self_references(
+                            &alias_config.depends_on,
+                            project_address,
+                        );
+                        depends_on.extend(extra_deps);
+                    }
+
+                    targets.insert(
+                        name.clone(),
+                        Target {
+                            command: source_target.command,
+                            depends_on,
+                            capabilities: source_target.capabilities,
+                            files_glob: source_target.files_glob,
+                            stream: source_target.stream,
+                            cache: source_target.cache,
+                            invalidates_cache: source_target.invalidates_cache,
+                            working_dir: source_target.working_dir,
+                        },
+                    );
+                } else {
+                    eprintln!(
+                        "Warning: alias target '{name}' references non-existent target '{aliased_name}', skipping"
                     );
                 }
             }
@@ -441,6 +485,105 @@ mod tests {
             .capabilities
             .contains(&TargetCapability::FilesList));
         assert_eq!(integration_target.files_glob, Some("*_test.go".to_string()));
+    }
+
+    fn alias(alias_name: &str, depends_on: Vec<&str>) -> TargetConfig {
+        TargetConfig::Alias(crate::config::AliasTargetConfig {
+            alias: alias_name.to_string(),
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    #[test]
+    fn test_alias_clones_target() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
+
+        let mut custom = HashMap::new();
+        custom.insert("check".to_string(), alias("test", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
+
+        let check = targets.get("check").unwrap();
+        assert_eq!(check.command, "npm test");
+        assert_eq!(check.depends_on, vec!["//apps/web:deps".to_string()]);
+    }
+
+    #[test]
+    fn test_alias_with_self_prefix() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("pytest", vec![]));
+
+        let mut custom = HashMap::new();
+        custom.insert("check".to_string(), alias("//self:test", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let check = targets.get("check").unwrap();
+        assert_eq!(check.command, "pytest");
+    }
+
+    #[test]
+    fn test_alias_with_extra_deps() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("npm test", vec!["//self:deps"]));
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "ci".to_string(),
+            alias("test", vec!["//self:lint", "//self:typecheck"]),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
+
+        let ci = targets.get("ci").unwrap();
+        assert_eq!(ci.command, "npm test");
+        assert_eq!(
+            ci.depends_on,
+            vec![
+                "//apps/web:deps".to_string(),
+                "//apps/web:lint".to_string(),
+                "//apps/web:typecheck".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alias_of_nonexistent_target_skipped() {
+        let detected = HashMap::new();
+
+        let mut custom = HashMap::new();
+        custom.insert("check".to_string(), alias("nonexistent", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
+
+        // Alias to non-existent target should be silently skipped
+        assert!(targets.get("check").is_none());
+    }
+
+    #[test]
+    fn test_alias_of_custom_rich_target() {
+        let detected = HashMap::new();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "test".to_string(),
+            rich(
+                "pytest {files}",
+                vec!["//self:deps"],
+                vec!["files_list"],
+                Some("*_test.py"),
+            ),
+        );
+        custom.insert("check".to_string(), alias("test", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let check = targets.get("check").unwrap();
+        assert_eq!(check.command, "pytest {files}");
+        assert_eq!(check.depends_on, vec!["//apps/api:deps".to_string()]);
+        assert!(check.capabilities.contains(&TargetCapability::FilesList));
+        assert_eq!(check.files_glob, Some("*_test.py".to_string()));
     }
 
     #[test]
