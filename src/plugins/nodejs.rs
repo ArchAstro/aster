@@ -18,6 +18,26 @@ struct PackageJson {
     #[serde(rename = "devDependencies")]
     dev_dependencies: Option<HashMap<String, String>>,
     scripts: Option<HashMap<String, String>>,
+    workspaces: Option<WorkspacesConfig>,
+}
+
+/// npm workspaces can be either an array of glob patterns or an object with a `packages` field
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkspacesConfig {
+    /// Simple array: `"workspaces": ["packages/*"]`
+    Patterns(Vec<String>),
+    /// Object form: `"workspaces": { "packages": ["packages/*"] }`
+    Object { packages: Vec<String> },
+}
+
+impl WorkspacesConfig {
+    fn patterns(&self) -> &[String] {
+        match self {
+            WorkspacesConfig::Patterns(p) => p,
+            WorkspacesConfig::Object { packages } => packages,
+        }
+    }
 }
 
 /// Node.js plugin for discovering and parsing npm/yarn/pnpm projects
@@ -88,33 +108,46 @@ impl LanguagePlugin for NodeJsPlugin {
 
         let mut targets = HashMap::new();
 
-        // Always add deps target for npm install (no cross-project dependencies)
-        targets.insert(
-            "deps".to_string(),
-            Target {
-                command: "npm install".to_string(),
-                depends_on: vec![],
-                capabilities: HashSet::new(),
-                files_glob: None,
-                stream: false,
-                cache: None,
-                invalidates_cache: false,
-                working_dir: None,
-            },
-        );
+        // Check if this project is a member of an npm workspace.
+        // Workspace members share a single node_modules/ at the workspace root,
+        // so we skip the per-package deps target entirely and point all dependency
+        // references directly at the workspace root's deps target.
+        let workspace_root_addr = find_npm_workspace_root(ctx);
+
+        // The deps reference that other targets in this project should depend on.
+        let deps_ref = if let Some(ref ws_addr) = workspace_root_addr {
+            // Workspace member: depend directly on the workspace root's deps
+            format!("{ws_addr}:deps")
+        } else {
+            // Standalone project or workspace root: run npm install as //self:deps
+            targets.insert(
+                "deps".to_string(),
+                Target {
+                    command: "npm install".to_string(),
+                    depends_on: vec![],
+                    capabilities: HashSet::new(),
+                    files_glob: None,
+                    stream: false,
+                    cache: None,
+                    invalidates_cache: false,
+                    working_dir: None,
+                },
+            );
+            "//self:deps".to_string()
+        };
 
         // Resolve dependency paths to project addresses
         let dependency_addresses = resolve_dependency_addresses(ctx);
 
         // Build dependencies for non-deps targets:
-        // - //self:deps (install our own dependencies first)
+        // - deps_ref (install dependencies first — either our own or workspace root's)
         // - :build for each project dependency (they must be built first)
-        let mut base_deps = vec!["//self:deps".to_string()];
+        let mut base_deps = vec![deps_ref.clone()];
         for dep_addr in &dependency_addresses {
             base_deps.push(format!("{dep_addr}:build"));
         }
 
-        let format_deps = vec!["//self:deps".to_string(), "//self:build".to_string()];
+        let format_deps = vec![deps_ref.clone(), "//self:build".to_string()];
 
         if let Some(scripts) = pkg.scripts {
             // Track scripts to skip entirely (e.g., npm placeholder scripts)
@@ -362,6 +395,84 @@ impl LanguagePlugin for NodeJsPlugin {
             working_dir: None,
         })
     }
+}
+
+/// Detect if this project is a member of an npm workspace.
+///
+/// Walks up from `project_dir` toward `workspace_root` looking for a parent
+/// `package.json` with a `workspaces` field whose glob patterns include this project.
+///
+/// Returns the aster project address of the npm workspace root (e.g., `//src/ts/native-templates`)
+/// if this project is a workspace member, or None if it's standalone.
+fn find_npm_workspace_root(ctx: &TargetContext) -> Option<String> {
+    let project_dir = ctx.project_dir;
+
+    // Walk up from project_dir, stopping before workspace_root
+    let mut candidate = project_dir.parent()?;
+    while candidate.starts_with(ctx.workspace_root) && candidate != ctx.workspace_root {
+        let parent_pkg = candidate.join("package.json");
+        if parent_pkg.exists() {
+            if let Ok(content) = std::fs::read_to_string(&parent_pkg) {
+                if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                    if let Some(ref ws) = pkg.workspaces {
+                        // Check if our project matches one of the workspace patterns
+                        let relative = project_dir.strip_prefix(candidate).ok()?;
+                        let relative_str = relative.to_string_lossy();
+
+                        for pattern in ws.patterns() {
+                            if matches_workspace_pattern(pattern, &relative_str) {
+                                // Return aster address of the npm workspace root
+                                let ws_relative =
+                                    candidate.strip_prefix(ctx.workspace_root).ok()?;
+                                return Some(format!("//{}", ws_relative.display()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        candidate = candidate.parent()?;
+    }
+
+    // Also check the workspace root itself
+    let root_pkg = ctx.workspace_root.join("package.json");
+    if root_pkg.exists() && ctx.project_dir != ctx.workspace_root {
+        if let Ok(content) = std::fs::read_to_string(&root_pkg) {
+            if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                if let Some(ref ws) = pkg.workspaces {
+                    let relative = project_dir.strip_prefix(ctx.workspace_root).ok()?;
+                    let relative_str = relative.to_string_lossy();
+
+                    for pattern in ws.patterns() {
+                        if matches_workspace_pattern(pattern, &relative_str) {
+                            // Workspace root is at the aster workspace root
+                            return Some("//".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a relative path matches an npm workspace glob pattern.
+///
+/// npm workspace patterns use simple globs: `packages/*`, `apps/*`, or exact paths.
+/// `*` matches a single directory segment (not recursive).
+fn matches_workspace_pattern(pattern: &str, relative_path: &str) -> bool {
+    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+    let path_parts: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if pattern_parts.len() != path_parts.len() {
+        return false;
+    }
+
+    pattern_parts
+        .iter()
+        .zip(path_parts.iter())
+        .all(|(pat, path)| *pat == "*" || *pat == *path)
 }
 
 /// Resolve LocalDependency paths to project addresses
@@ -977,5 +1088,190 @@ mod tests {
         let clean = targets.get("clean").unwrap();
         assert!(clean.command.contains("node_modules"));
         assert!(clean.command.contains(".next"));
+    }
+
+    #[test]
+    fn test_matches_workspace_pattern_glob() {
+        assert!(matches_workspace_pattern("packages/*", "packages/core"));
+        assert!(matches_workspace_pattern("packages/*", "packages/react"));
+        assert!(!matches_workspace_pattern("packages/*", "apps/web"));
+        assert!(!matches_workspace_pattern(
+            "packages/*",
+            "packages/deep/nested"
+        ));
+    }
+
+    #[test]
+    fn test_matches_workspace_pattern_exact() {
+        assert!(matches_workspace_pattern(
+            "apps/storybook-react",
+            "apps/storybook-react"
+        ));
+        assert!(!matches_workspace_pattern(
+            "apps/storybook-react",
+            "apps/web"
+        ));
+    }
+
+    #[test]
+    fn test_workspace_member_has_no_deps_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root with workspaces field
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member
+        let member_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_pkg = member_dir.join("package.json");
+        std::fs::write(
+            &member_pkg,
+            r#"{"name": "@scope/core", "scripts": {"build": "tsc", "test": "vitest"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&member_pkg, &workspace_root, &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // No deps target — workspace root handles installation
+        assert!(targets.get("deps").is_none());
+
+        // Other targets depend directly on the workspace root's deps
+        let build = targets.get("build").unwrap();
+        assert!(build.depends_on.contains(&"//:deps".to_string()));
+        let test = targets.get("test").unwrap();
+        assert!(test.depends_on.contains(&"//:deps".to_string()));
+    }
+
+    #[test]
+    fn test_workspace_root_runs_npm_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root
+        let pkg_json = workspace_root.join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "monorepo", "workspaces": ["packages/*"], "scripts": {"build": "npm run build --workspaces"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, &workspace_root, &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Workspace root itself should run npm install directly
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.command, "npm install");
+        assert!(deps.depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_member_nested_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aster_root = tmp.path().canonicalize().unwrap();
+
+        // npm workspace root is nested under aster workspace root
+        let npm_root = aster_root.join("src/ts/native-templates");
+        std::fs::create_dir_all(&npm_root).unwrap();
+        std::fs::write(
+            npm_root.join("package.json"),
+            r#"{"name": "native-templates", "workspaces": ["packages/*", "apps/storybook-react"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member
+        let member_dir = npm_root.join("packages/react");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_pkg = member_dir.join("package.json");
+        std::fs::write(
+            &member_pkg,
+            r#"{"name": "@scope/react", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&member_pkg, &aster_root, &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // No deps target on the member
+        assert!(targets.get("deps").is_none());
+
+        // build depends directly on the nested npm workspace root's deps
+        let build = targets.get("build").unwrap();
+        assert!(build
+            .depends_on
+            .contains(&"//src/ts/native-templates:deps".to_string()));
+    }
+
+    #[test]
+    fn test_non_workspace_member_not_affected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root with specific patterns
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create a project NOT matching workspace patterns
+        let standalone_dir = workspace_root.join("tools/cli");
+        std::fs::create_dir_all(&standalone_dir).unwrap();
+        let standalone_pkg = standalone_dir.join("package.json");
+        std::fs::write(
+            &standalone_pkg,
+            r#"{"name": "cli-tool", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&standalone_pkg, &workspace_root, &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Should run its own npm install since it's not a workspace member
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.command, "npm install");
+        assert!(deps.depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_object_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // npm also supports object form: { "packages": [...] }
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": {"packages": ["packages/*"]}}"#,
+        )
+        .unwrap();
+
+        let member_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_pkg = member_dir.join("package.json");
+        std::fs::write(
+            &member_pkg,
+            r#"{"name": "@scope/core", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&member_pkg, &workspace_root, &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // No deps target on the member
+        assert!(targets.get("deps").is_none());
+
+        // build depends directly on workspace root's deps
+        let build = targets.get("build").unwrap();
+        assert!(build.depends_on.contains(&"//:deps".to_string()));
     }
 }
