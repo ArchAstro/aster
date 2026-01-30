@@ -43,7 +43,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let output_mode = cli.output_mode();
     let full_logs = cli.full_logs();
 
@@ -867,13 +867,32 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Commands::Target(args) => {
+        Commands::Target(ref args) => {
             // Parse external subcommand args
-            let run_args = parse_run_args(args);
+            let run_args = parse_run_args(args.clone());
 
             if run_args.target.is_empty() {
                 return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));
             }
+
+            // Apply global flags that clap couldn't parse from external subcommands
+            if run_args.no_cache {
+                cli.no_cache = true;
+            }
+            if run_args.verbose {
+                cli.verbose = true;
+            }
+            if run_args.quiet {
+                cli.quiet = true;
+            }
+            if run_args.json {
+                cli.json = true;
+            }
+            if run_args.full_logs {
+                cli.full_logs = true;
+            }
+            let output_mode = cli.output_mode();
+            let full_logs = cli.full_logs();
 
             // Check for reserved command conflicts
             if let Some(err_msg) = check_reserved_target(&run_args.target) {
