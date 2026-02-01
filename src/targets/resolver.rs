@@ -50,6 +50,7 @@ impl TargetResolver {
                     cache: target.cache.clone(),
                     invalidates_cache: target.invalidates_cache,
                     working_dir: target.working_dir.clone(),
+                    exclusive_resources: target.exclusive_resources.clone(),
                 },
             );
         }
@@ -72,6 +73,7 @@ impl TargetResolver {
                                 cache: existing.cache.clone(),
                                 invalidates_cache: existing.invalidates_cache,
                                 working_dir: existing.working_dir.clone(),
+                                exclusive_resources: existing.exclusive_resources.clone(),
                             },
                         );
                     } else {
@@ -87,6 +89,7 @@ impl TargetResolver {
                                 cache: None,
                                 invalidates_cache: false,
                                 working_dir: None,
+                                exclusive_resources: vec![],
                             },
                         );
                     }
@@ -126,6 +129,15 @@ impl TargetResolver {
                     // working_dir preserved from existing (not configurable via aster.toml)
                     let working_dir = existing.and_then(|e| e.working_dir.clone());
 
+                    // exclusive_resources: config value if non-empty, else fall back to detected
+                    let exclusive_resources = if !rich.exclusive_resources.is_empty() {
+                        rich.exclusive_resources.clone()
+                    } else {
+                        existing
+                            .map(|e| e.exclusive_resources.clone())
+                            .unwrap_or_default()
+                    };
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -137,6 +149,7 @@ impl TargetResolver {
                             cache,
                             invalidates_cache,
                             working_dir,
+                            exclusive_resources,
                         },
                     );
                 }
@@ -177,6 +190,7 @@ impl TargetResolver {
                             cache: source_target.cache,
                             invalidates_cache: source_target.invalidates_cache,
                             working_dir: source_target.working_dir,
+                            exclusive_resources: source_target.exclusive_resources,
                         },
                     );
                 } else {
@@ -229,6 +243,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             working_dir: None,
+            exclusive_resources: vec![],
         }
     }
 
@@ -250,6 +265,7 @@ mod tests {
             stream: false,
             cache: None,
             invalidates_cache: false,
+            exclusive_resources: vec![],
         })
     }
 
@@ -584,6 +600,100 @@ mod tests {
         assert_eq!(check.depends_on, vec!["//apps/api:deps".to_string()]);
         assert!(check.capabilities.contains(&TargetCapability::FilesList));
         assert_eq!(check.files_glob, Some("*_test.py".to_string()));
+    }
+
+    #[test]
+    fn test_exclusive_resources_preserved_from_detected() {
+        let mut detected = HashMap::new();
+        let mut deps_target = target("mix deps.get", vec![]);
+        deps_target.exclusive_resources = vec!["hex_registry".to_string()];
+        detected.insert("deps".to_string(), deps_target);
+
+        let targets = TargetResolver::resolve(&detected, &HashMap::new(), "//apps/api");
+
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.exclusive_resources, vec!["hex_registry".to_string()]);
+    }
+
+    #[test]
+    fn test_exclusive_resources_preserved_through_simple_override() {
+        let mut detected = HashMap::new();
+        let mut deps_target = target("mix deps.get", vec![]);
+        deps_target.exclusive_resources = vec!["hex_registry".to_string()];
+        detected.insert("deps".to_string(), deps_target);
+
+        let mut custom = HashMap::new();
+        custom.insert("deps".to_string(), simple("mix deps.get --force"));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.command, "mix deps.get --force");
+        // exclusive_resources should be preserved from detected target
+        assert_eq!(deps.exclusive_resources, vec!["hex_registry".to_string()]);
+    }
+
+    #[test]
+    fn test_exclusive_resources_rich_override() {
+        let mut detected = HashMap::new();
+        let mut deps_target = target("mix deps.get", vec![]);
+        deps_target.exclusive_resources = vec!["hex_registry".to_string()];
+        detected.insert("deps".to_string(), deps_target);
+
+        let mut custom = HashMap::new();
+        let rich_config = RichTargetConfig {
+            command: "mix deps.get --force".to_string(),
+            depends_on: vec![],
+            capabilities: vec![],
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            exclusive_resources: vec!["custom_resource".to_string()],
+        };
+        custom.insert("deps".to_string(), TargetConfig::Rich(rich_config));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let deps = targets.get("deps").unwrap();
+        // Rich config's exclusive_resources should take precedence
+        assert_eq!(deps.exclusive_resources, vec!["custom_resource".to_string()]);
+    }
+
+    #[test]
+    fn test_exclusive_resources_rich_fallback_to_detected() {
+        let mut detected = HashMap::new();
+        let mut deps_target = target("mix deps.get", vec![]);
+        deps_target.exclusive_resources = vec!["hex_registry".to_string()];
+        detected.insert("deps".to_string(), deps_target);
+
+        let mut custom = HashMap::new();
+        // Rich config with empty exclusive_resources should fall back to detected
+        custom.insert(
+            "deps".to_string(),
+            rich("mix deps.get --force", vec![], vec![], None),
+        );
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.exclusive_resources, vec!["hex_registry".to_string()]);
+    }
+
+    #[test]
+    fn test_exclusive_resources_alias_clones_from_source() {
+        let mut detected = HashMap::new();
+        let mut deps_target = target("mix deps.get", vec![]);
+        deps_target.exclusive_resources = vec!["hex_registry".to_string()];
+        detected.insert("deps".to_string(), deps_target);
+
+        let mut custom = HashMap::new();
+        custom.insert("install".to_string(), alias("deps", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let install = targets.get("install").unwrap();
+        assert_eq!(install.exclusive_resources, vec!["hex_registry".to_string()]);
     }
 
     #[test]

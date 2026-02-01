@@ -1167,6 +1167,28 @@ fn execute_heterogeneous(
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
 
+        // Build per-resource mutexes for exclusive access within this level
+        let resource_mutexes: std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>> = {
+            let mut resources = std::collections::HashSet::new();
+            for addr in level {
+                if let Some(colon_pos) = addr.rfind(':') {
+                    let pa = &addr[..colon_pos];
+                    let tn = &addr[colon_pos + 1..];
+                    if let Some(p) = project_map.get(pa) {
+                        if let Some(t) = p.targets.get(tn) {
+                            for r in &t.exclusive_resources {
+                                resources.insert(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            resources
+                .into_iter()
+                .map(|r| (r, std::sync::Arc::new(std::sync::Mutex::new(()))))
+                .collect()
+        };
+
         for target_addr in level {
             // Parse target address
             let colon_pos = match target_addr.rfind(':') {
@@ -1208,8 +1230,27 @@ fn execute_heterogeneous(
             let addr = target_addr.clone();
             let project_root = project.root.clone();
             let tx_clone = tx.clone();
+            // Collect per-resource mutexes this target needs to acquire
+            let target_resource_locks: Vec<std::sync::Arc<std::sync::Mutex<()>>> = {
+                let mut res_names: Vec<&String> = project
+                    .targets
+                    .get(target_name)
+                    .map(|t| t.exclusive_resources.iter().collect())
+                    .unwrap_or_default();
+                res_names.sort();
+                res_names
+                    .iter()
+                    .filter_map(|name| resource_mutexes.get(*name).map(std::sync::Arc::clone))
+                    .collect()
+            };
 
             let handle = thread::spawn(move || {
+                // Acquire exclusive resource locks (sorted to prevent deadlocks)
+                let _resource_guards: Vec<_> = target_resource_locks
+                    .iter()
+                    .map(|m| m.lock().unwrap())
+                    .collect();
+
                 let start = Instant::now();
                 let parts: Vec<&str> = command.split_whitespace().collect();
 

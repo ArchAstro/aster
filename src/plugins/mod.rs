@@ -68,6 +68,10 @@ pub struct Target {
     /// Override working directory for this target (absolute path)
     /// If None, uses the project's root directory
     pub working_dir: Option<PathBuf>,
+    /// Named resources that require exclusive access within a DAG level.
+    /// Targets sharing a resource are serialized via per-resource mutexes
+    /// while non-contending targets still run in parallel.
+    pub exclusive_resources: Vec<String>,
 }
 
 /// Context passed to plugins for target detection

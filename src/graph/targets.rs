@@ -242,6 +242,7 @@ mod tests {
                             cache: None,
                             invalidates_cache: false,
                             working_dir: None,
+                            exclusive_resources: vec![],
                         },
                     )
                 })

@@ -131,6 +131,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
+                    exclusive_resources: vec!["npm_cache".into()],
                 },
             );
             "//self:deps".to_string()
@@ -175,6 +176,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             cache: None,
                             invalidates_cache: false,
                             working_dir: None,
+                            exclusive_resources: vec![],
                         },
                     );
                 }
@@ -191,6 +193,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         cache: None,
                         invalidates_cache: false,
                         working_dir: None,
+                        exclusive_resources: vec![],
                     },
                 );
             }
@@ -206,6 +209,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         cache: None,
                         invalidates_cache: false,
                         working_dir: None,
+                        exclusive_resources: vec![],
                     },
                 );
             }
@@ -221,6 +225,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         cache: None,
                         invalidates_cache: false,
                         working_dir: None,
+                        exclusive_resources: vec![],
                     },
                 );
             }
@@ -240,6 +245,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             cache: None,
                             invalidates_cache: false,
                             working_dir: None,
+                            exclusive_resources: vec![],
                         },
                     );
                 }
@@ -277,6 +283,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         cache: None,
                         invalidates_cache: false,
                         working_dir: None,
+                        exclusive_resources: vec![],
                     },
                 );
             }
@@ -408,6 +415,7 @@ impl LanguagePlugin for NodeJsPlugin {
             cache: None,
             invalidates_cache: true,
             working_dir: None,
+            exclusive_resources: vec![],
         })
     }
 }

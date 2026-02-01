@@ -352,6 +352,27 @@ impl<'a> Executor<'a> {
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
+        // Build per-resource mutexes for exclusive access within this level.
+        // Targets sharing a resource will serialize; others run in parallel.
+        let resource_mutexes: HashMap<String, Arc<Mutex<()>>> = {
+            let mut resources = HashSet::new();
+            for addr in target_addrs {
+                if let Some((pa, tn)) = parse_target_address(addr) {
+                    if let Some(p) = project_map.get(&pa) {
+                        if let Some(t) = p.targets.get(&tn) {
+                            for r in &t.exclusive_resources {
+                                resources.insert(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            resources
+                .into_iter()
+                .map(|r| (r, Arc::new(Mutex::new(()))))
+                .collect()
+        };
+
         let mut handles = Vec::new();
 
         for target_addr in target_addrs {
@@ -485,8 +506,28 @@ impl<'a> Executor<'a> {
                 .get(&target_name)
                 .map(|t| t.invalidates_cache)
                 .unwrap_or(false);
+            // Collect per-resource mutexes this target needs to acquire
+            let target_resource_locks: Vec<Arc<Mutex<()>>> = {
+                let mut res_names: Vec<&String> = project
+                    .targets
+                    .get(&target_name)
+                    .map(|t| t.exclusive_resources.iter().collect())
+                    .unwrap_or_default();
+                // Sort by resource name to prevent deadlocks
+                res_names.sort();
+                res_names
+                    .iter()
+                    .filter_map(|name| resource_mutexes.get(*name).map(Arc::clone))
+                    .collect()
+            };
 
             let handle = thread::spawn(move || {
+                // Acquire exclusive resource locks (sorted to prevent deadlocks)
+                let _resource_guards: Vec<_> = target_resource_locks
+                    .iter()
+                    .map(|m| m.lock().unwrap())
+                    .collect();
+
                 let result = run_command(&addr, &command_clone, &working_dir);
 
                 // Update cache if execution succeeded and caching is enabled
@@ -1008,6 +1049,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             working_dir: None,
+            exclusive_resources: vec![],
         }
     }
 
@@ -1176,6 +1218,193 @@ mod tests {
         assert!(levels[1].contains(&"//a:build".to_string()));
         assert!(levels[1].contains(&"//a:lint".to_string()));
         assert!(levels[2].contains(&"//a:test".to_string()));
+    }
+
+    /// Helper to create a Target with exclusive_resources
+    fn target_with_resources(
+        command: &str,
+        depends_on: Vec<&str>,
+        resources: Vec<&str>,
+    ) -> Target {
+        Target {
+            command: command.to_string(),
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+            capabilities: HashSet::new(),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: None,
+            exclusive_resources: resources.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_exclusive_resources_serializes_contending_targets() {
+        // Two targets sharing "hex_registry" resource should not run concurrently.
+        // We verify by having each target sleep briefly, then checking that total
+        // duration indicates serialization rather than parallelism.
+        let tmp = std::env::temp_dir().join("aster_test_exclusive");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // Use atomic counter to track max concurrent executions
+        // The commands will write to files; we check timing via duration
+        let mut targets_a = HashMap::new();
+        targets_a.insert(
+            "deps".to_string(),
+            target_with_resources("sleep 0.15", vec![], vec!["shared_cache"]),
+        );
+        let mut targets_b = HashMap::new();
+        targets_b.insert(
+            "deps".to_string(),
+            target_with_resources("sleep 0.15", vec![], vec!["shared_cache"]),
+        );
+
+        let project_a = DiscoveredProject {
+            root: tmp.clone(),
+            config_path: tmp.join("mix.exs"),
+            metadata: ProjectMetadata {
+                name: "a".to_string(),
+                version: Some("1.0.0".to_string()),
+            },
+            dependencies: vec![],
+            targets: targets_a,
+            plugin_name: "elixir".to_string(),
+            relative_path: PathBuf::from("a"),
+        };
+        let project_b = DiscoveredProject {
+            root: tmp.clone(),
+            config_path: tmp.join("mix.exs"),
+            metadata: ProjectMetadata {
+                name: "b".to_string(),
+                version: Some("1.0.0".to_string()),
+            },
+            dependencies: vec![],
+            targets: targets_b,
+            plugin_name: "elixir".to_string(),
+            relative_path: PathBuf::from("b"),
+        };
+
+        let projects = vec![project_a, project_b];
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let executor = Executor::new(&tmp);
+        let target_addrs = vec!["//a:deps".to_string(), "//b:deps".to_string()];
+        let mut progress = crate::ui::ProgressDisplay::new(false);
+        let computed_hashes = Arc::new(Mutex::new(HashMap::new()));
+        let env_snapshot = HashMap::new();
+        let plugin_registry = crate::plugins::PluginRegistry::with_all_plugins();
+
+        let start = Instant::now();
+        let results = executor.execute_target_level(
+            &target_addrs,
+            &project_map,
+            &mut progress,
+            false,
+            None,
+            None,
+            &plugin_registry,
+            &computed_hashes,
+            &env_snapshot,
+        );
+        let total_ms = start.elapsed().as_millis();
+
+        // Both targets should succeed
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(r.success, "Target {} should succeed", r.address);
+        }
+
+        // If serialized, total time >= 300ms (2 x 150ms).
+        // If parallel, total time would be ~150ms.
+        assert!(
+            total_ms >= 280,
+            "Contending targets should serialize (took {total_ms}ms, expected >= 280ms)"
+        );
+    }
+
+    #[test]
+    fn test_exclusive_resources_non_contending_run_parallel() {
+        // Two targets with DIFFERENT resources should run in parallel
+        let tmp = std::env::temp_dir().join("aster_test_exclusive_parallel");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let mut targets_a = HashMap::new();
+        targets_a.insert(
+            "deps".to_string(),
+            target_with_resources("sleep 0.15", vec![], vec!["resource_a"]),
+        );
+        let mut targets_b = HashMap::new();
+        targets_b.insert(
+            "deps".to_string(),
+            target_with_resources("sleep 0.15", vec![], vec!["resource_b"]),
+        );
+
+        let project_a = DiscoveredProject {
+            root: tmp.clone(),
+            config_path: tmp.join("mix.exs"),
+            metadata: ProjectMetadata {
+                name: "a".to_string(),
+                version: Some("1.0.0".to_string()),
+            },
+            dependencies: vec![],
+            targets: targets_a,
+            plugin_name: "elixir".to_string(),
+            relative_path: PathBuf::from("a"),
+        };
+        let project_b = DiscoveredProject {
+            root: tmp.clone(),
+            config_path: tmp.join("mix.exs"),
+            metadata: ProjectMetadata {
+                name: "b".to_string(),
+                version: Some("1.0.0".to_string()),
+            },
+            dependencies: vec![],
+            targets: targets_b,
+            plugin_name: "elixir".to_string(),
+            relative_path: PathBuf::from("b"),
+        };
+
+        let projects = vec![project_a, project_b];
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let executor = Executor::new(&tmp);
+        let target_addrs = vec!["//a:deps".to_string(), "//b:deps".to_string()];
+        let mut progress = crate::ui::ProgressDisplay::new(false);
+        let computed_hashes = Arc::new(Mutex::new(HashMap::new()));
+        let env_snapshot = HashMap::new();
+        let plugin_registry = crate::plugins::PluginRegistry::with_all_plugins();
+
+        let start = Instant::now();
+        let results = executor.execute_target_level(
+            &target_addrs,
+            &project_map,
+            &mut progress,
+            false,
+            None,
+            None,
+            &plugin_registry,
+            &computed_hashes,
+            &env_snapshot,
+        );
+        let total_ms = start.elapsed().as_millis();
+
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(r.success, "Target {} should succeed", r.address);
+        }
+
+        // Non-contending targets should run in parallel (~150ms, not ~300ms)
+        assert!(
+            total_ms < 280,
+            "Non-contending targets should run in parallel (took {total_ms}ms, expected < 280ms)"
+        );
     }
 
     #[test]

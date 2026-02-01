@@ -191,6 +191,7 @@ impl LanguagePlugin for PythonPlugin {
                 cache: None,
                 invalidates_cache: false,
                 working_dir: None,
+                exclusive_resources: vec!["pip_cache".into()],
             },
         );
 
@@ -224,6 +225,7 @@ impl LanguagePlugin for PythonPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
+                    exclusive_resources: vec![],
                 },
             );
         }
@@ -241,6 +243,7 @@ impl LanguagePlugin for PythonPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
+                    exclusive_resources: vec![],
                 },
             );
         }
@@ -259,6 +262,7 @@ impl LanguagePlugin for PythonPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
+                    exclusive_resources: vec![],
                 },
             );
         } else if content.contains("[tool.black]") {
@@ -273,6 +277,7 @@ impl LanguagePlugin for PythonPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
+                    exclusive_resources: vec![],
                 },
             );
         }
@@ -400,6 +405,7 @@ impl LanguagePlugin for PythonPlugin {
             cache: None,
             invalidates_cache: true,
             working_dir: None,
+            exclusive_resources: vec![],
         })
     }
 }

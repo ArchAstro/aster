@@ -103,6 +103,10 @@ pub struct RichTargetConfig {
     /// Invalidate all project cache entries after successful execution
     #[serde(default)]
     pub invalidates_cache: bool,
+
+    /// Named resources requiring exclusive access within a DAG level
+    #[serde(default)]
+    pub exclusive_resources: Vec<String>,
 }
 
 impl TargetConfig {
@@ -161,6 +165,14 @@ impl TargetConfig {
         match self {
             TargetConfig::Simple(_) | TargetConfig::Alias(_) => false,
             TargetConfig::Rich(rich) => rich.invalidates_cache,
+        }
+    }
+
+    /// Get exclusive_resources (empty for simple/alias format)
+    pub fn exclusive_resources(&self) -> &[String] {
+        match self {
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => &[],
+            TargetConfig::Rich(rich) => &rich.exclusive_resources,
         }
     }
 
@@ -511,6 +523,51 @@ depends_on = ["//self:lint", "//self:typecheck"]
         assert!(config.name.is_none());
         assert!(config.depends_on.is_empty());
         assert!(config.targets.is_empty());
+    }
+
+    #[test]
+    fn test_parse_exclusive_resources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.deps]
+command = "mix deps.get"
+exclusive_resources = ["hex_registry"]
+
+[targets.build]
+command = "mix compile"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let deps = config.targets.get("deps").unwrap();
+        assert_eq!(deps.exclusive_resources(), &["hex_registry"]);
+
+        let build = config.targets.get("build").unwrap();
+        assert!(build.exclusive_resources().is_empty());
+    }
+
+    #[test]
+    fn test_exclusive_resources_defaults_empty_for_simple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets]
+test = "npm test"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        let test = config.targets.get("test").unwrap();
+        assert!(test.exclusive_resources().is_empty());
     }
 
     #[test]
