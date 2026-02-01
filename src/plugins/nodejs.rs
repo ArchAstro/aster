@@ -62,6 +62,18 @@ impl LanguagePlugin for NodeJsPlugin {
         let name = pkg
             .name
             .filter(|n| !n.is_empty())
+            .or_else(|| {
+                // npm workspace roots often omit `name` (they're private and not published).
+                // Derive a name from the directory when workspaces field is present.
+                if pkg.workspaces.is_some() {
+                    config_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| anyhow!("Missing or empty 'name' field in {}", config_path.display()))?;
 
         Ok(ProjectMetadata {
@@ -625,6 +637,59 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pkg_json = tmp.path().join("package.json");
         std::fs::write(&pkg_json, r#"{"name": "", "version": "1.0.0"}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let result = plugin.parse_project(tmp.path(), &pkg_json);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing or empty"));
+    }
+
+    #[test]
+    fn test_parse_workspace_root_without_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("my-monorepo");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let pkg_json = ws_dir.join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"private": true, "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let metadata = plugin.parse_project(tmp.path(), &pkg_json).unwrap();
+
+        // Name derived from directory name
+        assert_eq!(metadata.name, "my-monorepo");
+        assert_eq!(metadata.version, None);
+    }
+
+    #[test]
+    fn test_parse_workspace_root_with_name_preferred() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("my-monorepo");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let pkg_json = ws_dir.join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "explicit-name", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let metadata = plugin.parse_project(tmp.path(), &pkg_json).unwrap();
+
+        // Explicit name takes priority over directory name
+        assert_eq!(metadata.name, "explicit-name");
+    }
+
+    #[test]
+    fn test_parse_empty_name_without_workspaces_still_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        // No name and no workspaces — should still fail
+        std::fs::write(&pkg_json, r#"{"private": true}"#).unwrap();
 
         let plugin = NodeJsPlugin;
         let result = plugin.parse_project(tmp.path(), &pkg_json);
