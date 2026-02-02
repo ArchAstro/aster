@@ -59,10 +59,19 @@ impl LanguagePlugin for NodeJsPlugin {
         let pkg: PackageJson = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
+        // Use the package name if present, otherwise fall back to the directory name.
+        // Private workspace roots (e.g. monorepo root package.json) commonly omit "name".
         let name = pkg
             .name
             .filter(|n| !n.is_empty())
-            .ok_or_else(|| anyhow!("Missing or empty 'name' field in {}", config_path.display()))?;
+            .or_else(|| {
+                config_path
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .ok_or_else(|| anyhow!("Cannot determine project name for {}", config_path.display()))?;
 
         Ok(ProjectMetadata {
             name,
@@ -775,29 +784,29 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_missing_name() {
+    fn test_parse_missing_name_falls_back_to_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let pkg_json = tmp.path().join("package.json");
         std::fs::write(&pkg_json, r#"{"version": "1.0.0"}"#).unwrap();
 
         let plugin = NodeJsPlugin;
-        let result = plugin.parse_project(tmp.path(), &pkg_json);
+        let result = plugin.parse_project(tmp.path(), &pkg_json).unwrap();
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Missing or empty"));
+        // Falls back to the directory name from tempdir
+        assert!(!result.name.is_empty());
     }
 
     #[test]
-    fn test_parse_empty_name() {
+    fn test_parse_empty_name_falls_back_to_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let pkg_json = tmp.path().join("package.json");
         std::fs::write(&pkg_json, r#"{"name": "", "version": "1.0.0"}"#).unwrap();
 
         let plugin = NodeJsPlugin;
-        let result = plugin.parse_project(tmp.path(), &pkg_json);
+        let result = plugin.parse_project(tmp.path(), &pkg_json).unwrap();
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Missing or empty"));
+        // Falls back to the directory name from tempdir
+        assert!(!result.name.is_empty());
     }
 
     #[test]
