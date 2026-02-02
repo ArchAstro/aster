@@ -657,7 +657,10 @@ mod tests {
 
         let deps = targets.get("deps").unwrap();
         // Rich config's exclusive_resources should take precedence
-        assert_eq!(deps.exclusive_resources, vec!["custom_resource".to_string()]);
+        assert_eq!(
+            deps.exclusive_resources,
+            vec!["custom_resource".to_string()]
+        );
     }
 
     #[test]
@@ -693,7 +696,10 @@ mod tests {
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
 
         let install = targets.get("install").unwrap();
-        assert_eq!(install.exclusive_resources, vec!["hex_registry".to_string()]);
+        assert_eq!(
+            install.exclusive_resources,
+            vec!["hex_registry".to_string()]
+        );
     }
 
     #[test]

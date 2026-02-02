@@ -1221,11 +1221,7 @@ mod tests {
     }
 
     /// Helper to create a Target with exclusive_resources
-    fn target_with_resources(
-        command: &str,
-        depends_on: Vec<&str>,
-        resources: Vec<&str>,
-    ) -> Target {
+    fn target_with_resources(command: &str, depends_on: Vec<&str>, resources: Vec<&str>) -> Target {
         Target {
             command: command.to_string(),
             depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),

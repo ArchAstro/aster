@@ -71,7 +71,12 @@ impl LanguagePlugin for NodeJsPlugin {
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string())
             })
-            .ok_or_else(|| anyhow!("Cannot determine project name for {}", config_path.display()))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Cannot determine project name for {}",
+                    config_path.display()
+                )
+            })?;
 
         Ok(ProjectMetadata {
             name,

@@ -1168,7 +1168,10 @@ fn execute_heterogeneous(
         let mut handles = Vec::new();
 
         // Build per-resource mutexes for exclusive access within this level
-        let resource_mutexes: std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>> = {
+        let resource_mutexes: std::collections::HashMap<
+            String,
+            std::sync::Arc<std::sync::Mutex<()>>,
+        > = {
             let mut resources = std::collections::HashSet::new();
             for addr in level {
                 if let Some(colon_pos) = addr.rfind(':') {
