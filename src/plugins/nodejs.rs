@@ -84,14 +84,40 @@ impl LanguagePlugin for NodeJsPlugin {
         let mut deps = Vec::new();
 
         // Extract file: dependencies from both dependencies and devDependencies
-        for dep_map in [pkg.dependencies, pkg.dev_dependencies]
+        for dep_map in [&pkg.dependencies, &pkg.dev_dependencies]
             .into_iter()
             .flatten()
         {
             for (name, version) in dep_map {
                 if let Some(path_str) = version.strip_prefix("file:") {
                     let path = project_dir.join(path_str);
-                    deps.push(LocalDependency { name, path });
+                    deps.push(LocalDependency {
+                        name: name.clone(),
+                        path,
+                    });
+                }
+            }
+        }
+
+        // Also detect workspace sibling dependencies by package name
+        let workspace_members = resolve_npm_workspace_members(config_path);
+        if !workspace_members.is_empty() {
+            for dep_map in [&pkg.dependencies, &pkg.dev_dependencies]
+                .into_iter()
+                .flatten()
+            {
+                for (name, version) in dep_map {
+                    // Skip file: deps (already handled above)
+                    if version.starts_with("file:") {
+                        continue;
+                    }
+                    // If this dep name matches a workspace sibling, add as local dep
+                    if let Some(member_path) = workspace_members.get(name) {
+                        deps.push(LocalDependency {
+                            name: name.clone(),
+                            path: member_path.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -417,6 +443,139 @@ impl LanguagePlugin for NodeJsPlugin {
             working_dir: None,
             exclusive_resources: vec![],
         })
+    }
+}
+
+/// Resolve all npm workspace members reachable from a package.json's location.
+///
+/// Walks up from `config_path` looking for a parent `package.json` with a `workspaces` field,
+/// then expands workspace glob patterns to build a map of package name → absolute filesystem path
+/// for every workspace member.
+///
+/// Returns an empty map if the package is not inside an npm workspace.
+fn resolve_npm_workspace_members(config_path: &Path) -> HashMap<String, PathBuf> {
+    let mut members = HashMap::new();
+
+    let project_dir = match config_path.parent() {
+        Some(d) => d,
+        None => return members,
+    };
+
+    // Walk up from project_dir looking for a parent package.json with workspaces
+    let mut candidate = project_dir.to_path_buf();
+    loop {
+        candidate = match candidate.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
+
+        let parent_pkg_path = candidate.join("package.json");
+        if !parent_pkg_path.exists() {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&parent_pkg_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let pkg: PackageJson = match serde_json::from_str(&content) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let ws = match pkg.workspaces {
+            Some(ref ws) => ws,
+            None => continue,
+        };
+
+        // Found a workspace root — expand patterns to discover members
+        for pattern in ws.patterns() {
+            expand_workspace_pattern(&candidate, pattern, &mut members);
+        }
+
+        // Only use the nearest workspace root
+        break;
+    }
+
+    members
+}
+
+/// Expand a single npm workspace glob pattern (e.g. "packages/*") relative to the workspace root,
+/// reading each matched directory's package.json to extract the package name.
+fn expand_workspace_pattern(
+    workspace_root: &Path,
+    pattern: &str,
+    members: &mut HashMap<String, PathBuf>,
+) {
+    // Split pattern into directory prefix and optional glob segment
+    // e.g. "packages/*" -> parent="packages", has glob
+    // e.g. "platform-sdk" -> exact path, no glob
+    let parts: Vec<&str> = pattern.split('/').collect();
+
+    // Find the first segment containing '*'
+    let glob_index = parts.iter().position(|p| p.contains('*'));
+
+    match glob_index {
+        Some(idx) => {
+            // Build the parent directory path from segments before the glob
+            let parent_dir: PathBuf = parts[..idx]
+                .iter()
+                .fold(workspace_root.to_path_buf(), |acc, seg| acc.join(seg));
+
+            let glob_segment = parts[idx];
+
+            // Read entries in the parent directory
+            let entries = match std::fs::read_dir(&parent_dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if !entry_path.is_dir() {
+                    continue;
+                }
+
+                let dir_name = match entry_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+
+                // Match against the glob segment (simple * matching)
+                if glob_segment == "*" || dir_name == glob_segment {
+                    // If there are more segments after the glob, we'd need recursion,
+                    // but npm workspace patterns are typically one level deep
+                    let member_dir = if idx + 1 < parts.len() {
+                        parts[idx + 1..]
+                            .iter()
+                            .fold(entry_path.clone(), |acc, seg| acc.join(seg))
+                    } else {
+                        entry_path.clone()
+                    };
+
+                    try_add_workspace_member(&member_dir, members);
+                }
+            }
+        }
+        None => {
+            // Exact path — no glob
+            let member_dir = workspace_root.join(pattern);
+            try_add_workspace_member(&member_dir, members);
+        }
+    }
+}
+
+/// Read a directory's package.json and add it to the workspace members map if it has a name.
+fn try_add_workspace_member(dir: &Path, members: &mut HashMap<String, PathBuf>) {
+    let pkg_path = dir.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(&pkg_path) {
+        if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+            if let Some(name) = pkg.name {
+                if !name.is_empty() {
+                    members.insert(name, dir.to_path_buf());
+                }
+            }
+        }
     }
 }
 
@@ -1296,5 +1455,246 @@ mod tests {
         // build depends directly on workspace root's deps
         let build = targets.get("build").unwrap();
         assert!(build.depends_on.contains(&"//:deps".to_string()));
+    }
+
+    #[test]
+    fn test_parse_workspace_sibling_deps_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/core
+        let core_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            r#"{"name": "@archastro/core", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/sdk that depends on core by name
+        let sdk_dir = workspace_root.join("packages/sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        let sdk_pkg = sdk_dir.join("package.json");
+        std::fs::write(
+            &sdk_pkg,
+            r#"{
+                "name": "@archastro/sdk",
+                "dependencies": {
+                    "@archastro/core": "^1.0.0",
+                    "lodash": "^4.17.21"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&sdk_pkg).unwrap();
+
+        // Should detect @archastro/core as a local dependency
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@archastro/core");
+        assert_eq!(deps[0].path, core_dir);
+    }
+
+    #[test]
+    fn test_parse_workspace_sibling_deps_in_dev_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/test-utils
+        let utils_dir = workspace_root.join("packages/test-utils");
+        std::fs::create_dir_all(&utils_dir).unwrap();
+        std::fs::write(
+            utils_dir.join("package.json"),
+            r#"{"name": "@archastro/test-utils", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/app with devDependency on test-utils
+        let app_dir = workspace_root.join("packages/app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_pkg = app_dir.join("package.json");
+        std::fs::write(
+            &app_pkg,
+            r#"{
+                "name": "@archastro/app",
+                "devDependencies": {
+                    "@archastro/test-utils": "^1.0.0",
+                    "typescript": "^5.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&app_pkg).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@archastro/test-utils");
+        assert_eq!(deps[0].path, utils_dir);
+    }
+
+    #[test]
+    fn test_parse_workspace_sibling_deps_not_duplicated_with_file_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/core
+        let core_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            r#"{"name": "@archastro/core", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create workspace member that uses file: prefix (already handled)
+        let sdk_dir = workspace_root.join("packages/sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        let sdk_pkg = sdk_dir.join("package.json");
+        std::fs::write(
+            &sdk_pkg,
+            r#"{
+                "name": "@archastro/sdk",
+                "dependencies": {
+                    "@archastro/core": "file:../core"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&sdk_pkg).unwrap();
+
+        // Should only have one dep (from file: prefix), not duplicated
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@archastro/core");
+        // The file: path is relative
+        assert_eq!(deps[0].path, sdk_dir.join("../core"));
+    }
+
+    #[test]
+    fn test_parse_workspace_sibling_deps_nested_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // npm workspace root is nested
+        let npm_root = root.join("src/ts/native-templates");
+        std::fs::create_dir_all(&npm_root).unwrap();
+        std::fs::write(
+            npm_root.join("package.json"),
+            r#"{"name": "native-templates", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/core
+        let core_dir = npm_root.join("packages/core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            r#"{"name": "@archastro/native-templates-core", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/react that depends on core
+        let react_dir = npm_root.join("packages/react");
+        std::fs::create_dir_all(&react_dir).unwrap();
+        let react_pkg = react_dir.join("package.json");
+        std::fs::write(
+            &react_pkg,
+            r#"{
+                "name": "@archastro/native-templates-react",
+                "dependencies": {
+                    "@archastro/native-templates-core": "^1.0.0",
+                    "react": "^18.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&react_pkg).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@archastro/native-templates-core");
+        assert_eq!(deps[0].path, core_dir);
+    }
+
+    #[test]
+    fn test_workspace_sibling_deps_end_to_end_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // Create npm workspace root (also the aster workspace root)
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/core
+        let core_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            r#"{"name": "@archastro/core", "version": "1.0.0", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        // Create workspace member: packages/sdk that depends on core by name
+        let sdk_dir = workspace_root.join("packages/sdk");
+        std::fs::create_dir_all(&sdk_dir).unwrap();
+        let sdk_pkg = sdk_dir.join("package.json");
+        std::fs::write(
+            &sdk_pkg,
+            r#"{
+                "name": "@archastro/sdk",
+                "scripts": {"build": "tsc"},
+                "dependencies": {
+                    "@archastro/core": "^1.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Parse dependencies for sdk
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&sdk_pkg).unwrap();
+
+        // Now detect targets with those dependencies
+        let ctx = TargetContext {
+            config_path: &sdk_pkg,
+            project_dir: &sdk_dir,
+            workspace_root: &workspace_root,
+            dependencies: &deps,
+        };
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // sdk:build should depend on core:build
+        let build = targets.get("build").unwrap();
+        assert!(build
+            .depends_on
+            .contains(&"//packages/core:build".to_string()));
     }
 }
