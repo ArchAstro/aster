@@ -1011,14 +1011,32 @@ fn run() -> Result<()> {
                     );
                 }
 
+                // Pass ALL projects so executor can resolve target-level dependencies
+                // (e.g., workspace member :build depends on workspace root :deps).
+                // Only primary projects will run the requested target.
+                // With --no-deps, only pass the ordered subset to skip dependency projects entirely.
+                let executor_projects: Vec<_> = if run_args.no_deps {
+                    ordered.iter().copied().collect()
+                } else {
+                    projects.iter().collect()
+                };
                 executor.execute_with_command_overrides(
                     &run_args.target,
-                    &ordered,
+                    &executor_projects,
                     &command_overrides,
                     Some(&primary_projects),
                 )
             } else {
-                executor.execute(&run_args.target, &ordered, &graph, Some(&primary_projects))
+                // Pass ALL projects so executor can resolve target-level dependencies
+                // (e.g., workspace member :build depends on workspace root :deps).
+                // Only primary projects will run the requested target.
+                // With --no-deps, only pass the ordered subset to skip dependency projects entirely.
+                let executor_projects: Vec<_> = if run_args.no_deps {
+                    ordered.iter().copied().collect()
+                } else {
+                    projects.iter().collect()
+                };
+                executor.execute(&run_args.target, &executor_projects, &graph, Some(&primary_projects))
             };
 
             // Output results based on mode
