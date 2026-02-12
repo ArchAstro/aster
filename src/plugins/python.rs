@@ -353,6 +353,9 @@ impl LanguagePlugin for PythonPlugin {
                     "requirements.txt".to_string(),
                     "setup.py".to_string(),
                     "setup.cfg".to_string(),
+                    // Include venv config so cache invalidates when the venv is
+                    // deleted, recreated, or rebuilt with a different Python version.
+                    ".venv/pyvenv.cfg".to_string(),
                 ],
                 env_vars: vec!["PYTHONPATH".to_string()],
             };
@@ -1183,5 +1186,36 @@ name = "mypackage"
 
         let clean = targets.get("clean").unwrap();
         assert!(clean.command.contains(".venv"));
+    }
+
+    #[test]
+    fn test_deps_cache_inputs_include_venv_config() {
+        let plugin = PythonPlugin;
+        let inputs = plugin.cache_inputs("deps");
+
+        // deps cache should include .venv/pyvenv.cfg so that deleting or
+        // recreating the venv invalidates the cache
+        assert!(
+            inputs.config_files.contains(&".venv/pyvenv.cfg".to_string()),
+            "deps cache_inputs should include .venv/pyvenv.cfg"
+        );
+
+        // deps should NOT include source globs (source changes don't require reinstall)
+        assert!(inputs.source_globs.is_empty());
+    }
+
+    #[test]
+    fn test_non_deps_cache_inputs_exclude_venv_config() {
+        let plugin = PythonPlugin;
+
+        // test/lint/format targets should NOT include venv config —
+        // they rely on the deps target dependency chain for invalidation
+        for target in &["test", "lint", "format"] {
+            let inputs = plugin.cache_inputs(target);
+            assert!(
+                !inputs.config_files.contains(&".venv/pyvenv.cfg".to_string()),
+                "{target} cache_inputs should not include .venv/pyvenv.cfg"
+            );
+        }
     }
 }
