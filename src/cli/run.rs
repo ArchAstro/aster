@@ -45,6 +45,8 @@ pub struct RunArgs {
     pub json: bool,
     /// Show full output for failed targets
     pub full_logs: bool,
+    /// Filter by language/plugin name (e.g., "nodejs", "python")
+    pub lang: Vec<String>,
 }
 
 /// Check if a target name conflicts with a reserved command
@@ -96,8 +98,21 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut quiet = false;
     let mut json = false;
     let mut full_logs = false;
+    let mut lang = Vec::new();
+    let mut expecting_lang = false;
 
     for arg in args {
+        if expecting_lang {
+            expecting_lang = false;
+            for l in arg.split(',') {
+                let l = l.trim();
+                if !l.is_empty() {
+                    lang.push(l.to_string());
+                }
+            }
+            continue;
+        }
+
         match arg.as_str() {
             "--no-deps" => no_deps = true,
             "--dependents" => dependents = true,
@@ -111,6 +126,18 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
             "--quiet" | "-q" => quiet = true,
             "--json" => json = true,
             "--full-logs" => full_logs = true,
+            _ if arg == "--lang" => {
+                expecting_lang = true;
+            }
+            _ if arg.starts_with("--lang=") => {
+                let value = &arg["--lang=".len()..];
+                for l in value.split(',') {
+                    let l = l.trim();
+                    if !l.is_empty() {
+                        lang.push(l.to_string());
+                    }
+                }
+            }
             "." => {
                 // Current directory - use cwd detection
                 use_cwd = true;
@@ -156,6 +183,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         quiet,
         json,
         full_logs,
+        lang,
     }
 }
 
@@ -308,6 +336,11 @@ pub fn select_projects<'a>(
                 .iter()
                 .any(|excl| matches_pattern(excl, &project_addr))
         });
+    }
+
+    // Apply language filter
+    if !args.lang.is_empty() {
+        result.retain(|p| args.lang.contains(&p.plugin_name));
     }
 
     Ok(result)
@@ -599,6 +632,64 @@ mod tests {
         assert!(args.verbose);
         assert!(args.quiet);
         assert!(args.json);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_lang_flag() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--lang".to_string(),
+            "nodejs".to_string(),
+        ]);
+
+        assert_eq!(args.target, "test");
+        assert!(args.all);
+        assert_eq!(args.lang, vec!["nodejs"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_lang_comma_separated() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--lang".to_string(),
+            "nodejs,python".to_string(),
+        ]);
+
+        assert_eq!(args.lang, vec!["nodejs", "python"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_lang_equals() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--lang=rust,go".to_string(),
+        ]);
+
+        assert_eq!(args.lang, vec!["rust", "go"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_with_multiple_lang_flags() {
+        let args = parse_run_args(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--lang".to_string(),
+            "nodejs".to_string(),
+            "--lang".to_string(),
+            "python".to_string(),
+        ]);
+
+        assert_eq!(args.lang, vec!["nodejs", "python"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_lang_default_empty() {
+        let args = parse_run_args(vec!["test".to_string()]);
+
+        assert!(args.lang.is_empty());
     }
 
     mod select_projects_tests {
@@ -1010,6 +1101,76 @@ mod tests {
             // Should select root project
             assert_eq!(selected.len(), 1);
             assert_eq!(selected[0].metadata.name, "root");
+        }
+
+        fn make_project_with_lang(
+            name: &str,
+            relative_path: &str,
+            plugin: &str,
+        ) -> DiscoveredProject {
+            DiscoveredProject {
+                root: PathBuf::from("/workspace").join(relative_path),
+                config_path: PathBuf::from("/workspace")
+                    .join(relative_path)
+                    .join("package.json"),
+                metadata: ProjectMetadata {
+                    name: name.to_string(),
+                    version: None,
+                },
+                dependencies: vec![],
+                targets: HashMap::new(),
+                plugin_name: plugin.to_string(),
+                relative_path: PathBuf::from(relative_path),
+            }
+        }
+
+        #[test]
+        fn test_select_projects_lang_filter() {
+            let projects = vec![
+                make_project_with_lang("node-app", "src/node-app", "nodejs"),
+                make_project_with_lang("py-app", "src/py-app", "python"),
+                make_project_with_lang("rust-lib", "src/rust-lib", "rust"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                all: true,
+                lang: vec!["nodejs".to_string(), "python".to_string()],
+                ..Default::default()
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
+            let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
+            assert!(names.contains(&"node-app"));
+            assert!(names.contains(&"py-app"));
+            assert!(!names.contains(&"rust-lib"));
+        }
+
+        #[test]
+        fn test_select_projects_lang_filter_empty_means_no_filter() {
+            let projects = vec![
+                make_project_with_lang("node-app", "src/node-app", "nodejs"),
+                make_project_with_lang("py-app", "src/py-app", "python"),
+            ];
+            let graph = build_graph(&projects).unwrap();
+            let workspace_root = Path::new("/workspace");
+            let cwd = Path::new("/workspace");
+
+            let args = RunArgs {
+                target: "test".to_string(),
+                all: true,
+                lang: vec![],
+                ..Default::default()
+            };
+
+            let selected = select_projects(&args, &graph, &projects, cwd, workspace_root).unwrap();
+
+            assert_eq!(selected.len(), 2);
         }
     }
 }

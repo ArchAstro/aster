@@ -31,6 +31,7 @@ use super::output::OutputMode;
     --no-deps             Skip running dependencies first
     --dependents          Also run projects that depend on selected ones
     --warnings-as-errors  Treat warnings as errors (for supported targets)
+    --lang <langs>        Filter by language (e.g., --lang nodejs,python)
 
 EXAMPLES:
     aster test --all                     # Test everything
@@ -101,6 +102,10 @@ pub enum Commands {
     List {
         /// Directory to scope listing to (e.g., "services/" or ".")
         path: Option<String>,
+
+        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        #[arg(long, value_delimiter = ',')]
+        lang: Vec<String>,
     },
 
     /// Show the target dependency graph
@@ -155,6 +160,10 @@ pub enum Commands {
         /// to fail on warnings. Useful for CI to catch potential issues.
         #[arg(long)]
         warnings_as_errors: bool,
+
+        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        #[arg(long, value_delimiter = ',')]
+        lang: Vec<String>,
     },
 
     /// View logs from the last run
@@ -175,6 +184,10 @@ pub enum Commands {
         /// Skip dependencies not explicitly listed
         #[arg(long)]
         no_deps: bool,
+
+        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        #[arg(long, value_delimiter = ',')]
+        lang: Vec<String>,
     },
 
     /// Project-level commands

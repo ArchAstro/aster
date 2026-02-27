@@ -81,7 +81,9 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init => unreachable!("Init handled above"),
-        Commands::List { path } => {
+        Commands::List { path, lang } => {
+            validate_lang_filter(&lang)?;
+
             // Filter projects by path if specified
             let filtered_projects: Vec<&DiscoveredProject> = if let Some(ref filter_path) = path {
                 // Resolve the filter path relative to cwd
@@ -103,6 +105,16 @@ fn run() -> Result<()> {
                     .collect()
             } else {
                 projects.iter().collect()
+            };
+
+            // Apply language filter
+            let filtered_projects: Vec<&DiscoveredProject> = if !lang.is_empty() {
+                filtered_projects
+                    .into_iter()
+                    .filter(|p| lang.contains(&p.plugin_name))
+                    .collect()
+            } else {
+                filtered_projects
             };
 
             if output_mode == OutputMode::Json {
@@ -378,7 +390,10 @@ fn run() -> Result<()> {
             dry_run,
             only_affected_files,
             warnings_as_errors,
+            lang,
         } => {
+            validate_lang_filter(&lang)?;
+
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)
                 .context("Not in a git repository. The 'affected' command requires git.")?;
@@ -437,6 +452,7 @@ fn run() -> Result<()> {
                     let addr = format!("//{}", p.relative_path.display());
                     affected_addrs.contains(&addr)
                 })
+                .filter(|p| lang.is_empty() || lang.contains(&p.plugin_name))
                 .collect();
 
             if affected_projects.is_empty() {
@@ -724,7 +740,12 @@ fn run() -> Result<()> {
                 return Err(anyhow::anyhow!("{failed} project(s) failed"));
             }
         }
-        Commands::Run { targets, no_deps } => {
+        Commands::Run {
+            targets,
+            no_deps,
+            lang,
+        } => {
+            validate_lang_filter(&lang)?;
             // Heterogeneous run: execute multiple //project:target pairs
 
             // Validate all targets exist and have correct format
@@ -752,22 +773,48 @@ fn run() -> Result<()> {
                 ));
             }
 
-            // Collect all targets to run (and optionally their dependencies)
-            let mut targets_to_run: std::collections::HashSet<String> =
-                targets.iter().cloned().collect();
-
-            if !no_deps {
-                // Add dependencies of each target
-                for target in &targets {
-                    collect_target_deps_recursive(target, &target_graph, &mut targets_to_run);
-                }
-            }
-
-            // Build project map for executor
+            // Build project map for lang filtering and executor
             let project_map: std::collections::HashMap<String, &DiscoveredProject> = projects
                 .iter()
                 .map(|p| (format!("//{}", p.relative_path.display()), p))
                 .collect();
+
+            // Apply language filter to requested targets
+            let filtered_targets: Vec<String> = if !lang.is_empty() {
+                targets
+                    .into_iter()
+                    .filter(|t| {
+                        if let Some((proj_addr, _)) = t.rsplit_once(':') {
+                            project_map
+                                .get(proj_addr)
+                                .map(|p| lang.contains(&p.plugin_name))
+                                .unwrap_or(true)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            } else {
+                targets
+            };
+
+            if filtered_targets.is_empty() {
+                if output_mode != OutputMode::Quiet {
+                    println!("No targets match the specified language filter");
+                }
+                return Ok(());
+            }
+
+            // Collect all targets to run (and optionally their dependencies)
+            let mut targets_to_run: std::collections::HashSet<String> =
+                filtered_targets.iter().cloned().collect();
+
+            if !no_deps {
+                // Add dependencies of each target
+                for target in &filtered_targets {
+                    collect_target_deps_recursive(target, &target_graph, &mut targets_to_run);
+                }
+            }
 
             // Compute DAG levels and execute
             let levels = compute_heterogeneous_levels(&targets_to_run, &project_map);
@@ -874,6 +921,8 @@ fn run() -> Result<()> {
             if run_args.target.is_empty() {
                 return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));
             }
+
+            validate_lang_filter(&run_args.lang)?;
 
             // Apply global flags that clap couldn't parse from external subcommands
             if run_args.no_cache {
@@ -1016,7 +1065,7 @@ fn run() -> Result<()> {
                 // Only primary projects will run the requested target.
                 // With --no-deps, only pass the ordered subset to skip dependency projects entirely.
                 let executor_projects: Vec<_> = if run_args.no_deps {
-                    ordered.iter().copied().collect()
+                    ordered.to_vec()
                 } else {
                     projects.iter().collect()
                 };
@@ -1032,7 +1081,7 @@ fn run() -> Result<()> {
                 // Only primary projects will run the requested target.
                 // With --no-deps, only pass the ordered subset to skip dependency projects entirely.
                 let executor_projects: Vec<_> = if run_args.no_deps {
-                    ordered.iter().copied().collect()
+                    ordered.to_vec()
                 } else {
                     projects.iter().collect()
                 };
@@ -1837,6 +1886,23 @@ fn apply_warnings_as_errors(
 
 /// Format a timestamp as a human-readable relative time
 ///
+/// Known language/plugin names for --lang validation
+const VALID_LANGS: &[&str] = &["nodejs", "python", "rust", "go", "elixir"];
+
+/// Validate that all --lang values are known plugin names
+fn validate_lang_filter(langs: &[String]) -> Result<()> {
+    for lang in langs {
+        if !VALID_LANGS.contains(&lang.as_str()) {
+            return Err(anyhow::anyhow!(
+                "Unknown language '{}'. Valid languages: {}",
+                lang,
+                VALID_LANGS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parses an RFC3339 timestamp and returns a string like "2 minutes ago"
 /// Falls back to the raw timestamp if parsing fails.
 fn format_relative_time(timestamp: &str) -> String {

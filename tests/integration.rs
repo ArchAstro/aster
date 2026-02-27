@@ -1606,3 +1606,248 @@ fn test_full_logs_flag_position() {
         "Flag after subcommand should work: {stderr}"
     );
 }
+
+// ============================================================================
+// Language Filter (--lang)
+// ============================================================================
+
+#[test]
+fn test_list_lang_filter() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // Node.js project
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "version": "1.0.0"}"#,
+    );
+
+    // Python project
+    write_pyproject_toml(
+        &tmp,
+        "libs/ml/pyproject.toml",
+        r#"
+[project]
+name = "ml"
+version = "1.0.0"
+"#,
+    );
+
+    // Elixir project
+    write_mix_exs(
+        &tmp,
+        "services/backend/mix.exs",
+        r#"
+defmodule Backend.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :backend]
+  end
+end
+"#,
+    );
+
+    // Filter to only Python
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "python"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("//libs/ml"),
+        "Expected Python project in output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("//services/api"),
+        "Node.js project should be filtered out: {stdout}"
+    );
+    assert!(
+        !stdout.contains("//services/backend"),
+        "Elixir project should be filtered out: {stdout}"
+    );
+}
+
+#[test]
+fn test_list_lang_filter_multiple() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "version": "1.0.0"}"#,
+    );
+
+    write_pyproject_toml(
+        &tmp,
+        "libs/ml/pyproject.toml",
+        r#"
+[project]
+name = "ml"
+version = "1.0.0"
+"#,
+    );
+
+    write_mix_exs(
+        &tmp,
+        "services/backend/mix.exs",
+        r#"
+defmodule Backend.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :backend]
+  end
+end
+"#,
+    );
+
+    // Filter to nodejs and elixir (comma-separated)
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "nodejs,elixir"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("//services/api"),
+        "Expected Node.js project: {stdout}"
+    );
+    assert!(
+        stdout.contains("//services/backend"),
+        "Expected Elixir project: {stdout}"
+    );
+    assert!(
+        !stdout.contains("//libs/ml"),
+        "Python project should be filtered out: {stdout}"
+    );
+}
+
+#[test]
+fn test_lang_filter_invalid_language() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api"}"#,
+    );
+
+    // Invalid language should produce an error
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "javascript"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "Should fail with invalid language"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown language 'javascript'"),
+        "Expected helpful error message: {stderr}"
+    );
+    assert!(
+        stderr.contains("nodejs"),
+        "Error should list valid languages: {stderr}"
+    );
+}
+
+#[test]
+fn test_target_lang_filter() {
+    // Test --lang with external subcommand (aster test --all --lang nodejs)
+    // Python project has a test that fails, Node.js project passes.
+    // If lang filter works, only nodejs runs and we get success.
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "echo api_test_pass"}}"#,
+    );
+
+    write_pyproject_toml(
+        &tmp,
+        "libs/ml/pyproject.toml",
+        r#"
+[project]
+name = "ml"
+version = "1.0.0"
+"#,
+    );
+    // Create pytest marker so test target is detected
+    fs::create_dir_all(tmp.path().join("libs/ml/tests")).unwrap();
+    fs::write(tmp.path().join("libs/ml/tests/test_ml.py"), "").unwrap();
+
+    // Without --lang, all projects are selected
+    let output_all = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "--all"])
+        .output()
+        .unwrap();
+    let stdout_all = String::from_utf8_lossy(&output_all.stdout);
+    assert!(
+        stdout_all.contains("2 passed") || stdout_all.contains("3 projects"),
+        "Without --lang should run multiple projects: {stdout_all}"
+    );
+
+    // With --lang nodejs, only Node.js projects selected
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--verbose", "test", "--all", "--lang", "nodejs"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Verbose stderr shows how many primary projects run, stdout has summary
+    // The Python project should not appear
+    assert!(
+        !stdout.contains("//libs/ml"),
+        "Python project should be filtered out: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_target_lang_filter_invalid() {
+    // Test --lang with invalid language in external subcommand
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "echo test"}}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["test", "--all", "--lang", "js"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "Should fail with invalid language"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown language 'js'"),
+        "Expected helpful error message: {stderr}"
+    );
+}
