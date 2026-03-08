@@ -639,6 +639,7 @@ fn run() -> Result<()> {
             // Build command overrides for files-list and warnings-as-errors
             let results = if only_affected_files || warnings_as_errors {
                 let mut command_overrides: HashMap<String, String> = HashMap::new();
+                let mut effective_primary_addrs = primary_addrs.clone();
 
                 // Create plugin registry for capability handling
                 let mut registry = PluginRegistry::new();
@@ -654,6 +655,7 @@ fn run() -> Result<()> {
 
                     if let Some(target_def) = project.targets.get(&target) {
                         let mut modified_cmd: Option<String> = None;
+                        let mut files_list_attempted = false;
 
                         // Apply files-list if requested and supported
                         if only_affected_files
@@ -661,6 +663,8 @@ fn run() -> Result<()> {
                                 .capabilities
                                 .contains(&TargetCapability::FilesList)
                         {
+                            files_list_attempted = true;
+
                             let project_files: Vec<PathBuf> = changed_files
                                 .iter()
                                 .filter(|f| f.starts_with(&project.relative_path))
@@ -705,6 +709,16 @@ fn run() -> Result<()> {
 
                         if let Some(cmd) = modified_cmd {
                             command_overrides.insert(target_addr, cmd);
+                        } else if files_list_attempted {
+                            // --only-affected-files was set and the target supports FilesList,
+                            // but no relevant files matched (e.g., only source files changed,
+                            // no test files). Skip this project instead of running the full suite.
+                            effective_primary_addrs.remove(&project_addr);
+                            if output_mode == OutputMode::Verbose {
+                                eprintln!(
+                                    "[aster] Skipping {target_addr}: no matching files for --only-affected-files"
+                                );
+                            }
                         }
                     }
                 }
@@ -720,7 +734,7 @@ fn run() -> Result<()> {
                     &target,
                     &all_project_refs,
                     &command_overrides,
-                    Some(&primary_addrs),
+                    Some(&effective_primary_addrs),
                 )
             } else {
                 executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))

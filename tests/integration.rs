@@ -1851,3 +1851,175 @@ fn test_target_lang_filter_invalid() {
         "Expected helpful error message: {stderr}"
     );
 }
+
+// ============================================================================
+// --only-affected-files bug: falls back to full suite when no test files changed
+// ============================================================================
+
+#[test]
+fn test_only_affected_files_skips_when_no_test_files_changed() {
+    // When --only-affected-files is used and only source files (not test files)
+    // are in the change set, the project's test target should be skipped rather
+    // than running the full test suite.
+
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // Python project with explicit test target that has files_list capability
+    write_pyproject_toml(
+        &tmp,
+        "libs/mylib/pyproject.toml",
+        r#"
+[project]
+name = "mylib"
+version = "1.0.0"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+test = ["pytest"]
+"#,
+    );
+
+    // Add a test file and a source file in initial commit
+    fs::create_dir_all(tmp.path().join("libs/mylib/src")).unwrap();
+    fs::write(
+        tmp.path().join("libs/mylib/src/utils.py"),
+        "def add(a, b): return a + b",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("libs/mylib/tests")).unwrap();
+    fs::write(
+        tmp.path().join("libs/mylib/tests/test_utils.py"),
+        "def test_add(): assert True",
+    )
+    .unwrap();
+    git_commit(&tmp, "Initial commit");
+
+    // Now change ONLY a source file (not a test file)
+    fs::write(
+        tmp.path().join("libs/mylib/src/utils.py"),
+        "def add(a, b): return a + b\ndef sub(a, b): return a - b",
+    )
+    .unwrap();
+
+    // Run affected test with --only-affected-files
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--only-affected-files",
+            "--json",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Parse JSON output
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("Failed to parse JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+
+    let results = json["results"].as_array().expect("results should be array");
+    let mylib_result = results.iter().find(|r| {
+        r["address"]
+            .as_str()
+            .map(|a| a.contains("mylib"))
+            .unwrap_or(false)
+    });
+
+    // With --only-affected-files, since no test files changed, the project's
+    // test target should NOT be executed at all.
+    assert!(
+        mylib_result.is_none(),
+        "With --only-affected-files and no test files changed, mylib:test should not run. \
+         Got: {mylib_result:?}"
+    );
+}
+
+#[test]
+fn test_only_affected_files_runs_when_test_files_changed() {
+    // When --only-affected-files is used and test files ARE in the change set,
+    // the project's test target should run with only those files.
+
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    // Python project
+    write_pyproject_toml(
+        &tmp,
+        "libs/mylib/pyproject.toml",
+        r#"
+[project]
+name = "mylib"
+version = "1.0.0"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+test = ["pytest"]
+"#,
+    );
+
+    // Add source and test files in initial commit
+    fs::create_dir_all(tmp.path().join("libs/mylib/src")).unwrap();
+    fs::write(
+        tmp.path().join("libs/mylib/src/utils.py"),
+        "def add(a, b): return a + b",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("libs/mylib/tests")).unwrap();
+    fs::write(
+        tmp.path().join("libs/mylib/tests/test_utils.py"),
+        "def test_add(): assert True",
+    )
+    .unwrap();
+    git_commit(&tmp, "Initial commit");
+
+    // Change a test file
+    fs::write(
+        tmp.path().join("libs/mylib/tests/test_utils.py"),
+        "def test_add(): assert 1 + 1 == 2",
+    )
+    .unwrap();
+
+    // Run affected test with --only-affected-files
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--only-affected-files",
+            "--json",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Parse JSON output
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("Failed to parse JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+
+    let results = json["results"].as_array().expect("results should be array");
+    let mylib_result = results.iter().find(|r| {
+        r["address"]
+            .as_str()
+            .map(|a| a.contains("mylib"))
+            .unwrap_or(false)
+    });
+
+    // When test files are changed, the target SHOULD run
+    assert!(
+        mylib_result.is_some(),
+        "With --only-affected-files and test files changed, mylib:test should run. \
+         stdout: {stdout}, stderr: {stderr}"
+    );
+}
