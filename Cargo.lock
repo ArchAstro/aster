@@ -106,6 +106,7 @@ dependencies = [
  "globset",
  "ignore",
  "indicatif",
+ "libc",
  "petgraph",
  "predicates",
  "regex",

@@ -17,7 +17,9 @@ use aster::cli::{
 use aster::config::find_workspace_root;
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
-use aster::executor::{collect_target_deps, compute_target_levels, parse_target_address, Executor};
+use aster::executor::{
+    collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler, Executor,
+};
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
 use aster::plugins::{
@@ -43,6 +45,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    setup_signal_handler();
+
     let mut cli = Cli::parse();
     let output_mode = cli.output_mode();
     let full_logs = cli.full_logs();

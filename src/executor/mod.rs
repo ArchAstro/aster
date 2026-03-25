@@ -8,5 +8,6 @@ pub mod runner;
 
 pub use logs::{LogStore, RunLog, TargetLog};
 pub use runner::{
-    collect_target_deps, compute_target_levels, parse_target_address, ExecutionResult, Executor,
+    collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler,
+    ExecutionResult, Executor,
 };

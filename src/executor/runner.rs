@@ -28,6 +28,32 @@ use crate::graph::ProjectGraph;
 use crate::plugins::PluginRegistry;
 use crate::ui::ProgressDisplay;
 
+/// On SIGINT/SIGTERM, send SIGTERM to our process group so every child
+/// (including Beam VMs that trap SIGINT) gets a clean shutdown signal.
+#[cfg(unix)]
+extern "C" fn shutdown_handler(_sig: libc::c_int) {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::kill(-libc::getpgrp(), libc::SIGTERM);
+    }
+}
+
+/// Install signal handlers that clean up child processes on SIGINT/SIGTERM.
+pub fn setup_signal_handler() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            shutdown_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            shutdown_handler as *const () as libc::sighandler_t,
+        );
+    }
+}
+
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -151,8 +177,6 @@ impl<'a> Executor<'a> {
         target: &str,
         project: &DiscoveredProject,
     ) -> Result<i32, String> {
-        use std::process::Stdio;
-
         let project_addr = format!("//{}", project.relative_path.display());
         let target_addr = format!("{project_addr}:{target}");
 
@@ -212,6 +236,7 @@ impl<'a> Executor<'a> {
         let args = &parts[cmd_start + 1..];
 
         // Run with inherited stdio for streaming
+        use std::process::Stdio;
         let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(working_dir)
@@ -1421,4 +1446,5 @@ mod tests {
         assert_eq!(result.output, "test output");
         assert_eq!(result.duration_ms, 100);
     }
+
 }
