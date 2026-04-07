@@ -196,9 +196,10 @@ pub fn discover_projects(
         });
     }
 
-    // Phase 2: Resolve in_umbrella dependencies for Elixir projects
+    // Phase 2: Resolve special dependency references
     // This must happen BEFORE target detection so dependencies are resolved correctly
     resolve_umbrella_dependencies_partial(&mut partial_projects);
+    resolve_uv_workspace_dependencies_partial(&mut partial_projects);
 
     // Phase 3: Detect targets with resolved dependencies
     let mut projects: Vec<DiscoveredProject> = Vec::new();
@@ -302,6 +303,42 @@ fn resolve_umbrella_dependencies_partial(projects: &mut [PartialProject]) {
                     dep.path = PathBuf::from(address.clone());
                 }
                 // If not found, keep the original path (will fail to resolve later)
+            }
+        }
+    }
+}
+
+/// Resolve uv workspace dependencies for Python projects
+///
+/// In uv workspaces, `[tool.uv.sources]` can reference other workspace members
+/// via `{ workspace = true }`. The Python plugin emits these as sentinel paths
+/// `uv_workspace:<name>`. This function resolves them to project addresses by
+/// matching the dependency name against discovered Python project names.
+fn resolve_uv_workspace_dependencies_partial(projects: &mut [PartialProject]) {
+    // Build a map of Python project name -> project address
+    let name_to_address: HashMap<String, String> = projects
+        .iter()
+        .filter(|p| p.plugin_name == "python")
+        .map(|p| {
+            (
+                p.metadata.name.clone(),
+                format!("//{}", p.relative_path.display()),
+            )
+        })
+        .collect();
+
+    // Resolve uv_workspace: dependencies
+    for project in projects.iter_mut() {
+        if project.plugin_name != "python" {
+            continue;
+        }
+
+        for dep in &mut project.dependencies {
+            let path_str = dep.path.to_string_lossy();
+            if let Some(dep_name) = path_str.strip_prefix("uv_workspace:") {
+                if let Some(address) = name_to_address.get(dep_name) {
+                    dep.path = PathBuf::from(address.clone());
+                }
             }
         }
     }

@@ -33,6 +33,19 @@ struct PepProject {
 #[derive(Deserialize, Default)]
 struct ToolSection {
     poetry: Option<PoetrySection>,
+    uv: Option<UvSection>,
+}
+
+/// uv-specific configuration
+#[derive(Deserialize, Default)]
+struct UvSection {
+    sources: Option<HashMap<String, UvSource>>,
+}
+
+/// A uv source entry (e.g., `phx-channel = { workspace = true }`)
+#[derive(Deserialize, Default)]
+struct UvSource {
+    workspace: Option<bool>,
 }
 
 /// Poetry-specific configuration
@@ -154,6 +167,21 @@ impl LanguagePlugin for PythonPlugin {
                     }
                 }
             }
+
+            // Extract uv workspace dependencies: `pkg = { workspace = true }` in [tool.uv.sources]
+            if let Some(uv) = &tool.uv {
+                if let Some(sources) = &uv.sources {
+                    for (name, source) in sources {
+                        if source.workspace == Some(true) {
+                            // Use a sentinel path so the scanner can resolve by name
+                            deps.push(LocalDependency {
+                                name: name.clone(),
+                                path: PathBuf::from(format!("uv_workspace:{name}")),
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         Ok(deps)
@@ -169,7 +197,7 @@ impl LanguagePlugin for PythonPlugin {
         // Poetry projects use `poetry run` to execute commands in the venv
         // uv projects use `uv run` to execute commands in the venv
         let is_poetry = content.contains("[tool.poetry]");
-        let has_uv_lock = ctx.project_dir.join("uv.lock").exists();
+        let has_uv_lock = has_uv_lock_in_ancestry(ctx.project_dir, ctx.workspace_root);
 
         let (deps_command, cmd_prefix) = if is_poetry {
             ("poetry install", "poetry run ")
@@ -410,6 +438,26 @@ impl LanguagePlugin for PythonPlugin {
             working_dir: None,
             exclusive_resources: vec![],
         })
+    }
+}
+
+/// Check if a `uv.lock` exists at or above `project_dir`, up to `workspace_root`.
+///
+/// In uv workspaces the lock file lives at the workspace root, not in each member.
+/// Walking upward mirrors how uv itself resolves workspace membership.
+fn has_uv_lock_in_ancestry(project_dir: &Path, workspace_root: &Path) -> bool {
+    let mut dir = project_dir;
+    loop {
+        if dir.join("uv.lock").exists() {
+            return true;
+        }
+        if dir == workspace_root {
+            return false;
+        }
+        dir = match dir.parent() {
+            Some(parent) => parent,
+            None => return false,
+        };
     }
 }
 
@@ -1217,5 +1265,106 @@ name = "mypackage"
                 "{target} cache_inputs should not include .venv/pyvenv.cfg"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_uv_workspace_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "my-sdk"
+dependencies = ["phx-channel"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+phx-channel = { workspace = true }
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let deps = plugin.parse_dependencies(&pyproject).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "phx-channel");
+        assert_eq!(deps[0].path, PathBuf::from("uv_workspace:phx-channel"));
+    }
+
+    #[test]
+    fn test_uv_workspace_member_detects_uv() {
+        // Simulate a uv workspace where the lock file is in a parent directory
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path();
+
+        // uv.lock at workspace root
+        std::fs::write(workspace_root.join("uv.lock"), "").unwrap();
+
+        // Workspace member in packages/phx-channel/
+        let member_dir = workspace_root.join("packages/phx-channel");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let pyproject = member_dir.join("pyproject.toml");
+        std::fs::write(
+            &pyproject,
+            r#"
+[project]
+name = "phx-channel"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+"#,
+        )
+        .unwrap();
+
+        let plugin = PythonPlugin;
+        let ctx = TargetContext {
+            config_path: &pyproject,
+            project_dir: &member_dir,
+            workspace_root,
+            dependencies: &[],
+        };
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // Should detect uv from ancestor uv.lock, not fall back to pip
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"uv sync".to_string())
+        );
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"uv run pytest".to_string())
+        );
+        assert_eq!(
+            targets.get("lint").map(|t| &t.command),
+            Some(&"uv run ruff check .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_has_uv_lock_in_ancestry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // No uv.lock anywhere
+        let child = root.join("a/b");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(!has_uv_lock_in_ancestry(&child, root));
+
+        // uv.lock at root
+        std::fs::write(root.join("uv.lock"), "").unwrap();
+        assert!(has_uv_lock_in_ancestry(&child, root));
+        assert!(has_uv_lock_in_ancestry(root, root));
+
+        // uv.lock at intermediate dir
+        std::fs::remove_file(root.join("uv.lock")).unwrap();
+        std::fs::write(root.join("a/uv.lock"), "").unwrap();
+        assert!(has_uv_lock_in_ancestry(&child, root));
     }
 }
