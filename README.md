@@ -85,6 +85,46 @@ Run different targets on different projects:
 aster run //services/api:test //libs/core:build //tools/cli:lint
 ```
 
+### Watching targets
+
+Rerun targets automatically when their declared inputs change:
+
+```sh
+aster watch //services/api:build
+aster watch //services/api                       # uses --target (default: build)
+aster watch //services/api:build //libs/core:test
+aster watch //services/api:dev --debounce 500ms  # stream=true target runs long-lived
+```
+
+**Semantics**: watching `//services/api:build` implicitly watches its transitive
+dependencies. When a file changes, aster looks up the target whose `cache_inputs`
+own the changed path and reruns it plus every requested/in-closure target that
+depends on it. Files outside any watched target's inputs are ignored.
+
+**Streaming targets** (with `stream = true`) are spawned as long-lived children.
+Aster restarts them when their inputs or any dependency's inputs change.
+
+**Workspace config** (`aster.toml` at the repo root):
+
+```toml
+[watch]
+# Extend built-in fs ignores (.git, node_modules, target, _build, .next, dist, .turbo, .venv, .elixir_ls)
+ignore = ["coverage/**"]
+# Paths written by build output — events here are dropped during/after rebuilds
+suppress_paths = ["services/platform/priv/static/assets/**"]
+debounce_ms = 300
+```
+
+**Per-target inputs**: watch uses the same `cache_inputs` metadata as the cache.
+Refine which files a target watches via `[targets.X.cache]` in the project's
+`aster.toml`:
+
+```toml
+[targets.build.cache]
+include = ["config/**/*.json"]
+exclude = ["**/*.generated.ts"]
+```
+
 ### Exploring the workspace
 
 ```sh

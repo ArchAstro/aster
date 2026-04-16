@@ -8,6 +8,32 @@ pub struct WorkspaceConfig {
     /// Glob patterns for paths to ignore during project discovery
     #[serde(default)]
     pub ignore: Vec<String>,
+
+    /// Watch mode configuration
+    #[serde(default)]
+    pub watch: WatchWorkspaceConfig,
+}
+
+/// Watch-mode configuration controlling fs-event ignore and suppression behavior.
+///
+/// Built-in defaults always apply (`.git/`, `node_modules/`, `target/`, `_build/`,
+/// `.next/`, `dist/`, `.turbo/`, `.venv/`, `.elixir_ls/`). User patterns extend
+/// them — they never replace the defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WatchWorkspaceConfig {
+    /// Additional glob patterns (workspace-relative) whose fs events are dropped
+    /// before being considered by the watcher.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+
+    /// Paths written by build-like processes that must not retrigger rebuilds.
+    /// Events under these paths are dropped during and briefly after a rebuild.
+    #[serde(default)]
+    pub suppress_paths: Vec<String>,
+
+    /// Debounce window in milliseconds for coalescing bursts of events.
+    /// Defaults to 300 when unset.
+    pub debounce_ms: Option<u64>,
 }
 
 impl WorkspaceConfig {
@@ -139,6 +165,43 @@ mod tests {
             result.unwrap().canonicalize().unwrap(),
             root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn test_workspace_config_load_with_watch_section() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("aster.toml"),
+            r#"
+[watch]
+ignore = ["coverage/**"]
+suppress_paths = ["priv/static/assets/**"]
+debounce_ms = 500
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert_eq!(config.watch.ignore, vec!["coverage/**".to_string()]);
+        assert_eq!(
+            config.watch.suppress_paths,
+            vec!["priv/static/assets/**".to_string()]
+        );
+        assert_eq!(config.watch.debounce_ms, Some(500));
+    }
+
+    #[test]
+    fn test_workspace_config_watch_defaults() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("aster.toml"), "").unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert!(config.watch.ignore.is_empty());
+        assert!(config.watch.suppress_paths.is_empty());
+        assert_eq!(config.watch.debounce_ms, None);
     }
 
     #[test]

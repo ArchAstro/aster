@@ -202,6 +202,36 @@ pub enum Commands {
         command: CacheCommands,
     },
 
+    /// Watch targets and rerun them when their declared inputs change
+    ///
+    /// Pass one or more target addresses (//project:target) or bare projects
+    /// (//project uses the --target default). Watching a target implicitly
+    /// watches its transitive dependency closure.
+    ///
+    /// Targets with `stream = true` (dev servers, etc.) are kept running and
+    /// restarted when their inputs or any dependency's inputs change.
+    Watch {
+        /// Targets to watch (//project:target or //project)
+        #[arg(required = true)]
+        targets: Vec<String>,
+
+        /// Default target name for bare project addresses
+        #[arg(long, default_value = "build")]
+        target: String,
+
+        /// Debounce window for coalescing rapid file events (e.g. "300ms", "1s")
+        #[arg(long)]
+        debounce: Option<String>,
+
+        /// Skip the one-shot initial run on startup
+        #[arg(long)]
+        no_initial: bool,
+
+        /// Filter by language (e.g., --lang nodejs,python)
+        #[arg(long, value_delimiter = ',')]
+        lang: Vec<String>,
+    },
+
     /// Run a single target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
     Target(Vec<String>),

@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 mod hasher;
+pub mod matcher;
 mod store;
 
 pub use hasher::CacheHasher;
+pub use matcher::TargetInputMatcher;
 pub use store::CacheStore;
 
 /// Entry in the cache for a single target

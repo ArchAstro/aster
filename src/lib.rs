@@ -9,6 +9,7 @@ pub mod graph;
 pub mod plugins;
 pub mod targets;
 pub mod ui;
+pub mod watch;
 
 // Re-export core types for convenience
 pub use cli::{Cli, Commands};

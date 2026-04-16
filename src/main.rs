@@ -932,6 +932,28 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Commands::Watch {
+            targets,
+            target,
+            debounce,
+            no_initial,
+            lang,
+        } => {
+            validate_lang_filter(&lang)?;
+
+            handle_watch(
+                &workspace_root,
+                projects,
+                targets,
+                target,
+                debounce,
+                no_initial,
+                lang,
+                output_mode,
+                full_logs,
+                cli.no_cache,
+            )?;
+        }
         Commands::Target(ref args) => {
             // Parse external subcommand args
             let run_args = parse_run_args(args.clone());
@@ -1585,6 +1607,109 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Handle the `watch` command.
+#[allow(clippy::too_many_arguments)]
+fn handle_watch(
+    workspace_root: &Path,
+    projects: Vec<DiscoveredProject>,
+    targets: Vec<String>,
+    default_target: String,
+    debounce: Option<String>,
+    no_initial: bool,
+    lang: Vec<String>,
+    output_mode: OutputMode,
+    full_logs: bool,
+    no_cache: bool,
+) -> Result<()> {
+    use aster::config::WorkspaceConfig;
+    use aster::watch::{run_watch, WatchOpts, WatchPlan, WorkspaceIgnore};
+    use std::time::Duration;
+
+    // Resolve each entry to //project:target. Bare //project uses default_target.
+    let mut resolved: Vec<String> = Vec::new();
+    for entry in &targets {
+        if entry.ends_with("/...") || entry == "//..." {
+            return Err(anyhow::anyhow!(
+                "glob selectors are not yet supported by `aster watch`; specify targets explicitly: {entry}"
+            ));
+        }
+        if entry.contains(':') {
+            resolved.push(entry.clone());
+        } else if let Some(rest) = entry.strip_prefix("//") {
+            if rest.is_empty() {
+                return Err(anyhow::anyhow!("invalid target: {entry}"));
+            }
+            resolved.push(format!("{entry}:{default_target}"));
+        } else {
+            return Err(anyhow::anyhow!(
+                "target must start with '//': {entry}"
+            ));
+        }
+    }
+
+    // Apply language filter by dropping targets from non-matching projects.
+    if !lang.is_empty() {
+        let project_lang: HashMap<String, String> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p.plugin_name.clone()))
+            .collect();
+        resolved.retain(|addr| {
+            let project_addr = addr.rsplit_once(':').map(|(p, _)| p).unwrap_or(addr);
+            project_lang
+                .get(project_addr)
+                .map(|pl| lang.contains(pl))
+                .unwrap_or(false)
+        });
+        if resolved.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no targets match the specified language filter"
+            ));
+        }
+    }
+
+    // Build target graph for validation + dependents traversal.
+    let graph = build_target_graph(&projects);
+    if let Some(cycle) = graph.find_cycle() {
+        return Err(anyhow::anyhow!("{cycle}"));
+    }
+
+    let mut registry = PluginRegistry::new();
+    registry.register(Box::new(NodeJsPlugin));
+    registry.register(Box::new(ElixirPlugin));
+    registry.register(Box::new(PythonPlugin));
+    registry.register(Box::new(GoPlugin));
+    registry.register(Box::new(RustPlugin));
+
+    let plan = WatchPlan::build(&resolved, &projects, &graph, &registry)?;
+
+    let workspace_config = WorkspaceConfig::load(workspace_root)?;
+    let ignore = WorkspaceIgnore::build(&workspace_config.watch)?;
+
+    let debounce_duration = match debounce.as_deref() {
+        Some(s) => humantime::parse_duration(s)
+            .map_err(|e| anyhow::anyhow!("invalid --debounce '{s}': {e}"))?,
+        None => Duration::from_millis(workspace_config.watch.debounce_ms.unwrap_or(300)),
+    };
+
+    let opts = WatchOpts {
+        debounce: debounce_duration,
+        run_initial: !no_initial,
+        ..Default::default()
+    };
+
+    let executor = Executor::with_all_options(workspace_root, output_mode, full_logs, !no_cache);
+
+    run_watch(
+        plan,
+        workspace_root.to_path_buf(),
+        projects,
+        graph,
+        executor,
+        ignore,
+        opts,
+    )
 }
 
 /// Handle project subcommands

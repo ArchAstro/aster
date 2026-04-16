@@ -255,6 +255,43 @@ impl<'a> Executor<'a> {
         Ok(status.code().unwrap_or(1))
     }
 
+    /// Execute an explicit set of target addresses (heterogeneous run).
+    ///
+    /// Builds the `targets_to_run` set by expanding `primary_targets` with their
+    /// transitive dependencies (unless `no_deps` is true), then runs the cached
+    /// execution pipeline. Used by `aster watch` to rerun a precomputed set of
+    /// targets whose inputs were touched.
+    pub fn execute_targets(
+        &self,
+        primary_targets: &HashSet<String>,
+        projects: &[&DiscoveredProject],
+        no_deps: bool,
+    ) -> Vec<ExecutionResult> {
+        if projects.is_empty() || primary_targets.is_empty() {
+            return Vec::new();
+        }
+
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), *p))
+            .collect();
+
+        let mut targets_to_run: HashSet<String> = primary_targets.clone();
+        if !no_deps {
+            for addr in primary_targets {
+                collect_target_deps(addr, &project_map, &mut targets_to_run);
+            }
+        }
+
+        let target_label = primary_targets
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "watch".to_string());
+
+        self.execute_target_set(&targets_to_run, &project_map, None, &target_label)
+    }
+
     /// Internal execution method that supports optional command overrides
     fn execute_internal(
         &self,
@@ -266,15 +303,6 @@ impl<'a> Executor<'a> {
         if projects.is_empty() {
             return Vec::new();
         }
-
-        // Determine if we should show progress output
-        // Show in Normal or Verbose mode (ProgressDisplay handles terminal vs CI mode internally)
-        let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
-        let verbose_progress = self.output_mode == OutputMode::Verbose;
-        let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
-
-        // Create progress display (verbose mode shows each item with PASS/FAIL/SKIP)
-        let mut progress = ProgressDisplay::with_verbose(show_progress, verbose_progress);
 
         // Build address -> project map (for all discovered projects, not just selected)
         let project_map: HashMap<String, &DiscoveredProject> = projects
@@ -306,13 +334,32 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Compute DAG levels based on target dependencies
-        let levels = compute_target_levels(&targets_to_run, &project_map);
+        self.execute_target_set(&targets_to_run, &project_map, command_overrides, target)
+    }
 
-        // Set total count for progress display
+    /// Shared pipeline: compute DAG levels from `targets_to_run`, run each level
+    /// in parallel with caching, then finalize progress + logs.
+    fn execute_target_set(
+        &self,
+        targets_to_run: &HashSet<String>,
+        project_map: &HashMap<String, &DiscoveredProject>,
+        command_overrides: Option<&HashMap<String, String>>,
+        target_label_for_logs: &str,
+    ) -> Vec<ExecutionResult> {
+        if targets_to_run.is_empty() {
+            return Vec::new();
+        }
+
+        let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
+        let verbose_progress = self.output_mode == OutputMode::Verbose;
+        let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
+
+        let mut progress = ProgressDisplay::with_verbose(show_progress, verbose_progress);
+
+        let levels = compute_target_levels(targets_to_run, project_map);
+
         progress.set_total(targets_to_run.len());
 
-        // Initialize cache infrastructure
         let cache_store = if self.use_cache {
             Some(CacheStore::new(self.workspace_root))
         } else {
@@ -320,20 +367,17 @@ impl<'a> Executor<'a> {
         };
         let plugin_registry = PluginRegistry::with_all_plugins();
 
-        // Track computed hashes for hash chaining (shared across levels)
         let computed_hashes: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Capture current environment for cache key computation
         let env_snapshot: HashMap<String, String> = std::env::vars().collect();
 
         let mut all_results = Vec::new();
 
-        // Execute each level in parallel
         for level in levels {
             let level_results = self.execute_target_level(
                 &level,
-                &project_map,
+                project_map,
                 &mut progress,
                 show_progress,
                 command_overrides,
@@ -345,15 +389,12 @@ impl<'a> Executor<'a> {
             all_results.extend(level_results);
         }
 
-        // Finish the progress display
         progress.finish();
 
-        // Store logs (in all modes except JSON, which is meant for machine processing)
         if self.output_mode != OutputMode::Json {
-            self.store_logs(target, &all_results);
+            self.store_logs(target_label_for_logs, &all_results);
         }
 
-        // Print failure details (only in Normal or Verbose mode)
         if show_output {
             self.print_failure_details(&all_results, &progress);
         }

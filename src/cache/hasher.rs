@@ -1,12 +1,12 @@
 //! Hash computation for cache keys
 
 use anyhow::Result;
-use globset::{Glob, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use walkdir::WalkDir;
 
+use crate::cache::matcher::TargetInputMatcher;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
 
@@ -86,39 +86,10 @@ impl CacheHasher {
         plugin_inputs: &CacheInputs,
         user_config: Option<&CacheConfig>,
     ) -> Result<Vec<(String, String)>> {
-        // Build combined glob patterns
-        let mut patterns: Vec<String> = Vec::new();
-        patterns.extend(plugin_inputs.source_globs.clone());
-        patterns.extend(plugin_inputs.config_files.clone());
-
-        if let Some(config) = user_config {
-            patterns.extend(config.include.clone());
-        }
-
-        if patterns.is_empty() {
+        let matcher = TargetInputMatcher::build(&self.project_root, plugin_inputs, user_config)?;
+        if !matcher.has_patterns() {
             return Ok(Vec::new());
         }
-
-        // Build a GlobSet for efficient matching
-        let mut builder = GlobSetBuilder::new();
-        for pattern in &patterns {
-            if let Ok(glob) = Glob::new(pattern) {
-                builder.add(glob);
-            }
-        }
-        let glob_set = builder.build()?;
-
-        // Build exclude set
-        let exclude_patterns: Vec<String> =
-            user_config.map(|c| c.exclude.clone()).unwrap_or_default();
-
-        let mut exclude_builder = GlobSetBuilder::new();
-        for pattern in &exclude_patterns {
-            if let Ok(glob) = Glob::new(pattern) {
-                exclude_builder.add(glob);
-            }
-        }
-        let exclude_set = exclude_builder.build()?;
 
         // Walk directory once and match files
         // Disable symlink following to prevent DoS via symlink cycles
@@ -136,13 +107,7 @@ impl CacheHasher {
                 Err(_) => continue,
             };
 
-            // Skip if excluded
-            if !exclude_set.is_empty() && exclude_set.is_match(rel_path) {
-                continue;
-            }
-
-            // Check if matches any include pattern
-            if glob_set.is_match(rel_path) {
+            if matcher.matches_relative(rel_path) {
                 if let Ok(content) = std::fs::read(entry.path()) {
                     let hash = format!("{:x}", Sha256::digest(&content));
                     file_hashes.push((rel_path.to_string_lossy().to_string(), hash));
