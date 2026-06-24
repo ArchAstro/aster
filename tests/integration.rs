@@ -1737,11 +1737,7 @@ fn test_lang_filter_invalid_language() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    write_package_json(
-        &tmp,
-        "services/api/package.json",
-        r#"{"name": "api"}"#,
-    );
+    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
 
     // Invalid language should produce an error
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))

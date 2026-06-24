@@ -18,7 +18,8 @@ use aster::config::find_workspace_root;
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
-    collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler, Executor,
+    collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler,
+    Executor,
 };
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
@@ -1125,7 +1126,12 @@ fn run() -> Result<()> {
                 } else {
                     projects.iter().collect()
                 };
-                executor.execute(&run_args.target, &executor_projects, &graph, Some(&primary_projects))
+                executor.execute(
+                    &run_args.target,
+                    &executor_projects,
+                    &graph,
+                    Some(&primary_projects),
+                )
             };
 
             // Output results based on mode
@@ -1643,9 +1649,7 @@ fn handle_watch(
             }
             resolved.push(format!("{entry}:{default_target}"));
         } else {
-            return Err(anyhow::anyhow!(
-                "target must start with '//': {entry}"
-            ));
+            return Err(anyhow::anyhow!("target must start with '//': {entry}"));
         }
     }
 
@@ -1653,7 +1657,12 @@ fn handle_watch(
     if !lang.is_empty() {
         let project_lang: HashMap<String, String> = projects
             .iter()
-            .map(|p| (format!("//{}", p.relative_path.display()), p.plugin_name.clone()))
+            .map(|p| {
+                (
+                    format!("//{}", p.relative_path.display()),
+                    p.plugin_name.clone(),
+                )
+            })
             .collect();
         resolved.retain(|addr| {
             let project_addr = addr.rsplit_once(':').map(|(p, _)| p).unwrap_or(addr);

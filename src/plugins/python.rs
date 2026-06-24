@@ -1244,7 +1244,9 @@ name = "mypackage"
         // deps cache should include .venv/pyvenv.cfg so that deleting or
         // recreating the venv invalidates the cache
         assert!(
-            inputs.config_files.contains(&".venv/pyvenv.cfg".to_string()),
+            inputs
+                .config_files
+                .contains(&".venv/pyvenv.cfg".to_string()),
             "deps cache_inputs should include .venv/pyvenv.cfg"
         );
 
@@ -1261,7 +1263,9 @@ name = "mypackage"
         for target in &["test", "lint", "format"] {
             let inputs = plugin.cache_inputs(target);
             assert!(
-                !inputs.config_files.contains(&".venv/pyvenv.cfg".to_string()),
+                !inputs
+                    .config_files
+                    .contains(&".venv/pyvenv.cfg".to_string()),
                 "{target} cache_inputs should not include .venv/pyvenv.cfg"
             );
         }
