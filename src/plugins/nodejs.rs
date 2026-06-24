@@ -19,6 +19,117 @@ struct PackageJson {
     dev_dependencies: Option<HashMap<String, String>>,
     scripts: Option<HashMap<String, String>>,
     workspaces: Option<WorkspacesConfig>,
+    #[serde(rename = "packageManager")]
+    package_manager: Option<String>,
+}
+
+/// Package manager used by a Node.js project.
+///
+/// Aster supports npm and pnpm; the enum is the single source of truth for the
+/// command strings emitted by `detect_targets`. yarn is intentionally deferred
+/// (its `exec` equivalent differs between classic and berry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Npm,
+    Pnpm,
+}
+
+impl PackageManager {
+    /// The CLI binary name.
+    fn binary(self) -> &'static str {
+        match self {
+            PackageManager::Npm => "npm",
+            PackageManager::Pnpm => "pnpm",
+        }
+    }
+
+    /// Command to install all dependencies.
+    fn install(self) -> String {
+        format!("{} install", self.binary())
+    }
+
+    /// Command to run the conventional `test` script.
+    /// Both npm and pnpm accept `<pm> test` as shorthand for `<pm> run test`.
+    fn test(self) -> String {
+        format!("{} test", self.binary())
+    }
+
+    /// Command to run a named script (`<pm> run <script>`).
+    fn run(self, script: &str) -> String {
+        format!("{} run {script}", self.binary())
+    }
+
+    /// Command to execute a locally-installed binary (the `npx` equivalent).
+    fn exec(self, cmd: &str) -> String {
+        match self {
+            PackageManager::Npm => format!("npx {cmd}"),
+            PackageManager::Pnpm => format!("pnpm exec {cmd}"),
+        }
+    }
+
+    /// Name of the exclusive-resource lock used to serialize installs.
+    /// npm and pnpm use distinct global caches/stores, so keying the lock on the
+    /// binary keeps their installs from being needlessly serialized against each
+    /// other while still serializing same-manager installs.
+    fn cache_resource(self) -> String {
+        format!("{}_cache", self.binary())
+    }
+
+    /// Parse the `packageManager` field value (Corepack convention, e.g.
+    /// `"pnpm@9.1.0"`). Returns None for unrecognized managers (yarn, bun, …) so
+    /// detection can fall through to lockfiles/default.
+    fn from_package_manager_field(value: &str) -> Option<Self> {
+        match value.split('@').next().unwrap_or(value) {
+            "npm" => Some(PackageManager::Npm),
+            "pnpm" => Some(PackageManager::Pnpm),
+            _ => None,
+        }
+    }
+}
+
+/// Detect which package manager a Node.js project uses.
+///
+/// Walks up from `project_dir` to `workspace_root` (inclusive). At each level,
+/// closest-wins:
+///   1. a `packageManager` field in that level's package.json (Corepack convention)
+///   2. else a lockfile: `pnpm-lock.yaml` → pnpm, `package-lock.json` → npm
+///
+/// Walking up means workspace members inherit the root's choice (members share
+/// the root lockfile). Defaults to npm when nothing matches.
+fn detect_package_manager(project_dir: &Path, workspace_root: &Path) -> PackageManager {
+    let mut dir = project_dir;
+    loop {
+        // 1. packageManager field (only honored if it names a manager we support)
+        if let Ok(content) = std::fs::read_to_string(dir.join("package.json")) {
+            if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+                if let Some(pm) = pkg
+                    .package_manager
+                    .as_deref()
+                    .and_then(PackageManager::from_package_manager_field)
+                {
+                    return pm;
+                }
+            }
+        }
+
+        // 2. lockfiles
+        if dir.join("pnpm-lock.yaml").exists() {
+            return PackageManager::Pnpm;
+        }
+        if dir.join("package-lock.json").exists() {
+            return PackageManager::Npm;
+        }
+
+        if dir == workspace_root {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+
+    PackageManager::Npm
 }
 
 /// npm workspaces can be either an array of glob patterns or an object with a `packages` field
@@ -148,6 +259,10 @@ impl LanguagePlugin for NodeJsPlugin {
 
         let mut targets = HashMap::new();
 
+        // Determine which package manager this project uses (npm or pnpm).
+        // All generated commands below route through it.
+        let pm = detect_package_manager(ctx.project_dir, ctx.workspace_root);
+
         // Check if this project is a member of an npm workspace.
         // Workspace members share a single node_modules/ at the workspace root,
         // so we skip the per-package deps target entirely and point all dependency
@@ -163,7 +278,7 @@ impl LanguagePlugin for NodeJsPlugin {
             targets.insert(
                 "deps".to_string(),
                 Target {
-                    command: "npm install".to_string(),
+                    command: pm.install(),
                     depends_on: vec![],
                     capabilities: HashSet::new(),
                     files_glob: None,
@@ -171,7 +286,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     cache: None,
                     invalidates_cache: false,
                     working_dir: None,
-                    exclusive_resources: vec!["npm_cache".into()],
+                    exclusive_resources: vec![pm.cache_resource()],
                 },
             );
             "//self:deps".to_string()
@@ -208,7 +323,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     targets.insert(
                         "test".to_string(),
                         Target {
-                            command: "npm test".to_string(),
+                            command: pm.test(),
                             depends_on: base_deps.clone(),
                             capabilities: test_caps,
                             files_glob: None,
@@ -225,7 +340,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 targets.insert(
                     "build".to_string(),
                     Target {
-                        command: "npm run build".to_string(),
+                        command: pm.run("build"),
                         depends_on: base_deps.clone(),
                         capabilities: HashSet::new(),
                         files_glob: None,
@@ -241,7 +356,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 targets.insert(
                     "lint".to_string(),
                     Target {
-                        command: "npm run lint".to_string(),
+                        command: pm.run("lint"),
                         depends_on: base_deps.clone(),
                         capabilities: HashSet::new(),
                         files_glob: None,
@@ -257,7 +372,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 targets.insert(
                     "format".to_string(),
                     Target {
-                        command: "npm run format".to_string(),
+                        command: pm.run("format"),
                         depends_on: format_deps.clone(),
                         capabilities: HashSet::new(),
                         files_glob: None,
@@ -277,7 +392,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     targets.insert(
                         script_name.clone(),
                         Target {
-                            command: format!("npm run {script_name}"),
+                            command: pm.run(&script_name),
                             depends_on: base_deps.clone(),
                             capabilities: HashSet::new(),
                             files_glob: None,
@@ -315,7 +430,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 targets.insert(
                     "format".to_string(),
                     Target {
-                        command: "npx prettier --write .".to_string(),
+                        command: pm.exec("prettier --write ."),
                         depends_on: format_deps,
                         capabilities: HashSet::new(),
                         files_glob: None,
@@ -1710,5 +1825,174 @@ mod tests {
         assert!(build
             .depends_on
             .contains(&"//packages/core:build".to_string()));
+    }
+
+    #[test]
+    fn test_from_package_manager_field() {
+        assert_eq!(
+            PackageManager::from_package_manager_field("npm"),
+            Some(PackageManager::Npm)
+        );
+        assert_eq!(
+            PackageManager::from_package_manager_field("pnpm@9.1.0"),
+            Some(PackageManager::Pnpm)
+        );
+        // Unsupported managers fall through (None) so detection can default.
+        assert_eq!(
+            PackageManager::from_package_manager_field("yarn@4.0.0"),
+            None
+        );
+        assert_eq!(PackageManager::from_package_manager_field("bun"), None);
+    }
+
+    #[test]
+    fn test_detect_pnpm_via_package_manager_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "packageManager": "pnpm@9.1.0", "scripts": {"test": "vitest", "build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"pnpm install".to_string())
+        );
+        assert_eq!(
+            targets.get("test").map(|t| &t.command),
+            Some(&"pnpm test".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"pnpm run build".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_pnpm_via_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+        // No packageManager field — detection falls back to the lockfile.
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        assert_eq!(
+            targets.get("deps").map(|t| &t.command),
+            Some(&"pnpm install".to_string())
+        );
+        assert_eq!(
+            targets.get("build").map(|t| &t.command),
+            Some(&"pnpm run build".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_pnpm_install_uses_pnpm_cache_resource() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "packageManager": "pnpm@9.1.0"}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // pnpm installs serialize on their own resource, not npm's.
+        let deps = targets.get("deps").unwrap();
+        assert_eq!(deps.exclusive_resources, vec!["pnpm_cache".to_string()]);
+    }
+
+    #[test]
+    fn test_detect_pnpm_prettier_uses_pnpm_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"name": "my-app", "packageManager": "pnpm@9.1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".prettierrc"), r#"{"semi": false}"#).unwrap();
+
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        assert_eq!(
+            targets.get("format").map(|t| &t.command),
+            Some(&"pnpm exec prettier --write .".to_string())
+        );
+    }
+
+    #[test]
+    fn test_workspace_member_inherits_pnpm_from_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
+
+        // pnpm workspace root: lockfile at the root, members share it.
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"name": "monorepo", "workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+
+        // Workspace member (no lockfile of its own).
+        let member_dir = workspace_root.join("packages/core");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_pkg = member_dir.join("package.json");
+        std::fs::write(
+            &member_pkg,
+            r#"{"name": "@scope/core", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+
+        // Member infers pnpm by walking up to the root lockfile.
+        let member_ctx = make_context(&member_pkg, &workspace_root, &[]);
+        let member_targets = plugin.detect_targets(&member_ctx).unwrap();
+        assert!(member_targets.get("deps").is_none());
+        assert_eq!(
+            member_targets.get("build").map(|t| &t.command),
+            Some(&"pnpm run build".to_string())
+        );
+        assert!(member_targets
+            .get("build")
+            .unwrap()
+            .depends_on
+            .contains(&"//:deps".to_string()));
+
+        // Root runs pnpm install.
+        let root_pkg = workspace_root.join("package.json");
+        let root_ctx = make_context(&root_pkg, &workspace_root, &[]);
+        let root_targets = plugin.detect_targets(&root_ctx).unwrap();
+        assert_eq!(
+            root_targets.get("deps").map(|t| &t.command),
+            Some(&"pnpm install".to_string())
+        );
     }
 }
