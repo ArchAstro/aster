@@ -194,6 +194,12 @@ aster project init ./myproj  # In specific directory
 | Python | `pyproject.toml` | deps, build, test, lint |
 | Elixir | `mix.exs` | deps, build, test, lint |
 
+For Node.js, aster auto-detects whether the project uses **npm** or **pnpm** and
+emits matching commands (`pnpm install`, `pnpm run build`, `pnpm exec …`). Detection
+prefers the `packageManager` field in `package.json`, then falls back to the lockfile
+(`pnpm-lock.yaml` → pnpm, `package-lock.json` → npm), defaulting to npm. Workspace
+members inherit the manager from their workspace root.
+
 ## License
 
 MIT
