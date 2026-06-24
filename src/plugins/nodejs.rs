@@ -206,41 +206,44 @@ impl LanguagePlugin for NodeJsPlugin {
             .parent()
             .ok_or_else(|| anyhow!("Config path has no parent directory"))?;
 
-        let mut deps = Vec::new();
+        // Map of package name -> member directory for every workspace sibling,
+        // drawn from npm `workspaces` and/or `pnpm-workspace.yaml`. Used to resolve
+        // dependencies declared by name (the `workspace:*` protocol, plain-semver
+        // siblings, and `workspace:` aliases).
+        let workspace_members = resolve_workspace_members(config_path);
 
-        // Extract file: dependencies from both dependencies and devDependencies
+        let mut deps = Vec::new();
+        // Dedupe by resolved path so a package listed in both `dependencies` and
+        // `devDependencies` (or via an alias and directly) yields a single edge.
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+
         for dep_map in [&pkg.dependencies, &pkg.dev_dependencies]
             .into_iter()
             .flatten()
         {
             for (name, version) in dep_map {
-                if let Some(path_str) = version.strip_prefix("file:") {
-                    let path = project_dir.join(path_str);
-                    deps.push(LocalDependency {
-                        name: name.clone(),
-                        path,
-                    });
-                }
-            }
-        }
-
-        // Also detect workspace sibling dependencies by package name
-        let workspace_members = resolve_npm_workspace_members(config_path);
-        if !workspace_members.is_empty() {
-            for dep_map in [&pkg.dependencies, &pkg.dev_dependencies]
-                .into_iter()
-                .flatten()
-            {
-                for (name, version) in dep_map {
-                    // Skip file: deps (already handled above)
-                    if version.starts_with("file:") {
-                        continue;
+                // Resolve this specifier to a member directory, if it denotes a
+                // local inter-project dependency.
+                let resolved = if let Some(path_str) = version.strip_prefix("file:") {
+                    // file: local path dep — resolve relative to this project.
+                    Some(project_dir.join(path_str))
+                } else if let Some(rest) = version.strip_prefix("workspace:") {
+                    // pnpm/yarn(berry)/bun `workspace:` protocol.
+                    match parse_workspace_specifier(rest, name) {
+                        WorkspaceTarget::Path(rel) => Some(project_dir.join(rel)),
+                        WorkspaceTarget::Name(target) => workspace_members.get(target).cloned(),
                     }
-                    // If this dep name matches a workspace sibling, add as local dep
-                    if let Some(member_path) = workspace_members.get(name) {
+                } else {
+                    // Bare sibling reference: the dep key matches a workspace
+                    // member (e.g. npm workspaces declaring `"^1.0.0"`).
+                    workspace_members.get(name).cloned()
+                };
+
+                if let Some(path) = resolved {
+                    if seen_paths.insert(path.clone()) {
                         deps.push(LocalDependency {
                             name: name.clone(),
-                            path: member_path.clone(),
+                            path,
                         });
                     }
                 }
@@ -575,14 +578,56 @@ impl LanguagePlugin for NodeJsPlugin {
     }
 }
 
-/// Resolve all npm workspace members reachable from a package.json's location.
+/// A resolved target for a `workspace:` protocol specifier (the value after the
+/// `workspace:` prefix).
+enum WorkspaceTarget<'a> {
+    /// Path form (`workspace:./pkg`, `workspace:../pkg`): resolve by relative path,
+    /// exactly like a `file:` dep.
+    Path(&'a str),
+    /// Resolve by package name: the dependency key for the plain range forms
+    /// (`workspace:*`, `workspace:^`, `workspace:~`, `workspace:1.2.3`, …), or the
+    /// aliased target name for the alias form (`workspace:@scope/dep@*`).
+    Name(&'a str),
+}
+
+/// Parse the portion of a `workspace:` specifier that follows the `workspace:`
+/// prefix into the workspace member it points at.
 ///
-/// Walks up from `config_path` looking for a parent `package.json` with a `workspaces` field,
-/// then expands workspace glob patterns to build a map of package name → absolute filesystem path
-/// for every workspace member.
+/// `dep_key` is the dependency's own package-name key; it's the resolution target
+/// for the range forms (`*`, `^`, `~`, `1.2.3`, …) that don't name a package.
+fn parse_workspace_specifier<'a>(rest: &'a str, dep_key: &'a str) -> WorkspaceTarget<'a> {
+    // Path form: workspace:./path or workspace:../path
+    if rest.starts_with("./") || rest.starts_with("../") {
+        return WorkspaceTarget::Path(rest);
+    }
+
+    // Alias form: workspace:<targetName>@<range>, where <targetName> may itself be
+    // scoped (e.g. @scope/dep). The delimiter is the `@` separating name from
+    // range — i.e. any `@` other than a leading scope marker. Ranges never
+    // contain `@`, so its presence reliably signals an alias.
+    let scope_offset = usize::from(rest.starts_with('@'));
+    if let Some(rel) = rest[scope_offset..].find('@') {
+        let at = scope_offset + rel;
+        let name = &rest[..at];
+        if !name.is_empty() {
+            return WorkspaceTarget::Name(name);
+        }
+    }
+
+    // Range form: resolve by the dependency key.
+    WorkspaceTarget::Name(dep_key)
+}
+
+/// Resolve all workspace members reachable from a package.json's location.
 ///
-/// Returns an empty map if the package is not inside an npm workspace.
-fn resolve_npm_workspace_members(config_path: &Path) -> HashMap<String, PathBuf> {
+/// Walks up from `config_path` to the nearest workspace root — either a parent
+/// `package.json` with a `workspaces` field (npm/yarn classic) or a
+/// `pnpm-workspace.yaml` (pnpm/yarn-berry/bun) — then expands the workspace glob
+/// patterns to build a map of package name → absolute filesystem path for every
+/// workspace member.
+///
+/// Returns an empty map if the package is not inside a workspace.
+fn resolve_workspace_members(config_path: &Path) -> HashMap<String, PathBuf> {
     let mut members = HashMap::new();
 
     let project_dir = match config_path.parent() {
@@ -590,7 +635,7 @@ fn resolve_npm_workspace_members(config_path: &Path) -> HashMap<String, PathBuf>
         None => return members,
     };
 
-    // Walk up from project_dir looking for a parent package.json with workspaces
+    // Walk up from project_dir looking for the nearest workspace root.
     let mut candidate = project_dir.to_path_buf();
     loop {
         candidate = match candidate.parent() {
@@ -598,35 +643,127 @@ fn resolve_npm_workspace_members(config_path: &Path) -> HashMap<String, PathBuf>
             None => break,
         };
 
-        let parent_pkg_path = candidate.join("package.json");
-        if !parent_pkg_path.exists() {
+        let patterns = workspace_patterns_at(&candidate);
+        if patterns.is_empty() {
             continue;
         }
 
-        let content = match std::fs::read_to_string(&parent_pkg_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let pkg: PackageJson = match serde_json::from_str(&content) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let ws = match pkg.workspaces {
-            Some(ref ws) => ws,
-            None => continue,
-        };
-
-        // Found a workspace root — expand patterns to discover members
-        for pattern in ws.patterns() {
+        // Found a workspace root — expand patterns to discover members.
+        for pattern in &patterns {
+            // Skip pnpm exclusion patterns (e.g. "!packages/excluded").
+            if pattern.starts_with('!') {
+                continue;
+            }
             expand_workspace_pattern(&candidate, pattern, &mut members);
         }
 
-        // Only use the nearest workspace root
+        // Only use the nearest workspace root.
         break;
     }
 
     members
+}
+
+/// Read the workspace glob patterns declared at `dir`, if it is a workspace root.
+///
+/// Prefers a `package.json` `workspaces` field (npm/yarn classic); otherwise falls
+/// back to `pnpm-workspace.yaml` (pnpm/yarn-berry/bun). Returns an empty vec when
+/// `dir` is not a workspace root.
+fn workspace_patterns_at(dir: &Path) -> Vec<String> {
+    // npm/yarn classic: package.json "workspaces"
+    if let Ok(content) = std::fs::read_to_string(dir.join("package.json")) {
+        if let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) {
+            if let Some(ws) = pkg.workspaces {
+                return ws.patterns().to_vec();
+            }
+        }
+    }
+
+    // pnpm/yarn-berry/bun: pnpm-workspace.yaml "packages:"
+    if let Ok(content) = std::fs::read_to_string(dir.join("pnpm-workspace.yaml")) {
+        return parse_pnpm_workspace_packages(&content);
+    }
+
+    Vec::new()
+}
+
+/// Extract the `packages:` glob list from a `pnpm-workspace.yaml`.
+///
+/// Supports both the block-list form and a simple inline flow sequence:
+///
+/// ```yaml
+/// packages:
+///   - 'packages/*'
+///   - "apps/*"
+/// ```
+///
+/// ```yaml
+/// packages: ['packages/*', 'apps/*']
+/// ```
+///
+/// This is a deliberately minimal parser (the project has no YAML dependency); it
+/// reads just the one field aster needs and ignores everything else.
+fn parse_pnpm_workspace_packages(content: &str) -> Vec<String> {
+    let mut packages = Vec::new();
+    let mut in_block = false;
+
+    for raw_line in content.lines() {
+        // Drop trailing comments and surrounding whitespace.
+        let line = raw_line.split('#').next().unwrap_or(raw_line);
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if !in_block {
+            let stripped = match line.trim_start().strip_prefix("packages:") {
+                Some(rest) => rest.trim(),
+                None => continue,
+            };
+
+            if stripped.is_empty() {
+                // Block list follows on subsequent lines.
+                in_block = true;
+            } else if let Some(inner) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+            {
+                // Inline flow sequence: packages: ['a', 'b']
+                for item in inner.split(',') {
+                    let item = unquote_yaml_scalar(item.trim());
+                    if !item.is_empty() {
+                        packages.push(item.to_string());
+                    }
+                }
+                break;
+            }
+            continue;
+        }
+
+        // Inside the block list: collect `- <pattern>` entries.
+        match line.trim_start().strip_prefix('-') {
+            Some(item) => {
+                let item = unquote_yaml_scalar(item.trim());
+                if !item.is_empty() {
+                    packages.push(item.to_string());
+                }
+            }
+            // A non-list line ends the `packages:` block (e.g. another top-level key).
+            None => break,
+        }
+    }
+
+    packages
+}
+
+/// Strip a single layer of matching single or double quotes from a YAML scalar.
+fn unquote_yaml_scalar(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Expand a single npm workspace glob pattern (e.g. "packages/*") relative to the workspace root,
@@ -1993,6 +2130,223 @@ mod tests {
         assert_eq!(
             root_targets.get("deps").map(|t| &t.command),
             Some(&"pnpm install".to_string())
+        );
+    }
+
+    // --- workspace: protocol (pnpm/yarn-berry/bun) ---------------------------
+
+    /// Create a workspace member directory with a buildable package.json.
+    fn write_member(root: &Path, rel: &str, name: &str) -> PathBuf {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name": "{name}", "version": "1.0.0", "scripts": {{"build": "tsc"}}}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_parse_pnpm_workspace_packages() {
+        // Block list, with quotes, a trailing comment, and a following key.
+        let block = "packages:\n  - 'packages/*'\n  - \"apps/*\" # internal\n  - libs/shared\nonlyBuiltDependencies:\n  - esbuild\n";
+        assert_eq!(
+            parse_pnpm_workspace_packages(block),
+            vec!["packages/*", "apps/*", "libs/shared"]
+        );
+
+        // Inline flow sequence.
+        let inline = "packages: ['packages/*', \"apps/*\"]\n";
+        assert_eq!(
+            parse_pnpm_workspace_packages(inline),
+            vec!["packages/*", "apps/*"]
+        );
+
+        // Exclusion patterns are returned verbatim; the caller filters them.
+        let excl = "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n";
+        assert_eq!(
+            parse_pnpm_workspace_packages(excl),
+            vec!["packages/*", "!packages/excluded"]
+        );
+
+        // A file without a packages: key yields nothing.
+        assert!(parse_pnpm_workspace_packages("name: foo\n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_workspace_specifier_forms() {
+        fn target<'a>(spec: &'a str, key: &'a str) -> (Option<&'a str>, Option<&'a str>) {
+            match parse_workspace_specifier(spec, key) {
+                WorkspaceTarget::Name(n) => (Some(n), None),
+                WorkspaceTarget::Path(p) => (None, Some(p)),
+            }
+        }
+
+        // Range forms resolve by the dependency key.
+        for range in ["*", "^", "~", "^1.2.3", "~1.2.3", "1.2.3", ">=1.0.0"] {
+            assert_eq!(target(range, "@scope/dep"), (Some("@scope/dep"), None));
+        }
+
+        // Alias forms resolve by the aliased target name (scoped and unscoped).
+        assert_eq!(
+            target("@scope/dep@*", "alias-key"),
+            (Some("@scope/dep"), None)
+        );
+        assert_eq!(target("plain@^1.0.0", "alias-key"), (Some("plain"), None));
+
+        // Path forms resolve by relative path.
+        assert_eq!(target("./pkg", "k"), (None, Some("./pkg")));
+        assert_eq!(target("../pkg", "k"), (None, Some("../pkg")));
+    }
+
+    #[test]
+    fn test_parse_workspace_protocol_resolves_all_forms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // pnpm workspace root — members live in pnpm-workspace.yaml, not package.json.
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+
+        let star = write_member(&root, "packages/star", "@scope/star");
+        let caret = write_member(&root, "packages/caret", "@scope/caret");
+        let tilde = write_member(&root, "packages/tilde", "@scope/tilde");
+        let pinned = write_member(&root, "packages/pinned", "@scope/pinned");
+        let aliased = write_member(&root, "packages/aliased", "@scope/aliased");
+        let pathdep = write_member(&root, "packages/pathdep", "@scope/pathdep");
+
+        // Consumer depends on each member via a different workspace: form.
+        let consumer_dir = root.join("packages/consumer");
+        std::fs::create_dir_all(&consumer_dir).unwrap();
+        let consumer_pkg = consumer_dir.join("package.json");
+        std::fs::write(
+            &consumer_pkg,
+            r#"{
+                "name": "@scope/consumer",
+                "scripts": {"build": "tsc"},
+                "dependencies": {
+                    "@scope/star": "workspace:*",
+                    "@scope/caret": "workspace:^",
+                    "@scope/tilde": "workspace:~1.2.3",
+                    "@scope/pinned": "workspace:1.0.0",
+                    "alias-key": "workspace:@scope/aliased@*",
+                    "@scope/pathdep": "workspace:../pathdep"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&consumer_pkg).unwrap();
+
+        // Canonicalize to normalize the `..` left in the path form.
+        let resolved: HashSet<PathBuf> = deps
+            .iter()
+            .map(|d| d.path.canonicalize().unwrap())
+            .collect();
+
+        for (label, expected) in [
+            ("workspace:*", &star),
+            ("workspace:^", &caret),
+            ("workspace:~1.2.3", &tilde),
+            ("workspace:1.0.0", &pinned),
+            ("alias", &aliased),
+            ("path", &pathdep),
+        ] {
+            let expected = expected.canonicalize().unwrap();
+            assert!(
+                resolved.contains(&expected),
+                "{label} form should resolve to {}; got {resolved:?}",
+                expected.display()
+            );
+        }
+        assert_eq!(deps.len(), 6, "expected exactly six workspace deps");
+    }
+
+    #[test]
+    fn test_parse_workspace_protocol_in_dev_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        let dep = write_member(&root, "packages/dep", "@scope/dep");
+
+        let consumer_dir = root.join("packages/consumer");
+        std::fs::create_dir_all(&consumer_dir).unwrap();
+        let consumer_pkg = consumer_dir.join("package.json");
+        std::fs::write(
+            &consumer_pkg,
+            r#"{
+                "name": "@scope/consumer",
+                "scripts": {"build": "tsc"},
+                "devDependencies": { "@scope/dep": "workspace:*" }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&consumer_pkg).unwrap();
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "@scope/dep");
+        assert_eq!(deps[0].path, dep);
+    }
+
+    #[test]
+    fn test_workspace_protocol_end_to_end_targets_pnpm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // pnpm workspace with a lockfile so the members resolve to pnpm commands.
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+
+        let _dep = write_member(&root, "packages/dep", "@scope/dep");
+
+        let consumer_dir = root.join("packages/consumer");
+        std::fs::create_dir_all(&consumer_dir).unwrap();
+        let consumer_pkg = consumer_dir.join("package.json");
+        std::fs::write(
+            &consumer_pkg,
+            r#"{
+                "name": "@scope/consumer",
+                "scripts": {"build": "tsc"},
+                "dependencies": { "@scope/dep": "workspace:*" }
+            }"#,
+        )
+        .unwrap();
+
+        let plugin = NodeJsPlugin;
+        let deps = plugin.parse_dependencies(&consumer_pkg).unwrap();
+        let ctx = TargetContext {
+            config_path: &consumer_pkg,
+            project_dir: &consumer_dir,
+            workspace_root: &root,
+            dependencies: &deps,
+        };
+        let targets = plugin.detect_targets(&ctx).unwrap();
+
+        // The headline fix: consumer:build must depend on the dependency's build,
+        // so it is ordered after it.
+        let build = targets.get("build").unwrap();
+        assert!(
+            build
+                .depends_on
+                .contains(&"//packages/dep:build".to_string()),
+            "consumer:build should depend on //packages/dep:build; got {:?}",
+            build.depends_on
         );
     }
 }

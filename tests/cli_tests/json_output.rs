@@ -7,7 +7,7 @@ use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use super::{setup_workspace, write_package_json};
+use super::{setup_workspace, write_file, write_package_json};
 
 /// Helper to create a workspace with multiple Node.js projects
 fn setup_workspace_with_projects() -> TempDir {
@@ -245,4 +245,70 @@ fn test_json_flag_produces_valid_json_for_all_commands() {
         let _: Value = serde_json::from_str(&stdout)
             .unwrap_or_else(|e| panic!("Command {args:?} did not produce valid JSON: {e}"));
     }
+}
+
+/// A pnpm workspace (members in pnpm-workspace.yaml) where the consumer depends on
+/// the dependency via the `workspace:*` protocol. aster must infer a build edge so
+/// the dependency builds before the consumer.
+#[test]
+fn test_pnpm_workspace_protocol_build_edge() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    // pnpm workspace root: members declared in pnpm-workspace.yaml, not package.json.
+    write_file(&tmp, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    write_file(&tmp, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+
+    write_package_json(
+        &tmp,
+        "packages/dep/package.json",
+        r#"{"name": "@scope/dep", "scripts": {"build": "tsc"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "packages/consumer/package.json",
+        r#"{"name": "@scope/consumer", "scripts": {"build": "tsc"},
+            "dependencies": {"@scope/dep": "workspace:*"}}"#,
+    );
+
+    // graph --json exposes target-level edges (target -> its dependencies).
+    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "graph"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Command failed: {output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(&stdout).expect("Should be valid JSON object");
+    let edges = parsed.get("edges").unwrap().as_object().unwrap();
+
+    let consumer_build = edges
+        .get("//packages/consumer:build")
+        .and_then(|v| v.as_array())
+        .expect("consumer:build node should exist");
+    assert!(
+        consumer_build.contains(&Value::String("//packages/dep:build".to_string())),
+        "consumer:build should depend on //packages/dep:build; got {consumer_build:?}"
+    );
+
+    // why confirms there is a dependency path from the consumer's build to the dep's.
+    let mut why = Command::cargo_bin("aster").unwrap();
+    let why_out = why
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "why",
+            "//packages/consumer:build",
+            "//packages/dep:build",
+        ])
+        .output()
+        .unwrap();
+    assert!(why_out.status.success(), "why failed: {why_out:?}");
+    let why_json: Value = serde_json::from_str(&String::from_utf8_lossy(&why_out.stdout)).unwrap();
+    assert!(
+        why_json.get("path").map(|p| !p.is_null()).unwrap_or(false),
+        "expected a dependency path consumer:build -> dep:build; got {why_json}"
+    );
 }
