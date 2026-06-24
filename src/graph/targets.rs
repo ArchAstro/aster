@@ -152,16 +152,16 @@ impl TargetGraph {
                     in_stack[node.index()] = true;
                     path.push(node);
                 }
-                DfsEvent::TreeEdge(_, target) | DfsEvent::BackEdge(_, target) => {
-                    if in_stack[target.index()] {
-                        // Found a cycle - extract it
-                        let cycle_start = path.iter().position(|&n| n == target).unwrap();
-                        let cycle: Vec<String> = path[cycle_start..]
-                            .iter()
-                            .map(|&idx| self.graph[idx].address.clone())
-                            .collect();
-                        return Control::Break(cycle);
-                    }
+                DfsEvent::TreeEdge(_, target) | DfsEvent::BackEdge(_, target)
+                    if in_stack[target.index()] =>
+                {
+                    // Found a cycle - extract it
+                    let cycle_start = path.iter().position(|&n| n == target).unwrap();
+                    let cycle: Vec<String> = path[cycle_start..]
+                        .iter()
+                        .map(|&idx| self.graph[idx].address.clone())
+                        .collect();
+                    return Control::Break(cycle);
                 }
                 DfsEvent::Finish(node, _) => {
                     in_stack[node.index()] = false;

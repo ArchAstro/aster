@@ -73,12 +73,7 @@ pub fn run_watch(
     let requested_non_stream: HashSet<String> = plan
         .requested
         .iter()
-        .filter(|addr| {
-            !plan
-                .targets
-                .iter()
-                .any(|t| t.address == **addr && t.stream)
-        })
+        .filter(|addr| !plan.targets.iter().any(|t| t.address == **addr && t.stream))
         .cloned()
         .collect();
 
@@ -228,11 +223,7 @@ where
 
         // Drain additional events within the debounce window.
         let deadline = Instant::now() + opts.debounce;
-        loop {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
-            };
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match event_rx.recv_timeout(remaining) {
                 Ok(Ok(ev)) => process_event(
                     &ev,
@@ -405,11 +396,7 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::path::PathBuf;
 
-    fn mk_project(
-        rel: &str,
-        abs_root: &str,
-        targets: &[(&str, Vec<&str>)],
-    ) -> DiscoveredProject {
+    fn mk_project(rel: &str, abs_root: &str, targets: &[(&str, Vec<&str>)]) -> DiscoveredProject {
         let mut target_map = StdHashMap::new();
         for (name, deps) in targets {
             target_map.insert(
@@ -490,7 +477,11 @@ mod tests {
         }
     }
 
-    fn run_event(f: &Fixture, event: &Event, suppress_until: Instant) -> (HashSet<String>, Vec<PathBuf>) {
+    fn run_event(
+        f: &Fixture,
+        event: &Event,
+        suppress_until: Instant,
+    ) -> (HashSet<String>, Vec<PathBuf>) {
         let mut pending = HashSet::new();
         let mut trigger_paths = Vec::new();
         process_event(
@@ -730,7 +721,10 @@ mod tests {
 
     impl Dispatches {
         fn record(&self, primary: HashSet<String>, delay: Option<Duration>) {
-            self.calls.lock().unwrap().push(DispatchCall { primary, delay });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(DispatchCall { primary, delay });
         }
 
         fn count(&self) -> usize {
@@ -1056,10 +1050,7 @@ mod tests {
 
         // poll_stream fires every 250ms — wait for at least 2 ticks.
         assert!(
-            wait_until(
-                || ticks.load(Ordering::SeqCst) >= 2,
-                Duration::from_secs(2),
-            ),
+            wait_until(|| ticks.load(Ordering::SeqCst) >= 2, Duration::from_secs(2),),
             "idle tick never fired"
         );
 

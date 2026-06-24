@@ -81,12 +81,9 @@ impl WatchPlan {
                 .map(|p| p.cache_inputs(&node.target_name))
                 .unwrap_or_default();
 
-            let matcher = TargetInputMatcher::build(
-                &project.root,
-                &plugin_inputs,
-                target_def.cache.as_ref(),
-            )
-            .with_context(|| format!("failed to build input matcher for {addr}"))?;
+            let matcher =
+                TargetInputMatcher::build(&project.root, &plugin_inputs, target_def.cache.as_ref())
+                    .with_context(|| format!("failed to build input matcher for {addr}"))?;
 
             let uses_fallback = !matcher.has_patterns();
 
@@ -112,7 +109,7 @@ impl WatchPlan {
             .iter()
             .map(|t| (t.project_root.clone(), t.project_address.clone()))
             .collect();
-        project_by_root.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        project_by_root.sort_by_key(|p| std::cmp::Reverse(p.0.as_os_str().len()));
         project_by_root.dedup_by(|a, b| a.0 == b.0);
 
         Ok(Self {
@@ -448,8 +445,16 @@ mod tests {
         )
         .unwrap();
 
-        let a = plan.targets.iter().find(|t| t.address == "//a:build").unwrap();
-        let b = plan.targets.iter().find(|t| t.address == "//b:build").unwrap();
+        let a = plan
+            .targets
+            .iter()
+            .find(|t| t.address == "//a:build")
+            .unwrap();
+        let b = plan
+            .targets
+            .iter()
+            .find(|t| t.address == "//b:build")
+            .unwrap();
         assert!(!a.uses_fallback, "nodejs plugin provides inputs");
         assert!(b.uses_fallback);
 

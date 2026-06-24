@@ -1487,5 +1487,4 @@ mod tests {
         assert_eq!(result.output, "test output");
         assert_eq!(result.duration_ms, 100);
     }
-
 }

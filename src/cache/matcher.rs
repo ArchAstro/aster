@@ -151,12 +151,9 @@ mod tests {
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
         };
-        let m = TargetInputMatcher::build(
-            Path::new("/p"),
-            &inputs(&["src/**/*.ts"], &[]),
-            Some(&user),
-        )
-        .unwrap();
+        let m =
+            TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))
+                .unwrap();
         assert!(m.matches_relative(Path::new("src/foo.ts")));
         assert!(!m.matches_relative(Path::new("src/foo.test.ts")));
     }
@@ -168,12 +165,9 @@ mod tests {
             exclude: vec![],
             env: vec![],
         };
-        let m = TargetInputMatcher::build(
-            Path::new("/p"),
-            &inputs(&["src/**/*.ts"], &[]),
-            Some(&user),
-        )
-        .unwrap();
+        let m =
+            TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))
+                .unwrap();
         assert!(m.matches_relative(Path::new("src/foo.ts")));
         assert!(m.matches_relative(Path::new("extra/data.json")));
     }

@@ -282,7 +282,11 @@ fn watch_ignores_node_modules_changes() {
     setup_workspace(&tmp);
     write(&tmp, "libs/core/package.json", &nodejs_package("core"));
     write(&tmp, "libs/core/src/index.ts", "export const x = 1;\n");
-    write(&tmp, "libs/core/node_modules/foo/index.js", "module.exports = 1;\n");
+    write(
+        &tmp,
+        "libs/core/node_modules/foo/index.js",
+        "module.exports = 1;\n",
+    );
 
     let mut cmd = Command::new(aster_bin());
     cmd.current_dir(tmp.path())
@@ -338,7 +342,11 @@ fn watch_reruns_dependent_target_on_dep_source_change() {
     // Give notify time to register the watch.
     thread::sleep(Duration::from_millis(500));
     // Touch the core source file.
-    fs::write(tmp.path().join("libs/core/src/index.ts"), "export const x = 2;\n").unwrap();
+    fs::write(
+        tmp.path().join("libs/core/src/index.ts"),
+        "export const x = 2;\n",
+    )
+    .unwrap();
 
     // Expect the change banner AND the start of libs/core:build.
     let change = wait_for_line(&rx, "change:", Duration::from_secs(8));

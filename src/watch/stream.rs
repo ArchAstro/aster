@@ -333,7 +333,8 @@ mod tests {
         let dir = tempdir();
         let mut sup = StreamSupervisor::new(Duration::from_secs(1));
         // A child that exits immediately with code 0.
-        sup.spawn("//a:dev", &mk_target("true"), dir.path()).unwrap();
+        sup.spawn("//a:dev", &mk_target("true"), dir.path())
+            .unwrap();
 
         // Give the short-lived child time to exit.
         std::thread::sleep(Duration::from_millis(200));
