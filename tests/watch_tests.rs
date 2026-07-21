@@ -32,7 +32,25 @@ fn aster_bin() -> &'static str {
 /// kill the process.
 fn spawn_capturing(mut cmd: Command) -> (std::process::Child, mpsc::Receiver<String>) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Aster's shutdown handler terminates its process group so streamed target
+    // descendants cannot be orphaned. Give the test child its own group; CI
+    // shells run without job control and would otherwise share the cargo test
+    // process group, causing SIGTERM cleanup to cancel the entire job.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
     let mut child = cmd.spawn().expect("spawn aster watch");
+    #[cfg(unix)]
+    assert_eq!(
+        unsafe { libc::getpgid(child.id() as i32) },
+        child.id() as i32,
+        "watch test child must own its process group"
+    );
+
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 

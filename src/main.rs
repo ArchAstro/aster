@@ -14,14 +14,14 @@ use aster::cli::{
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
     ProjectInfo, WhyOutput,
 };
-use aster::config::find_workspace_root;
+use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
     collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler,
     Executor,
 };
-use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector};
+use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector, AffectedIgnore};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
 use aster::plugins::{
     ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, RustPlugin, Target,
@@ -414,8 +414,19 @@ fn run() -> Result<()> {
                     )
                 })?;
 
+            // Affected ignores are distinct from discovery ignores: they remove
+            // matching Git changes before ownership, rationale, and files-list handling.
+            let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+            let unfiltered_count = changed_files.len();
+            let changed_files =
+                AffectedIgnore::build(&workspace_config.affected)?.filter(changed_files);
+
             if output_mode == OutputMode::Verbose {
                 eprintln!("[aster] Found {} changed files", changed_files.len());
+                let ignored_count = unfiltered_count - changed_files.len();
+                if ignored_count > 0 {
+                    eprintln!("[aster] Ignored {ignored_count} changed files via affected.ignore");
+                }
                 for file in &changed_files {
                     eprintln!("  - {}", file.display());
                 }

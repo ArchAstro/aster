@@ -12,6 +12,18 @@ pub struct WorkspaceConfig {
     /// Watch mode configuration
     #[serde(default)]
     pub watch: WatchWorkspaceConfig,
+
+    /// Affected-command configuration
+    #[serde(default)]
+    pub affected: AffectedWorkspaceConfig,
+}
+
+/// Configuration controlling which Git changes participate in affected analysis.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AffectedWorkspaceConfig {
+    /// Workspace-relative glob patterns excluded from affected analysis.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 /// Watch-mode configuration controlling fs-event ignore and suppression behavior.
@@ -50,7 +62,8 @@ impl WorkspaceConfig {
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
         // Parse TOML - workspace config fields are at the top level
-        let config: WorkspaceConfig = toml::from_str(&content).unwrap_or_default();
+        let config: WorkspaceConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         Ok(config)
     }
@@ -193,6 +206,27 @@ debounce_ms = 500
     }
 
     #[test]
+    fn test_workspace_config_load_with_affected_section() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join("aster.toml"),
+            r#"
+[affected]
+ignore = [".agents/**", ".claude/skills/**"]
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert_eq!(
+            config.affected.ignore,
+            vec![".agents/**".to_string(), ".claude/skills/**".to_string()]
+        );
+    }
+
+    #[test]
     fn test_workspace_config_watch_defaults() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -232,6 +266,7 @@ ignore = ["vendor/**", "examples/**"]
 
         let config = WorkspaceConfig::load(root).unwrap();
         assert!(config.ignore.is_empty());
+        assert!(config.affected.ignore.is_empty());
     }
 
     #[test]
@@ -242,6 +277,19 @@ ignore = ["vendor/**", "examples/**"]
         // No aster.toml file
         let config = WorkspaceConfig::load(root).unwrap();
         assert!(config.ignore.is_empty());
+        assert!(config.affected.ignore.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_config_reports_invalid_toml() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("aster.toml"), "[affected\nignore = []").unwrap();
+
+        let error = WorkspaceConfig::load(root).err().unwrap();
+
+        assert!(error.to_string().contains("Failed to parse"));
+        assert!(error.to_string().contains("aster.toml"));
     }
 
     #[test]
