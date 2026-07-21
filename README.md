@@ -77,6 +77,22 @@ aster affected test --dry-run
 aster affected test --dependents
 ```
 
+Exclude workspace metadata or generated files from affected analysis in the
+root `aster.toml`. Patterns are workspace-relative and are applied to Git changes
+before Aster maps files to projects:
+
+```toml
+[affected]
+ignore = [
+  ".agents/**",
+  ".claude/skills/**",
+  "docs/generated/**",
+]
+```
+
+This setting only controls `aster affected`; the top-level `ignore` setting
+continues to control project discovery.
+
 ### Heterogeneous runs
 
 Run different targets on different projects:

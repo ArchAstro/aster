@@ -5,6 +5,8 @@
 
 pub mod affected;
 pub mod file_owner;
+pub mod ignore;
 
 pub use affected::AffectedDetector;
 pub use file_owner::{affected_with_dependents, files_to_projects};
+pub use ignore::AffectedIgnore;

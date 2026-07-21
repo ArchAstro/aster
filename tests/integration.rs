@@ -807,6 +807,240 @@ fn test_affected_no_changes() {
 }
 
 #[test]
+fn test_affected_ignore_prevents_root_project_from_claiming_ignored_changes() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "package.json",
+        r#"{"name": "workspace", "scripts": {"test": "true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        r#"
+[affected]
+ignore = [".agents/**/*.md"]
+"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    fs::create_dir_all(tmp.path().join(".agents/skills/example")).unwrap();
+    fs::write(
+        tmp.path().join(".agents/skills/example/SKILL.md"),
+        "new untracked skill",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No projects affected"),
+        "Root project should not claim ignored paths: {stdout}"
+    );
+}
+
+#[test]
+fn test_affected_ignore_filters_verbose_and_dry_run_file_lists() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "package.json",
+        r#"{"name": "workspace", "scripts": {"test": "true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        r#"
+[affected]
+ignore = [".agents/**"]
+
+[targets.test]
+command = "./capture-files.sh {files}"
+capabilities = ["files_list"]
+"#,
+    );
+    fs::write(
+        tmp.path().join("capture-files.sh"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > affected-files.txt\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(tmp.path().join("capture-files.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(tmp.path().join("capture-files.sh"), permissions).unwrap();
+    }
+    fs::create_dir_all(tmp.path().join(".agents/skills/example")).unwrap();
+    fs::write(
+        tmp.path().join(".agents/skills/example/SKILL.md"),
+        "original",
+    )
+    .unwrap();
+    git_commit(&tmp, "Initial commit");
+
+    fs::write(
+        tmp.path().join(".agents/skills/example/SKILL.md"),
+        "updated",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name": "workspace", "scripts": {"test": "true"}, "private": true}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--verbose",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--dry-run",
+            "--only-affected-files",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("//:test"),
+        "Root package should remain affected: {stdout}"
+    );
+    assert!(
+        stdout.contains("package.json"),
+        "Expected real changed file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("SKILL.md") && !stderr.contains("SKILL.md"),
+        "Ignored file leaked into affected output: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Found 1 changed files")
+            && stderr.contains("Ignored 1 changed files via affected.ignore"),
+        "Expected verbose counts after filtering: {stderr}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--only-affected-files",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let affected_files =
+        fs::read_to_string(tmp.path().join("affected-files.txt")).unwrap_or_else(|error| {
+            panic!(
+                "files-list command did not write output: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(affected_files.trim(), "package.json");
+}
+
+#[test]
+fn test_affected_ignore_rejects_invalid_glob() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(&tmp, "package.json", r#"{"name": "workspace"}"#);
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        r#"
+[affected]
+ignore = ["["]
+"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid affected.ignore pattern: ["),
+        "Expected invalid pattern context: {stderr}"
+    );
+}
+
+#[test]
+fn test_affected_ignore_filters_rename_paths_independently() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "package.json",
+        r#"{"name": "workspace", "scripts": {"test": "true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        r#"
+[affected]
+ignore = [".agents/**"]
+"#,
+    );
+    fs::write(tmp.path().join("runtime.js"), "content").unwrap();
+    git_commit(&tmp, "Initial commit");
+
+    fs::create_dir_all(tmp.path().join(".agents/archive")).unwrap();
+    let status = Command::new("git")
+        .args(["mv", "runtime.js", ".agents/archive/runtime.js"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    git_commit(&tmp, "Move runtime file into ignored metadata");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD~1",
+            "--head=HEAD",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("runtime.js"),
+        "The non-ignored old rename path should remain affected: {stdout}"
+    );
+    assert!(
+        !stdout.contains(".agents/archive/runtime.js"),
+        "The ignored new rename path should be filtered: {stdout}"
+    );
+}
+
+#[test]
 fn test_affected_detects_uncommitted_changes() {
     let tmp = TempDir::new().unwrap();
     setup_git_repo(&tmp);

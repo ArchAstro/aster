@@ -78,6 +78,7 @@ impl AffectedDetector {
     pub fn uncommitted_changes(&self) -> Result<HashSet<PathBuf>> {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
             .include_ignored(false)
             .include_unmodified(false);
 
@@ -195,6 +196,24 @@ mod tests {
         let changes = detector.uncommitted_changes().unwrap();
 
         assert!(changes.contains(&PathBuf::from("new_file.txt")));
+    }
+
+    #[test]
+    fn test_uncommitted_changes_recurses_into_untracked_directories() {
+        let tmp = TempDir::new().unwrap();
+        setup_git_repo(&tmp);
+        fs::create_dir_all(tmp.path().join(".agents/skills/example")).unwrap();
+        fs::write(
+            tmp.path().join(".agents/skills/example/SKILL.md"),
+            "content",
+        )
+        .unwrap();
+
+        let detector = AffectedDetector::new(tmp.path()).unwrap();
+        let changes = detector.uncommitted_changes().unwrap();
+
+        assert!(changes.contains(&PathBuf::from(".agents/skills/example/SKILL.md")));
+        assert!(!changes.contains(&PathBuf::from(".agents/")));
     }
 
     #[test]
