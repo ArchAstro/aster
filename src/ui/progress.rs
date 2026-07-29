@@ -229,31 +229,9 @@ impl ProgressDisplay {
     }
 
     /// Mark a target as cached (no execution needed)
-    pub fn mark_cached(&mut self, address: &str) {
+    pub fn mark_cached(&mut self, _address: &str) {
         self.cached.fetch_add(1, Ordering::SeqCst);
         self.refresh_status();
-
-        // Show cached status (in all modes - it's useful to see)
-        if self.enabled {
-            if self.ci_mode {
-                // CI mode: include timestamp
-                eprintln!(
-                    "{} {} {} {}",
-                    style(format_timestamp()).dim(),
-                    style("✓").cyan(),
-                    address,
-                    style("cached").cyan()
-                );
-            } else {
-                let msg = format!(
-                    "{} {} {}",
-                    style("✓").cyan(),
-                    address,
-                    style("cached").cyan()
-                );
-                let _ = self.multi.println(msg);
-            }
-        }
     }
 
     /// Mark a target as complete
