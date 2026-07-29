@@ -224,6 +224,24 @@ fn assert_no_line_containing(
     observed
 }
 
+/// Discard platform watcher events that predate the startup banner.
+///
+/// macOS FSEvents may report fixture files created immediately before the
+/// watcher registered. Those lines must not be attributed to the later edit
+/// each test is trying to classify.
+fn drain_startup_events(rx: &mpsc::Receiver<String>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 #[test]
 fn watch_ignores_non_input_file_changes() {
     let tmp = TempDir::new().unwrap();
@@ -243,8 +261,7 @@ fn watch_ignores_non_input_file_changes() {
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
 
-    // Let notify register before editing.
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     // Touch a file the build target's cache_inputs does NOT cover. The watcher
     // must not emit a change banner or rebuild.
@@ -278,7 +295,7 @@ fn watch_ignores_dotgit_changes() {
 
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     // Simulate a git internal write.
     fs::write(tmp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -313,7 +330,7 @@ fn watch_ignores_node_modules_changes() {
 
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     fs::write(
         tmp.path().join("libs/core/node_modules/foo/index.js"),
@@ -353,8 +370,7 @@ fn watch_reruns_dependent_target_on_dep_source_change() {
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
 
-    // Give notify time to register the watch.
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
     // Touch the core source file.
     fs::write(
         tmp.path().join("libs/core/src/index.ts"),
