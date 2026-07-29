@@ -1146,24 +1146,34 @@ fn print_heterogeneous_summary(
 ) {
     use console::style;
 
-    let passed = results.iter().filter(|r| r.success && !r.skipped).count();
+    let cached = results.iter().filter(|r| r.cached).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.success && !r.skipped && !r.cached)
+        .count();
     let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
     let skipped = results.iter().filter(|r| r.skipped).count();
+    let cached_summary = if cached > 0 {
+        format!(", {cached} cached")
+    } else {
+        String::new()
+    };
 
     if output_mode == OutputMode::Quiet {
-        println!("{passed} passed, {failed} failed");
+        println!("{passed} passed{cached_summary}, {failed} failed");
         return;
     }
 
     println!();
     println!(
-        "{} {} passed, {} failed{}",
+        "{} {} passed{}, {} failed{}",
         if failed > 0 {
             style("✗").red()
         } else {
             style("✓").green()
         },
         passed,
+        cached_summary,
         failed,
         if skipped > 0 {
             format!(", {skipped} skipped")

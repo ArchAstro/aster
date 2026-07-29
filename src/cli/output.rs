@@ -131,10 +131,19 @@ pub fn print_summary(
     }
 
     let skipped = results.iter().filter(|r| r.skipped).count();
-    let passed = results.iter().filter(|r| r.success && !r.skipped).count();
+    let cached = results.iter().filter(|r| r.cached).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.success && !r.skipped && !r.cached)
+        .count();
     let failed = results.iter().filter(|r| !r.success).count();
     let total = results.len();
     let total_duration: u128 = results.iter().map(|r| r.duration_ms).sum();
+    let cached_summary = if cached > 0 {
+        format!(", {cached} cached")
+    } else {
+        String::new()
+    };
 
     let context = if is_affected {
         "affected projects"
@@ -145,9 +154,9 @@ pub fn print_summary(
     if mode == OutputMode::Quiet {
         // Single line summary for quiet mode
         if failed > 0 {
-            eprintln!("{passed} passed, {failed} failed");
+            eprintln!("{passed} passed{cached_summary}, {failed} failed");
         } else {
-            eprintln!("{passed} passed");
+            eprintln!("{passed} passed{cached_summary}");
         }
         return;
     }
@@ -156,10 +165,12 @@ pub fn print_summary(
     println!("\n=== Summary ===");
     if skipped > 0 {
         println!(
-            "Ran '{target}' on {total} {context}: {passed} passed, {failed} failed, {skipped} skipped (no target)"
+            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed, {skipped} skipped (no target)"
         );
     } else {
-        println!("Ran '{target}' on {total} {context}: {passed} passed, {failed} failed");
+        println!(
+            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed"
+        );
     }
     println!("Total time: {total_duration}ms");
 
