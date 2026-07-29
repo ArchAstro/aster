@@ -28,6 +28,20 @@ cargo install --git https://github.com/ArchAstro/aster.git --locked
 Prebuilt release archives are available for Linux x86-64, macOS x86-64, and
 macOS Apple Silicon. Windows is not currently built or tested by the project.
 
+### Native Linux packages
+
+Tagged releases also include native x86-64 packages for Debian/Ubuntu, RPM-based
+distributions, and Arch Linux. Download the package for your distribution from
+the GitHub release, then install it with the system package manager:
+
+```console
+sudo apt install ./aster_VERSION_amd64.deb
+sudo dnf install ./aster-VERSION-1.x86_64.rpm
+sudo pacman -U ./aster-VERSION-1-x86_64.pkg.tar.zst
+```
+
+These packages currently target x86-64 Linux systems with glibc 2.35 or newer.
+
 ## Quick start
 
 Run the same target across a workspace:

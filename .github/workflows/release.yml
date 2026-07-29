@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: "1.88"
           components: clippy, rustfmt
       - name: Validate tag and package version
         id: version
@@ -46,7 +47,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             artifact: aster-linux-x64
           - target: x86_64-apple-darwin
             os: macos-15-intel
@@ -58,17 +59,31 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: "1.88"
           targets: ${{ matrix.target }}
       - run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Smoke test
         run: target/${{ matrix.target }}/release/aster --version
       - name: Package
         shell: bash
-        run: tar -C "target/${{ matrix.target }}/release" -czf "${{ matrix.artifact }}.tar.gz" aster
+        run: |
+          mkdir dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact }}.tar.gz" aster
+      - name: Install nFPM
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          scripts/install-nfpm "${RUNNER_TEMP}/nfpm"
+          echo "${RUNNER_TEMP}/nfpm" >> "${GITHUB_PATH}"
+      - name: Build native Linux packages
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: scripts/package-linux "${{ needs.verify.outputs.version }}" "target/${{ matrix.target }}/release/aster" dist
+      - name: Smoke-test native Linux packages
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: scripts/test-linux-packages "${{ needs.verify.outputs.version }}" dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          path: dist/
           if-no-files-found: error
 
   release:
@@ -86,16 +101,18 @@ jobs:
       - name: Create checksums
         run: |
           mkdir release-assets
-          find artifacts -name '*.tar.gz' -exec cp '{}' release-assets/ \;
+          find artifacts -type f \
+            \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) \
+            -exec cp '{}' release-assets/ \;
           cd release-assets
-          sha256sum ./*.tar.gz | sed 's#  \./#  #' > ../SHA256SUMS
+          sha256sum ./* | sed 's#  \./#  #' > ../SHA256SUMS
       - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          subject-path: release-assets/*.tar.gz
+          subject-path: release-assets/*
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
-            release-assets/*.tar.gz
+            release-assets/*
             SHA256SUMS
           generate_release_notes: true
 

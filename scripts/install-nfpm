@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $0 <install-directory>" >&2
+  exit 2
+fi
+
+readonly version="2.47.0"
+readonly archive="nfpm_${version}_Linux_x86_64.tar.gz"
+readonly checksum="0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+readonly url="https://github.com/goreleaser/nfpm/releases/download/v${version}/${archive}"
+readonly install_dir="$1"
+
+mkdir -p "${install_dir}"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+curl --fail --location --silent --show-error "${url}" --output "${tmp_dir}/${archive}"
+echo "${checksum}  ${tmp_dir}/${archive}" | sha256sum --check --status
+tar -xzf "${tmp_dir}/${archive}" -C "${install_dir}" nfpm
+"${install_dir}/nfpm" --version
