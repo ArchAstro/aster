@@ -2,7 +2,7 @@
 name = "aster"
 version = "0.6.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Build orchestration for polyglot monorepos"
 license = "MIT"
 repository = "https://github.com/ArchAstro/aster"
@@ -15,7 +15,7 @@ include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 petgraph = "0.8"
-ignore = "=0.4.29"
+ignore = "=0.4.31"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -11,7 +11,7 @@ Thanks for helping improve Aster.
 
 ## Development setup
 
-Aster requires Rust 1.85 or newer.
+Aster requires Rust 1.88 or newer.
 
 ```console
 git clone https://github.com/ArchAstro/aster.git

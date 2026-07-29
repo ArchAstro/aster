@@ -19,7 +19,7 @@ brew install ArchAstro/tap/aster
 
 ### From source
 
-Aster requires Rust 1.85 or newer.
+Aster requires Rust 1.88 or newer.
 
 ```console
 cargo install --git https://github.com/ArchAstro/aster.git --locked
