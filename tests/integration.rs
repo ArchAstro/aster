@@ -1360,6 +1360,68 @@ fn test_target_on_all_runs_all_tests() {
 }
 
 #[test]
+fn test_cached_targets_are_not_printed() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_package_json(
+        &tmp,
+        "app/package.json",
+        r#"{"name": "app", "scripts": {"build": "touch built.txt"}}"#,
+    );
+
+    let first = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "--all"])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "Command failed: {first:?}");
+
+    // The initial Node deps target creates package-lock.json, so run once more
+    // after that input settles before asserting cache-hit behavior.
+    let warm = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "--all"])
+        .output()
+        .unwrap();
+    assert!(warm.status.success(), "Command failed: {warm:?}");
+
+    let cached_json = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        cached_json.status.success(),
+        "Command failed: {cached_json:?}"
+    );
+    let cached_output: serde_json::Value =
+        serde_json::from_slice(&cached_json.stdout).expect("valid JSON output");
+    assert!(
+        cached_output["summary"]["cached"].as_u64().unwrap_or(0) > 0,
+        "Expected the second run to hit the cache: {cached_output}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Command failed: {output:?}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(" cached"),
+        "Cache-hit targets should not be printed: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 passed, 2 cached, 0 failed"),
+        "Expected one consolidated cache count: {stdout}"
+    );
+}
+
+#[test]
 fn test_verbose_shows_primary_project_count() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
