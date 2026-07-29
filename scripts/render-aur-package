@@ -45,5 +45,7 @@ docker run --rm \
   archlinux:base@sha256:3406a568f45d68f0bef35dc80b3eacec8bda59b0292b2e50d5932ba1667f20cf \
   bash -euc '
     useradd --create-home builder
-    su builder --shell /bin/bash --command "cd /pkg && makepkg --printsrcinfo" > /pkg/.SRCINFO
+    install --directory --owner builder --group builder /build
+    install --owner builder --group builder --mode 644 /pkg/PKGBUILD /build/PKGBUILD
+    su builder --shell /bin/bash --command "cd /build && makepkg --printsrcinfo" > /pkg/.SRCINFO
   '
