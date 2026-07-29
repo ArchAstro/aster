@@ -31,23 +31,23 @@ impl TargetInputMatcher {
         let mut has_patterns = false;
 
         for pattern in &plugin_inputs.source_globs {
-            if let Ok(glob) = Glob::new(pattern) {
-                include_builder.add(glob);
-                has_patterns = true;
-            }
+            let glob = Glob::new(pattern)
+                .with_context(|| format!("Invalid plugin cache input glob: {pattern}"))?;
+            include_builder.add(glob);
+            has_patterns = true;
         }
         for pattern in &plugin_inputs.config_files {
-            if let Ok(glob) = Glob::new(pattern) {
-                include_builder.add(glob);
-                has_patterns = true;
-            }
+            let glob = Glob::new(pattern)
+                .with_context(|| format!("Invalid plugin config-file glob: {pattern}"))?;
+            include_builder.add(glob);
+            has_patterns = true;
         }
         if let Some(cfg) = user_config {
             for pattern in &cfg.include {
-                if let Ok(glob) = Glob::new(pattern) {
-                    include_builder.add(glob);
-                    has_patterns = true;
-                }
+                let glob = Glob::new(pattern)
+                    .with_context(|| format!("Invalid cache include glob: {pattern}"))?;
+                include_builder.add(glob);
+                has_patterns = true;
             }
         }
 
@@ -58,9 +58,9 @@ impl TargetInputMatcher {
         let mut exclude_builder = GlobSetBuilder::new();
         if let Some(cfg) = user_config {
             for pattern in &cfg.exclude {
-                if let Ok(glob) = Glob::new(pattern) {
-                    exclude_builder.add(glob);
-                }
+                let glob = Glob::new(pattern)
+                    .with_context(|| format!("Invalid cache exclude glob: {pattern}"))?;
+                exclude_builder.add(glob);
             }
         }
         let exclude = exclude_builder
@@ -147,9 +147,11 @@ mod tests {
     #[test]
     fn user_exclude_wins_over_include() {
         let user = CacheConfig {
+            enabled: None,
             include: vec![],
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
+            outputs: vec![],
         };
         let m =
             TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))
@@ -161,9 +163,11 @@ mod tests {
     #[test]
     fn user_include_extends_plugin_patterns() {
         let user = CacheConfig {
+            enabled: None,
             include: vec!["extra/**/*.json".to_string()],
             exclude: vec![],
             env: vec![],
+            outputs: vec![],
         };
         let m =
             TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))

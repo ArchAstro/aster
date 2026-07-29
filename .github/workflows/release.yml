@@ -3,16 +3,46 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: clippy, rustfmt
+      - name: Validate tag and package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+          test "${version}" = "${package_version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -24,168 +54,87 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: aster-darwin-arm64
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           targets: ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
+      - run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Smoke test
+        run: target/${{ matrix.target }}/release/aster --version
       - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz aster
-          cd ../../..
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        shell: bash
+        run: tar -C "target/${{ matrix.target }}/release" -czf "${{ matrix.artifact }}.tar.gz" aster
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
 
   release:
-    name: Create Release
-    needs: build
+    name: Publish release
+    needs: [verify, build]
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Create checksums
+        run: |
+          mkdir release-assets
+          find artifacts -name '*.tar.gz' -exec cp '{}' release-assets/ \;
+          cd release-assets
+          sha256sum ./*.tar.gz | sed 's#  \./#  #' > ../SHA256SUMS
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          files: artifacts/**/*.tar.gz
+          subject-path: release-assets/*.tar.gz
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            release-assets/*.tar.gz
+            SHA256SUMS
           generate_release_notes: true
 
   update-homebrew:
-    name: Update Homebrew Tap
-    needs: release
+    name: Update Homebrew tap
+    needs: [verify, release]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
-
       - name: Calculate checksums
         id: checksums
         run: |
-          echo "darwin_arm64=$(sha256sum artifacts/aster-darwin-arm64/aster-darwin-arm64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-          echo "darwin_x64=$(sha256sum artifacts/aster-darwin-x64/aster-darwin-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-          echo "linux_x64=$(sha256sum artifacts/aster-linux-x64/aster-linux-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-
+          {
+            echo "darwin_arm64=$(sha256sum artifacts/aster-darwin-arm64/aster-darwin-arm64.tar.gz | cut -d' ' -f1)"
+            echo "darwin_x64=$(sha256sum artifacts/aster-darwin-x64/aster-darwin-x64.tar.gz | cut -d' ' -f1)"
+            echo "linux_x64=$(sha256sum artifacts/aster-linux-x64/aster-linux-x64.tar.gz | cut -d' ' -f1)"
+          } >> "${GITHUB_OUTPUT}"
       - name: Update Homebrew formula
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ needs.release.outputs.version }}
+          VERSION: ${{ needs.verify.outputs.version }}
           SHA_DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
           SHA_DARWIN_X64: ${{ steps.checksums.outputs.darwin_x64 }}
           SHA_LINUX_X64: ${{ steps.checksums.outputs.linux_x64 }}
         run: |
-          git clone https://x-access-token:${GH_TOKEN}@github.com/ArchAstro/homebrew-tap.git
+          set -euo pipefail
+          gh auth setup-git
+          gh repo clone ArchAstro/homebrew-tap
           cd homebrew-tap
-
-          cat > Formula/aster.rb << 'FORMULA'
-          require "download_strategy"
-
-          class GitHubPrivateRepositoryReleaseDownloadStrategy < CurlDownloadStrategy
-            def initialize(url, name, version, **meta)
-              super
-              parse_url_pattern
-              set_github_token
-            end
-
-            def parse_url_pattern
-              url_pattern = %r{https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(\S+)}
-              unless @url =~ url_pattern
-                raise CurlDownloadStrategyError, "Invalid GitHub release URL pattern"
-              end
-              _, @owner, @repo, @tag, @filename = *@url.match(url_pattern)
-            end
-
-            def set_github_token
-              @github_token = ENV["HOMEBREW_GITHUB_API_TOKEN"]
-              unless @github_token
-                raise CurlDownloadStrategyError, "HOMEBREW_GITHUB_API_TOKEN is required"
-              end
-            end
-
-            def _fetch(url:, resolved_url:, timeout:)
-              api_url = "https://api.github.com/repos/#{@owner}/#{@repo}/releases/tags/#{@tag}"
-              assets_json = Utils::Curl.curl_output(
-                "--header", "Authorization: token #{@github_token}",
-                "--header", "Accept: application/vnd.github.v3+json",
-                api_url
-              ).stdout
-              require "json"
-              release = JSON.parse(assets_json)
-              asset = release["assets"].find { |a| a["name"] == @filename }
-              unless asset
-                raise CurlDownloadStrategyError, "Asset #{@filename} not found in release #{@tag}"
-              end
-              curl_download(
-                "--header", "Authorization: token #{@github_token}",
-                "--header", "Accept: application/octet-stream",
-                asset["url"],
-                to: temporary_path,
-                timeout: timeout
-              )
-            end
-          end
-          FORMULA
-
-          cat >> Formula/aster.rb << EOF
-
-          class Aster < Formula
-            desc "Build orchestration for polyglot monorepos"
-            homepage "https://github.com/ArchAstro/aster"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-arm64.tar.gz",
-                    using: GitHubPrivateRepositoryReleaseDownloadStrategy
-                sha256 "${SHA_DARWIN_ARM64}"
-              end
-              on_intel do
-                url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-darwin-x64.tar.gz",
-                    using: GitHubPrivateRepositoryReleaseDownloadStrategy
-                sha256 "${SHA_DARWIN_X64}"
-              end
-            end
-
-            on_linux do
-              url "https://github.com/ArchAstro/aster/releases/download/v${VERSION}/aster-linux-x64.tar.gz",
-                  using: GitHubPrivateRepositoryReleaseDownloadStrategy
-              sha256 "${SHA_LINUX_X64}"
-            end
-
-            def install
-              bin.install "aster"
-            end
-
-            test do
-              system "#{bin}/aster", "--version"
-            end
-          end
-          EOF
-
+          mkdir -p Formula
+          sed \
+            -e "s/__VERSION__/${VERSION}/g" \
+            -e "s/__SHA_DARWIN_ARM64__/${SHA_DARWIN_ARM64}/g" \
+            -e "s/__SHA_DARWIN_X64__/${SHA_DARWIN_X64}/g" \
+            -e "s/__SHA_LINUX_X64__/${SHA_LINUX_X64}/g" \
+            ../.github/homebrew/aster.rb.template > Formula/aster.rb
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/aster.rb

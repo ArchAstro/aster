@@ -225,7 +225,6 @@ fn assert_no_line_containing(
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_non_input_file_changes() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
@@ -263,7 +262,6 @@ fn watch_ignores_non_input_file_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_dotgit_changes() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
@@ -292,7 +290,6 @@ fn watch_ignores_dotgit_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_node_modules_changes() {
     // node_modules is in the built-in ignore defaults — a write there during
     // e.g. `npm install` must not trigger any rebuild.
@@ -331,7 +328,6 @@ fn watch_ignores_node_modules_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_reruns_dependent_target_on_dep_source_change() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

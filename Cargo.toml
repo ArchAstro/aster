@@ -2,19 +2,28 @@
 name = "aster"
 version = "0.6.1"
 edition = "2021"
+rust-version = "1.85"
+description = "Build orchestration for polyglot monorepos"
+license = "MIT"
+repository = "https://github.com/ArchAstro/aster"
+homepage = "https://github.com/ArchAstro/aster"
+readme = "README.md"
+keywords = ["build", "monorepo", "polyglot", "task-runner"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 petgraph = "0.8"
-ignore = "0.4"
+ignore = "=0.4.30"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 regex = "1.10"
-git2 = "0.19"
+git2 = "0.21"
 console = "0.16"
-indicatif = "0.17"
+indicatif = "0.18"
 chrono = { version = "0.4", features = ["clock"] }
 globset = "0.4"
 fs2 = "0.4"
@@ -24,6 +33,7 @@ libc = "0.2"
 notify = "6.1"
 crossbeam-channel = "0.5"
 humantime = "2.1"
+shell-words = "1.1"
 
 [dev-dependencies]
 tempfile = "3"

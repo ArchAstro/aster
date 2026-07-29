@@ -159,46 +159,60 @@ impl TargetResolver {
             }
         }
 
-        // Second pass: resolve alias targets by cloning from already-resolved targets
-        for (name, config) in custom_targets {
-            if let TargetConfig::Alias(alias_config) = config {
-                // Resolve the alias reference: strip //self: prefix if present
+        // Resolve aliases iteratively so alias chains do not depend on HashMap
+        // iteration order. Cycles and missing sources remain unresolved.
+        let mut pending_aliases: Vec<_> = custom_targets
+            .iter()
+            .filter_map(|(name, config)| match config {
+                TargetConfig::Alias(alias) => Some((name.clone(), alias.clone())),
+                _ => None,
+            })
+            .collect();
+        pending_aliases.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        loop {
+            let pending_count = pending_aliases.len();
+            pending_aliases.retain(|(name, alias_config)| {
                 let aliased_name = alias_config
                     .alias
                     .strip_prefix("//self:")
                     .unwrap_or(&alias_config.alias);
+                let Some(source_target) = targets.get(aliased_name).cloned() else {
+                    return true;
+                };
 
-                if let Some(source_target) = targets.get(aliased_name).cloned() {
-                    // Clone the source target and append extra depends_on
-                    let mut depends_on = source_target.depends_on.clone();
-                    if !alias_config.depends_on.is_empty() {
-                        let extra_deps = Self::resolve_self_references(
-                            &alias_config.depends_on,
-                            project_address,
-                        );
-                        depends_on.extend(extra_deps);
-                    }
+                let mut depends_on = source_target.depends_on.clone();
+                depends_on.extend(Self::resolve_self_references(
+                    &alias_config.depends_on,
+                    project_address,
+                ));
+                targets.insert(
+                    name.clone(),
+                    Target {
+                        command: source_target.command,
+                        depends_on,
+                        capabilities: source_target.capabilities,
+                        files_glob: source_target.files_glob,
+                        stream: source_target.stream,
+                        cache: source_target.cache,
+                        invalidates_cache: source_target.invalidates_cache,
+                        working_dir: source_target.working_dir,
+                        exclusive_resources: source_target.exclusive_resources,
+                    },
+                );
+                false
+            });
 
-                    targets.insert(
-                        name.clone(),
-                        Target {
-                            command: source_target.command,
-                            depends_on,
-                            capabilities: source_target.capabilities,
-                            files_glob: source_target.files_glob,
-                            stream: source_target.stream,
-                            cache: source_target.cache,
-                            invalidates_cache: source_target.invalidates_cache,
-                            working_dir: source_target.working_dir,
-                            exclusive_resources: source_target.exclusive_resources,
-                        },
-                    );
-                } else {
-                    eprintln!(
-                        "Warning: alias target '{name}' references non-existent target '{aliased_name}', skipping"
-                    );
-                }
+            if pending_aliases.is_empty() || pending_aliases.len() == pending_count {
+                break;
             }
+        }
+
+        for (name, alias_config) in pending_aliases {
+            eprintln!(
+                "Warning: alias target '{name}' references unresolved target '{}', skipping",
+                alias_config.alias
+            );
         }
 
         targets
@@ -574,7 +588,7 @@ mod tests {
         let targets = TargetResolver::resolve(&detected, &custom, "//apps/web");
 
         // Alias to non-existent target should be silently skipped
-        assert!(targets.get("check").is_none());
+        assert!(!targets.contains_key("check"));
     }
 
     #[test]
@@ -600,6 +614,22 @@ mod tests {
         assert_eq!(check.depends_on, vec!["//apps/api:deps".to_string()]);
         assert!(check.capabilities.contains(&TargetCapability::FilesList));
         assert_eq!(check.files_glob, Some("*_test.py".to_string()));
+    }
+
+    #[test]
+    fn test_alias_chain_resolves_regardless_of_name_order() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("pytest", vec!["//self:deps"]));
+
+        let mut custom = HashMap::new();
+        custom.insert("a-first".to_string(), alias("z-second", vec![]));
+        custom.insert("z-second".to_string(), alias("test", vec![]));
+
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+
+        let first = targets.get("a-first").unwrap();
+        assert_eq!(first.command, "pytest");
+        assert_eq!(first.depends_on, vec!["//apps/api:deps".to_string()]);
     }
 
     #[test]

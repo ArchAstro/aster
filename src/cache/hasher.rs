@@ -259,9 +259,11 @@ mod tests {
             env_vars: vec![],
         };
         let config = CacheConfig {
+            enabled: None,
             include: vec![],
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
+            outputs: vec![],
         };
 
         let file_hashes = hasher.hash_files(&inputs, Some(&config)).unwrap();

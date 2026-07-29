@@ -491,7 +491,7 @@ impl LanguagePlugin for NodeJsPlugin {
         // npm test -- file1 file2 (-- passes args through to the underlying test runner)
         let file_args: Vec<String> = test_files
             .iter()
-            .map(|f| f.to_string_lossy().to_string())
+            .map(|f| crate::executor::quote_command_argument(&f.to_string_lossy()))
             .collect();
 
         Some(format!("{} -- {}", command, file_args.join(" ")))
@@ -562,7 +562,12 @@ impl LanguagePlugin for NodeJsPlugin {
             dirs_to_clean.push("build");
         }
 
-        let command = format!("rm -rf {}", dirs_to_clean.join(" "));
+        let arguments = dirs_to_clean
+            .iter()
+            .map(|path| crate::executor::quote_command_argument(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!("rm -rf {arguments}");
 
         Some(Target {
             command,
@@ -1233,7 +1238,7 @@ mod tests {
             targets.get("deps").map(|t| &t.command),
             Some(&"npm install".to_string())
         );
-        assert!(targets.get("clean").is_some());
+        assert!(targets.contains_key("clean"));
     }
 
     #[test]
@@ -1267,7 +1272,7 @@ mod tests {
         assert_eq!(targets.get("test"), None);
         assert_eq!(targets.get("build"), None);
         // deps is always present
-        assert!(targets.get("deps").is_some());
+        assert!(targets.contains_key("deps"));
     }
 
     #[test]
@@ -1482,7 +1487,7 @@ mod tests {
         assert_eq!(targets.get("test"), None);
 
         // deps is always present
-        assert!(targets.get("deps").is_some());
+        assert!(targets.contains_key("deps"));
     }
 
     #[test]
@@ -1588,7 +1593,7 @@ mod tests {
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // No deps target — workspace root handles installation
-        assert!(targets.get("deps").is_none());
+        assert!(!targets.contains_key("deps"));
 
         // Other targets depend directly on the workspace root's deps
         let build = targets.get("build").unwrap();
@@ -1649,7 +1654,7 @@ mod tests {
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // No deps target on the member
-        assert!(targets.get("deps").is_none());
+        assert!(!targets.contains_key("deps"));
 
         // build depends directly on the nested npm workspace root's deps
         let build = targets.get("build").unwrap();
@@ -1716,7 +1721,7 @@ mod tests {
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         // No deps target on the member
-        assert!(targets.get("deps").is_none());
+        assert!(!targets.contains_key("deps"));
 
         // build depends directly on workspace root's deps
         let build = targets.get("build").unwrap();
@@ -2112,7 +2117,7 @@ mod tests {
         // Member infers pnpm by walking up to the root lockfile.
         let member_ctx = make_context(&member_pkg, &workspace_root, &[]);
         let member_targets = plugin.detect_targets(&member_ctx).unwrap();
-        assert!(member_targets.get("deps").is_none());
+        assert!(!member_targets.contains_key("deps"));
         assert_eq!(
             member_targets.get("build").map(|t| &t.command),
             Some(&"pnpm run build".to_string())

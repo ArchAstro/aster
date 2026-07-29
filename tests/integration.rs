@@ -7,6 +7,8 @@ mod cli_tests;
 
 use std::fs;
 use std::process::Command;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Set up a minimal workspace with .git marker
@@ -40,6 +42,113 @@ fn write_pyproject_toml(tmp: &TempDir, path: &str, content: &str) {
     let full_path = tmp.path().join(path);
     fs::create_dir_all(full_path.parent().unwrap()).unwrap();
     fs::write(full_path, content).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn terminating_aster_cleans_up_the_target_process_group() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.long]
+command = "sh long.sh"
+cache = { enabled = false }
+"#,
+    );
+    fs::write(
+        tmp.path().join("app/long.sh"),
+        "#!/bin/sh\necho $$ > child.pid\nexec sleep 30\n",
+    )
+    .unwrap();
+
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:long"])
+        .spawn()
+        .unwrap();
+
+    let child_pid_path = tmp.path().join("app/child.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child_pid_path.exists(), "target process never started");
+    let child_pid: i32 = fs::read_to_string(&child_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    unsafe {
+        libc::kill(aster.id() as i32, libc::SIGTERM);
+    }
+    let _ = aster.wait().unwrap();
+
+    let child_exists = unsafe { libc::kill(child_pid, 0) == 0 };
+    assert!(!child_exists, "target process survived Aster termination");
+}
+
+#[test]
+fn heterogeneous_run_preserves_quoted_arguments() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.write]
+command = "sh -c 'printf \"%s\" \"$1\" > quoted.txt' sh 'two words'"
+cache = { enabled = false }
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:write"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("app/quoted.txt")).unwrap(),
+        "two words"
+    );
+}
+
+#[test]
+fn heterogeneous_run_blocks_dependents_after_failure() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.check]
+command = "sh -c 'exit 9'"
+cache = { enabled = false }
+
+[targets.deploy]
+command = "touch deployed"
+depends_on = ["//self:check"]
+cache = { enabled = false }
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:deploy"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!tmp.path().join("app/deployed").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Blocked"));
 }
 
 #[test]

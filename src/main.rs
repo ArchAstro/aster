@@ -18,11 +18,11 @@ use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
-    collect_target_deps, compute_target_levels, parse_target_address, setup_signal_handler,
+    collect_target_deps, compute_target_levels, install_signal_handler, parse_target_address,
     Executor,
 };
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector, AffectedIgnore};
-use aster::graph::{build_graph, build_target_graph, find_cycle, format_path, TargetGraph};
+use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::{
     ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, RustPlugin, Target,
     TargetCapability,
@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 const CACHE_HASH_DISPLAY_LENGTH: usize = 8;
 
 fn main() -> ExitCode {
+    install_signal_handler();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -46,8 +47,6 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    setup_signal_handler();
-
     let mut cli = Cli::parse();
     let output_mode = cli.output_mode();
     let full_logs = cli.full_logs();
@@ -697,7 +696,7 @@ fn run() -> Result<()> {
                                 &target,
                                 &project.plugin_name,
                                 &registry,
-                            );
+                            )?;
                         }
 
                         // Apply warnings-as-errors if requested and supported
@@ -835,43 +834,19 @@ fn run() -> Result<()> {
                 return Ok(());
             }
 
-            // Collect all targets to run (and optionally their dependencies)
-            let mut targets_to_run: std::collections::HashSet<String> =
-                filtered_targets.iter().cloned().collect();
-
-            if !no_deps {
-                // Add dependencies of each target
-                for target in &filtered_targets {
-                    collect_target_deps_recursive(target, &target_graph, &mut targets_to_run);
-                }
-            }
-
-            // Compute DAG levels and execute
-            let levels = compute_heterogeneous_levels(&targets_to_run, &project_map);
-
-            if output_mode == OutputMode::Verbose {
-                eprintln!(
-                    "[aster] Running {} targets across {} levels",
-                    targets_to_run.len(),
-                    levels.len()
-                );
-                for (i, level) in levels.iter().enumerate() {
-                    eprintln!("[aster] Level {i}: {level:?}");
-                }
-            }
-
-            // Execute using the executor's infrastructure
+            let primary_targets: std::collections::HashSet<String> =
+                filtered_targets.into_iter().collect();
+            let all_project_refs: Vec<_> = projects.iter().collect();
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
-            let results =
-                execute_heterogeneous(&executor, &levels, &project_map, output_mode, full_logs);
+            let results = executor.execute_targets(&primary_targets, &all_project_refs, no_deps);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
                 let output = build_execution_output(&results);
                 output_json(&output)?;
             } else {
-                print_heterogeneous_summary(&results, output_mode, full_logs);
+                print_heterogeneous_summary(&results, output_mode);
             }
 
             // Return error if any failed (for exit code)
@@ -1164,347 +1139,10 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Recursively collect target dependencies from the target graph
-fn collect_target_deps_recursive(
-    target: &str,
-    graph: &TargetGraph,
-    collected: &mut std::collections::HashSet<String>,
-) {
-    for dep in graph.dependencies(target) {
-        if collected.insert(dep.address.clone()) {
-            collect_target_deps_recursive(&dep.address, graph, collected);
-        }
-    }
-}
-
-/// Compute DAG levels for heterogeneous target execution
-fn compute_heterogeneous_levels(
-    targets: &std::collections::HashSet<String>,
-    project_map: &std::collections::HashMap<String, &DiscoveredProject>,
-) -> Vec<Vec<String>> {
-    use std::collections::{HashMap, HashSet};
-
-    // Build dependency map for targets in our set
-    let mut deps_map: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for target_addr in targets {
-        // Parse target address: //path/to/project:target_name
-        let colon_pos = match target_addr.rfind(':') {
-            Some(pos) => pos,
-            None => continue,
-        };
-        let project_addr = &target_addr[..colon_pos];
-        let target_name = &target_addr[colon_pos + 1..];
-
-        let project = match project_map.get(project_addr) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let target_deps: HashSet<String> = project
-            .targets
-            .get(target_name)
-            .map(|t| {
-                t.depends_on
-                    .iter()
-                    .filter(|d| targets.contains(*d))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        deps_map.insert(target_addr.clone(), target_deps);
-    }
-
-    // Track which level each target is assigned to
-    let mut level_of: HashMap<String, usize> = HashMap::new();
-    let mut remaining: HashSet<String> = targets.clone();
-    let mut current_level = 0;
-
-    while !remaining.is_empty() {
-        let mut this_level = Vec::new();
-
-        for addr in &remaining {
-            let deps = deps_map.get(addr).cloned().unwrap_or_default();
-
-            let all_deps_assigned = deps
-                .iter()
-                .all(|d| level_of.get(d).map(|l| *l < current_level).unwrap_or(false));
-
-            let no_deps = deps.is_empty();
-
-            if all_deps_assigned || no_deps {
-                this_level.push(addr.clone());
-            }
-        }
-
-        // If we made no progress, there's a cycle - just add remaining
-        if this_level.is_empty() && !remaining.is_empty() {
-            this_level = remaining.iter().cloned().collect();
-        }
-
-        for addr in &this_level {
-            level_of.insert(addr.clone(), current_level);
-            remaining.remove(addr);
-        }
-
-        current_level += 1;
-    }
-
-    // Build level vectors
-    let max_level = level_of.values().max().copied().unwrap_or(0);
-    let mut levels: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
-
-    for (addr, level) in level_of {
-        levels[level].push(addr);
-    }
-
-    // Sort each level for deterministic output
-    for level in &mut levels {
-        level.sort();
-    }
-
-    levels
-}
-
-/// Execute heterogeneous targets level by level
-fn execute_heterogeneous(
-    _executor: &Executor,
-    levels: &[Vec<String>],
-    project_map: &std::collections::HashMap<String, &DiscoveredProject>,
-    output_mode: OutputMode,
-    _full_logs: bool,
-) -> Vec<aster::executor::ExecutionResult> {
-    use std::process::Command;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Instant;
-
-    use aster::ui::ProgressDisplay;
-
-    // Show progress in Normal mode (ProgressDisplay handles terminal vs CI mode internally)
-    let show_progress = output_mode == OutputMode::Normal;
-    let mut progress = ProgressDisplay::new(show_progress);
-    let mut all_results = Vec::new();
-
-    for level in levels {
-        let (tx, rx) = mpsc::channel();
-        let mut handles = Vec::new();
-
-        // Build per-resource mutexes for exclusive access within this level
-        let resource_mutexes: std::collections::HashMap<
-            String,
-            std::sync::Arc<std::sync::Mutex<()>>,
-        > = {
-            let mut resources = std::collections::HashSet::new();
-            for addr in level {
-                if let Some(colon_pos) = addr.rfind(':') {
-                    let pa = &addr[..colon_pos];
-                    let tn = &addr[colon_pos + 1..];
-                    if let Some(p) = project_map.get(pa) {
-                        if let Some(t) = p.targets.get(tn) {
-                            for r in &t.exclusive_resources {
-                                resources.insert(r.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            resources
-                .into_iter()
-                .map(|r| (r, std::sync::Arc::new(std::sync::Mutex::new(()))))
-                .collect()
-        };
-
-        for target_addr in level {
-            // Parse target address
-            let colon_pos = match target_addr.rfind(':') {
-                Some(pos) => pos,
-                None => continue,
-            };
-            let project_addr = &target_addr[..colon_pos];
-            let target_name = &target_addr[colon_pos + 1..];
-
-            let project = match project_map.get(project_addr) {
-                Some(p) => *p,
-                None => continue,
-            };
-
-            let command = match project.targets.get(target_name) {
-                Some(t) => t.command.clone(),
-                None => {
-                    let result = aster::executor::ExecutionResult {
-                        address: target_addr.clone(),
-                        success: true,
-                        skipped: true,
-                        cached: false,
-                        output: format!("Skipped: no '{target_name}' target defined"),
-                        duration_ms: 0,
-                    };
-                    if show_progress {
-                        progress.add_running(target_addr);
-                        progress.mark_complete(target_addr, true, true, 0);
-                    }
-                    let _ = tx.send(result);
-                    continue;
-                }
-            };
-
-            if show_progress {
-                progress.add_running(target_addr);
-            }
-
-            let addr = target_addr.clone();
-            let project_root = project.root.clone();
-            let tx_clone = tx.clone();
-            // Collect per-resource mutexes this target needs to acquire
-            let target_resource_locks: Vec<std::sync::Arc<std::sync::Mutex<()>>> = {
-                let mut res_names: Vec<&String> = project
-                    .targets
-                    .get(target_name)
-                    .map(|t| t.exclusive_resources.iter().collect())
-                    .unwrap_or_default();
-                res_names.sort();
-                res_names
-                    .iter()
-                    .filter_map(|name| resource_mutexes.get(*name).map(std::sync::Arc::clone))
-                    .collect()
-            };
-
-            let handle = thread::spawn(move || {
-                // Acquire exclusive resource locks (sorted to prevent deadlocks)
-                let _resource_guards: Vec<_> = target_resource_locks
-                    .iter()
-                    .map(|m| m.lock().unwrap())
-                    .collect();
-
-                let start = Instant::now();
-                let parts: Vec<&str> = command.split_whitespace().collect();
-
-                let result = if parts.is_empty() {
-                    aster::executor::ExecutionResult {
-                        address: addr.clone(),
-                        success: false,
-                        skipped: false,
-                        cached: false,
-                        output: "Empty command".to_string(),
-                        duration_ms: 0,
-                    }
-                } else {
-                    // Parse environment variables (VAR=value prefix pattern)
-                    let mut env_vars: Vec<(&str, &str)> = Vec::new();
-                    let mut cmd_start = 0;
-                    for (i, part) in parts.iter().enumerate() {
-                        if let Some(eq_pos) = part.find('=') {
-                            let name = &part[..eq_pos];
-                            if !name.is_empty()
-                                && name
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.is_ascii_alphabetic() || c == '_')
-                                    .unwrap_or(false)
-                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                            {
-                                let value = &part[eq_pos + 1..];
-                                env_vars.push((name, value));
-                                cmd_start = i + 1;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if cmd_start >= parts.len() {
-                        return aster::executor::ExecutionResult {
-                            address: addr,
-                            success: false,
-                            skipped: false,
-                            cached: false,
-                            output: "Empty command (only environment variables)".to_string(),
-                            duration_ms: 0,
-                        };
-                    }
-
-                    let mut cmd = Command::new(parts[cmd_start]);
-                    cmd.args(&parts[cmd_start + 1..]).current_dir(&project_root);
-                    for (name, value) in env_vars {
-                        cmd.env(name, value);
-                    }
-                    let output = cmd.output();
-
-                    let duration_ms = start.elapsed().as_millis();
-
-                    match output {
-                        Ok(out) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            let mut combined = String::new();
-                            if !stdout.is_empty() {
-                                combined.push_str(&stdout);
-                            }
-                            if !stderr.is_empty() {
-                                if !combined.is_empty() && !combined.ends_with('\n') {
-                                    combined.push('\n');
-                                }
-                                combined.push_str(&stderr);
-                            }
-
-                            aster::executor::ExecutionResult {
-                                address: addr,
-                                success: out.status.success(),
-                                skipped: false,
-                                cached: false,
-                                output: combined,
-                                duration_ms,
-                            }
-                        }
-                        Err(e) => aster::executor::ExecutionResult {
-                            address: addr,
-                            success: false,
-                            skipped: false,
-                            cached: false,
-                            output: format!("Failed to execute: {e}"),
-                            duration_ms,
-                        },
-                    }
-                };
-
-                let _ = tx_clone.send(result.clone());
-                result
-            });
-
-            handles.push(handle);
-        }
-
-        drop(tx);
-
-        for result in rx.iter() {
-            if show_progress {
-                progress.mark_complete(
-                    &result.address,
-                    result.success,
-                    result.skipped,
-                    result.duration_ms,
-                );
-            }
-            all_results.push(result);
-        }
-
-        for handle in handles {
-            let _ = handle.join();
-        }
-    }
-
-    all_results
-}
-
 /// Print summary for heterogeneous execution
 fn print_heterogeneous_summary(
     results: &[aster::executor::ExecutionResult],
     output_mode: OutputMode,
-    full_logs: bool,
 ) {
     use console::style;
 
@@ -1515,38 +1153,6 @@ fn print_heterogeneous_summary(
     if output_mode == OutputMode::Quiet {
         println!("{passed} passed, {failed} failed");
         return;
-    }
-
-    // Print failure details
-    for result in results.iter().filter(|r| !r.success && !r.skipped) {
-        eprintln!();
-        eprintln!("{} {}", style("FAILED").red().bold(), result.address);
-        let lines: Vec<&str> = result.output.lines().collect();
-        let output_lines = if full_logs {
-            // Full output mode - show all lines
-            &lines[..]
-        } else {
-            // Truncated mode - show last 15 lines
-            if lines.len() > 15 {
-                &lines[lines.len() - 15..]
-            } else {
-                &lines[..]
-            }
-        };
-        for line in output_lines {
-            eprintln!("    {line}");
-        }
-        // Only show hint if not already showing full logs
-        if !full_logs {
-            eprintln!(
-                "    {}",
-                style(format!(
-                    "Run `aster logs {}` for full output",
-                    result.address
-                ))
-                .dim()
-            );
-        }
     }
 
     println!();
@@ -1942,7 +1548,7 @@ fn generate_aster_toml_content(
 
 # Rich format - full control over target behavior:
 # [targets.test]
-# command = "make test ARGS='{files}'"
+# command = "make test {files}"
 # depends_on = ["//self:build"]
 # capabilities = ["files_list"]
 # files_glob = "*_test.*"
@@ -1967,9 +1573,9 @@ fn apply_files_to_command(
     target_name: &str,
     plugin_name: &str,
     registry: &PluginRegistry,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if files.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Filter files by files_glob if specified
@@ -1995,30 +1601,124 @@ fn apply_files_to_command(
     };
 
     if filtered_files.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    // Check if command uses {files} placeholder
+    // Expand only standalone argv placeholders. Textual substitution inside
+    // an already quoted argument (especially `sh -c '... {files}'`) can turn a
+    // filename into shell syntax after the outer command is parsed.
     if target.command.contains("{files}") {
-        let file_list = filtered_files
+        let parts = shell_words::split(&target.command)
+            .with_context(|| format!("invalid command quoting: {}", target.command))?;
+        if parts
             .iter()
-            .map(|f| f.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+            .any(|part| part.contains("{files}") && part != "{files}")
+        {
+            anyhow::bail!(
+                "{{files}} must be a standalone command argument, not embedded in a quoted or \
+                 combined argument: {}",
+                target.command
+            );
+        }
+        let program_index = parts
+            .iter()
+            .position(|part| !is_environment_assignment(part))
+            .context("command contains only environment assignments")?;
+        let placeholder_positions = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, part)| (part == "{files}").then_some(index))
+            .collect::<Vec<_>>();
+        if placeholder_positions.len() != 1 {
+            anyhow::bail!("command must contain exactly one {{files}} placeholder");
+        }
+        let placeholder_index = placeholder_positions[0];
+        if placeholder_index == program_index {
+            anyhow::bail!("{{files}} cannot be used as the executable");
+        }
+        if parts[program_index..placeholder_index]
+            .iter()
+            .any(|part| is_command_interpreter_token(part))
+        {
+            anyhow::bail!(
+                "{{files}} cannot be expanded directly through a command interpreter; \
+                 use a fixed wrapper executable instead"
+            );
+        }
 
-        // Replace {files} with file list (may be empty, which results in trimmed command)
-        let modified = target.command.replace("{files}", &file_list);
-        // Trim extra whitespace that may result from empty replacement
-        let modified = modified.split_whitespace().collect::<Vec<_>>().join(" ");
-        return Some(modified);
+        let mut expanded = Vec::new();
+        for part in parts {
+            if part == "{files}" {
+                expanded.extend(
+                    filtered_files
+                        .iter()
+                        .map(|file| file.to_string_lossy().into_owned()),
+                );
+            } else {
+                expanded.push(part);
+            }
+        }
+        return Ok(Some(
+            expanded
+                .iter()
+                .map(|part| aster::executor::quote_command_argument(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
     }
 
     // Fall back to plugin's with_files_list for language-specific handling
     if let Some(plugin) = registry.find_by_name(plugin_name) {
-        return plugin.with_files_list(target_name, &target.command, &filtered_files);
+        return Ok(plugin.with_files_list(target_name, &target.command, &filtered_files));
     }
 
-    None
+    Ok(None)
+}
+
+fn is_environment_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn is_command_interpreter_token(value: &str) -> bool {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "fish"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "env"
+            | "sudo"
+            | "xargs"
+            | "node"
+            | "nodejs"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+    ) || name.starts_with("python")
+        || name.starts_with("pypy")
+        || name.starts_with("ruby")
 }
 
 /// Apply warnings-as-errors to a command
@@ -2116,5 +1816,107 @@ fn format_relative_time(timestamp: &str) -> String {
             dt.format("%Y-%m-%d").to_string()
         }
         Err(_) => timestamp.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod file_command_tests {
+    use super::*;
+
+    fn files_target(command: &str) -> Target {
+        Target {
+            command: command.to_string(),
+            depends_on: vec![],
+            capabilities: HashSet::from([TargetCapability::FilesList]),
+            files_glob: None,
+            stream: false,
+            cache: None,
+            invalidates_cache: false,
+            working_dir: None,
+            exclusive_resources: vec![],
+        }
+    }
+
+    #[test]
+    fn files_placeholder_expands_to_literal_arguments() {
+        let file = PathBuf::from("tests/x;touch${IFS}pwned.js");
+        let expanded = apply_files_to_command(
+            &files_target("./capture {files}"),
+            std::slice::from_ref(&file),
+            "test",
+            "unknown",
+            &PluginRegistry::new(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            shell_words::split(&expanded).unwrap(),
+            vec!["./capture".to_string(), file.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn files_placeholder_inside_shell_script_is_rejected() {
+        let error = apply_files_to_command(
+            &files_target("sh -c 'tool {files}'"),
+            &[PathBuf::from("test.js")],
+            "test",
+            "unknown",
+            &PluginRegistry::new(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("{files} must be a standalone command argument"));
+    }
+
+    #[test]
+    fn files_placeholder_as_executable_is_rejected() {
+        let error = apply_files_to_command(
+            &files_target("{files} --flag"),
+            &[PathBuf::from("tool")],
+            "test",
+            "unknown",
+            &PluginRegistry::new(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be used as the executable"));
+    }
+
+    #[test]
+    fn files_placeholder_as_interpreter_input_is_rejected() {
+        let error = apply_files_to_command(
+            &files_target("sh -c {files}"),
+            &[PathBuf::from("touch pwned")],
+            "test",
+            "unknown",
+            &PluginRegistry::new(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be expanded directly through a command interpreter"));
+    }
+
+    #[test]
+    fn files_placeholder_cannot_hide_an_interpreter_behind_a_launcher() {
+        let error = apply_files_to_command(
+            &files_target("nice -n 5 /bin/sh -c {files}"),
+            &[PathBuf::from("touch pwned")],
+            "test",
+            "unknown",
+            &PluginRegistry::new(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be expanded directly through a command interpreter"));
     }
 }

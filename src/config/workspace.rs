@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use super::project::TargetConfig;
 
 /// Workspace-level configuration from the root aster.toml
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Glob patterns for paths to ignore during project discovery
     #[serde(default)]
@@ -16,10 +20,19 @@ pub struct WorkspaceConfig {
     /// Affected-command configuration
     #[serde(default)]
     pub affected: AffectedWorkspaceConfig,
+
+    /// Project settings are accepted because a project at the repository root
+    /// may share this file with workspace configuration.
+    pub name: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub targets: HashMap<String, TargetConfig>,
 }
 
 /// Configuration controlling which Git changes participate in affected analysis.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AffectedWorkspaceConfig {
     /// Workspace-relative glob patterns excluded from affected analysis.
     #[serde(default)]
@@ -32,6 +45,7 @@ pub struct AffectedWorkspaceConfig {
 /// `.next/`, `dist/`, `.turbo/`, `.venv/`, `.elixir_ls/`). User patterns extend
 /// them — they never replace the defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchWorkspaceConfig {
     /// Additional glob patterns (workspace-relative) whose fs events are dropped
     /// before being considered by the watcher.
@@ -290,6 +304,25 @@ ignore = ["vendor/**", "examples/**"]
 
         assert!(error.to_string().contains("Failed to parse"));
         assert!(error.to_string().contains("aster.toml"));
+    }
+
+    #[test]
+    fn workspace_file_accepts_root_project_fields() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("aster.toml"),
+            r#"
+name = "root"
+
+[targets]
+test = "cargo test"
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(temp.path()).unwrap();
+        assert_eq!(config.name.as_deref(), Some("root"));
+        assert!(config.targets.contains_key("test"));
     }
 
     #[test]

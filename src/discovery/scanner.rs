@@ -53,6 +53,7 @@ struct PartialProject {
     metadata: ProjectMetadata,
     dependencies: Vec<LocalDependency>,
     custom_targets: HashMap<String, crate::config::TargetConfig>,
+    explicit_target_dependencies: Vec<(String, String)>,
     plugin_name: String,
     relative_path: PathBuf,
 }
@@ -157,6 +158,7 @@ pub fn discover_projects(
 
         // Collect custom targets from aster.toml (if exists)
         let mut custom_targets = HashMap::new();
+        let mut explicit_target_dependencies = Vec::new();
 
         // Check for aster.toml and merge overrides
         if let Some(aster_path) = find_aster_toml(project_dir) {
@@ -169,6 +171,11 @@ pub fn discover_projects(
 
             // Add depends_on as LocalDependency (with empty path for now, resolved later)
             for dep_addr in aster_config.depends_on {
+                let dependency_project = dep_addr.split(':').next().unwrap_or(&dep_addr);
+                explicit_target_dependencies.push((
+                    format!("project //{}", relative_path.display()),
+                    format!("{dependency_project}:build"),
+                ));
                 dependencies.push(LocalDependency {
                     name: dep_addr.clone(),
                     path: PathBuf::from(dep_addr), // Address string stored as path
@@ -177,6 +184,37 @@ pub fn discover_projects(
 
             // Collect custom targets for merging with detected
             custom_targets = aster_config.targets;
+            let project_address = format!("//{}", relative_path.display());
+            for (target_name, target) in &custom_targets {
+                if let crate::config::TargetConfig::Alias(alias) = target {
+                    if alias.alias.starts_with("//") && !alias.alias.starts_with("//self:") {
+                        anyhow::bail!(
+                            "target {project_address}:{target_name} has external alias source {}; \
+                             aliases must use a local target name or //self:<target>",
+                            alias.alias
+                        );
+                    }
+                    let alias_dependency = alias
+                        .alias
+                        .strip_prefix("//self:")
+                        .map(|name| format!("{project_address}:{name}"))
+                        .unwrap_or_else(|| format!("{project_address}:{}", alias.alias));
+                    explicit_target_dependencies.push((
+                        format!("target {project_address}:{target_name}"),
+                        alias_dependency,
+                    ));
+                }
+                for dependency in target.depends_on() {
+                    let dependency = dependency
+                        .strip_prefix("//self:")
+                        .map(|name| format!("{project_address}:{name}"))
+                        .unwrap_or_else(|| dependency.clone());
+                    explicit_target_dependencies.push((
+                        format!("target {project_address}:{target_name}"),
+                        dependency,
+                    ));
+                }
+            }
         }
 
         // Compute relative path (needed for target resolution)
@@ -191,6 +229,7 @@ pub fn discover_projects(
             metadata,
             dependencies,
             custom_targets,
+            explicit_target_dependencies,
             plugin_name: plugin.name().to_string(),
             relative_path,
         });
@@ -203,6 +242,7 @@ pub fn discover_projects(
 
     // Phase 3: Detect targets with resolved dependencies
     let mut projects: Vec<DiscoveredProject> = Vec::new();
+    let mut explicit_target_dependencies = Vec::new();
     for partial in partial_projects {
         let plugin = registry
             .find_by_name(&partial.plugin_name)
@@ -228,6 +268,7 @@ pub fn discover_projects(
         // Resolve targets: detected + aster.toml overrides, resolving //self: references
         let targets =
             TargetResolver::resolve(&detected_targets, &partial.custom_targets, &project_address);
+        explicit_target_dependencies.extend(partial.explicit_target_dependencies);
 
         projects.push(DiscoveredProject {
             root: partial.root,
@@ -243,7 +284,66 @@ pub fn discover_projects(
     // Phase 4: Handle name collisions
     resolve_name_collisions(&mut projects);
 
+    validate_project_addresses(&projects)?;
+    normalize_target_dependencies(&mut projects, &explicit_target_dependencies)?;
+
     Ok(projects)
+}
+
+fn validate_project_addresses(projects: &[DiscoveredProject]) -> Result<()> {
+    let mut seen: HashMap<String, &DiscoveredProject> = HashMap::new();
+
+    for project in projects {
+        let address = format!("//{}", project.relative_path.display());
+        if let Some(existing) = seen.insert(address.clone(), project) {
+            anyhow::bail!(
+                "Multiple projects resolve to {address}: {} ({}) and {} ({}). \
+                 Put each language project in its own directory.",
+                existing.config_path.display(),
+                existing.plugin_name,
+                project.config_path.display(),
+                project.plugin_name,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_target_dependencies(
+    projects: &mut [DiscoveredProject],
+    explicit_dependencies: &[(String, String)],
+) -> Result<()> {
+    let available: std::collections::HashSet<String> = projects
+        .iter()
+        .flat_map(|project| {
+            let project_address = format!("//{}", project.relative_path.display());
+            project
+                .targets
+                .keys()
+                .map(move |target| format!("{project_address}:{target}"))
+        })
+        .collect();
+
+    for (source, dependency) in explicit_dependencies {
+        if !available.contains(dependency) {
+            anyhow::bail!("{source} depends on missing target {dependency}");
+        }
+    }
+
+    // Language plugins infer `:build` edges from native path/workspace
+    // dependencies. Not every dependency project defines a build target, so
+    // discard only those unavailable inferred edges after explicit config has
+    // been validated.
+    for project in projects {
+        for target in project.targets.values_mut() {
+            target
+                .depends_on
+                .retain(|dependency| available.contains(dependency));
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve name collisions by appending plugin suffix
@@ -530,31 +630,42 @@ lint = "npm run lint:ci"
         )
         .unwrap();
 
+        let shared_dir = tmp.path().join("libs/shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        std::fs::write(
+            shared_dir.join("package.json"),
+            r#"{"name": "shared", "version": "1.0.0", "scripts": {"build": "tsc"}}"#,
+        )
+        .unwrap();
+
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
 
         let registry = setup_registry();
         let projects = discover_projects(tmp.path(), &registry).unwrap();
 
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].metadata.name, "api-service"); // Name overridden
+        assert_eq!(projects.len(), 2);
+        let api = projects
+            .iter()
+            .find(|project| project.metadata.name == "api-service")
+            .unwrap();
 
         // Custom lint target from aster.toml overrides detected
         assert_eq!(
-            projects[0].targets.get("lint").map(|t| &t.command),
+            api.targets.get("lint").map(|t| &t.command),
             Some(&"npm run lint:ci".to_string())
         );
         // Detected targets still present
         assert_eq!(
-            projects[0].targets.get("test").map(|t| &t.command),
+            api.targets.get("test").map(|t| &t.command),
             Some(&"npm test".to_string())
         );
         assert_eq!(
-            projects[0].targets.get("build").map(|t| &t.command),
+            api.targets.get("build").map(|t| &t.command),
             Some(&"npm run build".to_string())
         );
 
         // depends_on should be in dependencies
-        assert!(projects[0]
+        assert!(api
             .dependencies
             .iter()
             .any(|d| d.name == "//libs/shared:build"));
@@ -642,6 +753,150 @@ deploy = "npm run deploy"
         for project in &projects {
             assert_eq!(project.metadata.name, "core-nodejs");
         }
+    }
+
+    #[test]
+    fn rejects_colocated_language_projects_with_the_same_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("app");
+        std::fs::create_dir_all(project_dir.join("src")).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"echo node"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "app-rust"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(project_dir.join("src/lib.rs"), "").unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let registry = PluginRegistry::with_all_plugins();
+        let error = discover_projects(tmp.path(), &registry).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Multiple projects resolve to //app"));
+    }
+
+    #[test]
+    fn rejects_missing_target_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"echo build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+[targets.deploy]
+command = "echo deploy"
+depends_on = ["//missing:build"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("depends on missing target //missing:build"));
+    }
+
+    #[test]
+    fn rejects_alias_to_missing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+[targets]
+check = { alias = "typo" }
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("target //app:check depends on missing target //app:typo"));
+    }
+
+    #[test]
+    fn rejects_external_alias_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+[targets]
+check = { alias = "//other:test" }
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("aliases must use a local target name or //self:<target>"));
+    }
+
+    #[test]
+    fn inferred_build_dependency_is_omitted_when_dependency_has_no_build_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("packages/lib");
+        let app_dir = tmp.path().join("packages/app");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("package.json"),
+            r#"{"name":"lib","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            app_dir.join("package.json"),
+            r#"{
+  "name":"app",
+  "scripts":{"test":"node --test"},
+  "dependencies":{"lib":"file:../lib"}
+}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let app = projects
+            .iter()
+            .find(|project| project.relative_path == Path::new("packages/app"))
+            .unwrap();
+        assert!(!app
+            .targets
+            .get("test")
+            .unwrap()
+            .depends_on
+            .contains(&"//packages/lib:build".to_string()));
     }
 
     #[test]

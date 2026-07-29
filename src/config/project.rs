@@ -6,14 +6,17 @@
 //! - Defines custom targets
 
 use anyhow::{Context, Result};
+use globset::Glob;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::workspace::{AffectedWorkspaceConfig, WatchWorkspaceConfig};
 use crate::address::Address;
 
 /// Configuration from an aster.toml file
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AsterToml {
     /// Override project name (instead of inferring from native config)
     pub name: Option<String>,
@@ -27,10 +30,20 @@ pub struct AsterToml {
     /// Rich: `[targets.test]` with command, depends_on, capabilities, files_glob
     #[serde(default)]
     pub targets: HashMap<String, TargetConfig>,
+
+    /// Workspace discovery settings are accepted because a repository-root
+    /// project may share this file with workspace configuration.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    #[serde(default)]
+    pub watch: WatchWorkspaceConfig,
+    #[serde(default)]
+    pub affected: AffectedWorkspaceConfig,
 }
 
 /// Alias target configuration - references another target in the same project
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AliasTargetConfig {
     /// The target name to alias (bare name or //self:name)
     pub alias: String,
@@ -62,7 +75,10 @@ pub enum TargetConfig {
 /// Allows users to customize which files and environment variables
 /// are included in the cache key for a target.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
+    /// Explicitly enable or disable memoization for this target.
+    pub enabled: Option<bool>,
     /// Additional files/globs to include in cache key
     #[serde(default)]
     pub include: Vec<String>,
@@ -72,10 +88,14 @@ pub struct CacheConfig {
     /// Additional environment variables to track
     #[serde(default)]
     pub env: Vec<String>,
+    /// Output paths that must exist before a cached success may be reused.
+    #[serde(default)]
+    pub outputs: Vec<String>,
 }
 
 /// Rich target configuration with all options
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RichTargetConfig {
     /// The command to execute (may contain {files} placeholder)
     pub command: String,
@@ -206,6 +226,42 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
             .with_context(|| format!("Invalid dependency '{}' in {}", dep, path.display()))?;
     }
 
+    for (target_name, target) in &config.targets {
+        let TargetConfig::Rich(target) = target else {
+            continue;
+        };
+
+        for capability in &target.capabilities {
+            if capability != "files_list" {
+                anyhow::bail!(
+                    "Unsupported capability '{capability}' for target '{target_name}' in {}. \
+                     Supported capabilities: files_list",
+                    path.display()
+                );
+            }
+        }
+
+        if let Some(pattern) = &target.files_glob {
+            Glob::new(pattern).with_context(|| {
+                format!(
+                    "Invalid files_glob '{pattern}' for target '{target_name}' in {}",
+                    path.display()
+                )
+            })?;
+        }
+
+        if let Some(cache) = &target.cache {
+            for pattern in cache.include.iter().chain(&cache.exclude) {
+                Glob::new(pattern).with_context(|| {
+                    format!(
+                        "Invalid cache glob '{pattern}' for target '{target_name}' in {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+
     Ok(config)
 }
 
@@ -327,6 +383,100 @@ depends_on = ["//self:deps"]
         assert_eq!(build_target.depends_on(), &["//self:deps"]);
         assert!(build_target.capabilities().is_empty());
         assert_eq!(build_target.files_glob(), None);
+    }
+
+    #[test]
+    fn rejects_unknown_capability_and_invalid_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest {files}"
+capabilities = ["FilesList"]
+"#,
+        )
+        .unwrap();
+        let error = parse_aster_toml(&toml_path).unwrap_err();
+        assert!(error.to_string().contains("Unsupported capability"));
+
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest {files}"
+capabilities = ["files_list"]
+files_glob = "["
+"#,
+        )
+        .unwrap();
+        let error = parse_aster_toml(&toml_path).unwrap_err();
+        assert!(error.to_string().contains("Invalid files_glob"));
+
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest"
+
+[targets.test.cache]
+include = ["["]
+"#,
+        )
+        .unwrap();
+        let error = parse_aster_toml(&toml_path).unwrap_err();
+        assert!(error.to_string().contains("Invalid cache glob"));
+    }
+
+    #[test]
+    fn rejects_unknown_rich_target_and_cache_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest"
+unknown = true
+"#,
+        )
+        .unwrap();
+        assert!(parse_aster_toml(&toml_path).is_err());
+
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "pytest"
+
+[targets.test.cache]
+enabled = true
+artifact = "report.xml"
+"#,
+        )
+        .unwrap();
+        assert!(parse_aster_toml(&toml_path).is_err());
+    }
+
+    #[test]
+    fn root_file_accepts_workspace_fields_but_rejects_unknown_top_level_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+ignore = ["vendor/**"]
+
+[watch]
+debounce_ms = 250
+"#,
+        )
+        .unwrap();
+        assert!(parse_aster_toml(&toml_path).is_ok());
+
+        std::fs::write(&toml_path, "mystery = true").unwrap();
+        assert!(parse_aster_toml(&toml_path).is_err());
     }
 
     #[test]

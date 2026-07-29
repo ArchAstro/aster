@@ -2,7 +2,6 @@
 //!
 //! Tests that all commands with --json flag produce valid, parseable JSON output.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -29,7 +28,7 @@ fn setup_workspace_with_projects() -> TempDir {
 fn test_list_json_outputs_valid_json() {
     let tmp = setup_workspace_with_projects();
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "list"])
@@ -63,7 +62,7 @@ fn test_list_json_empty_workspace() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "list"])
@@ -85,7 +84,7 @@ fn test_list_json_empty_workspace() {
 fn test_graph_json_outputs_valid_json() {
     let tmp = setup_workspace_with_projects();
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "graph"])
@@ -115,7 +114,7 @@ fn test_why_json_outputs_valid_json() {
     let tmp = setup_workspace_with_projects();
 
     // Use target addresses (with :target suffix)
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "why", "//services/api:deps", "//libs/core:deps"])
@@ -142,7 +141,7 @@ fn test_why_json_no_path_found() {
     write_package_json(&tmp, "a/package.json", r#"{"name": "a"}"#);
     write_package_json(&tmp, "b/package.json", r#"{"name": "b"}"#);
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "why", "//a:deps", "//b:deps"])
@@ -167,7 +166,7 @@ fn test_logs_json_no_previous_run() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "logs"])
@@ -190,7 +189,7 @@ fn test_logs_json_specific_target_not_found() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
 
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "logs", "//nonexistent:target"])
@@ -213,7 +212,7 @@ fn test_json_flag_before_subcommand() {
     let tmp = setup_workspace_with_projects();
 
     // --json must come before the subcommand (global flag)
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     cmd.current_dir(tmp.path())
         .args(["--json", "list"])
         .assert()
@@ -233,7 +232,7 @@ fn test_json_flag_produces_valid_json_for_all_commands() {
     ];
 
     for args in test_cases {
-        let mut cmd = Command::cargo_bin("aster").unwrap();
+        let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
         let output = cmd.current_dir(tmp.path()).args(&args).output().unwrap();
 
         assert!(
@@ -272,7 +271,7 @@ fn test_pnpm_workspace_protocol_build_edge() {
     );
 
     // graph --json exposes target-level edges (target -> its dependencies).
-    let mut cmd = Command::cargo_bin("aster").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let output = cmd
         .current_dir(tmp.path())
         .args(["--json", "graph"])
@@ -294,7 +293,7 @@ fn test_pnpm_workspace_protocol_build_edge() {
     );
 
     // why confirms there is a dependency path from the consumer's build to the dep's.
-    let mut why = Command::cargo_bin("aster").unwrap();
+    let mut why = assert_cmd::cargo::cargo_bin_cmd!("aster");
     let why_out = why
         .current_dir(tmp.path())
         .args([
