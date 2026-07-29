@@ -230,13 +230,24 @@ fn assert_no_line_containing(
 /// watcher registered. Those lines must not be attributed to the later edit
 /// each test is trying to classify.
 fn drain_startup_events(rx: &mpsc::Receiver<String>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while std::time::Instant::now() < deadline {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .unwrap_or_default();
+    let started = std::time::Instant::now();
+    let minimum_deadline = started + Duration::from_secs(2);
+    let maximum_deadline = started + Duration::from_secs(8);
+    let quiet_period = Duration::from_millis(500);
+    let mut quiet_deadline = minimum_deadline;
+
+    while std::time::Instant::now() < maximum_deadline {
+        let now = std::time::Instant::now();
+        let wait_until = quiet_deadline.min(maximum_deadline);
+        let remaining = wait_until.checked_duration_since(now).unwrap_or_default();
         match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Ok(_) => {
+                quiet_deadline = (std::time::Instant::now() + quiet_period).max(minimum_deadline);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= quiet_deadline => {
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
