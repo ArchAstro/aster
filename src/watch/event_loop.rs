@@ -60,7 +60,7 @@ pub fn run_watch(
 
     emit_startup_banner(&plan);
 
-    let shutdown = install_signal_handler();
+    let shutdown = crate::executor::install_signal_handler();
 
     let mut supervisor = StreamSupervisor::new(opts.stream_grace);
 
@@ -70,25 +70,43 @@ pub fn run_watch(
         .iter()
         .filter(|t| t.stream && plan.requested.contains(&t.address))
         .collect();
-    let requested_non_stream: HashSet<String> = plan
+    let mut requested_non_stream: HashSet<String> = plan
         .requested
         .iter()
         .filter(|addr| !plan.targets.iter().any(|t| t.address == **addr && t.stream))
         .cloned()
         .collect();
+    for target in &requested_stream {
+        collect_non_stream_dependencies(&target.address, &graph, &plan, &mut requested_non_stream);
+    }
 
     let project_refs: Vec<&DiscoveredProject> = projects.iter().collect();
 
     // Initial run.
     if opts.run_initial {
-        if !requested_non_stream.is_empty() {
+        let successful = if !requested_non_stream.is_empty() {
             eprintln!("{} initial build…", style("[watch]").cyan().bold());
-            let _ = executor.execute_targets(&requested_non_stream, &project_refs, false);
-        }
+            executor
+                .execute_targets(&requested_non_stream, &project_refs, false)
+                .iter()
+                .filter(|result| result.success)
+                .map(|result| result.address.clone())
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         for t in &requested_stream {
-            if let Err(e) = start_stream_target(&mut supervisor, t, &projects) {
+            if stream_prerequisites_succeeded(&t.address, &graph, &plan, &successful) {
+                if let Err(e) = start_stream_target(&mut supervisor, t, &projects) {
+                    eprintln!(
+                        "{} failed to start {}: {e:#}",
+                        style("[watch]").red().bold(),
+                        t.address
+                    );
+                }
+            } else {
                 eprintln!(
-                    "{} failed to start {}: {e:#}",
+                    "{} {} was not started because its prerequisite failed",
                     style("[watch]").red().bold(),
                     t.address
                 );
@@ -112,20 +130,39 @@ pub fn run_watch(
             }
         }
 
-        if !non_stream.is_empty() {
-            let _ = executor.execute_targets(&non_stream, &project_refs, false);
+        for target in &stream_addrs {
+            collect_non_stream_dependencies(&target.address, &graph, &plan, &mut non_stream);
         }
 
+        let successful = if non_stream.is_empty() {
+            HashSet::new()
+        } else {
+            executor
+                .execute_targets(&non_stream, &project_refs, false)
+                .iter()
+                .filter(|result| result.success)
+                .map(|result| result.address.clone())
+                .collect::<HashSet<_>>()
+        };
+
         for t in stream_addrs {
-            eprintln!(
-                "{} restart {}",
-                style("[watch]").cyan().bold(),
-                style(&t.address).yellow()
-            );
-            let mut sup = supervisor_cell.borrow_mut();
-            if let Err(e) = restart_stream_target(&mut sup, t, &projects) {
+            if stream_prerequisites_succeeded(&t.address, &graph, &plan, &successful) {
                 eprintln!(
-                    "{} failed to restart {}: {e:#}",
+                    "{} restart {}",
+                    style("[watch]").cyan().bold(),
+                    style(&t.address).yellow()
+                );
+                let mut sup = supervisor_cell.borrow_mut();
+                if let Err(e) = restart_stream_target(&mut sup, t, &projects) {
+                    eprintln!(
+                        "{} failed to restart {}: {e:#}",
+                        style("[watch]").red().bold(),
+                        t.address
+                    );
+                }
+            } else {
+                eprintln!(
+                    "{} {} was not restarted because its prerequisite failed",
                     style("[watch]").red().bold(),
                     t.address
                 );
@@ -299,11 +336,11 @@ fn process_event(
             Err(_) => path.as_path(),
         };
 
-        if ignore.is_ignored(rel) || ignore.is_suppressed(rel) {
+        if ignore.is_ignored(rel) {
             continue;
         }
 
-        if suppressed {
+        if suppressed && ignore.is_suppressed(rel) {
             continue;
         }
 
@@ -316,6 +353,45 @@ fn process_event(
         let primary = plan.primary_set(&owners, graph);
         pending.extend(primary);
     }
+}
+
+fn collect_non_stream_dependencies(
+    address: &str,
+    graph: &TargetGraph,
+    plan: &WatchPlan,
+    output: &mut HashSet<String>,
+) {
+    for dependency in graph.dependencies(address) {
+        let is_stream = plan
+            .targets
+            .iter()
+            .any(|target| target.address == dependency.address && target.stream);
+        if !is_stream && output.insert(dependency.address.clone()) {
+            collect_non_stream_dependencies(&dependency.address, graph, plan, output);
+        } else if is_stream {
+            // A stream prerequisite may itself have one-shot prerequisites.
+            collect_non_stream_dependencies(&dependency.address, graph, plan, output);
+        }
+    }
+}
+
+fn non_stream_dependencies(
+    address: &str,
+    graph: &TargetGraph,
+    plan: &WatchPlan,
+) -> HashSet<String> {
+    let mut dependencies = HashSet::new();
+    collect_non_stream_dependencies(address, graph, plan, &mut dependencies);
+    dependencies
+}
+
+fn stream_prerequisites_succeeded(
+    address: &str,
+    graph: &TargetGraph,
+    plan: &WatchPlan,
+    successful: &HashSet<String>,
+) -> bool {
+    non_stream_dependencies(address, graph, plan).is_subset(successful)
 }
 
 fn is_meaningful_kind(kind: &notify::EventKind) -> bool {
@@ -477,6 +553,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stream_dispatch_collects_non_stream_prerequisites() {
+        let mut project = mk_project(
+            "app",
+            "/repo/app",
+            &[("build", vec![]), ("dev", vec!["//app:build"])],
+        );
+        project.targets.get_mut("dev").unwrap().stream = true;
+        let projects = vec![project];
+        let graph = build_target_graph(&projects);
+        let plan =
+            WatchPlan::build(&["//app:dev".to_string()], &projects, &graph, &registry()).unwrap();
+        let mut prerequisites = HashSet::new();
+
+        collect_non_stream_dependencies("//app:dev", &graph, &plan, &mut prerequisites);
+
+        assert_eq!(prerequisites, HashSet::from(["//app:build".to_string()]));
+    }
+
+    #[test]
+    fn independent_streams_are_gated_by_their_own_prerequisites() {
+        let mut app = mk_project(
+            "app",
+            "/repo/app",
+            &[("build", vec![]), ("dev", vec!["//app:build"])],
+        );
+        app.targets.get_mut("dev").unwrap().stream = true;
+        let mut docs = mk_project(
+            "docs",
+            "/repo/docs",
+            &[("build", vec![]), ("dev", vec!["//docs:build"])],
+        );
+        docs.targets.get_mut("dev").unwrap().stream = true;
+        let projects = vec![app, docs];
+        let graph = build_target_graph(&projects);
+        let plan = WatchPlan::build(
+            &["//app:dev".to_string(), "//docs:dev".to_string()],
+            &projects,
+            &graph,
+            &registry(),
+        )
+        .unwrap();
+        let successful = HashSet::from(["//docs:build".to_string()]);
+
+        assert!(!stream_prerequisites_succeeded(
+            "//app:dev",
+            &graph,
+            &plan,
+            &successful
+        ));
+        assert!(stream_prerequisites_succeeded(
+            "//docs:dev",
+            &graph,
+            &plan,
+            &successful
+        ));
+    }
+
     fn run_event(
         f: &Fixture,
         event: &Event,
@@ -546,14 +680,15 @@ mod tests {
     }
 
     #[test]
-    fn suppression_window_drops_events() {
+    fn suppression_window_preserves_source_events() {
         let f = two_project_fixture();
         let e = modify("/repo/libs/core/src/index.ts");
         let future = Instant::now() + Duration::from_secs(60);
         let (pending, triggers) = run_event(&f, &e, future);
 
-        assert!(pending.is_empty());
-        assert!(triggers.is_empty());
+        assert!(pending.contains("//libs/core:build"));
+        assert!(pending.contains("//services/api:build"));
+        assert_eq!(triggers.len(), 1);
     }
 
     #[test]
@@ -716,15 +851,12 @@ mod tests {
 
     struct DispatchCall {
         primary: HashSet<String>,
-        delay: Option<Duration>,
     }
 
     impl Dispatches {
         fn record(&self, primary: HashSet<String>, delay: Option<Duration>) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(DispatchCall { primary, delay });
+            let _ = delay;
+            self.calls.lock().unwrap().push(DispatchCall { primary });
         }
 
         fn count(&self) -> usize {
@@ -903,10 +1035,9 @@ mod tests {
     }
 
     #[test]
-    fn events_during_dispatch_are_suppressed_by_cooldown_window() {
-        // With a nonzero cooldown, events that arrive during dispatch and are
-        // processed while the cooldown window is still open MUST be dropped.
-        // This is the anti-feedback-loop behavior for build-generated events.
+    fn source_events_during_dispatch_are_not_lost() {
+        // A cooldown only suppresses configured generated paths. Genuine
+        // source edits that arrive during a build must trigger a second cycle.
         let f = leaked_fixture();
         let opts = WatchOpts {
             debounce: Duration::from_millis(50),
@@ -929,13 +1060,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         send_modify(&tx, "/repo/services/api/src/main.ts");
 
-        // Wait well past dispatch end but within cooldown. Second dispatch
-        // must NOT have fired.
+        // Wait long enough for the queued edit to dispatch after the first
+        // build returns.
         std::thread::sleep(Duration::from_millis(450));
         assert_eq!(
             dispatches.count(),
-            1,
-            "expected cooldown to suppress mid-build event; got dispatches: {:?}",
+            2,
+            "expected the mid-build source edit to survive cooldown; got dispatches: {:?}",
             dispatches.snapshot()
         );
 
@@ -1058,29 +1189,4 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
     }
-}
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-fn install_signal_handler() -> &'static AtomicBool {
-    SHUTDOWN.store(false, Ordering::SeqCst);
-
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            shutdown_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            shutdown_handler as *const () as libc::sighandler_t,
-        );
-    }
-
-    &SHUTDOWN
-}
-
-#[cfg(unix)]
-extern "C" fn shutdown_handler(_sig: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::SeqCst);
 }

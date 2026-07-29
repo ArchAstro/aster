@@ -188,7 +188,7 @@ impl LanguagePlugin for ElixirPlugin {
         // mix test file1_test.exs file2_test.exs (mix test accepts file paths directly)
         let file_args: Vec<String> = test_files
             .iter()
-            .map(|f| f.to_string_lossy().to_string())
+            .map(|f| crate::executor::quote_command_argument(&f.to_string_lossy()))
             .collect();
 
         Some(format!("{} {}", command, file_args.join(" ")))

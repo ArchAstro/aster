@@ -10,11 +10,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use console::style;
@@ -28,31 +29,9 @@ use crate::graph::ProjectGraph;
 use crate::plugins::PluginRegistry;
 use crate::ui::ProgressDisplay;
 
-/// On SIGINT/SIGTERM, send SIGTERM to our process group so every child
-/// (including Beam VMs that trap SIGINT) gets a clean shutdown signal.
+use super::command::parse_command;
 #[cfg(unix)]
-extern "C" fn shutdown_handler(_sig: libc::c_int) {
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::kill(-libc::getpgrp(), libc::SIGTERM);
-    }
-}
-
-/// Install signal handlers that clean up child processes on SIGINT/SIGTERM.
-pub fn setup_signal_handler() {
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            shutdown_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            shutdown_handler as *const () as libc::sighandler_t,
-        );
-    }
-}
+use super::{register_supervised_child, shutdown_requested, unregister_supervised_child};
 
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
@@ -138,7 +117,7 @@ impl<'a> Executor<'a> {
     /// Respects target dependencies from Target.depends_on (fully resolved by TargetResolver).
     /// Targets are grouped into DAG levels and each level is executed in parallel.
     /// Output is buffered per-target and printed as a group when complete.
-    /// Execution continues on failure, collecting all results.
+    /// Independent branches continue on failure; dependent targets are blocked.
     ///
     /// The `primary_projects` set specifies which projects should run the requested target.
     /// Dependency projects are included for target-level dependency resolution (e.g., :build)
@@ -197,60 +176,37 @@ impl<'a> Executor<'a> {
             eprintln!("[aster] Working directory: {}", working_dir.display());
         }
 
-        // Split command by whitespace
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err("Empty command".to_string());
-        }
-
-        // Parse environment variables (VAR=value prefix pattern)
-        let mut env_vars: Vec<(&str, &str)> = Vec::new();
-        let mut cmd_start = 0;
-        for (i, part) in parts.iter().enumerate() {
-            if let Some(eq_pos) = part.find('=') {
-                let name = &part[..eq_pos];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .next()
-                        .map(|c| c.is_ascii_alphabetic() || c == '_')
-                        .unwrap_or(false)
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    let value = &part[eq_pos + 1..];
-                    env_vars.push((name, value));
-                    cmd_start = i + 1;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        if cmd_start >= parts.len() {
-            return Err("Empty command (only environment variables)".to_string());
-        }
-
-        let program = parts[cmd_start];
-        let args = &parts[cmd_start + 1..];
+        let parsed = parse_command(command).map_err(|error| error.to_string())?;
 
         // Run with inherited stdio for streaming
         use std::process::Stdio;
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        let mut cmd = Command::new(&parsed.program);
+        cmd.args(&parsed.args)
             .current_dir(working_dir)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        for (name, value) in env_vars {
+        for (name, value) in parsed.env {
             cmd.env(name, value);
         }
 
-        let status = cmd
-            .status()
-            .map_err(|e| format!("Failed to execute {target_addr}: {e}"))?;
+        #[cfg(unix)]
+        isolate_process_group(&mut cmd);
+
+        #[cfg(unix)]
+        register_supervised_child();
+        let mut child = cmd.spawn().map_err(|e| {
+            #[cfg(unix)]
+            unregister_supervised_child();
+            format!("Failed to execute {target_addr}: {e}")
+        })?;
+        #[cfg(unix)]
+        let monitor = ChildSignalMonitor::new(child.id());
+        let status = child.wait();
+        #[cfg(unix)]
+        monitor.finish();
+        let status = status.map_err(|e| format!("Failed to execute {target_addr}: {e}"))?;
 
         Ok(status.code().unwrap_or(1))
     }
@@ -373,10 +329,43 @@ impl<'a> Executor<'a> {
         let env_snapshot: HashMap<String, String> = std::env::vars().collect();
 
         let mut all_results = Vec::new();
+        let mut failed_or_blocked: HashSet<String> = HashSet::new();
 
         for level in levels {
+            let mut runnable = Vec::new();
+            let mut blocked_results = Vec::new();
+
+            for target_addr in level {
+                let failed_dependencies = target_dependencies(&target_addr, project_map)
+                    .into_iter()
+                    .filter(|dependency| failed_or_blocked.contains(dependency))
+                    .collect::<Vec<_>>();
+
+                if failed_dependencies.is_empty() {
+                    runnable.push(target_addr);
+                    continue;
+                }
+
+                if show_progress {
+                    progress.add_running(&target_addr);
+                    progress.mark_complete(&target_addr, false, false, 0);
+                }
+                failed_or_blocked.insert(target_addr.clone());
+                blocked_results.push(ExecutionResult {
+                    address: target_addr,
+                    success: false,
+                    skipped: false,
+                    cached: false,
+                    output: format!(
+                        "Blocked: prerequisite target(s) failed: {}",
+                        failed_dependencies.join(", ")
+                    ),
+                    duration_ms: 0,
+                });
+            }
+
             let level_results = self.execute_target_level(
-                &level,
+                &runnable,
                 project_map,
                 &mut progress,
                 show_progress,
@@ -386,6 +375,13 @@ impl<'a> Executor<'a> {
                 &computed_hashes,
                 &env_snapshot,
             );
+            failed_or_blocked.extend(
+                level_results
+                    .iter()
+                    .filter(|result| !result.success)
+                    .map(|result| result.address.clone()),
+            );
+            all_results.extend(blocked_results);
             all_results.extend(level_results);
         }
 
@@ -501,9 +497,12 @@ impl<'a> Executor<'a> {
                 }
             };
 
-            // Check cache if enabled
+            // Check cache if enabled. A miss carries the exact hash that may
+            // be stored after successful execution; `None` means this target
+            // is not cacheable and must not create a cache entry.
+            let mut cache_hash = None;
             if let Some(store) = cache_store {
-                if let Some((cache_hit, _current_hash)) = check_cache(
+                if let Some((cache_hit, current_hash)) = check_cache(
                     target_addr,
                     &target_name,
                     &command,
@@ -529,9 +528,14 @@ impl<'a> Executor<'a> {
                         let _ = tx.send(result);
                         continue;
                     } else {
-                        // Cache miss - store hash for later update after execution
-                        // The hash will be stored if execution succeeds
+                        cache_hash = Some(current_hash);
                     }
+                } else if let Err(e) = store.remove(target_addr) {
+                    // A disabled or currently unhashable target must not leave
+                    // an older entry available for a future false hit.
+                    eprintln!(
+                        "[aster] Warning: Failed to remove unavailable cache for {target_addr}: {e}"
+                    );
                 }
             }
 
@@ -551,21 +555,19 @@ impl<'a> Executor<'a> {
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
-            let target_name_clone = target_name.clone();
             let command_clone = command.clone();
+            let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
             let env_snapshot_clone = env_snapshot.clone();
-            // Get target's depends_on for dependency hash lookup
-            let target_deps: Vec<String> = project
+            let target_deps = project
                 .targets
                 .get(&target_name)
-                .map(|t| t.depends_on.clone())
+                .map(|target| target.depends_on.clone())
                 .unwrap_or_default();
-            // Get user cache config
             let target_cache_config = project
                 .targets
                 .get(&target_name)
-                .and_then(|t| t.cache.clone());
+                .and_then(|target| target.cache.clone());
             // Get invalidates_cache flag for cache invalidation after execution
             let invalidates_cache = project
                 .targets
@@ -596,48 +598,69 @@ impl<'a> Executor<'a> {
 
                 let result = run_command(&addr, &command_clone, &working_dir);
 
-                // Update cache if execution succeeded and caching is enabled
-                if result.success && cache_store_path.is_some() {
-                    if let Some(ref workspace_root) = cache_store_path {
-                        // Compute hash for storing
-                        let plugin_reg = PluginRegistry::with_all_plugins();
-                        if let Some(plugin) = plugin_reg.find_by_name(&plugin_name) {
+                if !result.success {
+                    if let Some(workspace_root) = cache_store_path.as_ref() {
+                        let store = CacheStore::new(workspace_root);
+                        if let Err(e) = store.remove(&addr) {
+                            eprintln!(
+                                "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
+                            );
+                        }
+                    }
+                } else {
+                    // Update cache only when the preflight cache policy
+                    // produced a hash for this target.
+                    if let (Some(workspace_root), Some(preflight_hash)) =
+                        (cache_store_path.as_ref(), cache_hash)
+                    {
+                        let plugin_registry = PluginRegistry::with_all_plugins();
+                        if let Some(plugin) = plugin_registry.find_by_name(&plugin_name) {
                             let plugin_inputs = plugin.cache_inputs(&target_name_clone);
                             let hasher = CacheHasher::new(&project_root);
-
-                            // Get dependency hashes from previously computed targets
                             let hashes_guard = computed_hashes_clone.lock().unwrap();
-                            let dep_hashes: Vec<&str> = target_deps
+                            let dependency_hashes = target_deps
                                 .iter()
-                                .filter_map(|dep| hashes_guard.get(dep).map(|s| s.as_str()))
-                                .collect();
-
-                            if let Ok(hash) = hasher.compute_hash(
+                                .filter_map(|dependency| {
+                                    hashes_guard.get(dependency).map(String::as_str)
+                                })
+                                .collect::<Vec<_>>();
+                            let postflight_hash = hasher.compute_hash(
                                 &plugin_inputs,
                                 target_cache_config.as_ref(),
                                 &command_clone,
-                                &dep_hashes,
+                                &dependency_hashes,
                                 &env_snapshot_clone,
-                            ) {
-                                drop(hashes_guard);
+                            );
+                            drop(hashes_guard);
 
-                                // Store hash
-                                {
-                                    let mut hashes = computed_hashes_clone.lock().unwrap();
-                                    hashes.insert(addr.clone(), hash.clone());
+                            match postflight_hash {
+                                Ok(postflight_hash) if postflight_hash == preflight_hash => {
+                                    {
+                                        let mut hashes = computed_hashes_clone.lock().unwrap();
+                                        hashes.insert(addr.clone(), postflight_hash.clone());
+                                    }
+                                    let store = CacheStore::new(workspace_root);
+                                    let entry = CacheEntry {
+                                        hash: postflight_hash,
+                                        timestamp: Utc::now().to_rfc3339(),
+                                        success: true,
+                                    };
+                                    if let Err(e) = store.set(&addr, entry) {
+                                        eprintln!(
+                                            "[aster] Warning: Failed to update cache for {addr}: {e}"
+                                        );
+                                    }
                                 }
-
-                                // Update cache store
-                                let store = CacheStore::new(workspace_root);
-                                let entry = CacheEntry {
-                                    hash,
-                                    timestamp: Utc::now().to_rfc3339(),
-                                    success: true,
-                                };
-                                if let Err(e) = store.set(&addr, entry) {
-                                    eprintln!(
-                                        "[aster] Warning: Failed to update cache for {addr}: {e}"
-                                    );
+                                _ => {
+                                    // An unstable or unhashable execution may
+                                    // have changed outputs. Do not leave an old
+                                    // entry available for a future false hit.
+                                    let store = CacheStore::new(workspace_root);
+                                    if let Err(e) = store.remove(&addr) {
+                                        eprintln!(
+                                            "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -797,6 +820,20 @@ impl<'a> Executor<'a> {
     }
 }
 
+fn target_dependencies(
+    target_addr: &str,
+    project_map: &HashMap<String, &DiscoveredProject>,
+) -> Vec<String> {
+    let Some((project_addr, target_name)) = parse_target_address(target_addr) else {
+        return Vec::new();
+    };
+    project_map
+        .get(&project_addr)
+        .and_then(|project| project.targets.get(&target_name))
+        .map(|target| target.depends_on.clone())
+        .unwrap_or_default()
+}
+
 /// Parse a target address like "//path/to/project:target" into (project_addr, target_name)
 pub fn parse_target_address(addr: &str) -> Option<(String, String)> {
     let colon_pos = addr.rfind(':')?;
@@ -936,29 +973,36 @@ fn check_cache(
     computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
     env_snapshot: &HashMap<String, String>,
 ) -> Option<(bool, String)> {
-    // Get plugin for cache inputs
-    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
-    let plugin_inputs = plugin.cache_inputs(target_name);
-
-    // If plugin provides no cache inputs, don't cache this target
-    if plugin_inputs.source_globs.is_empty()
-        && plugin_inputs.config_files.is_empty()
-        && plugin_inputs.env_vars.is_empty()
+    // Get user cache config from project's target configuration
+    let target = project.targets.get(target_name)?;
+    let user_config: Option<&CacheConfig> = target.cache.as_ref();
+    let explicitly_enabled = user_config.and_then(|config| config.enabled);
+    if explicitly_enabled == Some(false)
+        || (explicitly_enabled != Some(true) && !is_default_cacheable_target(target_name))
     {
         return None;
     }
 
-    // Get user cache config from project's target configuration
-    let target = project.targets.get(target_name)?;
-    let user_config: Option<&CacheConfig> = target.cache.as_ref();
+    // Get plugin for cache inputs. Targets with no detected inputs are only
+    // cacheable by explicit opt-in; their command, dependencies, configured
+    // inputs, and environment still form the cache key.
+    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
+    let plugin_inputs = plugin.cache_inputs(target_name);
+    if plugin_inputs.source_globs.is_empty()
+        && plugin_inputs.config_files.is_empty()
+        && plugin_inputs.env_vars.is_empty()
+        && explicitly_enabled != Some(true)
+    {
+        return None;
+    }
 
     // Get dependency hashes from previously computed targets
     let hashes_guard = computed_hashes.lock().ok()?;
     let dep_hashes: Vec<&str> = target
         .depends_on
         .iter()
-        .filter_map(|dep| hashes_guard.get(dep).map(|s| s.as_str()))
-        .collect();
+        .map(|dep| hashes_guard.get(dep).map(String::as_str))
+        .collect::<Option<_>>()?;
 
     // Compute current hash
     let hasher = CacheHasher::new(&project.root);
@@ -976,7 +1020,13 @@ fn check_cache(
 
     // Check if cached entry matches
     if let Ok(Some(entry)) = cache_store.get(target_addr) {
-        if entry.hash == current_hash && entry.success {
+        let outputs_exist = user_config.is_none_or(|config| {
+            config
+                .outputs
+                .iter()
+                .all(|output| project.root.join(output).exists())
+        });
+        if entry.hash == current_hash && entry.success && outputs_exist {
             // Store computed hash for dependents
             {
                 let mut hashes = computed_hashes.lock().ok()?;
@@ -990,13 +1040,32 @@ fn check_cache(
     Some((false, current_hash))
 }
 
+fn is_default_cacheable_target(target_name: &str) -> bool {
+    matches!(
+        target_name,
+        "deps" | "build" | "test" | "lint" | "format" | "typecheck" | "check"
+    )
+}
+
 /// Run a command in a directory and capture output
 fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionResult {
     let start = Instant::now();
 
-    // Split command by whitespace (simple parsing for v1)
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() {
+    let parsed = match parse_command(command) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return ExecutionResult {
+                address: address.to_string(),
+                success: false,
+                skipped: false,
+                cached: false,
+                output: error.to_string(),
+                duration_ms: 0,
+            };
+        }
+    };
+
+    if parsed.program.is_empty() {
         return ExecutionResult {
             address: address.to_string(),
             success: false,
@@ -1007,56 +1076,39 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
         };
     }
 
-    // Parse environment variables (VAR=value prefix pattern)
-    // Environment variable names must start with a letter or underscore
-    let mut env_vars: Vec<(&str, &str)> = Vec::new();
-    let mut cmd_start = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if let Some(eq_pos) = part.find('=') {
-            let name = &part[..eq_pos];
-            // Check if it looks like an env var name (starts with letter/underscore, contains only alphanumeric/underscore)
-            if !name.is_empty()
-                && name
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_alphabetic() || c == '_')
-                    .unwrap_or(false)
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                let value = &part[eq_pos + 1..];
-                env_vars.push((name, value));
-                cmd_start = i + 1;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    if cmd_start >= parts.len() {
-        return ExecutionResult {
-            address: address.to_string(),
-            success: false,
-            skipped: false,
-            cached: false,
-            output: "Empty command (only environment variables)".to_string(),
-            duration_ms: 0,
-        };
-    }
-
-    let program = parts[cmd_start];
-    let args = &parts[cmd_start + 1..];
-
-    let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(working_dir);
+    let mut cmd = Command::new(&parsed.program);
+    cmd.args(&parsed.args)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // Set environment variables
-    for (name, value) in env_vars {
+    for (name, value) in parsed.env {
         cmd.env(name, value);
     }
 
-    let result = cmd.output();
+    #[cfg(unix)]
+    isolate_process_group(&mut cmd);
+
+    #[cfg(unix)]
+    register_supervised_child();
+    let result = cmd
+        .spawn()
+        .inspect_err(|_| {
+            #[cfg(unix)]
+            unregister_supervised_child();
+        })
+        .and_then(|child| {
+            #[cfg(unix)]
+            let monitor = ChildSignalMonitor::new(child.id());
+
+            let output = child.wait_with_output();
+
+            #[cfg(unix)]
+            monitor.finish();
+
+            output
+        });
 
     let duration_ms = start.elapsed().as_millis();
 
@@ -1094,6 +1146,65 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
             output: format!("Failed to execute command: {e}"),
             duration_ms,
         },
+    }
+}
+
+#[cfg(unix)]
+fn isolate_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                let _ = libc::setpgid(0, 0);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+struct ChildSignalMonitor {
+    completed: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl ChildSignalMonitor {
+    fn new(process_id: u32) -> Self {
+        let process_group = process_id as i32;
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_thread = Arc::clone(&completed);
+        let handle = thread::spawn(move || {
+            while !completed_for_thread.load(Ordering::SeqCst) {
+                if shutdown_requested() {
+                    unsafe {
+                        libc::kill(-process_group, libc::SIGTERM);
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < deadline {
+                        if completed_for_thread.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    unsafe {
+                        libc::kill(-process_group, libc::SIGKILL);
+                    }
+                    return;
+                }
+                thread::park_timeout(Duration::from_millis(20));
+            }
+        });
+
+        Self { completed, handle }
+    }
+
+    fn finish(self) {
+        self.completed.store(true, Ordering::SeqCst);
+        self.handle.thread().unpark();
+        let _ = self.handle.join();
+        unregister_supervised_child();
     }
 }
 
@@ -1154,7 +1265,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert("test".to_string(), target("npm test", vec![]));
         let project = make_project_with_targets("a", targets);
-        let projects = vec![project];
+        let projects = [project];
 
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -1177,7 +1288,7 @@ mod tests {
         targets.insert("deps".to_string(), target("npm install", vec![]));
         targets.insert("test".to_string(), target("npm test", vec!["//a:deps"]));
         let project = make_project_with_targets("a", targets);
-        let projects = vec![project];
+        let projects = [project];
 
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -1206,7 +1317,7 @@ mod tests {
 
         let project_a = make_project_with_targets("a", targets_a);
         let project_b = make_project_with_targets("b", targets_b);
-        let projects = vec![project_a, project_b];
+        let projects = [project_a, project_b];
 
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -1234,7 +1345,7 @@ mod tests {
         );
         targets.insert("test".to_string(), target("npm test", vec!["//a:build"]));
         let project = make_project_with_targets("a", targets);
-        let projects = vec![project];
+        let projects = [project];
 
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -1264,7 +1375,7 @@ mod tests {
             target("npm test", vec!["//a:build", "//a:lint"]),
         );
         let project = make_project_with_targets("a", targets);
-        let projects = vec![project];
+        let projects = [project];
 
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
@@ -1284,6 +1395,189 @@ mod tests {
         assert!(levels[1].contains(&"//a:build".to_string()));
         assert!(levels[1].contains(&"//a:lint".to_string()));
         assert!(levels[2].contains(&"//a:test".to_string()));
+    }
+
+    #[test]
+    fn failed_prerequisite_blocks_dependent_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("dependent-ran");
+        let mut targets = HashMap::new();
+        targets.insert("deps".to_string(), target("sh -c 'exit 7'", vec![]));
+        targets.insert(
+            "build".to_string(),
+            target(
+                &format!(
+                    "touch {}",
+                    crate::executor::quote_command_argument(&marker.to_string_lossy())
+                ),
+                vec!["//a:deps"],
+            ),
+        );
+
+        let mut project = make_project_with_targets("a", targets);
+        project.root = tmp.path().to_path_buf();
+        let projects = [project];
+        let refs = projects.iter().collect::<Vec<_>>();
+        let requested = HashSet::from(["//a:build".to_string()]);
+        let executor = Executor::with_all_options(
+            tmp.path(),
+            crate::cli::output::OutputMode::Json,
+            false,
+            false,
+        );
+
+        let results = executor.execute_targets(&requested, &refs, false);
+        let dependency = results
+            .iter()
+            .find(|result| result.address == "//a:deps")
+            .unwrap();
+        let dependent = results
+            .iter()
+            .find(|result| result.address == "//a:build")
+            .unwrap();
+
+        assert!(!dependency.success);
+        assert!(!dependent.success);
+        assert!(dependent.output.contains("Blocked"));
+        assert!(!marker.exists(), "blocked dependent command was executed");
+    }
+
+    #[test]
+    fn custom_targets_only_write_cache_entries_when_explicitly_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"a"}"#).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert("deploy".to_string(), target("true", vec![]));
+        let mut project = make_project_with_targets("a", targets);
+        project.root = tmp.path().to_path_buf();
+        project.plugin_name = "nodejs".to_string();
+        let requested = HashSet::from(["//a:deploy".to_string()]);
+        let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
+
+        let projects = [&project];
+        let results = executor.execute_targets(&requested, &projects, false);
+        assert!(results.iter().all(|result| result.success));
+        let store = CacheStore::new(tmp.path());
+        assert!(store.get("//a:deploy").unwrap().is_none());
+        store
+            .set(
+                "//a:deploy",
+                CacheEntry {
+                    hash: "stale".to_string(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    success: true,
+                },
+            )
+            .unwrap();
+        let results = executor.execute_targets(&requested, &projects, false);
+        assert!(results.iter().all(|result| result.success));
+        assert!(store.get("//a:deploy").unwrap().is_none());
+
+        project.targets.get_mut("deploy").unwrap().cache = Some(CacheConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let projects = [&project];
+        let results = executor.execute_targets(&requested, &projects, false);
+        assert!(results.iter().all(|result| result.success));
+        assert!(store.get("//a:deploy").unwrap().is_some());
+    }
+
+    #[test]
+    fn cache_is_disabled_when_a_dependency_has_no_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"a"}"#).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert("build".to_string(), target("true", vec!["//a:prepare"]));
+        targets.insert("prepare".to_string(), target("true", vec![]));
+        let mut project = make_project_with_targets("a", targets);
+        project.root = tmp.path().to_path_buf();
+        project.plugin_name = "nodejs".to_string();
+
+        let result = check_cache(
+            "//a:build",
+            "build",
+            "true",
+            &project,
+            &CacheStore::new(tmp.path()),
+            &PluginRegistry::with_all_plugins(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &HashMap::new(),
+        );
+
+        assert!(
+            result.is_none(),
+            "a dependency omitted from the cache key must disable caching"
+        );
+    }
+
+    #[test]
+    fn target_that_changes_its_inputs_is_not_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/input.js"), "before").unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"a"}"#).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert(
+            "build".to_string(),
+            target("sh -c 'printf after > src/input.js'", vec![]),
+        );
+        let mut project = make_project_with_targets("a", targets);
+        project.root = tmp.path().to_path_buf();
+        project.plugin_name = "nodejs".to_string();
+        let projects = [&project];
+        let requested = HashSet::from(["//a:build".to_string()]);
+        let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
+        let store = CacheStore::new(tmp.path());
+        store
+            .set(
+                "//a:build",
+                CacheEntry {
+                    hash: "old-hash".to_string(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    success: true,
+                },
+            )
+            .unwrap();
+
+        let results = executor.execute_targets(&requested, &projects, false);
+        assert!(results.iter().all(|result| result.success));
+        assert!(store.get("//a:build").unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_execution_removes_previous_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/input.js"), "input").unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"a"}"#).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert(
+            "build".to_string(),
+            target("sh -c 'printf broken > output; exit 1'", vec![]),
+        );
+        let mut project = make_project_with_targets("a", targets);
+        project.root = tmp.path().to_path_buf();
+        project.plugin_name = "nodejs".to_string();
+        let store = CacheStore::new(tmp.path());
+        store
+            .set(
+                "//a:build",
+                CacheEntry {
+                    hash: "old-hash".to_string(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    success: true,
+                },
+            )
+            .unwrap();
+
+        let projects = [&project];
+        let requested = HashSet::from(["//a:build".to_string()]);
+        let results = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json)
+            .execute_targets(&requested, &projects, false);
+
+        assert!(results.iter().any(|result| !result.success));
+        assert!(store.get("//a:build").unwrap().is_none());
     }
 
     /// Helper to create a Target with exclusive_resources
@@ -1347,7 +1641,7 @@ mod tests {
             relative_path: PathBuf::from("b"),
         };
 
-        let projects = vec![project_a, project_b];
+        let projects = [project_a, project_b];
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
             .map(|p| (format!("//{}", p.relative_path.display()), p))
@@ -1430,7 +1724,7 @@ mod tests {
             relative_path: PathBuf::from("b"),
         };
 
-        let projects = vec![project_a, project_b];
+        let projects = [project_a, project_b];
         let project_map: HashMap<String, &DiscoveredProject> = projects
             .iter()
             .map(|p| (format!("//{}", p.relative_path.display()), p))

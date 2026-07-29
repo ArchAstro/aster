@@ -67,7 +67,7 @@ pub fn check_reserved_target(target: &str) -> Option<String> {
 
 /// Parse external subcommand args into RunArgs
 ///
-/// Args format: [target] [projects...] [--no-deps] [--dependents] [--all]
+/// Args format: `[target] [projects...] [--no-deps] [--dependents] [--all]`
 ///
 /// Project patterns:
 ///   //path/to/project  - exact project match

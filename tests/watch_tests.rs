@@ -224,8 +224,36 @@ fn assert_no_line_containing(
     observed
 }
 
+/// Discard platform watcher events that predate the startup banner.
+///
+/// macOS FSEvents may report fixture files created immediately before the
+/// watcher registered. Those lines must not be attributed to the later edit
+/// each test is trying to classify.
+fn drain_startup_events(rx: &mpsc::Receiver<String>) {
+    let started = std::time::Instant::now();
+    let minimum_deadline = started + Duration::from_secs(2);
+    let maximum_deadline = started + Duration::from_secs(8);
+    let quiet_period = Duration::from_millis(500);
+    let mut quiet_deadline = minimum_deadline;
+
+    while std::time::Instant::now() < maximum_deadline {
+        let now = std::time::Instant::now();
+        let wait_until = quiet_deadline.min(maximum_deadline);
+        let remaining = wait_until.checked_duration_since(now).unwrap_or_default();
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(_) => {
+                quiet_deadline = (std::time::Instant::now() + quiet_period).max(minimum_deadline);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= quiet_deadline => {
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_non_input_file_changes() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
@@ -244,8 +272,7 @@ fn watch_ignores_non_input_file_changes() {
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
 
-    // Let notify register before editing.
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     // Touch a file the build target's cache_inputs does NOT cover. The watcher
     // must not emit a change banner or rebuild.
@@ -263,7 +290,6 @@ fn watch_ignores_non_input_file_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_dotgit_changes() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
@@ -280,7 +306,7 @@ fn watch_ignores_dotgit_changes() {
 
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     // Simulate a git internal write.
     fs::write(tmp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -292,7 +318,6 @@ fn watch_ignores_dotgit_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_ignores_node_modules_changes() {
     // node_modules is in the built-in ignore defaults — a write there during
     // e.g. `npm install` must not trigger any rebuild.
@@ -316,7 +341,7 @@ fn watch_ignores_node_modules_changes() {
 
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
 
     fs::write(
         tmp.path().join("libs/core/node_modules/foo/index.js"),
@@ -331,7 +356,6 @@ fn watch_ignores_node_modules_changes() {
 }
 
 #[test]
-#[ignore = "fs-event timing is flaky; run explicitly via cargo test -- --ignored"]
 fn watch_reruns_dependent_target_on_dep_source_change() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
@@ -357,8 +381,7 @@ fn watch_reruns_dependent_target_on_dep_source_change() {
     let (mut child, rx) = spawn_capturing(cmd);
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
 
-    // Give notify time to register the watch.
-    thread::sleep(Duration::from_millis(500));
+    drain_startup_events(&rx);
     // Touch the core source file.
     fs::write(
         tmp.path().join("libs/core/src/index.ts"),

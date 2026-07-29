@@ -353,7 +353,7 @@ impl LanguagePlugin for PythonPlugin {
         // pytest file1.py file2.py (pytest accepts file paths directly)
         let file_args: Vec<String> = test_files
             .iter()
-            .map(|f| f.to_string_lossy().to_string())
+            .map(|f| crate::executor::quote_command_argument(&f.to_string_lossy()))
             .collect();
 
         Some(format!("{} {}", command, file_args.join(" ")))
@@ -413,19 +413,54 @@ impl LanguagePlugin for PythonPlugin {
 
     fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
         let mut dirs_to_clean = vec![
-            "__pycache__",
-            ".pytest_cache",
-            "*.egg-info",
-            "dist",
-            "build",
+            PathBuf::from(".pytest_cache"),
+            PathBuf::from("dist"),
+            PathBuf::from("build"),
         ];
-
-        // Add .venv if it exists
         if ctx.project_dir.join(".venv").exists() {
-            dirs_to_clean.insert(0, ".venv");
+            dirs_to_clean.push(PathBuf::from(".venv"));
         }
 
-        let command = format!("rm -rf {}", dirs_to_clean.join(" "));
+        let mut walker = walkdir::WalkDir::new(ctx.project_dir)
+            .follow_links(false)
+            .into_iter();
+        while let Some(entry) = walker.next() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name == "__pycache__" || name.ends_with(".egg-info") {
+                if let Ok(relative) = entry.path().strip_prefix(ctx.project_dir) {
+                    dirs_to_clean.push(relative.to_path_buf());
+                }
+                walker.skip_current_dir();
+            } else if entry.depth() > 0
+                && matches!(
+                    name.as_ref(),
+                    ".venv"
+                        | ".git"
+                        | ".pytest_cache"
+                        | "build"
+                        | "dist"
+                        | "node_modules"
+                        | "target"
+                )
+            {
+                walker.skip_current_dir();
+            }
+        }
+
+        dirs_to_clean.sort();
+        dirs_to_clean.dedup();
+        let arguments = dirs_to_clean
+            .iter()
+            .map(|path| crate::executor::quote_command_argument(&path.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!("rm -rf {arguments}");
 
         Some(Target {
             command,
@@ -1201,13 +1236,16 @@ name = "mypackage"
 "#,
         )
         .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/mypackage/__pycache__")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("mypackage.egg-info")).unwrap();
 
         let plugin = PythonPlugin;
         let ctx = make_context(&pyproject, tmp.path(), &[]);
         let targets = plugin.detect_targets(&ctx).unwrap();
 
         let clean = targets.get("clean").unwrap();
-        assert!(clean.command.contains("__pycache__"));
+        assert!(clean.command.contains("src/mypackage/__pycache__"));
+        assert!(clean.command.contains("mypackage.egg-info"));
         assert!(clean.command.contains(".pytest_cache"));
         assert!(clean.invalidates_cache);
     }
@@ -1225,8 +1263,9 @@ name = "mypackage"
         )
         .unwrap();
 
-        // Create .venv directory
-        std::fs::create_dir(tmp.path().join(".venv")).unwrap();
+        // A virtualenv may contain thousands of cache directories. The clean
+        // command should name only the virtualenv root.
+        std::fs::create_dir_all(tmp.path().join(".venv/lib/pkg/__pycache__")).unwrap();
 
         let plugin = PythonPlugin;
         let ctx = make_context(&pyproject, tmp.path(), &[]);
@@ -1234,6 +1273,7 @@ name = "mypackage"
 
         let clean = targets.get("clean").unwrap();
         assert!(clean.command.contains(".venv"));
+        assert!(!clean.command.contains(".venv/lib"));
     }
 
     #[test]

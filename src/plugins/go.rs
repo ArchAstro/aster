@@ -226,7 +226,10 @@ impl LanguagePlugin for GoPlugin {
         // Go test runs on packages (directories), not individual files
         let mut test_dirs: Vec<String> = test_files
             .iter()
-            .filter_map(|f| f.parent().map(|p| format!("./{}", p.display())))
+            .filter_map(|f| {
+                f.parent()
+                    .map(|p| crate::executor::quote_command_argument(&format!("./{}", p.display())))
+            })
             .collect();
         test_dirs.sort();
         test_dirs.dedup();
@@ -500,7 +503,7 @@ go 1.21
             targets.get("test").map(|t| &t.command),
             Some(&"go test ./...".to_string())
         );
-        assert!(targets.get("lint").is_none()); // No lint config
+        assert!(!targets.contains_key("lint")); // No lint config
 
         // Check dependencies
         assert!(targets.get("deps").unwrap().depends_on.is_empty());

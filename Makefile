@@ -1,4 +1,4 @@
-.PHONY: all build build-release install test clean release setup
+.PHONY: all build build-release install test test-all clean release-check setup
 
 # Default target
 all: build
@@ -15,29 +15,21 @@ build-release:
 install: build-release
 	cargo install --path .
 
-# Release: update version, commit, tag, and push
-# Usage: make release VERSION=0.2.0
-release:
-ifndef VERSION
-	$(error VERSION is required. Usage: make release VERSION=0.2.0)
-endif
-	@echo "Releasing version $(VERSION)..."
-	sed -i '' 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
-	cargo check
-	git add Cargo.toml Cargo.lock
-	git commit -m "chore: bump version to $(VERSION)"
-	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
-	git push origin main
-	git push origin "v$(VERSION)"
-	@echo "Released v$(VERSION)"
+# Validate a release candidate. Tagging and pushing stay explicit human actions.
+release-check:
+	cargo fmt --all -- --check
+	cargo clippy --locked --all-targets --all-features -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+	cargo test --locked --all-targets --all-features
+	cargo audit
 
 # Run all tests
 test:
 	cargo test
 
-# Run tests including ignored (monorepo integration tests)
+# Run the complete test suite.
 test-all:
-	cargo test -- --include-ignored
+	cargo test --all-targets --all-features
 
 # Clean build artifacts
 clean:
@@ -50,7 +42,7 @@ fmt:
 
 # Lint
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 # Check (fast compile check without codegen)
 check:

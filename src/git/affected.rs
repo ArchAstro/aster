@@ -43,12 +43,23 @@ impl AffectedDetector {
             .revparse_single(head)
             .with_context(|| format!("Git ref '{head}' not found. Check your --head value."))?;
 
-        let base_tree = base_obj
-            .peel_to_tree()
-            .with_context(|| format!("Could not get tree for ref '{base}'"))?;
-
-        let head_tree = head_obj
-            .peel_to_tree()
+        let base_commit = base_obj
+            .peel_to_commit()
+            .with_context(|| format!("Could not get commit for ref '{base}'"))?;
+        let head_commit = head_obj
+            .peel_to_commit()
+            .with_context(|| format!("Could not get commit for ref '{head}'"))?;
+        let merge_base_id = self
+            .repo
+            .merge_base(base_commit.id(), head_commit.id())
+            .with_context(|| format!("Could not find merge base for '{base}' and '{head}'"))?;
+        let merge_base = self
+            .repo
+            .find_commit(merge_base_id)
+            .context("Could not load merge-base commit")?;
+        let base_tree = merge_base.tree().context("Could not get merge-base tree")?;
+        let head_tree = head_commit
+            .tree()
             .with_context(|| format!("Could not get tree for ref '{head}'"))?;
 
         let mut opts = DiffOptions::new();
@@ -90,7 +101,7 @@ impl AffectedDetector {
         let mut changed = HashSet::new();
 
         for entry in statuses.iter() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 changed.insert(PathBuf::from(path));
             }
         }
@@ -256,6 +267,65 @@ mod tests {
 
         assert!(changes.contains(&PathBuf::from("feature.txt")));
         assert!(!changes.contains(&PathBuf::from("README.md")));
+    }
+
+    #[test]
+    fn comparison_uses_merge_base_when_base_branch_has_advanced() {
+        let tmp = TempDir::new().unwrap();
+        setup_git_repo(&tmp);
+        let path = tmp.path();
+        let base_branch = String::from_utf8(
+            Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let base_branch = base_branch.trim();
+
+        Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("feature.txt"), "feature").unwrap();
+        Command::new("git")
+            .args(["add", "feature.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Feature work"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["checkout", base_branch])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("base-only.txt"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "base-only.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Base branch work"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let changes = AffectedDetector::new(path)
+            .unwrap()
+            .changed_files_between_refs(base_branch, "feature")
+            .unwrap();
+
+        assert!(changes.contains(&PathBuf::from("feature.txt")));
+        assert!(!changes.contains(&PathBuf::from("base-only.txt")));
     }
 
     #[test]

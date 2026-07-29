@@ -9,6 +9,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::executor::command::parse_command;
+#[cfg(unix)]
+use crate::executor::{register_supervised_child, unregister_supervised_child};
 use crate::plugins::Target;
 
 pub struct StreamChild {
@@ -16,6 +19,18 @@ pub struct StreamChild {
     child: Child,
     #[cfg(unix)]
     pgid: Option<i32>,
+    #[cfg(unix)]
+    registered: bool,
+}
+
+impl Drop for StreamChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.registered {
+            unregister_supervised_child();
+            self.registered = false;
+        }
+    }
 }
 
 impl StreamChild {
@@ -144,46 +159,15 @@ impl Drop for StreamSupervisor {
 fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
     let working_dir = target.working_dir.as_deref().unwrap_or(project_root);
 
-    let parts: Vec<&str> = target.command.split_whitespace().collect();
-    if parts.is_empty() {
-        return Err(anyhow!("empty command"));
-    }
+    let parsed = parse_command(&target.command)?;
 
-    let mut env_vars: Vec<(&str, &str)> = Vec::new();
-    let mut cmd_start = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if let Some(eq_pos) = part.find('=') {
-            let name = &part[..eq_pos];
-            let is_env = !name.is_empty()
-                && name
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_alphabetic() || c == '_')
-                    .unwrap_or(false)
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if is_env {
-                env_vars.push((name, &part[eq_pos + 1..]));
-                cmd_start = i + 1;
-                continue;
-            }
-        }
-        break;
-    }
-
-    if cmd_start >= parts.len() {
-        return Err(anyhow!("empty command (only env vars)"));
-    }
-
-    let program = parts[cmd_start];
-    let args = &parts[cmd_start + 1..];
-
-    let mut cmd = Command::new(program);
-    cmd.args(args)
+    let mut cmd = Command::new(&parsed.program);
+    cmd.args(&parsed.args)
         .current_dir(working_dir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    for (name, value) in env_vars {
+    for (name, value) in parsed.env {
         cmd.env(name, value);
     }
 
@@ -202,7 +186,15 @@ fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
         }
     }
 
-    let child = cmd.spawn().context("spawn failed")?;
+    #[cfg(unix)]
+    register_supervised_child();
+    let child = cmd
+        .spawn()
+        .inspect_err(|_| {
+            #[cfg(unix)]
+            unregister_supervised_child();
+        })
+        .context("spawn failed")?;
 
     #[cfg(unix)]
     let pgid = Some(child.id() as i32);
@@ -214,6 +206,8 @@ fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
         child,
         #[cfg(unix)]
         pgid,
+        #[cfg(unix)]
+        registered: true,
     })
 }
 
@@ -294,7 +288,7 @@ mod tests {
         let script_path = dir.path().join("trap.sh");
         std::fs::write(
             &script_path,
-            "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 1; done\n",
+            "#!/bin/sh\ntrap '' TERM\n: > ready\nwhile :; do :; done\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -308,8 +302,13 @@ mod tests {
         let mut sup = StreamSupervisor::new(Duration::from_millis(300));
         let target = mk_target(script_path.to_str().unwrap());
         sup.spawn("//a:dev", &target, dir.path()).unwrap();
-        // Let the trap handler install before we SIGTERM.
-        std::thread::sleep(Duration::from_millis(200));
+        // Wait until the child confirms that the trap handler is installed.
+        let ready = dir.path().join("ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "child never installed its signal handler");
 
         let start = std::time::Instant::now();
         sup.shutdown_all();

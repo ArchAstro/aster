@@ -1,221 +1,200 @@
 # aster
 
-*From the Greek ἀστήρ (astḗr) — "star"*
+Aster is a build orchestrator for polyglot monorepos. It discovers projects,
+connects cross-language dependencies, and runs targets in dependency order.
 
-In the constellation of a polyglot monorepo, each project is a star. Alone, they twinkle. Together, they form something greater. **aster** is the force that binds them — orchestrating builds across languages, respecting the ancient paths of dependency, ensuring that when one star shines, all the stars it depends upon have already risen.
-
-Born from [ArchAstro](https://github.com/ArchAstro), where we architect among the stars.
-
----
-
-## What is aster?
-
-A build orchestration tool for polyglot monorepos. It automatically discovers projects (Node.js, Go, Python, Elixir), understands their dependencies, and runs targets (test, build, lint) in the correct order.
-
-```
-aster test --all              # Test everything, dependencies first
-aster build //services/api    # Build one project and its dependencies
-aster affected test           # Only test what changed
+```console
+aster test --all
+aster build //services/api
+aster affected test --base=main
 ```
 
 ## Installation
 
-### Homebrew (private tap)
+### Homebrew
 
-Requires GitHub authentication for private repo access:
-
-```sh
-# Set up token (add to ~/.zshrc to persist)
-export HOMEBREW_GITHUB_API_TOKEN="$(gh auth token)"
-
-# Install
+```console
 brew install ArchAstro/tap/aster
 ```
 
 ### From source
 
-```sh
-cargo install --git git@github.com:ArchAstro/aster.git
+Aster requires Rust 1.88 or newer.
+
+```console
+cargo install --git https://github.com/ArchAstro/aster.git --locked
 ```
 
-## Usage
+Prebuilt release archives are available for Linux x86-64, macOS x86-64, and
+macOS Apple Silicon. Windows is not currently built or tested by the project.
 
-### Running targets
+## Quick start
 
-```sh
-# Run a target on all projects
+Run the same target across a workspace:
+
+```console
 aster test --all
 aster build --all
 aster lint --all
+```
 
-# Run on specific projects (with dependencies)
+Select projects by address, directory, or the current directory:
+
+```console
 aster test //services/api
 aster build //libs/core //libs/utils
-
-# Run without dependencies
-aster test //services/api --no-deps
-
-# Run on project in current directory
 aster test .
-
-# Include dependents (reverse dependencies)
-aster build //libs/core --dependents
+aster test 'services/*'
 ```
 
-### Affected projects
+Dependencies run by default. Use `--no-deps` to omit them or `--dependents` to
+include reverse dependencies.
 
-Run targets only on projects changed since a base branch:
+Run different targets in one dependency-aware invocation:
 
-```sh
-# Test projects affected by changes since main
-aster affected test --base=main
-
-# Show what would run without executing
-aster affected test --dry-run
-
-# Include dependents of affected projects
-aster affected test --dependents
-```
-
-Exclude workspace metadata or generated files from affected analysis in the
-root `aster.toml`. Patterns are workspace-relative and are applied to Git changes
-before Aster maps files to projects:
-
-```toml
-[affected]
-ignore = [
-  ".agents/**",
-  ".claude/skills/**",
-  "docs/generated/**",
-]
-```
-
-This setting only controls `aster affected`; the top-level `ignore` setting
-continues to control project discovery.
-
-### Heterogeneous runs
-
-Run different targets on different projects:
-
-```sh
+```console
 aster run //services/api:test //libs/core:build //tools/cli:lint
 ```
 
-### Watching targets
+Explore what Aster discovered:
 
-Rerun targets automatically when their declared inputs change:
-
-```sh
-aster watch //services/api:build
-aster watch //services/api                       # uses --target (default: build)
-aster watch //services/api:build //libs/core:test
-aster watch //services/api:dev --debounce 500ms  # stream=true target runs long-lived
-```
-
-**Semantics**: watching `//services/api:build` implicitly watches its transitive
-dependencies. When a file changes, aster looks up the target whose `cache_inputs`
-own the changed path and reruns it plus every requested/in-closure target that
-depends on it. Files outside any watched target's inputs are ignored.
-
-**Streaming targets** (with `stream = true`) are spawned as long-lived children.
-Aster restarts them when their inputs or any dependency's inputs change.
-
-**Workspace config** (`aster.toml` at the repo root):
-
-```toml
-[watch]
-# Extend built-in fs ignores (.git, node_modules, target, _build, .next, dist, .turbo, .venv, .elixir_ls)
-ignore = ["coverage/**"]
-# Paths written by build output — events here are dropped during/after rebuilds
-suppress_paths = ["services/platform/priv/static/assets/**"]
-debounce_ms = 300
-```
-
-**Per-target inputs**: watch uses the same `cache_inputs` metadata as the cache.
-Refine which files a target watches via `[targets.X.cache]` in the project's
-`aster.toml`:
-
-```toml
-[targets.build.cache]
-include = ["config/**/*.json"]
-exclude = ["**/*.generated.ts"]
-```
-
-### Exploring the workspace
-
-```sh
-# List all projects
+```console
 aster list
-
-# List projects in a directory
-aster list services/
-
-# Show dependency graph
 aster graph
-
-# Show dependencies for a specific target
 aster graph //services/api:build
-
-# Find why one target depends on another
 aster why //services/api:test //libs/core:build
 ```
 
-## Project Configuration
+Use `aster --help` and `aster <command> --help` for the complete CLI reference.
 
-Create `aster.toml` in any project to customize targets:
+## Supported languages
+
+| Language | Marker | Common detected targets |
+| --- | --- | --- |
+| Rust | `Cargo.toml` | deps, build, test, lint, format, clean |
+| Node.js | `package.json` | deps, build, test, lint, format, clean |
+| Go | `go.mod` | deps, build, test, lint, clean |
+| Python | `pyproject.toml` | deps, build, test, lint, format, clean |
+| Elixir | `mix.exs` | deps, build, test, lint, format, clean |
+
+Detected targets depend on the tools and scripts present in each project.
+Node.js projects use the `packageManager` field or lockfile to choose npm or
+pnpm. Workspace members inherit their workspace root's package manager.
+
+## Project configuration
+
+Place `aster.toml` beside a project's language marker:
 
 ```toml
-# Add dependencies on other projects
+name = "api"
 depends_on = ["//libs/core:build"]
 
-# Override or add targets
 [targets]
-lint = "npm run eslint"
-typecheck = "tsc --noEmit"
-
-# Rich target configuration
-[targets.test]
-command = "npm test"
-depends_on = ["//self:build", "//libs/core:build"]
-
-# File-aware targets for affected runs
-[targets.test]
-command = "npm test -- {files}"
-files_glob = "**/*.test.ts"
-capabilities = ["FilesList"]
-
-# Alias another target (clones command, deps, capabilities, etc.)
-[targets]
+lint = "npm run lint"
 check = { alias = "test" }
 
-# Alias with additional dependencies
-[targets.ci]
-alias = "test"
-depends_on = ["//self:lint", "//self:typecheck"]
+[targets.test]
+command = "npm test -- {files}"
+depends_on = ["//self:build"]
+capabilities = ["files_list"]
+files_glob = "**/*.test.ts"
+exclusive_resources = ["database"]
+
+[targets.test.cache]
+enabled = true
+include = ["config/**/*.json"]
+exclude = ["**/*.generated.ts"]
+env = ["CI"]
+outputs = ["coverage/summary.json"]
 ```
 
-Generate a starter config:
+Run `aster project init` to generate a starter file.
 
-```sh
-aster project init           # In current directory
-aster project init ./myproj  # In specific directory
+Target commands are parsed like a shell command line for quoting, escaping, and
+leading `NAME=value` environment assignments, but they are executed directly.
+Shell operators such as pipes, redirects, `&&`, substitutions, and glob
+expansion are not interpreted. If shell behavior is intentional, invoke it
+explicitly, for example:
+
+```toml
+[targets.generate]
+command = "sh -c 'generator | formatter > src/generated.rs'"
+cache = { enabled = false }
 ```
 
-## Supported Languages
+Only the `files_list` capability is supported. When present, `{files}` is
+required to be a standalone command argument and is safely expanded into
+individual path arguments. It cannot be embedded in a quoted shell script or
+combined argument, used as the executable, or passed directly through a command
+interpreter. Use a fixed wrapper executable for more complex handling.
+Affected paths are filtered by `files_glob`.
+Unknown fields, capabilities, dependencies, and invalid globs are configuration
+errors.
 
-| Language | Marker File | Auto-detected Targets |
-|----------|-------------|----------------------|
-| Node.js | `package.json` | deps, build, test, lint (from scripts) |
-| Go | `go.mod` | deps, build, test, lint (if golangci config) |
-| Python | `pyproject.toml` | deps, build, test, lint |
-| Elixir | `mix.exs` | deps, build, test, lint |
+### Cache behavior
 
-For Node.js, aster auto-detects whether the project uses **npm** or **pnpm** and
-emits matching commands (`pnpm install`, `pnpm run build`, `pnpm exec …`). Detection
-prefers the `packageManager` field in `package.json`, then falls back to the lockfile
-(`pnpm-lock.yaml` → pnpm, `package-lock.json` → npm), defaulting to npm. Workspace
-members inherit the manager from their workspace root.
+Aster's local cache memoizes successful target executions; it does not restore
+artifacts. The default cacheable target names are `deps`, `build`, `test`,
+`lint`, `format`, `typecheck`, and `check`. Other targets must opt in with
+`cache.enabled = true`. Set `enabled = false` to opt out.
+
+`include`, `exclude`, and `env` extend a target's detected cache inputs.
+Configured `outputs` must still exist for a cached success to be reused. Clean
+targets invalidate the project's cache after succeeding.
+
+## Affected projects
+
+```console
+aster affected test --base=main
+aster affected test --base=main --dependents
+aster affected test --dry-run
+```
+
+Aster compares `HEAD` with the merge base of `HEAD` and `--base`, then includes
+uncommitted changes. CI must fetch enough history for the merge base to exist.
+
+Workspace-relative files can be excluded from affected analysis in the root
+`aster.toml`:
+
+```toml
+[affected]
+ignore = [".agents/**", "docs/generated/**"]
+```
+
+The root-level `ignore` list separately controls project discovery.
+
+## Watch mode
+
+```console
+aster watch //services/api:build
+aster watch //services/api:dev --debounce 500ms
+```
+
+Watch mode observes the requested targets and their transitive dependencies.
+Non-stream prerequisites run before a `stream = true` target starts. Relevant
+source changes received during a build are preserved for the next cycle.
+
+Configure filesystem behavior in the root `aster.toml`:
+
+```toml
+[watch]
+ignore = ["coverage/**"]
+suppress_paths = ["services/web/priv/static/assets/**"]
+debounce_ms = 300
+```
+
+Built-in ignores cover common VCS, dependency, and build-output directories.
+During the cooldown window, only configured `suppress_paths` are dropped; use
+them for generated paths that would otherwise create feedback loops.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request
+checks. Please report vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md). Community expectations and project decision-making
+are documented in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and
+[GOVERNANCE.md](GOVERNANCE.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)

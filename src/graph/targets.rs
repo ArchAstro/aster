@@ -229,8 +229,8 @@ mod tests {
                                 .into_iter()
                                 .map(|d| {
                                     // Handle //self: references for test convenience
-                                    if d.starts_with("//self:") {
-                                        format!("{}:{}", project_address, &d[7..])
+                                    if let Some(target) = d.strip_prefix("//self:") {
+                                        format!("{project_address}:{target}")
                                     } else {
                                         d.to_string()
                                     }
