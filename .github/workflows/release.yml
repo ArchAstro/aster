@@ -68,7 +68,9 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/${{ matrix.artifact }}.tar.gz" aster
+          tar -czf "dist/${{ matrix.artifact }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" aster \
+            -C "${GITHUB_WORKSPACE}" LICENSE
       - name: Install nFPM
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
@@ -76,7 +78,20 @@ jobs:
           echo "${RUNNER_TEMP}/nfpm" >> "${GITHUB_PATH}"
       - name: Build native Linux packages
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: scripts/package-linux "${{ needs.verify.outputs.version }}" "target/${{ matrix.target }}/release/aster" dist
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+          NFPM_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
+        run: |
+          test -n "${PACKAGE_SIGNING_KEY}"
+          install -m 600 /dev/null "${RUNNER_TEMP}/package-signing-key.asc"
+          printf '%s' "${PACKAGE_SIGNING_KEY}" > "${RUNNER_TEMP}/package-signing-key.asc"
+          export ASTER_SIGNING_KEY_FILE="${RUNNER_TEMP}/package-signing-key.asc"
+          scripts/package-linux "${{ needs.verify.outputs.version }}" "target/${{ matrix.target }}/release/aster" dist
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -m 700 "${GNUPGHOME}"
+          gpg --batch --import "${ASTER_SIGNING_KEY_FILE}"
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          gpg --batch --armor --export "${fingerprint}" > dist/aster-archive-keyring.asc
       - name: Smoke-test native Linux packages
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: scripts/test-linux-packages "${{ needs.verify.outputs.version }}" dist
@@ -102,7 +117,7 @@ jobs:
         run: |
           mkdir release-assets
           find artifacts -type f \
-            \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) \
+            \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' -o -name 'aster-archive-keyring.asc' \) \
             -exec cp '{}' release-assets/ \;
           cd release-assets
           sha256sum ./* | sed 's#  \./#  #' > ../SHA256SUMS
@@ -115,11 +130,166 @@ jobs:
             release-assets/*
             SHA256SUMS
           generate_release_notes: true
+          make_latest: legacy
+
+  publication-freshness:
+    name: Check publication freshness
+    needs: release
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.latest.outputs.should_publish }}
+    steps:
+      - name: Compare with latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          newest_tag="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+              sed -n '/^v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' |
+              sort --version-sort |
+              tail -1
+          )"
+          test -n "${newest_tag}"
+          if [[ "${GITHUB_REF_NAME}" == "${newest_tag}" ]]; then
+            echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Skipping stale ${GITHUB_REF_NAME}; newest release is ${newest_tag}"
+            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  publish-linux-repositories:
+    name: Publish APT and Yum repositories
+    if: vars.PACKAGE_REPOSITORIES_ENABLED == 'true' && needs.publication-freshness.outputs.should_publish == 'true'
+    needs: [verify, release, publication-freshness]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: aster-linux-repository-publishing
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download released Linux packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir released-packages
+          # shellcheck disable=SC2016 # $release is a jq variable.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | . as $release
+              | $release.assets[]
+              | select(
+                  (.name | test("^aster_.*_amd64\\.deb$"))
+                  or (
+                    (.name | test("^aster-.*\\.x86_64\\.rpm$"))
+                    and any($release.assets[]; .name == "aster-archive-keyring.asc")
+                  )
+                )
+              | [.id, .name]
+              | @tsv
+            ' |
+            while IFS=$'\t' read -r asset_id asset_name; do
+              gh api \
+                --header 'Accept: application/octet-stream' \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "released-packages/${asset_name}"
+            done
+          test -n "$(find released-packages -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$(find released-packages -maxdepth 1 -name '*.rpm' -print -quit)"
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes apt-utils createrepo-c dpkg-dev
+      - name: Build and test repositories
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+          PACKAGE_SIGNING_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
+          PACKAGE_SIGNING_PUBLIC_KEYS: ${{ secrets.PACKAGE_SIGNING_PUBLIC_KEYS }}
+          PACKAGE_REPOSITORY_URL: ${{ vars.PACKAGE_REPOSITORY_URL }}
+        run: |
+          test -n "${PACKAGE_SIGNING_KEY}"
+          test -n "${PACKAGE_REPOSITORY_URL}"
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -m 700 "${GNUPGHOME}"
+          if [[ -n "${PACKAGE_SIGNING_PUBLIC_KEYS}" ]]; then
+            printf '%s' "${PACKAGE_SIGNING_PUBLIC_KEYS}" | gpg --batch --import
+          fi
+          printf '%s' "${PACKAGE_SIGNING_KEY}" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          scripts/build-linux-repositories \
+            released-packages package-repositories "${PACKAGE_REPOSITORY_URL}" \
+            "${fingerprint}" "${{ needs.verify.outputs.version }}"
+          scripts/test-linux-repositories "${{ needs.verify.outputs.version }}" package-repositories
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: package-repositories
+      - name: Deploy package repositories
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+  update-aur:
+    name: Update AUR package
+    if: vars.AUR_PUBLISH_ENABLED == 'true' && needs.publication-freshness.outputs.should_publish == 'true'
+    needs: [verify, release, publication-freshness]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: aster-aur-publishing
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aster-linux-x64
+          path: artifacts
+      - name: Render AUR recipe
+        run: |
+          archive_sha256="$(sha256sum artifacts/aster-linux-x64.tar.gz | cut -d' ' -f1)"
+          scripts/render-aur-package "${{ needs.verify.outputs.version }}" "${archive_sha256}" aur-package
+      - name: Publish AUR recipe
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          test -n "${AUR_SSH_PRIVATE_KEY}"
+          mkdir -m 700 "${HOME}/.ssh"
+          install -m 600 /dev/null "${HOME}/.ssh/aur"
+          printf '%s' "${AUR_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/aur"
+          cat > "${HOME}/.ssh/known_hosts" <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          EOF
+          export GIT_SSH_COMMAND="ssh -i ${HOME}/.ssh/aur -o IdentitiesOnly=yes"
+          git -c init.defaultBranch=master clone ssh://aur@aur.archlinux.org/aster-bin.git aur
+          install -m 644 aur-package/PKGBUILD aur/PKGBUILD
+          install -m 644 aur-package/.SRCINFO aur/.SRCINFO
+          install -m 644 aur-package/LICENSE aur/LICENSE
+          cd aur
+          git config user.name "ArchAstro release automation"
+          git config user.email "aster@archastro.ai"
+          git add PKGBUILD .SRCINFO LICENSE
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Update to ${{ needs.verify.outputs.version }}"
+          git push origin master
 
   update-homebrew:
     name: Update Homebrew tap
-    needs: [verify, release]
+    if: needs.publication-freshness.outputs.should_publish == 'true'
+    needs: [verify, release, publication-freshness]
     runs-on: ubuntu-latest
+    concurrency:
+      group: aster-homebrew-publishing
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

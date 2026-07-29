@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 <version> <repository-directory>" >&2
+  exit 2
+fi
+
+readonly version="$1"
+readonly repository_dir="$2"
+readonly debian_image="debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
+readonly fedora_image="fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898"
+
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "version must use MAJOR.MINOR.PATCH format: ${version}" >&2
+  exit 2
+fi
+
+for path in \
+  apt/dists/stable/InRelease \
+  apt/dists/stable/main/binary-amd64/Packages.gz \
+  rpm/x86_64/repodata/repomd.xml \
+  rpm/x86_64/repodata/repomd.xml.asc \
+  aster-archive-keyring.gpg \
+  aster-archive-keyring.asc; do
+  if [[ ! -f "${repository_dir}/${path}" ]]; then
+    echo "missing repository file: ${path}" >&2
+    exit 1
+  fi
+done
+
+absolute_repository_dir="$(cd "${repository_dir}" && pwd)"
+readonly absolute_repository_dir
+
+docker run --rm \
+  --env "ASTER_VERSION=${version}" \
+  --volume "${absolute_repository_dir}:/repo:ro" \
+  "${debian_image}" \
+  bash -euc '
+    install -Dm644 /repo/aster-archive-keyring.gpg /usr/share/keyrings/aster-archive-keyring.gpg
+    cat > /etc/apt/sources.list.d/aster.sources <<EOF
+Types: deb
+URIs: file:/repo/apt
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/aster-archive-keyring.gpg
+EOF
+    apt-get update
+    apt-get install --yes aster-archive-keyring aster
+    test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    test "$(dpkg-query --show --showformat="\${Version}" aster)" = "${ASTER_VERSION}-1"
+    test "$(dpkg-query --show --showformat="\${Version}" aster-archive-keyring)" = "${ASTER_VERSION}"
+  '
+
+docker run --rm \
+  --env "ASTER_VERSION=${version}" \
+  --volume "${absolute_repository_dir}:/repo:ro" \
+  "${fedora_image}" \
+  bash -euc '
+    rpm --import /repo/aster-archive-keyring.asc
+    while IFS= read -r -d "" package; do
+      rpm --checksig "${package}"
+    done < <(find /repo/rpm/x86_64/Packages -type f -name "*.rpm" -print0)
+    cat > /etc/yum.repos.d/aster.repo <<EOF
+[aster]
+name=Aster
+baseurl=file:///repo/rpm/\$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///repo/aster-archive-keyring.asc
+EOF
+    dnf --assumeyes install aster
+    test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    test "$(rpm --query --queryformat="%{VERSION}" aster)" = "${ASTER_VERSION}"
+  '

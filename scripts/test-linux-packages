@@ -46,7 +46,11 @@ docker run --rm \
   --volume "${absolute_package_dir}:/packages:ro" \
   "${fedora_image}" \
   bash -euc '
-    dnf --assumeyes install "/packages/aster-${ASTER_VERSION}-1.x86_64.rpm"
+    if [[ -f /packages/aster-archive-keyring.asc ]]; then
+      rpm --import /packages/aster-archive-keyring.asc
+    fi
+    dnf --assumeyes --setopt=localpkg_gpgcheck=True \
+      install "/packages/aster-${ASTER_VERSION}-1.x86_64.rpm"
     test "$(aster --version)" = "aster ${ASTER_VERSION}"
     rpm --query --info aster
   '

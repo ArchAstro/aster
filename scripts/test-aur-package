@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $0 <aur-package-directory>" >&2
+  exit 2
+fi
+
+readonly package_dir="$1"
+version="$(sed -n 's/^pkgver=//p' "${package_dir}/PKGBUILD")"
+readonly version
+
+for file in PKGBUILD .SRCINFO LICENSE "aster-${version}.tar.gz"; do
+  if [[ ! -f "${package_dir}/${file}" ]]; then
+    echo "missing AUR test file: ${file}" >&2
+    exit 1
+  fi
+done
+
+bash -n "${package_dir}/PKGBUILD"
+
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --env HOME=/tmp \
+  --volume "$(cd "${package_dir}" && pwd):/pkg" \
+  archlinux:base@sha256:3406a568f45d68f0bef35dc80b3eacec8bda59b0292b2e50d5932ba1667f20cf \
+  bash -euc '
+    cd /pkg
+    makepkg --verifysource
+    test "$(makepkg --printsrcinfo)" = "$(cat .SRCINFO)"
+  '

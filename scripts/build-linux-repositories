@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 <package-directory> <output-directory> <public-base-url> <signing-key-id> <keyring-version>" >&2
+  exit 2
+fi
+
+readonly package_dir="$1"
+readonly output_dir="$2"
+readonly public_base_url="${3%/}"
+readonly signing_key_id="$4"
+readonly keyring_version="$5"
+
+if [[ ! -d "${package_dir}" ]]; then
+  echo "package directory does not exist: ${package_dir}" >&2
+  exit 2
+fi
+
+if [[ ! "${public_base_url}" =~ ^https://[A-Za-z0-9./:_-]+$ ]]; then
+  echo "public base URL must use HTTPS: ${public_base_url}" >&2
+  exit 2
+fi
+
+if [[ ! "${keyring_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "keyring version must use MAJOR.MINOR.PATCH format: ${keyring_version}" >&2
+  exit 2
+fi
+
+for command in apt-ftparchive createrepo_c dpkg-deb dpkg-scanpackages gpg; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "required command is missing: ${command}" >&2
+    exit 2
+  fi
+done
+
+if ! gpg --batch --list-secret-keys "${signing_key_id}" >/dev/null 2>&1; then
+  echo "signing key is not available: ${signing_key_id}" >&2
+  exit 2
+fi
+
+gpg_sign() {
+  if [[ -n "${PACKAGE_SIGNING_PASSPHRASE:-}" ]]; then
+    gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 "$@" \
+      3<<<"${PACKAGE_SIGNING_PASSPHRASE}"
+  else
+    gpg --batch --yes "$@"
+  fi
+}
+
+mapfile -t debs < <(find "${package_dir}" -maxdepth 1 -type f -name 'aster_*_amd64.deb' -print | sort)
+mapfile -t rpms < <(find "${package_dir}" -maxdepth 1 -type f -name 'aster-*.x86_64.rpm' -print | sort)
+
+if [[ ${#debs[@]} -eq 0 || ${#rpms[@]} -eq 0 ]]; then
+  echo "at least one Aster deb and RPM package is required" >&2
+  exit 1
+fi
+
+if [[ -d "${output_dir}" ]] && find "${output_dir}" -mindepth 1 -print -quit | grep -q .; then
+  echo "output directory must be empty: ${output_dir}" >&2
+  exit 2
+fi
+
+mkdir -p \
+  "${output_dir}/apt/pool/main/a/aster" \
+  "${output_dir}/apt/dists/stable/main/binary-amd64" \
+  "${output_dir}/rpm/x86_64/Packages"
+
+cp "${debs[@]}" "${output_dir}/apt/pool/main/a/aster/"
+cp "${rpms[@]}" "${output_dir}/rpm/x86_64/Packages/"
+
+gpg --batch --yes --export > "${output_dir}/aster-archive-keyring.gpg"
+gpg --batch --yes --armor --export > "${output_dir}/aster-archive-keyring.asc"
+
+keyring_root="$(mktemp -d)"
+readonly keyring_root
+trap 'rm -rf "${keyring_root}"' EXIT
+install -Dm644 \
+  "${output_dir}/aster-archive-keyring.gpg" \
+  "${keyring_root}/usr/share/keyrings/aster-archive-keyring.gpg"
+mkdir -p "${keyring_root}/DEBIAN" "${output_dir}/apt/pool/main/a/aster-archive-keyring"
+cat > "${keyring_root}/DEBIAN/control" <<EOF
+Package: aster-archive-keyring
+Version: ${keyring_version}
+Architecture: all
+Maintainer: ArchAstro <aster@archastro.ai>
+Section: misc
+Priority: optional
+Description: OpenPGP keys for the Aster package repository
+EOF
+dpkg-deb --build --root-owner-group \
+  "${keyring_root}" \
+  "${output_dir}/apt/pool/main/a/aster-archive-keyring/aster-archive-keyring_${keyring_version}_all.deb"
+
+(
+  cd "${output_dir}/apt"
+  dpkg-scanpackages --multiversion pool /dev/null > dists/stable/main/binary-amd64/Packages
+  gzip --keep --force --no-name --best dists/stable/main/binary-amd64/Packages
+  apt-ftparchive \
+    -o APT::FTPArchive::Release::Origin=ArchAstro \
+    -o APT::FTPArchive::Release::Label=Aster \
+    -o APT::FTPArchive::Release::Suite=stable \
+    -o APT::FTPArchive::Release::Codename=stable \
+    -o APT::FTPArchive::Release::Architectures=amd64 \
+    -o APT::FTPArchive::Release::Components=main \
+    -o APT::FTPArchive::Release::Description="Aster package repository" \
+    release dists/stable > dists/stable/Release
+  gpg_sign --local-user "${signing_key_id}" \
+    --output dists/stable/Release.gpg --detach-sign dists/stable/Release
+  gpg_sign --local-user "${signing_key_id}" \
+    --output dists/stable/InRelease --clearsign dists/stable/Release
+)
+
+createrepo_c "${output_dir}/rpm/x86_64"
+gpg_sign --armor --local-user "${signing_key_id}" \
+  --output "${output_dir}/rpm/x86_64/repodata/repomd.xml.asc" \
+  --detach-sign "${output_dir}/rpm/x86_64/repodata/repomd.xml"
+
+cat > "${output_dir}/apt/aster.sources" <<EOF
+Types: deb
+URIs: ${public_base_url}/apt
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/aster-archive-keyring.gpg
+EOF
+
+cat > "${output_dir}/rpm/aster.repo" <<EOF
+[aster]
+name=Aster
+baseurl=${public_base_url}/rpm/\$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=${public_base_url}/aster-archive-keyring.asc
+EOF
+
+cat > "${output_dir}/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Aster Linux packages</title>
+  </head>
+  <body>
+    <main>
+      <h1>Aster Linux packages</h1>
+      <h2>Debian and Ubuntu</h2>
+      <pre><code>sudo install -d -m 0755 /usr/share/keyrings
+sudo curl -fsSL ${public_base_url}/aster-archive-keyring.gpg -o /usr/share/keyrings/aster-archive-keyring.gpg
+sudo curl -fsSL ${public_base_url}/apt/aster.sources -o /etc/apt/sources.list.d/aster.sources
+sudo apt update
+sudo apt install aster-archive-keyring aster</code></pre>
+      <h2>Fedora and RPM-based distributions</h2>
+      <pre><code>sudo curl -fsSL ${public_base_url}/rpm/aster.repo -o /etc/yum.repos.d/aster.repo
+sudo dnf install aster</code></pre>
+      <p>Packages are built from
+        <a href="https://github.com/ArchAstro/aster">ArchAstro/aster</a>.
+      </p>
+    </main>
+  </body>
+</html>
+EOF
+
+touch "${output_dir}/.nojekyll"
