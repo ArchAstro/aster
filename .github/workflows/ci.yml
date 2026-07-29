@@ -58,3 +58,25 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-packages:
+    name: Linux packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.88"
+      - run: cargo build --locked --release
+      - name: Install nFPM
+        run: |
+          scripts/install-nfpm "${RUNNER_TEMP}/nfpm"
+          echo "${RUNNER_TEMP}/nfpm" >> "${GITHUB_PATH}"
+      - name: Build native packages
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          scripts/package-linux "${version}" target/release/aster dist
+      - name: Smoke-test native packages
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          scripts/test-linux-packages "${version}" dist

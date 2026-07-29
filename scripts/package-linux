@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <version> <aster-binary> <output-directory>" >&2
+  exit 2
+fi
+
+readonly version="$1"
+readonly binary="$2"
+readonly output_dir="$3"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly repo_root
+
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "version must use MAJOR.MINOR.PATCH format: ${version}" >&2
+  exit 2
+fi
+
+if [[ ! -x "${binary}" ]]; then
+  echo "aster binary is missing or not executable: ${binary}" >&2
+  exit 2
+fi
+
+if ! command -v nfpm >/dev/null 2>&1; then
+  echo "nfpm is required; run scripts/install-nfpm first" >&2
+  exit 2
+fi
+
+mkdir -p "${output_dir}"
+absolute_binary="$(cd "$(dirname "${binary}")" && pwd)/$(basename "${binary}")"
+readonly absolute_binary
+absolute_output="$(cd "${output_dir}" && pwd)"
+readonly absolute_output
+
+export ASTER_VERSION="${version}"
+export ASTER_BINARY="${absolute_binary}"
+
+nfpm package \
+  --config "${repo_root}/packaging/nfpm.yaml" \
+  --packager deb \
+  --target "${absolute_output}/aster_${version}_amd64.deb"
+nfpm package \
+  --config "${repo_root}/packaging/nfpm.yaml" \
+  --packager rpm \
+  --target "${absolute_output}/aster-${version}-1.x86_64.rpm"
+nfpm package \
+  --config "${repo_root}/packaging/nfpm.yaml" \
+  --packager archlinux \
+  --target "${absolute_output}/aster-${version}-1-x86_64.pkg.tar.zst"

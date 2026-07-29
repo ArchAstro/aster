@@ -1,0 +1,45 @@
+name: aster
+arch: amd64
+platform: linux
+version: ${ASTER_VERSION}
+release: "1"
+section: devel
+priority: optional
+maintainer: ArchAstro
+description: Build orchestration for polyglot monorepos
+vendor: ArchAstro
+homepage: https://github.com/ArchAstro/aster
+license: MIT
+provides:
+  - aster
+contents:
+  - src: ${ASTER_BINARY}
+    dst: /usr/bin/aster
+    expand: true
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/licenses/aster/LICENSE
+    file_info:
+      mode: 0644
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libgcc-s1
+      - libssl3 | libssl3t64
+      - zlib1g
+  rpm:
+    depends:
+      - glibc >= 2.35
+      - libgcc
+      - openssl-libs
+      - zlib
+  archlinux:
+    depends:
+      - gcc-libs
+      - glibc>=2.35
+      - openssl
+      - zlib
+archlinux:
+  packager: ArchAstro

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 <version> <package-directory>" >&2
+  exit 2
+fi
+
+readonly version="$1"
+readonly package_dir="$2"
+readonly deb="${package_dir}/aster_${version}_amd64.deb"
+readonly rpm="${package_dir}/aster-${version}-1.x86_64.rpm"
+readonly arch="${package_dir}/aster-${version}-1-x86_64.pkg.tar.zst"
+readonly debian_image="debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
+readonly fedora_image="fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898"
+readonly archlinux_image="archlinux:base@sha256:3406a568f45d68f0bef35dc80b3eacec8bda59b0292b2e50d5932ba1667f20cf"
+
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "version must use MAJOR.MINOR.PATCH format: ${version}" >&2
+  exit 2
+fi
+
+for package in "${deb}" "${rpm}" "${arch}"; do
+  if [[ ! -f "${package}" ]]; then
+    echo "missing package: ${package}" >&2
+    exit 1
+  fi
+done
+
+absolute_package_dir="$(cd "${package_dir}" && pwd)"
+readonly absolute_package_dir
+
+docker run --rm \
+  --env "ASTER_VERSION=${version}" \
+  --volume "${absolute_package_dir}:/packages:ro" \
+  "${debian_image}" \
+  bash -euc '
+    apt-get update
+    apt-get install --yes "/packages/aster_${ASTER_VERSION}_amd64.deb"
+    test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    dpkg --status aster
+  '
+
+docker run --rm \
+  --env "ASTER_VERSION=${version}" \
+  --volume "${absolute_package_dir}:/packages:ro" \
+  "${fedora_image}" \
+  bash -euc '
+    dnf --assumeyes install "/packages/aster-${ASTER_VERSION}-1.x86_64.rpm"
+    test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    rpm --query --info aster
+  '
+
+docker run --rm \
+  --env "ASTER_VERSION=${version}" \
+  --volume "${absolute_package_dir}:/packages:ro" \
+  "${archlinux_image}" \
+  bash -euc '
+    pacman --noconfirm --upgrade "/packages/aster-${ASTER_VERSION}-1-x86_64.pkg.tar.zst"
+    test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    pacman --query --info aster
+  '
