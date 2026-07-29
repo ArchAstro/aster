@@ -72,11 +72,44 @@ jobs:
         run: |
           scripts/install-nfpm "${RUNNER_TEMP}/nfpm"
           echo "${RUNNER_TEMP}/nfpm" >> "${GITHUB_PATH}"
+      - name: Create test signing key
+        run: |
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -m 700 "${GNUPGHOME}"
+          gpg --batch --passphrase "" \
+            --quick-generate-key "Aster package CI <ci@localhost>" rsa3072 sign 1d
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          gpg --batch --armor --export-secret-keys "${fingerprint}" > "${RUNNER_TEMP}/package-signing-key.asc"
+          gpg --batch --armor --export "${fingerprint}" > dist-key.asc
       - name: Build native packages
+        env:
+          ASTER_SIGNING_KEY_FILE: ${{ runner.temp }}/package-signing-key.asc
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           scripts/package-linux "${version}" target/release/aster dist
+          mv dist-key.asc dist/aster-archive-keyring.asc
       - name: Smoke-test native packages
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           scripts/test-linux-packages "${version}" dist
+      - name: Build AUR recipe
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          repo_root="${PWD}"
+          tar -czf dist/aster-linux-x64.tar.gz \
+            -C target/release aster \
+            -C "${repo_root}" LICENSE
+          archive_sha256="$(sha256sum dist/aster-linux-x64.tar.gz | cut -d' ' -f1)"
+          scripts/render-aur-package "${version}" "${archive_sha256}" aur-package aster-linux-x64.tar.gz
+          cp dist/aster-linux-x64.tar.gz "aur-package/aster-${version}.tar.gz"
+          scripts/test-aur-package aur-package
+      - name: Build signed APT and Yum repositories
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes apt-utils createrepo-c dpkg-dev
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          scripts/build-linux-repositories \
+            dist package-repositories https://packages.example.test "${fingerprint}" "${version}"
+          scripts/test-linux-repositories "${version}" package-repositories

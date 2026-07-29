@@ -35,6 +35,7 @@ readonly absolute_output
 
 export ASTER_VERSION="${version}"
 export ASTER_BINARY="${absolute_binary}"
+export ASTER_SIGNING_KEY_FILE="${ASTER_SIGNING_KEY_FILE:-}"
 
 nfpm package \
   --config "${repo_root}/packaging/nfpm.yaml" \

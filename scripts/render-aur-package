@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "usage: $0 <version> <archive-sha256> <output-directory> [source-url]" >&2
+  exit 2
+fi
+
+readonly version="$1"
+readonly archive_sha256="$2"
+readonly output_dir="$3"
+readonly source_url="${4:-https://github.com/ArchAstro/aster/releases/download/v${version}/aster-linux-x64.tar.gz}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly repo_root
+
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "version must use MAJOR.MINOR.PATCH format: ${version}" >&2
+  exit 2
+fi
+
+if [[ ! "${archive_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "archive SHA-256 must be 64 lowercase hexadecimal characters" >&2
+  exit 2
+fi
+
+case "${source_url}" in
+  https://* | aster-linux-x64.tar.gz) ;;
+  *)
+    echo "source URL must use HTTPS or be the local test archive" >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "${output_dir}"
+
+sed \
+  -e "s/__VERSION__/${version}/g" \
+  -e "s#__SOURCE_URL__#${source_url}#g" \
+  -e "s/__SHA256__/${archive_sha256}/g" \
+  "${repo_root}/packaging/aur/PKGBUILD.template" > "${output_dir}/PKGBUILD"
+install -m 644 "${repo_root}/packaging/aur/LICENSE" "${output_dir}/LICENSE"
+
+docker run --rm \
+  --volume "$(cd "${output_dir}" && pwd):/pkg" \
+  archlinux:base@sha256:3406a568f45d68f0bef35dc80b3eacec8bda59b0292b2e50d5932ba1667f20cf \
+  bash -euc '
+    useradd --create-home builder
+    su builder --shell /bin/bash --command "cd /pkg && makepkg --printsrcinfo" > /pkg/.SRCINFO
+  '

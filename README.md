@@ -31,8 +31,33 @@ macOS Apple Silicon. Windows is not currently built or tested by the project.
 ### Native Linux packages
 
 Tagged releases also include native x86-64 packages for Debian/Ubuntu, RPM-based
-distributions, and Arch Linux. Download the package for your distribution from
-the GitHub release, then install it with the system package manager:
+distributions, and Arch Linux.
+
+For Debian and Ubuntu, add the signed Aster repository and install by package
+name:
+
+```console
+sudo install -d -m 0755 /usr/share/keyrings
+sudo curl -fsSL https://archastro.github.io/aster/aster-archive-keyring.gpg -o /usr/share/keyrings/aster-archive-keyring.gpg
+sudo curl -fsSL https://archastro.github.io/aster/apt/aster.sources -o /etc/apt/sources.list.d/aster.sources
+sudo apt update
+sudo apt install aster-archive-keyring aster
+```
+
+For Fedora and other RPM-based distributions:
+
+```console
+sudo curl -fsSL https://archastro.github.io/aster/rpm/aster.repo -o /etc/yum.repos.d/aster.repo
+sudo dnf install aster
+```
+
+On Arch Linux, install the AUR package:
+
+```console
+yay -S aster-bin
+```
+
+You can also download a native package directly from the GitHub release:
 
 ```console
 sudo apt install ./aster_VERSION_amd64.deb

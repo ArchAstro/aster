@@ -43,3 +43,6 @@ overrides:
       - zlib
 archlinux:
   packager: ArchAstro
+rpm:
+  signature:
+    key_file: ${ASTER_SIGNING_KEY_FILE}

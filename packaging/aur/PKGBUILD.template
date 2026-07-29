@@ -1,0 +1,19 @@
+# Maintainer: ArchAstro <aster@archastro.ai>
+
+pkgname=aster-bin
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc='Build orchestration for polyglot monorepos'
+arch=('x86_64')
+url='https://github.com/ArchAstro/aster'
+license=('MIT')
+depends=('gcc-libs' 'glibc>=2.35' 'openssl' 'zlib')
+provides=('aster')
+conflicts=('aster')
+source=("aster-${pkgver}.tar.gz::__SOURCE_URL__")
+sha256sums=('__SHA256__')
+
+package() {
+  install -Dm755 "${srcdir}/aster" "${pkgdir}/usr/bin/aster"
+  install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/aster/LICENSE"
+}
