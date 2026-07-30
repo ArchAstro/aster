@@ -39,6 +39,8 @@ pub struct AsterToml {
     pub watch: WatchWorkspaceConfig,
     #[serde(default)]
     pub affected: AffectedWorkspaceConfig,
+    #[serde(default)]
+    pub dev: super::workspace::DevWorkspaceConfig,
 }
 
 /// Alias target configuration - references another target in the same project

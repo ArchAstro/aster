@@ -2,6 +2,7 @@ pub mod address;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod dev;
 pub mod discovery;
 pub mod executor;
 pub mod git;
@@ -10,6 +11,8 @@ pub mod plugins;
 pub mod targets;
 pub mod ui;
 pub mod watch;
+#[cfg(windows)]
+mod windows_process;
 
 // Re-export core types for convenience
 pub use cli::{Cli, Commands};

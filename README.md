@@ -226,6 +226,89 @@ Built-in ignores cover common VCS, dependency, and build-output directories.
 During the cooldown window, only configured `suppress_paths` are dropped; use
 them for generated paths that would otherwise create feedback loops.
 
+## Development services
+
+`aster dev` runs a configured set of long-lived targets in one supervised
+dashboard:
+
+```console
+aster dev
+aster dev api web
+aster dev --no-ui
+aster dev --dry-run
+```
+
+If a project already has a target named `dev`, run that target explicitly with
+`aster target dev <project selectors>`. The same escape hatch works for any
+target name that conflicts with a built-in Aster command.
+
+Services are mappings to ordinary `stream = true` targets. Their non-stream
+target dependencies are pre-start steps: Aster runs them before the service
+starts and again before a dependency-triggered or manual restart. The same
+transitive target graph determines which project directories are watched.
+
+Configure the harness in the workspace-root `aster.toml`:
+
+```toml
+[dev]
+port_env_files = [".env", ".env.local"]
+control_port = "control"
+
+[dev.ports.api]
+env = "API_PORT"
+file_env = "PORT"
+default = 4000
+
+[dev.ports.web]
+env = "WEB_PORT"
+default = 3000
+offset_from = "api"
+offset_base = 4000
+saturating_offset = true
+
+[dev.ports.control]
+env = "CONTROL_PORT"
+default = 5000
+
+[dev.services.api]
+target = "//services/api:dev"
+port = "api"
+open_path = "/health"
+env_files = ["services/api/.env"]
+env = { PORT = "{port}", WEB_PORT = "{ports.web}" }
+inherit_env = ["GOOGLE_CLOUD_MODE"]
+order = 10
+
+[dev.services.web]
+target = "//services/web:dev"
+port = "web"
+env = { PORT = "{port}", API_URL = "http://localhost:{ports.api}" }
+order = 20
+```
+
+`port_env_files` participate only in named-port resolution. A service receives
+only a small process baseline (`PATH`, home/user, temporary-directory, locale,
+shell, and terminal variables), its own `env_files`, explicit `env`,
+`ASTER_SERVICE_NAME`, and (when it has a port) `ASTER_SERVICE_PORT`; leading
+target-command environment assignments take final precedence. Other ambient
+variables are intentionally not inherited unless their names appear in that
+service's `inherit_env` allowlist. Process environment values named by a port's
+`env` field take precedence over `file_env` values from those files. When
+`file_env` is omitted, the `env` names are also checked in the files. An
+`offset_from` port adds the positive delta from `offset_base`, which is useful
+for collision-free worktree stacks. By default, a source below the baseline is
+an error; `saturating_offset = true` clamps that delta to zero.
+
+`{port}` and `{ports.<name>}` are expanded in service target commands and
+service environment values. They are separate from the `{files}` target
+capability. `open_path` controls the dashboard's browser URL.
+
+When `control_port` is configured, Aster accepts the platform launcher's
+line-delimited JSON commands on localhost: `status`, `list_services`,
+`restart` (with a `service` field), `restart_all`, and `shutdown`. Aster prints
+the path to a per-run token file; state-changing requests must include its
+contents as the JSON `token` field. Read-only requests do not require it.
+
 ## Contributing and security
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request

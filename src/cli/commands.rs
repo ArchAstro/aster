@@ -33,6 +33,8 @@ use super::output::OutputMode;
     --warnings-as-errors  Treat warnings as errors (for supported targets)
     --lang <langs>        Filter by language (e.g., --lang nodejs,python)
 
+  Use `aster target <name>` when a target name conflicts with a built-in command.
+
 EXAMPLES:
     aster test --all                     # Test everything
     aster test //...                     # Same as above
@@ -43,6 +45,7 @@ EXAMPLES:
     aster test //... -//vendor/...       # Test all except vendor projects
     aster build //app --dependents       # Build app and everything that uses it
     aster affected test --base=main      # Test projects changed since main
+    aster target dev //services/api      # Run a target named "dev"
 
 HETEROGENEOUS RUNS:
     aster run //a:test //b:build //c:lint   # Run different targets on different projects
@@ -232,9 +235,35 @@ pub enum Commands {
         lang: Vec<String>,
     },
 
+    /// Run configured local development services in a supervised dashboard
+    Dev {
+        /// Service names from `[dev.services]` (defaults to all services)
+        services: Vec<String>,
+
+        /// Disable dependency-aware file watching and automatic restarts
+        #[arg(long)]
+        no_watch: bool,
+
+        /// Use line-oriented logs instead of the interactive dashboard
+        #[arg(long)]
+        no_ui: bool,
+
+        /// Resolve and validate the service plan without starting processes
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Run a target whose name conflicts with a built-in command
+    #[command(name = "target")]
+    RunTarget {
+        /// Target name followed by normal target selectors and flags
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Run a single target on projects (catch-all for targets like test, build, lint)
     #[command(external_subcommand)]
-    Target(Vec<String>),
+    ExternalTarget(Vec<String>),
 }
 
 /// Cache subcommands

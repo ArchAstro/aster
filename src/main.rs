@@ -19,7 +19,7 @@ use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
     collect_target_deps, compute_target_levels, install_signal_handler, parse_target_address,
-    Executor,
+    shutdown_signal, Executor,
 };
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector, AffectedIgnore};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
@@ -37,7 +37,11 @@ const CACHE_HASH_DISPLAY_LENGTH: usize = 8;
 
 fn main() -> ExitCode {
     install_signal_handler();
-    match run() {
+    let result = run();
+    if let Some(signal) = shutdown_signal() {
+        return ExitCode::from(u8::try_from(128 + signal).unwrap_or(u8::MAX));
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -83,6 +87,7 @@ fn run() -> Result<()> {
         eprintln!("[aster] Discovered {} projects", projects.len());
     }
 
+    let explicit_target = matches!(&cli.command, Commands::RunTarget { .. });
     match cli.command {
         Commands::Init => unreachable!("Init handled above"),
         Commands::List { path, lang } => {
@@ -941,7 +946,40 @@ fn run() -> Result<()> {
                 cli.no_cache,
             )?;
         }
-        Commands::Target(ref args) => {
+        Commands::Dev {
+            services,
+            no_watch,
+            no_ui,
+            dry_run,
+        } => {
+            let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+            let graph = build_target_graph(&projects);
+            if let Some(cycle) = graph.find_cycle() {
+                return Err(anyhow::anyhow!("{cycle}"));
+            }
+            let plan = aster::dev::resolve_dev_plan(
+                &workspace_root,
+                &workspace_config.dev,
+                &services,
+                &projects,
+                &graph,
+                &registry,
+            )?;
+            aster::dev::run_dev(
+                &workspace_root,
+                projects,
+                graph,
+                plan,
+                &workspace_config,
+                aster::dev::DevOptions {
+                    watch: !no_watch,
+                    ui: !no_ui,
+                    dry_run,
+                    use_cache: !cli.no_cache,
+                },
+            )?;
+        }
+        Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
             // Parse external subcommand args
             let run_args = parse_run_args(args.clone());
 
@@ -971,8 +1009,10 @@ fn run() -> Result<()> {
             let full_logs = cli.full_logs();
 
             // Check for reserved command conflicts
-            if let Some(err_msg) = check_reserved_target(&run_args.target) {
-                return Err(anyhow::anyhow!("{err_msg}"));
+            if !explicit_target {
+                if let Some(err_msg) = check_reserved_target(&run_args.target) {
+                    return Err(anyhow::anyhow!("{err_msg}"));
+                }
             }
 
             // Build the graph

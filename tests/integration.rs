@@ -44,6 +44,34 @@ fn write_pyproject_toml(tmp: &TempDir, path: &str, content: &str) {
     fs::write(full_path, content).unwrap();
 }
 
+#[test]
+fn explicit_target_command_runs_a_target_named_dev() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.dev]
+command = "sh -c 'echo ran > dev-target-ran'"
+cache = { enabled = false }
+"#,
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["target", "dev", "//app", "--no-deps"])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("app/dev-target-ran")).unwrap(),
+        "ran\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn terminating_aster_cleans_up_the_target_process_group() {
@@ -86,7 +114,8 @@ cache = { enabled = false }
     unsafe {
         libc::kill(aster.id() as i32, libc::SIGTERM);
     }
-    let _ = aster.wait().unwrap();
+    let status = aster.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
 
     let child_exists = unsafe { libc::kill(child_pid, 0) == 0 };
     assert!(!child_exists, "target process survived Aster termination");
