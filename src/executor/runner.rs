@@ -30,8 +30,9 @@ use crate::plugins::PluginRegistry;
 use crate::ui::ProgressDisplay;
 
 use super::command::parse_command;
-#[cfg(unix)]
-use super::{register_supervised_child, shutdown_requested, unregister_supervised_child};
+use super::shutdown_requested;
+#[cfg(any(unix, windows))]
+use super::{register_supervised_child, unregister_supervised_child};
 
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
@@ -60,6 +61,8 @@ pub struct Executor<'a> {
     full_logs: bool,
     /// Whether to use caching
     use_cache: bool,
+    /// Whether child targets should receive a closed stdin.
+    null_stdin: bool,
 }
 
 impl<'a> Executor<'a> {
@@ -70,6 +73,7 @@ impl<'a> Executor<'a> {
             output_mode: OutputMode::Normal,
             full_logs: false,
             use_cache: true,
+            null_stdin: false,
         }
     }
 
@@ -80,6 +84,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs: false,
             use_cache: true,
+            null_stdin: false,
         }
     }
 
@@ -94,6 +99,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache: true,
+            null_stdin: false,
         }
     }
 
@@ -109,7 +115,17 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache,
+            null_stdin: false,
         }
+    }
+
+    /// Prevent targets from reading the caller's terminal.
+    ///
+    /// This is used for dev-service prerequisites, which execute in a worker
+    /// while the dashboard remains the foreground terminal process.
+    pub fn with_null_stdin(mut self) -> Self {
+        self.null_stdin = true;
+        self
     }
 
     /// Execute a target on selected projects in dependency order
@@ -192,19 +208,25 @@ impl<'a> Executor<'a> {
         }
 
         #[cfg(unix)]
-        isolate_process_group(&mut cmd);
+        isolate_streaming_session(&mut cmd);
+        #[cfg(windows)]
+        prepare_windows_child(&mut cmd);
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         register_supervised_child();
         let mut child = cmd.spawn().map_err(|e| {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             unregister_supervised_child();
             format!("Failed to execute {target_addr}: {e}")
         })?;
         #[cfg(unix)]
         let monitor = ChildSignalMonitor::new(child.id());
+        #[cfg(windows)]
+        let monitor = WindowsChildSignalMonitor::new(&mut child)
+            .inspect_err(|_| unregister_supervised_child())
+            .map_err(|error| format!("Failed to supervise {target_addr}: {error}"))?;
         let status = child.wait();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         monitor.finish();
         let status = status.map_err(|e| format!("Failed to execute {target_addr}: {e}"))?;
 
@@ -332,6 +354,9 @@ impl<'a> Executor<'a> {
         let mut failed_or_blocked: HashSet<String> = HashSet::new();
 
         for level in levels {
+            if shutdown_requested() {
+                break;
+            }
             let mut runnable = Vec::new();
             let mut blocked_results = Vec::new();
 
@@ -438,6 +463,9 @@ impl<'a> Executor<'a> {
         let mut handles = Vec::new();
 
         for target_addr in target_addrs {
+            if shutdown_requested() {
+                break;
+            }
             // Parse target address: //path/to/project:target_name
             let (project_addr, target_name) = match parse_target_address(target_addr) {
                 Some((p, t)) => (p, t),
@@ -574,6 +602,7 @@ impl<'a> Executor<'a> {
                 .get(&target_name)
                 .map(|t| t.invalidates_cache)
                 .unwrap_or(false);
+            let null_stdin = self.null_stdin;
             // Collect per-resource mutexes this target needs to acquire
             let target_resource_locks: Vec<Arc<Mutex<()>>> = {
                 let mut res_names: Vec<&String> = project
@@ -596,7 +625,28 @@ impl<'a> Executor<'a> {
                     .map(|m| m.lock().unwrap())
                     .collect();
 
-                let result = run_command(&addr, &command_clone, &working_dir);
+                if shutdown_requested() {
+                    let result = ExecutionResult {
+                        address: addr,
+                        success: false,
+                        skipped: true,
+                        cached: false,
+                        output: "Cancelled: shutdown requested".to_string(),
+                        duration_ms: 0,
+                    };
+                    let _ = tx_clone.send(result.clone());
+                    return result;
+                }
+                let mut result = run_command(&addr, &command_clone, &working_dir, null_stdin);
+                if shutdown_requested() {
+                    result.success = false;
+                    result.skipped = true;
+                    result.output = if result.output.is_empty() {
+                        "Cancelled: shutdown requested".to_string()
+                    } else {
+                        format!("{}\nCancelled: shutdown requested", result.output)
+                    };
+                }
 
                 if !result.success {
                     if let Some(workspace_root) = cache_store_path.as_ref() {
@@ -1048,7 +1098,12 @@ fn is_default_cacheable_target(target_name: &str) -> bool {
 }
 
 /// Run a command in a directory and capture output
-fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionResult {
+fn run_command(
+    address: &str,
+    command: &str,
+    working_dir: &Path,
+    null_stdin: bool,
+) -> ExecutionResult {
     let start = Instant::now();
 
     let parsed = match parse_command(command) {
@@ -1081,6 +1136,9 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if null_stdin {
+        cmd.stdin(Stdio::null());
+    }
 
     // Set environment variables
     for (name, value) in parsed.env {
@@ -1088,23 +1146,30 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
     }
 
     #[cfg(unix)]
-    isolate_process_group(&mut cmd);
+    isolate_streaming_session(&mut cmd);
+    #[cfg(windows)]
+    prepare_windows_child(&mut cmd);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     register_supervised_child();
     let result = cmd
         .spawn()
         .inspect_err(|_| {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             unregister_supervised_child();
         })
         .and_then(|child| {
+            #[cfg(windows)]
+            let mut child = child;
             #[cfg(unix)]
             let monitor = ChildSignalMonitor::new(child.id());
+            #[cfg(windows)]
+            let monitor = WindowsChildSignalMonitor::new(&mut child)
+                .inspect_err(|_| unregister_supervised_child())?;
 
             let output = child.wait_with_output();
 
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             monitor.finish();
 
             output
@@ -1149,8 +1214,161 @@ fn run_command(address: &str, command: &str, working_dir: &Path) -> ExecutionRes
     }
 }
 
+#[cfg(windows)]
+fn prepare_windows_child(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+}
+
+#[cfg(windows)]
+struct WindowsChildSignalMonitor {
+    completed: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    termination_handle: windows_sys::Win32::Foundation::HANDLE,
+    job_backed: bool,
+    registered: bool,
+}
+
+#[cfg(windows)]
+impl WindowsChildSignalMonitor {
+    fn new(child: &mut std::process::Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                let error = std::io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as _) != 0;
+            let assignment_error = (!assigned).then(std::io::Error::last_os_error);
+            let (termination_handle, job_backed) = if assigned {
+                (job, true)
+            } else if assignment_error
+                .as_ref()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+            {
+                windows_sys::Win32::Foundation::CloseHandle(job);
+                (std::ptr::null_mut(), false)
+            } else {
+                let error = assignment_error.unwrap_or_else(std::io::Error::last_os_error);
+                windows_sys::Win32::Foundation::CloseHandle(job);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            };
+            if let Err(error) = resume_windows_process(child.id()) {
+                windows_sys::Win32::Foundation::CloseHandle(termination_handle);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_for_thread = completed.clone();
+            let termination_value = termination_handle as usize;
+            let root_process_id = child.id();
+            let handle = thread::spawn(move || {
+                while !completed_for_thread.load(Ordering::SeqCst) {
+                    if shutdown_requested() {
+                        let handle = termination_value as windows_sys::Win32::Foundation::HANDLE;
+                        if job_backed {
+                            windows_sys::Win32::System::JobObjects::TerminateJobObject(handle, 1);
+                        } else {
+                            crate::windows_process::terminate_process_tree(root_process_id);
+                        }
+                        return;
+                    }
+                    thread::park_timeout(Duration::from_millis(20));
+                }
+            });
+            Ok(Self {
+                completed,
+                handle: Some(handle),
+                termination_handle,
+                job_backed,
+                registered: true,
+            })
+        }
+    }
+
+    fn finish(mut self) {
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        self.completed.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+        if !self.termination_handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.termination_handle);
+            }
+            self.termination_handle = std::ptr::null_mut();
+        }
+        if self.registered {
+            unregister_supervised_child();
+            self.registered = false;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsChildSignalMonitor {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+#[cfg(windows)]
+fn resume_windows_process(process_id: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut has_entry = Thread32First(snapshot, &mut entry) != 0;
+        while has_entry {
+            if entry.th32OwnerProcessID == process_id {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if thread.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    CloseHandle(snapshot);
+                    return Err(error);
+                }
+                let result = ResumeThread(thread);
+                let error = (result == u32::MAX).then(std::io::Error::last_os_error);
+                CloseHandle(thread);
+                CloseHandle(snapshot);
+                return error.map_or(Ok(()), Err);
+            }
+            has_entry = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "suspended process had no discoverable primary thread",
+    ))
+}
+
 #[cfg(unix)]
-fn isolate_process_group(command: &mut Command) {
+fn isolate_streaming_session(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     unsafe {

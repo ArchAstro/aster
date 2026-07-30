@@ -21,6 +21,10 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub affected: AffectedWorkspaceConfig,
 
+    /// Local development service harness configuration
+    #[serde(default)]
+    pub dev: DevWorkspaceConfig,
+
     /// Project settings are accepted because a project at the repository root
     /// may share this file with workspace configuration.
     pub name: Option<String>,
@@ -28,6 +32,108 @@ pub struct WorkspaceConfig {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub targets: HashMap<String, TargetConfig>,
+}
+
+/// Configuration for `aster dev`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevWorkspaceConfig {
+    /// Environment files consulted when resolving named ports. Later files win.
+    #[serde(default)]
+    pub port_env_files: Vec<String>,
+
+    /// Named ports shared by services and their environment.
+    #[serde(default)]
+    pub ports: HashMap<String, DevPortConfig>,
+
+    /// Optional named port for the line-delimited JSON control socket.
+    pub control_port: Option<String>,
+
+    /// Named service-to-target mappings.
+    #[serde(default)]
+    pub services: HashMap<String, DevServiceConfig>,
+}
+
+/// A named port used by one or more development services.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DevPortConfig {
+    /// A fixed port.
+    Fixed(u16),
+    /// A port resolved from the process environment, port env files, or a default.
+    Resolved(ResolvedDevPortConfig),
+}
+
+/// Detailed named-port resolution.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedDevPortConfig {
+    /// Process environment variables checked in order.
+    #[serde(default, deserialize_with = "deserialize_one_or_many")]
+    pub env: Vec<String>,
+    /// Port-env-file variables checked in order after the process environment.
+    /// When omitted, `env` names are also checked in the configured files.
+    #[serde(default, deserialize_with = "deserialize_optional_one_or_many")]
+    pub file_env: Option<Vec<String>>,
+    /// Default value when no configured environment variable is set.
+    pub default: u16,
+    /// Add the delta between this port and `offset_base` to the default.
+    pub offset_from: Option<String>,
+    /// Baseline for `offset_from`; required when `offset_from` is set.
+    pub offset_base: Option<u16>,
+    /// Clamp a negative offset delta to zero instead of rejecting it.
+    #[serde(default)]
+    pub saturating_offset: bool,
+}
+
+/// One long-running service managed by `aster dev`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevServiceConfig {
+    /// Address of a `stream = true` target.
+    pub target: String,
+    /// Named port from `[dev.ports]`.
+    pub port: Option<String>,
+    /// Optional browser path appended to `http://localhost:<port>`.
+    pub open_path: Option<String>,
+    /// Environment files loaded into the service process. Later files win.
+    #[serde(default)]
+    pub env_files: Vec<String>,
+    /// Environment overrides. Values support `{port}` and `{ports.<name>}`.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Ambient environment variables explicitly allowed into the service.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
+    /// Stable startup/display order. Ties are sorted by service name.
+    #[serde(default)]
+    pub order: i32,
+}
+
+fn deserialize_one_or_many<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(value) => vec![value],
+        OneOrMany::Many(values) => values,
+    })
+}
+
+fn deserialize_optional_one_or_many<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_one_or_many(deserializer).map(Some)
 }
 
 /// Configuration controlling which Git changes participate in affected analysis.
@@ -123,6 +229,61 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn parses_dev_services_ports_and_environment() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("aster.toml"),
+            r#"
+[dev]
+port_env_files = [".env"]
+control_port = "api"
+
+[dev.ports.api]
+env = "API_PORT"
+file_env = "PORT"
+default = 4000
+
+[dev.ports.web]
+env = "WEB_PORT"
+default = 3000
+offset_from = "api"
+offset_base = 4000
+
+[dev.services.api]
+target = "//api:dev"
+port = "api"
+open_path = "/health"
+env_files = ["api/.env"]
+env = { PORT = "{port}", WEB_PORT = "{ports.web}" }
+inherit_env = ["GOOGLE_CLOUD_MODE"]
+order = 10
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(temp.path()).unwrap();
+        assert_eq!(config.dev.services["api"].target, "//api:dev");
+        assert_eq!(
+            config.dev.services["api"].open_path.as_deref(),
+            Some("/health")
+        );
+        assert_eq!(
+            config.dev.services["api"].inherit_env,
+            ["GOOGLE_CLOUD_MODE"]
+        );
+        let DevPortConfig::Resolved(api) = &config.dev.ports["api"] else {
+            panic!("expected resolved port");
+        };
+        assert_eq!(api.env, ["API_PORT"]);
+        assert_eq!(api.file_env.as_deref().unwrap(), ["PORT"]);
+        let DevPortConfig::Resolved(web) = &config.dev.ports["web"] else {
+            panic!("expected resolved port");
+        };
+        assert_eq!(web.offset_from.as_deref(), Some("api"));
+        assert_eq!(web.offset_base, Some(4000));
+    }
 
     #[test]
     fn test_find_workspace_root_with_aster_toml() {

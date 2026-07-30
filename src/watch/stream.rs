@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::executor::command::parse_command;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::executor::{register_supervised_child, unregister_supervised_child};
 use crate::plugins::Target;
 
@@ -19,13 +19,13 @@ pub struct StreamChild {
     child: Child,
     #[cfg(unix)]
     pgid: Option<i32>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     registered: bool,
 }
 
 impl Drop for StreamChild {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.registered {
             unregister_supervised_child();
             self.registered = false;
@@ -74,6 +74,8 @@ impl StreamChild {
         #[cfg(not(unix))]
         {
             let _ = grace;
+            #[cfg(windows)]
+            crate::windows_process::terminate_process_tree(self.child.id());
             let _ = self.child.kill();
         }
 
@@ -186,12 +188,12 @@ fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     register_supervised_child();
     let child = cmd
         .spawn()
         .inspect_err(|_| {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             unregister_supervised_child();
         })
         .context("spawn failed")?;
@@ -207,6 +209,8 @@ fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
         #[cfg(unix)]
         pgid,
         #[cfg(unix)]
+        registered: true,
+        #[cfg(windows)]
         registered: true,
     })
 }
