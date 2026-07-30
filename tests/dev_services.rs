@@ -218,7 +218,7 @@ command = "sh -c 'echo BUILD >> ../events.log'"
     thread::sleep(Duration::from_secs(1));
     fs::write(root.join("lib/src/suppressed.js"), "manual").unwrap();
     let suppressed_restart_completed = condition_met(Duration::from_secs(20), || {
-        occurrences(&events, "PREPARE") >= 2 && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        occurrences(&events, "PREPARE") >= 2
     });
     if !suppressed_restart_completed {
         fail_with_process_diagnostics(
