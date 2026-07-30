@@ -737,8 +737,9 @@ impl ControlServer {
     fn start(port: u16) -> Result<Self> {
         use std::net::TcpListener;
 
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .with_context(|| format!("failed to bind services control socket on 127.0.0.1:{port}"))?;
+        let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+            format!("failed to bind services control socket on 127.0.0.1:{port}")
+        })?;
         listener.set_nonblocking(true)?;
         let (token, token_path) = create_control_token(port)?;
         eprintln!("[services]   control token {}", token_path.display());
