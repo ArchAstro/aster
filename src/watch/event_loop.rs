@@ -957,11 +957,11 @@ mod tests {
         };
         let (tx, shutdown, dispatches, handle) = spawn_loop_with_fixture(f, opts, None);
 
-        // Three events within the debounce window.
+        // Queue three events together. Sleeping between sends makes this test
+        // depend on scheduler latency and can push the last event outside the
+        // debounce window on loaded hosted runners.
         send_modify(&tx, "/repo/libs/core/src/a.ts");
-        std::thread::sleep(Duration::from_millis(30));
         send_modify(&tx, "/repo/libs/core/src/b.ts");
-        std::thread::sleep(Duration::from_millis(30));
         send_modify(&tx, "/repo/services/api/src/main.ts");
 
         // Wait for dispatch to fire after debounce elapses.
