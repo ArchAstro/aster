@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -48,23 +48,32 @@ fn process_is_running(pid: i32) -> bool {
 fn fail_with_process_diagnostics(
     aster: &mut std::process::Child,
     events: &Path,
+    stdout: &Path,
+    stderr: &Path,
     context: &str,
 ) -> ! {
     unsafe {
         libc::kill(aster.id() as i32, libc::SIGTERM);
     }
-    let status = aster.wait().unwrap();
-    let mut stdout = String::new();
-    if let Some(mut pipe) = aster.stdout.take() {
-        pipe.read_to_string(&mut stdout).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut status = None;
+    while Instant::now() < deadline {
+        status = aster.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = aster.stderr.take() {
-        pipe.read_to_string(&mut stderr).unwrap();
+    if status.is_none() {
+        aster.kill().unwrap();
+        status = Some(aster.wait().unwrap());
     }
     panic!(
-        "{context}:\nstatus: {status}\nevents:\n{}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "{context}:\nstatus: {:?}\nevents:\n{}\nstdout:\n{}\nstderr:\n{}",
+        status.unwrap(),
         fs::read_to_string(events).unwrap_or_default(),
+        fs::read_to_string(stdout).unwrap_or_default(),
+        fs::read_to_string(stderr).unwrap_or_default(),
     );
 }
 
@@ -162,6 +171,8 @@ command = "sh -c 'echo BUILD >> ../events.log'"
 "#,
     )
     .unwrap();
+    let stdout_log = tempfile::NamedTempFile::new().unwrap();
+    let stderr_log = tempfile::NamedTempFile::new().unwrap();
 
     // Process boundary: launch the public CLI, which starts a real prerequisite
     // process and a real HTTP child in its own process group.
@@ -172,8 +183,8 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         .current_dir(root)
         .env("ASTER_AMBIENT_SECRET", "must-not-reach-service")
         .env("ASTER_ALLOWED_VALUE", "explicitly-allowed")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout_log.reopen().unwrap())
+        .stderr(stderr_log.reopen().unwrap())
         .spawn()
         .unwrap();
     let events = root.join("events.log");
@@ -183,7 +194,13 @@ command = "sh -c 'echo BUILD >> ../events.log'"
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
     if !started {
-        fail_with_process_diagnostics(&mut aster, &events, "service did not start");
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            stdout_log.path(),
+            stderr_log.path(),
+            "service did not start",
+        );
     }
     assert_eq!(occurrences(&events, "AMBIENT_SECRET_LEAKED"), 0);
     assert!(fs::read_to_string(&events)
@@ -207,6 +224,8 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         fail_with_process_diagnostics(
             &mut aster,
             &events,
+            stdout_log.path(),
+            stderr_log.path(),
             "suppressed-path restart did not complete",
         );
     }
@@ -220,7 +239,13 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         occurrences(&events, "PREPARE") >= 3
     });
     if !dependency_restart_started {
-        fail_with_process_diagnostics(&mut aster, &events, "dependency restart did not start");
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            stdout_log.path(),
+            stderr_log.path(),
+            "dependency restart did not start",
+        );
     }
     thread::sleep(Duration::from_millis(250));
     fs::write(root.join("lib/src/input.js"), "third").unwrap();
@@ -231,15 +256,12 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         thread::sleep(Duration::from_millis(100));
     }
     if occurrences(&events, "PREPARE") < 4 || TcpStream::connect(("127.0.0.1", port)).is_err() {
-        unsafe {
-            libc::kill(aster.id() as i32, libc::SIGTERM);
-        }
-        let output = aster.wait_with_output().unwrap();
-        panic!(
-            "restart did not settle:\n{}\nstdout:\n{}\nstderr:\n{}",
-            fs::read_to_string(&events).unwrap_or_default(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            stdout_log.path(),
+            stderr_log.path(),
+            "restart did not settle",
         );
     }
     thread::sleep(Duration::from_secs(2));
