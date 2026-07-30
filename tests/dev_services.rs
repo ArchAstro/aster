@@ -8,15 +8,22 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+fn condition_met(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if condition() {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("condition was not satisfied within {timeout:?}");
+    condition()
+}
+
+fn wait_until(timeout: Duration, condition: impl FnMut() -> bool) {
+    assert!(
+        condition_met(timeout, condition),
+        "condition was not satisfied within {timeout:?}"
+    );
 }
 
 fn occurrences(path: &Path, needle: &str) -> usize {
@@ -147,11 +154,23 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         .spawn()
         .unwrap();
     let events = root.join("events.log");
-    wait_until(Duration::from_secs(30), || {
+    let started = condition_met(Duration::from_secs(30), || {
         occurrences(&events, "PREPARE") >= 1
             && occurrences(&events, &format!("START:{port}")) >= 1
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
+    if !started {
+        unsafe {
+            libc::kill(aster.id() as i32, libc::SIGTERM);
+        }
+        let output = aster.wait_with_output().unwrap();
+        panic!(
+            "service did not start:\n{}\nstdout:\n{}\nstderr:\n{}",
+            fs::read_to_string(&events).unwrap_or_default(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
     assert_eq!(occurrences(&events, "AMBIENT_SECRET_LEAKED"), 0);
     assert!(fs::read_to_string(&events)
         .unwrap()
