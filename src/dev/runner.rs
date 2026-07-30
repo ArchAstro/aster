@@ -327,7 +327,53 @@ pub fn run_dev(
                                     }
                                     needs_draw = true;
                                 }
+                                DashboardAction::ToggleMouse(enabled) => {
+                                    guard.set_mouse_capture(enabled)?;
+                                    needs_draw = true;
+                                }
                                 DashboardAction::Draw => needs_draw = true,
+                                DashboardAction::None => {}
+                            }
+                        }
+                        Event::Mouse(mouse) => {
+                            let size = guard.terminal.size()?;
+                            let control_token_path = control
+                                .as_ref()
+                                .and_then(|control| control.token_path.to_str());
+                            match dashboard.handle_mouse(
+                                mouse,
+                                ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                                control_token_path,
+                            ) {
+                                DashboardAction::Open => {
+                                    if let Some(url) = dashboard.active_url() {
+                                        if let Err(error) = open_url(url) {
+                                            let active = dashboard.active_name().to_string();
+                                            dashboard.push_system(
+                                                &active,
+                                                format!("failed to open browser: {error}"),
+                                            );
+                                        }
+                                    }
+                                    needs_draw = true;
+                                }
+                                DashboardAction::Draw => needs_draw = true,
+                                DashboardAction::ToggleMouse(enabled) => {
+                                    guard.set_mouse_capture(enabled)?;
+                                    needs_draw = true;
+                                }
+                                DashboardAction::Restart(name) => {
+                                    queue_restart(
+                                        &mut pending_starts,
+                                        &name,
+                                        "manual restart",
+                                        &system_tx,
+                                        &mut dashboard,
+                                    );
+                                    suppress_until = Instant::now() + Duration::from_millis(700);
+                                    needs_draw = true;
+                                }
+                                DashboardAction::Quit => quitting = true,
                                 DashboardAction::None => {}
                             }
                         }

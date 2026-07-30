@@ -248,6 +248,15 @@ target dependencies are pre-start steps: Aster runs them before the service
 starts and again before a dependency-triggered or manual restart. The same
 transitive target graph determines which project directories are watched.
 
+The dashboard uses scalable colored service tabs beside one focused log
+stream. Use `h`/`l` or click a tab to switch services, drag the divider or use
+`[`/`]` to resize, and scroll the service list independently when it exceeds
+the terminal height. It also supports fullscreen logs (`f`), wrapping (`w`),
+search (`/`), mouse line selection and clipboard copy (`y`), browser opening
+(`o` or `[open]`), manual restart (`r`), and the `?` controls overlay. Press
+`m` to disable dashboard mouse capture when native terminal selection is
+preferred.
+
 Configure the harness in the workspace-root `aster.toml`:
 
 ```toml
