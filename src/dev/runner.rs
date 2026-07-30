@@ -176,7 +176,7 @@ pub fn run_dev(
                             watch_deadline.get_or_insert_with(|| Instant::now() + watch_debounce);
                         }
                         Ok(_) => {}
-                        Err(error) => eprintln!("[dev] watcher error: {error}"),
+                        Err(error) => eprintln!("[services] watcher error: {error}"),
                     }
                 }
                 if watch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -343,7 +343,7 @@ pub fn run_dev(
     })();
 
     drop(terminal);
-    eprintln!("[dev] shutting down services...");
+    eprintln!("[services] shutting down services...");
     executor::request_shutdown();
     pending_starts.clear();
     if let Some((_, handle)) = active_start.take() {
@@ -604,7 +604,7 @@ fn start_watcher(
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = tx.send(event);
     })
-    .context("failed to create dev file watcher")?;
+    .context("failed to create services file watcher")?;
     let mut roots = plan
         .services
         .iter()
@@ -696,19 +696,19 @@ fn emit_system(
 }
 
 fn print_plan(plan: &DevPlan) {
-    eprintln!("[dev] {} service(s)", plan.services.len());
+    eprintln!("[services] {} service(s)", plan.services.len());
     for service in &plan.services {
         let port = service
             .port
             .map(|port| format!(" :{port}"))
             .unwrap_or_default();
         eprintln!(
-            "[dev]   {}{port} -> {}",
+            "[services]   {}{port} -> {}",
             service.name, service.target_address
         );
     }
     if let Some(port) = plan.control_port {
-        eprintln!("[dev]   control :{port}");
+        eprintln!("[services]   control :{port}");
     }
 }
 
@@ -738,10 +738,10 @@ impl ControlServer {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", port))
-            .with_context(|| format!("failed to bind dev control socket on 127.0.0.1:{port}"))?;
+            .with_context(|| format!("failed to bind services control socket on 127.0.0.1:{port}"))?;
         listener.set_nonblocking(true)?;
         let (token, token_path) = create_control_token(port)?;
-        eprintln!("[dev]   control token {}", token_path.display());
+        eprintln!("[services]   control token {}", token_path.display());
         let stop = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -890,7 +890,7 @@ fn create_control_token(port: u16) -> Result<(String, PathBuf)> {
 
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)
-        .map_err(|error| anyhow::anyhow!("failed to generate dev control token: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to generate services control token: {error}"))?;
     let token = random
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -900,7 +900,7 @@ fn create_control_token(port: u16) -> Result<(String, PathBuf)> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let path = std::env::temp_dir().join(format!(
-        "aster-dev-{port}-{}-{unique}.token",
+        "aster-services-{port}-{}-{unique}.token",
         std::process::id()
     ));
     let mut options = OpenOptions::new();

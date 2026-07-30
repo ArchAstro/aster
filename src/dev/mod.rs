@@ -1,4 +1,4 @@
-//! Config-driven local service supervision for `aster dev`.
+//! Config-driven local service supervision for `aster services up`.
 
 mod dashboard;
 mod plan;

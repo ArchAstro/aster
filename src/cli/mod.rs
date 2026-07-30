@@ -6,7 +6,7 @@ pub mod commands;
 pub mod output;
 pub mod run;
 
-pub use commands::{CacheCommands, Cli, Commands, ProjectCommands};
+pub use commands::{CacheCommands, Cli, Commands, ProjectCommands, ServicesCommands};
 pub use output::{
     build_execution_output, output_json, print_summary, ExecutionOutput, ExecutionSummary,
     GraphOutput, OutputMode, ProjectInfo, TargetResult, WhyOutput,

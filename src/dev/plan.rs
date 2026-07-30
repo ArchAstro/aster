@@ -10,7 +10,7 @@ use crate::graph::TargetGraph;
 use crate::plugins::{PluginRegistry, Target};
 use crate::watch::WatchPlan;
 
-/// Fully resolved plan for one invocation of `aster dev`.
+/// Fully resolved plan for one invocation of `aster services up`.
 pub struct DevPlan {
     pub services: Vec<ServicePlan>,
     pub ports: HashMap<String, u16>,
@@ -50,14 +50,14 @@ pub fn resolve_dev_plan(
             ports
                 .get(name)
                 .copied()
-                .ok_or_else(|| anyhow!("dev control_port references unknown port '{name}'"))
+                .ok_or_else(|| anyhow!("control_port references unknown service port '{name}'"))
         })
         .transpose()?;
     let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
 
     for name in &selected {
         if !config.services.contains_key(*name) {
-            bail!("unknown dev service '{name}'");
+            bail!("unknown service '{name}'");
         }
     }
 
@@ -77,16 +77,16 @@ pub fn resolve_dev_plan(
 
         let (project_address, _) = service.target.split_once(':').ok_or_else(|| {
             anyhow!(
-                "dev service '{name}' target must use //project:target syntax: {}",
+                "service '{name}' target must use //project:target syntax: {}",
                 service.target
             )
         })?;
         let project = project_by_address.get(project_address).ok_or_else(|| {
-            anyhow!("dev service '{name}' references unknown project {project_address}")
+            anyhow!("service '{name}' references unknown project {project_address}")
         })?;
         let node = graph.get(&service.target).ok_or_else(|| {
             anyhow!(
-                "dev service '{name}' references unknown target {}",
+                "service '{name}' references unknown target {}",
                 service.target
             )
         })?;
@@ -96,14 +96,14 @@ pub fn resolve_dev_plan(
             .ok_or_else(|| anyhow!("target definition missing for {}", service.target))?;
         if !target.stream {
             bail!(
-                "dev service '{name}' target {} must set stream = true",
+                "service '{name}' target {} must set stream = true",
                 service.target
             );
         }
 
         let port = match service.port.as_deref() {
             Some(port_name) => Some(*ports.get(port_name).ok_or_else(|| {
-                anyhow!("dev service '{name}' references unknown port '{port_name}'")
+                anyhow!("service '{name}' references unknown port '{port_name}'")
             })?),
             None => None,
         };
@@ -119,7 +119,7 @@ pub fn resolve_dev_plan(
             service_env.insert(
                 key.clone(),
                 expand_template(value, port, &ports).with_context(|| {
-                    format!("invalid env value for dev service '{name}' key '{key}'")
+                    format!("invalid env value for service '{name}' key '{key}'")
                 })?,
             );
         }
@@ -131,7 +131,7 @@ pub fn resolve_dev_plan(
 
         let mut target = target.clone();
         target.command = expand_template(&target.command, port, &ports)
-            .with_context(|| format!("invalid command for dev service '{name}'"))?;
+            .with_context(|| format!("invalid command for service '{name}'"))?;
         let open_url = port.map(|port| {
             let path = service.open_path.as_deref().unwrap_or("");
             let path = if path.is_empty() || path.starts_with('/') {
@@ -147,7 +147,7 @@ pub fn resolve_dev_plan(
             graph,
             plugins,
         )
-        .with_context(|| format!("failed to build watch plan for dev service '{name}'"))?;
+        .with_context(|| format!("failed to build watch plan for service '{name}'"))?;
 
         services.push(ServicePlan {
             name: name.clone(),
@@ -162,7 +162,7 @@ pub fn resolve_dev_plan(
     }
 
     if services.is_empty() {
-        bail!("no dev services selected");
+        bail!("no services selected");
     }
 
     Ok(DevPlan {
@@ -176,7 +176,7 @@ fn validate_environment(service: &str, environment: &HashMap<String, String>) ->
     for (key, value) in environment {
         validate_environment_key(service, key)?;
         if value.contains('\0') {
-            bail!("dev service '{service}' environment value for '{key}' contains NUL");
+            bail!("service '{service}' environment value for '{key}' contains NUL");
         }
     }
     Ok(())
@@ -184,7 +184,7 @@ fn validate_environment(service: &str, environment: &HashMap<String, String>) ->
 
 fn validate_environment_key(service: &str, key: &str) -> Result<()> {
     if key.is_empty() || key.contains('=') || key.contains('\0') {
-        bail!("dev service '{service}' has invalid environment key {key:?}");
+        bail!("service '{service}' has invalid environment key {key:?}");
     }
     Ok(())
 }
@@ -294,7 +294,7 @@ fn resolve_ports(
             let mut names = pending.into_iter().collect::<Vec<_>>();
             names.sort_unstable();
             bail!(
-                "unable to resolve dev ports (unknown or cyclic offset_from): {}",
+                "unable to resolve service ports (unknown or cyclic offset_from): {}",
                 names.join(", ")
             );
         }
@@ -321,7 +321,7 @@ fn validate_port_offsets(configs: &HashMap<String, DevPortConfig>) -> Result<()>
                 break;
             };
             if !seen.insert(current) {
-                bail!("dev port offset_from cycle includes '{current}'");
+                bail!("service port offset_from cycle includes '{current}'");
             }
             if !configs.contains_key(next) {
                 bail!("port '{current}' offset_from references unknown port '{next}'");
