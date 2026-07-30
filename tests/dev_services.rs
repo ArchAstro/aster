@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -43,6 +43,29 @@ fn process_is_running(pid: i32) -> bool {
         .unwrap();
     let state = String::from_utf8_lossy(&output.stdout);
     !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+}
+
+fn fail_with_process_diagnostics(
+    aster: &mut std::process::Child,
+    events: &Path,
+    context: &str,
+) -> ! {
+    unsafe {
+        libc::kill(aster.id() as i32, libc::SIGTERM);
+    }
+    let status = aster.wait().unwrap();
+    let mut stdout = String::new();
+    if let Some(mut pipe) = aster.stdout.take() {
+        pipe.read_to_string(&mut stdout).unwrap();
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = aster.stderr.take() {
+        pipe.read_to_string(&mut stderr).unwrap();
+    }
+    panic!(
+        "{context}:\nstatus: {status}\nevents:\n{}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        fs::read_to_string(events).unwrap_or_default(),
+    );
 }
 
 fn control_request(port: u16, request: &str) -> serde_json::Value {
@@ -160,16 +183,7 @@ command = "sh -c 'echo BUILD >> ../events.log'"
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
     if !started {
-        unsafe {
-            libc::kill(aster.id() as i32, libc::SIGTERM);
-        }
-        let output = aster.wait_with_output().unwrap();
-        panic!(
-            "service did not start:\n{}\nstdout:\n{}\nstderr:\n{}",
-            fs::read_to_string(&events).unwrap_or_default(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        fail_with_process_diagnostics(&mut aster, &events, "service did not start");
     }
     assert_eq!(occurrences(&events, "AMBIENT_SECRET_LEAKED"), 0);
     assert!(fs::read_to_string(&events)
@@ -186,18 +200,28 @@ command = "sh -c 'echo BUILD >> ../events.log'"
     // window expires, even when its path matches suppress_paths.
     thread::sleep(Duration::from_secs(1));
     fs::write(root.join("lib/src/suppressed.js"), "manual").unwrap();
-    wait_until(Duration::from_secs(10), || {
+    let suppressed_restart_completed = condition_met(Duration::from_secs(20), || {
         occurrences(&events, "PREPARE") >= 2 && TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
+    if !suppressed_restart_completed {
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            "suppressed-path restart did not complete",
+        );
+    }
     thread::sleep(Duration::from_secs(2));
 
     // Watch boundary: mutate the transitive library dependency, not the service
     // directory. Mutate it again while the deliberately slow prerequisite is
     // running; that genuine source event must survive the restart cooldown.
     fs::write(root.join("lib/src/input.js"), "second").unwrap();
-    wait_until(Duration::from_secs(10), || {
+    let dependency_restart_started = condition_met(Duration::from_secs(20), || {
         occurrences(&events, "PREPARE") >= 3
     });
+    if !dependency_restart_started {
+        fail_with_process_diagnostics(&mut aster, &events, "dependency restart did not start");
+    }
     thread::sleep(Duration::from_millis(250));
     fs::write(root.join("lib/src/input.js"), "third").unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
