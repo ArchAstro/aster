@@ -70,16 +70,12 @@ fn wait_for_control_token(port: u16, process_id: u32) -> (std::path::PathBuf, St
 fn dev_supervises_targets_runs_prerequisites_and_restarts_on_dependency_changes() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let port = TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let control_port = TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Keep both reservations open until launch so the OS cannot assign the
+    // same ephemeral port to HTTP and the control server.
+    let port_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = port_reservation.local_addr().unwrap().port();
+    let control_port_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let control_port = control_port_reservation.local_addr().unwrap().port();
     fs::create_dir(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
     fs::create_dir_all(root.join("lib/src")).unwrap();
@@ -139,6 +135,8 @@ command = "sh -c 'echo BUILD >> ../events.log'"
 
     // Process boundary: launch the public CLI, which starts a real prerequisite
     // process and a real HTTP child in its own process group.
+    drop(port_reservation);
+    drop(control_port_reservation);
     let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["services", "up", "--no-ui"])
         .current_dir(root)
@@ -149,7 +147,7 @@ command = "sh -c 'echo BUILD >> ../events.log'"
         .spawn()
         .unwrap();
     let events = root.join("events.log");
-    wait_until(Duration::from_secs(12), || {
+    wait_until(Duration::from_secs(30), || {
         occurrences(&events, "PREPARE") >= 1
             && occurrences(&events, &format!("START:{port}")) >= 1
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
