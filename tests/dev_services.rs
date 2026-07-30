@@ -35,7 +35,7 @@ fn control_request(port: u16, request: &str) -> serde_json::Value {
 }
 
 fn wait_for_control_token(port: u16, process_id: u32) -> (std::path::PathBuf, String) {
-    let prefix = format!("aster-dev-{port}-{process_id}-");
+    let prefix = format!("aster-services-{port}-{process_id}-");
     let mut found = None;
     wait_until(Duration::from_secs(5), || {
         found = fs::read_dir(std::env::temp_dir())
@@ -128,7 +128,7 @@ command = "sh -c 'echo BUILD >> ../events.log'"
     // Process boundary: launch the public CLI, which starts a real prerequisite
     // process and a real HTTP child in its own process group.
     let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["dev", "--no-ui"])
+        .args(["services", "up", "--no-ui"])
         .current_dir(root)
         .env("ASTER_AMBIENT_SECRET", "must-not-reach-service")
         .env("ASTER_ALLOWED_VALUE", "explicitly-allowed")
@@ -264,7 +264,7 @@ stream = true
     // No supervised child is ever registered. SIGTERM must still take the
     // graceful dev-loop path so an interactive caller can restore its terminal.
     let aster = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["dev", "--no-ui"])
+        .args(["services", "up", "--no-ui"])
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -319,7 +319,7 @@ stream = true
     .unwrap();
 
     let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["dev", "--no-ui"])
+        .args(["services", "up", "--no-ui"])
         .current_dir(root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -387,7 +387,7 @@ stream = true
     .unwrap();
 
     let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["dev", "--no-ui"])
+        .args(["services", "up", "--no-ui"])
         .current_dir(root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

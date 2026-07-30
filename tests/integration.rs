@@ -45,7 +45,7 @@ fn write_pyproject_toml(tmp: &TempDir, path: &str, content: &str) {
 }
 
 #[test]
-fn explicit_target_command_runs_a_target_named_dev() {
+fn dev_target_does_not_conflict_with_services_command() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
     write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
@@ -61,7 +61,7 @@ cache = { enabled = false }
 
     let status = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
-        .args(["target", "dev", "//app", "--no-deps"])
+        .args(["dev", "//app", "--no-deps"])
         .status()
         .unwrap();
 

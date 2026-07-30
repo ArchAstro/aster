@@ -228,19 +228,20 @@ them for generated paths that would otherwise create feedback loops.
 
 ## Development services
 
-`aster dev` runs a configured set of long-lived targets in one supervised
+`aster services up` runs a configured set of long-lived targets in one supervised
 dashboard:
 
 ```console
-aster dev
-aster dev api web
-aster dev --no-ui
-aster dev --dry-run
+aster services up
+aster services up api web
+aster services up --no-ui
+aster services up --dry-run
 ```
 
-If a project already has a target named `dev`, run that target explicitly with
-`aster target dev <project selectors>`. The same escape hatch works for any
-target name that conflicts with a built-in Aster command.
+Targets named `dev` remain ordinary targets (`aster dev <project selectors>`).
+If a project has a target named `services`, run it explicitly with
+`aster target services <project selectors>`. The same escape hatch works for
+any target name that conflicts with a built-in Aster command.
 
 Services are mappings to ordinary `stream = true` targets. Their non-stream
 target dependencies are pre-start steps: Aster runs them before the service

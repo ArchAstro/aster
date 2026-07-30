@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, WhyOutput,
+    ProjectInfo, ServicesCommands, WhyOutput,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -946,39 +946,41 @@ fn run() -> Result<()> {
                 cli.no_cache,
             )?;
         }
-        Commands::Dev {
-            services,
-            no_watch,
-            no_ui,
-            dry_run,
-        } => {
-            let workspace_config = WorkspaceConfig::load(&workspace_root)?;
-            let graph = build_target_graph(&projects);
-            if let Some(cycle) = graph.find_cycle() {
-                return Err(anyhow::anyhow!("{cycle}"));
+        Commands::Services { command } => match command {
+            ServicesCommands::Up {
+                services,
+                no_watch,
+                no_ui,
+                dry_run,
+            } => {
+                let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+                let graph = build_target_graph(&projects);
+                if let Some(cycle) = graph.find_cycle() {
+                    return Err(anyhow::anyhow!("{cycle}"));
+                }
+                let plan = aster::dev::resolve_dev_plan(
+                    &workspace_root,
+                    &workspace_config.dev,
+                    &services,
+                    &projects,
+                    &graph,
+                    &registry,
+                )?;
+                aster::dev::run_dev(
+                    &workspace_root,
+                    projects,
+                    graph,
+                    plan,
+                    &workspace_config,
+                    aster::dev::DevOptions {
+                        watch: !no_watch,
+                        ui: !no_ui,
+                        dry_run,
+                        use_cache: !cli.no_cache,
+                    },
+                )?;
             }
-            let plan = aster::dev::resolve_dev_plan(
-                &workspace_root,
-                &workspace_config.dev,
-                &services,
-                &projects,
-                &graph,
-                &registry,
-            )?;
-            aster::dev::run_dev(
-                &workspace_root,
-                projects,
-                graph,
-                plan,
-                &workspace_config,
-                aster::dev::DevOptions {
-                    watch: !no_watch,
-                    ui: !no_ui,
-                    dry_run,
-                    use_cache: !cli.no_cache,
-                },
-            )?;
-        }
+        },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
             // Parse external subcommand args
             let run_args = parse_run_args(args.clone());

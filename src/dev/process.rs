@@ -80,11 +80,11 @@ impl ServiceProcess {
                 #[cfg(any(unix, windows))]
                 unregister_supervised_child();
             })
-            .with_context(|| format!("failed to spawn dev service '{service}'"))?;
+            .with_context(|| format!("failed to spawn service '{service}'"))?;
         #[cfg(windows)]
         let job = assign_kill_on_close_job_and_resume(&mut child)
             .inspect_err(|_| unregister_supervised_child())
-            .with_context(|| format!("failed to supervise dev service '{service}'"))?;
+            .with_context(|| format!("failed to supervise service '{service}'"))?;
         let stdout = child.stdout.take().context("missing service stdout")?;
         let stderr = child.stderr.take().context("missing service stderr")?;
         #[cfg(unix)]

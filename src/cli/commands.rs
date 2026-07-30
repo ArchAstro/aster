@@ -235,8 +235,30 @@ pub enum Commands {
         lang: Vec<String>,
     },
 
-    /// Run configured local development services in a supervised dashboard
-    Dev {
+    /// Manage configured local development services
+    Services {
+        #[command(subcommand)]
+        command: ServicesCommands,
+    },
+
+    /// Run a target whose name conflicts with a built-in command
+    #[command(name = "target")]
+    RunTarget {
+        /// Target name followed by normal target selectors and flags
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Run a single target on projects (catch-all for targets like test, build, lint)
+    #[command(external_subcommand)]
+    ExternalTarget(Vec<String>),
+}
+
+/// Local development service commands
+#[derive(Subcommand)]
+pub enum ServicesCommands {
+    /// Start configured services in a supervised dashboard
+    Up {
         /// Service names from `[dev.services]` (defaults to all services)
         services: Vec<String>,
 
@@ -252,18 +274,6 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-
-    /// Run a target whose name conflicts with a built-in command
-    #[command(name = "target")]
-    RunTarget {
-        /// Target name followed by normal target selectors and flags
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Run a single target on projects (catch-all for targets like test, build, lint)
-    #[command(external_subcommand)]
-    ExternalTarget(Vec<String>),
 }
 
 /// Cache subcommands

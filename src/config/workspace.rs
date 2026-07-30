@@ -34,7 +34,7 @@ pub struct WorkspaceConfig {
     pub targets: HashMap<String, TargetConfig>,
 }
 
-/// Configuration for `aster dev`.
+/// Configuration for `aster services up`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevWorkspaceConfig {
@@ -86,7 +86,7 @@ pub struct ResolvedDevPortConfig {
     pub saturating_offset: bool,
 }
 
-/// One long-running service managed by `aster dev`.
+/// One long-running service managed by `aster services up`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevServiceConfig {
