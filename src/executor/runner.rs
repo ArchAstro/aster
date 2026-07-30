@@ -1909,12 +1909,12 @@ mod tests {
         let mut targets_a = HashMap::new();
         targets_a.insert(
             "deps".to_string(),
-            target_with_resources("sleep 0.15", vec![], vec!["resource_a"]),
+            target_with_resources("sleep 0.5", vec![], vec!["resource_a"]),
         );
         let mut targets_b = HashMap::new();
         targets_b.insert(
             "deps".to_string(),
-            target_with_resources("sleep 0.15", vec![], vec!["resource_b"]),
+            target_with_resources("sleep 0.5", vec![], vec!["resource_b"]),
         );
 
         let project_a = DiscoveredProject {
@@ -1974,10 +1974,11 @@ mod tests {
             assert!(r.success, "Target {} should succeed", r.address);
         }
 
-        // Non-contending targets should run in parallel (~150ms, not ~300ms)
+        // Non-contending targets should run in parallel (~500ms, not ~1000ms).
+        // Leave enough headroom for process startup on loaded hosted runners.
         assert!(
-            total_ms < 280,
-            "Non-contending targets should run in parallel (took {total_ms}ms, expected < 280ms)"
+            total_ms < 900,
+            "Non-contending targets should run in parallel (took {total_ms}ms, expected < 900ms)"
         );
     }
 
