@@ -1556,7 +1556,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
                 return Ok(());
             }
         }
-        return Err(anyhow!("clipboard helper not found (tried wl-copy, xclip)"));
+        Err(anyhow!("clipboard helper not found (tried wl-copy, xclip)"))
     }
     #[cfg(not(target_os = "linux"))]
     copy_with(program, args, text)
