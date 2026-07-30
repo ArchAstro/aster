@@ -26,6 +26,18 @@ fn occurrences(path: &Path, needle: &str) -> usize {
         .count()
 }
 
+fn process_is_running(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return false;
+    }
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+}
+
 fn control_request(port: u16, request: &str) -> serde_json::Value {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     writeln!(stream, "{request}").unwrap();
@@ -206,9 +218,10 @@ command = "sh -c 'echo BUILD >> ../events.log'"
     }
     let status = aster.wait().unwrap();
     assert_eq!(status.code(), Some(143));
-    wait_until(Duration::from_secs(5), || unsafe {
-        libc::kill(child_pid, 0) == -1
-    });
+    // A killed grandchild can remain as a zombie briefly on hosted macOS
+    // runners. It is no longer executing, so treat that as terminated while
+    // still rejecting any live descendant.
+    wait_until(Duration::from_secs(5), || !process_is_running(child_pid));
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
 }
 
