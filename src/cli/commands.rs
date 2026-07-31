@@ -106,7 +106,7 @@ pub enum Commands {
         /// Directory to scope listing to (e.g., "services/" or ".")
         path: Option<String>,
 
-        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        /// Filter by language/build plugin (e.g., nodejs, python, gradle, maven)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
     },
@@ -164,7 +164,7 @@ pub enum Commands {
         #[arg(long)]
         warnings_as_errors: bool,
 
-        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        /// Filter by language/build plugin (e.g., nodejs, python, gradle, maven)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
     },
@@ -188,7 +188,7 @@ pub enum Commands {
         #[arg(long)]
         no_deps: bool,
 
-        /// Filter by language (e.g., nodejs, python, rust, go, elixir)
+        /// Filter by language/build plugin (e.g., nodejs, python, gradle, maven)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
     },

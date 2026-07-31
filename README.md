@@ -119,10 +119,20 @@ Use `aster --help` and `aster <command> --help` for the complete CLI reference.
 | Go | `go.mod` | deps, build, test, lint, clean |
 | Python | `pyproject.toml` | deps, build, test, lint, format, clean |
 | Elixir | `mix.exs` | deps, build, test, lint, format, clean |
+| Gradle/JVM | `settings.gradle[.kts]`, `build.gradle[.kts]` | deps, build, test, lint, format, clean |
+| Maven/JVM | `pom.xml` | deps, build, test, lint, format, clean |
 
 Detected targets depend on the tools and scripts present in each project.
 Node.js projects use the `packageManager` field or lockfile to choose npm or
 pnpm. Workspace members inherit their workspace root's package manager.
+Gradle and Maven projects prefer their checked-in wrappers and scope module
+targets to the native multi-project build or reactor, which remains responsible
+for ordering dependencies within that build. Pure aggregator roots and embedded
+Maven integration-test fixtures are not exposed as standalone projects. In a
+directory containing both Gradle and Maven configuration, Maven takes precedence
+so the project has one unambiguous Aster address. A colocated `package.json`
+similarly keeps the existing Node.js project rather than creating a conflicting
+Gradle address.
 
 ## Project configuration
 

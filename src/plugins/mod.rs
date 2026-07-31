@@ -99,6 +99,15 @@ pub trait LanguagePlugin: Send + Sync {
     /// Files that identify this project type (e.g., ["package.json"])
     fn marker_files(&self) -> &[&str];
 
+    /// Whether this plugin recognizes a marker filename.
+    ///
+    /// Most plugins use exact marker filenames. Build systems such as Gradle
+    /// may also use project-specific build filenames, so they can override
+    /// this method and let `should_skip` apply the path-aware filtering.
+    fn matches_marker(&self, filename: &str) -> bool {
+        self.marker_files().contains(&filename)
+    }
+
     /// Check if this config file should be skipped during discovery
     ///
     /// Some marker files don't represent buildable projects. For example,
@@ -198,6 +207,8 @@ pub trait LanguagePlugin: Send + Sync {
 
 pub mod elixir;
 pub mod go;
+pub mod gradle;
+pub mod maven;
 pub mod nodejs;
 pub mod python;
 pub mod registry;
@@ -205,6 +216,8 @@ pub mod rust;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;
+pub use gradle::GradlePlugin;
+pub use maven::MavenPlugin;
 pub use nodejs::NodeJsPlugin;
 pub use python::PythonPlugin;
 pub use registry::PluginRegistry;

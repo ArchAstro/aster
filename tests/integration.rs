@@ -44,6 +44,13 @@ fn write_pyproject_toml(tmp: &TempDir, path: &str, content: &str) {
     fs::write(full_path, content).unwrap();
 }
 
+/// Write an arbitrary fixture file, creating parent directories.
+fn write_fixture(tmp: &TempDir, path: &str, content: &str) {
+    let full_path = tmp.path().join(path);
+    fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+    fs::write(full_path, content).unwrap();
+}
+
 #[test]
 fn dev_target_does_not_conflict_with_services_command() {
     let tmp = TempDir::new().unwrap();
@@ -146,6 +153,34 @@ cache = { enabled = false }
     assert_eq!(
         fs::read_to_string(tmp.path().join("app/quoted.txt")).unwrap(),
         "two words"
+    );
+}
+
+#[test]
+fn stale_execution_log_is_absent_while_native_target_runs() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "app/package.json",
+        r#"{"name":"app","scripts":{"test":"test ! -e ../.aster/logs/latest.json"}}"#,
+    );
+    write_fixture(
+        &tmp,
+        ".aster/logs/latest.json",
+        r#"{"timestamp":"old","target":"test","results":[]}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--no-cache", "test", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    assert!(
+        tmp.path().join(".aster/logs/latest.json").is_file(),
+        "Aster should recreate the run log after native tools finish"
     );
 }
 
@@ -576,6 +611,155 @@ utils = {path = "../../libs/utils"}
         stdout.contains("//libs/utils"),
         "Expected //libs/utils in dependency output: {stdout}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn gradle_module_target_executes_wrapper_from_build_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(
+        &tmp,
+        "settings.gradle.kts",
+        r#"rootProject.name = "sample"
+include("shared", "app")
+"#,
+    );
+    write_fixture(&tmp, "shared/shared.gradle.kts", "plugins { java }\n");
+    write_fixture(
+        &tmp,
+        "app/app.gradle.kts",
+        "plugins { java }\ndependencies { implementation(project(\":shared\")) }\n",
+    );
+    write_fixture(
+        &tmp,
+        "gradlew",
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD|$*\" >> wrapper-invocations\n",
+    );
+    let wrapper = tmp.path().join("gradlew");
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--no-cache", "build", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let invocation = fs::read_to_string(tmp.path().join("wrapper-invocations")).unwrap();
+    assert!(
+        invocation.contains("|:app:build"),
+        "expected scoped Gradle task: {invocation}"
+    );
+    assert!(
+        invocation.starts_with(
+            &tmp.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "wrapper should run at Gradle root: {invocation}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn maven_module_target_executes_wrapper_with_reactor_selection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(
+        &tmp,
+        "pom.xml",
+        "<project><artifactId>parent</artifactId><packaging>pom</packaging><modules><module>shared</module><module>app</module></modules></project>",
+    );
+    write_fixture(
+        &tmp,
+        "shared/pom.xml",
+        "<project><artifactId>shared</artifactId></project>",
+    );
+    write_fixture(
+        &tmp,
+        "shared/src/main/java/Shared.java",
+        "class Shared {}\n",
+    );
+    write_fixture(
+        &tmp,
+        "app/pom.xml",
+        "<project><artifactId>app</artifactId><dependencies><dependency><groupId>dev.example</groupId><artifactId>shared</artifactId></dependency></dependencies></project>",
+    );
+    write_fixture(&tmp, "app/src/main/java/App.java", "class App {}\n");
+    write_fixture(
+        &tmp,
+        "mvnw",
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD|$*\" >> wrapper-invocations\n",
+    );
+    let wrapper = tmp.path().join("mvnw");
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--no-cache", "test", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let invocation = fs::read_to_string(tmp.path().join("wrapper-invocations")).unwrap();
+    assert!(
+        invocation.contains("|-pl :app -am test"),
+        "expected Maven reactor selection: {invocation}"
+    );
+    assert!(
+        invocation.starts_with(
+            &tmp.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        ),
+        "wrapper should run at Maven reactor root: {invocation}"
+    );
+}
+
+#[test]
+fn gradle_and_maven_are_valid_language_filters() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "gradle-app/build.gradle", "apply plugin: 'java'\n");
+    write_fixture(
+        &tmp,
+        "maven-app/pom.xml",
+        "<project><artifactId>maven-app</artifactId></project>",
+    );
+    write_fixture(&tmp, "maven-app/src/main/java/App.java", "class App {}\n");
+
+    let gradle = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "gradle"])
+        .output()
+        .unwrap();
+    assert!(gradle.status.success(), "Command failed: {gradle:?}");
+    let stdout = String::from_utf8_lossy(&gradle.stdout);
+    assert!(stdout.contains("//gradle-app"));
+    assert!(!stdout.contains("//maven-app"));
+
+    let maven = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "maven"])
+        .output()
+        .unwrap();
+    assert!(maven.status.success(), "Command failed: {maven:?}");
+    let stdout = String::from_utf8_lossy(&maven.stdout);
+    assert!(stdout.contains("//maven-app"));
+    assert!(!stdout.contains("//gradle-app"));
 }
 
 #[test]

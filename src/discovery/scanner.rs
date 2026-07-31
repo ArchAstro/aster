@@ -73,13 +73,6 @@ pub fn discover_projects(
     let workspace_config = WorkspaceConfig::load(workspace_root)?;
     let ignore_set = build_ignore_set(&workspace_config.ignore)?;
 
-    // Collect all marker files we're looking for
-    let marker_files: Vec<&str> = registry
-        .plugins()
-        .iter()
-        .flat_map(|p| p.marker_files().iter().copied())
-        .collect();
-
     let mut partial_projects: Vec<PartialProject> = Vec::new();
 
     // Phase 1: Walk the directory tree and collect project metadata + dependencies
@@ -106,10 +99,6 @@ pub fn discover_projects(
             Some(name) => name,
             None => continue,
         };
-
-        if !marker_files.contains(&file_name) {
-            continue;
-        }
 
         // Find the plugin that handles this marker
         let plugin = match registry.find_by_marker(file_name) {
@@ -567,6 +556,92 @@ mod tests {
         assert!(names.contains(&"api"));
         assert!(names.contains(&"web"));
         assert!(names.contains(&"shared"));
+    }
+
+    #[test]
+    fn discovers_gradle_kotlin_dsl_modules_without_flattening_native_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("settings.gradle.kts"),
+            r#"rootProject.name = "sample"
+include("shared", "app")
+"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("gradlew"), "").unwrap();
+
+        for module in ["shared", "app"] {
+            let directory = tmp.path().join(module);
+            std::fs::create_dir_all(directory.join("src/main/java")).unwrap();
+            std::fs::write(
+                directory.join(format!("{module}.gradle.kts")),
+                if module == "app" {
+                    r#"plugins { java }
+dependencies { implementation(project(":shared")) }
+"#
+                } else {
+                    "plugins { java }\n"
+                },
+            )
+            .unwrap();
+        }
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        assert_eq!(projects.len(), 2);
+        let app = projects
+            .iter()
+            .find(|project| project.relative_path == Path::new("app"))
+            .unwrap();
+        assert_eq!(app.plugin_name, "gradle");
+        assert_eq!(app.targets["build"].command, "./gradlew :app:build");
+        assert!(app.dependencies.is_empty());
+        assert_eq!(app.targets["build"].depends_on, vec!["//app:deps"]);
+    }
+
+    #[test]
+    fn discovers_maven_reactor_modules_without_flattening_native_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            r#"<project>
+  <artifactId>sample-parent</artifactId>
+  <packaging>pom</packaging>
+  <modules><module>shared</module><module>app</module></modules>
+</project>"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("mvnw"), "").unwrap();
+
+        for module in ["shared", "app"] {
+            let directory = tmp.path().join(module);
+            std::fs::create_dir_all(directory.join("src/main/java")).unwrap();
+            let dependencies = if module == "app" {
+                "<dependencies><dependency><groupId>dev.example</groupId><artifactId>shared</artifactId></dependency></dependencies>"
+            } else {
+                ""
+            };
+            std::fs::write(
+                directory.join("pom.xml"),
+                format!("<project><artifactId>{module}</artifactId>{dependencies}</project>"),
+            )
+            .unwrap();
+        }
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        assert_eq!(projects.len(), 2);
+        let app = projects
+            .iter()
+            .find(|project| project.relative_path == Path::new("app"))
+            .unwrap();
+        assert_eq!(app.plugin_name, "maven");
+        assert_eq!(
+            app.targets["build"].command,
+            "./mvnw -pl :app -am package -DskipTests"
+        );
+        assert!(app.dependencies.is_empty());
+        assert_eq!(app.targets["build"].depends_on, vec!["//app:deps"]);
     }
 
     #[test]
