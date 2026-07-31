@@ -117,6 +117,7 @@ Use `aster --help` and `aster <command> --help` for the complete CLI reference.
 | Elixir | `mix.exs` | deps, build, test, lint, format, clean |
 | Gradle/JVM | `settings.gradle[.kts]`, `build.gradle[.kts]` | deps, build, test, lint, format, clean |
 | Maven/JVM | `pom.xml` | deps, build, test, lint, format, clean |
+| Ruby | `Gemfile`, `*.gemspec` | deps, build, test, lint, format, dev, clean |
 
 Detected targets depend on the tools and scripts present in each project.
 Node.js projects use the `packageManager` field or lockfile to choose npm or
@@ -129,6 +130,12 @@ directory containing both Gradle and Maven configuration, Maven takes precedence
 so the project has one unambiguous Aster address. A colocated `package.json`
 similarly keeps the existing Node.js project rather than creating a conflicting
 Gradle address.
+Ruby projects use Bundler when a Gemfile is present and detect conventional gem builds,
+Rake/Minitest, RSpec, Rails tests and servers, and RuboCop. A colocated gemspec
+is the canonical marker for a packaged gem, while Rails and gem projects take
+precedence over colocated JavaScript asset packages at the same directory-based
+Aster address. Ruby config is parsed statically and is never evaluated during
+discovery.
 
 ## Project configuration
 

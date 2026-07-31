@@ -1,6 +1,6 @@
 use super::{
     ElixirPlugin, GoPlugin, GradlePlugin, LanguagePlugin, MavenPlugin, NodeJsPlugin, PythonPlugin,
-    RustPlugin,
+    RubyPlugin, RustPlugin,
 };
 
 /// Registry of available language plugins
@@ -25,6 +25,7 @@ impl PluginRegistry {
         registry.register(Box::new(RustPlugin));
         registry.register(Box::new(GradlePlugin));
         registry.register(Box::new(MavenPlugin));
+        registry.register(Box::new(RubyPlugin));
         registry
     }
 
@@ -189,13 +190,18 @@ mod tests {
     }
 
     #[test]
-    fn all_builtin_plugins_include_jvm_build_systems() {
+    fn all_builtin_plugins_are_registered() {
         let registry = PluginRegistry::with_all_plugins();
-        assert_eq!(registry.plugins().len(), 7);
+        assert_eq!(registry.plugins().len(), 8);
         assert_eq!(registry.find_by_marker("pom.xml").unwrap().name(), "maven");
         assert_eq!(
             registry.find_by_marker("build.gradle.kts").unwrap().name(),
             "gradle"
+        );
+        assert_eq!(registry.find_by_marker("Gemfile").unwrap().name(), "ruby");
+        assert_eq!(
+            registry.find_by_marker("sample.gemspec").unwrap().name(),
+            "ruby"
         );
         assert_eq!(
             registry

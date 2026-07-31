@@ -31,7 +31,7 @@ use super::output::OutputMode;
     --no-deps             Skip running dependencies first
     --dependents          Also run projects that depend on selected ones
     --warnings-as-errors  Treat warnings as errors (for supported targets)
-    --lang <langs>        Filter by language (e.g., --lang nodejs,python)
+    --lang <langs>        Filter by language (e.g., --lang nodejs,ruby)
 
   Use `aster target <name>` when a target name conflicts with a built-in command.
 
@@ -106,7 +106,7 @@ pub enum Commands {
         /// Directory to scope listing to (e.g., "services/" or ".")
         path: Option<String>,
 
-        /// Filter by language/build plugin (e.g., nodejs, python, gradle, maven)
+        /// Filter by language/build plugin (e.g., nodejs, ruby, gradle, maven)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
     },
@@ -164,7 +164,7 @@ pub enum Commands {
         #[arg(long)]
         warnings_as_errors: bool,
 
-        /// Filter by language/build plugin (e.g., nodejs, python, gradle, maven)
+        /// Filter by language/build plugin (e.g., nodejs, ruby, gradle, maven)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
     },

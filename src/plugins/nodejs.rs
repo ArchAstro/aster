@@ -163,6 +163,27 @@ impl LanguagePlugin for NodeJsPlugin {
         &["package.json"]
     }
 
+    fn should_skip(&self, config_path: &Path) -> bool {
+        let Some(project_dir) = config_path.parent() else {
+            return false;
+        };
+        // Rails applications and packaged gems often colocate JavaScript
+        // assets with their primary Ruby project. Aster addresses are
+        // directory-based, so prefer the Ruby build when a gemspec or Rails
+        // executable makes that ownership unambiguous.
+        (project_dir.join("Gemfile").is_file() && project_dir.join("bin/rails").is_file())
+            || std::fs::read_dir(project_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "gemspec")
+                })
+    }
+
     fn parse_project(&self, _root: &Path, config_path: &Path) -> Result<ProjectMetadata> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
@@ -2353,5 +2374,15 @@ mod tests {
             "consumer:build should depend on //packages/dep:build; got {:?}",
             build.depends_on
         );
+    }
+
+    #[test]
+    fn packaged_ruby_project_owns_colocated_javascript_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("package.json");
+        std::fs::write(&package, r#"{"name":"assets"}"#).unwrap();
+        std::fs::write(tmp.path().join("app.gemspec"), "s.name = 'app'\n").unwrap();
+
+        assert!(NodeJsPlugin.should_skip(&package));
     }
 }

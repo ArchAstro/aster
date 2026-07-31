@@ -228,6 +228,7 @@ pub fn discover_projects(
     // This must happen BEFORE target detection so dependencies are resolved correctly
     resolve_umbrella_dependencies_partial(&mut partial_projects);
     resolve_uv_workspace_dependencies_partial(&mut partial_projects);
+    resolve_ruby_workspace_dependencies_partial(&mut partial_projects);
 
     // Phase 3: Detect targets with resolved dependencies
     let mut projects: Vec<DiscoveredProject> = Vec::new();
@@ -430,6 +431,40 @@ fn resolve_uv_workspace_dependencies_partial(projects: &mut [PartialProject]) {
                 }
             }
         }
+    }
+}
+
+/// Resolve gemspec runtime dependencies to sibling gems in the same workspace.
+/// Unmatched names are ordinary remote gems and are removed: LocalDependency
+/// represents only relationships Aster can resolve within this checkout.
+fn resolve_ruby_workspace_dependencies_partial(projects: &mut [PartialProject]) {
+    let name_to_address: HashMap<String, String> = projects
+        .iter()
+        .filter(|project| project.plugin_name == "ruby")
+        .map(|project| {
+            (
+                project.metadata.name.clone(),
+                format!("//{}", project.relative_path.display()),
+            )
+        })
+        .collect();
+
+    for project in projects
+        .iter_mut()
+        .filter(|project| project.plugin_name == "ruby")
+    {
+        project.dependencies.retain_mut(|dependency| {
+            let path = dependency.path.to_string_lossy();
+            let Some(name) = path.strip_prefix("ruby_workspace:") else {
+                return true;
+            };
+            if let Some(address) = name_to_address.get(name) {
+                dependency.path = PathBuf::from(address);
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -1583,5 +1618,48 @@ end
             core.dependencies[0].path,
             std::path::PathBuf::from("//src/elixir/config")
         );
+    }
+
+    #[test]
+    fn discovers_ruby_sibling_gems_and_resolves_runtime_dependencies_by_name() {
+        use crate::plugins::RubyPlugin;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        for (directory, name, dependency) in [
+            ("gems/shared", "shared", None),
+            ("gems/app", "app", Some("shared")),
+        ] {
+            let project = tmp.path().join(directory);
+            std::fs::create_dir_all(project.join("test")).unwrap();
+            std::fs::write(project.join("Gemfile"), "gemspec\n").unwrap();
+            std::fs::write(
+                project.join(format!("{name}.gemspec")),
+                format!(
+                    "Gem::Specification.new do |s|\n  s.name = '{name}'\n{}end\n",
+                    dependency
+                        .map(|value| format!("  s.add_dependency '{value}'\n"))
+                        .unwrap_or_default()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                project.join("Rakefile"),
+                "require 'rake/testtask'\nRake::TestTask.new\n",
+            )
+            .unwrap();
+        }
+
+        let mut registry = PluginRegistry::new();
+        registry.register(Box::new(RubyPlugin));
+        let projects = discover_projects(tmp.path(), &registry).unwrap();
+        assert_eq!(projects.len(), 2);
+        let app = projects
+            .iter()
+            .find(|project| project.metadata.name == "app")
+            .unwrap();
+        assert_eq!(app.dependencies.len(), 1);
+        assert_eq!(app.dependencies[0].path, Path::new("//gems/shared"));
+        assert_eq!(app.targets["test"].command, "bundle exec rake test");
     }
 }

@@ -729,6 +729,94 @@ fn maven_module_target_executes_wrapper_with_reactor_selection() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn ruby_member_executes_bundle_install_at_root_and_rspec_in_member() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "Gemfile", "source 'https://rubygems.org'\n");
+    write_fixture(
+        &tmp,
+        "gems/core/core.gemspec",
+        "Gem::Specification.new { |s| s.name = 'core' }\n",
+    );
+    write_fixture(&tmp, "gems/core/.rspec", "--color\n");
+    write_fixture(&tmp, "gems/core/spec/core_spec.rb", "# fixture\n");
+    write_fixture(
+        &tmp,
+        "bin/bundle",
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> \"$ASTER_RUBY_LOG\"\n",
+    );
+    let wrapper = tmp.path().join("bin/bundle");
+    let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&wrapper, permissions).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        tmp.path().join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log = tmp.path().join("bundle-invocations");
+    for (target, address) in [("deps", "//gems/core"), ("test", "//gems/core")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .env("PATH", &path)
+            .env("ASTER_RUBY_LOG", &log)
+            .args(["--no-cache", target, address, "--no-deps"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Command failed: {output:?}");
+    }
+
+    let invocations = fs::read_to_string(log).unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    assert!(
+        invocations.contains(&format!("{}|install", root.display())),
+        "bundle install should run at the nearest Gemfile: {invocations}"
+    );
+    assert!(
+        invocations.contains(&format!("{}|exec rspec", root.join("gems/core").display())),
+        "RSpec should run in the selected gem: {invocations}"
+    );
+}
+
+#[test]
+fn ruby_gem_takes_precedence_over_colocated_javascript_assets() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "app/Gemfile", "gemspec\n");
+    write_fixture(
+        &tmp,
+        "app/app.gemspec",
+        "Gem::Specification.new { |s| s.name = 'app' }\n",
+    );
+    write_package_json(
+        &tmp,
+        "app/package.json",
+        r#"{"name":"app-assets","scripts":{"build":"vite build"}}"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "ruby"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("//app"));
+
+    let node = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "nodejs"])
+        .output()
+        .unwrap();
+    assert!(node.status.success(), "Command failed: {node:?}");
+    assert!(!String::from_utf8_lossy(&node.stdout).contains("//app"));
+}
+
 #[test]
 fn gradle_and_maven_are_valid_language_filters() {
     let tmp = TempDir::new().unwrap();
