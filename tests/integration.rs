@@ -1858,7 +1858,7 @@ fn test_dry_run_shows_full_target_graph_with_rationale() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Dry run failed: {:?}", output);
+    assert!(output.status.success(), "Dry run failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Should show the affected target with rationale
@@ -1928,7 +1928,7 @@ fn test_dry_run_shows_dependents_rationale() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Dry run failed: {:?}", output);
+    assert!(output.status.success(), "Dry run failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // SDK should be marked as affected
@@ -2241,7 +2241,7 @@ version = "1.0.0"
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Command failed: {:?}", output);
+    assert!(output.status.success(), "Command failed: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
