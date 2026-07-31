@@ -212,6 +212,7 @@ pub mod maven;
 pub mod nodejs;
 pub mod python;
 pub mod registry;
+pub mod ruby;
 pub mod rust;
 
 pub use elixir::ElixirPlugin;
@@ -221,6 +222,7 @@ pub use maven::MavenPlugin;
 pub use nodejs::NodeJsPlugin;
 pub use python::PythonPlugin;
 pub use registry::PluginRegistry;
+pub use ruby::RubyPlugin;
 pub use rust::RustPlugin;
 
 // Re-export CacheInputs for use by cache module

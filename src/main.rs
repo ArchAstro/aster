@@ -1438,6 +1438,7 @@ fn handle_project_init(
 /// Detect which language plugin applies to a directory
 fn detect_plugin_for_directory(dir: &Path) -> Option<String> {
     let markers = [
+        ("Gemfile", "ruby"),
         ("package.json", "nodejs"),
         ("go.mod", "go"),
         ("pyproject.toml", "python"),
@@ -1454,6 +1455,20 @@ fn detect_plugin_for_directory(dir: &Path) -> Option<String> {
         if dir.join(marker).exists() {
             return Some(plugin_name.to_string());
         }
+    }
+
+    if std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "gemspec")
+        })
+    {
+        return Some("ruby".to_string());
     }
 
     None
@@ -1590,6 +1605,19 @@ fn generate_aster_toml_content(
 # [targets.integration]
 # command = "./mvnw verify -Pintegration"
 # depends_on = ["//self:build"]
+"#
+        }
+        Some("ruby") => {
+            r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "bundle exec rake test"
+# lint = "bundle exec rubocop"
+
+# Rich format - full control over target behavior:
+# [targets.integration]
+# command = "bundle exec rspec spec/integration"
+# depends_on = ["//self:deps"]
 "#
         }
         _ => {
@@ -1807,7 +1835,7 @@ fn apply_warnings_as_errors(
 ///
 /// Known language/plugin names for --lang validation
 const VALID_LANGS: &[&str] = &[
-    "nodejs", "python", "rust", "go", "elixir", "gradle", "maven",
+    "nodejs", "python", "rust", "go", "elixir", "gradle", "maven", "ruby",
 ];
 
 /// Validate that all --lang values are known plugin names
