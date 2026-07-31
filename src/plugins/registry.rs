@@ -1,4 +1,7 @@
-use super::{ElixirPlugin, GoPlugin, LanguagePlugin, NodeJsPlugin, PythonPlugin, RustPlugin};
+use super::{
+    ElixirPlugin, GoPlugin, GradlePlugin, LanguagePlugin, MavenPlugin, NodeJsPlugin, PythonPlugin,
+    RustPlugin,
+};
 
 /// Registry of available language plugins
 pub struct PluginRegistry {
@@ -20,6 +23,8 @@ impl PluginRegistry {
         registry.register(Box::new(PythonPlugin));
         registry.register(Box::new(GoPlugin));
         registry.register(Box::new(RustPlugin));
+        registry.register(Box::new(GradlePlugin));
+        registry.register(Box::new(MavenPlugin));
         registry
     }
 
@@ -37,7 +42,7 @@ impl PluginRegistry {
     pub fn find_by_marker(&self, filename: &str) -> Option<&dyn LanguagePlugin> {
         self.plugins
             .iter()
-            .find(|p| p.marker_files().contains(&filename))
+            .find(|p| p.matches_marker(filename))
             .map(|p| p.as_ref())
     }
 
@@ -181,5 +186,23 @@ mod tests {
         // Unknown name returns None
         assert!(registry.find_by_name("unknown").is_none());
         assert!(registry.find_by_name("").is_none());
+    }
+
+    #[test]
+    fn all_builtin_plugins_include_jvm_build_systems() {
+        let registry = PluginRegistry::with_all_plugins();
+        assert_eq!(registry.plugins().len(), 7);
+        assert_eq!(registry.find_by_marker("pom.xml").unwrap().name(), "maven");
+        assert_eq!(
+            registry.find_by_marker("build.gradle.kts").unwrap().name(),
+            "gradle"
+        );
+        assert_eq!(
+            registry
+                .find_by_marker("custom-project.gradle.kts")
+                .unwrap()
+                .name(),
+            "gradle"
+        );
     }
 }

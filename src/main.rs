@@ -23,10 +23,7 @@ use aster::executor::{
 };
 use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector, AffectedIgnore};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
-use aster::plugins::{
-    ElixirPlugin, GoPlugin, NodeJsPlugin, PluginRegistry, PythonPlugin, RustPlugin, Target,
-    TargetCapability,
-};
+use aster::plugins::{PluginRegistry, Target, TargetCapability};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet};
@@ -72,12 +69,7 @@ fn run() -> Result<()> {
     }
 
     // Set up plugin registry with all language plugins
-    let mut registry = PluginRegistry::new();
-    registry.register(Box::new(NodeJsPlugin));
-    registry.register(Box::new(ElixirPlugin));
-    registry.register(Box::new(PythonPlugin));
-    registry.register(Box::new(GoPlugin));
-    registry.register(Box::new(RustPlugin));
+    let registry = PluginRegistry::with_all_plugins();
 
     // Discover projects
     let projects =
@@ -662,12 +654,7 @@ fn run() -> Result<()> {
                 let mut effective_primary_addrs = primary_addrs.clone();
 
                 // Create plugin registry for capability handling
-                let mut registry = PluginRegistry::new();
-                registry.register(Box::new(NodeJsPlugin));
-                registry.register(Box::new(PythonPlugin));
-                registry.register(Box::new(ElixirPlugin));
-                registry.register(Box::new(GoPlugin));
-                registry.register(Box::new(RustPlugin));
+                let registry = PluginRegistry::with_all_plugins();
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
@@ -1099,12 +1086,7 @@ fn run() -> Result<()> {
                 let mut command_overrides: HashMap<String, String> = HashMap::new();
 
                 // Create plugin registry for capability handling
-                let mut registry = PluginRegistry::new();
-                registry.register(Box::new(NodeJsPlugin));
-                registry.register(Box::new(PythonPlugin));
-                registry.register(Box::new(ElixirPlugin));
-                registry.register(Box::new(GoPlugin));
-                registry.register(Box::new(RustPlugin));
+                let registry = PluginRegistry::with_all_plugins();
 
                 for project in &ordered {
                     let project_addr = format!("//{}", project.relative_path.display());
@@ -1258,12 +1240,7 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     println!("Created {}", aster_toml_path.display());
 
     // Set up plugin registry
-    let mut registry = PluginRegistry::new();
-    registry.register(Box::new(NodeJsPlugin));
-    registry.register(Box::new(ElixirPlugin));
-    registry.register(Box::new(PythonPlugin));
-    registry.register(Box::new(GoPlugin));
-    registry.register(Box::new(RustPlugin));
+    let registry = PluginRegistry::with_all_plugins();
 
     // Discover projects
     let projects =
@@ -1353,12 +1330,7 @@ fn handle_watch(
         return Err(anyhow::anyhow!("{cycle}"));
     }
 
-    let mut registry = PluginRegistry::new();
-    registry.register(Box::new(NodeJsPlugin));
-    registry.register(Box::new(ElixirPlugin));
-    registry.register(Box::new(PythonPlugin));
-    registry.register(Box::new(GoPlugin));
-    registry.register(Box::new(RustPlugin));
+    let registry = PluginRegistry::with_all_plugins();
 
     let plan = WatchPlan::build(&resolved, &projects, &graph, &registry)?;
 
@@ -1470,6 +1442,12 @@ fn detect_plugin_for_directory(dir: &Path) -> Option<String> {
         ("go.mod", "go"),
         ("pyproject.toml", "python"),
         ("mix.exs", "elixir"),
+        ("Cargo.toml", "rust"),
+        ("pom.xml", "maven"),
+        ("settings.gradle.kts", "gradle"),
+        ("settings.gradle", "gradle"),
+        ("build.gradle.kts", "gradle"),
+        ("build.gradle", "gradle"),
     ];
 
     for (marker, plugin_name) in markers {
@@ -1585,6 +1563,32 @@ fn generate_aster_toml_content(
 
 # [targets.dialyzer]
 # command = "mix dialyzer"
+# depends_on = ["//self:build"]
+"#
+        }
+        Some("gradle") => {
+            r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "./gradlew test"
+# lint = "./gradlew check"
+
+# Rich format - full control over target behavior:
+# [targets.integration]
+# command = "./gradlew integrationTest"
+# depends_on = ["//self:build"]
+"#
+        }
+        Some("maven") => {
+            r#"# Target configuration
+# Simple format - just override the command:
+# [targets]
+# test = "./mvnw test"
+# lint = "./mvnw verify -DskipTests"
+
+# Rich format - full control over target behavior:
+# [targets.integration]
+# command = "./mvnw verify -Pintegration"
 # depends_on = ["//self:build"]
 "#
         }
@@ -1802,7 +1806,9 @@ fn apply_warnings_as_errors(
 /// Format a timestamp as a human-readable relative time
 ///
 /// Known language/plugin names for --lang validation
-const VALID_LANGS: &[&str] = &["nodejs", "python", "rust", "go", "elixir"];
+const VALID_LANGS: &[&str] = &[
+    "nodejs", "python", "rust", "go", "elixir", "gradle", "maven",
+];
 
 /// Validate that all --lang values are known plugin names
 fn validate_lang_filter(langs: &[String]) -> Result<()> {

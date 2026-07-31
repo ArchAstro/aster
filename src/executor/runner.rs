@@ -328,6 +328,13 @@ impl<'a> Executor<'a> {
             return Vec::new();
         }
 
+        if self.output_mode != OutputMode::Json {
+            let log_store = LogStore::new(self.workspace_root);
+            if let Err(error) = log_store.clear_latest() {
+                eprintln!("[aster] Warning: Failed to clear previous logs: {error}");
+            }
+        }
+
         let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
         let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);

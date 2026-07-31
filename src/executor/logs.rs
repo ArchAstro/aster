@@ -73,6 +73,20 @@ impl LogStore {
         Ok(Some(run))
     }
 
+    /// Remove the previous run log before executing native build tools.
+    ///
+    /// Some repositories lint every file under their checkout. Keeping a
+    /// captured build log in-tree while the next build runs can make the build
+    /// inspect Aster's output as if it were source.
+    pub fn clear_latest(&self) -> anyhow::Result<()> {
+        let latest_path = self.log_dir.join("latest.json");
+        match fs::remove_file(latest_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Get the log for a specific target from the latest run
     pub fn get_target_log(&self, address: &str) -> anyhow::Result<Option<TargetLog>> {
         let run = match self.load_latest()? {
@@ -132,6 +146,23 @@ mod tests {
 
         let result = store.load_latest().unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_clear_latest_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = LogStore::new(tmp.path());
+        let run = RunLog {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            target: "test".to_string(),
+            results: vec![],
+        };
+        store.store(&run).unwrap();
+        assert!(store.load_latest().unwrap().is_some());
+
+        store.clear_latest().unwrap();
+        store.clear_latest().unwrap();
+        assert!(store.load_latest().unwrap().is_none());
     }
 
     #[test]
