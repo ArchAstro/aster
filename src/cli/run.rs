@@ -45,7 +45,7 @@ pub struct RunArgs {
     pub json: bool,
     /// Show full output for failed targets
     pub full_logs: bool,
-    /// Filter by language/plugin name (e.g., "nodejs", "python")
+    /// Filter by source language (e.g., "nodejs", "python", "java", "kotlin")
     pub lang: Vec<String>,
 }
 
@@ -340,7 +340,7 @@ pub fn select_projects<'a>(
 
     // Apply language filter
     if !args.lang.is_empty() {
-        result.retain(|p| args.lang.contains(&p.plugin_name));
+        result.retain(|p| p.has_any_language(&args.lang));
     }
 
     Ok(result)
@@ -713,6 +713,8 @@ mod tests {
                 dependencies: vec![],
                 targets: HashMap::new(),
                 plugin_name: "nodejs".to_string(),
+                languages: vec!["nodejs".to_string()],
+                build_system: None,
                 relative_path: PathBuf::from(relative_path),
             }
         }
@@ -1120,16 +1122,22 @@ mod tests {
                 dependencies: vec![],
                 targets: HashMap::new(),
                 plugin_name: plugin.to_string(),
+                languages: vec![plugin.to_string()],
+                build_system: None,
                 relative_path: PathBuf::from(relative_path),
             }
         }
 
         #[test]
         fn test_select_projects_lang_filter() {
+            let mut mixed_jvm = make_project_with_lang("mixed-jvm", "src/mixed", "gradle");
+            mixed_jvm.languages = vec!["java".to_string(), "kotlin".to_string()];
+            mixed_jvm.build_system = Some("gradle".to_string());
             let projects = vec![
                 make_project_with_lang("node-app", "src/node-app", "nodejs"),
                 make_project_with_lang("py-app", "src/py-app", "python"),
                 make_project_with_lang("rust-lib", "src/rust-lib", "rust"),
+                mixed_jvm,
             ];
             let graph = build_graph(&projects).unwrap();
             let workspace_root = Path::new("/workspace");
@@ -1138,7 +1146,7 @@ mod tests {
             let args = RunArgs {
                 target: "test".to_string(),
                 all: true,
-                lang: vec!["nodejs".to_string(), "python".to_string()],
+                lang: vec!["nodejs".to_string(), "kotlin".to_string()],
                 ..Default::default()
             };
 
@@ -1147,7 +1155,8 @@ mod tests {
             assert_eq!(selected.len(), 2);
             let names: Vec<&str> = selected.iter().map(|p| p.metadata.name.as_str()).collect();
             assert!(names.contains(&"node-app"));
-            assert!(names.contains(&"py-app"));
+            assert!(names.contains(&"mixed-jvm"));
+            assert!(!names.contains(&"py-app"));
             assert!(!names.contains(&"rust-lib"));
         }
 

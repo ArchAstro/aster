@@ -818,36 +818,125 @@ fn ruby_gem_takes_precedence_over_colocated_javascript_assets() {
 }
 
 #[test]
-fn gradle_and_maven_are_valid_language_filters() {
+fn java_and_kotlin_filters_are_independent_from_jvm_build_systems() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
-    write_fixture(&tmp, "gradle-app/build.gradle", "apply plugin: 'java'\n");
+    write_fixture(&tmp, "gradle-java/build.gradle", "apply plugin: 'java'\n");
     write_fixture(
         &tmp,
-        "maven-app/pom.xml",
-        "<project><artifactId>maven-app</artifactId></project>",
+        "gradle-kotlin/build.gradle.kts",
+        "plugins { kotlin(\"jvm\") version \"2.1.0\" }\n",
     );
-    write_fixture(&tmp, "maven-app/src/main/java/App.java", "class App {}\n");
+    write_fixture(
+        &tmp,
+        "gradle-mixed/build.gradle.kts",
+        "plugins { kotlin(\"jvm\") version \"2.1.0\" }\n",
+    );
+    write_fixture(
+        &tmp,
+        "gradle-mixed/src/main/java/App.java",
+        "class App {}\n",
+    );
+    write_fixture(&tmp, "gradle-mixed/src/main/kotlin/App.kt", "class App\n");
+    write_fixture(
+        &tmp,
+        "maven-java/pom.xml",
+        "<project><artifactId>maven-java</artifactId></project>",
+    );
+    write_fixture(&tmp, "maven-java/src/main/java/App.java", "class App {}\n");
+    write_fixture(
+        &tmp,
+        "maven-kotlin/pom.xml",
+        "<project><artifactId>maven-kotlin</artifactId><build><plugins><plugin><artifactId>kotlin-maven-plugin</artifactId></plugin></plugins></build></project>",
+    );
+    write_fixture(&tmp, "maven-kotlin/src/main/kotlin/App.kt", "class App\n");
 
-    let gradle = Command::new(env!("CARGO_BIN_EXE_aster"))
+    let java = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
-        .args(["list", "--lang", "gradle"])
+        .args(["list", "--lang", "java"])
         .output()
         .unwrap();
-    assert!(gradle.status.success(), "Command failed: {gradle:?}");
-    let stdout = String::from_utf8_lossy(&gradle.stdout);
-    assert!(stdout.contains("//gradle-app"));
-    assert!(!stdout.contains("//maven-app"));
+    assert!(java.status.success(), "Command failed: {java:?}");
+    let stdout = String::from_utf8_lossy(&java.stdout);
+    assert!(stdout.contains("//gradle-java"));
+    assert!(stdout.contains("//maven-java"));
+    assert!(stdout.contains("//gradle-mixed"));
+    assert!(!stdout.contains("//gradle-kotlin"));
+    assert!(!stdout.contains("//maven-kotlin"));
 
-    let maven = Command::new(env!("CARGO_BIN_EXE_aster"))
+    let kotlin = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
-        .args(["list", "--lang", "maven"])
+        .args(["list", "--lang", "kotlin"])
         .output()
         .unwrap();
-    assert!(maven.status.success(), "Command failed: {maven:?}");
-    let stdout = String::from_utf8_lossy(&maven.stdout);
-    assert!(stdout.contains("//maven-app"));
-    assert!(!stdout.contains("//gradle-app"));
+    assert!(kotlin.status.success(), "Command failed: {kotlin:?}");
+    let stdout = String::from_utf8_lossy(&kotlin.stdout);
+    assert!(stdout.contains("//gradle-kotlin"));
+    assert!(stdout.contains("//maven-kotlin"));
+    assert!(stdout.contains("//gradle-mixed"));
+    assert!(!stdout.contains("//gradle-java"));
+    assert!(!stdout.contains("//maven-java"));
+}
+
+#[test]
+fn gradle_kotlin_dsl_does_not_imply_kotlin_source() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "app/build.gradle.kts", "plugins { java }\n");
+
+    let java = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "java"])
+        .output()
+        .unwrap();
+    assert!(java.status.success(), "Command failed: {java:?}");
+    assert!(String::from_utf8_lossy(&java.stdout).contains("//app"));
+
+    let kotlin = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["list", "--lang", "kotlin"])
+        .output()
+        .unwrap();
+    assert!(kotlin.status.success(), "Command failed: {kotlin:?}");
+    assert!(!String::from_utf8_lossy(&kotlin.stdout).contains("//app"));
+}
+
+#[test]
+fn list_json_reports_languages_and_build_system_separately() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "app/build.gradle", "apply plugin: 'java'\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let projects: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(projects[0]["languages"], serde_json::json!(["java"]));
+    assert_eq!(projects[0]["build_system"], "gradle");
+    assert_eq!(projects[0]["plugin"], "gradle");
+}
+
+#[test]
+fn gradle_and_maven_are_not_language_filters() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(&tmp, "app/build.gradle", "apply plugin: 'java'\n");
+
+    for build_system in ["gradle", "maven"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(["list", "--lang", build_system])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("Unknown language '{build_system}'")));
+        assert!(stderr.contains("java"));
+        assert!(stderr.contains("kotlin"));
+    }
 }
 
 #[test]

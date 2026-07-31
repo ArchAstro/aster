@@ -5,6 +5,7 @@ use roxmltree::{Document, Node};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::jvm;
 use super::{
     CacheInputs, LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability,
     TargetContext,
@@ -16,6 +17,27 @@ pub struct MavenPlugin;
 impl LanguagePlugin for MavenPlugin {
     fn name(&self) -> &str {
         "maven"
+    }
+
+    fn languages(&self, project_dir: &Path, config_path: &Path) -> Result<Vec<String>> {
+        let mut languages = jvm::source_languages(project_dir);
+        let content = std::fs::read_to_string(config_path).unwrap_or_default();
+        let has_kotlin_plugin = content.contains("kotlin-maven-plugin");
+
+        if has_kotlin_plugin && !languages.iter().any(|language| language == "kotlin") {
+            languages.push("kotlin".to_string());
+        }
+        // Java is Maven's default source language when no Kotlin evidence is
+        // present. This also gives empty starter projects a useful language.
+        if languages.is_empty() {
+            languages.push(if has_kotlin_plugin { "kotlin" } else { "java" }.to_string());
+        }
+        languages.sort();
+        Ok(languages)
+    }
+
+    fn build_system(&self) -> Option<&str> {
+        Some("maven")
     }
 
     fn marker_files(&self) -> &[&str] {

@@ -42,6 +42,10 @@ pub struct DiscoveredProject {
     pub targets: HashMap<String, Target>,
     /// Which plugin discovered this project
     pub plugin_name: String,
+    /// Source languages used by this project (for example, Java and Kotlin)
+    pub languages: Vec<String>,
+    /// Build system used by this project when distinct from its language
+    pub build_system: Option<String>,
     /// Path relative to workspace root (for addressing)
     pub relative_path: PathBuf,
 }
@@ -55,6 +59,8 @@ struct PartialProject {
     custom_targets: HashMap<String, crate::config::TargetConfig>,
     explicit_target_dependencies: Vec<(String, String)>,
     plugin_name: String,
+    languages: Vec<String>,
+    build_system: Option<String>,
     relative_path: PathBuf,
 }
 
@@ -145,6 +151,10 @@ pub fn discover_projects(
             )
         })?;
 
+        let languages = plugin
+            .languages(project_dir, &config_path)
+            .with_context(|| format!("Failed to detect languages for {}", config_path.display()))?;
+
         // Collect custom targets from aster.toml (if exists)
         let mut custom_targets = HashMap::new();
         let mut explicit_target_dependencies = Vec::new();
@@ -220,6 +230,8 @@ pub fn discover_projects(
             custom_targets,
             explicit_target_dependencies,
             plugin_name: plugin.name().to_string(),
+            languages,
+            build_system: plugin.build_system().map(str::to_string),
             relative_path,
         });
     }
@@ -267,6 +279,8 @@ pub fn discover_projects(
             dependencies: partial.dependencies,
             targets,
             plugin_name: partial.plugin_name,
+            languages: partial.languages,
+            build_system: partial.build_system,
             relative_path: partial.relative_path,
         });
     }
@@ -278,6 +292,18 @@ pub fn discover_projects(
     normalize_target_dependencies(&mut projects, &explicit_target_dependencies)?;
 
     Ok(projects)
+}
+
+impl DiscoveredProject {
+    /// Whether this project contains the requested source language.
+    pub fn has_language(&self, language: &str) -> bool {
+        self.languages.iter().any(|candidate| candidate == language)
+    }
+
+    /// Whether this project contains any of the requested source languages.
+    pub fn has_any_language(&self, languages: &[String]) -> bool {
+        languages.iter().any(|language| self.has_language(language))
+    }
 }
 
 fn validate_project_addresses(projects: &[DiscoveredProject]) -> Result<()> {
@@ -629,6 +655,8 @@ dependencies { implementation(project(":shared")) }
             .find(|project| project.relative_path == Path::new("app"))
             .unwrap();
         assert_eq!(app.plugin_name, "gradle");
+        assert_eq!(app.languages, vec!["java"]);
+        assert_eq!(app.build_system.as_deref(), Some("gradle"));
         assert_eq!(app.targets["build"].command, "./gradlew :app:build");
         assert!(app.dependencies.is_empty());
         assert_eq!(app.targets["build"].depends_on, vec!["//app:deps"]);
@@ -671,6 +699,8 @@ dependencies { implementation(project(":shared")) }
             .find(|project| project.relative_path == Path::new("app"))
             .unwrap();
         assert_eq!(app.plugin_name, "maven");
+        assert_eq!(app.languages, vec!["java"]);
+        assert_eq!(app.build_system.as_deref(), Some("maven"));
         assert_eq!(
             app.targets["build"].command,
             "./mvnw -pl :app -am package -DskipTests"

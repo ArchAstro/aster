@@ -119,6 +119,8 @@ mod tests {
                 .collect(),
             targets: HashMap::new(),
             plugin_name: "nodejs".to_string(),
+            languages: vec!["nodejs".to_string()],
+            build_system: None,
             relative_path: PathBuf::from(relative_path),
         }
     }

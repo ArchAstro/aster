@@ -48,8 +48,13 @@ pub struct ProjectInfo {
     pub address: String,
     /// Relative path from workspace root
     pub path: String,
-    /// Plugin that discovered this project
+    /// Internal plugin that discovered and executes this project
     pub plugin: String,
+    /// Source languages used by the project
+    pub languages: Vec<String>,
+    /// Build system used by the project, when distinct from its language
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_system: Option<String>,
     /// Available targets and their commands
     pub targets: HashMap<String, String>,
 }
@@ -260,6 +265,8 @@ mod tests {
             address: "//services/api".to_string(),
             path: "services/api".to_string(),
             plugin: "nodejs".to_string(),
+            languages: vec!["nodejs".to_string()],
+            build_system: None,
             targets,
         };
 

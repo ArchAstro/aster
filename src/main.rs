@@ -112,7 +112,7 @@ fn run() -> Result<()> {
             let filtered_projects: Vec<&DiscoveredProject> = if !lang.is_empty() {
                 filtered_projects
                     .into_iter()
-                    .filter(|p| lang.contains(&p.plugin_name))
+                    .filter(|p| p.has_any_language(&lang))
                     .collect()
             } else {
                 filtered_projects
@@ -132,6 +132,8 @@ fn run() -> Result<()> {
                             address: format!("//{}", p.relative_path.display()),
                             path: p.relative_path.display().to_string(),
                             plugin: p.plugin_name.clone(),
+                            languages: p.languages.clone(),
+                            build_system: p.build_system.clone(),
                             targets,
                         }
                     })
@@ -464,7 +466,7 @@ fn run() -> Result<()> {
                     let addr = format!("//{}", p.relative_path.display());
                     affected_addrs.contains(&addr)
                 })
-                .filter(|p| lang.is_empty() || lang.contains(&p.plugin_name))
+                .filter(|p| lang.is_empty() || p.has_any_language(&lang))
                 .collect();
 
             if affected_projects.is_empty() {
@@ -808,7 +810,7 @@ fn run() -> Result<()> {
                         if let Some((proj_addr, _)) = t.rsplit_once(':') {
                             project_map
                                 .get(proj_addr)
-                                .map(|p| lang.contains(&p.plugin_name))
+                                .map(|p| p.has_any_language(&lang))
                                 .unwrap_or(true)
                         } else {
                             true
@@ -1301,20 +1303,23 @@ fn handle_watch(
 
     // Apply language filter by dropping targets from non-matching projects.
     if !lang.is_empty() {
-        let project_lang: HashMap<String, String> = projects
+        let project_languages: HashMap<String, Vec<String>> = projects
             .iter()
             .map(|p| {
                 (
                     format!("//{}", p.relative_path.display()),
-                    p.plugin_name.clone(),
+                    p.languages.clone(),
                 )
             })
             .collect();
         resolved.retain(|addr| {
             let project_addr = addr.rsplit_once(':').map(|(p, _)| p).unwrap_or(addr);
-            project_lang
+            project_languages
                 .get(project_addr)
-                .map(|pl| lang.contains(pl))
+                .map(|project_languages| {
+                    lang.iter()
+                        .any(|language| project_languages.contains(language))
+                })
                 .unwrap_or(false)
         });
         if resolved.is_empty() {
@@ -1833,12 +1838,12 @@ fn apply_warnings_as_errors(
 
 /// Format a timestamp as a human-readable relative time
 ///
-/// Known language/plugin names for --lang validation
+/// Known source-language names for --lang validation
 const VALID_LANGS: &[&str] = &[
-    "nodejs", "python", "rust", "go", "elixir", "gradle", "maven", "ruby",
+    "nodejs", "python", "rust", "go", "elixir", "java", "kotlin", "ruby",
 ];
 
-/// Validate that all --lang values are known plugin names
+/// Validate that all --lang values are known source languages
 fn validate_lang_filter(langs: &[String]) -> Result<()> {
     for lang in langs {
         if !VALID_LANGS.contains(&lang.as_str()) {

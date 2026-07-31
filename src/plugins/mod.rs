@@ -93,8 +93,24 @@ pub struct TargetContext<'a> {
 
 /// Trait that each language plugin implements
 pub trait LanguagePlugin: Send + Sync {
-    /// Plugin identifier (e.g., "nodejs", "elixir")
+    /// Internal plugin identifier (e.g., "nodejs", "gradle", "maven")
     fn name(&self) -> &str;
+
+    /// Languages used by the discovered project.
+    ///
+    /// Most plugins represent one language, so their plugin identifier is the
+    /// language name. Build-system plugins can override this to detect one or
+    /// more source languages independently from the backend used to execute
+    /// targets.
+    fn languages(&self, _project_dir: &Path, _config_path: &Path) -> Result<Vec<String>> {
+        Ok(vec![self.name().to_string()])
+    }
+
+    /// Build system used to execute this project's targets, when distinct
+    /// from its language identity.
+    fn build_system(&self) -> Option<&str> {
+        None
+    }
 
     /// Files that identify this project type (e.g., ["package.json"])
     fn marker_files(&self) -> &[&str];
@@ -208,6 +224,7 @@ pub trait LanguagePlugin: Send + Sync {
 pub mod elixir;
 pub mod go;
 pub mod gradle;
+mod jvm;
 pub mod maven;
 pub mod nodejs;
 pub mod python;
