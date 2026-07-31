@@ -1469,6 +1469,8 @@ mod tests {
             dependencies: vec![],
             targets,
             plugin_name: "nodejs".to_string(),
+            languages: vec!["nodejs".to_string()],
+            build_system: None,
             relative_path: PathBuf::from(relative_path),
         }
     }
@@ -1851,6 +1853,8 @@ mod tests {
             dependencies: vec![],
             targets: targets_a,
             plugin_name: "elixir".to_string(),
+            languages: vec!["elixir".to_string()],
+            build_system: None,
             relative_path: PathBuf::from("a"),
         };
         let project_b = DiscoveredProject {
@@ -1863,6 +1867,8 @@ mod tests {
             dependencies: vec![],
             targets: targets_b,
             plugin_name: "elixir".to_string(),
+            languages: vec!["elixir".to_string()],
+            build_system: None,
             relative_path: PathBuf::from("b"),
         };
 
@@ -1934,6 +1940,8 @@ mod tests {
             dependencies: vec![],
             targets: targets_a,
             plugin_name: "elixir".to_string(),
+            languages: vec!["elixir".to_string()],
+            build_system: None,
             relative_path: PathBuf::from("a"),
         };
         let project_b = DiscoveredProject {
@@ -1946,6 +1954,8 @@ mod tests {
             dependencies: vec![],
             targets: targets_b,
             plugin_name: "elixir".to_string(),
+            languages: vec!["elixir".to_string()],
+            build_system: None,
             relative_path: PathBuf::from("b"),
         };
 

@@ -115,13 +115,17 @@ Use `aster --help` and `aster <command> --help` for the complete CLI reference.
 | Go | `go.mod` | deps, build, test, lint, clean |
 | Python | `pyproject.toml` | deps, build, test, lint, format, clean |
 | Elixir | `mix.exs` | deps, build, test, lint, format, clean |
-| Gradle/JVM | `settings.gradle[.kts]`, `build.gradle[.kts]` | deps, build, test, lint, format, clean |
-| Maven/JVM | `pom.xml` | deps, build, test, lint, format, clean |
+| Java | Gradle or Maven build files plus `.java` sources/plugins | deps, build, test, lint, format, clean |
+| Kotlin | Gradle or Maven build files plus `.kt` sources/plugins | deps, build, test, lint, format, clean |
 | Ruby | `Gemfile`, `*.gemspec` | deps, build, test, lint, format, dev, clean |
 
 Detected targets depend on the tools and scripts present in each project.
 Node.js projects use the `packageManager` field or lockfile to choose npm or
 pnpm. Workspace members inherit their workspace root's package manager.
+Java and Kotlin are detected independently from their build system, so one
+Gradle or Maven project may report either or both languages. Kotlin DSL files
+such as `build.gradle.kts` configure the build and do not by themselves make a
+project Kotlin. Use `--lang java` or `--lang kotlin` across either build system.
 Gradle and Maven projects prefer their checked-in wrappers and scope module
 targets to the native multi-project build or reactor, which remains responsible
 for ordering dependencies within that build. Pure aggregator roots and embedded

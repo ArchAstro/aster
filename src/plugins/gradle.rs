@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use super::jvm;
 use super::{CacheInputs, LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
 
 static ROOT_NAME: LazyLock<Regex> = LazyLock::new(|| {
@@ -33,6 +34,46 @@ pub struct GradlePlugin;
 impl LanguagePlugin for GradlePlugin {
     fn name(&self) -> &str {
         "gradle"
+    }
+
+    fn languages(&self, project_dir: &Path, config_path: &Path) -> Result<Vec<String>> {
+        let mut languages = jvm::source_languages(project_dir);
+        let mut build_content = std::fs::read_to_string(config_path).unwrap_or_default();
+        for filename in ["build.gradle", "build.gradle.kts"] {
+            let sibling = project_dir.join(filename);
+            if sibling != config_path {
+                if let Ok(content) = std::fs::read_to_string(sibling) {
+                    build_content.push('\n');
+                    build_content.push_str(&content);
+                }
+            }
+        }
+
+        let has_java_plugin = build_content.contains("plugins { java")
+            || build_content.contains("apply plugin: 'java'")
+            || build_content.contains("apply plugin: \"java\"")
+            || build_content.contains("id(\"java\")")
+            || build_content.contains("id(\"java-library\")")
+            || build_content.contains("id 'java'")
+            || build_content.contains("id 'java-library'");
+        let has_kotlin_plugin = build_content.contains("org.jetbrains.kotlin")
+            || build_content.contains("kotlin(\"jvm\")")
+            || build_content.contains("kotlin(\"multiplatform\")")
+            || build_content.contains("kotlin('jvm')")
+            || build_content.contains("kotlin('multiplatform')");
+
+        if has_java_plugin && !languages.iter().any(|language| language == "java") {
+            languages.push("java".to_string());
+        }
+        if has_kotlin_plugin && !languages.iter().any(|language| language == "kotlin") {
+            languages.push("kotlin".to_string());
+        }
+        languages.sort();
+        Ok(languages)
+    }
+
+    fn build_system(&self) -> Option<&str> {
+        Some("gradle")
     }
 
     fn marker_files(&self) -> &[&str] {
