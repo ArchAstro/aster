@@ -129,6 +129,7 @@ jobs:
           cd release-assets
           sha256sum ./* | sed 's#  \./#  #' > ../SHA256SUMS
       - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        if: github.event.repository.visibility == 'public'
         with:
           subject-path: release-assets/*
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
