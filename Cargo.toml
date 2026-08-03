@@ -19,30 +19,30 @@ ignore = "=0.4.31"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1"
 regex = "1.10"
-roxmltree = "0.20"
+roxmltree = "0.21"
 git2 = "0.21"
 console = "0.16"
 indicatif = "0.18"
 chrono = { version = "0.4", features = ["clock"] }
 globset = "0.4"
-getrandom = "0.3"
+getrandom = "0.4"
 fs2 = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 walkdir = "2"
 libc = "0.2"
-notify = "6.1"
+notify = "8.2"
 crossbeam-channel = "0.5"
 humantime = "2.1"
 shell-words = "1.1"
-crossterm = "0.28"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
@@ -57,4 +57,4 @@ windows-sys = { version = "0.59", features = [
 tempfile = "3"
 assert_cmd = "2.0"
 predicates = "3.1"
-dirs = "5.0"
+dirs = "6.0"
