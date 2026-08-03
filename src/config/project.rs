@@ -222,13 +222,35 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
     let config: AsterToml =
         toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
-    // Validate depends_on entries are valid addresses
-    for dep in &config.depends_on {
+    validate_aster_config(&config.depends_on, &config.targets, path)?;
+
+    Ok(config)
+}
+
+/// Validate fields shared by the project and workspace views of aster.toml.
+///
+/// The root file is deserialized through both views by different commands, so
+/// semantic validity must not depend on which command happened to load it.
+pub(super) fn validate_aster_config(
+    depends_on: &[String],
+    targets: &HashMap<String, TargetConfig>,
+    path: &Path,
+) -> Result<()> {
+    for dep in depends_on {
         Address::parse(dep)
             .with_context(|| format!("Invalid dependency '{}' in {}", dep, path.display()))?;
     }
 
-    for (target_name, target) in &config.targets {
+    for (target_name, target) in targets {
+        for dep in target.depends_on() {
+            Address::parse(dep).with_context(|| {
+                format!(
+                    "Invalid dependency '{dep}' for target '{target_name}' in {}",
+                    path.display()
+                )
+            })?;
+        }
+
         let TargetConfig::Rich(target) = target else {
             continue;
         };
@@ -264,7 +286,7 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
         }
     }
 
-    Ok(config)
+    Ok(())
 }
 
 /// Check if an aster.toml file exists in the given project directory
