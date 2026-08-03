@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::project::TargetConfig;
+use super::project::{validate_aster_config, TargetConfig};
 
 /// Workspace-level configuration from the root aster.toml
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -184,6 +184,8 @@ impl WorkspaceConfig {
         // Parse TOML - workspace config fields are at the top level
         let config: WorkspaceConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+        validate_aster_config(&config.depends_on, &config.targets, &config_path)?;
 
         Ok(config)
     }
