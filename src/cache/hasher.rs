@@ -10,6 +10,16 @@ use crate::cache::matcher::TargetInputMatcher;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 /// Computes cache hashes for targets
 pub struct CacheHasher {
     project_root: std::path::PathBuf,
@@ -77,7 +87,7 @@ impl CacheHasher {
         }
 
         let result = hasher.finalize();
-        Ok(format!("{result:x}"))
+        Ok(encode_hex(result.as_ref()))
     }
 
     /// Hash all files matching the globs
@@ -109,7 +119,8 @@ impl CacheHasher {
 
             if matcher.matches_relative(rel_path) {
                 if let Ok(content) = std::fs::read(entry.path()) {
-                    let hash = format!("{:x}", Sha256::digest(&content));
+                    let digest = Sha256::digest(&content);
+                    let hash = encode_hex(digest.as_ref());
                     file_hashes.push((rel_path.to_string_lossy().to_string(), hash));
                 }
             }
@@ -138,6 +149,11 @@ impl CacheHasher {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn encode_hex_preserves_leading_zeroes_and_lowercase() {
+        assert_eq!(encode_hex(&[0x00, 0x09, 0xaf, 0xff]), "0009afff");
+    }
 
     #[test]
     fn test_compute_hash_empty_inputs() {
