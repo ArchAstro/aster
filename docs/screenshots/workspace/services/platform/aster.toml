@@ -1,0 +1,9 @@
+[targets.build]
+command = "sh ../../scripts/build.sh platform 35"
+depends_on = ["//src/elixir/core:build"]
+cache = { enabled = false }
+
+[targets.dev]
+command = "sh ../../scripts/service.sh platform 'Phoenix running at http://localhost:4000'"
+depends_on = ["//self:build"]
+stream = true

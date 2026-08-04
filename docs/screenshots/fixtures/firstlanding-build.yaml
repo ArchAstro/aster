@@ -1,0 +1,20 @@
+version: 1
+command: ./run-demo.sh
+args:
+  - build
+  - //services/platform
+  - //services/developer-portal
+  - //services/go/smtp-proxy
+  - --no-cache
+cwd: ..
+cols: 112
+rows: 24
+timeoutMs: 15000
+actions:
+  - waitForExit: true
+    timeoutMs: 15000
+expectText:
+  - PASS //services/platform:build
+  - PASS //services/developer-portal:build
+  - PASS //services/go/smtp-proxy:build
+  - 6 passed

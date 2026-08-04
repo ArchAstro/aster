@@ -1,0 +1,9 @@
+[targets.build]
+command = "sh ../../scripts/build.sh developer-portal 34"
+depends_on = ["//src/ts/platform-sdk:build"]
+cache = { enabled = false }
+
+[targets.dev]
+command = "sh ../../scripts/service.sh developer-portal 'Ready on http://localhost:3300'"
+depends_on = ["//self:build"]
+stream = true

@@ -1,0 +1,4 @@
+[targets.build]
+command = "sh ../../../scripts/build.sh platform-sdk 36"
+depends_on = ["//src/elixir/core:build"]
+cache = { enabled = false }

@@ -1,0 +1,22 @@
+version: 1
+command: ./run-demo.sh
+args:
+  - services
+  - up
+  - --no-watch
+cwd: ..
+env:
+  TMPDIR: /tmp
+cols: 126
+rows: 32
+timeoutMs: 15000
+actions:
+  - waitFor: "Phoenix running at http://localhost:4000"
+    timeoutMs: 15000
+  - pauseMs: 4000
+expectText:
+  - platform
+  - developer-portal
+  - agent-network
+  - scrape-dashboard
+  - Phoenix running at http://localhost:4000
