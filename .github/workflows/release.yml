@@ -128,7 +128,7 @@ jobs:
             -exec cp '{}' release-assets/ \;
           cd release-assets
           sha256sum ./* | sed 's#  \./#  #' > ../SHA256SUMS
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         if: github.event.repository.visibility == 'public'
         with:
           subject-path: release-assets/*
@@ -239,12 +239,12 @@ jobs:
             released-packages package-repositories "${PACKAGE_REPOSITORY_URL}" \
             "${fingerprint}" "${{ needs.verify.outputs.version }}"
           scripts/test-linux-repositories "${{ needs.verify.outputs.version }}" package-repositories
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: package-repositories
       - name: Deploy package repositories
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
   update-aur:
     name: Update AUR package
