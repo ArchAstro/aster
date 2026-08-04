@@ -23,8 +23,7 @@ impl LanguagePlugin for RustPlugin {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
-        let cargo_toml: Value = content
-            .parse()
+        let cargo_toml: Value = toml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         // Extract package name and version
@@ -53,8 +52,7 @@ impl LanguagePlugin for RustPlugin {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
-        let cargo_toml: Value = content
-            .parse()
+        let cargo_toml: Value = toml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         let mut deps = Vec::new();
