@@ -1,0 +1,5 @@
+[tool.poetry]
+name = "archastro-scrape"
+version = "0.1.0"
+description = "Screenshot fixture"
+authors = []

@@ -1,0 +1,4 @@
+[targets.build]
+command = "sh ../../../scripts/build.sh smtp-proxy 33"
+depends_on = ["//src/elixir/core:build"]
+cache = { enabled = false }

@@ -1,0 +1,7 @@
+[targets.deps]
+command = "sh ../../../scripts/build.sh core-deps 90"
+cache = { enabled = false }
+
+[targets.build]
+command = "sh ../../../scripts/build.sh core 35"
+cache = { enabled = false }

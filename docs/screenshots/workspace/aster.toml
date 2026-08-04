@@ -1,0 +1,40 @@
+ignore = []
+
+[dev]
+
+[dev.ports.platform]
+env = "ARCHASTRO_PLATFORM_PORT"
+default = 4000
+
+[dev.ports.developer-portal]
+env = "ARCHASTRO_DEVELOPER_PORTAL_PORT"
+default = 3300
+
+[dev.ports.agent-network]
+env = "ARCHASTRO_AGENT_NETWORK_PORT"
+default = 3500
+
+[dev.ports.scrape-dashboard]
+env = "ARCHASTRO_SCRAPE_DASHBOARD_PORT"
+default = 8080
+
+[dev.services.platform]
+target = "//services/platform:dev"
+port = "platform"
+open_path = "/dev/mailbox"
+order = 10
+
+[dev.services.developer-portal]
+target = "//services/developer-portal:dev"
+port = "developer-portal"
+order = 20
+
+[dev.services.agent-network]
+target = "//services/agent-network:dev"
+port = "agent-network"
+order = 30
+
+[dev.services.scrape-dashboard]
+target = "//services/python/scrape:dev"
+port = "scrape-dashboard"
+order = 40

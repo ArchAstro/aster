@@ -10,7 +10,15 @@ homepage = "https://github.com/ArchAstro/aster"
 readme = "README.md"
 keywords = ["build", "monorepo", "polyglot", "task-runner"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/GETTING_STARTED.MD",
+    "/LICENSE",
+]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

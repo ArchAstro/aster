@@ -1,0 +1,3 @@
+[targets.dev]
+command = "sh ../../scripts/service.sh agent-network 'Ready on http://localhost:3500'"
+stream = true

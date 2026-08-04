@@ -9,6 +9,27 @@ aster build //services/api
 aster affected test --base=main
 ```
 
+New to Aster? Follow the [end-to-end getting started tutorial](GETTING_STARTED.MD)
+to create a workspace, connect project dependencies, build, test, cache, watch,
+and run only affected projects.
+
+## Aster at work
+
+A single command builds FirstLanding's Elixir, TypeScript, and Go projects in
+dependency order while independent work runs in parallel:
+
+![Aster completing a dependency-ordered FirstLanding build across Elixir, TypeScript, and Go projects](docs/images/firstlanding-build.png)
+
+For local development, `aster services up` keeps the platform and web services
+in one dashboard with focused logs, service switching, search, restart, and
+mouse controls:
+
+![Aster supervising four FirstLanding development services with the platform log selected](docs/images/firstlanding-services.png)
+
+The [screenshot fixtures](docs/screenshots/README.md) use the real Aster binary
+against a synthetic, FirstLanding-shaped workspace, so these images can be
+regenerated without private source code or credentials.
+
 ## Installation
 
 ### Homebrew
