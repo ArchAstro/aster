@@ -248,7 +248,7 @@ jobs:
 
   update-aur:
     name: Update AUR package
-    if: vars.AUR_PUBLISH_ENABLED == 'true' && needs.publication-freshness.outputs.should_publish == 'true'
+    if: vars.AUR_PUBLISH_ENABLED == 'true' && needs.publication-freshness.outputs.should_publish == 'true' && github.event.repository.visibility == 'public'
     needs: [verify, release, publication-freshness]
     runs-on: ubuntu-latest
     concurrency:
@@ -292,7 +292,7 @@ jobs:
 
   update-homebrew:
     name: Update Homebrew tap
-    if: needs.publication-freshness.outputs.should_publish == 'true'
+    if: needs.publication-freshness.outputs.should_publish == 'true' && github.event.repository.visibility == 'public'
     needs: [verify, release, publication-freshness]
     runs-on: ubuntu-latest
     concurrency:
@@ -313,25 +313,34 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
       - name: Update Homebrew formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.ARCHASTRO_RELEASE_GITHUB_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
           SHA_DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
           SHA_DARWIN_X64: ${{ steps.checksums.outputs.darwin_x64 }}
           SHA_LINUX_X64: ${{ steps.checksums.outputs.linux_x64 }}
         run: |
           set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "ARCHASTRO_RELEASE_GITHUB_TOKEN is not configured" >&2
+            exit 1
+          fi
           gh auth setup-git
-          gh repo clone ArchAstro/homebrew-tap
-          cd homebrew-tap
+          git clone https://github.com/ArchAstro/homebrew-tools.git "${RUNNER_TEMP}/homebrew-tools"
+          cd "${RUNNER_TEMP}/homebrew-tools"
           mkdir -p Formula
           sed \
             -e "s/__VERSION__/${VERSION}/g" \
             -e "s/__SHA_DARWIN_ARM64__/${SHA_DARWIN_ARM64}/g" \
             -e "s/__SHA_DARWIN_X64__/${SHA_DARWIN_X64}/g" \
             -e "s/__SHA_LINUX_X64__/${SHA_LINUX_X64}/g" \
-            ../.github/homebrew/aster.rb.template > Formula/aster.rb
+            "${GITHUB_WORKSPACE}/.github/homebrew/aster.rb.template" > Formula/aster.rb
+          ruby -c Formula/aster.rb
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/aster.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew formula is already current"
+            exit 0
+          fi
           git commit -m "Update aster to ${VERSION}"
-          git push
+          git push origin main

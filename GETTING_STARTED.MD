@@ -13,11 +13,10 @@ You need:
 - Git
 - Node.js 20 or newer with npm
 
-On macOS, install Aster from the private Homebrew tap:
+On macOS, install Aster from ArchAstro's public Homebrew tap:
 
 ```console
-export HOMEBREW_GITHUB_API_TOKEN="$(gh auth token)"
-brew install ArchAstro/tap/aster
+brew install ArchAstro/tools/aster
 aster --version
 ```
 

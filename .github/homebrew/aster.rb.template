@@ -1,73 +1,30 @@
-require "download_strategy"
-
-class GitHubPrivateRepositoryReleaseDownloadStrategy < CurlDownloadStrategy
-  def initialize(url, name, version, **meta)
-    super
-    parse_url_pattern
-    set_github_token
-  end
-
-  def parse_url_pattern
-    url_pattern = %r{https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(\S+)}
-    unless @url =~ url_pattern
-      raise CurlDownloadStrategyError, "Invalid GitHub release URL pattern"
-    end
-    _, @owner, @repo, @tag, @filename = *@url.match(url_pattern)
-  end
-
-  def set_github_token
-    @github_token = ENV["HOMEBREW_GITHUB_API_TOKEN"]
-    unless @github_token
-      raise CurlDownloadStrategyError, "HOMEBREW_GITHUB_API_TOKEN is required"
-    end
-  end
-
-  def _fetch(url:, resolved_url:, timeout:)
-    api_url = "https://api.github.com/repos/#{@owner}/#{@repo}/releases/tags/#{@tag}"
-    assets_json = Utils::Curl.curl_output(
-      "--header", "Authorization: token #{@github_token}",
-      "--header", "Accept: application/vnd.github.v3+json",
-      api_url
-    ).stdout
-    require "json"
-    release = JSON.parse(assets_json)
-    asset = release["assets"].find { |candidate| candidate["name"] == @filename }
-    unless asset
-      raise CurlDownloadStrategyError, "Asset #{@filename} not found in release #{@tag}"
-    end
-    curl_download(
-      "--header", "Authorization: token #{@github_token}",
-      "--header", "Accept: application/octet-stream",
-      asset["url"],
-      to: temporary_path,
-      timeout: timeout
-    )
-  end
-end
-
 class Aster < Formula
   desc "Build orchestration for polyglot monorepos"
   homepage "https://github.com/ArchAstro/aster"
   version "__VERSION__"
   license "MIT"
 
+  livecheck do
+    url :stable
+    regex(/^v?(\d+(?:\.\d+)+)$/i)
+  end
+
   on_macos do
     on_arm do
-      url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-darwin-arm64.tar.gz",
-          using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-darwin-arm64.tar.gz"
       sha256 "__SHA_DARWIN_ARM64__"
     end
     on_intel do
-      url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-darwin-x64.tar.gz",
-          using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-darwin-x64.tar.gz"
       sha256 "__SHA_DARWIN_X64__"
     end
   end
 
   on_linux do
-    url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-linux-x64.tar.gz",
-        using: GitHubPrivateRepositoryReleaseDownloadStrategy
-    sha256 "__SHA_LINUX_X64__"
+    on_intel do
+      url "https://github.com/ArchAstro/aster/releases/download/v__VERSION__/aster-linux-x64.tar.gz"
+      sha256 "__SHA_LINUX_X64__"
+    end
   end
 
   def install
@@ -75,6 +32,6 @@ class Aster < Formula
   end
 
   test do
-    system "#{bin}/aster", "--version"
+    assert_match version.to_s, shell_output("#{bin}/aster --version")
   end
 end

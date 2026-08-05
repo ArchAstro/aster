@@ -65,10 +65,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Render formula for the latest private release
+      - name: Render public formula for the latest release
         run: |
-          brew tap-new --no-git aster-ci/private-release
-          formula="$(brew --repository aster-ci/private-release)/Formula/aster.rb"
+          brew tap-new --no-git aster-ci/public-release
+          formula="$(brew --repository aster-ci/public-release)/Formula/aster.rb"
           sed \
             -e "s/__VERSION__/0.7.0/g" \
             -e "s/__SHA_DARWIN_ARM64__/1d0a98bac39f4bea1194d6314247a7de40a2a5f3b9def1577342fff75c6d412e/g" \
@@ -76,10 +76,13 @@ jobs:
             -e "s/__SHA_LINUX_X64__/e8a42adbda5aa4da3f8edcc91b3bda4a7cf8e3758464ddfab3e0ff249ee47a8f/g" \
             .github/homebrew/aster.rb.template > "${formula}"
           ruby -c "${formula}"
-      - name: Fetch the private Apple Silicon release asset
-        env:
-          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: brew fetch --force --formula aster-ci/private-release/aster
+          if rg -n 'HOMEBREW_GITHUB_API_TOKEN|api\.github\.com|download_strategy' "${formula}"; then
+            echo "Homebrew formula must use only anonymous public release URLs" >&2
+            exit 1
+          fi
+      - name: Fetch the public Apple Silicon release asset anonymously
+        if: github.event.repository.visibility == 'public'
+        run: brew fetch --force --formula aster-ci/public-release/aster
 
   linux-packages:
     name: Linux packages
