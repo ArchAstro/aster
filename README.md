@@ -34,12 +34,8 @@ regenerated without private source code or credentials.
 
 ### Homebrew
 
-The repository is private, so authenticate Homebrew's release download with a
-GitHub token that can read it:
-
 ```console
-export HOMEBREW_GITHUB_API_TOKEN="$(gh auth token)"
-brew install ArchAstro/tap/aster
+brew install ArchAstro/tools/aster
 ```
 
 ### From source
