@@ -1,7 +1,15 @@
-# aster
+# Aster
 
-Aster is a build orchestrator for polyglot monorepos. It discovers projects,
-connects cross-language dependencies, and runs targets in dependency order.
+[![CI](https://github.com/ArchAstro/aster/actions/workflows/ci.yml/badge.svg)](https://github.com/ArchAstro/aster/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/ArchAstro/aster)](https://github.com/ArchAstro/aster/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/ArchAstro/aster)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](Cargo.toml)
+
+![A luminous aster-shaped constellation connecting many project nodes into one dependency-ordered build](docs/images/aster-banner.jpg)
+
+Aster is a build orchestrator for polyglot monorepos. It discovers projects
+across languages, connects their dependencies into one graph, and runs work in
+the correct order while independent targets execute in parallel.
 
 ```console
 aster test --all
@@ -12,6 +20,33 @@ aster affected test --base=main
 New to Aster? Follow the [end-to-end getting started tutorial](GETTING_STARTED.MD)
 to create a workspace, connect project dependencies, build, test, cache, watch,
 and run only affected projects.
+
+[Install](#installation) · [Quick start](#quick-start) ·
+[Configuration](#project-configuration) · [Contributing](CONTRIBUTING.md) ·
+[Support](SUPPORT.md) · [Security](SECURITY.md)
+
+## Why Aster
+
+- **One graph across languages.** Rust, Node.js, Go, Python, Elixir, Java,
+  Kotlin, and Ruby projects can depend on one another while each ecosystem
+  keeps using its native tools.
+- **Correct work, maximum concurrency.** Prerequisites run first; unrelated
+  targets run together; failures stop the work that depends on them.
+- **Fast local feedback.** Content-aware caching, affected-project selection,
+  and watch mode avoid repeating work that cannot change the result.
+- **A single development cockpit.** `aster services up` supervises long-lived
+  services with focused logs, restarts, search, and collision-free ports.
+- **A graph you can inspect.** `aster list`, `aster graph`, and `aster why`
+  explain what Aster found and why a target will run.
+
+### Why the name?
+
+*Aster* comes from Ancient Greek *astḗr* (ἀστήρ), meaning “star.” The flower
+took the same name from its radiating, star-shaped head. The metaphor fits a
+monorepo: each project is a point in a larger constellation, dependencies draw
+the lines between them, and Aster turns that graph into one coordinated build.
+The word history is documented by the [Online Etymology Dictionary](https://www.etymonline.com/word/aster)
+and the flower form by the [Chicago Botanic Garden](https://www.chicagobotanic.org/plant-information/plant-profiles/aster).
 
 ## Aster at work
 
@@ -46,8 +81,9 @@ Aster requires Rust 1.88 or newer.
 cargo install --git https://github.com/ArchAstro/aster.git --locked
 ```
 
-Prebuilt release archives are available for Linux x86-64, macOS x86-64, and
-macOS Apple Silicon. Windows is not currently built or tested by the project.
+Prebuilt archives are available from [GitHub Releases](https://github.com/ArchAstro/aster/releases)
+for Linux x86-64, macOS x86-64, and macOS Apple Silicon. Windows is not
+currently built or tested by the project.
 
 ### Native Linux packages
 
@@ -70,12 +106,6 @@ For Fedora and other RPM-based distributions:
 ```console
 sudo curl -fsSL https://archastro.github.io/aster/rpm/aster.repo -o /etc/yum.repos.d/aster.repo
 sudo dnf install aster
-```
-
-On Arch Linux, install the AUR package:
-
-```console
-yay -S aster-bin
 ```
 
 You can also download a native package directly from the GitHub release:
@@ -136,8 +166,8 @@ Use `aster --help` and `aster <command> --help` for the complete CLI reference.
 | Go | `go.mod` | deps, build, test, lint, clean |
 | Python | `pyproject.toml` | deps, build, test, lint, format, clean |
 | Elixir | `mix.exs` | deps, build, test, lint, format, clean |
-| Java | Gradle or Maven build files plus `.java` sources/plugins | deps, build, test, lint, format, clean |
-| Kotlin | Gradle or Maven build files plus `.kt` sources/plugins | deps, build, test, lint, format, clean |
+| Java | Gradle/Maven plus `.java` | deps, build, test, lint, format, clean |
+| Kotlin | Gradle/Maven plus `.kt` | deps, build, test, lint, format, clean |
 | Ruby | `Gemfile`, `*.gemspec` | deps, build, test, lint, format, dev, clean |
 
 Detected targets depend on the tools and scripts present in each project.
@@ -155,12 +185,12 @@ directory containing both Gradle and Maven configuration, Maven takes precedence
 so the project has one unambiguous Aster address. A colocated `package.json`
 similarly keeps the existing Node.js project rather than creating a conflicting
 Gradle address.
-Ruby projects use Bundler when a Gemfile is present and detect conventional gem builds,
-Rake/Minitest, RSpec, Rails tests and servers, and RuboCop. A colocated gemspec
-is the canonical marker for a packaged gem, while Rails and gem projects take
-precedence over colocated JavaScript asset packages at the same directory-based
-Aster address. Ruby config is parsed statically and is never evaluated during
-discovery.
+Ruby projects use Bundler when a Gemfile is present and detect conventional gem
+builds, Rake/Minitest, RSpec, Rails tests and servers, and RuboCop. A colocated
+gemspec is the canonical marker for a packaged gem, while Rails and gem projects
+take precedence over colocated JavaScript asset packages at the same
+directory-based Aster address. Ruby config is parsed statically and is never
+evaluated during discovery.
 
 ## Project configuration
 
@@ -361,10 +391,15 @@ line-delimited JSON commands on localhost: `status`, `list_services`,
 the path to a per-run token file; state-changing requests must include its
 contents as the JSON `token` field. Read-only requests do not require it.
 
-## Contributing and security
+## Community
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request
-checks. Please report vulnerabilities privately as described in
+checks. Use [GitHub Discussions](https://github.com/ArchAstro/aster/discussions)
+for usage questions and design conversations, and the issue forms for
+reproducible bugs and feature requests; the full support policy is in
+[SUPPORT.md](SUPPORT.md).
+
+Please report vulnerabilities privately as described in
 [SECURITY.md](SECURITY.md). Community expectations and project decision-making
 are documented in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and
 [GOVERNANCE.md](GOVERNANCE.md).
