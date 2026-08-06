@@ -483,8 +483,7 @@ fn rake_has_task(rakefile: &str, name: &str) -> bool {
     }
     let escaped = regex::escape(name);
     Regex::new(&format!(
-        r#"(?m)^\s*task\s*(?:\(\s*)?(?::{}\b|[\"']{}[\"'])"#,
-        escaped, escaped
+        r#"(?m)^\s*task\s*(?:\(\s*)?(?::{escaped}\b|[\"']{escaped}[\"'])"#
     ))
     .expect("escaped task regex is valid")
     .is_match(rakefile)
