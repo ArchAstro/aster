@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -103,6 +104,76 @@ fn wait_for_control_token(port: u16, process_id: u32) -> (std::path::PathBuf, St
     let path = found.unwrap();
     let token = fs::read_to_string(&path).unwrap();
     (path, token)
+}
+
+#[test]
+fn services_kill_ports_previews_then_clears_configured_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut listener = Command::new("python3")
+        .args([
+            "-c",
+            "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',int(__import__('sys').argv[1]))); s.listen(); time.sleep(60)",
+            &port.to_string(),
+        ])
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+
+    // Explicit numeric cleanup works without an aster.toml or .git workspace.
+    let outside_workspace = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports", &port.to_string(), "--dry-run"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(outside_workspace.status.success());
+    assert!(String::from_utf8_lossy(&outside_workspace.stdout).contains("Would terminate"));
+    assert!(listener.try_wait().unwrap().is_none());
+
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        format!("[dev.ports.web]\ndefault = {port}\n"),
+    )
+    .unwrap();
+
+    let preview = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports", "web", "--dry-run"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("Would terminate"));
+    assert!(listener.try_wait().unwrap().is_none());
+
+    let cleanup = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    if !cleanup.status.success() {
+        let _ = listener.kill();
+        let _ = listener.wait();
+    }
+    assert!(
+        cleanup.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    wait_until(Duration::from_secs(3), || {
+        listener.try_wait().unwrap().is_some()
+    });
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(String::from_utf8_lossy(&cleanup.stdout).contains("Cleared"));
 }
 
 #[test]

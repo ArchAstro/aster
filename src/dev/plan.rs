@@ -41,8 +41,7 @@ pub fn resolve_dev_plan(
         bail!("no services configured; add [dev.services.<name>] to aster.toml");
     }
 
-    let port_file_env = load_env_files(workspace_root, &config.port_env_files)?;
-    let ports = resolve_ports(&config.ports, &port_file_env)?;
+    let ports = resolve_dev_ports(workspace_root, config)?;
     let control_port = config
         .control_port
         .as_deref()
@@ -170,6 +169,18 @@ pub fn resolve_dev_plan(
         ports,
         control_port,
     })
+}
+
+/// Resolve the named development ports without requiring service targets.
+///
+/// This is intentionally separate from [`resolve_dev_plan`] so maintenance
+/// commands can operate even when a service target is temporarily broken.
+pub fn resolve_dev_ports(
+    workspace_root: &Path,
+    config: &DevWorkspaceConfig,
+) -> Result<HashMap<String, u16>> {
+    let port_file_env = load_env_files(workspace_root, &config.port_env_files)?;
+    resolve_ports(&config.ports, &port_file_env)
 }
 
 fn validate_environment(service: &str, environment: &HashMap<String, String>) -> Result<()> {

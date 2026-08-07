@@ -310,6 +310,21 @@ aster services up --no-ui
 aster services up --dry-run
 ```
 
+Clear stale or orphaned processes from development ports before starting the
+stack again:
+
+```console
+aster services kill-ports --dry-run     # inspect every configured port
+aster services kill-ports               # clean every configured port
+aster services kill-ports api web 4011  # clean named and explicit ports
+```
+
+The command sends a graceful termination request to each listener, waits
+briefly, then force-kills listeners that still hold a selected port. It targets
+only processes that own the selected listening ports. An explicit numeric port
+need not appear in `aster.toml` and can be cleaned from outside an Aster
+workspace.
+
 Targets named `dev` remain ordinary targets (`aster dev <project selectors>`).
 If a project has a target named `services`, run it explicitly with
 `aster target services <project selectors>`. The same escape hatch works for
