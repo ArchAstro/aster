@@ -59,6 +59,21 @@ fn run() -> Result<()> {
         return handle_init(&cwd, cli.verbose);
     }
 
+    // Explicit numeric port cleanup is useful even outside an Aster workspace.
+    // Named/default selection still loads the workspace configuration below.
+    if let Commands::Services {
+        command: ServicesCommands::KillPorts { ports, dry_run },
+    } = &cli.command
+    {
+        if !ports.is_empty() && ports.iter().all(|port| port.parse::<u16>().is_ok()) {
+            let selected = aster::dev::resolve_port_selection(&HashMap::new(), ports)?;
+            return aster::dev::kill_ports(
+                &selected,
+                aster::dev::KillPortsOptions { dry_run: *dry_run },
+            );
+        }
+    }
+
     // For all other commands, require a workspace
     let workspace_root = find_workspace_root(&cwd).context(
         "Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.",
@@ -968,6 +983,13 @@ fn run() -> Result<()> {
                         use_cache: !cli.no_cache,
                     },
                 )?;
+            }
+            ServicesCommands::KillPorts { ports, dry_run } => {
+                let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+                let configured =
+                    aster::dev::resolve_dev_ports(&workspace_root, &workspace_config.dev)?;
+                let selected = aster::dev::resolve_port_selection(&configured, &ports)?;
+                aster::dev::kill_ports(&selected, aster::dev::KillPortsOptions { dry_run })?;
             }
         },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {

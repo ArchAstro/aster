@@ -274,6 +274,16 @@ pub enum ServicesCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Terminate processes listening on configured or specified ports
+    KillPorts {
+        /// Port numbers or names from `[dev.ports]` (defaults to all configured ports)
+        ports: Vec<String>,
+
+        /// Show matching processes without terminating them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Cache subcommands
