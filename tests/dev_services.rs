@@ -563,3 +563,77 @@ stream = true
     assert_eq!(occurrences(&events, "LATER_SIDE_EFFECT"), 0);
     assert!(!token_path.exists());
 }
+
+#[test]
+fn services_up_selects_an_optional_service_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+
+    for project in ["platform", "intern-data", "intern-fe"] {
+        let directory = root.join(project);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("aster.toml"),
+            "[targets.dev]\ncommand = \"sh -c true\"\nstream = true\n",
+        )
+        .unwrap();
+    }
+
+    fs::write(
+        root.join("aster.toml"),
+        r#"
+[dev.service_groups]
+main = ["platform"]
+intern = ["intern-data", "intern-fe"]
+
+[dev.services.platform]
+target = "//platform:dev"
+
+[dev.services.intern-data]
+target = "//intern-data:dev"
+
+[dev.services.intern-fe]
+target = "//intern-fe:dev"
+"#,
+    )
+    .unwrap();
+
+    let ungrouped = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--dry-run"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(ungrouped.status.success(), "{ungrouped:?}");
+    let stderr = String::from_utf8_lossy(&ungrouped.stderr);
+    assert!(stderr.contains("platform -> //platform:dev"), "{stderr}");
+    assert!(!stderr.contains("intern-data ->"), "{stderr}");
+    assert!(!stderr.contains("intern-fe ->"), "{stderr}");
+
+    let intern = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "intern", "--dry-run"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(intern.status.success(), "{intern:?}");
+    let stderr = String::from_utf8_lossy(&intern.stderr);
+    assert!(!stderr.contains("platform ->"), "{stderr}");
+    assert!(
+        stderr.contains("intern-data -> //intern-data:dev"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("intern-fe -> //intern-fe:dev"), "{stderr}");
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "missing", "--dry-run"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown service group 'missing'"));
+}

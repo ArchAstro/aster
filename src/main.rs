@@ -952,7 +952,7 @@ fn run() -> Result<()> {
         }
         Commands::Services { command } => match command {
             ServicesCommands::Up {
-                services,
+                group,
                 no_watch,
                 no_ui,
                 dry_run,
@@ -965,7 +965,7 @@ fn run() -> Result<()> {
                 let plan = aster::dev::resolve_dev_plan(
                     &workspace_root,
                     &workspace_config.dev,
-                    &services,
+                    group.as_deref(),
                     &projects,
                     &graph,
                     &registry,

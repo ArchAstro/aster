@@ -305,7 +305,7 @@ dashboard:
 
 ```console
 aster services up
-aster services up api web
+aster services up intern
 aster services up --no-ui
 aster services up --dry-run
 ```
@@ -339,6 +339,19 @@ Services are mappings to ordinary `stream = true` targets. Their non-stream
 target dependencies are pre-start steps: Aster runs them before the service
 starts and again before a dependency-triggered or manual restart. The same
 transitive target graph determines which project directories are watched.
+
+Services can be collected into named groups in the root `aster.toml`:
+
+```toml
+[dev.service_groups]
+main = ["platform", "developer-portal", "user-portal", "agent-network"]
+intern = ["intern-postgres", "intern-data", "intern-ctl", "intern-gateway", "intern-fe"]
+```
+
+`aster services up intern` runs that group. With no group argument, Aster runs
+the `main` group plus services that do not appear in any group. When no `main`
+group exists, the default remains all ungrouped services. A service may belong
+to more than one group.
 
 The dashboard uses scalable colored service tabs beside one focused log
 stream. Use `h`/`l` or click a tab to switch services, drag the divider or use
