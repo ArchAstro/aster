@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::plan::ServicePlan;
 use super::process::LogEvent;
+use crate::config::DevWorkspaceConfig;
 
 pub const SERVICE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const TRUNCATION_NOTICE: &str = "[aster] log truncated after reaching the 10 MiB limit\n";
@@ -31,15 +33,10 @@ impl ServiceLogFiles {
         services: impl IntoIterator<Item = &'a str>,
         max_bytes: u64,
     ) -> Result<Self> {
-        let worktree = workspace_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("default");
         let base = workspace_root
             .join(".aster")
             .join("logs")
-            .join(encode_path_component(worktree));
+            .join(encode_path_component(worktree_name(workspace_root)));
         let mut files = HashMap::new();
 
         for service in services {
@@ -62,6 +59,121 @@ impl ServiceLogFiles {
             let _ = file.write_line(&event.line);
         }
     }
+}
+
+/// Print a configured service's durable log, paging only for an interactive terminal.
+pub fn show_service_logs(
+    workspace_root: &Path,
+    config: &DevWorkspaceConfig,
+    service: &str,
+) -> Result<()> {
+    if !config.services.contains_key(service) {
+        let mut available = config
+            .services
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        available.sort_unstable();
+        if available.is_empty() {
+            bail!("unknown service '{service}'; no services are configured");
+        }
+        bail!(
+            "unknown service '{service}'; configured services: {}",
+            available.join(", ")
+        );
+    }
+
+    let path = service_log_path(workspace_root, service);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+            "no logs found for service '{service}' at {}; run `aster services up` first",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open service log {}", path.display()));
+        }
+    };
+
+    if !io::stdout().is_terminal() {
+        return copy_to_stdout(&file);
+    }
+
+    show_in_pager(&file)
+}
+
+fn service_log_path(workspace_root: &Path, service: &str) -> PathBuf {
+    workspace_root
+        .join(".aster")
+        .join("logs")
+        .join(encode_path_component(worktree_name(workspace_root)))
+        .join(encode_path_component(service))
+        .join("logs.txt")
+}
+
+fn worktree_name(workspace_root: &Path) -> &str {
+    workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("default")
+}
+
+fn show_in_pager(file: &File) -> Result<()> {
+    if let Some(pager) = std::env::var_os("PAGER").filter(|value| !value.is_empty()) {
+        let pager = pager
+            .to_str()
+            .ok_or_else(|| anyhow!("PAGER is not valid UTF-8"))?;
+        let command = shell_words::split(pager).context("failed to parse PAGER")?;
+        if command.is_empty() {
+            return copy_to_stdout(file);
+        }
+        let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+        return run_pager(file, &command).with_context(|| format!("failed to run PAGER '{pager}'"));
+    }
+
+    #[cfg(windows)]
+    let defaults: &[&[&str]] = &[&["more.com"]];
+    #[cfg(not(windows))]
+    let defaults: &[&[&str]] = &[&["less"], &["more"]];
+
+    for command in defaults {
+        match run_pager(file, command) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    copy_to_stdout(file)
+}
+
+fn run_pager(file: &File, command: &[&str]) -> Result<()> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow!("pager command is empty"))?;
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::from(file.try_clone()?))
+        .status()?;
+    if !status.success() {
+        bail!("pager '{program}' exited with {status}");
+    }
+    Ok(())
+}
+
+fn copy_to_stdout(file: &File) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut input = file;
+    io::copy(&mut input, &mut stdout).context("failed to write service logs to stdout")?;
+    Ok(())
 }
 
 struct CappedLogFile {

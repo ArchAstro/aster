@@ -637,3 +637,59 @@ target = "//intern-fe:dev"
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown service group 'missing'"));
 }
+
+#[test]
+fn services_logs_writes_raw_log_text_when_stdout_is_piped() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev.services.api]\ntarget = \"//api:dev\"\n",
+    )
+    .unwrap();
+    let log = root
+        .join(".aster/logs")
+        .join(root.file_name().unwrap())
+        .join("api/logs.txt");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, "ready\nERROR exploded\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "logs", "api"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"ready\nERROR exploded\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn services_logs_rejects_unknown_services_and_missing_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev.services.api]\ntarget = \"//api:dev\"\n",
+    )
+    .unwrap();
+
+    let unknown = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "logs", "missing"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr)
+        .contains("unknown service 'missing'; configured services: api"));
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "logs", "api"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no logs found for service 'api'"));
+}
