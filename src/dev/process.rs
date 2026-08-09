@@ -13,11 +13,35 @@ use crate::executor::command::parse_command;
 use crate::executor::{register_supervised_child, unregister_supervised_child};
 use crate::plugins::Target;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LogEvent {
     pub service: String,
     pub line: String,
     pub stderr: bool,
+}
+
+#[derive(Clone)]
+pub struct ProcessLogSenders {
+    dashboard: SyncSender<LogEvent>,
+    system: Sender<LogEvent>,
+    durable: Sender<LogEvent>,
+    ui: bool,
+}
+
+impl ProcessLogSenders {
+    pub fn new(
+        dashboard: SyncSender<LogEvent>,
+        system: Sender<LogEvent>,
+        durable: Sender<LogEvent>,
+        ui: bool,
+    ) -> Self {
+        Self {
+            dashboard,
+            system,
+            durable,
+            ui,
+        }
+    }
 }
 
 pub struct ServiceProcess {
@@ -40,9 +64,7 @@ impl ServiceProcess {
         target: &Target,
         project_root: &std::path::Path,
         env: &HashMap<String, String>,
-        log_tx: &SyncSender<LogEvent>,
-        system_tx: &Sender<LogEvent>,
-        ui: bool,
+        log_senders: ProcessLogSenders,
     ) -> Result<Self> {
         let parsed = parse_command(&target.command)?;
         let working_dir = target.working_dir.as_deref().unwrap_or(project_root);
@@ -104,20 +126,10 @@ impl ServiceProcess {
             service,
             false,
             stdout,
-            log_tx.clone(),
-            system_tx.clone(),
+            log_senders.clone(),
             reader_stop.clone(),
-            ui,
         );
-        let stderr_handle = spawn_reader(
-            service,
-            true,
-            stderr,
-            log_tx.clone(),
-            system_tx.clone(),
-            reader_stop.clone(),
-            ui,
-        );
+        let stderr_handle = spawn_reader(service, true, stderr, log_senders, reader_stop.clone());
 
         Ok(Self {
             #[cfg(unix)]
@@ -454,10 +466,8 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     service: &str,
     stderr: bool,
     reader: R,
-    tx: SyncSender<LogEvent>,
-    system_tx: Sender<LogEvent>,
+    senders: ProcessLogSenders,
     stop: Arc<AtomicBool>,
-    ui: bool,
 ) -> JoinHandle<()> {
     let service = service.to_string();
     std::thread::spawn(move || {
@@ -480,15 +490,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
             };
             if read == 0 {
                 if !pending.is_empty() {
-                    forward_log_line(
-                        &service,
-                        stderr,
-                        &pending,
-                        &tx,
-                        &system_tx,
-                        ui,
-                        &mut drop_reported,
-                    );
+                    forward_log_line(&service, stderr, &pending, &senders, &mut drop_reported);
                 }
                 break;
             }
@@ -498,29 +500,13 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 while matches!(line.last(), Some(b'\n' | b'\r')) {
                     line.pop();
                 }
-                forward_log_line(
-                    &service,
-                    stderr,
-                    &line,
-                    &tx,
-                    &system_tx,
-                    ui,
-                    &mut drop_reported,
-                );
+                forward_log_line(&service, stderr, &line, &senders, &mut drop_reported);
             }
             const MAX_PENDING_LINE: usize = 64 * 1024;
             while pending.len() >= MAX_PENDING_LINE {
                 let mut bounded = pending.drain(..MAX_PENDING_LINE).collect::<Vec<_>>();
                 bounded.extend_from_slice(b" [aster: long line continued]");
-                forward_log_line(
-                    &service,
-                    stderr,
-                    &bounded,
-                    &tx,
-                    &system_tx,
-                    ui,
-                    &mut drop_reported,
-                );
+                forward_log_line(&service, stderr, &bounded, &senders, &mut drop_reported);
             }
         }
     })
@@ -530,27 +516,26 @@ fn forward_log_line(
     service: &str,
     stderr: bool,
     bytes: &[u8],
-    tx: &SyncSender<LogEvent>,
-    system_tx: &Sender<LogEvent>,
-    ui: bool,
+    senders: &ProcessLogSenders,
     drop_reported: &mut bool,
 ) {
     let line = String::from_utf8_lossy(bytes).into_owned();
-    if !ui {
-        let stream = if stderr { "!" } else { "|" };
-        println!("[{service}] {stream} {line}");
-        return;
-    }
     let event = LogEvent {
         service: service.to_string(),
         line,
         stderr,
     };
-    match tx.try_send(event) {
+    let _ = senders.durable.send(event.clone());
+    if !senders.ui {
+        let stream = if stderr { "!" } else { "|" };
+        println!("[{service}] {stream} {}", event.line);
+        return;
+    }
+    match senders.dashboard.try_send(event) {
         Ok(()) => *drop_reported = false,
         Err(std::sync::mpsc::TrySendError::Full(_)) => {
             if !*drop_reported {
-                let _ = system_tx.send(LogEvent {
+                let _ = senders.system.send(LogEvent {
                     service: service.to_string(),
                     line: "[aster] service output omitted while the UI was busy".to_string(),
                     stderr: true,

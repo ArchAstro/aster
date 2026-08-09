@@ -228,7 +228,7 @@ command = "sh -c 'count=$(grep -c PREPARE ../events.log 2>/dev/null || true); ec
 depends_on = ["//lib:build"]
 
 [targets.dev]
-command = "sh -c 'if [ -n \"${ASTER_AMBIENT_SECRET:-}\" ]; then echo AMBIENT_SECRET_LEAKED >> ../events.log; fi; echo INHERITED:$ASTER_ALLOWED_VALUE >> ../events.log; echo START:$ASTER_SERVICE_PORT >> ../events.log; python3 -m http.server {port} & server=$!; echo $server > ../child.pid; wait $server'"
+command = "sh -c 'echo SERVICE_STDOUT; echo SERVICE_STDERR >&2; if [ -n \"${ASTER_AMBIENT_SECRET:-}\" ]; then echo AMBIENT_SECRET_LEAKED >> ../events.log; fi; echo INHERITED:$ASTER_ALLOWED_VALUE >> ../events.log; echo START:$ASTER_SERVICE_PORT >> ../events.log; python3 -m http.server {port} & server=$!; echo $server > ../child.pid; wait $server'"
 depends_on = ["//self:prepare"]
 stream = true
 "#,
@@ -277,6 +277,15 @@ command = "sh -c 'echo BUILD >> ../events.log'"
     assert!(fs::read_to_string(&events)
         .unwrap()
         .contains("INHERITED:explicitly-allowed"));
+    let worktree = root.file_name().unwrap();
+    let durable_log = root.join(".aster/logs").join(worktree).join("web/logs.txt");
+    wait_until(Duration::from_secs(5), || {
+        let contents = fs::read_to_string(&durable_log).unwrap_or_default();
+        contents.contains("SERVICE_STDOUT")
+            && contents.contains("SERVICE_STDERR")
+            && contents.contains("starting //app:dev")
+    });
+    assert!(fs::metadata(&durable_log).unwrap().len() <= 10 * 1024 * 1024);
     let status = control_request(control_port, r#"{"command":"status"}"#);
     assert_eq!(status["ok"], true);
     assert_eq!(status["services"]["web"], "running");
