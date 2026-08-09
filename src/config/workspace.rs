@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::project::{validate_aster_config, TargetConfig};
@@ -52,6 +52,33 @@ pub struct DevWorkspaceConfig {
     /// Named service-to-target mappings.
     #[serde(default)]
     pub services: HashMap<String, DevServiceConfig>,
+
+    /// Named groups of services selected by `aster services up <group>`.
+    #[serde(default)]
+    pub service_groups: HashMap<String, Vec<String>>,
+}
+
+impl DevWorkspaceConfig {
+    pub(crate) fn validate_service_groups(&self) -> Result<()> {
+        for (group, services) in &self.service_groups {
+            if group.trim().is_empty() {
+                bail!("service group names cannot be empty");
+            }
+            if services.is_empty() {
+                bail!("service group '{group}' must contain at least one service");
+            }
+            let mut seen = HashSet::new();
+            for service in services {
+                if !self.services.contains_key(service) {
+                    bail!("service group '{group}' references unknown service '{service}'");
+                }
+                if !seen.insert(service) {
+                    bail!("service group '{group}' contains duplicate service '{service}'");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A named port used by one or more development services.
@@ -186,6 +213,10 @@ impl WorkspaceConfig {
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         validate_aster_config(&config.depends_on, &config.targets, &config_path)?;
+        config
+            .dev
+            .validate_service_groups()
+            .with_context(|| format!("Invalid service groups in {}", config_path.display()))?;
 
         Ok(config)
     }
@@ -242,6 +273,9 @@ mod tests {
 port_env_files = [".env"]
 control_port = "api"
 
+[dev.service_groups]
+frontend = ["api"]
+
 [dev.ports.api]
 env = "API_PORT"
 file_env = "PORT"
@@ -267,6 +301,7 @@ order = 10
 
         let config = WorkspaceConfig::load(temp.path()).unwrap();
         assert_eq!(config.dev.services["api"].target, "//api:dev");
+        assert_eq!(config.dev.service_groups["frontend"], ["api"]);
         assert_eq!(
             config.dev.services["api"].open_path.as_deref(),
             Some("/health")
@@ -285,6 +320,29 @@ order = 10
         };
         assert_eq!(web.offset_from.as_deref(), Some("api"));
         assert_eq!(web.offset_base, Some(4000));
+    }
+
+    #[test]
+    fn rejects_invalid_service_groups() {
+        for (configuration, expected) in [
+            (
+                "[dev.service_groups]\nintern = [\"missing\"]\n",
+                "references unknown service 'missing'",
+            ),
+            (
+                "[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\nintern = [\"api\", \"api\"]\n",
+                "contains duplicate service 'api'",
+            ),
+            (
+                "[dev.service_groups]\nintern = []\n",
+                "must contain at least one service",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            fs::write(temp.path().join("aster.toml"), configuration).unwrap();
+            let error = WorkspaceConfig::load(temp.path()).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

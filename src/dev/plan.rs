@@ -32,7 +32,7 @@ pub struct ServicePlan {
 pub fn resolve_dev_plan(
     workspace_root: &Path,
     config: &DevWorkspaceConfig,
-    selected: &[String],
+    group: Option<&str>,
     projects: &[DiscoveredProject],
     graph: &TargetGraph,
     plugins: &PluginRegistry,
@@ -52,13 +52,7 @@ pub fn resolve_dev_plan(
                 .ok_or_else(|| anyhow!("control_port references unknown service port '{name}'"))
         })
         .transpose()?;
-    let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
-
-    for name in &selected {
-        if !config.services.contains_key(*name) {
-            bail!("unknown service '{name}'");
-        }
-    }
+    let selected = select_service_names(config, group)?;
 
     let project_by_address: HashMap<String, &DiscoveredProject> = projects
         .iter()
@@ -70,7 +64,7 @@ pub fn resolve_dev_plan(
 
     let mut services = Vec::new();
     for (name, service) in configured {
-        if !selected.is_empty() && !selected.contains(name.as_str()) {
+        if !selected.contains(name.as_str()) {
             continue;
         }
 
@@ -161,7 +155,10 @@ pub fn resolve_dev_plan(
     }
 
     if services.is_empty() {
-        bail!("no services selected");
+        match group {
+            Some(group) => bail!("service group '{group}' has no services"),
+            None => bail!("no services configured for the default run"),
+        }
     }
 
     Ok(DevPlan {
@@ -169,6 +166,49 @@ pub fn resolve_dev_plan(
         ports,
         control_port,
     })
+}
+
+fn select_service_names<'a>(
+    config: &'a DevWorkspaceConfig,
+    group: Option<&str>,
+) -> Result<HashSet<&'a str>> {
+    config.validate_service_groups()?;
+    if let Some(group) = group {
+        let services = config.service_groups.get(group).ok_or_else(|| {
+            let mut known = config
+                .service_groups
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            known.sort_unstable();
+            if known.is_empty() {
+                anyhow!("unknown service group '{group}'; no service groups are configured")
+            } else {
+                anyhow!(
+                    "unknown service group '{group}'; configured groups: {}",
+                    known.join(", ")
+                )
+            }
+        })?;
+        return Ok(services.iter().map(String::as_str).collect());
+    }
+
+    let grouped = config
+        .service_groups
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut selected = config
+        .services
+        .keys()
+        .map(String::as_str)
+        .filter(|service| !grouped.contains(service))
+        .collect::<HashSet<_>>();
+    if let Some(main) = config.service_groups.get("main") {
+        selected.extend(main.iter().map(String::as_str));
+    }
+    Ok(selected)
 }
 
 /// Resolve the named development ports without requiring service targets.
@@ -368,7 +408,80 @@ fn expand_template(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ResolvedDevPortConfig;
+    use crate::config::{DevServiceConfig, ResolvedDevPortConfig};
+
+    fn service(target: &str) -> DevServiceConfig {
+        DevServiceConfig {
+            target: target.to_string(),
+            port: None,
+            open_path: None,
+            env_files: Vec::new(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+            order: 0,
+        }
+    }
+
+    #[test]
+    fn service_groups_select_grouped_or_ungrouped_services() {
+        let config = DevWorkspaceConfig {
+            services: HashMap::from([
+                ("platform".to_string(), service("//platform:dev")),
+                ("metrics".to_string(), service("//metrics:dev")),
+                ("intern-data".to_string(), service("//intern-data:dev")),
+                ("intern-fe".to_string(), service("//intern-fe:dev")),
+            ]),
+            service_groups: HashMap::from([
+                ("main".to_string(), vec!["platform".to_string()]),
+                (
+                    "intern".to_string(),
+                    vec!["intern-data".to_string(), "intern-fe".to_string()],
+                ),
+            ]),
+            ..DevWorkspaceConfig::default()
+        };
+
+        assert_eq!(
+            select_service_names(&config, None).unwrap(),
+            HashSet::from(["platform", "metrics"])
+        );
+        assert_eq!(
+            select_service_names(&config, Some("intern")).unwrap(),
+            HashSet::from(["intern-data", "intern-fe"])
+        );
+        assert_eq!(
+            select_service_names(&config, Some("main")).unwrap(),
+            HashSet::from(["platform"])
+        );
+        let error = select_service_names(&config, Some("missing")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("configured groups: intern, main"));
+    }
+
+    #[test]
+    fn services_can_belong_to_multiple_groups() {
+        let config = DevWorkspaceConfig {
+            services: HashMap::from([
+                ("shared".to_string(), service("//shared:dev")),
+                ("one".to_string(), service("//one:dev")),
+            ]),
+            service_groups: HashMap::from([
+                ("small".to_string(), vec!["shared".to_string()]),
+                (
+                    "full".to_string(),
+                    vec!["shared".to_string(), "one".to_string()],
+                ),
+            ]),
+            ..DevWorkspaceConfig::default()
+        };
+
+        assert!(select_service_names(&config, None).unwrap().is_empty());
+        assert_eq!(
+            select_service_names(&config, Some("small")).unwrap(),
+            HashSet::from(["shared"])
+        );
+    }
 
     #[test]
     fn resolves_offset_ports_and_templates() {

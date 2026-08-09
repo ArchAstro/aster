@@ -259,8 +259,8 @@ pub enum Commands {
 pub enum ServicesCommands {
     /// Start configured services in a supervised dashboard
     Up {
-        /// Service names from `[dev.services]` (defaults to all services)
-        services: Vec<String>,
+        /// Optional group from `[dev.service_groups]`; defaults to ungrouped services
+        group: Option<String>,
 
         /// Disable dependency-aware file watching and automatic restarts
         #[arg(long)]
@@ -320,4 +320,32 @@ pub enum ProjectCommands {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn services_up_accepts_zero_or_one_group() {
+        let cli = Cli::try_parse_from(["aster", "services", "up"]).unwrap();
+        let Commands::Services {
+            command: ServicesCommands::Up { group, .. },
+        } = cli.command
+        else {
+            panic!("expected services up command");
+        };
+        assert_eq!(group, None);
+
+        let cli = Cli::try_parse_from(["aster", "services", "up", "intern"]).unwrap();
+        let Commands::Services {
+            command: ServicesCommands::Up { group, .. },
+        } = cli.command
+        else {
+            panic!("expected services up command");
+        };
+        assert_eq!(group.as_deref(), Some("intern"));
+
+        assert!(Cli::try_parse_from(["aster", "services", "up", "one", "two"]).is_err());
+    }
 }

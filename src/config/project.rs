@@ -223,6 +223,10 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
         toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
     validate_aster_config(&config.depends_on, &config.targets, path)?;
+    config
+        .dev
+        .validate_service_groups()
+        .with_context(|| format!("Invalid service groups in {}", path.display()))?;
 
     Ok(config)
 }
