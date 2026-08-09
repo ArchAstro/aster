@@ -79,6 +79,15 @@ fn run() -> Result<()> {
         "Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.",
     )?;
 
+    // Reading existing logs does not require project discovery or graph validation.
+    if let Commands::Services {
+        command: ServicesCommands::Logs { service },
+    } = &cli.command
+    {
+        let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+        return aster::dev::show_service_logs(&workspace_root, &workspace_config.dev, service);
+    }
+
     if output_mode == OutputMode::Verbose {
         eprintln!("[aster] Workspace root: {}", workspace_root.display());
     }
@@ -991,6 +1000,7 @@ fn run() -> Result<()> {
                 let selected = aster::dev::resolve_port_selection(&configured, &ports)?;
                 aster::dev::kill_ports(&selected, aster::dev::KillPortsOptions { dry_run })?;
             }
+            ServicesCommands::Logs { .. } => unreachable!("service logs handled before discovery"),
         },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
             // Parse external subcommand args

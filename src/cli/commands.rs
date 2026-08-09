@@ -275,6 +275,12 @@ pub enum ServicesCommands {
         dry_run: bool,
     },
 
+    /// Read the durable log for a configured service
+    Logs {
+        /// Service name from `[dev.services]`
+        service: String,
+    },
+
     /// Terminate processes listening on configured or specified ports
     KillPorts {
         /// Port numbers or names from `[dev.ports]` (defaults to all configured ports)
@@ -347,5 +353,20 @@ mod tests {
         assert_eq!(group.as_deref(), Some("intern"));
 
         assert!(Cli::try_parse_from(["aster", "services", "up", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn services_logs_requires_exactly_one_service() {
+        let cli = Cli::try_parse_from(["aster", "services", "logs", "api"]).unwrap();
+        let Commands::Services {
+            command: ServicesCommands::Logs { service },
+        } = cli.command
+        else {
+            panic!("expected services logs command");
+        };
+        assert_eq!(service, "api");
+
+        assert!(Cli::try_parse_from(["aster", "services", "logs"]).is_err());
+        assert!(Cli::try_parse_from(["aster", "services", "logs", "api", "web"]).is_err());
     }
 }
