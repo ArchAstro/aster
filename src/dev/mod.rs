@@ -1,6 +1,7 @@
 //! Config-driven local service supervision for `aster services up`.
 
 mod dashboard;
+mod log_files;
 mod plan;
 mod port_cleanup;
 mod process;

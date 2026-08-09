@@ -310,6 +310,11 @@ aster services up --no-ui
 aster services up --dry-run
 ```
 
+Service stdout, stderr, and Aster lifecycle messages are also persisted to
+`.aster/logs/<worktree>/<service>/logs.txt` in the workspace. Each service log
+is capped at 10 MiB; Aster truncates it and continues writing when it reaches
+the limit.
+
 Clear stale or orphaned processes from development ports before starting the
 stack again:
 

@@ -18,8 +18,9 @@ use crate::graph::TargetGraph;
 use crate::watch::WorkspaceIgnore;
 
 use super::dashboard::{Dashboard, DashboardAction, ServiceState, TerminalGuard};
+use super::log_files::ServiceLogFiles;
 use super::plan::{DevPlan, ServicePlan};
-use super::process::{LogEvent, ServiceProcess};
+use super::process::{LogEvent, ProcessLogSenders, ServiceProcess};
 
 pub struct DevOptions {
     pub watch: bool,
@@ -60,6 +61,13 @@ pub fn run_dev(
     let ignore = WorkspaceIgnore::build(&config.watch)?;
     let (log_tx, log_rx) = mpsc::sync_channel(4000);
     let (system_tx, system_rx) = mpsc::channel();
+    let (durable_log_tx, durable_log_rx) = mpsc::channel();
+    let mut durable_logs = ServiceLogFiles::open(workspace_root, &plan.services)?;
+    let durable_log_handle = std::thread::spawn(move || {
+        while let Ok(event) = durable_log_rx.recv() {
+            durable_logs.write(&event);
+        }
+    });
     let control = plan.control_port.map(ControlServer::start).transpose()?;
     let (watch_rx, _watcher) = if options.watch {
         let (rx, watcher) = start_watcher(&plan)?;
@@ -101,7 +109,13 @@ pub fn run_dev(
                 .as_ref()
                 .is_some_and(|control| control.shutdown.load(Ordering::SeqCst))
         {
-            needs_draw |= drain_logs(&log_rx, &system_rx, &mut dashboard, options.ui);
+            needs_draw |= drain_logs(
+                &log_rx,
+                &system_rx,
+                &durable_log_tx,
+                &mut dashboard,
+                options.ui,
+            );
 
             while let Ok(result) = start_rx.try_recv() {
                 if let Some((name, handle)) = active_start.take() {
@@ -139,6 +153,7 @@ pub fn run_dev(
                         options.ui,
                         &log_tx,
                         &system_tx,
+                        &durable_log_tx,
                         &mut dashboard,
                         runtimes.get_mut(&name).expect("runtime exists"),
                         &reason,
@@ -416,7 +431,9 @@ pub fn run_dev(
     for process in &mut shutdown_processes {
         process.finish_terminate(shutdown_deadline);
     }
-    drain_logs(&log_rx, &system_rx, &mut dashboard, false);
+    drain_logs(&log_rx, &system_rx, &durable_log_tx, &mut dashboard, false);
+    drop(durable_log_tx);
+    let _ = durable_log_handle.join();
     drop(control);
     if let Some(signal) = executor::shutdown_signal() {
         std::process::exit(128 + signal);
@@ -435,6 +452,7 @@ fn begin_start_service(
     ui: bool,
     log_tx: &std::sync::mpsc::SyncSender<LogEvent>,
     system_tx: &std::sync::mpsc::Sender<LogEvent>,
+    durable_log_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
     runtime: &mut Runtime,
     reason: &str,
@@ -478,6 +496,7 @@ fn begin_start_service(
     let workspace_root = workspace_root.to_path_buf();
     let log_tx = log_tx.clone();
     let system_tx = system_tx.clone();
+    let durable_log_tx = durable_log_tx.clone();
     std::thread::spawn(move || {
         let prerequisite_run =
             run_prerequisites(&prerequisites, &workspace_root, &projects, use_cache);
@@ -528,9 +547,7 @@ fn begin_start_service(
             &target,
             &project_root,
             &env,
-            &log_tx,
-            &system_tx,
-            ui,
+            ProcessLogSenders::new(log_tx, system_tx.clone(), durable_log_tx, ui),
         ) {
             Ok(process) => StartOutcome::Running(process),
             Err(error) => {
@@ -711,19 +728,23 @@ fn is_meaningful_event(kind: &notify::EventKind) -> bool {
 fn drain_logs(
     process_rx: &Receiver<LogEvent>,
     system_rx: &Receiver<LogEvent>,
+    durable_log_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
     ui: bool,
 ) -> bool {
     let mut consumed = false;
-    for rx in [system_rx, process_rx] {
-        while let Ok(event) = rx.try_recv() {
-            consumed = true;
-            if !ui {
-                let stream = if event.stderr { "!" } else { "|" };
-                println!("[{}] {stream} {}", event.service, event.line);
-            }
-            dashboard.push_log(event);
+    while let Ok(event) = system_rx.try_recv() {
+        consumed = true;
+        let _ = durable_log_tx.send(event.clone());
+        if !ui {
+            let stream = if event.stderr { "!" } else { "|" };
+            println!("[{}] {stream} {}", event.service, event.line);
         }
+        dashboard.push_log(event);
+    }
+    while let Ok(event) = process_rx.try_recv() {
+        consumed = true;
+        dashboard.push_log(event);
     }
     consumed
 }
