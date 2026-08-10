@@ -10,6 +10,7 @@ use super::output::OutputMode;
 #[derive(Parser)]
 #[command(name = "aster")]
 #[command(version, about, long_about = None)]
+#[command(arg_required_else_help = true)]
 #[command(after_help = r#"RUNNING TARGETS:
   Run any target (test, build, lint, etc.) on your projects:
 
@@ -52,7 +53,11 @@ HETEROGENEOUS RUNS:
     aster run //a:test //b:test --no-deps   # Run without unlisted dependencies"#)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
+
+    /// Print a Markdown guide for using Aster, including examples for LLMs
+    #[arg(long, global = true, exclusive = true)]
+    pub skills: bool,
 
     /// Enable verbose output
     #[arg(short, long, global = true, conflicts_with = "quiet")]
@@ -337,7 +342,7 @@ mod tests {
         let cli = Cli::try_parse_from(["aster", "services", "up"]).unwrap();
         let Commands::Services {
             command: ServicesCommands::Up { group, .. },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected services up command");
         };
@@ -346,7 +351,7 @@ mod tests {
         let cli = Cli::try_parse_from(["aster", "services", "up", "intern"]).unwrap();
         let Commands::Services {
             command: ServicesCommands::Up { group, .. },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected services up command");
         };
@@ -360,7 +365,7 @@ mod tests {
         let cli = Cli::try_parse_from(["aster", "services", "logs", "api"]).unwrap();
         let Commands::Services {
             command: ServicesCommands::Logs { service },
-        } = cli.command
+        } = cli.command.unwrap()
         else {
             panic!("expected services logs command");
         };
@@ -368,5 +373,14 @@ mod tests {
 
         assert!(Cli::try_parse_from(["aster", "services", "logs"]).is_err());
         assert!(Cli::try_parse_from(["aster", "services", "logs", "api", "web"]).is_err());
+    }
+
+    #[test]
+    fn skills_is_available_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["aster", "--skills"]).unwrap();
+        assert!(cli.skills);
+        assert!(cli.command.is_none());
+
+        assert!(Cli::try_parse_from(["aster"]).is_err());
     }
 }

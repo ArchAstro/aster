@@ -156,6 +156,9 @@ aster why //services/api:test //libs/core:build
 ```
 
 Use `aster --help` and `aster <command> --help` for the complete CLI reference.
+`aster --skills` prints a workspace-independent Markdown usage guide covering
+project selection, common targets, affected runs, watching, services, logs,
+caching, and configuration. It is suitable for supplying directly to an LLM.
 
 ## Supported languages
 
