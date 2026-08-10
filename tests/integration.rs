@@ -485,6 +485,26 @@ fn test_not_in_workspace() {
     );
 }
 
+#[test]
+fn skills_prints_markdown_without_a_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("--skills")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "Command failed: {output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("# Using Aster\n"));
+    assert!(stdout.contains("aster lint --all"));
+    assert!(stdout.contains("aster test --all"));
+    assert!(stdout.contains("aster services up"));
+    assert!(stdout.contains("aster services logs api | grep ERROR"));
+    assert!(stdout.contains("It does not define policy"));
+}
+
 // ============================================================================
 // Phase 2 Integration Tests: Language Plugins
 // ============================================================================

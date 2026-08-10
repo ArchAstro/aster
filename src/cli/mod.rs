@@ -5,6 +5,7 @@
 pub mod commands;
 pub mod output;
 pub mod run;
+mod skills;
 
 pub use commands::{CacheCommands, Cli, Commands, ProjectCommands, ServicesCommands};
 pub use output::{
@@ -12,3 +13,4 @@ pub use output::{
     GraphOutput, OutputMode, ProjectInfo, TargetResult, WhyOutput,
 };
 pub use run::{check_reserved_target, expand_selection, parse_run_args, select_projects, RunArgs};
+pub use skills::SKILLS_MARKDOWN;

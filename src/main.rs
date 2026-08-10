@@ -7,12 +7,13 @@ use clap::Parser;
 use console::style;
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, ServicesCommands, WhyOutput,
+    ProjectInfo, ServicesCommands, WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -49,13 +50,20 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.skills {
+        return print_skills();
+    }
+    let command = cli
+        .command
+        .take()
+        .expect("clap requires either --skills or a subcommand");
     let output_mode = cli.output_mode();
     let full_logs = cli.full_logs();
 
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
     // Handle init command specially - it works even without an existing workspace
-    if matches!(cli.command, Commands::Init) {
+    if matches!(command, Commands::Init) {
         return handle_init(&cwd, cli.verbose);
     }
 
@@ -63,7 +71,7 @@ fn run() -> Result<()> {
     // Named/default selection still loads the workspace configuration below.
     if let Commands::Services {
         command: ServicesCommands::KillPorts { ports, dry_run },
-    } = &cli.command
+    } = &command
     {
         if !ports.is_empty() && ports.iter().all(|port| port.parse::<u16>().is_ok()) {
             let selected = aster::dev::resolve_port_selection(&HashMap::new(), ports)?;
@@ -82,7 +90,7 @@ fn run() -> Result<()> {
     // Reading existing logs does not require project discovery or graph validation.
     if let Commands::Services {
         command: ServicesCommands::Logs { service },
-    } = &cli.command
+    } = &command
     {
         let workspace_config = WorkspaceConfig::load(&workspace_root)?;
         return aster::dev::show_service_logs(&workspace_root, &workspace_config.dev, service);
@@ -103,8 +111,8 @@ fn run() -> Result<()> {
         eprintln!("[aster] Discovered {} projects", projects.len());
     }
 
-    let explicit_target = matches!(&cli.command, Commands::RunTarget { .. });
-    match cli.command {
+    let explicit_target = matches!(&command, Commands::RunTarget { .. });
+    match command {
         Commands::Init => unreachable!("Init handled above"),
         Commands::List { path, lang } => {
             validate_lang_filter(&lang)?;
@@ -1195,6 +1203,14 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_skills() -> Result<()> {
+    match io::stdout().lock().write_all(SKILLS_MARKDOWN.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("Failed to write the Aster skills guide"),
+    }
 }
 
 /// Print summary for heterogeneous execution
