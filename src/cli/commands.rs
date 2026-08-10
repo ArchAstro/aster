@@ -295,6 +295,27 @@ pub enum ServicesCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Generate certificates or run a configured local HTTPS edge
+    Tls {
+        #[command(subcommand)]
+        command: TlsCommands,
+    },
+}
+
+/// Local TLS edge commands.
+#[derive(Subcommand)]
+pub enum TlsCommands {
+    /// Trust mkcert's local CA and generate the configured certificate
+    Setup {
+        /// Name from `[dev.services.<name>]`
+        edge: String,
+    },
+    /// Serve the configured HTTPS edge until interrupted
+    Serve {
+        /// Name from `[dev.services.<name>]`
+        edge: String,
+    },
 }
 
 /// Cache subcommands

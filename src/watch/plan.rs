@@ -36,6 +36,16 @@ pub struct WatchPlan {
 }
 
 impl WatchPlan {
+    pub fn empty() -> Self {
+        Self {
+            requested: HashSet::new(),
+            watched: HashSet::new(),
+            targets: Vec::new(),
+            watch_roots: Vec::new(),
+            project_by_root: Vec::new(),
+        }
+    }
+
     pub fn build(
         requested: &[String],
         projects: &[DiscoveredProject],

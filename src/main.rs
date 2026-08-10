@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, ServicesCommands, WhyOutput, SKILLS_MARKDOWN,
+    ProjectInfo, ServicesCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -94,6 +94,24 @@ fn run() -> Result<()> {
     {
         let workspace_config = WorkspaceConfig::load(&workspace_root)?;
         return aster::dev::show_service_logs(&workspace_root, &workspace_config.dev, service);
+    }
+
+    // TLS setup and serving only need workspace service configuration. Handling
+    // them before discovery lets a supervised TLS target remain independent of
+    // the repository's project graph.
+    if let Commands::Services {
+        command: ServicesCommands::Tls { command },
+    } = &command
+    {
+        let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+        return match command {
+            TlsCommands::Setup { edge } => {
+                aster::dev::setup_tls(&workspace_root, &workspace_config.dev, edge)
+            }
+            TlsCommands::Serve { edge } => {
+                aster::dev::serve_tls(&workspace_root, &workspace_config.dev, edge)
+            }
+        };
     }
 
     if output_mode == OutputMode::Verbose {
@@ -1009,6 +1027,7 @@ fn run() -> Result<()> {
                 aster::dev::kill_ports(&selected, aster::dev::KillPortsOptions { dry_run })?;
             }
             ServicesCommands::Logs { .. } => unreachable!("service logs handled before discovery"),
+            ServicesCommands::Tls { .. } => unreachable!("TLS commands handled before discovery"),
         },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
             // Parse external subcommand args

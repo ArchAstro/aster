@@ -770,8 +770,14 @@ fn print_plan(plan: &DevPlan) {
             .map(|port| format!(" :{port}"))
             .unwrap_or_default();
         eprintln!(
-            "[services]   {}{port} -> {}",
-            service.name, service.target_address
+            "[services]   {}{port} -> {}{}",
+            service.name,
+            service.target_address,
+            service
+                .open_url
+                .as_ref()
+                .map(|url| format!(" [open {url}]"))
+                .unwrap_or_default()
         );
     }
     if let Some(port) = plan.control_port {

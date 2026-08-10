@@ -59,7 +59,7 @@ pub struct DevWorkspaceConfig {
 }
 
 impl DevWorkspaceConfig {
-    pub(crate) fn validate_service_groups(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for (group, group_config) in &self.service_groups {
             if group.trim().is_empty() {
                 bail!("service group names cannot be empty");
@@ -85,8 +85,131 @@ impl DevWorkspaceConfig {
                 }
             }
         }
+        for (name, service) in &self.services {
+            match (&service.target, &service.tls_proxy) {
+                (Some(_), None) => {}
+                (None, Some(tls)) => self.validate_tls_proxy(name, service, tls)?,
+                (Some(_), Some(_)) => {
+                    bail!("service '{name}' must configure exactly one of target or tls_proxy")
+                }
+                (None, None) => {
+                    bail!("service '{name}' must configure exactly one of target or tls_proxy")
+                }
+            }
+        }
         Ok(())
     }
+
+    fn validate_tls_proxy(
+        &self,
+        name: &str,
+        service: &DevServiceConfig,
+        tls: &DevTlsProxyConfig,
+    ) -> Result<()> {
+        let port = service
+            .port
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("TLS proxy service '{name}' requires a port"))?;
+        if !self.ports.contains_key(port) {
+            bail!("TLS proxy service '{name}' references unknown port '{port}'");
+        }
+        if tls.certificate_hosts.is_empty() {
+            bail!("TLS proxy service '{name}' must contain at least one certificate host");
+        }
+        if tls.routes.is_empty() {
+            bail!("TLS proxy service '{name}' must contain at least one route");
+        }
+        for hostname in &tls.certificate_hosts {
+            validate_tls_hostname(name, "certificate", hostname)?;
+        }
+        validate_tls_hostname(name, "open_host", &tls.open_host)?;
+        if !tls
+            .certificate_hosts
+            .iter()
+            .any(|host| host == &tls.open_host)
+        {
+            bail!(
+                "TLS proxy service '{name}' open_host '{}' must be an exact certificate host",
+                tls.open_host
+            );
+        }
+        if let Some(domain) = &tls.dns_domain {
+            validate_tls_hostname(name, "DNS", domain)?;
+        }
+        for route in &tls.routes {
+            match (&route.host, &route.host_suffix) {
+                (Some(host), None) => {
+                    validate_tls_hostname(name, "route", host)?;
+                    if !tls_certificate_covers(tls, host) {
+                        bail!("TLS proxy service '{name}' route host '{host}' is not covered by certificate_hosts");
+                    }
+                }
+                (None, Some(suffix)) if suffix.starts_with('.') => {
+                    validate_tls_hostname(name, "route suffix", &suffix[1..])?
+                }
+                (None, Some(suffix)) => bail!(
+                    "TLS proxy service '{name}' route suffix '{suffix}' must start with '.'"
+                ),
+                _ => bail!(
+                    "TLS proxy service '{name}' routes must configure exactly one of host or host_suffix"
+                ),
+            }
+            if let Some(open_host) = &route.open_host {
+                validate_tls_hostname(name, "route open_host", open_host)?;
+                let accepted = route
+                    .host
+                    .as_ref()
+                    .is_some_and(|host| host.eq_ignore_ascii_case(open_host))
+                    || route.host_suffix.as_ref().is_some_and(|suffix| {
+                        open_host
+                            .to_ascii_lowercase()
+                            .ends_with(&suffix.to_ascii_lowercase())
+                            && open_host.len() > suffix.len()
+                    });
+                if !accepted {
+                    bail!("TLS proxy service '{name}' route open_host '{open_host}' does not match its host selector");
+                }
+                if !tls_certificate_covers(tls, open_host) {
+                    bail!("TLS proxy service '{name}' route open_host '{open_host}' is not covered by certificate_hosts");
+                }
+            }
+            if !self.ports.contains_key(&route.upstream_port) {
+                bail!(
+                    "TLS proxy service '{name}' route references unknown upstream port '{}'",
+                    route.upstream_port
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn tls_certificate_covers(tls: &DevTlsProxyConfig, hostname: &str) -> bool {
+    let hostname = hostname.to_ascii_lowercase();
+    tls.certificate_hosts.iter().any(|certificate_host| {
+        let certificate_host = certificate_host.to_ascii_lowercase();
+        if let Some(suffix) = certificate_host.strip_prefix("*.") {
+            hostname.strip_suffix(suffix).is_some_and(|prefix| {
+                prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+            })
+        } else {
+            hostname == certificate_host
+        }
+    })
+}
+
+fn validate_tls_hostname(edge: &str, kind: &str, hostname: &str) -> Result<()> {
+    let value = hostname.strip_prefix("*.").unwrap_or(hostname);
+    if value.is_empty()
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        bail!("TLS edge '{edge}' has invalid {kind} hostname '{hostname}'");
+    }
+    Ok(())
 }
 
 /// A named set of services, optionally with its own control socket port.
@@ -161,8 +284,10 @@ pub struct ResolvedDevPortConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevServiceConfig {
-    /// Address of a `stream = true` target.
-    pub target: String,
+    /// Address of a `stream = true` target. Mutually exclusive with `tls_proxy`.
+    pub target: Option<String>,
+    /// Built-in loopback TLS reverse proxy. Mutually exclusive with `target`.
+    pub tls_proxy: Option<DevTlsProxyConfig>,
     /// Named port from `[dev.ports]`.
     pub port: Option<String>,
     /// Optional browser path appended to `http://localhost:<port>`.
@@ -179,6 +304,32 @@ pub struct DevServiceConfig {
     /// Stable startup/display order. Ties are sorted by service name.
     #[serde(default)]
     pub order: i32,
+}
+
+/// Built-in local HTTPS service configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevTlsProxyConfig {
+    /// Exact and wildcard certificate SANs passed to mkcert.
+    pub certificate_hosts: Vec<String>,
+    /// Exact hostname used by Aster's browser-open URL.
+    pub open_host: String,
+    /// Optional suffix whose local resolution must point to 127.0.0.1.
+    pub dns_domain: Option<String>,
+    /// Host routing rules to named Aster ports.
+    pub routes: Vec<DevTlsRouteConfig>,
+}
+
+/// One TLS hostname selector and its loopback upstream.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevTlsRouteConfig {
+    pub host: Option<String>,
+    pub host_suffix: Option<String>,
+    /// Concrete public hostname used to open this upstream service. Exact
+    /// routes default to `host`; suffix routes without this publish no open URL.
+    pub open_host: Option<String>,
+    pub upstream_port: String,
 }
 
 fn deserialize_one_or_many<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
@@ -257,10 +408,9 @@ impl WorkspaceConfig {
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         validate_aster_config(&config.depends_on, &config.targets, &config_path)?;
-        config
-            .dev
-            .validate_service_groups()
-            .with_context(|| format!("Invalid service groups in {}", config_path.display()))?;
+        config.dev.validate().with_context(|| {
+            format!("Invalid development services in {}", config_path.display())
+        })?;
 
         Ok(config)
     }
@@ -345,7 +495,10 @@ order = 10
         .unwrap();
 
         let config = WorkspaceConfig::load(temp.path()).unwrap();
-        assert_eq!(config.dev.services["api"].target, "//api:dev");
+        assert_eq!(
+            config.dev.services["api"].target.as_deref(),
+            Some("//api:dev")
+        );
         assert_eq!(config.dev.service_groups["frontend"].services(), ["api"]);
         assert_eq!(
             config.dev.service_groups["backend"].control_port(),

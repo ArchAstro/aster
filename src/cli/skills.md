@@ -185,6 +185,39 @@ scrolling, restart, wrapping, copy, and browser opening; `?` shows its controls.
 Array groups use the global `[dev].control_port`. A detailed group may override
 it with its own named `control_port`, so multiple groups can run concurrently.
 
+## Serve trusted local HTTPS
+
+Use a `tls_proxy` service when browsers need a trusted `.dev` or other HTTPS
+origin. The edge uses named Aster ports for upstreams and belongs in service
+groups like an ordinary service.
+
+```toml
+[dev.ports.https]
+default = 8443
+
+[dev.services.local-edge]
+port = "https"
+tls_proxy = { certificate_hosts = ["app.example.test", "*.local.example.test"], open_host = "app.example.test", dns_domain = "example.test", routes = [{ host = "app.example.test", upstream_port = "web" }, { host_suffix = ".local.example.test", open_host = "demo.local.example.test", upstream_port = "api" }] }
+```
+
+```fish
+brew install mkcert dnsmasq
+aster services tls setup local-edge
+aster services up
+```
+
+Setup explicitly installs the mkcert local CA and writes the certificate under
+`.aster/tls/local-edge/`. Normal service startup never installs packages,
+changes trust stores, or edits DNS. Configure wildcard DNS separately so the
+configured `dns_domain` resolves to `127.0.0.1`. If Chrome still reports
+`ERR_NAME_NOT_RESOLVED`, fully quit and reopen Chrome and disable Secure DNS if
+it is bypassing the system resolver.
+
+For a selected TLS edge, `[open]` on an upstream service uses its HTTPS route.
+Exact routes infer the hostname from `host`. To publish an open URL for a
+suffix route, configure a concrete `open_host` matching the suffix and
+certificate.
+
 ## Read service logs and clear occupied ports
 
 Service output is persisted at
