@@ -42,9 +42,18 @@ pub fn resolve_dev_plan(
     }
 
     let ports = resolve_dev_ports(workspace_root, config)?;
-    let control_port = config
-        .control_port
-        .as_deref()
+    let group_control_port = match group {
+        Some(group) => config
+            .service_groups
+            .get(group)
+            .and_then(|config| config.control_port()),
+        None => config
+            .service_groups
+            .get("main")
+            .and_then(|config| config.control_port()),
+    };
+    let control_port = group_control_port
+        .or(config.control_port.as_deref())
         .map(|name| {
             ports
                 .get(name)
@@ -190,13 +199,13 @@ fn select_service_names<'a>(
                 )
             }
         })?;
-        return Ok(services.iter().map(String::as_str).collect());
+        return Ok(services.services().iter().map(String::as_str).collect());
     }
 
     let grouped = config
         .service_groups
         .values()
-        .flatten()
+        .flat_map(|group| group.services())
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let mut selected = config
@@ -206,7 +215,7 @@ fn select_service_names<'a>(
         .filter(|service| !grouped.contains(service))
         .collect::<HashSet<_>>();
     if let Some(main) = config.service_groups.get("main") {
-        selected.extend(main.iter().map(String::as_str));
+        selected.extend(main.services().iter().map(String::as_str));
     }
     Ok(selected)
 }
@@ -408,7 +417,10 @@ fn expand_template(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DevServiceConfig, ResolvedDevPortConfig};
+    use crate::config::{
+        DetailedDevServiceGroupConfig, DevServiceConfig, DevServiceGroupConfig,
+        ResolvedDevPortConfig,
+    };
 
     fn service(target: &str) -> DevServiceConfig {
         DevServiceConfig {
@@ -432,10 +444,16 @@ mod tests {
                 ("intern-fe".to_string(), service("//intern-fe:dev")),
             ]),
             service_groups: HashMap::from([
-                ("main".to_string(), vec!["platform".to_string()]),
+                (
+                    "main".to_string(),
+                    DevServiceGroupConfig::Services(vec!["platform".to_string()]),
+                ),
                 (
                     "intern".to_string(),
-                    vec!["intern-data".to_string(), "intern-fe".to_string()],
+                    DevServiceGroupConfig::Services(vec![
+                        "intern-data".to_string(),
+                        "intern-fe".to_string(),
+                    ]),
                 ),
             ]),
             ..DevWorkspaceConfig::default()
@@ -467,10 +485,13 @@ mod tests {
                 ("one".to_string(), service("//one:dev")),
             ]),
             service_groups: HashMap::from([
-                ("small".to_string(), vec!["shared".to_string()]),
+                (
+                    "small".to_string(),
+                    DevServiceGroupConfig::Services(vec!["shared".to_string()]),
+                ),
                 (
                     "full".to_string(),
-                    vec!["shared".to_string(), "one".to_string()],
+                    DevServiceGroupConfig::Services(vec!["shared".to_string(), "one".to_string()]),
                 ),
             ]),
             ..DevWorkspaceConfig::default()
@@ -481,6 +502,30 @@ mod tests {
             select_service_names(&config, Some("small")).unwrap(),
             HashSet::from(["shared"])
         );
+    }
+
+    #[test]
+    fn service_group_control_port_overrides_global_control_port() {
+        let config = DevWorkspaceConfig {
+            control_port: Some("global-control".to_string()),
+            ports: HashMap::from([
+                ("global-control".to_string(), DevPortConfig::Fixed(5000)),
+                ("intern-control".to_string(), DevPortConfig::Fixed(5001)),
+            ]),
+            services: HashMap::from([("api".to_string(), service("//api:dev"))]),
+            service_groups: HashMap::from([(
+                "intern".to_string(),
+                DevServiceGroupConfig::Detailed(DetailedDevServiceGroupConfig {
+                    services: vec!["api".to_string()],
+                    control_port: Some("intern-control".to_string()),
+                }),
+            )]),
+            ..DevWorkspaceConfig::default()
+        };
+
+        let ports = resolve_ports(&config.ports, &HashMap::new()).unwrap();
+        let selected = config.service_groups["intern"].control_port();
+        assert_eq!(selected.and_then(|name| ports.get(name)), Some(&5001));
     }
 
     #[test]

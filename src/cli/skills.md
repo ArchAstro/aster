@@ -159,9 +159,12 @@ target = "//services/web:dev"
 port = "web"
 order = 20
 
+[dev.ports.intern-control]
+default = 5001
+
 [dev.service_groups]
 main = ["api", "web"]
-intern = ["intern-postgres", "intern-api", "intern-web"]
+intern = { services = ["intern-postgres", "intern-api", "intern-web"], control_port = "intern-control" }
 ```
 
 Run the default stack or one named group:
@@ -179,6 +182,8 @@ run. If no `main` group exists, all ungrouped services run. An explicit group
 runs exactly that group. The default terminal UI supports service tabs, search,
 scrolling, restart, wrapping, copy, and browser opening; `?` shows its controls.
 `--no-ui` emits line-oriented logs for non-interactive environments.
+Array groups use the global `[dev].control_port`. A detailed group may override
+it with its own named `control_port`, so multiple groups can run concurrently.
 
 ## Read service logs and clear occupied ports
 

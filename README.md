@@ -355,15 +355,22 @@ transitive target graph determines which project directories are watched.
 Services can be collected into named groups in the root `aster.toml`:
 
 ```toml
+[dev.ports.intern-control]
+env = "INTERN_CONTROL_PORT"
+default = 5001
+
 [dev.service_groups]
 main = ["platform", "developer-portal", "user-portal", "agent-network"]
-intern = ["intern-postgres", "intern-data", "intern-ctl", "intern-gateway", "intern-fe"]
+intern = { services = ["intern-postgres", "intern-data", "intern-ctl", "intern-gateway", "intern-fe"], control_port = "intern-control" }
 ```
 
 `aster services up intern` runs that group. With no group argument, Aster runs
 the `main` group plus services that do not appear in any group. When no `main`
 group exists, the default remains all ungrouped services. A service may belong
-to more than one group.
+to more than one group. The array form uses `[dev].control_port`. The detailed
+form can set a named `control_port`, allowing multiple groups to run concurrently
+without their control sockets conflicting. A detailed `main` group also supplies
+the control port for `aster services up` with no group argument.
 
 The dashboard uses scalable colored service tabs beside one focused log
 stream. Use `h`/`l` or click a tab to switch services, drag the divider or use

@@ -49,6 +49,7 @@ fn configuration_scenario_matrix() {
         Scenario { name: "derived port", input: "[dev.ports.base]\ndefault = 4000\n[dev.ports.web]\ndefault = 3000\noffset_from = \"base\"\noffset_base = 4000\nsaturating_offset = true\n", expected: Expected::Accept },
         Scenario { name: "development service", input: "[dev.services.api]\ntarget = \"//api:dev\"\nport = \"http\"\nopen_path = \"/health\"\nenv_files = [\".env\"]\nenv = { PORT = \"{port}\" }\ninherit_env = [\"PATH\"]\norder = -2147483648\n", expected: Expected::Accept },
         Scenario { name: "development service group", input: "[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\ncore = [\"api\"]\n", expected: Expected::Accept },
+        Scenario { name: "development service group with control port", input: "[dev.ports]\ncore_control = 5001\n[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\ncore = { services = [\"api\"], control_port = \"core_control\" }\n", expected: Expected::Accept },
         Scenario { name: "unknown grouped service", input: "[dev.service_groups]\ncore = [\"missing\"]\n", expected: Expected::Reject },
         Scenario { name: "cache configuration", input: "[targets.build]\ncommand = \"cargo build\"\n[targets.build.cache]\nenabled = true\ninclude = [\"src/**\"]\nexclude = [\"**/*.tmp\"]\nenv = [\"RUSTFLAGS\"]\noutputs = [\"target/debug/app\"]\n", expected: Expected::Accept },
         Scenario { name: "quoted dotted target", input: "[targets.\"check:all\"]\ncommand = \"true\"\n", expected: Expected::Accept },
