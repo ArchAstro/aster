@@ -55,15 +55,16 @@ pub struct DevWorkspaceConfig {
 
     /// Named groups of services selected by `aster services up <group>`.
     #[serde(default)]
-    pub service_groups: HashMap<String, Vec<String>>,
+    pub service_groups: HashMap<String, DevServiceGroupConfig>,
 }
 
 impl DevWorkspaceConfig {
     pub(crate) fn validate_service_groups(&self) -> Result<()> {
-        for (group, services) in &self.service_groups {
+        for (group, group_config) in &self.service_groups {
             if group.trim().is_empty() {
                 bail!("service group names cannot be empty");
             }
+            let services = group_config.services();
             if services.is_empty() {
                 bail!("service group '{group}' must contain at least one service");
             }
@@ -76,9 +77,52 @@ impl DevWorkspaceConfig {
                     bail!("service group '{group}' contains duplicate service '{service}'");
                 }
             }
+            if let Some(control_port) = group_config.control_port() {
+                if !self.ports.contains_key(control_port) {
+                    bail!(
+                        "service group '{group}' control_port references unknown port '{control_port}'"
+                    );
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// A named set of services, optionally with its own control socket port.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DevServiceGroupConfig {
+    /// Backwards-compatible shorthand containing only service names.
+    Services(Vec<String>),
+    /// Detailed group configuration.
+    Detailed(DetailedDevServiceGroupConfig),
+}
+
+impl DevServiceGroupConfig {
+    pub(crate) fn services(&self) -> &[String] {
+        match self {
+            Self::Services(services) => services,
+            Self::Detailed(config) => &config.services,
+        }
+    }
+
+    pub(crate) fn control_port(&self) -> Option<&str> {
+        match self {
+            Self::Services(_) => None,
+            Self::Detailed(config) => config.control_port.as_deref(),
+        }
+    }
+}
+
+/// Detailed configuration for one development service group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetailedDevServiceGroupConfig {
+    /// Services started when this group is selected.
+    pub services: Vec<String>,
+    /// Named port overriding `[dev].control_port` for this group.
+    pub control_port: Option<String>,
 }
 
 /// A named port used by one or more development services.
@@ -275,6 +319,7 @@ control_port = "api"
 
 [dev.service_groups]
 frontend = ["api"]
+backend = { services = ["api"], control_port = "web" }
 
 [dev.ports.api]
 env = "API_PORT"
@@ -301,7 +346,11 @@ order = 10
 
         let config = WorkspaceConfig::load(temp.path()).unwrap();
         assert_eq!(config.dev.services["api"].target, "//api:dev");
-        assert_eq!(config.dev.service_groups["frontend"], ["api"]);
+        assert_eq!(config.dev.service_groups["frontend"].services(), ["api"]);
+        assert_eq!(
+            config.dev.service_groups["backend"].control_port(),
+            Some("web")
+        );
         assert_eq!(
             config.dev.services["api"].open_path.as_deref(),
             Some("/health")
@@ -336,6 +385,10 @@ order = 10
             (
                 "[dev.service_groups]\nintern = []\n",
                 "must contain at least one service",
+            ),
+            (
+                "[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\nintern = { services = [\"api\"], control_port = \"missing\" }\n",
+                "control_port references unknown port 'missing'",
             ),
         ] {
             let temp = TempDir::new().unwrap();

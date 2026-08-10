@@ -588,9 +588,17 @@ fn services_up_selects_an_optional_service_group() {
     fs::write(
         root.join("aster.toml"),
         r#"
+[dev]
+control_port = "fallback-control"
+
+[dev.ports]
+fallback-control = 5100
+main-control = 5101
+intern-control = 5102
+
 [dev.service_groups]
-main = ["platform"]
-intern = ["intern-data", "intern-fe"]
+main = { services = ["platform"], control_port = "main-control" }
+intern = { services = ["intern-data", "intern-fe"], control_port = "intern-control" }
 
 [dev.services.platform]
 target = "//platform:dev"
@@ -614,6 +622,7 @@ target = "//intern-fe:dev"
     assert!(stderr.contains("platform -> //platform:dev"), "{stderr}");
     assert!(!stderr.contains("intern-data ->"), "{stderr}");
     assert!(!stderr.contains("intern-fe ->"), "{stderr}");
+    assert!(stderr.contains("control :5101"), "{stderr}");
 
     let intern = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["services", "up", "intern", "--dry-run"])
@@ -628,6 +637,7 @@ target = "//intern-fe:dev"
         "{stderr}"
     );
     assert!(stderr.contains("intern-fe -> //intern-fe:dev"), "{stderr}");
+    assert!(stderr.contains("control :5102"), "{stderr}");
 
     let missing = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["services", "up", "missing", "--dry-run"])
@@ -636,6 +646,90 @@ target = "//intern-fe:dev"
         .unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown service group 'missing'"));
+}
+
+#[test]
+fn concurrent_service_groups_bind_distinct_control_ports() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let alpha_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let alpha_port = alpha_reservation.local_addr().unwrap().port();
+    let beta_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let beta_port = beta_reservation.local_addr().unwrap().port();
+
+    fs::create_dir(root.join(".git")).unwrap();
+    for project in ["alpha", "beta"] {
+        let directory = root.join(project);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("aster.toml"),
+            "[targets.dev]\ncommand = \"sh -c 'while true; do sleep 1; done'\"\nstream = true\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports]
+alpha-control = {alpha_port}
+beta-control = {beta_port}
+
+[dev.service_groups]
+alpha = {{ services = ["alpha"], control_port = "alpha-control" }}
+beta = {{ services = ["beta"], control_port = "beta-control" }}
+
+[dev.services.alpha]
+target = "//alpha:dev"
+
+[dev.services.beta]
+target = "//beta:dev"
+"#
+        ),
+    )
+    .unwrap();
+    drop(alpha_reservation);
+    drop(beta_reservation);
+
+    let mut alpha = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "alpha", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut beta = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "beta", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let (alpha_token_path, alpha_token) = wait_for_control_token(alpha_port, alpha.id());
+    let (beta_token_path, beta_token) = wait_for_control_token(beta_port, beta.id());
+    assert_eq!(
+        control_request(alpha_port, r#"{"command":"status"}"#)["ok"],
+        true
+    );
+    assert_eq!(
+        control_request(beta_port, r#"{"command":"status"}"#)["ok"],
+        true
+    );
+
+    for (port, token) in [(alpha_port, alpha_token), (beta_port, beta_token)] {
+        let request = serde_json::json!({"command": "shutdown", "token": token}).to_string();
+        assert_eq!(control_request(port, &request)["ok"], true);
+    }
+    assert!(alpha.wait().unwrap().success());
+    assert!(beta.wait().unwrap().success());
+    assert!(!alpha_token_path.exists());
+    assert!(!beta_token_path.exists());
 }
 
 #[test]

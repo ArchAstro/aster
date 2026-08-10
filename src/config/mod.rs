@@ -6,6 +6,7 @@ pub use project::{
     TargetConfig,
 };
 pub use workspace::{
-    find_workspace_root, AffectedWorkspaceConfig, DevPortConfig, DevServiceConfig,
-    DevWorkspaceConfig, ResolvedDevPortConfig, WatchWorkspaceConfig, WorkspaceConfig,
+    find_workspace_root, AffectedWorkspaceConfig, DetailedDevServiceGroupConfig, DevPortConfig,
+    DevServiceConfig, DevServiceGroupConfig, DevWorkspaceConfig, ResolvedDevPortConfig,
+    WatchWorkspaceConfig, WorkspaceConfig,
 };
