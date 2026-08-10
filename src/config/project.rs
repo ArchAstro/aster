@@ -225,7 +225,7 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
     validate_aster_config(&config.depends_on, &config.targets, path)?;
     config
         .dev
-        .validate_service_groups()
+        .validate()
         .with_context(|| format!("Invalid service groups in {}", path.display()))?;
 
     Ok(config)

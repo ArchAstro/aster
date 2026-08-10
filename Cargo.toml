@@ -48,6 +48,13 @@ crossterm = "0.29"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server", "tokio"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio-rustls = "0.26"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -66,3 +73,4 @@ tempfile = "3"
 assert_cmd = "2.0"
 predicates = "3.1"
 dirs = "6.0"
+rcgen = "0.14"

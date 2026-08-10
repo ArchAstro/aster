@@ -7,6 +7,6 @@ pub use project::{
 };
 pub use workspace::{
     find_workspace_root, AffectedWorkspaceConfig, DetailedDevServiceGroupConfig, DevPortConfig,
-    DevServiceConfig, DevServiceGroupConfig, DevWorkspaceConfig, ResolvedDevPortConfig,
-    WatchWorkspaceConfig, WorkspaceConfig,
+    DevServiceConfig, DevServiceGroupConfig, DevTlsProxyConfig, DevTlsRouteConfig,
+    DevWorkspaceConfig, ResolvedDevPortConfig, WatchWorkspaceConfig, WorkspaceConfig,
 };

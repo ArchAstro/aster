@@ -62,6 +62,7 @@ pub fn resolve_dev_plan(
         })
         .transpose()?;
     let selected = select_service_names(config, group)?;
+    let tls_open_urls = resolve_tls_open_urls(config, &selected, &ports)?;
 
     let project_by_address: HashMap<String, &DiscoveredProject> = projects
         .iter()
@@ -75,32 +76,6 @@ pub fn resolve_dev_plan(
     for (name, service) in configured {
         if !selected.contains(name.as_str()) {
             continue;
-        }
-
-        let (project_address, _) = service.target.split_once(':').ok_or_else(|| {
-            anyhow!(
-                "service '{name}' target must use //project:target syntax: {}",
-                service.target
-            )
-        })?;
-        let project = project_by_address.get(project_address).ok_or_else(|| {
-            anyhow!("service '{name}' references unknown project {project_address}")
-        })?;
-        let node = graph.get(&service.target).ok_or_else(|| {
-            anyhow!(
-                "service '{name}' references unknown target {}",
-                service.target
-            )
-        })?;
-        let target = project
-            .targets
-            .get(&node.target_name)
-            .ok_or_else(|| anyhow!("target definition missing for {}", service.target))?;
-        if !target.stream {
-            bail!(
-                "service '{name}' target {} must set stream = true",
-                service.target
-            );
         }
 
         let port = match service.port.as_deref() {
@@ -131,31 +106,92 @@ pub fn resolve_dev_plan(
         }
         validate_environment(name, &service_env)?;
 
-        let mut target = target.clone();
+        let path = service.open_path.as_deref().unwrap_or("");
+        let path = if path.is_empty() || path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let (target_address, mut target, project_root, watch, open_url) =
+            if let Some(target_address) = &service.target {
+                let (project_address, _) = target_address.split_once(':').ok_or_else(|| {
+                    anyhow!(
+                        "service '{name}' target must use //project:target syntax: {target_address}"
+                    )
+                })?;
+                let project = project_by_address.get(project_address).ok_or_else(|| {
+                    anyhow!("service '{name}' references unknown project {project_address}")
+                })?;
+                let node = graph.get(target_address).ok_or_else(|| {
+                    anyhow!("service '{name}' references unknown target {target_address}")
+                })?;
+                let target = project
+                    .targets
+                    .get(&node.target_name)
+                    .ok_or_else(|| anyhow!("target definition missing for {target_address}"))?;
+                if !target.stream {
+                    bail!("service '{name}' target {target_address} must set stream = true");
+                }
+                let watch = WatchPlan::build(
+                    std::slice::from_ref(target_address),
+                    projects,
+                    graph,
+                    plugins,
+                )
+                .with_context(|| format!("failed to build watch plan for service '{name}'"))?;
+                (
+                    target_address.clone(),
+                    target.clone(),
+                    project.root.clone(),
+                    watch,
+                    service.port.as_ref().and_then(|port_name| {
+                        tls_open_urls
+                            .get(port_name)
+                            .map(|base| format!("{base}{path}"))
+                            .or_else(|| port.map(|port| format!("http://localhost:{port}{path}")))
+                    }),
+                )
+            } else {
+                let tls = service
+                    .tls_proxy
+                    .as_ref()
+                    .expect("development config validates service variants");
+                let executable = std::env::current_exe()
+                    .context("failed to locate the Aster executable for TLS proxy service")?;
+                let command = format!(
+                    "{} services tls serve {}",
+                    shell_words::quote(&executable.to_string_lossy()),
+                    shell_words::quote(name)
+                );
+                let target = crate::plugins::Target {
+                    command,
+                    stream: true,
+                    ..Default::default()
+                };
+                let open_url = port.map(|port| {
+                    let authority = if port == 443 {
+                        tls.open_host.clone()
+                    } else {
+                        format!("{}:{port}", tls.open_host)
+                    };
+                    format!("https://{authority}{path}")
+                });
+                (
+                    format!("builtin:tls-proxy:{name}"),
+                    target,
+                    workspace_root.to_path_buf(),
+                    WatchPlan::empty(),
+                    open_url,
+                )
+            };
         target.command = expand_template(&target.command, port, &ports)
             .with_context(|| format!("invalid command for service '{name}'"))?;
-        let open_url = port.map(|port| {
-            let path = service.open_path.as_deref().unwrap_or("");
-            let path = if path.is_empty() || path.starts_with('/') {
-                path.to_string()
-            } else {
-                format!("/{path}")
-            };
-            format!("http://localhost:{port}{path}")
-        });
-        let watch = WatchPlan::build(
-            std::slice::from_ref(&service.target),
-            projects,
-            graph,
-            plugins,
-        )
-        .with_context(|| format!("failed to build watch plan for service '{name}'"))?;
 
         services.push(ServicePlan {
             name: name.clone(),
-            target_address: service.target.clone(),
+            target_address,
             target,
-            project_root: project.root.clone(),
+            project_root,
             port,
             open_url,
             env: service_env,
@@ -177,11 +213,52 @@ pub fn resolve_dev_plan(
     })
 }
 
+fn resolve_tls_open_urls(
+    config: &DevWorkspaceConfig,
+    selected: &HashSet<&str>,
+    ports: &HashMap<String, u16>,
+) -> Result<HashMap<String, String>> {
+    let mut upstreams = HashMap::new();
+    for (service_name, service) in &config.services {
+        if !selected.contains(service_name.as_str()) {
+            continue;
+        }
+        let Some(tls) = &service.tls_proxy else {
+            continue;
+        };
+        let port_name = service
+            .port
+            .as_ref()
+            .expect("TLS proxy validation requires a port");
+        let port = ports[port_name];
+        for route in &tls.routes {
+            let Some(hostname) = route.open_host.as_ref().or(route.host.as_ref()) else {
+                continue;
+            };
+            let authority = if port == 443 {
+                hostname.clone()
+            } else {
+                format!("{hostname}:{port}")
+            };
+            let url = format!("https://{authority}");
+            if let Some(existing) = upstreams.insert(route.upstream_port.clone(), url.clone()) {
+                if existing != url {
+                    bail!(
+                        "TLS routes publish multiple open hosts for upstream port '{}': {existing} and {url}",
+                        route.upstream_port
+                    );
+                }
+            }
+        }
+    }
+    Ok(upstreams)
+}
+
 fn select_service_names<'a>(
     config: &'a DevWorkspaceConfig,
     group: Option<&str>,
 ) -> Result<HashSet<&'a str>> {
-    config.validate_service_groups()?;
+    config.validate()?;
     if let Some(group) = group {
         let services = config.service_groups.get(group).ok_or_else(|| {
             let mut known = config
@@ -418,13 +495,14 @@ fn expand_template(
 mod tests {
     use super::*;
     use crate::config::{
-        DetailedDevServiceGroupConfig, DevServiceConfig, DevServiceGroupConfig,
-        ResolvedDevPortConfig,
+        DetailedDevServiceGroupConfig, DevServiceConfig, DevServiceGroupConfig, DevTlsProxyConfig,
+        DevTlsRouteConfig, ResolvedDevPortConfig,
     };
 
     fn service(target: &str) -> DevServiceConfig {
         DevServiceConfig {
-            target: target.to_string(),
+            target: Some(target.to_string()),
+            tls_proxy: None,
             port: None,
             open_path: None,
             env_files: Vec::new(),
@@ -432,6 +510,71 @@ mod tests {
             inherit_env: Vec::new(),
             order: 0,
         }
+    }
+
+    #[test]
+    fn tls_routes_publish_https_open_urls_for_upstream_services() {
+        let tls_service = DevServiceConfig {
+            target: None,
+            tls_proxy: Some(DevTlsProxyConfig {
+                certificate_hosts: vec![
+                    "intern.dev".to_string(),
+                    "*.local.sites.intern.dev".to_string(),
+                ],
+                open_host: "intern.dev".to_string(),
+                dns_domain: None,
+                routes: vec![
+                    DevTlsRouteConfig {
+                        host: Some("intern.dev".to_string()),
+                        host_suffix: None,
+                        open_host: None,
+                        upstream_port: "frontend".to_string(),
+                    },
+                    DevTlsRouteConfig {
+                        host: None,
+                        host_suffix: Some(".sites.intern.dev".to_string()),
+                        open_host: Some("test.local.sites.intern.dev".to_string()),
+                        upstream_port: "gateway".to_string(),
+                    },
+                ],
+            }),
+            port: Some("https".to_string()),
+            open_path: None,
+            env_files: Vec::new(),
+            env: HashMap::new(),
+            inherit_env: Vec::new(),
+            order: 0,
+        };
+        let config = DevWorkspaceConfig {
+            ports: HashMap::from([
+                ("https".to_string(), DevPortConfig::Fixed(8443)),
+                ("frontend".to_string(), DevPortConfig::Fixed(3100)),
+                ("gateway".to_string(), DevPortConfig::Fixed(3800)),
+            ]),
+            services: HashMap::from([
+                ("frontend".to_string(), service("//frontend:dev")),
+                ("gateway".to_string(), service("//gateway:dev")),
+                ("edge".to_string(), tls_service),
+            ]),
+            service_groups: HashMap::from([(
+                "intern".to_string(),
+                DevServiceGroupConfig::Services(vec![
+                    "frontend".to_string(),
+                    "gateway".to_string(),
+                    "edge".to_string(),
+                ]),
+            )]),
+            ..DevWorkspaceConfig::default()
+        };
+        let selected = select_service_names(&config, Some("intern")).unwrap();
+        let ports = resolve_ports(&config.ports, &HashMap::new()).unwrap();
+
+        let open_urls = resolve_tls_open_urls(&config, &selected, &ports).unwrap();
+        assert_eq!(open_urls["frontend"], "https://intern.dev:8443");
+        assert_eq!(
+            open_urls["gateway"],
+            "https://test.local.sites.intern.dev:8443"
+        );
     }
 
     #[test]

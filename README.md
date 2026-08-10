@@ -420,6 +420,48 @@ env = { PORT = "{port}", API_URL = "http://localhost:{ports.api}" }
 order = 20
 ```
 
+### Local HTTPS edges
+
+A TLS edge is supervised like any other service, but terminates HTTPS and
+routes browser traffic to other services by their named ports. Certificate
+trust is an explicit setup step; `services up` never installs software or
+changes the host trust store.
+
+```toml
+[dev.ports.https]
+default = 8443
+
+[dev.services.local-edge]
+port = "https"
+open_path = "/"
+tls_proxy = { certificate_hosts = ["app.example.test", "*.local.example.test"], open_host = "app.example.test", dns_domain = "example.test", routes = [{ host = "app.example.test", upstream_port = "web" }, { host_suffix = ".local.example.test", open_host = "demo.local.example.test", upstream_port = "api" }] }
+```
+
+On macOS with fish:
+
+```fish
+brew install mkcert dnsmasq
+aster services tls setup local-edge
+aster services up
+```
+
+`setup` runs `mkcert -install`, writes a mode-0600 key under
+`.aster/tls/local-edge/`, and verifies that `dns_domain` resolves to loopback.
+Configure wildcard DNS separately (for example, dnsmasq
+`address=/.example.test/127.0.0.1`). If Chrome cached an earlier DNS failure,
+fully quit it and reopen it; also disable Chrome Secure DNS if it bypasses the
+macOS resolver. Aster prints the same checks when DNS validation fails.
+
+The proxy binds only to `127.0.0.1`, routes only to configured named ports,
+and supports HTTP upgrades for development WebSockets/HMR. Use port 8443 when
+the operating system restricts unprivileged processes from binding port 443.
+Do not run the complete development stack as root.
+
+When a TLS route points to another service's named port, that service's
+dashboard `[open]` action uses the route's HTTPS hostname. Exact routes infer
+it from `host`. To publish an open URL for a suffix route, configure a concrete
+`open_host`; a suffix alone does not identify which tenant hostname to open.
+
 `port_env_files` participate only in named-port resolution. A service receives
 only a small process baseline (`PATH`, home/user, temporary-directory, locale,
 shell, and terminal variables), its own `env_files`, explicit `env`,
