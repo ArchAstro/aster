@@ -149,14 +149,27 @@ debounce_ms = 300
 Services map stable names to `stream = true` targets in root `aster.toml`:
 
 ```toml
+[dev.ports.api]
+allocation = "dynamic"
+range = [4000, 4099]
+preferred = 4000
+
+[dev.ports.web]
+default = 3000
+offset_from = "api"
+offset_base = 4000
+
 [dev.services.api]
 target = "//services/api:dev"
 port = "api"
+port_env = { PORT = "api" }
 order = 10
 
 [dev.services.web]
 target = "//services/web:dev"
 port = "web"
+port_env = { PORT = "web" }
+env = { API_URL = "http://localhost:{ports.api}" }
 order = 20
 
 [dev.ports.intern-control]
@@ -184,6 +197,10 @@ scrolling, restart, wrapping, copy, and browser opening; `?` shows its controls.
 `--no-ui` emits line-oriented logs for non-interactive environments.
 Array groups use the global `[dev].control_port`. A detailed group may override
 it with its own named `control_port`, so multiple groups can run concurrently.
+Static ports retain their configured values. Dynamic named ports are selected
+from their ranges as one collision-free bundle per supervisor and released at
+exit. Use `port_env` for direct numeric environment values and `{ports.name}`
+inside `env` or target commands for URLs and other composite values.
 
 ## Serve trusted local HTTPS
 

@@ -47,6 +47,8 @@ fn configuration_scenario_matrix() {
         Scenario { name: "resolved port one env", input: "[dev.ports.http]\nenv = \"PORT\"\ndefault = 4000\n", expected: Expected::Accept },
         Scenario { name: "resolved port many env", input: "[dev.ports.http]\nenv = [\"PORT\", \"HTTP_PORT\"]\nfile_env = []\ndefault = 4000\n", expected: Expected::Accept },
         Scenario { name: "derived port", input: "[dev.ports.base]\ndefault = 4000\n[dev.ports.web]\ndefault = 3000\noffset_from = \"base\"\noffset_base = 4000\nsaturating_offset = true\n", expected: Expected::Accept },
+        Scenario { name: "dynamic port", input: "[dev.ports.http]\nallocation = \"dynamic\"\nrange = [4000, 4099]\npreferred = 4000\n", expected: Expected::Accept },
+        Scenario { name: "explicit static port", input: "[dev.ports.http]\nallocation = \"static\"\ndefault = 4000\n", expected: Expected::Accept },
         Scenario { name: "development service", input: "[dev.services.api]\ntarget = \"//api:dev\"\nport = \"http\"\nopen_path = \"/health\"\nenv_files = [\".env\"]\nenv = { PORT = \"{port}\" }\ninherit_env = [\"PATH\"]\norder = -2147483648\n", expected: Expected::Accept },
         Scenario { name: "development service group", input: "[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\ncore = [\"api\"]\n", expected: Expected::Accept },
         Scenario { name: "development service group with control port", input: "[dev.ports]\ncore_control = 5001\n[dev.services.api]\ntarget = \"//api:dev\"\n[dev.service_groups]\ncore = { services = [\"api\"], control_port = \"core_control\" }\n", expected: Expected::Accept },

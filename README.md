@@ -389,9 +389,9 @@ port_env_files = [".env", ".env.local"]
 control_port = "control"
 
 [dev.ports.api]
-env = "API_PORT"
-file_env = "PORT"
-default = 4000
+allocation = "dynamic"
+range = [4000, 4099]
+preferred = 4000
 
 [dev.ports.web]
 env = "WEB_PORT"
@@ -409,14 +409,15 @@ target = "//services/api:dev"
 port = "api"
 open_path = "/health"
 env_files = ["services/api/.env"]
-env = { PORT = "{port}", WEB_PORT = "{ports.web}" }
+port_env = { PORT = "api", WEB_PORT = "web" }
 inherit_env = ["GOOGLE_CLOUD_MODE"]
 order = 10
 
 [dev.services.web]
 target = "//services/web:dev"
 port = "web"
-env = { PORT = "{port}", API_URL = "http://localhost:{ports.api}" }
+port_env = { PORT = "web" }
+env = { API_URL = "http://localhost:{ports.api}" }
 order = 20
 ```
 
@@ -462,7 +463,17 @@ dashboard `[open]` action uses the route's HTTPS hostname. Exact routes infer
 it from `host`. To publish an open URL for a suffix route, configure a concrete
 `open_host`; a suffix alone does not identify which tenant hostname to open.
 
-`port_env_files` participate only in named-port resolution. A service receives
+Named ports have two allocation modes. Existing integer and detailed definitions
+are static; a detailed static definition may say `allocation = "static"`
+explicitly. A dynamic root uses `allocation = "dynamic"`, an inclusive `range`,
+and an optional `preferred` candidate. Aster atomically claims the root and its
+selected derived ports, skips ports leased by another Aster supervisor or bound
+by another process, and holds the leases until the supervisor exits.
+Dynamic allocations are released automatically and are therefore excluded from
+the configured-name set used by `services kill-ports`; explicit numeric cleanup
+remains available when diagnosing a non-Aster listener.
+
+`port_env_files` participate only in static named-port resolution. A service receives
 only a small process baseline (`PATH`, home/user, temporary-directory, locale,
 shell, and terminal variables), its own `env_files`, explicit `env`,
 `ASTER_SERVICE_NAME`, and (when it has a port) `ASTER_SERVICE_PORT`; leading
@@ -475,9 +486,13 @@ service's `inherit_env` allowlist. Process environment values named by a port's
 for collision-free worktree stacks. By default, a source below the baseline is
 an error; `saturating_offset = true` clamps that delta to zero.
 
-`{port}` and `{ports.<name>}` are expanded in service target commands and
-service environment values. They are separate from the `{files}` target
-capability. `open_path` controls the dashboard's browser URL.
+`port_env = { PORT = "api" }` injects a resolved named port after service env
+files are loaded, so stale checked-in values cannot override an allocation. A
+key cannot appear in both `port_env` and `env`. `{port}` and `{ports.<name>}`
+remain available in service target commands and `env` for composite values such
+as URLs. Port references do not implicitly start services; groups remain the
+process-selection contract. These templates are separate from the `{files}`
+target capability. `open_path` controls the dashboard's browser URL.
 
 When `control_port` is configured, Aster accepts the platform launcher's
 line-delimited JSON commands on localhost: `status`, `list_services`,

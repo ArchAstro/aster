@@ -106,6 +106,34 @@ fn wait_for_control_token(port: u16, process_id: u32) -> (std::path::PathBuf, St
     (path, token)
 }
 
+fn reserve_consecutive_dynamic_bundles() -> (u16, u16) {
+    for start in 30000u16..60000u16 {
+        let Some(derived_start) = start.checked_add(1000) else {
+            break;
+        };
+        let Some(derived_next) = derived_start.checked_add(1) else {
+            break;
+        };
+        let listeners = [start, start + 1, derived_start, derived_next]
+            .into_iter()
+            .map(|port| TcpListener::bind(("127.0.0.1", port)))
+            .collect::<Result<Vec<_>, _>>();
+        if let Ok(listeners) = listeners {
+            drop(listeners);
+            return (start, derived_start);
+        }
+    }
+    panic!("could not find two consecutive free dynamic port bundles");
+}
+
+fn terminate_aster(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
+}
+
 #[test]
 fn services_kill_ports_previews_then_clears_configured_listener() {
     let temp = tempfile::tempdir().unwrap();
@@ -174,6 +202,100 @@ fn services_kill_ports_previews_then_clears_configured_listener() {
     });
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     assert!(String::from_utf8_lossy(&cleanup.stdout).contains("Cleared"));
+}
+
+#[test]
+fn dynamic_port_bundles_are_distinct_propagated_and_released() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    let (start, derived_start) = reserve_consecutive_dynamic_bundles();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(root.join("service.env"), "DEPENDENT_PORT=wrong\n").unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports.http]
+allocation = "dynamic"
+range = [{start}, {}]
+preferred = {start}
+
+[dev.ports.dependent]
+default = {derived_start}
+offset_from = "http"
+offset_base = {start}
+
+[dev.services.web]
+target = "//app:dev"
+port = "http"
+env_files = ["service.env"]
+port_env = {{ DEPENDENT_PORT = "dependent" }}
+"#,
+            start + 1
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh -c 'echo $ASTER_SERVICE_PORT:$DEPENDENT_PORT >> ../events.log; python3 -m http.server {port}'"
+stream = true
+"#,
+    )
+    .unwrap();
+
+    let launch = || {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .args(["services", "up", "--no-ui", "--no-watch"])
+            .current_dir(root)
+            .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+
+    let events = root.join("events.log");
+    let mut first = launch();
+    wait_until(Duration::from_secs(20), || {
+        fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains(&format!("{start}:{derived_start}"))
+            && TcpStream::connect(("127.0.0.1", start)).is_ok()
+    });
+
+    let mut second = launch();
+    wait_until(Duration::from_secs(20), || {
+        fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains(&format!("{}:{}", start + 1, derived_start + 1))
+            && TcpStream::connect(("127.0.0.1", start + 1)).is_ok()
+    });
+    assert!(first.try_wait().unwrap().is_none());
+    assert!(second.try_wait().unwrap().is_none());
+
+    terminate_aster(&mut first);
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", start)).is_err()
+    });
+
+    let previous = occurrences(&events, &format!("{start}:{derived_start}"));
+    let mut third = launch();
+    wait_until(Duration::from_secs(20), || {
+        occurrences(&events, &format!("{start}:{derived_start}")) > previous
+            && TcpStream::connect(("127.0.0.1", start)).is_ok()
+    });
+
+    terminate_aster(&mut third);
+    terminate_aster(&mut second);
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", start)).is_err()
+            && TcpStream::connect(("127.0.0.1", start + 1)).is_err()
+    });
 }
 
 #[test]

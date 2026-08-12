@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -10,11 +10,14 @@ use crate::graph::TargetGraph;
 use crate::plugins::{PluginRegistry, Target};
 use crate::watch::WatchPlan;
 
+use super::port_allocator::{PortAllocator, PortLease};
+
 /// Fully resolved plan for one invocation of `aster services up`.
 pub struct DevPlan {
     pub services: Vec<ServicePlan>,
     pub ports: HashMap<String, u16>,
     pub control_port: Option<u16>,
+    _port_lease: PortLease,
 }
 
 /// One configured long-running service.
@@ -41,7 +44,7 @@ pub fn resolve_dev_plan(
         bail!("no services configured; add [dev.services.<name>] to aster.toml");
     }
 
-    let ports = resolve_dev_ports(workspace_root, config)?;
+    let selected = select_service_names(config, group)?;
     let group_control_port = match group {
         Some(group) => config
             .service_groups
@@ -52,8 +55,14 @@ pub fn resolve_dev_plan(
             .get("main")
             .and_then(|config| config.control_port()),
     };
-    let control_port = group_control_port
-        .or(config.control_port.as_deref())
+    let project_by_address: HashMap<String, &DiscoveredProject> = projects
+        .iter()
+        .map(|project| (format!("//{}", project.relative_path.display()), project))
+        .collect();
+    let selected_control_port = group_control_port.or(config.control_port.as_deref());
+    let active_ports = collect_active_ports(config, &selected, selected_control_port)?;
+    let (ports, port_lease) = allocate_dev_ports(workspace_root, config, &active_ports)?;
+    let control_port = selected_control_port
         .map(|name| {
             ports
                 .get(name)
@@ -61,13 +70,7 @@ pub fn resolve_dev_plan(
                 .ok_or_else(|| anyhow!("control_port references unknown service port '{name}'"))
         })
         .transpose()?;
-    let selected = select_service_names(config, group)?;
     let tls_open_urls = resolve_tls_open_urls(config, &selected, &ports)?;
-
-    let project_by_address: HashMap<String, &DiscoveredProject> = projects
-        .iter()
-        .map(|project| (format!("//{}", project.relative_path.display()), project))
-        .collect();
     let mut configured = config.services.iter().collect::<Vec<_>>();
     configured
         .sort_by(|(name_a, a), (name_b, b)| a.order.cmp(&b.order).then_with(|| name_a.cmp(name_b)));
@@ -100,9 +103,23 @@ pub fn resolve_dev_plan(
                 })?,
             );
         }
+        for (key, port_name) in &service.port_env {
+            let port = ports.get(port_name).ok_or_else(|| {
+                anyhow!(
+                    "service '{name}' port_env key '{key}' references unknown port '{port_name}'"
+                )
+            })?;
+            service_env.insert(key.clone(), port.to_string());
+        }
         service_env.insert("ASTER_SERVICE_NAME".to_string(), name.clone());
         if let Some(port) = port {
             service_env.insert("ASTER_SERVICE_PORT".to_string(), port.to_string());
+        }
+        if service.tls_proxy.is_some() {
+            service_env.insert(
+                "ASTER_RESOLVED_PORTS".to_string(),
+                serde_json::to_string(&ports).context("failed to encode resolved TLS ports")?,
+            );
         }
         validate_environment(name, &service_env)?;
 
@@ -210,6 +227,7 @@ pub fn resolve_dev_plan(
         services,
         ports,
         control_port,
+        _port_lease: port_lease,
     })
 }
 
@@ -297,6 +315,167 @@ fn select_service_names<'a>(
     Ok(selected)
 }
 
+fn collect_active_ports(
+    config: &DevWorkspaceConfig,
+    selected: &HashSet<&str>,
+    control_port: Option<&str>,
+) -> Result<HashSet<String>> {
+    let mut active = HashSet::new();
+    if let Some(port) = control_port {
+        active.insert(port.to_string());
+    }
+
+    for name in selected {
+        let service = &config.services[*name];
+        if let Some(port) = &service.port {
+            active.insert(port.clone());
+        }
+        active.extend(service.port_env.values().cloned());
+        // TLS routes consume upstream ports but do not own their listeners.
+        // They may intentionally point at services outside this supervisor.
+    }
+
+    // Derived ports depend on their offset source, which is part of the same
+    // atomic allocation bundle even when only the derived name is referenced.
+    let mut pending = active.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        let Some(DevPortConfig::Resolved(port)) = config.ports.get(&name) else {
+            continue;
+        };
+        if let Some(parent) = &port.offset_from {
+            if active.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
+        }
+    }
+    Ok(active)
+}
+
+fn allocate_dev_ports(
+    workspace_root: &Path,
+    config: &DevWorkspaceConfig,
+    active: &HashSet<String>,
+) -> Result<(HashMap<String, u16>, PortLease)> {
+    let file_env = load_env_files(workspace_root, &config.port_env_files)?;
+    validate_port_offsets(&config.ports)?;
+
+    for name in active {
+        if !config.ports.contains_key(name) {
+            bail!("selected services reference unknown port '{name}'");
+        }
+    }
+
+    let mut groups: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    for name in active {
+        let root = dynamic_root(name, &config.ports)?;
+        groups.entry(root).or_default().push(name.clone());
+    }
+    for names in groups.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+
+    let mut allocator = PortAllocator::lock()?;
+    // Resolution produces a complete named-port map. Seed roots that are not
+    // active in this run with deterministic display values; only active groups
+    // are probed and leased below.
+    let mut dynamic_values = config
+        .ports
+        .iter()
+        .filter_map(|(name, port)| match port {
+            DevPortConfig::Dynamic(dynamic) => {
+                Some((name.clone(), dynamic.preferred.unwrap_or(dynamic.range[0])))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+
+    if let Some(static_names) = groups.remove(&None) {
+        let bundle =
+            resolve_named_bundle(&config.ports, &file_env, &dynamic_values, &static_names)?;
+        if !bundle.is_empty() && !allocator.try_bundle(workspace_root, &bundle)? {
+            bail!(
+                "configured static service ports are already allocated or listening: {}",
+                format_named_ports(&bundle)
+            );
+        }
+    }
+
+    for (root, names) in groups {
+        let root = root.expect("dynamic groups have a root");
+        let DevPortConfig::Dynamic(dynamic) = &config.ports[&root] else {
+            unreachable!("dynamic_root returns only dynamic port names");
+        };
+        let mut candidates = Vec::new();
+        if let Some(preferred) = dynamic.preferred {
+            candidates.push(preferred);
+        }
+        candidates.extend(dynamic.range[0]..=dynamic.range[1]);
+        candidates.dedup();
+
+        let mut selected = None;
+        for candidate in candidates {
+            dynamic_values.insert(root.clone(), candidate);
+            let bundle = resolve_named_bundle(&config.ports, &file_env, &dynamic_values, &names)?;
+            if allocator.try_bundle(workspace_root, &bundle)? {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        let Some(value) = selected else {
+            bail!(
+                "no collision-free port bundle is available for dynamic port '{root}' in range {}-{}",
+                dynamic.range[0],
+                dynamic.range[1]
+            );
+        };
+        dynamic_values.insert(root, value);
+    }
+
+    let ports = resolve_ports(&config.ports, &file_env, &dynamic_values)?;
+    Ok((ports, allocator.finish()))
+}
+
+fn dynamic_root(name: &str, configs: &HashMap<String, DevPortConfig>) -> Result<Option<String>> {
+    let mut current = name;
+    loop {
+        match configs
+            .get(current)
+            .ok_or_else(|| anyhow!("unknown service port '{current}'"))?
+        {
+            DevPortConfig::Dynamic(_) => return Ok(Some(current.to_string())),
+            DevPortConfig::Resolved(config) => {
+                let Some(parent) = config.offset_from.as_deref() else {
+                    return Ok(None);
+                };
+                current = parent;
+            }
+            DevPortConfig::Fixed(_) => return Ok(None),
+        }
+    }
+}
+
+fn resolve_named_bundle(
+    configs: &HashMap<String, DevPortConfig>,
+    file_env: &HashMap<String, String>,
+    dynamic_values: &HashMap<String, u16>,
+    names: &[String],
+) -> Result<BTreeMap<String, u16>> {
+    let resolved = resolve_ports(configs, file_env, dynamic_values)?;
+    names
+        .iter()
+        .map(|name| Ok((name.clone(), resolved[name])))
+        .collect()
+}
+
+fn format_named_ports(ports: &BTreeMap<String, u16>) -> String {
+    ports
+        .iter()
+        .map(|(name, port)| format!("{name}={port}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve the named development ports without requiring service targets.
 ///
 /// This is intentionally separate from [`resolve_dev_plan`] so maintenance
@@ -306,7 +485,34 @@ pub fn resolve_dev_ports(
     config: &DevWorkspaceConfig,
 ) -> Result<HashMap<String, u16>> {
     let port_file_env = load_env_files(workspace_root, &config.port_env_files)?;
-    resolve_ports(&config.ports, &port_file_env)
+    let dynamic_values = config
+        .ports
+        .iter()
+        .filter_map(|(name, port)| match port {
+            DevPortConfig::Dynamic(config) => {
+                Some((name.clone(), config.preferred.unwrap_or(config.range[0])))
+            }
+            _ => None,
+        })
+        .collect();
+    resolve_ports(&config.ports, &port_file_env, &dynamic_values)
+}
+
+/// Resolve only ports whose value does not depend on a dynamic allocation.
+/// Maintenance commands must not guess a dynamic run's current value.
+pub fn resolve_static_dev_ports(
+    workspace_root: &Path,
+    config: &DevWorkspaceConfig,
+) -> Result<HashMap<String, u16>> {
+    let resolved = resolve_dev_ports(workspace_root, config)?;
+    resolved
+        .into_iter()
+        .filter_map(|(name, port)| match dynamic_root(&name, &config.ports) {
+            Ok(None) => Some(Ok((name, port))),
+            Ok(Some(_)) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn validate_environment(service: &str, environment: &HashMap<String, String>) -> Result<()> {
@@ -366,6 +572,7 @@ fn load_env_files(workspace_root: &Path, files: &[String]) -> Result<HashMap<Str
 fn resolve_ports(
     configs: &HashMap<String, DevPortConfig>,
     file_env: &HashMap<String, String>,
+    dynamic_values: &HashMap<String, u16>,
 ) -> Result<HashMap<String, u16>> {
     validate_port_offsets(configs)?;
     let mut resolved: HashMap<String, u16> = HashMap::new();
@@ -377,6 +584,11 @@ fn resolve_ports(
             let config = &configs[name];
             let value = match config {
                 DevPortConfig::Fixed(value) => Some(*value),
+                DevPortConfig::Dynamic(_) => Some(
+                    *dynamic_values
+                        .get(name)
+                        .ok_or_else(|| anyhow!("dynamic port '{name}' has not been allocated"))?,
+                ),
                 DevPortConfig::Resolved(config) => {
                     let process_value = config
                         .env
@@ -442,6 +654,20 @@ fn resolve_ports(
 
 fn validate_port_offsets(configs: &HashMap<String, DevPortConfig>) -> Result<()> {
     for (name, config) in configs {
+        if let DevPortConfig::Dynamic(config) = config {
+            let [start, end] = config.range;
+            if start == 0 || start > end {
+                bail!("dynamic port '{name}' range must contain valid ports in ascending order");
+            }
+            if let Some(preferred) = config.preferred {
+                if preferred < start || preferred > end {
+                    bail!(
+                        "dynamic port '{name}' preferred value {preferred} is outside range {start}-{end}"
+                    );
+                }
+            }
+            continue;
+        }
         let DevPortConfig::Resolved(config) = config else {
             continue;
         };
@@ -453,7 +679,10 @@ fn validate_port_offsets(configs: &HashMap<String, DevPortConfig>) -> Result<()>
         }
         let mut current = name.as_str();
         let mut seen = HashSet::new();
-        while let DevPortConfig::Resolved(current_config) = &configs[current] {
+        loop {
+            let DevPortConfig::Resolved(current_config) = &configs[current] else {
+                break;
+            };
             let Some(next) = current_config.offset_from.as_deref() else {
                 break;
             };
@@ -507,6 +736,7 @@ mod tests {
             open_path: None,
             env_files: Vec::new(),
             env: HashMap::new(),
+            port_env: HashMap::new(),
             inherit_env: Vec::new(),
             order: 0,
         }
@@ -542,6 +772,7 @@ mod tests {
             open_path: None,
             env_files: Vec::new(),
             env: HashMap::new(),
+            port_env: HashMap::new(),
             inherit_env: Vec::new(),
             order: 0,
         };
@@ -567,7 +798,7 @@ mod tests {
             ..DevWorkspaceConfig::default()
         };
         let selected = select_service_names(&config, Some("intern")).unwrap();
-        let ports = resolve_ports(&config.ports, &HashMap::new()).unwrap();
+        let ports = resolve_ports(&config.ports, &HashMap::new(), &HashMap::new()).unwrap();
 
         let open_urls = resolve_tls_open_urls(&config, &selected, &ports).unwrap();
         assert_eq!(open_urls["frontend"], "https://intern.dev:8443");
@@ -666,7 +897,7 @@ mod tests {
             ..DevWorkspaceConfig::default()
         };
 
-        let ports = resolve_ports(&config.ports, &HashMap::new()).unwrap();
+        let ports = resolve_ports(&config.ports, &HashMap::new(), &HashMap::new()).unwrap();
         let selected = config.service_groups["intern"].control_port();
         assert_eq!(selected.and_then(|name| ports.get(name)), Some(&5001));
     }
@@ -678,6 +909,7 @@ mod tests {
             (
                 "web".to_string(),
                 DevPortConfig::Resolved(ResolvedDevPortConfig {
+                    allocation: None,
                     env: vec![],
                     file_env: None,
                     default: 3300,
@@ -687,7 +919,7 @@ mod tests {
                 }),
             ),
         ]);
-        let ports = resolve_ports(&configs, &HashMap::new()).unwrap();
+        let ports = resolve_ports(&configs, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(ports["web"], 3304);
         assert_eq!(
             expand_template("serve {port} --api {ports.api}", Some(3304), &ports).unwrap(),
@@ -702,6 +934,40 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_resolution_excludes_dynamic_bundles() {
+        let config = DevWorkspaceConfig {
+            ports: HashMap::from([
+                (
+                    "dynamic".to_string(),
+                    DevPortConfig::Dynamic(crate::config::DynamicDevPortConfig {
+                        allocation: crate::config::DynamicPortAllocation::Dynamic,
+                        range: [4000, 4099],
+                        preferred: Some(4000),
+                    }),
+                ),
+                (
+                    "derived".to_string(),
+                    DevPortConfig::Resolved(ResolvedDevPortConfig {
+                        allocation: None,
+                        env: vec![],
+                        file_env: None,
+                        default: 3000,
+                        offset_from: Some("dynamic".to_string()),
+                        offset_base: Some(4000),
+                        saturating_offset: false,
+                    }),
+                ),
+                ("static".to_string(), DevPortConfig::Fixed(5432)),
+            ]),
+            ..DevWorkspaceConfig::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+
+        let ports = resolve_static_dev_ports(root.path(), &config).unwrap();
+        assert_eq!(ports, HashMap::from([("static".to_string(), 5432)]));
+    }
+
+    #[test]
     fn rejects_invalid_derived_port_ranges() {
         for (base, default, expected) in [
             (3999, 3300, "below offset_base"),
@@ -712,6 +978,7 @@ mod tests {
                 (
                     "web".to_string(),
                     DevPortConfig::Resolved(ResolvedDevPortConfig {
+                        allocation: None,
                         env: vec![],
                         file_env: None,
                         default,
@@ -721,7 +988,7 @@ mod tests {
                     }),
                 ),
             ]);
-            let error = resolve_ports(&configs, &HashMap::new()).unwrap_err();
+            let error = resolve_ports(&configs, &HashMap::new(), &HashMap::new()).unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
         }
     }
@@ -729,7 +996,7 @@ mod tests {
     #[test]
     fn rejects_zero_named_port() {
         let configs = HashMap::from([("control".to_string(), DevPortConfig::Fixed(0))]);
-        let error = resolve_ports(&configs, &HashMap::new()).unwrap_err();
+        let error = resolve_ports(&configs, &HashMap::new(), &HashMap::new()).unwrap_err();
         assert!(error.to_string().contains("between 1 and 65535"));
     }
 
@@ -740,6 +1007,7 @@ mod tests {
             (
                 "web".to_string(),
                 DevPortConfig::Resolved(ResolvedDevPortConfig {
+                    allocation: None,
                     env: vec![],
                     file_env: None,
                     default: 3300,
@@ -749,7 +1017,7 @@ mod tests {
                 }),
             ),
         ]);
-        let ports = resolve_ports(&configs, &HashMap::new()).unwrap();
+        let ports = resolve_ports(&configs, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(ports["web"], 3300);
     }
 
@@ -759,6 +1027,7 @@ mod tests {
         let configs = HashMap::from([(
             "api".to_string(),
             DevPortConfig::Resolved(ResolvedDevPortConfig {
+                allocation: None,
                 env: vec![key.to_string()],
                 file_env: Some(vec![]),
                 default: 4100,
@@ -769,13 +1038,14 @@ mod tests {
         )]);
         let file_env = HashMap::from([(key.to_string(), "4200".to_string())]);
 
-        let ports = resolve_ports(&configs, &file_env).unwrap();
+        let ports = resolve_ports(&configs, &file_env, &HashMap::new()).unwrap();
         assert_eq!(ports["api"], 4100);
     }
 
     #[test]
     fn validates_offset_graph_before_considering_overrides() {
         let malformed = ResolvedDevPortConfig {
+            allocation: None,
             env: vec!["PORT_OVERRIDE".to_string()],
             file_env: None,
             default: 3300,
@@ -789,6 +1059,7 @@ mod tests {
 
         let cyclic = |next: &str| {
             DevPortConfig::Resolved(ResolvedDevPortConfig {
+                allocation: None,
                 env: vec![],
                 file_env: None,
                 default: 3000,
