@@ -25,7 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-      - run: cargo test --locked --all-targets --all-features
+      # macOS process/listener integration tests contend heavily when libtest
+      # launches them together; run that runner serially to avoid port races
+      # and supervisor startup starvation. Linux remains parallel.
+      - if: runner.os == 'macOS'
+        run: cargo test --locked --all-targets --all-features -- --test-threads=1
+      - if: runner.os != 'macOS'
+        run: cargo test --locked --all-targets --all-features
       - run: scripts/test-dynamic-service-ports
 
   quality:
