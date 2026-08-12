@@ -222,13 +222,13 @@ env = {
       <div><b>1 · Select</b><small>Resolve group and collect its complete named-port dependency set.</small></div>
       <div><b>2 · Lock</b><small>Take the host-level allocator mutex shared by every local Aster process.</small></div>
       <div><b>3 · Claim</b><small>Try candidates deterministically; exclude locked, listening, and wildcard-bound ports.</small></div>
-      <div><b>4 · Run</b><small>Hold per-port lease file handles while building the plan and supervising children.</small></div>
-      <div><b>5 · Release</b><small>Drop leases after child teardown; the OS releases leases if the supervisor crashes.</small></div>
+      <div><b>4 · Run</b><small>Hold per-port leases and a worktree-scoped allocation manifest while supervising children.</small></div>
+      <div><b>5 · Release</b><small>Remove the manifest after child teardown; retain it for orphan recovery if the supervisor crashes.</small></div>
     </div>
     <ol class="rules" style="margin-top:18px">
       <li><b>Location:</b> a per-user runtime directory shared across repositories, not a worktree directory. Ports occupy a host-global namespace, so a repo-local lock is insufficient.</li>
       <li><b>Atomicity:</b> claim static ports, dynamic roots, and derived ports as one sorted bundle while holding the allocator mutex. On any failure, release the partial bundle.</li>
-      <li><b>Crash safety:</b> one lock file per port is held for the supervisor lifetime. A stale metadata record is advisory; an unlocked lease is reclaimable. If a force-killed supervisor leaves an orphan listener, availability probes continue excluding its port.</li>
+      <li><b>Crash safety:</b> one lock file per port is held for the supervisor lifetime. The OS releases locks after a crash, while the durable allocation manifest retains the named bundle. <code>services kill-ports</code> can then discover orphan listeners by name and removes the manifest only after its bundle is unlocked and free.</li>
       <li><b>Availability:</b> lock ownership prevents Aster-versus-Aster races. A loopback connect plus wildcard bind probe rejects listeners and bound sockets owned by other programs. Arbitrary services cannot eliminate the final external bind race without socket activation.</li>
       <li><b>Restarts:</b> service restarts retain the same lease. The allocation ends only when the owning <code>services up</code> supervisor finishes.</li>
     </ol>

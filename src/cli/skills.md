@@ -257,7 +257,8 @@ aster services kill-ports
 aster services kill-ports api web 4011
 ```
 
-Named ports come from `[dev.ports]`. Explicit numeric ports can be inspected or
+Named ports come from `[dev.ports]` and this worktree's active or crash-left
+dynamic allocation manifests. Explicit numeric ports can be inspected or
 cleared outside an Aster workspace.
 
 ## Read target logs and manage the cache

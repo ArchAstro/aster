@@ -435,9 +435,6 @@ pub fn run_dev(
     drop(durable_log_tx);
     let _ = durable_log_handle.join();
     drop(control);
-    if let Some(signal) = executor::shutdown_signal() {
-        std::process::exit(128 + signal);
-    }
     run_result?;
     Ok(())
 }

@@ -433,7 +433,7 @@ fn allocate_dev_ports(
     }
 
     let ports = resolve_ports(&config.ports, &file_env, &dynamic_values)?;
-    Ok((ports, allocator.finish()))
+    Ok((ports, allocator.finish(workspace_root)?))
 }
 
 fn dynamic_root(name: &str, configs: &HashMap<String, DevPortConfig>) -> Result<Option<String>> {

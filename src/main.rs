@@ -75,10 +75,13 @@ fn run() -> Result<()> {
     {
         if !ports.is_empty() && ports.iter().all(|port| port.parse::<u16>().is_ok()) {
             let selected = aster::dev::resolve_port_selection(&HashMap::new(), ports)?;
-            return aster::dev::kill_ports(
-                &selected,
-                aster::dev::KillPortsOptions { dry_run: *dry_run },
-            );
+            let options = aster::dev::KillPortsOptions { dry_run: *dry_run };
+            return match find_workspace_root(&cwd) {
+                Some(workspace_root) => {
+                    aster::dev::kill_workspace_ports(&workspace_root, &selected, options)
+                }
+                None => aster::dev::kill_ports(&selected, options),
+            };
         }
     }
 
@@ -1023,8 +1026,16 @@ fn run() -> Result<()> {
                 let workspace_config = WorkspaceConfig::load(&workspace_root)?;
                 let configured =
                     aster::dev::resolve_static_dev_ports(&workspace_root, &workspace_config.dev)?;
-                let selected = aster::dev::resolve_port_selection(&configured, &ports)?;
-                aster::dev::kill_ports(&selected, aster::dev::KillPortsOptions { dry_run })?;
+                let selected = aster::dev::resolve_workspace_port_selection(
+                    &workspace_root,
+                    &configured,
+                    &ports,
+                )?;
+                aster::dev::kill_workspace_ports(
+                    &workspace_root,
+                    &selected,
+                    aster::dev::KillPortsOptions { dry_run },
+                )?;
             }
             ServicesCommands::Logs { .. } => unreachable!("service logs handled before discovery"),
             ServicesCommands::Tls { .. } => unreachable!("TLS commands handled before discovery"),

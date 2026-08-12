@@ -331,8 +331,8 @@ Clear stale or orphaned processes from development ports before starting the
 stack again:
 
 ```console
-aster services kill-ports --dry-run     # inspect every configured port
-aster services kill-ports               # clean every configured port
+aster services kill-ports --dry-run     # inspect every known worktree port
+aster services kill-ports               # clean every known worktree port
 aster services kill-ports api web 4011  # clean named and explicit ports
 ```
 
@@ -469,9 +469,11 @@ explicitly. A dynamic root uses `allocation = "dynamic"`, an inclusive `range`,
 and an optional `preferred` candidate. Aster atomically claims the root and its
 selected derived ports, skips ports leased by another Aster supervisor or bound
 by another process, and holds the leases until the supervisor exits.
-Dynamic allocations are released automatically and are therefore excluded from
-the configured-name set used by `services kill-ports`; explicit numeric cleanup
-remains available when diagnosing a non-Aster listener.
+Each supervisor also writes a worktree-scoped allocation manifest. Normal
+shutdown removes it after child teardown. If the supervisor crashes and leaves
+an orphan listener, `services kill-ports` uses the retained manifest to resolve
+dynamic names and removes it after the complete recorded bundle is free.
+Explicit numeric cleanup remains available for non-Aster listeners.
 
 `port_env_files` participate only in static named-port resolution. A service receives
 only a small process baseline (`PATH`, home/user, temporary-directory, locale,

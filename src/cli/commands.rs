@@ -288,7 +288,7 @@ pub enum ServicesCommands {
 
     /// Terminate processes listening on configured or specified ports
     KillPorts {
-        /// Port numbers or names from `[dev.ports]` (defaults to all configured ports)
+        /// Port numbers or configured/allocated names (defaults to all known workspace ports)
         ports: Vec<String>,
 
         /// Show matching processes without terminating them

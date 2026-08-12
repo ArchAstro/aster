@@ -34,6 +34,20 @@ fn occurrences(path: &Path, needle: &str) -> usize {
         .count()
 }
 
+fn allocation_manifest_count(lease_dir: &Path) -> usize {
+    fs::read_dir(lease_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("allocation-") && name.ends_with(".json"))
+        })
+        .count()
+}
+
 fn process_is_running(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } == -1 {
         return false;
@@ -267,6 +281,7 @@ stream = true
             .contains(&format!("{start}:{derived_start}"))
             && TcpStream::connect(("127.0.0.1", start)).is_ok()
     });
+    assert_eq!(allocation_manifest_count(&lease_dir), 1);
 
     let mut second = launch();
     wait_until(Duration::from_secs(20), || {
@@ -275,12 +290,14 @@ stream = true
             .contains(&format!("{}:{}", start + 1, derived_start + 1))
             && TcpStream::connect(("127.0.0.1", start + 1)).is_ok()
     });
+    assert_eq!(allocation_manifest_count(&lease_dir), 2);
     assert!(first.try_wait().unwrap().is_none());
     assert!(second.try_wait().unwrap().is_none());
 
     terminate_aster(&mut first);
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_err()
+            && allocation_manifest_count(&lease_dir) == 1
     });
 
     let previous = occurrences(&events, &format!("{start}:{derived_start}"));
@@ -295,7 +312,129 @@ stream = true
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_err()
             && TcpStream::connect(("127.0.0.1", start + 1)).is_err()
+            && allocation_manifest_count(&lease_dir) == 0
     });
+}
+
+#[test]
+fn kill_ports_recovers_dynamic_listener_after_supervisor_crash() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports.http]
+allocation = "dynamic"
+range = [{port}, {port}]
+
+[dev.services.web]
+target = "//app:dev"
+port = "http"
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.dev]
+command = "python3 -m http.server {port}"
+stream = true
+"#,
+    )
+    .unwrap();
+
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && allocation_manifest_count(&lease_dir) == 1
+    });
+
+    let active_preview = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports", "http", "--dry-run"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(active_preview.status.success());
+    assert!(String::from_utf8_lossy(&active_preview.stdout).contains("Would terminate"));
+    assert!(supervisor.try_wait().unwrap().is_none());
+
+    // SIGKILL bypasses PortLease::drop, reproducing a supervisor crash while
+    // its independently running service process remains alive.
+    supervisor.kill().unwrap();
+    supervisor.wait().unwrap();
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    assert_eq!(allocation_manifest_count(&lease_dir), 1);
+
+    let other_workspace = temp.path().join("other-worktree");
+    fs::create_dir(&other_workspace).unwrap();
+    fs::create_dir(other_workspace.join(".git")).unwrap();
+    fs::write(
+        other_workspace.join("aster.toml"),
+        format!("[dev.ports.http]\nallocation = \"dynamic\"\nrange = [{port}, {port}]\n"),
+    )
+    .unwrap();
+    let isolated = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports", "http", "--dry-run"])
+        .current_dir(&other_workspace)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(!isolated.status.success());
+    assert!(String::from_utf8_lossy(&isolated.stderr).contains("unknown configured or allocated"));
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+
+    let preview = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports", "http", "--dry-run"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("Would terminate"));
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+    assert_eq!(allocation_manifest_count(&lease_dir), 1);
+
+    let cleanup = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "kill-ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(
+        cleanup.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", port)).is_err()
+            && allocation_manifest_count(&lease_dir) == 0
+    });
+    assert!(String::from_utf8_lossy(&cleanup.stdout).contains("Cleared"));
 }
 
 #[test]
