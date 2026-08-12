@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aster Dynamic Service Ports</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d12;
+      --panel: #131720;
+      --panel-2: #191f2b;
+      --text: #edf1f7;
+      --muted: #9ca8ba;
+      --line: #2b3444;
+      --accent: #86efac;
+      --accent-2: #7dd3fc;
+      --warn: #fbbf24;
+      --danger: #fb7185;
+      --code: #090b10;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 90% 0%, rgba(125, 211, 252, .11), transparent 28rem),
+        radial-gradient(circle at 0% 20%, rgba(134, 239, 172, .08), transparent 24rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 80px; }
+    h1, h2, h3 { line-height: 1.15; letter-spacing: -.025em; }
+    h1 { max-width: 840px; margin: 12px 0 16px; font-size: clamp(34px, 6vw, 64px); }
+    h2 { margin: 0 0 18px; font-size: 28px; }
+    h3 { margin: 0 0 8px; font-size: 17px; }
+    p { margin: 0; }
+    code { color: #d8f7e2; }
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--code);
+      color: #dce7f5;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    .eyebrow { color: var(--accent); font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .lede { max-width: 820px; color: var(--muted); font-size: 18px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid rgba(134, 239, 172, .35);
+      border-radius: 999px;
+      background: rgba(134, 239, 172, .08);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 750;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .summary, section {
+      margin-top: 32px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(19, 23, 32, .94);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, .2);
+    }
+    .summary { display: grid; grid-template-columns: repeat(3, 1fr); overflow: hidden; }
+    .summary > div { min-height: 132px; padding: 22px; }
+    .summary > div + div { border-left: 1px solid var(--line); }
+    .summary strong { display: block; margin-bottom: 8px; color: var(--accent-2); font-size: 19px; }
+    .summary span, .muted { color: var(--muted); }
+    section { padding: 26px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .card { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-2); }
+    .card.recommended { border-color: rgba(134, 239, 172, .55); box-shadow: inset 3px 0 var(--accent); }
+    .number { color: var(--accent-2); font: 750 13px ui-monospace, monospace; }
+    .tradeoff { margin-top: 10px; color: var(--muted); }
+    .decision { margin-top: 16px; padding: 16px 18px; border-left: 3px solid var(--accent); background: rgba(134, 239, 172, .07); }
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 16px; }
+    .flow div { position: relative; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+    .flow b { display: block; color: var(--accent-2); }
+    .flow small { color: var(--muted); }
+    .rules { margin: 0; padding-left: 22px; }
+    .rules li + li { margin-top: 8px; }
+    .tasks { display: grid; gap: 12px; counter-reset: task; }
+    .task { display: grid; grid-template-columns: 42px 1fr auto; gap: 12px; align-items: start; padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-2); }
+    .task::before { counter-increment: task; content: counter(task); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: rgba(125, 211, 252, .1); color: var(--accent-2); font-weight: 800; }
+    .task p { color: var(--muted); }
+    .status { padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--warn); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .acceptance { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 14px; }
+    .check { padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+    .check::before { content: "✓"; margin-right: 9px; color: var(--accent); font-weight: 900; }
+    .risk { color: var(--danger); }
+    @media (max-width: 800px) {
+      main { width: min(100% - 20px, 1120px); padding-top: 28px; }
+      .summary, .grid, .acceptance { grid-template-columns: 1fr; }
+      .summary > div + div { border-left: 0; border-top: 1px solid var(--line); }
+      .flow { grid-template-columns: 1fr; }
+      .task { grid-template-columns: 38px 1fr; }
+      .status { grid-column: 2; justify-self: start; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <span class="badge">Decision spec · proposed</span>
+  <h1>Aster-owned dynamic service ports</h1>
+  <p class="lede">Allocate one collision-free port bundle per <code>aster services up</code> run, hold OS-backed leases for the supervisor lifetime, and inject the resolved values into every service without generating worktree-specific env files.</p>
+
+  <div class="summary">
+    <div><strong>DSL</strong><span>Extend named ports with <code>allocation = "dynamic"</code>; preserve every existing static form.</span></div>
+    <div><strong>Coordination</strong><span>Serialize allocation with a host-level lock and hold per-port lease locks until shutdown.</span></div>
+    <div><strong>Propagation</strong><span>Add typed <code>port_env</code> for numeric values; retain templates for composed strings and URLs.</span></div>
+  </div>
+
+  <section>
+    <h2>1. Decision options</h2>
+    <div class="grid">
+      <article class="card recommended">
+        <div class="number">OPTION 1 · RECOMMENDED</div>
+        <h3>Extend the existing named-port model</h3>
+        <p>Dynamic ports become a new resolution mode. Services continue referencing stable global port names, so current control ports, TLS routes, offsets, cleanup, and templates remain one model.</p>
+        <p class="tradeoff"><b>Tradeoff:</b> port ownership remains conventional rather than nested under a service. Cost: medium, approximately 2–4 engineering days plus FirstLanding smoke coverage.</p>
+      </article>
+      <article class="card">
+        <div class="number">OPTION 2</div>
+        <h3>Move ports under services</h3>
+        <p>Declare <code>[dev.services.platform.ports.http]</code> and reference <code>{services.platform.ports.http}</code>. Ownership is explicit, but control/TLS ports need a second model and FirstLanding requires a broad rewrite.</p>
+        <p class="tradeoff"><b>Tradeoff:</b> conceptually pure but duplicates today’s named-port graph. Cost: high, approximately 5–8 days.</p>
+      </article>
+      <article class="card">
+        <div class="number">OPTION 3</div>
+        <h3>Add first-class allocation slots</h3>
+        <p>Allocate a worktree slot and derive every port from a configured base plus offsets. This mirrors FirstLanding’s historical port bands.</p>
+        <p class="tradeoff"><b>Tradeoff:</b> compact for one monorepo, but one overlooked listener recreates the current collision class. Cost: medium, approximately 3–5 days.</p>
+      </article>
+      <article class="card">
+        <div class="number">EXEMPLAR</div>
+        <h3>FirstLanding’s atomic bundle allocator</h3>
+        <p>Reuse its strongest properties: one locked allocation transaction, complete bundles, real bind checks, and generated environment overrides.</p>
+        <p class="tradeoff"><b>Intentional deviation:</b> Aster leases ports only while the supervisor lives; it does not persist allocations for the lifetime of a Git worktree.</p>
+      </article>
+    </div>
+    <div class="decision"><b>Recommendation:</b> Option 1. The current named-port graph already expresses FirstLanding’s cross-service wiring; dynamic resolution and typed injection fill the two missing capabilities without creating a parallel port system.</div>
+  </section>
+
+  <section>
+    <h2>2. Proposed DSL</h2>
+    <pre><code># Existing forms remain static and backward compatible.
+[dev.ports.postgres]
+env = "POSTGRES_PORT"
+default = 5432
+
+# A dynamic root selects a free value from an inclusive range.
+[dev.ports.platform]
+allocation = "dynamic"
+range = [4000, 4999]
+preferred = 4000
+
+# Existing offsets form an atomic bundle with their dynamic root.
+[dev.ports.developer-portal]
+default = 3300
+offset_from = "platform"
+offset_base = 4000
+
+[dev.ports.grpc-auth]
+allocation = "dynamic"
+range = [51000, 51999]
+preferred = 51001
+
+[dev.ports.grpc-admin]
+default = 52001
+offset_from = "grpc-auth"
+offset_base = 51001
+
+[dev.services.platform]
+target = "//services/platform:dev"
+port = "platform"
+port_env = {
+  PHX_PORT = "platform",
+  GRPC_AUTH_PORT = "grpc-auth",
+  GRPC_ADMIN_PORT = "grpc-admin"
+}
+
+[dev.services.developer-portal]
+target = "//services/developer-portal:dev"
+port = "developer-portal"
+port_env = {
+  PORT = "developer-portal",
+  GRPC_AUTH_PORT = "grpc-auth"
+}
+env = {
+  PLATFORM_API_URL = "http://localhost:{ports.platform}"
+}</code></pre>
+    <div class="grid" style="margin-top:14px">
+      <div class="card"><h3>Static mode</h3><p class="muted">An integer or existing detailed definition is static. <code>allocation = "static"</code> may be accepted explicitly but is never required.</p></div>
+      <div class="card"><h3>Dynamic mode</h3><p class="muted"><code>range</code> is required; <code>preferred</code> is optional and tried first. Dynamic definitions reject <code>env</code>, <code>file_env</code>, and <code>offset_from</code>.</p></div>
+      <div class="card"><h3>Derived ports</h3><p class="muted">A static offset may depend on a dynamic root. The allocator evaluates and claims the entire transitive bundle before committing any port.</p></div>
+      <div class="card"><h3>Environment values</h3><p class="muted"><code>port_env</code> maps a variable directly to a named port. Existing <code>{port}</code> and <code>{ports.name}</code> templates remain for composite values.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. Cross-service semantics</h2>
+    <ol class="rules">
+      <li><b>Named ports are the contract.</b> Producers and consumers reference the same name; Aster does not infer ownership from target dependencies.</li>
+      <li><b><code>port_env</code> is typed.</b> Its value must be an existing named port and is injected as a decimal string after allocation. It overrides values loaded from the service’s <code>env_files</code>.</li>
+      <li><b><code>env</code> still wins over <code>env_files</code>.</b> It expands <code>{port}</code> and <code>{ports.name}</code> after allocation. A duplicate key in both <code>port_env</code> and <code>env</code> is a configuration error.</li>
+      <li><b>Selection remains explicit.</b> Referencing another service’s port does not silently start that service. Groups must continue listing the services they run.</li>
+      <li><b>Only owned listeners are claimed.</b> Claim selected services’ primary ports, their <code>port_env</code> declarations, and the selected control port. Templates and TLS upstream routes consume resolved values without claiming external listeners.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>4. Allocation lifecycle</h2>
+    <div class="flow">
+      <div><b>1 · Select</b><small>Resolve group and collect its complete named-port dependency set.</small></div>
+      <div><b>2 · Lock</b><small>Take the host-level allocator mutex shared by every local Aster process.</small></div>
+      <div><b>3 · Claim</b><small>Try candidates deterministically; exclude locked, listening, and wildcard-bound ports.</small></div>
+      <div><b>4 · Run</b><small>Hold per-port lease file handles while building the plan and supervising children.</small></div>
+      <div><b>5 · Release</b><small>Drop leases after child teardown; the OS releases leases if the supervisor crashes.</small></div>
+    </div>
+    <ol class="rules" style="margin-top:18px">
+      <li><b>Location:</b> a per-user runtime directory shared across repositories, not a worktree directory. Ports occupy a host-global namespace, so a repo-local lock is insufficient.</li>
+      <li><b>Atomicity:</b> claim static ports, dynamic roots, and derived ports as one sorted bundle while holding the allocator mutex. On any failure, release the partial bundle.</li>
+      <li><b>Crash safety:</b> one lock file per port is held for the supervisor lifetime. A stale metadata record is advisory; an unlocked lease is reclaimable. If a force-killed supervisor leaves an orphan listener, availability probes continue excluding its port.</li>
+      <li><b>Availability:</b> lock ownership prevents Aster-versus-Aster races. A loopback connect plus wildcard bind probe rejects listeners and bound sockets owned by other programs. Arbitrary services cannot eliminate the final external bind race without socket activation.</li>
+      <li><b>Restarts:</b> service restarts retain the same lease. The allocation ends only when the owning <code>services up</code> supervisor finishes.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>5. Implementation tasks</h2>
+    <div class="tasks">
+      <article class="task"><div><h3>Configuration and validation</h3><p>Extend <code>DevPortConfig</code> with dynamic roots; add <code>port_env</code>; validate ranges, preferred values, incompatible fields, unknown references, duplicates, cycles, and overflow.</p></div><span class="status">Complete</span></article>
+      <article class="task"><div><h3>Port dependency collection</h3><p>Separate listener ownership from consumer-only templates and TLS routes so disjoint groups do not reserve external or unrelated ports.</p></div><span class="status">Complete</span></article>
+      <article class="task"><div><h3>Host allocator and lifetime leases</h3><p>Add <code>src/dev/port_allocator.rs</code> using the existing <code>fs2</code> locking dependency, deterministic candidate order, availability probes, atomic rollback, metadata, and RAII cleanup.</p></div><span class="status">Complete</span></article>
+      <article class="task"><div><h3>Plan and runner integration</h3><p>Make <code>DevPlan</code> own the lease guard; expand templates and <code>port_env</code> only after allocation; retain leases across restarts and release after process-tree shutdown.</p></div><span class="status">Complete</span></article>
+      <article class="task"><div><h3>Aster tests</h3><p>Cover static compatibility, concurrent allocators, atomic derived bundles, cleanup, env precedence, and cross-service references.</p></div><span class="status">Complete</span></article>
+      <article class="task"><div><h3>FirstLanding integration</h3><p>Convert platform, gRPC auth, scrape gRPC, and dashboard roots to dynamic ranges; keep existing derived ports; replace generated port env overrides with <code>port_env</code>; verify live and concurrent allocations.</p></div><span class="status">Complete</span></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>6. Acceptance gates</h2>
+    <div class="acceptance">
+      <div class="check">Existing static configurations resolve exactly as before.</div>
+      <div class="check">Two simultaneous Aster runs cannot claim the same port.</div>
+      <div class="check">Dynamic roots and every derived port commit atomically.</div>
+      <div class="check">Normal exit and crash both make allocations reclaimable.</div>
+      <div class="check">Service env files cannot overwrite allocated <code>port_env</code> values.</div>
+      <div class="check">Consumers receive dependent named ports and composed URLs correctly.</div>
+      <div class="check">Concurrent service groups reserve only their required port closure.</div>
+      <div class="check">A live FirstLanding stack and a concurrent allocation plan receive disjoint bundles.</div>
+    </div>
+    <p class="risk" style="margin-top:18px"><b>Non-goal:</b> socket activation for arbitrary child processes. Aster guarantees conflict freedom among cooperating Aster supervisors and rejects already-bound external ports; it cannot transfer pre-bound sockets to frameworks that do not support it.</p>
+  </section>
+</main>
+</body>
+</html>

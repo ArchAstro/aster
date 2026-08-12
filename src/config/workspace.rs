@@ -60,6 +60,23 @@ pub struct DevWorkspaceConfig {
 
 impl DevWorkspaceConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        for (name, port) in &self.ports {
+            if let DevPortConfig::Dynamic(port) = port {
+                let [start, end] = port.range;
+                if start == 0 || start > end {
+                    bail!(
+                        "dynamic port '{name}' range must contain valid ports in ascending order"
+                    );
+                }
+                if let Some(preferred) = port.preferred {
+                    if preferred < start || preferred > end {
+                        bail!(
+                            "dynamic port '{name}' preferred value {preferred} is outside range {start}-{end}"
+                        );
+                    }
+                }
+            }
+        }
         for (group, group_config) in &self.service_groups {
             if group.trim().is_empty() {
                 bail!("service group names cannot be empty");
@@ -86,6 +103,19 @@ impl DevWorkspaceConfig {
             }
         }
         for (name, service) in &self.services {
+            for (key, port) in &service.port_env {
+                if key.is_empty() || key.contains('=') || key.contains('\0') {
+                    bail!("service '{name}' has invalid port_env key {key:?}");
+                }
+                if service.env.contains_key(key) {
+                    bail!(
+                        "service '{name}' environment key '{key}' is configured in both env and port_env"
+                    );
+                }
+                if !self.ports.contains_key(port) {
+                    bail!("service '{name}' port_env key '{key}' references unknown port '{port}'");
+                }
+            }
             match (&service.target, &service.tls_proxy) {
                 (Some(_), None) => {}
                 (None, Some(tls)) => self.validate_tls_proxy(name, service, tls)?,
@@ -254,14 +284,43 @@ pub struct DetailedDevServiceGroupConfig {
 pub enum DevPortConfig {
     /// A fixed port.
     Fixed(u16),
+    /// A port selected and leased by Aster for one supervisor run.
+    Dynamic(DynamicDevPortConfig),
     /// A port resolved from the process environment, port env files, or a default.
     Resolved(ResolvedDevPortConfig),
+}
+
+/// Marker accepted by the backwards-compatible detailed static form.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StaticPortAllocation {
+    Static,
+}
+
+/// Marker required by a dynamic named port.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicPortAllocation {
+    Dynamic,
+}
+
+/// A named port dynamically selected from an inclusive range.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicDevPortConfig {
+    pub allocation: DynamicPortAllocation,
+    /// Inclusive candidate range.
+    pub range: [u16; 2],
+    /// Candidate tried before scanning the range from low to high.
+    pub preferred: Option<u16>,
 }
 
 /// Detailed named-port resolution.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedDevPortConfig {
+    /// Optional explicit declaration; omitted remains backwards-compatible static mode.
+    pub allocation: Option<StaticPortAllocation>,
     /// Process environment variables checked in order.
     #[serde(default, deserialize_with = "deserialize_one_or_many")]
     pub env: Vec<String>,
@@ -298,6 +357,10 @@ pub struct DevServiceConfig {
     /// Environment overrides. Values support `{port}` and `{ports.<name>}`.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Environment variables populated directly from resolved named ports.
+    /// These override env-file values and may not duplicate keys in `env`.
+    #[serde(default)]
+    pub port_env: HashMap<String, String>,
     /// Ambient environment variables explicitly allowed into the service.
     #[serde(default)]
     pub inherit_env: Vec<String>,
@@ -488,6 +551,7 @@ port = "api"
 open_path = "/health"
 env_files = ["api/.env"]
 env = { PORT = "{port}", WEB_PORT = "{ports.web}" }
+port_env = { API_PORT = "api" }
 inherit_env = ["GOOGLE_CLOUD_MODE"]
 order = 10
 "#,
@@ -512,6 +576,7 @@ order = 10
             config.dev.services["api"].inherit_env,
             ["GOOGLE_CLOUD_MODE"]
         );
+        assert_eq!(config.dev.services["api"].port_env["API_PORT"], "api");
         let DevPortConfig::Resolved(api) = &config.dev.ports["api"] else {
             panic!("expected resolved port");
         };
@@ -522,6 +587,68 @@ order = 10
         };
         assert_eq!(web.offset_from.as_deref(), Some("api"));
         assert_eq!(web.offset_base, Some(4000));
+    }
+
+    #[test]
+    fn parses_and_validates_dynamic_ports() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("aster.toml"),
+            r#"
+[dev.ports.http]
+allocation = "dynamic"
+range = [4000, 4099]
+preferred = 4001
+
+[dev.ports.database]
+allocation = "static"
+default = 5432
+
+[dev.services.web]
+target = "//web:dev"
+port = "http"
+port_env = { PORT = "http", DATABASE_PORT = "database" }
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(temp.path()).unwrap();
+        let DevPortConfig::Dynamic(http) = &config.dev.ports["http"] else {
+            panic!("expected dynamic port");
+        };
+        assert_eq!(http.range, [4000, 4099]);
+        assert_eq!(http.preferred, Some(4001));
+        let DevPortConfig::Resolved(database) = &config.dev.ports["database"] else {
+            panic!("expected explicit static port");
+        };
+        assert_eq!(database.allocation, Some(StaticPortAllocation::Static));
+    }
+
+    #[test]
+    fn rejects_invalid_port_environment_references() {
+        for (configuration, expected) in [
+            (
+                "[dev.ports.http]\ndefault = 4000\n[dev.services.web]\ntarget = \"//web:dev\"\nport_env = { PORT = \"missing\" }\n",
+                "references unknown port 'missing'",
+            ),
+            (
+                "[dev.ports.http]\ndefault = 4000\n[dev.services.web]\ntarget = \"//web:dev\"\nenv = { PORT = \"4000\" }\nport_env = { PORT = \"http\" }\n",
+                "configured in both env and port_env",
+            ),
+            (
+                "[dev.ports.http]\nallocation = \"dynamic\"\nrange = [4100, 4000]\n",
+                "range must contain valid ports in ascending order",
+            ),
+            (
+                "[dev.ports.http]\nallocation = \"dynamic\"\nrange = [4000, 4099]\npreferred = 5000\n",
+                "preferred value 5000 is outside range",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            fs::write(temp.path().join("aster.toml"), configuration).unwrap();
+            let error = WorkspaceConfig::load(temp.path()).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

@@ -1022,7 +1022,7 @@ fn run() -> Result<()> {
             ServicesCommands::KillPorts { ports, dry_run } => {
                 let workspace_config = WorkspaceConfig::load(&workspace_root)?;
                 let configured =
-                    aster::dev::resolve_dev_ports(&workspace_root, &workspace_config.dev)?;
+                    aster::dev::resolve_static_dev_ports(&workspace_root, &workspace_config.dev)?;
                 let selected = aster::dev::resolve_port_selection(&configured, &ports)?;
                 aster::dev::kill_ports(&selected, aster::dev::KillPortsOptions { dry_run })?;
             }

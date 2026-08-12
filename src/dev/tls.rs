@@ -93,7 +93,12 @@ pub fn serve_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str)
         bail!("TLS edge '{edge}' has no certificate; run `aster services tls setup {edge}`");
     }
 
-    let ports = super::resolve_dev_ports(workspace_root, config)?;
+    let ports = match std::env::var("ASTER_RESOLVED_PORTS") {
+        Ok(encoded) => serde_json::from_str(&encoded)
+            .context("ASTER_RESOLVED_PORTS is not a valid named-port map")?,
+        Err(std::env::VarError::NotPresent) => super::resolve_dev_ports(workspace_root, config)?,
+        Err(error) => return Err(error).context("failed to read ASTER_RESOLVED_PORTS"),
+    };
     let port_name = service
         .port
         .as_deref()
