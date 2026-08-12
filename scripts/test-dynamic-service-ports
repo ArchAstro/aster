@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly repo_root="$(cd "${script_dir}/.." && pwd)"
+
+for dependency in git python3 mktemp; do
+  if ! command -v "${dependency}" >/dev/null 2>&1; then
+    echo "FAIL: required command not found: ${dependency}" >&2
+    exit 1
+  fi
+done
+
+if [[ -n "${ASTER_BIN:-}" ]]; then
+  if ! resolved_aster_bin="$(command -v "${ASTER_BIN}" 2>/dev/null)"; then
+    echo "FAIL: ASTER_BIN is not executable or on PATH: ${ASTER_BIN}" >&2
+    exit 1
+  fi
+  aster_bin="$(cd "$(dirname "${resolved_aster_bin}")" && pwd)/$(basename "${resolved_aster_bin}")"
+else
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "FAIL: cargo is required when ASTER_BIN is not set" >&2
+    exit 1
+  fi
+  echo "[bootstrap] building Aster from ${repo_root}"
+  cargo build --quiet --locked --manifest-path "${repo_root}/Cargo.toml"
+  aster_bin="${repo_root}/target/debug/aster"
+fi
+readonly aster_bin
+
+readonly temp_root="$(mktemp -d "${TMPDIR:-/tmp}/aster-dynamic-ports.XXXXXX")"
+readonly workspace="${temp_root}/workspace"
+readonly runtime_dir="${workspace}/runtime"
+readonly lease_dir="${temp_root}/leases"
+supervisor_pid=""
+current_scenario="bootstrap"
+passed=0
+
+allocation_manifest_count() {
+  if [[ ! -d "${lease_dir}" ]]; then
+    echo 0
+    return
+  fi
+  find "${lease_dir}" -maxdepth 1 -type f -name 'allocation-*.json' | wc -l | tr -d ' '
+}
+
+read_port() {
+  tr -d '[:space:]' < "${runtime_dir}/$1.port"
+}
+
+port_is_open() {
+  python3 - "$1" <<'PY'
+import socket
+import sys
+
+with socket.socket() as client:
+    client.settimeout(0.2)
+    raise SystemExit(0 if client.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
+PY
+}
+
+wait_for_services() {
+  local attempt name port ready
+  for attempt in $(seq 1 200); do
+    ready=1
+    for name in alpha beta gamma; do
+      if [[ ! -s "${runtime_dir}/${name}.port" ]]; then
+        ready=0
+        break
+      fi
+      port="$(read_port "${name}")"
+      if ! port_is_open "${port}"; then
+        ready=0
+        break
+      fi
+    done
+    if [[ "${ready}" -eq 1 ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "FAIL [${current_scenario}]: services did not become ready" >&2
+  return 1
+}
+
+wait_for_port_state() {
+  local port="$1" expected="$2" attempt
+  for attempt in $(seq 1 100); do
+    if [[ "${expected}" == "open" ]] && port_is_open "${port}"; then
+      return 0
+    fi
+    if [[ "${expected}" == "closed" ]] && ! port_is_open "${port}"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "FAIL [${current_scenario}]: port ${port} did not become ${expected}" >&2
+  return 1
+}
+
+start_supervisor() {
+  local log_file="$1"
+  rm -f "${runtime_dir}"/*.port "${runtime_dir}"/*.pid
+  (
+    cd "${workspace}"
+    exec env ASTER_PORT_LEASE_DIR="${lease_dir}" \
+      "${aster_bin}" services up --no-ui --no-watch
+  ) >"${log_file}" 2>&1 &
+  supervisor_pid=$!
+}
+
+stop_supervisor() {
+  local signal="$1" expected_status="$2" status
+  kill "-${signal}" "${supervisor_pid}"
+  set +e
+  wait "${supervisor_pid}" 2>/dev/null
+  status=$?
+  set -e
+  supervisor_pid=""
+  if [[ "${status}" -ne "${expected_status}" ]]; then
+    echo "FAIL [${current_scenario}]: expected supervisor status ${expected_status}, got ${status}" >&2
+    return 1
+  fi
+}
+
+cleanup() {
+  local status=$? port
+  set +e
+  if [[ -n "${supervisor_pid}" ]] && kill -0 "${supervisor_pid}" 2>/dev/null; then
+    kill -TERM "${supervisor_pid}" 2>/dev/null
+    sleep 0.5
+    kill -KILL "${supervisor_pid}" 2>/dev/null
+    wait "${supervisor_pid}" 2>/dev/null
+  fi
+  if [[ -d "${workspace}" ]]; then
+    for name in alpha beta gamma; do
+      if [[ -s "${runtime_dir}/${name}.port" ]]; then
+        port="$(read_port "${name}")"
+        (
+          cd "${workspace}"
+          ASTER_PORT_LEASE_DIR="${lease_dir}" \
+            "${aster_bin}" services kill-ports "${port}" >/dev/null 2>&1
+        )
+      fi
+    done
+  fi
+  if [[ "${status}" -eq 0 && "${ASTER_KEEP_TEMP:-0}" != "1" ]]; then
+    rm -rf "${temp_root}"
+  else
+    echo "artifacts: ${temp_root}" >&2
+  fi
+  if [[ "${status}" -eq 0 ]]; then
+    echo "PASS: ${passed}/2 dynamic-port lifecycle scenarios"
+  else
+    echo "FAIL [${current_scenario}]: dynamic-port smoke test exited ${status}" >&2
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "${workspace}" "${runtime_dir}"
+git -C "${workspace}" init --quiet
+
+cat > "${workspace}/service.py" <<'PY'
+import pathlib
+import signal
+import socket
+import sys
+
+name = sys.argv[1]
+port = int(sys.argv[2])
+runtime = pathlib.Path(sys.argv[3])
+
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen()
+(runtime / f"{name}.port").write_text(f"{port}\n")
+(runtime / f"{name}.pid").write_text(f"{__import__('os').getpid()}\n")
+
+def raise_exit():
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, lambda *_: raise_exit())
+
+while True:
+    signal.pause()
+PY
+
+cat > "${workspace}/aster.toml" <<'TOML'
+[dev.ports.alpha]
+allocation = "dynamic"
+range = [41000, 41999]
+preferred = 41000
+
+[dev.ports.beta]
+allocation = "dynamic"
+range = [42000, 42999]
+preferred = 42000
+
+[dev.ports.gamma]
+allocation = "dynamic"
+range = [43000, 43999]
+preferred = 43000
+
+[dev.services.alpha]
+target = "//alpha:dev"
+port = "alpha"
+
+[dev.services.beta]
+target = "//beta:dev"
+port = "beta"
+
+[dev.services.gamma]
+target = "//gamma:dev"
+port = "gamma"
+TOML
+
+for name in alpha beta gamma; do
+  mkdir -p "${workspace}/${name}"
+  printf '{"name":"%s"}\n' "${name}" > "${workspace}/${name}/package.json"
+  cat > "${workspace}/${name}/aster.toml" <<TOML
+[targets.dev]
+command = "python3 ../service.py ${name} {port} ../runtime"
+stream = true
+TOML
+done
+
+current_scenario="graceful termination"
+echo "[scenario 1/2] graceful supervisor termination"
+start_supervisor "${temp_root}/graceful.log"
+wait_for_services
+alpha_port="$(read_port alpha)"
+beta_port="$(read_port beta)"
+gamma_port="$(read_port gamma)"
+if [[ "${alpha_port}" == "${beta_port}" || "${alpha_port}" == "${gamma_port}" || "${beta_port}" == "${gamma_port}" ]]; then
+  echo "FAIL [${current_scenario}]: dynamically allocated ports are not distinct" >&2
+  exit 1
+fi
+if [[ "$(allocation_manifest_count)" -ne 1 ]]; then
+  echo "FAIL [${current_scenario}]: expected one active allocation manifest" >&2
+  exit 1
+fi
+stop_supervisor TERM 143
+for port in "${alpha_port}" "${beta_port}" "${gamma_port}"; do
+  wait_for_port_state "${port}" closed
+done
+if [[ "$(allocation_manifest_count)" -ne 0 ]]; then
+  echo "FAIL [${current_scenario}]: graceful shutdown retained an allocation manifest" >&2
+  exit 1
+fi
+passed=$((passed + 1))
+echo "[PASS] graceful termination closed all listeners and removed its manifest"
+
+current_scenario="crash recovery"
+echo "[scenario 2/2] SIGKILL supervisor, then recover with kill-ports"
+start_supervisor "${temp_root}/crash.log"
+wait_for_services
+alpha_port="$(read_port alpha)"
+beta_port="$(read_port beta)"
+gamma_port="$(read_port gamma)"
+stop_supervisor KILL 137
+for port in "${alpha_port}" "${beta_port}" "${gamma_port}"; do
+  wait_for_port_state "${port}" open
+done
+if [[ "$(allocation_manifest_count)" -ne 1 ]]; then
+  echo "FAIL [${current_scenario}]: supervisor crash did not retain its allocation manifest" >&2
+  exit 1
+fi
+
+(
+  cd "${workspace}"
+  ASTER_PORT_LEASE_DIR="${lease_dir}" \
+    "${aster_bin}" services kill-ports alpha --dry-run
+) >"${temp_root}/kill-preview.log"
+if ! grep -q "Would terminate" "${temp_root}/kill-preview.log"; then
+  echo "FAIL [${current_scenario}]: dry run did not discover the alpha listener" >&2
+  exit 1
+fi
+wait_for_port_state "${alpha_port}" open
+
+(
+  cd "${workspace}"
+  ASTER_PORT_LEASE_DIR="${lease_dir}" \
+    "${aster_bin}" services kill-ports alpha
+) >"${temp_root}/kill-alpha.log"
+if ! grep -q "Cleared" "${temp_root}/kill-alpha.log"; then
+  echo "FAIL [${current_scenario}]: named cleanup did not report success" >&2
+  exit 1
+fi
+wait_for_port_state "${alpha_port}" closed
+wait_for_port_state "${beta_port}" open
+wait_for_port_state "${gamma_port}" open
+if [[ "$(allocation_manifest_count)" -ne 1 ]]; then
+  echo "FAIL [${current_scenario}]: partial cleanup removed recoverable bundle history" >&2
+  exit 1
+fi
+
+(
+  cd "${workspace}"
+  ASTER_PORT_LEASE_DIR="${lease_dir}" \
+    "${aster_bin}" services kill-ports
+) >"${temp_root}/kill-remaining.log"
+if ! grep -q "Cleared" "${temp_root}/kill-remaining.log"; then
+  echo "FAIL [${current_scenario}]: default cleanup did not report success" >&2
+  exit 1
+fi
+for port in "${alpha_port}" "${beta_port}" "${gamma_port}"; do
+  wait_for_port_state "${port}" closed
+done
+if [[ "$(allocation_manifest_count)" -ne 0 ]]; then
+  echo "FAIL [${current_scenario}]: orphan cleanup retained a stale allocation manifest" >&2
+  exit 1
+fi
+passed=$((passed + 1))
+echo "[PASS] crash recovery found dynamic names, killed orphans, and pruned history"
