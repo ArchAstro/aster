@@ -286,6 +286,9 @@ pub enum ServicesCommands {
         service: String,
     },
 
+    /// List ports allocated to running services in this worktree
+    Ports,
+
     /// Terminate processes listening on configured or specified ports
     KillPorts {
         /// Port numbers or configured/allocated names (defaults to all known workspace ports)
@@ -394,6 +397,19 @@ mod tests {
 
         assert!(Cli::try_parse_from(["aster", "services", "logs"]).is_err());
         assert!(Cli::try_parse_from(["aster", "services", "logs", "api", "web"]).is_err());
+    }
+
+    #[test]
+    fn services_ports_accepts_no_arguments() {
+        let cli = Cli::try_parse_from(["aster", "services", "ports"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Services {
+                command: ServicesCommands::Ports
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["aster", "services", "ports", "web"]).is_err());
     }
 
     #[test]

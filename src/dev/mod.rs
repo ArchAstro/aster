@@ -5,6 +5,7 @@ mod log_files;
 mod plan;
 mod port_allocator;
 mod port_cleanup;
+mod port_report;
 mod process;
 mod runner;
 mod tls;
@@ -17,5 +18,6 @@ pub use port_cleanup::{
     kill_ports, kill_workspace_ports, resolve_port_selection, resolve_workspace_port_selection,
     KillPortsOptions,
 };
+pub use port_report::{format_workspace_ports, workspace_ports_report, WorkspacePortsReport};
 pub use runner::{run_dev, DevOptions};
 pub use tls::{serve_tls, setup_tls};

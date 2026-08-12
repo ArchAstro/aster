@@ -99,6 +99,22 @@ fn run() -> Result<()> {
         return aster::dev::show_service_logs(&workspace_root, &workspace_config.dev, service);
     }
 
+    // Allocation metadata is independent of project discovery and remains
+    // useful after a supervisor crash leaves service listeners behind.
+    if let Commands::Services {
+        command: ServicesCommands::Ports,
+    } = &command
+    {
+        let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+        let report = aster::dev::workspace_ports_report(&workspace_root, &workspace_config.dev)?;
+        if output_mode == OutputMode::Json {
+            output_json(&report)?;
+        } else if output_mode != OutputMode::Quiet {
+            print!("{}", aster::dev::format_workspace_ports(&report));
+        }
+        return Ok(());
+    }
+
     // TLS setup and serving only need workspace service configuration. Handling
     // them before discovery lets a supervised TLS target remain independent of
     // the repository's project graph.
@@ -1038,6 +1054,7 @@ fn run() -> Result<()> {
                 )?;
             }
             ServicesCommands::Logs { .. } => unreachable!("service logs handled before discovery"),
+            ServicesCommands::Ports => unreachable!("service ports handled before discovery"),
             ServicesCommands::Tls { .. } => unreachable!("TLS commands handled before discovery"),
         },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
