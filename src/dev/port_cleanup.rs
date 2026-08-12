@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+
+use super::port_allocator::{prune_workspace_manifests, workspace_allocated_ports};
 
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 
@@ -45,6 +48,61 @@ pub fn resolve_port_selection(
         bail!("no ports selected; configure [dev.ports] or provide port numbers");
     }
     Ok(selected.into_iter().collect())
+}
+
+/// Resolve configured static ports plus every allocation recorded for this
+/// worktree. A dynamic name can map to multiple concurrent supervisors.
+pub fn resolve_workspace_port_selection(
+    workspace_root: &Path,
+    configured: &HashMap<String, u16>,
+    requested: &[String],
+) -> Result<Vec<u16>> {
+    let allocated = workspace_allocated_ports(workspace_root)?;
+    let mut selected = BTreeSet::new();
+    if requested.is_empty() {
+        selected.extend(configured.values().copied());
+        selected.extend(allocated.values().flatten().copied());
+    } else {
+        for value in requested {
+            let mut matched = false;
+            if let Some(port) = configured.get(value) {
+                selected.insert(*port);
+                matched = true;
+            }
+            if let Some(ports) = allocated.get(value) {
+                selected.extend(ports.iter().copied());
+                matched = true;
+            }
+            if matched {
+                continue;
+            }
+            let port = value.parse::<u16>().map_err(|_| {
+                anyhow!(
+                    "unknown configured or allocated port name or invalid port number '{value}'"
+                )
+            })?;
+            if port == 0 {
+                bail!("port number must be between 1 and 65535");
+            }
+            selected.insert(port);
+        }
+    }
+    if selected.is_empty() {
+        bail!("no ports selected; configure [dev.ports], start a dynamic service, or provide port numbers");
+    }
+    Ok(selected.into_iter().collect())
+}
+
+pub fn kill_workspace_ports(
+    workspace_root: &Path,
+    ports: &[u16],
+    options: KillPortsOptions,
+) -> Result<()> {
+    kill_ports(ports, options)?;
+    if !options.dry_run {
+        prune_workspace_manifests(workspace_root)?;
+    }
+    Ok(())
 }
 
 pub fn kill_ports(ports: &[u16], options: KillPortsOptions) -> Result<()> {
