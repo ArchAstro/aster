@@ -250,8 +250,18 @@ if [[ "$(allocation_manifest_count)" -ne 0 ]]; then
   echo "FAIL [${current_scenario}]: graceful shutdown retained an allocation manifest" >&2
   exit 1
 fi
+(
+  cd "${workspace}"
+  ASTER_PORT_LEASE_DIR="${lease_dir}" \
+    "${aster_bin}" services kill-ports \
+      "${alpha_port}" "${beta_port}" "${gamma_port}"
+) >"${temp_root}/kill-after-graceful.log"
+if ! grep -q "No listeners found" "${temp_root}/kill-after-graceful.log"; then
+  echo "FAIL [${current_scenario}]: post-shutdown kill-ports did not report clean ports" >&2
+  exit 1
+fi
 passed=$((passed + 1))
-echo "[PASS] graceful termination closed all listeners and removed its manifest"
+echo "[PASS] graceful termination closed listeners; kill-ports confirmed clean state"
 
 current_scenario="crash recovery"
 echo "[scenario 2/2] SIGKILL supervisor, then recover with kill-ports"
