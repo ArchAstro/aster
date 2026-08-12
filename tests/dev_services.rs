@@ -6,6 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,15 @@ fn wait_until(timeout: Duration, condition: impl FnMut() -> bool) {
         condition_met(timeout, condition),
         "condition was not satisfied within {timeout:?}"
     );
+}
+
+/// These tests launch real supervisors and listeners. Running them in parallel
+/// creates released-port races and can starve process startup on macOS CI.
+fn service_process_test() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn occurrences(path: &Path, needle: &str) -> usize {
@@ -150,6 +160,7 @@ fn terminate_aster(child: &mut std::process::Child) {
 
 #[test]
 fn services_kill_ports_previews_then_clears_configured_listener() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -220,6 +231,7 @@ fn services_kill_ports_previews_then_clears_configured_listener() {
 
 #[test]
 fn dynamic_port_bundles_are_distinct_propagated_and_released() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let lease_dir = root.join("leases");
@@ -371,6 +383,7 @@ stream = true
 
 #[test]
 fn ports_reports_static_and_portless_services_from_the_running_instance() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let lease_dir = root.join("leases");
@@ -469,6 +482,7 @@ stream = true
 
 #[test]
 fn kill_ports_recovers_dynamic_listener_after_supervisor_crash() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let lease_dir = root.join("leases");
@@ -603,6 +617,7 @@ stream = true
 
 #[test]
 fn dev_supervises_targets_runs_prerequisites_and_restarts_on_dependency_changes() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     // Keep both reservations open until launch so the OS cannot assign the
@@ -795,6 +810,7 @@ command = "sh -c 'echo BUILD >> ../events.log'"
 
 #[test]
 fn dev_restores_through_normal_shutdown_when_every_service_fails_to_start() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let control_port = TcpListener::bind(("127.0.0.1", 0))
@@ -871,6 +887,7 @@ stream = true
 
 #[test]
 fn dev_does_not_start_a_service_after_shutdown_interrupts_its_prerequisite() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::create_dir(root.join(".git")).unwrap();
@@ -923,6 +940,7 @@ stream = true
 
 #[test]
 fn authenticated_control_shutdown_interrupts_an_in_progress_prerequisite() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let control_port = TcpListener::bind(("127.0.0.1", 0))
@@ -1075,6 +1093,7 @@ target = "//intern-fe:dev"
 
 #[test]
 fn concurrent_service_groups_bind_distinct_control_ports() {
+    let _serial = service_process_test();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let alpha_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
