@@ -679,10 +679,7 @@ fn validate_port_offsets(configs: &HashMap<String, DevPortConfig>) -> Result<()>
         }
         let mut current = name.as_str();
         let mut seen = HashSet::new();
-        loop {
-            let DevPortConfig::Resolved(current_config) = &configs[current] else {
-                break;
-            };
+        while let DevPortConfig::Resolved(current_config) = &configs[current] {
             let Some(next) = current_config.offset_from.as_deref() else {
                 break;
             };
