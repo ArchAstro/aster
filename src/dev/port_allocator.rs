@@ -191,11 +191,6 @@ pub(crate) fn workspace_port_allocations(
         return Ok(Vec::new());
     }
 
-    let allocation_lock = open_lock(&directory.join("allocation.lock"))?;
-    allocation_lock
-        .lock_exclusive()
-        .context("failed to acquire the Aster port allocator lock")?;
-
     let mut allocations = Vec::new();
     for (path, manifest) in workspace_manifests(&workspace_root)? {
         let mut leased = false;
@@ -361,8 +356,15 @@ fn workspace_manifests(workspace_root: &str) -> Result<Vec<(PathBuf, AllocationM
         {
             continue;
         }
-        let file = File::open(&path)
-            .with_context(|| format!("failed to open allocation manifest {}", path.display()))?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to open allocation manifest {}", path.display())
+                });
+            }
+        };
         let manifest: AllocationManifest = serde_json::from_reader(file)
             .with_context(|| format!("failed to parse allocation manifest {}", path.display()))?;
         if manifest.version == 1 && manifest.workspace_root == workspace_root {
