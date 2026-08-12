@@ -342,6 +342,12 @@ only processes that own the selected listening ports. An explicit numeric port
 need not appear in `aster.toml` and can be cleaned from outside an Aster
 workspace.
 
+Run `scripts/test-dynamic-service-ports` for a standalone lifecycle smoke test.
+It builds Aster, creates a temporary Git workspace with three dynamic services,
+and reports PASS/FAIL for graceful shutdown and crash-plus-`kill-ports`
+recovery. Set `ASTER_BIN` to test another binary or `ASTER_KEEP_TEMP=1` to keep
+the generated workspace and logs.
+
 Targets named `dev` remain ordinary targets (`aster dev <project selectors>`).
 If a project has a target named `services`, run it explicitly with
 `aster target services <project selectors>`. The same escape hatch works for
