@@ -252,6 +252,8 @@ Interactive `services logs` output honors `$PAGER`, then tries `less` and
 Configured development ports can be inspected or cleared:
 
 ```console
+aster services ports
+aster --json services ports
 aster services kill-ports --dry-run
 aster services kill-ports
 aster services kill-ports api web 4011
@@ -260,6 +262,10 @@ aster services kill-ports api web 4011
 Named ports come from `[dev.ports]` and this worktree's active or crash-left
 dynamic allocation manifests. Explicit numeric ports can be inspected or
 cleared outside an Aster workspace.
+
+`services ports` reports each supervisor instance separately. Human output
+maps primary ports to service names; JSON includes `active`/`orphaned` status,
+service mappings, and the complete named-port map for scripting.
 
 ## Read target logs and manage the cache
 

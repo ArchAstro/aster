@@ -61,7 +61,12 @@ pub fn resolve_dev_plan(
         .collect();
     let selected_control_port = group_control_port.or(config.control_port.as_deref());
     let active_ports = collect_active_ports(config, &selected, selected_control_port)?;
-    let (ports, port_lease) = allocate_dev_ports(workspace_root, config, &active_ports)?;
+    let selected_services = selected
+        .iter()
+        .map(|name| ((*name).to_string(), config.services[*name].port.clone()))
+        .collect();
+    let (ports, port_lease) =
+        allocate_dev_ports(workspace_root, config, &active_ports, selected_services)?;
     let control_port = selected_control_port
         .map(|name| {
             ports
@@ -355,6 +360,7 @@ fn allocate_dev_ports(
     workspace_root: &Path,
     config: &DevWorkspaceConfig,
     active: &HashSet<String>,
+    services: BTreeMap<String, Option<String>>,
 ) -> Result<(HashMap<String, u16>, PortLease)> {
     let file_env = load_env_files(workspace_root, &config.port_env_files)?;
     validate_port_offsets(&config.ports)?;
@@ -433,7 +439,7 @@ fn allocate_dev_ports(
     }
 
     let ports = resolve_ports(&config.ports, &file_env, &dynamic_values)?;
-    Ok((ports, allocator.finish(workspace_root)?))
+    Ok((ports, allocator.finish(workspace_root, services)?))
 }
 
 fn dynamic_root(name: &str, configs: &HashMap<String, DevPortConfig>) -> Result<Option<String>> {

@@ -294,6 +294,49 @@ stream = true
     assert!(first.try_wait().unwrap().is_none());
     assert!(second.try_wait().unwrap().is_none());
 
+    let json_ports = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["--json", "services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(json_ports.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json_ports.stdout).unwrap();
+    assert_eq!(
+        report["workspace"],
+        root.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    let instances = report["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 2);
+    for expected_port in [start, start + 1] {
+        let instance = instances
+            .iter()
+            .find(|instance| instance["ports"]["http"] == expected_port)
+            .unwrap();
+        assert_eq!(instance["status"], "active");
+        assert_eq!(
+            instance["ports"]["dependent"],
+            derived_start + expected_port - start
+        );
+        assert_eq!(instance["services"][0]["name"], "web");
+        assert_eq!(instance["services"][0]["port_name"], "http");
+        assert_eq!(instance["services"][0]["port"], expected_port);
+    }
+
+    let human_ports = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(human_ports.status.success());
+    let human_ports = String::from_utf8_lossy(&human_ports.stdout);
+    assert!(human_ports.contains("SERVICE"));
+    assert!(human_ports.contains("web"));
+    assert!(human_ports.contains("dependent"));
+    assert!(human_ports.contains(&start.to_string()));
+    assert!(human_ports.contains(&(start + 1).to_string()));
+
     terminate_aster(&mut first);
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_err()
@@ -314,6 +357,114 @@ stream = true
             && TcpStream::connect(("127.0.0.1", start + 1)).is_err()
             && allocation_manifest_count(&lease_dir) == 0
     });
+
+    let empty_ports = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "ports", "--json"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(empty_ports.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&empty_ports.stdout).unwrap();
+    assert!(report["instances"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn ports_reports_static_and_portless_services_from_the_running_instance() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports.http]
+default = {port}
+
+[dev.services.web]
+target = "//app:web"
+port = "http"
+
+[dev.services.worker]
+target = "//app:worker"
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.web]
+command = "python3 -m http.server {port}"
+stream = true
+
+[targets.worker]
+command = "sleep 30"
+stream = true
+"#,
+    )
+    .unwrap();
+
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "ports", "--json"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let instance = &report["instances"][0];
+    assert_eq!(instance["status"], "active");
+    assert_eq!(instance["ports"]["http"], port);
+    let services = instance["services"].as_array().unwrap();
+    let web = services
+        .iter()
+        .find(|service| service["name"] == "web")
+        .unwrap();
+    assert_eq!(web["port_name"], "http");
+    assert_eq!(web["port"], port);
+    let worker = services
+        .iter()
+        .find(|service| service["name"] == "worker")
+        .unwrap();
+    assert!(worker["port_name"].is_null());
+    assert!(worker["port"].is_null());
+
+    let human = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.lines().any(|line| {
+        line.contains("web") && line.contains("http") && line.contains(&port.to_string())
+    }));
+    assert!(human
+        .lines()
+        .any(|line| line.contains("worker") && line.contains("active")));
+
+    terminate_aster(&mut supervisor);
 }
 
 #[test]
@@ -384,6 +535,19 @@ stream = true
         TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
     assert_eq!(allocation_manifest_count(&lease_dir), 1);
+
+    let orphaned_ports = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["--json", "services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(orphaned_ports.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&orphaned_ports.stdout).unwrap();
+    assert_eq!(report["instances"].as_array().unwrap().len(), 1);
+    assert_eq!(report["instances"][0]["status"], "orphaned");
+    assert_eq!(report["instances"][0]["ports"]["http"], port);
+    assert_eq!(report["instances"][0]["services"][0]["name"], "web");
 
     let other_workspace = temp.path().join("other-worktree");
     fs::create_dir(&other_workspace).unwrap();

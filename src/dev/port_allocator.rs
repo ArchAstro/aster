@@ -39,6 +39,23 @@ struct AllocationManifest {
     supervisor_pid: u32,
     workspace_root: String,
     ports: BTreeMap<String, u16>,
+    #[serde(default)]
+    services: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PortAllocationStatus {
+    Active,
+    Orphaned,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkspacePortAllocation {
+    pub supervisor_pid: u32,
+    pub status: PortAllocationStatus,
+    pub ports: BTreeMap<String, u16>,
+    pub services: BTreeMap<String, Option<String>>,
 }
 
 impl PortAllocator {
@@ -129,12 +146,17 @@ impl PortAllocator {
         Ok(true)
     }
 
-    pub(crate) fn finish(self, workspace_root: &Path) -> Result<PortLease> {
+    pub(crate) fn finish(
+        self,
+        workspace_root: &Path,
+        services: BTreeMap<String, Option<String>>,
+    ) -> Result<PortLease> {
         let manifest = AllocationManifest {
             version: 1,
             supervisor_pid: std::process::id(),
             workspace_root: canonical_workspace(workspace_root)?,
             ports: self.named_ports,
+            services,
         };
         let manifest_path = write_manifest(&self.directory, &manifest)?;
         Ok(PortLease {
@@ -155,6 +177,81 @@ pub(crate) fn workspace_allocated_ports(
         }
     }
     Ok(ports)
+}
+
+/// Return live allocations for one worktree. Crash-left manifests whose ports
+/// are still occupied are retained as orphaned; fully stale manifests are
+/// removed and omitted.
+pub(crate) fn workspace_port_allocations(
+    workspace_root: &Path,
+) -> Result<Vec<WorkspacePortAllocation>> {
+    let workspace_root = canonical_workspace(workspace_root)?;
+    let directory = lease_directory();
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let allocation_lock = open_lock(&directory.join("allocation.lock"))?;
+    allocation_lock
+        .lock_exclusive()
+        .context("failed to acquire the Aster port allocator lock")?;
+
+    let mut allocations = Vec::new();
+    for (path, manifest) in workspace_manifests(&workspace_root)? {
+        let mut leased = false;
+        for port in manifest.ports.values().copied().collect::<HashSet<_>>() {
+            let file = open_lock(&directory.join(format!("{port}.lock")))?;
+            match file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    leased = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect port lease for {port}"));
+                }
+            }
+        }
+
+        let occupied = if leased {
+            false
+        } else {
+            manifest
+                .ports
+                .values()
+                .copied()
+                .map(port_is_available)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|available| !available)
+        };
+
+        let status = if leased {
+            Some(PortAllocationStatus::Active)
+        } else if occupied {
+            Some(PortAllocationStatus::Orphaned)
+        } else {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "failed to remove stale allocation manifest {}",
+                    path.display()
+                )
+            })?;
+            None
+        };
+
+        if let Some(status) = status {
+            allocations.push(WorkspacePortAllocation {
+                supervisor_pid: manifest.supervisor_pid,
+                status,
+                ports: manifest.ports,
+                services: manifest.services,
+            });
+        }
+    }
+    allocations.sort_by_key(|allocation| allocation.supervisor_pid);
+    Ok(allocations)
 }
 
 /// Remove crash-left manifests only after every recorded lease is unlocked and

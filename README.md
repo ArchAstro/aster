@@ -327,6 +327,19 @@ aster services logs platform-backend > platform-backend.log
 
 Interactive output honors `$PAGER`, then falls back to `less` or `more`.
 
+List every current allocation for this worktree, including separate supervisor
+instances and crash-left listeners:
+
+```console
+aster services ports
+aster --json services ports
+```
+
+Human output maps primary ports to service names and includes all dependency
+ports. JSON returns a stable `workspace`/`instances` object; each instance has
+its supervisor PID, `active` or `orphaned` status, service mappings, and the
+complete named-port map.
+
 Clear stale or orphaned processes from development ports before starting the
 stack again:
 
