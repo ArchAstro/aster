@@ -10,6 +10,7 @@ use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONNECTION, HOST, UPGRADE};
+use hyper::http::uri::Authority;
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
@@ -177,18 +178,18 @@ async fn proxy_request(
     mut request: Request<Incoming>,
     routes: Arc<Vec<ResolvedRoute>>,
 ) -> std::result::Result<Response<ProxyBody>, Infallible> {
-    let hostname = request
+    let authority = request
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .and_then(hostname_without_port)
-        .map(str::to_ascii_lowercase);
-    let Some(hostname) = hostname else {
+        .and_then(parse_host_authority);
+    let Some(authority) = authority else {
         return Ok(text_response(
             StatusCode::BAD_REQUEST,
-            "missing Host header\n",
+            "missing or invalid Host header\n",
         ));
     };
+    let hostname = authority.host().to_ascii_lowercase();
     let Some(port) = match_route(&hostname, &routes) else {
         return Ok(text_response(
             StatusCode::MISDIRECTED_REQUEST,
@@ -225,9 +226,11 @@ async fn proxy_request(
     request
         .headers_mut()
         .insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    if let Ok(value) = HeaderValue::from_str(&hostname) {
-        request.headers_mut().insert("x-forwarded-host", value);
-    }
+    let forwarded_host = HeaderValue::from_str(authority.as_str())
+        .expect("parsed HTTP authority is a valid header value");
+    request
+        .headers_mut()
+        .insert("x-forwarded-host", forwarded_host);
 
     let client: Client<HttpConnector, Incoming> =
         Client::builder(TokioExecutor::new()).build_http();
@@ -270,12 +273,20 @@ fn text_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
     Response::builder().status(status).body(body).unwrap()
 }
 
-fn hostname_without_port(host: &str) -> Option<&str> {
-    let host = host.trim();
-    if host.is_empty() {
+fn parse_host_authority(value: &str) -> Option<Authority> {
+    if value.contains('@') || value.matches(':').count() > 1 {
         return None;
     }
-    Some(host.split_once(':').map_or(host, |(hostname, _)| hostname))
+    if let Some((hostname, port)) = value.rsplit_once(':') {
+        if hostname.is_empty() || port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+            return None;
+        }
+    }
+    let authority = value.parse::<Authority>().ok()?;
+    if authority.host().is_empty() {
+        return None;
+    }
+    Some(authority)
 }
 
 #[derive(Clone)]
@@ -425,6 +436,15 @@ mod tests {
         assert_eq!(match_route("one.sites.test", &routes), Some(4100));
         assert_eq!(match_route("one.two.sites.test", &routes), Some(4100));
         assert_eq!(match_route("sites.test", &routes), None);
+    }
+
+    #[test]
+    fn host_authority_accepts_numeric_ports_and_rejects_userinfo() {
+        let authority = parse_host_authority("intern.dev:8443").unwrap();
+        assert_eq!(authority.host(), "intern.dev");
+        assert_eq!(authority.port_u16(), Some(8443));
+        assert!(parse_host_authority("intern.dev:443@evil.example").is_none());
+        assert!(parse_host_authority("intern.dev:not-a-port").is_none());
     }
 
     #[test]
