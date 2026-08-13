@@ -252,10 +252,13 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
 
     // Observable behavior: exact and suffix hosts cross real TLS and HTTP
     // sockets, preserve logical Host, and select different upstream services.
-    let front_response = https_get(tls_port, "intern.dev", "intern.dev", cert_der.clone());
+    let front_authority = format!("intern.dev:{tls_port}");
+    let front_response = https_get(tls_port, "intern.dev", &front_authority, cert_der.clone());
     assert!(front_response.contains("200 OK"), "{front_response}");
     assert!(
-        front_response.contains("frontend host=intern.dev proto=https"),
+        front_response.contains(&format!(
+            "frontend host={front_authority} forwarded={front_authority} proto=https"
+        )),
         "{front_response}"
     );
     let site_response = https_get(
@@ -265,11 +268,24 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
         cert_der.clone(),
     );
     assert!(
-        site_response.contains("site-gateway host=test.local.sites.intern.dev proto=https"),
+        site_response.contains(
+            "site-gateway host=test.local.sites.intern.dev forwarded=test.local.sites.intern.dev proto=https"
+        ),
         "{site_response}"
     );
     let unknown = https_get(tls_port, "intern.dev", "unknown.test", cert_der);
     assert!(unknown.contains("421 Misdirected Request"), "{unknown}");
+    let malformed = https_get(
+        tls_port,
+        "intern.dev",
+        "intern.dev:443@evil.example",
+        CertificateDer::from(certified.cert.der().to_vec()),
+    );
+    assert!(malformed.contains("400 Bad Request"), "{malformed}");
+    assert!(
+        malformed.contains("missing or invalid Host header"),
+        "{malformed}"
+    );
     assert_tls_upgrade_echo(tls_port, "intern.dev", certified.cert.der().to_vec());
 
     // Lifecycle outcome: authenticated control shutdown stops the group and
@@ -299,6 +315,7 @@ fn serve_http(listener: TcpListener, label: &'static str) -> thread::JoinHandle<
         for stream in listener.incoming().flatten() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut host = String::new();
+            let mut forwarded_host = String::new();
             let mut proto = String::new();
             let mut upgrade = false;
             loop {
@@ -316,6 +333,9 @@ fn serve_http(listener: TcpListener, label: &'static str) -> thread::JoinHandle<
                 if lower.starts_with("x-forwarded-proto:") {
                     proto = line[18..].trim().to_string();
                 }
+                if lower.starts_with("x-forwarded-host:") {
+                    forwarded_host = line[17..].trim().to_string();
+                }
             }
             if upgrade {
                 let mut stream = stream;
@@ -330,7 +350,7 @@ fn serve_http(listener: TcpListener, label: &'static str) -> thread::JoinHandle<
                 stream.write_all(&payload).unwrap();
                 continue;
             }
-            let body = format!("{label} host={host} proto={proto}");
+            let body = format!("{label} host={host} forwarded={forwarded_host} proto={proto}");
             let mut stream = stream;
             write!(
                 stream,
