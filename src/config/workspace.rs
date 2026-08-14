@@ -199,7 +199,7 @@ impl DevWorkspaceConfig {
                 if !accepted {
                     bail!("TLS proxy service '{name}' route open_host '{open_host}' does not match its host selector");
                 }
-                if !tls_certificate_covers(tls, open_host) {
+                if route.host.is_some() && !tls_certificate_covers(tls, open_host) {
                     bail!("TLS proxy service '{name}' route open_host '{open_host}' is not covered by certificate_hosts");
                 }
             }
