@@ -473,9 +473,13 @@ fully quit it and reopen it; also disable Chrome Secure DNS if it bypasses the
 macOS resolver. Aster prints the same checks when DNS validation fails.
 
 The proxy binds only to `127.0.0.1`, routes only to configured named ports,
-and supports HTTP upgrades for development WebSockets/HMR. Use port 8443 when
-the operating system restricts unprivileged processes from binding port 443.
-Do not run the complete development stack as root.
+and supports HTTP upgrades for development WebSockets/HMR. A suffix route may
+accept names deeper than a static wildcard certificate covers. For those SNI
+names, Aster asks `mkcert` for an exact certificate on first use and caches it
+under `.aster/tls/<edge>/hosts/`; issuance is restricted to configured routes
+and capped at 64 exact certificates per edge to bound local resource use.
+Use port 8443 when the operating system restricts unprivileged processes from
+binding port 443. Do not run the complete development stack as root.
 
 When a TLS route points to another service's named port, that service's
 dashboard `[open]` action uses the route's HTTPS hostname. Exact routes infer

@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rcgen::generate_simple_self_signed;
+use rcgen::{
+    generate_simple_self_signed, BasicConstraints, CertificateParams, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
+};
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -60,7 +63,7 @@ gateway = 3800
 worker = 3900
 
 [dev.service_groups]
-intern = ["frontend", "gateway", "worker", "edge"]
+web = ["frontend", "gateway", "worker", "edge"]
 
 [dev.services.frontend]
 target = "//frontend:dev"
@@ -77,7 +80,7 @@ port = "worker"
 
 [dev.services.edge]
 port = "https"
-tls_proxy = { certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], open_host = "intern.dev", routes = [{ host = "intern.dev", upstream_port = "frontend" }, { host_suffix = ".sites.intern.dev", open_host = "test.local.sites.intern.dev", upstream_port = "gateway" }] }
+tls_proxy = { certificate_hosts = ["app.example.test"], open_host = "app.example.test", routes = [{ host = "app.example.test", upstream_port = "frontend" }, { host_suffix = ".example.test", open_host = "demo.team.example.test", upstream_port = "gateway" }] }
 "#,
     )
     .unwrap();
@@ -85,7 +88,7 @@ tls_proxy = { certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], op
     // Public boundary: the same resolved plan feeds the dashboard [open]
     // action; dry-run renders those concrete URLs without launching services.
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["services", "up", "intern", "--dry-run"])
+        .args(["services", "up", "web", "--dry-run"])
         .current_dir(root)
         .output()
         .unwrap();
@@ -95,13 +98,13 @@ tls_proxy = { certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], op
     // Observable result: routed services open through trusted HTTPS, including
     // their own path, while an unpublished service retains localhost fallback.
     assert!(
-        plan.contains("frontend :3100 -> //frontend:dev [open https://intern.dev:8443/login]"),
+        plan.contains(
+            "frontend :3100 -> //frontend:dev [open https://app.example.test:8443/login]"
+        ),
         "{plan}"
     );
     assert!(
-        plan.contains(
-            "gateway :3800 -> //gateway:dev [open https://test.local.sites.intern.dev:8443]"
-        ),
+        plan.contains("gateway :3800 -> //gateway:dev [open https://demo.team.example.test:8443]"),
         "{plan}"
     );
     assert!(
@@ -126,7 +129,7 @@ upstream = 3000
 
 [dev.services.edge]
 port = "https"
-tls_proxy = { certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], open_host = "intern.dev", routes = [{ host = "intern.dev", upstream_port = "upstream" }] }
+tls_proxy = { certificate_hosts = ["app.example.test", "*.local.example.test"], open_host = "app.example.test", routes = [{ host = "app.example.test", upstream_port = "upstream" }] }
 "#,
     )
     .unwrap();
@@ -166,7 +169,7 @@ printf 'private-key' > "$key"
     let calls = fs::read_to_string(log).unwrap();
     assert!(calls.lines().any(|line| line == "-install"), "{calls}");
     assert!(
-        calls.contains("intern.dev *.local.sites.intern.dev"),
+        calls.contains("app.example.test *.local.example.test"),
         "{calls}"
     );
     let cert_dir = root.join(".aster/tls/edge");
@@ -182,9 +185,9 @@ printf 'private-key' > "$key"
 }
 
 #[test]
-fn service_group_serves_two_https_hosts_through_real_tls_and_http_boundaries() {
-    // Setup: two real loopback HTTP services and a real certificate trusted by
-    // this test client model the frontend and wildcard Sites gateway.
+fn suffix_route_issues_and_caches_exact_sni_certificate_through_real_tls() {
+    // Setup: two real loopback HTTP services, a static frontend certificate,
+    // and a fake mkcert issuer for a nested site hostname.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::create_dir(root.join(".git")).unwrap();
@@ -209,21 +212,37 @@ frontend = {front_port}
 gateway = {site_port}
 
 [dev.service_groups]
-intern = ["intern-edge"]
+web = ["edge"]
 
-[dev.services.intern-edge]
+[dev.services.edge]
 port = "https"
-tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], open_host = "intern.dev", routes = [{{ host = "intern.dev", upstream_port = "frontend" }}, {{ host_suffix = ".sites.intern.dev", open_host = "test.local.sites.intern.dev", upstream_port = "gateway" }}] }}
+inherit_env = ["ASTER_MKCERT_BIN", "ASTER_TEST_MKCERT_LOG", "ASTER_TEST_DYNAMIC_CERT", "ASTER_TEST_DYNAMIC_KEY"]
+tls_proxy = {{ certificate_hosts = ["app.example.test"], open_host = "app.example.test", routes = [{{ host = "app.example.test", upstream_port = "frontend" }}, {{ host_suffix = ".example.test", open_host = "docs.acme.example.test", upstream_port = "gateway" }}] }}
 "#
         ),
     )
     .unwrap();
-    let certified = generate_simple_self_signed(vec![
-        "intern.dev".to_string(),
-        "*.local.sites.intern.dev".to_string(),
-    ])
-    .unwrap();
-    let cert_dir = root.join(".aster/tls/intern-edge");
+    let certified = generate_simple_self_signed(vec!["app.example.test".to_string()]).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Aster test local CA");
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let site_key_pair = KeyPair::generate().unwrap();
+    let mut site_params =
+        CertificateParams::new(vec!["docs.acme.example.test".to_string()]).unwrap();
+    site_params
+        .distinguished_name
+        .push(DnType::CommonName, "docs.acme.example.test");
+    let site_certified = site_params.signed_by(&site_key_pair, &issuer).unwrap();
+    let cert_dir = root.join(".aster/tls/edge");
     fs::create_dir_all(&cert_dir).unwrap();
     fs::write(cert_dir.join("cert.pem"), certified.cert.pem()).unwrap();
     fs::write(
@@ -232,16 +251,44 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
     )
     .unwrap();
     let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+    let site_cert = root.join("site-cert.pem");
+    let site_key = root.join("site-key.pem");
+    fs::write(&site_cert, site_certified.pem()).unwrap();
+    fs::write(&site_key, site_key_pair.serialize_pem()).unwrap();
+    let mkcert_log = root.join("mkcert.log");
+    let fake_mkcert = root.join("mkcert");
+    fs::write(
+        &fake_mkcert,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ASTER_TEST_MKCERT_LOG"
+while test "$#" -gt 0; do
+  case "$1" in
+    -cert-file) cert=$2; shift 2 ;;
+    -key-file) key=$2; shift 2 ;;
+    *) host=$1; shift ;;
+  esac
+done
+test "$host" = "docs.acme.example.test" || exit 2
+cp "$ASTER_TEST_DYNAMIC_CERT" "$cert"
+cp "$ASTER_TEST_DYNAMIC_KEY" "$key"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mkcert, fs::Permissions::from_mode(0o700)).unwrap();
 
     // Process boundary: launch the public Aster supervisor and its built-in TLS
-    // service as a member of the named Intern group.
+    // service as a member of a named service group.
     drop(tls_reservation);
     drop(control_reservation);
     let stdout = tempfile::NamedTempFile::new().unwrap();
     let stderr = tempfile::NamedTempFile::new().unwrap();
     let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["services", "up", "intern", "--no-ui", "--no-watch"])
+        .args(["services", "up", "web", "--no-ui", "--no-watch"])
         .current_dir(root)
+        .env("ASTER_MKCERT_BIN", &fake_mkcert)
+        .env("ASTER_TEST_MKCERT_LOG", &mkcert_log)
+        .env("ASTER_TEST_DYNAMIC_CERT", &site_cert)
+        .env("ASTER_TEST_DYNAMIC_KEY", &site_key)
         .stdout(stdout.reopen().unwrap())
         .stderr(stderr.reopen().unwrap())
         .spawn()
@@ -252,8 +299,13 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
 
     // Observable behavior: exact and suffix hosts cross real TLS and HTTP
     // sockets, preserve logical Host, and select different upstream services.
-    let front_authority = format!("intern.dev:{tls_port}");
-    let front_response = https_get(tls_port, "intern.dev", &front_authority, cert_der.clone());
+    let front_authority = format!("app.example.test:{tls_port}");
+    let front_response = https_get(
+        tls_port,
+        "app.example.test",
+        &front_authority,
+        cert_der.clone(),
+    );
     assert!(front_response.contains("200 OK"), "{front_response}");
     assert!(
         front_response.contains(&format!(
@@ -261,24 +313,37 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
         )),
         "{front_response}"
     );
-    let site_response = https_get(
+    let site_response = https_get_with_roots(
         tls_port,
-        "test.local.sites.intern.dev",
-        "test.local.sites.intern.dev",
-        cert_der.clone(),
+        "docs.acme.example.test",
+        "docs.acme.example.test",
+        vec![CertificateDer::from(ca_cert.der().to_vec())],
     );
     assert!(
         site_response.contains(
-            "site-gateway host=test.local.sites.intern.dev forwarded=test.local.sites.intern.dev proto=https"
+            "site-gateway host=docs.acme.example.test forwarded=docs.acme.example.test proto=https"
         ),
         "{site_response}"
     );
-    let unknown = https_get(tls_port, "intern.dev", "unknown.test", cert_der);
+    let cached_site_response = https_get_with_roots(
+        tls_port,
+        "docs.acme.example.test",
+        "docs.acme.example.test",
+        vec![CertificateDer::from(ca_cert.der().to_vec())],
+    );
+    assert!(
+        cached_site_response.contains("200 OK"),
+        "{cached_site_response}"
+    );
+    assert_eq!(fs::read_to_string(&mkcert_log).unwrap().lines().count(), 1);
+    assert_tls_handshake_rejected(tls_port, "outside.invalid", certified.cert.der().to_vec());
+    assert_eq!(fs::read_to_string(&mkcert_log).unwrap().lines().count(), 1);
+    let unknown = https_get(tls_port, "app.example.test", "unknown.test", cert_der);
     assert!(unknown.contains("421 Misdirected Request"), "{unknown}");
     let malformed = https_get(
         tls_port,
-        "intern.dev",
-        "intern.dev:443@evil.example",
+        "app.example.test",
+        "app.example.test:443@evil.example",
         CertificateDer::from(certified.cert.der().to_vec()),
     );
     assert!(malformed.contains("400 Bad Request"), "{malformed}");
@@ -286,7 +351,7 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
         malformed.contains("missing or invalid Host header"),
         "{malformed}"
     );
-    assert_tls_upgrade_echo(tls_port, "intern.dev", certified.cert.der().to_vec());
+    assert_tls_upgrade_echo(tls_port, "app.example.test", certified.cert.der().to_vec());
 
     // Lifecycle outcome: authenticated control shutdown stops the group and
     // leaves durable evidence that the TLS edge reached readiness.
@@ -299,13 +364,52 @@ tls_proxy = {{ certificate_hosts = ["intern.dev", "*.local.sites.intern.dev"], o
     assert!(aster.wait().unwrap().success());
     assert!(!token_path.exists());
     assert!(TcpStream::connect(("127.0.0.1", tls_port)).is_err());
+
+    // Restart boundary: the next supervisor reuses the validated disk cache;
+    // it does not invoke mkcert again for the same nested SNI hostname.
+    let second_stdout = tempfile::NamedTempFile::new().unwrap();
+    let second_stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "web", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .env("ASTER_MKCERT_BIN", &fake_mkcert)
+        .env("ASTER_TEST_MKCERT_LOG", &mkcert_log)
+        .env("ASTER_TEST_DYNAMIC_CERT", &site_cert)
+        .env("ASTER_TEST_DYNAMIC_KEY", &site_key)
+        .stdout(second_stdout.reopen().unwrap())
+        .stderr(second_stderr.reopen().unwrap())
+        .spawn()
+        .unwrap();
+    wait_until(Duration::from_secs(8), || {
+        TcpStream::connect(("127.0.0.1", tls_port)).is_ok()
+    });
+    let persisted_site_response = https_get_with_roots(
+        tls_port,
+        "docs.acme.example.test",
+        "docs.acme.example.test",
+        vec![CertificateDer::from(ca_cert.der().to_vec())],
+    );
+    assert!(
+        persisted_site_response.contains("200 OK"),
+        "{persisted_site_response}"
+    );
+    assert_eq!(fs::read_to_string(&mkcert_log).unwrap().lines().count(), 1);
+    let (second_token_path, second_token) = wait_for_control_token(control_port, restarted.id());
+    let response = control_request(
+        control_port,
+        &serde_json::json!({"command":"shutdown", "token":second_token}).to_string(),
+    );
+    assert_eq!(response["ok"], true);
+    assert!(restarted.wait().unwrap().success());
+    assert!(!second_token_path.exists());
+
     let durable = root
         .join(".aster/logs")
         .join(root.file_name().unwrap())
-        .join("intern-edge/logs.txt");
+        .join("edge/logs.txt");
     assert!(fs::read_to_string(durable)
         .unwrap()
-        .contains("TLS edge 'intern-edge' ready"));
+        .contains("TLS edge 'edge' ready"));
     drop(front);
     drop(site);
 }
@@ -400,8 +504,39 @@ fn assert_tls_upgrade_echo(port: u16, host: &str, cert: Vec<u8>) {
 }
 
 fn https_get(port: u16, sni: &str, host: &str, cert: CertificateDer<'static>) -> String {
+    https_get_with_roots(port, sni, host, vec![cert])
+}
+
+fn assert_tls_handshake_rejected(port: u16, sni: &str, cert: Vec<u8>) {
     let mut roots = RootCertStore::empty();
-    roots.add(cert).unwrap();
+    roots.add(CertificateDer::from(cert)).unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connection = ClientConnection::new(
+        Arc::new(config),
+        ServerName::try_from(sni.to_string()).unwrap(),
+    )
+    .unwrap();
+    let socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut tls = StreamOwned::new(connection, socket);
+    assert!(
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: outside.invalid\r\nConnection: close\r\n\r\n")
+            .is_err(),
+        "unrouted SNI completed a TLS handshake"
+    );
+}
+
+fn https_get_with_roots(
+    port: u16,
+    sni: &str,
+    host: &str,
+    certs: Vec<CertificateDer<'static>>,
+) -> String {
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).unwrap();
+    }
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();

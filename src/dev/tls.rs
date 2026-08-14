@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
+use fs2::FileExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONNECTION, HOST, UPGRADE};
@@ -19,6 +22,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
@@ -26,6 +31,9 @@ use crate::config::{DevServiceConfig, DevTlsProxyConfig, DevWorkspaceConfig};
 
 const CERT_FILE: &str = "cert.pem";
 const KEY_FILE: &str = "key.pem";
+const DYNAMIC_CERT_DIR: &str = "hosts";
+const DYNAMIC_CERT_LOCK: &str = "hosts.lock";
+const MAX_DYNAMIC_CERTIFICATES: usize = 64;
 
 pub fn setup_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str) -> Result<()> {
     let (_, tls) = configured_proxy(config, edge)?;
@@ -47,6 +55,12 @@ pub fn setup_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str)
 
     let cert_path = cert_dir.join(CERT_FILE);
     let key_path = cert_dir.join(KEY_FILE);
+    let _dynamic_lock = lock_dynamic_certificates(&cert_dir)?;
+    let dynamic_dir = cert_dir.join(DYNAMIC_CERT_DIR);
+    if dynamic_dir.exists() {
+        fs::remove_dir_all(&dynamic_dir)
+            .with_context(|| format!("failed to clear {}", dynamic_dir.display()))?;
+    }
     let mut command = Command::new(&mkcert);
     command
         .arg("-cert-file")
@@ -129,8 +143,10 @@ pub fn serve_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str)
     runtime.block_on(serve(
         edge.to_string(),
         listen_port,
+        cert_dir,
         cert_path,
         key_path,
+        tls.certificate_hosts.clone(),
         Arc::new(routes),
     ))
 }
@@ -138,11 +154,19 @@ pub fn serve_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str)
 async fn serve(
     edge: String,
     listen_port: u16,
+    cert_dir: PathBuf,
     cert_path: PathBuf,
     key_path: PathBuf,
+    certificate_hosts: Vec<String>,
     routes: Arc<Vec<ResolvedRoute>>,
 ) -> Result<()> {
-    let tls = Arc::new(load_server_config(&cert_path, &key_path)?);
+    let tls = Arc::new(load_server_config(
+        &cert_path,
+        &key_path,
+        cert_dir,
+        certificate_hosts,
+        routes.clone(),
+    )?);
     let listener = TcpListener::bind(("127.0.0.1", listen_port))
         .await
         .with_context(|| format!("TLS edge '{edge}' could not bind 127.0.0.1:{listen_port}"))?;
@@ -323,19 +347,193 @@ fn match_route(hostname: &str, routes: &[ResolvedRoute]) -> Option<u16> {
         .map(|route| route.port)
 }
 
-fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
+fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
     let mut cert_reader = BufReader::new(fs::File::open(cert_path)?);
     let certificates =
         rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<Vec<_>, _>>()?;
     let mut key_reader = BufReader::new(fs::File::open(key_path)?);
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| anyhow!("no private key found in {}", key_path.display()))?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    Ok(Arc::new(
+        CertifiedKey::from_der(certificates, key, &provider)
+            .context("certificate and private key do not match")?,
+    ))
+}
+
+fn load_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    cert_dir: PathBuf,
+    certificate_hosts: Vec<String>,
+    routes: Arc<Vec<ResolvedRoute>>,
+) -> Result<ServerConfig> {
+    let default = load_certified_key(cert_path, key_path)?;
+    let resolver = DynamicCertificateResolver {
+        default,
+        certificate_hosts,
+        routes,
+        cert_dir,
+        mkcert: std::env::var_os("ASTER_MKCERT_BIN").unwrap_or_else(|| "mkcert".into()),
+        cache: Mutex::new(HashMap::new()),
+    };
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .context("certificate and private key do not match")?;
+        .with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+struct DynamicCertificateResolver {
+    default: Arc<CertifiedKey>,
+    certificate_hosts: Vec<String>,
+    routes: Arc<Vec<ResolvedRoute>>,
+    cert_dir: PathBuf,
+    mkcert: OsString,
+    cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for DynamicCertificateResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicCertificateResolver")
+            .field("certificate_hosts", &self.certificate_hosts)
+            .field("cert_dir", &self.cert_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvesServerCert for DynamicCertificateResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let hostname = client_hello.server_name()?.to_ascii_lowercase();
+        if self
+            .certificate_hosts
+            .iter()
+            .any(|configured| certificate_host_covers(configured, &hostname))
+        {
+            return Some(self.default.clone());
+        }
+        match_route(&hostname, &self.routes)?;
+
+        let mut cache = self.cache.lock().ok()?;
+        if let Some(certified) = cache.get(&hostname) {
+            return Some(certified.clone());
+        }
+        match issue_dynamic_certificate(&self.mkcert, &self.cert_dir, &hostname) {
+            Ok(certified) => {
+                cache.insert(hostname, certified.clone());
+                Some(certified)
+            }
+            Err(error) => {
+                eprintln!("TLS certificate issuance failed: {error:#}");
+                None
+            }
+        }
+    }
+}
+
+fn certificate_host_covers(configured: &str, hostname: &str) -> bool {
+    let configured = configured.to_ascii_lowercase();
+    if let Some(suffix) = configured.strip_prefix("*.") {
+        hostname.strip_suffix(suffix).is_some_and(|prefix| {
+            prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+        })
+    } else {
+        hostname == configured
+    }
+}
+
+fn issue_dynamic_certificate(
+    mkcert: &OsString,
+    cert_dir: &Path,
+    hostname: &str,
+) -> Result<Arc<CertifiedKey>> {
+    let _dynamic_lock = lock_dynamic_certificates(cert_dir)?;
+    let dynamic_dir = cert_dir.join(DYNAMIC_CERT_DIR);
+    let host_dir = dynamic_dir.join(hostname);
+    let cert_path = host_dir.join(CERT_FILE);
+    let key_path = host_dir.join(KEY_FILE);
+    if cert_path.is_file() && key_path.is_file() {
+        if let Ok(certified) = load_certified_key(&cert_path, &key_path) {
+            return Ok(certified);
+        }
+    }
+    if host_dir.exists() {
+        fs::remove_dir_all(&host_dir)
+            .with_context(|| format!("failed to clear invalid cache {}", host_dir.display()))?;
+    }
+    fs::create_dir_all(&dynamic_dir)?;
+    let certificate_count = fs::read_dir(&dynamic_dir)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .count();
+    if certificate_count >= MAX_DYNAMIC_CERTIFICATES {
+        bail!("dynamic TLS certificate limit of {MAX_DYNAMIC_CERTIFICATES} reached");
+    }
+    fs::create_dir(&host_dir)
+        .with_context(|| format!("failed to create {}", host_dir.display()))?;
+
+    let process_id = std::process::id();
+    let temp_cert_path = host_dir.join(format!(".{CERT_FILE}.{process_id}.tmp"));
+    let temp_key_path = host_dir.join(format!(".{KEY_FILE}.{process_id}.tmp"));
+    let mut command = Command::new(mkcert);
+    command
+        .arg("-cert-file")
+        .arg(&temp_cert_path)
+        .arg("-key-file")
+        .arg(&temp_key_path)
+        .arg(hostname);
+    if let Err(error) = run_mkcert(
+        &mut command,
+        &format!("generate a certificate for {hostname}"),
+    ) {
+        let _ = fs::remove_file(&temp_cert_path);
+        let _ = fs::remove_file(&temp_key_path);
+        let _ = fs::remove_dir(&host_dir);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&temp_key_path, fs::Permissions::from_mode(0o600)) {
+            clear_failed_certificate(&host_dir, &temp_cert_path, &temp_key_path);
+            return Err(error.into());
+        }
+    }
+    let certified = match load_certified_key(&temp_cert_path, &temp_key_path) {
+        Ok(certified) => certified,
+        Err(error) => {
+            clear_failed_certificate(&host_dir, &temp_cert_path, &temp_key_path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::rename(&temp_cert_path, &cert_path) {
+        clear_failed_certificate(&host_dir, &temp_cert_path, &temp_key_path);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&temp_key_path, &key_path) {
+        clear_failed_certificate(&host_dir, &cert_path, &temp_key_path);
+        return Err(error.into());
+    }
+    Ok(certified)
+}
+
+fn lock_dynamic_certificates(cert_dir: &Path) -> Result<File> {
+    fs::create_dir_all(cert_dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cert_dir.join(DYNAMIC_CERT_LOCK))?;
+    FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn clear_failed_certificate(host_dir: &Path, cert_path: &Path, key_path: &Path) {
+    let _ = fs::remove_file(cert_path);
+    let _ = fs::remove_file(key_path);
+    let _ = fs::remove_dir(host_dir);
 }
 
 fn configured_proxy<'a>(
@@ -440,37 +638,38 @@ mod tests {
 
     #[test]
     fn host_authority_accepts_numeric_ports_and_rejects_userinfo() {
-        let authority = parse_host_authority("intern.dev:8443").unwrap();
-        assert_eq!(authority.host(), "intern.dev");
+        let authority = parse_host_authority("app.example.test:8443").unwrap();
+        assert_eq!(authority.host(), "app.example.test");
         assert_eq!(authority.port_u16(), Some(8443));
-        assert!(parse_host_authority("intern.dev:443@evil.example").is_none());
-        assert!(parse_host_authority("intern.dev:not-a-port").is_none());
+        assert!(parse_host_authority("app.example.test:443@evil.example").is_none());
+        assert!(parse_host_authority("app.example.test:not-a-port").is_none());
     }
 
     #[test]
     fn dns_validation_probes_apex_open_host_and_a_wildcard_site_hostname() {
         let tls = DevTlsProxyConfig {
             certificate_hosts: vec![
-                "intern.dev".to_string(),
-                "*.local.sites.intern.dev".to_string(),
+                "app.example.test".to_string(),
+                "*.local.example.test".to_string(),
             ],
-            open_host: "intern.dev".to_string(),
-            dns_domain: Some("intern.dev".to_string()),
+            open_host: "app.example.test".to_string(),
+            dns_domain: Some("example.test".to_string()),
             routes: vec![crate::config::DevTlsRouteConfig {
                 host: None,
-                host_suffix: Some(".sites.intern.dev".to_string()),
-                open_host: Some("test.local.sites.intern.dev".to_string()),
+                host_suffix: Some(".example.test".to_string()),
+                open_host: Some("demo.team.example.test".to_string()),
                 upstream_port: "gateway".to_string(),
             }],
         };
         assert_eq!(
-            dns_probe_hostnames(&tls, "intern.dev")
+            dns_probe_hostnames(&tls, "example.test")
                 .into_iter()
                 .collect::<Vec<_>>(),
             [
-                "aster-dns-probe.local.sites.intern.dev",
-                "intern.dev",
-                "test.local.sites.intern.dev"
+                "app.example.test",
+                "aster-dns-probe.local.example.test",
+                "demo.team.example.test",
+                "example.test"
             ]
         );
     }
