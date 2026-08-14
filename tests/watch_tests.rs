@@ -325,12 +325,6 @@ fn watch_ignores_node_modules_changes() {
     setup_workspace(&tmp);
     write(&tmp, "libs/core/package.json", &nodejs_package("core"));
     write(&tmp, "libs/core/src/index.ts", "export const x = 1;\n");
-    write(
-        &tmp,
-        "libs/core/node_modules/foo/index.js",
-        "module.exports = 1;\n",
-    );
-
     let mut cmd = Command::new(aster_bin());
     cmd.current_dir(tmp.path())
         .arg("watch")
@@ -343,11 +337,13 @@ fn watch_ignores_node_modules_changes() {
     assert!(wait_for_line(&rx, "watching", Duration::from_secs(5)).is_some());
     drain_startup_events(&rx);
 
-    fs::write(
-        tmp.path().join("libs/core/node_modules/foo/index.js"),
-        "module.exports = 2;\n",
-    )
-    .unwrap();
+    // Model a dependency install creating node_modules after the watcher has
+    // started. The entire creation must remain ignored.
+    write(
+        &tmp,
+        "libs/core/node_modules/foo/index.js",
+        "module.exports = 1;\n",
+    );
 
     let observed = assert_no_line_containing(&rx, "change:", Duration::from_secs(2));
     kill_child(&mut child);
