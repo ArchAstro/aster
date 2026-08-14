@@ -1064,15 +1064,14 @@ mod tests {
 
         assert!(
             wait_until(|| dispatches.count() >= 2, Duration::from_secs(3)),
-            "dispatch #2 never fired. got count={}",
-            dispatches.count()
+            "dispatch #2 never fired. got count={dispatch_count}",
+            dispatch_count = dispatches.count()
         );
         let snapshot = dispatches.snapshot();
         assert_eq!(
             snapshot.len(),
             2,
-            "expected the mid-build source edit to survive cooldown; got dispatches: {:?}",
-            snapshot
+            "expected the mid-build source edit to survive cooldown; got dispatches: {snapshot:?}"
         );
 
         stop_loop(tx, shutdown, handle);
