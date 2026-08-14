@@ -1062,14 +1062,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         send_modify(&tx, "/repo/services/api/src/main.ts");
 
-        // Wait long enough for the queued edit to dispatch after the first
-        // build returns.
-        std::thread::sleep(Duration::from_millis(450));
+        assert!(
+            wait_until(|| dispatches.count() >= 2, Duration::from_secs(3)),
+            "dispatch #2 never fired. got count={}",
+            dispatches.count()
+        );
+        let snapshot = dispatches.snapshot();
         assert_eq!(
-            dispatches.count(),
+            snapshot.len(),
             2,
             "expected the mid-build source edit to survive cooldown; got dispatches: {:?}",
-            dispatches.snapshot()
+            snapshot
         );
 
         stop_loop(tx, shutdown, handle);
