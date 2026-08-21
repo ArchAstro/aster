@@ -5,7 +5,37 @@
   },
   "pipelines": {
     "branch-validation": {
-      "steps": []
+      "steps": [
+        {
+          "id": "format",
+          "run": ["cargo", "fmt", "--all", "--", "--check"]
+        },
+        {
+          "id": "lint",
+          "run": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "timeout_seconds": 1800
+        },
+        {
+          "id": "test",
+          "run": [
+            "cargo",
+            "test",
+            "--locked",
+            "--all-targets",
+            "--all-features"
+          ],
+          "timeout_seconds": 3600
+        }
+      ]
     }
   },
   "pipeline_bindings": {
