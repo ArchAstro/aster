@@ -1,5 +1,6 @@
 //! Config-driven local service supervision for `aster services up`.
 
+mod daemon;
 mod dashboard;
 mod log_files;
 mod plan;
@@ -10,6 +11,13 @@ mod process;
 mod runner;
 mod tls;
 
+#[doc(hidden)]
+pub use daemon::{is_internal_serve_invocation, register_supervisor_ready, serve_from_environment};
+pub use daemon::{
+    launch_bundle, list_workspace_bundles, ping_daemon, stop_all_bundles, stop_workspace_bundles,
+    BundleDescriptor, BundleState, DaemonError, DaemonErrorCode, DaemonResult, LaunchOptions,
+    LaunchResult, LaunchStatus, DEFAULT_GROUP, PROTOCOL_VERSION,
+};
 pub use log_files::show_service_logs;
 pub use plan::{
     resolve_dev_plan, resolve_dev_ports, resolve_static_dev_ports, DevPlan, ServicePlan,

@@ -1158,6 +1158,67 @@ target = "//beta:dev"
 }
 
 #[test]
+fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let runtime_dir = root.join("daemon-runtime");
+    let lease_dir = root.join("leases");
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev.services.worker]\ntarget = \"//app:worker\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.worker]\ncommand = \"sleep 30\"\nstream = true\n",
+    )
+    .unwrap();
+
+    let executable = Path::new(env!("CARGO_BIN_EXE_aster")).to_path_buf();
+    let launch = || {
+        let root = root.to_path_buf();
+        let executable = executable.clone();
+        thread::spawn(move || {
+            aster::dev::launch_bundle(aster::dev::LaunchOptions {
+                workspace: root,
+                group: None,
+                watch: false,
+                use_cache: true,
+                executable,
+            })
+            .unwrap()
+        })
+    };
+
+    std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", &runtime_dir);
+    std::env::set_var("ASTER_PORT_LEASE_DIR", &lease_dir);
+    let first = launch();
+    let second = launch();
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_eq!(first.bundle.supervisor_pid, second.bundle.supervisor_pid);
+    assert_eq!(first.bundle.services, vec!["worker"]);
+    assert_ne!(first.status, second.status);
+    let daemon_pid = aster::dev::ping_daemon().unwrap();
+    assert!(process_is_running(daemon_pid as i32));
+    assert_eq!(aster::dev::list_workspace_bundles(root).unwrap().len(), 1);
+
+    let stopped = aster::dev::stop_workspace_bundles(root, None).unwrap();
+    assert_eq!(stopped.len(), 1);
+    wait_until(Duration::from_secs(10), || {
+        !runtime_dir.join("daemon.sock").exists()
+            && !runtime_dir.join("daemon.pid").exists()
+            && !process_is_running(daemon_pid as i32)
+            && !process_is_running(first.bundle.supervisor_pid as i32)
+    });
+    std::env::remove_var("ASTER_DAEMON_RUNTIME_DIR");
+    std::env::remove_var("ASTER_PORT_LEASE_DIR");
+}
+
+#[test]
 fn services_logs_writes_raw_log_text_when_stdout_is_piped() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
