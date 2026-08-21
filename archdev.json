@@ -1,0 +1,18 @@
+{
+  "app": "dap_033y70rWJriCRNyb9uL0Pm",
+  "publish": {
+    "auto": true
+  },
+  "pipelines": {
+    "branch-validation": {
+      "steps": []
+    }
+  },
+  "pipeline_bindings": {
+    "branch_update": "branch-validation"
+  },
+  "local": {
+    "project_id": "project_44269112-848d-478d-b3a7-7314f786cf5a",
+    "repo_name": "aster"
+  }
+}
