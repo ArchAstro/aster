@@ -75,6 +75,17 @@ pub fn run_dev(
     } else {
         (None, None)
     };
+    super::daemon::register_supervisor_ready(
+        workspace_root,
+        plan.services
+            .iter()
+            .map(|service| service.name.clone())
+            .collect(),
+        plan.ports
+            .iter()
+            .map(|(name, port)| (name.clone(), *port))
+            .collect(),
+    )?;
     let mut dashboard = Dashboard::new(&plan.services);
     let mut runtimes: HashMap<String, Runtime> = plan
         .services

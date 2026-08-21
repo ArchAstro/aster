@@ -34,6 +34,15 @@ use std::path::{Path, PathBuf};
 const CACHE_HASH_DISPLAY_LENGTH: usize = 8;
 
 fn main() -> ExitCode {
+    if aster::dev::is_internal_serve_invocation() {
+        return match aster::dev::serve_from_environment() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("daemon error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     install_signal_handler();
     let result = run();
     if let Some(signal) = shutdown_signal() {
