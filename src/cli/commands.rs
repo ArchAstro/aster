@@ -150,6 +150,10 @@ pub enum Commands {
         #[arg(long)]
         dependents: bool,
 
+        /// Select a configured named subset of affected primary projects
+        #[arg(long)]
+        lane: Option<String>,
+
         /// Show what would run without executing
         #[arg(long)]
         dry_run: bool,
