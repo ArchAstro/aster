@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::address::ProjectSelector;
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 
@@ -216,37 +217,31 @@ pub fn select_projects<'a>(
     // Get cwd relative to workspace for ./... pattern
     let relative_cwd = cwd.strip_prefix(workspace_root).ok();
 
-    // Helper to check if a pattern matches a project address
+    // Absolute patterns use the shared selector grammar; ./... remains CLI-only.
     let matches_pattern = |pattern: &str, project_addr: &str| -> bool {
-        if pattern == "//..." {
-            // Match all projects
-            true
-        } else if let Some(prefix) = pattern.strip_suffix("/...") {
-            // Glob pattern: //prefix/... or ./...
-            let abs_prefix = if prefix == "." {
-                // ./... - use cwd
-                relative_cwd
-                    .map(|p| format!("//{}", p.display()))
-                    .unwrap_or_default()
-            } else if prefix.starts_with("./") {
-                // ./path/... - relative to cwd
-                relative_cwd
-                    .map(|p| format!("//{}/{}", p.display(), &prefix[2..]))
-                    .unwrap_or_default()
-            } else {
-                prefix.to_string()
-            };
-
-            if abs_prefix.is_empty() {
-                return false;
-            }
-
-            let prefix_with_slash = format!("{abs_prefix}/");
-            project_addr == abs_prefix || project_addr.starts_with(&prefix_with_slash)
-        } else {
-            // Exact match
-            project_addr == pattern
+        if pattern.starts_with("//") {
+            return ProjectSelector::parse(pattern)
+                .map(|selector| selector.matches(project_addr))
+                .unwrap_or(false);
         }
+
+        let Some(prefix) = pattern.strip_suffix("/...") else {
+            return false;
+        };
+        let abs_prefix = if prefix == "." {
+            relative_cwd
+                .map(|p| format!("//{}", p.display()))
+                .unwrap_or_default()
+        } else if prefix.starts_with("./") {
+            relative_cwd
+                .map(|p| format!("//{}/{}", p.display(), &prefix[2..]))
+                .unwrap_or_default()
+        } else {
+            return false;
+        };
+
+        !abs_prefix.is_empty()
+            && (project_addr == abs_prefix || project_addr.starts_with(&format!("{abs_prefix}/")))
     };
 
     // Check for //... in projects (means all)

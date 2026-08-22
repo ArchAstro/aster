@@ -22,7 +22,10 @@ use aster::executor::{
     collect_target_deps, compute_target_levels, install_signal_handler, parse_target_address,
     shutdown_signal, Executor,
 };
-use aster::git::{affected_with_dependents, files_to_projects, AffectedDetector, AffectedIgnore};
+use aster::git::{
+    affected_with_dependents, files_to_projects, select_affected_lane, AffectedDetector,
+    AffectedIgnore,
+};
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::{PluginRegistry, Target, TargetCapability};
 use chrono::{DateTime, Utc};
@@ -459,6 +462,7 @@ fn run() -> Result<()> {
             base,
             head,
             dependents,
+            lane,
             dry_run,
             only_affected_files,
             warnings_as_errors,
@@ -519,11 +523,25 @@ fn run() -> Result<()> {
             let directly_affected_addrs = directly_affected.clone();
 
             // Expand with dependents if requested
-            let affected_addrs = if dependents {
+            let mut affected_addrs = if dependents {
                 affected_with_dependents(directly_affected, &graph)
             } else {
                 directly_affected
             };
+
+            // Lane selection applies only to primary projects, after optional
+            // dependent expansion and before target dependency closure.
+            if let Some(lane_name) = lane.as_deref() {
+                affected_addrs = select_affected_lane(
+                    lane_name,
+                    &workspace_config.affected,
+                    affected_addrs,
+                    &projects,
+                )?;
+                if output_mode == OutputMode::Verbose {
+                    eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
+                }
+            }
 
             // Primary projects are the affected ones (only these run the requested target)
             let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
@@ -559,11 +577,13 @@ fn run() -> Result<()> {
                 );
             }
 
-            // Print affected projects list (unless quiet or json without dry_run)
-            if output_mode != OutputMode::Quiet && (output_mode != OutputMode::Json || dry_run) {
+            // Machine-readable output must contain JSON only, including dry runs.
+            if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
                 println!(
                     "Affected projects ({}):",
-                    if dependents {
+                    if lane.is_some() {
+                        "selected by lane"
+                    } else if dependents {
                         "including dependents"
                     } else {
                         "directly affected only"
@@ -610,14 +630,12 @@ fn run() -> Result<()> {
                 // Categorize each target's rationale
                 let rationale_for = |target_addr: &str| -> &'static str {
                     if let Some((project_addr, target_name)) = parse_target_address(target_addr) {
-                        if target_name == target {
-                            // This is the requested target
+                        if target_name == target && primary_addrs.contains(&project_addr) {
+                            // Only lane-selected requested targets are primary work.
                             if directly_affected_addrs.contains(&project_addr) {
                                 return "affected";
-                            } else if primary_addrs.contains(&project_addr) {
-                                // In primary but not directly affected = added by --dependents
-                                return "dependent";
                             }
+                            return "dependent";
                         }
                     }
                     "target dependency"
