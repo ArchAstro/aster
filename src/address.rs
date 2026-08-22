@@ -60,6 +60,58 @@ impl Address {
     }
 }
 
+/// A reusable selector for project addresses.
+///
+/// Supported forms are exact addresses (`//services/api`), recursive prefixes
+/// (`//services/...`), and the workspace-wide selector (`//...`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectSelector {
+    All,
+    Recursive(String),
+    Exact(String),
+}
+
+impl ProjectSelector {
+    pub fn parse(selector: &str) -> Result<Self> {
+        if selector == "//..." {
+            return Ok(Self::All);
+        }
+        if !selector.starts_with("//") {
+            return Err(anyhow!(
+                "project selector must start with '//': '{selector}'"
+            ));
+        }
+        if selector.contains(':') {
+            return Err(anyhow!(
+                "project selector must not include a target: '{selector}'"
+            ));
+        }
+        if let Some(prefix) = selector.strip_suffix("/...") {
+            if prefix == "//" || prefix.contains("...") {
+                return Err(anyhow!("invalid recursive project selector: '{selector}'"));
+            }
+            return Ok(Self::Recursive(prefix.to_string()));
+        }
+        if selector.contains("...") || selector.ends_with('/') {
+            return Err(anyhow!("invalid project selector: '{selector}'"));
+        }
+        Ok(Self::Exact(selector.to_string()))
+    }
+
+    pub fn matches(&self, project_address: &str) -> bool {
+        // Addresses are slash-delimited on every platform, while paths rendered
+        // by `Path::display` use the host separator on Windows.
+        let project_address = project_address.replace('\\', "/");
+        match self {
+            Self::All => true,
+            Self::Recursive(prefix) => {
+                project_address == *prefix || project_address.starts_with(&format!("{prefix}/"))
+            }
+            Self::Exact(address) => project_address == *address,
+        }
+    }
+}
+
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "//{}", self.path.display())?;
@@ -120,6 +172,37 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must start with //"));
+    }
+
+    #[test]
+    fn project_selectors_match_exact_prefix_and_all() {
+        assert!(ProjectSelector::parse("//services/api")
+            .unwrap()
+            .matches("//services/api"));
+        assert!(!ProjectSelector::parse("//services/api")
+            .unwrap()
+            .matches("//services/api/web"));
+        assert!(ProjectSelector::parse("//services/...")
+            .unwrap()
+            .matches("//services/api/web"));
+        assert!(ProjectSelector::parse("//...")
+            .unwrap()
+            .matches("//services/api"));
+        assert!(ProjectSelector::parse("//services/...")
+            .unwrap()
+            .matches("//services\\api"));
+    }
+
+    #[test]
+    fn project_selectors_reject_paths_targets_and_malformed_recursion() {
+        for selector in [
+            "services/api",
+            "//services/api:test",
+            "//services/.../api",
+            "//services/",
+        ] {
+            assert!(ProjectSelector::parse(selector).is_err(), "{selector}");
+        }
     }
 
     #[test]
