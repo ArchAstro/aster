@@ -6,8 +6,9 @@ pub use project::{
     TargetConfig,
 };
 pub use workspace::{
-    find_workspace_root, AffectedWorkspaceConfig, DetailedDevServiceGroupConfig, DevPortConfig,
-    DevServiceConfig, DevServiceGroupConfig, DevTlsProxyConfig, DevTlsRouteConfig,
-    DevWorkspaceConfig, DynamicDevPortConfig, DynamicPortAllocation, ResolvedDevPortConfig,
-    StaticPortAllocation, WatchWorkspaceConfig, WorkspaceConfig,
+    find_workspace_root, AffectedLaneConfig, AffectedWorkspaceConfig,
+    DetailedDevServiceGroupConfig, DevPortConfig, DevServiceConfig, DevServiceGroupConfig,
+    DevTlsProxyConfig, DevTlsRouteConfig, DevWorkspaceConfig, DynamicDevPortConfig,
+    DynamicPortAllocation, ResolvedDevPortConfig, StaticPortAllocation, WatchWorkspaceConfig,
+    WorkspaceConfig,
 };

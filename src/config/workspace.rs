@@ -428,6 +428,22 @@ pub struct AffectedWorkspaceConfig {
     /// Workspace-relative glob patterns excluded from affected analysis.
     #[serde(default)]
     pub ignore: Vec<String>,
+
+    /// Named subsets of affected primary projects.
+    #[serde(default)]
+    pub lanes: HashMap<String, AffectedLaneConfig>,
+}
+
+/// Inclusive and exclusive project-address selectors for one affected lane.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedLaneConfig {
+    /// Selectors admitted to the lane. Empty means all affected projects.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Selectors removed from the lane. Exclusions always win.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Watch-mode configuration controlling fs-event ignore and suppression behavior.
@@ -783,6 +799,10 @@ debounce_ms = 500
             r#"
 [affected]
 ignore = [".agents/**", ".claude/skills/**"]
+
+[affected.lanes.core]
+include = ["//src/elixir/core/..."]
+exclude = ["//src/elixir/core/generated"]
 "#,
         )
         .unwrap();
@@ -791,6 +811,14 @@ ignore = [".agents/**", ".claude/skills/**"]
         assert_eq!(
             config.affected.ignore,
             vec![".agents/**".to_string(), ".claude/skills/**".to_string()]
+        );
+        assert_eq!(
+            config.affected.lanes["core"].include,
+            vec!["//src/elixir/core/...".to_string()]
+        );
+        assert_eq!(
+            config.affected.lanes["core"].exclude,
+            vec!["//src/elixir/core/generated".to_string()]
         );
     }
 
