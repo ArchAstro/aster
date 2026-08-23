@@ -1685,6 +1685,264 @@ fn test_affected_with_dependents_flag() {
 }
 
 #[test]
+fn test_affected_lanes_split_elixir_primary_projects_and_keep_target_dependencies() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    let mix_project = |module: &str, app: &str| {
+        format!(
+            "defmodule {module}.MixProject do\n  use Mix.Project\n  def project, do: [app: :{app}, version: \"0.1.0\"]\nend\n"
+        )
+    };
+    write_mix_exs(
+        &tmp,
+        "src/elixir/core/accounts/mix.exs",
+        &mix_project("Accounts", "accounts"),
+    );
+    write_mix_exs(
+        &tmp,
+        "services/platform/gateway/mix.exs",
+        &mix_project("Gateway", "gateway"),
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        r#"
+[affected.lanes.core]
+include = ["//src/elixir/core/..."]
+
+[affected.lanes.platform]
+include = ["//services/platform/..."]
+
+[affected.lanes.with_exclusion]
+exclude = ["//services/platform/..."]
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "src/elixir/core/accounts/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+depends_on = ["//services/platform/gateway:prepare"]
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "services/platform/gateway/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+
+[targets.prepare]
+command = "true"
+"#,
+    );
+    git_commit(&tmp, "Initial commit");
+    write_fixture(&tmp, "src/elixir/core/accounts/lib/change.ex", "changed");
+    write_fixture(&tmp, "services/platform/gateway/lib/change.ex", "changed");
+
+    let run_lane = |name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args([
+                "affected",
+                "build",
+                "--base=HEAD",
+                "--dry-run",
+                "--json",
+                "--lane",
+                name,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let core = run_lane("core");
+    assert!(core.status.success(), "core lane failed: {core:?}");
+    let core_json: serde_json::Value = serde_json::from_slice(&core.stdout).unwrap();
+    let core_targets = core_json["targets"].as_array().unwrap();
+    assert!(core_targets.iter().any(|target| {
+        target["address"] == "//src/elixir/core/accounts:build" && target["reason"] == "affected"
+    }));
+    assert!(core_targets.iter().any(|target| {
+        target["address"] == "//services/platform/gateway:prepare"
+            && target["reason"] == "target dependency"
+    }));
+    assert!(!core_targets
+        .iter()
+        .any(|target| target["address"] == "//services/platform/gateway:build"));
+
+    let platform = run_lane("platform");
+    assert!(
+        platform.status.success(),
+        "platform lane failed: {platform:?}"
+    );
+    let platform_stdout = String::from_utf8_lossy(&platform.stdout);
+    assert!(platform_stdout.contains("//services/platform/gateway:build"));
+    assert!(!platform_stdout.contains("//src/elixir/core/accounts:build"));
+
+    let excluded = run_lane("with_exclusion");
+    assert!(
+        excluded.status.success(),
+        "excluded lane failed: {excluded:?}"
+    );
+    let excluded_stdout = String::from_utf8_lossy(&excluded.stdout);
+    assert!(excluded_stdout.contains("//src/elixir/core/accounts:build"));
+    assert!(!excluded_stdout.contains("//services/platform/gateway:build"));
+}
+
+#[test]
+fn test_affected_lane_filters_after_dependents_expansion() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "src/elixir/core/accounts/package.json",
+        r#"{"name":"accounts","scripts":{"build":"true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "services/platform/gateway/package.json",
+        r#"{"name":"gateway","dependencies":{"accounts":"file:../../../src/elixir/core/accounts"},"scripts":{"build":"true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        "[affected.lanes.platform]\ninclude = [\"//services/platform/...\"]\n",
+    );
+    git_commit(&tmp, "Initial commit");
+    write_fixture(&tmp, "src/elixir/core/accounts/change.js", "changed");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "build",
+            "--base=HEAD",
+            "--dependents",
+            "--lane",
+            "platform",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "lane failed: {output:?}");
+    assert!(stdout.contains("//services/platform/gateway:build"));
+    assert!(
+        stdout.contains("//src/elixir/core/accounts:build  (target dependency)"),
+        "expected filtered direct project to remain a target dependency: {stdout}"
+    );
+}
+
+#[test]
+fn test_affected_lane_validates_unknown_malformed_and_non_matching_selectors() {
+    for (configuration, lane, expected) in [
+        (
+            "[affected.lanes.core]\ninclude = [\"src/elixir/core/...\"]\n",
+            "core",
+            "invalid selector 'src/elixir/core/...' in affected lane 'core' include",
+        ),
+        (
+            "[affected.lanes.core]\ninclude = [\"//missing/...\"]\n",
+            "core",
+            "selector '//missing/...' in affected lane 'core' include matches no projects",
+        ),
+        (
+            "[affected.lanes.core]\ninclude = [\"//src/elixir/core/...\"]\n",
+            "other",
+            "unknown affected lane 'other'; configured lanes: core",
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        setup_git_repo(&tmp);
+        write_mix_exs(
+            &tmp,
+            "src/elixir/core/accounts/mix.exs",
+            "defmodule Accounts.MixProject do\n  use Mix.Project\n  def project, do: [app: :accounts, version: \"0.1.0\"]\nend\n",
+        );
+        write_aster_toml(&tmp, "aster.toml", configuration);
+        git_commit(&tmp, "Initial commit");
+        write_fixture(&tmp, "src/elixir/core/accounts/lib/change.ex", "changed");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(["affected", "build", "--base=HEAD", "--lane", lane])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "expected failure: {output:?}");
+        assert!(stderr.contains(expected), "expected {expected:?}: {stderr}");
+    }
+}
+
+#[test]
+fn test_affected_lane_empty_selection_uses_existing_output_contracts() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "src/elixir/core/accounts/package.json",
+        r#"{"name":"accounts","scripts":{"test":"true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "services/platform/gateway/package.json",
+        r#"{"name":"gateway","scripts":{"test":"true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        "[affected.lanes.platform]\ninclude = [\"//services/platform/...\"]\n",
+    );
+    git_commit(&tmp, "Initial commit");
+    write_fixture(&tmp, "src/elixir/core/accounts/change.js", "changed");
+
+    let human = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--lane", "platform"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout).trim(),
+        "No projects affected"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--lane",
+            "platform",
+        ])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["summary"]["total"], 0);
+
+    let quiet = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--quiet",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--lane",
+            "platform",
+        ])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success());
+    assert!(quiet.stdout.is_empty() && quiet.stderr.is_empty());
+}
+
+#[test]
 fn test_affected_help_shows_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["affected", "--help"])

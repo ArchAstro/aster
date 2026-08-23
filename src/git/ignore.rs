@@ -48,6 +48,7 @@ mod tests {
     fn filters_ignored_paths_and_keeps_other_paths() {
         let config = AffectedWorkspaceConfig {
             ignore: vec![".agents/**".to_string(), "docs/generated/**".to_string()],
+            ..AffectedWorkspaceConfig::default()
         };
         let ignore = AffectedIgnore::build(&config).unwrap();
         let paths = [
@@ -67,6 +68,7 @@ mod tests {
     fn rejects_invalid_patterns() {
         let config = AffectedWorkspaceConfig {
             ignore: vec!["[".to_string()],
+            ..AffectedWorkspaceConfig::default()
         };
 
         let error = AffectedIgnore::build(&config).err().unwrap();
