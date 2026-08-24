@@ -1206,6 +1206,12 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
     let daemon_pid = aster::dev::ping_daemon().unwrap();
     assert!(process_is_running(daemon_pid as i32));
     assert_eq!(aster::dev::list_workspace_bundles(root).unwrap().len(), 1);
+    let attach_socket = aster::dev::attach_bundle(root, None).unwrap();
+    assert_eq!(
+        first.bundle.attach_socket.as_deref(),
+        Some(attach_socket.as_path())
+    );
+    assert!(attach_socket.exists());
 
     let stopped = aster::dev::stop_workspace_bundles(root, None).unwrap();
     assert_eq!(stopped.len(), 1);
@@ -1257,7 +1263,7 @@ fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
     fs::write(
         root.join("aster.toml"),
         format!(
-            "[dev.ports.http]\ndefault = {port}\n\n[dev.services.web]\ntarget = \"//app:web\"\nport = \"http\"\n\n[dev.services.worker]\ntarget = \"//app:worker\"\n\n{group_config}"
+            "[dev]\ndaemon = true\n\n[dev.ports.http]\ndefault = {port}\n\n[dev.services.web]\ntarget = \"//app:web\"\nport = \"http\"\n\n[dev.services.worker]\ntarget = \"//app:worker\"\n\n{group_config}"
         ),
     )
     .unwrap();
@@ -1303,7 +1309,7 @@ fn daemon_cli_manages_and_lists_worktree_bundles() {
             "services",
             "up",
             "intern",
-            "--daemon",
+            "--no-ui",
             "--no-watch",
         ])
         .output()

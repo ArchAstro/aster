@@ -4,13 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
+const PREVIOUS_PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_GROUP: &str = "__aster_default__";
 const SERVE_ENV: &str = "ASTER_INTERNAL_DAEMON_SERVE";
 const READY_SOCKET_ENV: &str = "ASTER_INTERNAL_DAEMON_READY_SOCKET";
 const READY_ID_ENV: &str = "ASTER_INTERNAL_DAEMON_BUNDLE_ID";
 const READY_GROUP_ENV: &str = "ASTER_INTERNAL_DAEMON_GROUP";
 const READY_DISPLAY_GROUP_ENV: &str = "ASTER_INTERNAL_DAEMON_DISPLAY_GROUP";
+#[doc(hidden)]
+pub const SUPERVISOR_ENV: &str = "ASTER_INTERNAL_DAEMON_SUPERVISOR";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +67,8 @@ pub struct BundleDescriptor {
     pub state: BundleState,
     pub services: Vec<String>,
     pub ports: BTreeMap<String, u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_socket: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,6 +141,10 @@ enum Operation {
         workspace: PathBuf,
         group: Option<String>,
     },
+    Attach {
+        workspace: PathBuf,
+        group: Option<String>,
+    },
     StopAll,
 }
 
@@ -160,6 +169,7 @@ enum ResponseValue {
     Launch(LaunchResult),
     Bundles(Vec<BundleDescriptor>),
     Stopped(Vec<BundleDescriptor>),
+    Attached(PathBuf),
 }
 
 fn daemon_error(code: DaemonErrorCode, message: impl Into<String>) -> DaemonError {
@@ -256,6 +266,7 @@ mod platform {
         supervisor_pid: u32,
         services: Vec<String>,
         ports: BTreeMap<String, u16>,
+        attach_socket: Option<PathBuf>,
     }
 
     pub(super) fn is_serve_invocation() -> bool {
@@ -345,6 +356,21 @@ mod platform {
         }
     }
 
+    pub(super) fn attach(workspace: &Path, group: Option<&str>) -> DaemonResult<PathBuf> {
+        let paths = RuntimePaths::secure()?;
+        let response = request(
+            &paths.socket,
+            Operation::Attach {
+                workspace: workspace.to_path_buf(),
+                group: group.map(str::to_string),
+            },
+        )?;
+        match response {
+            ResponseValue::Attached(path) => Ok(path),
+            _ => Err(protocol_mismatch()),
+        }
+    }
+
     pub(super) fn stop_workspace(
         workspace: &Path,
         group: Option<&str>,
@@ -405,10 +431,12 @@ mod platform {
             .ok()
             .filter(|value| !value.is_empty());
         let workspace = canonical_directory(workspace, "workspace")?;
+        let attach_socket =
+            std::env::var_os(super::super::session::ATTACH_SOCKET_ENV).map(PathBuf::from);
         let record = serde_json::json!({
             "version": PROTOCOL_VERSION, "bundle_id": bundle_id, "workspace": workspace,
             "group": group, "display_group": display_group, "supervisor_pid": std::process::id(),
-            "services": services, "ports": ports,
+            "services": services, "ports": ports, "attach_socket": attach_socket,
         });
         let datagram =
             UnixDatagram::unbound().map_err(internal("failed to create readiness channel"))?;
@@ -425,6 +453,7 @@ mod platform {
         pid: PathBuf,
         log: PathBuf,
         ready: PathBuf,
+        attach_directory: PathBuf,
     }
 
     impl RuntimePaths {
@@ -469,6 +498,12 @@ mod platform {
                     ))
                 }
             }
+            let runtime_id = bundle_id(&directory, "runtime");
+            let attach_directory = PathBuf::from("/tmp")
+                .join(format!("aster-s-{}-{runtime_id}", unsafe {
+                    libc::geteuid()
+                }));
+            ensure_secure_directory(&attach_directory)?;
             Ok(Self {
                 socket: directory.join(SOCKET_NAME),
                 lock: directory.join(LOCK_NAME),
@@ -476,6 +511,7 @@ mod platform {
                 log: directory.join(LOG_NAME),
                 ready: directory.join(READY_NAME),
                 directory,
+                attach_directory,
             })
         }
     }
@@ -486,6 +522,29 @@ mod platform {
         }
         let uid = unsafe { libc::geteuid() };
         std::env::temp_dir().join(format!("aster-daemon-v1-{uid}"))
+    }
+
+    fn ensure_secure_directory(path: &Path) -> DaemonResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => validate_runtime_metadata(path, &metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(path) {
+                    Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .map_err(internal("failed to secure daemon directory"))?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(internal("failed to create daemon directory")(error)),
+                }
+                validate_runtime_metadata(
+                    path,
+                    &fs::symlink_metadata(path)
+                        .map_err(internal("failed to inspect daemon directory"))?,
+                )
+            }
+            Err(error) => Err(daemon_error(
+                DaemonErrorCode::InsecureRuntimeDirectory,
+                format!("failed to inspect {}: {error}", path.display()),
+            )),
+        }
     }
 
     fn validate_runtime_metadata(path: &Path, metadata: &fs::Metadata) -> DaemonResult<()> {
@@ -529,8 +588,12 @@ mod platform {
         let lock = open_regular(&paths.lock, true)?;
         lock.lock_exclusive()
             .map_err(internal("failed to acquire daemon startup lock"))?;
-        if ping_existing(&paths.socket).is_ok() {
-            return Ok(());
+        match ping_existing(&paths.socket) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.code == DaemonErrorCode::UnsupportedProtocol => {
+                stop_previous_daemon(paths)?;
+            }
+            Err(_) => {}
         }
         if let Some(is_socket) = endpoint_kind(&paths.socket)? {
             if !is_socket {
@@ -602,24 +665,27 @@ mod platform {
     }
 
     fn request(socket: &Path, operation: Operation) -> DaemonResult<ResponseValue> {
+        request_version(socket, operation, PROTOCOL_VERSION)
+    }
+
+    fn request_version(
+        socket: &Path,
+        operation: Operation,
+        version: u16,
+    ) -> DaemonResult<ResponseValue> {
         let mut stream =
             UnixStream::connect(socket).map_err(internal("failed to connect to Aster daemon"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(internal("failed to configure daemon connection"))?;
-        serde_json::to_writer(
-            &mut stream,
-            &WireRequest {
-                version: PROTOCOL_VERSION,
-                operation,
+        serde_json::to_writer(&mut stream, &WireRequest { version, operation }).map_err(
+            |error| {
+                daemon_error(
+                    DaemonErrorCode::Internal,
+                    format!("failed to encode daemon request: {error}"),
+                )
             },
-        )
-        .map_err(|error| {
-            daemon_error(
-                DaemonErrorCode::Internal,
-                format!("failed to encode daemon request: {error}"),
-            )
-        })?;
+        )?;
         writeln!(stream).map_err(internal("failed to send daemon request"))?;
         let response: WireResponse =
             serde_json::from_reader(BufReader::new(stream)).map_err(|error| {
@@ -628,7 +694,7 @@ mod platform {
                     format!("failed to decode daemon response: {error}"),
                 )
             })?;
-        if response.version != PROTOCOL_VERSION {
+        if response.version != version {
             return Err(protocol_mismatch());
         }
         match response.result {
@@ -660,6 +726,24 @@ mod platform {
                 Err(error) => Err(error),
             },
         }
+    }
+
+    fn stop_previous_daemon(paths: &RuntimePaths) -> DaemonResult<()> {
+        match request_version(&paths.socket, Operation::StopAll, PREVIOUS_PROTOCOL_VERSION)? {
+            ResponseValue::Stopped(_) => {}
+            _ => return Err(protocol_mismatch()),
+        }
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while paths.socket.exists() || paths.pid.exists() {
+            if Instant::now() >= deadline {
+                return Err(daemon_error(
+                    DaemonErrorCode::DaemonUnavailable,
+                    "previous Aster daemon did not exit during upgrade",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
     }
 
     fn ping_existing(socket: &Path) -> DaemonResult<u32> {
@@ -799,6 +883,8 @@ mod platform {
                 }
                 let bundle_id = bundle_id(&workspace, &group);
                 let startup_log = paths.directory.join(format!("supervisor-{bundle_id}.log"));
+                let attach_socket = paths.attach_directory.join(format!("{bundle_id}.sock"));
+                remove_if_socket(&attach_socket)?;
                 let spawn = SupervisorSpawn {
                     executable: &executable,
                     workspace: &workspace,
@@ -810,6 +896,7 @@ mod platform {
                     bundle_id: &bundle_id,
                     group: &group,
                     log_path: &startup_log,
+                    attach_socket: &attach_socket,
                 };
                 let child = spawn_supervisor(&spawn)?;
                 let descriptor = BundleDescriptor {
@@ -821,6 +908,7 @@ mod platform {
                     state: BundleState::Starting,
                     services: Vec::new(),
                     ports: BTreeMap::new(),
+                    attach_socket: Some(attach_socket),
                 };
                 bundles.insert(
                     key,
@@ -860,6 +948,24 @@ mod platform {
                 let stopped = stop_keys(bundles, keys);
                 write_value(&mut stream, ResponseValue::Stopped(stopped))
             }
+            Operation::Attach { workspace, group } => {
+                let workspace = canonical_directory(&workspace, "workspace")?;
+                let (group, _) = normalize_group(group.as_deref())?;
+                let key = BundleKey { workspace, group };
+                let bundle = bundles.get(&key).ok_or_else(|| {
+                    daemon_error(DaemonErrorCode::NotFound, "service bundle is not running")
+                })?;
+                if bundle.descriptor.state != BundleState::Running {
+                    return Err(daemon_error(
+                        DaemonErrorCode::Busy,
+                        "service bundle is still starting",
+                    ));
+                }
+                let socket = bundle.descriptor.attach_socket.clone().ok_or_else(|| {
+                    daemon_error(DaemonErrorCode::Internal, "supervisor has no attach socket")
+                })?;
+                write_value(&mut stream, ResponseValue::Attached(socket))
+            }
             Operation::StopAll => {
                 *stopping_all = true;
                 let keys = bundles.keys().cloned().collect();
@@ -880,6 +986,7 @@ mod platform {
         bundle_id: &'a str,
         group: &'a str,
         log_path: &'a Path,
+        attach_socket: &'a Path,
     }
 
     fn spawn_supervisor(options: &SupervisorSpawn<'_>) -> DaemonResult<Child> {
@@ -915,6 +1022,11 @@ mod platform {
             .env(READY_ID_ENV, options.bundle_id)
             .env(READY_GROUP_ENV, options.group)
             .env(READY_DISPLAY_GROUP_ENV, options.display_group.unwrap_or(""))
+            .env(
+                super::super::session::ATTACH_SOCKET_ENV,
+                options.attach_socket,
+            )
+            .env(SUPERVISOR_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -963,6 +1075,7 @@ mod platform {
             bundle.descriptor.state = BundleState::Running;
             bundle.descriptor.services = record.services;
             bundle.descriptor.ports = record.ports;
+            bundle.descriptor.attach_socket = record.attach_socket;
             let descriptor = bundle.descriptor.clone();
             for (mut waiter, status) in std::mem::take(&mut bundle.waiters) {
                 let _ = write_value(
@@ -1219,6 +1332,9 @@ mod platform {
     pub(super) fn list_workspace(_: &Path) -> DaemonResult<Vec<BundleDescriptor>> {
         unsupported()
     }
+    pub(super) fn attach(_: &Path, _: Option<&str>) -> DaemonResult<PathBuf> {
+        unsupported()
+    }
     pub(super) fn stop_workspace(_: &Path, _: Option<&str>) -> DaemonResult<Vec<BundleDescriptor>> {
         unsupported()
     }
@@ -1239,6 +1355,9 @@ pub fn ping_daemon() -> DaemonResult<u32> {
 }
 pub fn launch_bundle(options: LaunchOptions) -> DaemonResult<LaunchResult> {
     platform::launch(options)
+}
+pub fn attach_bundle(workspace: &Path, group: Option<&str>) -> DaemonResult<PathBuf> {
+    platform::attach(workspace, group)
 }
 pub fn list_workspace_bundles(workspace: &Path) -> DaemonResult<Vec<BundleDescriptor>> {
     platform::list_workspace(workspace)

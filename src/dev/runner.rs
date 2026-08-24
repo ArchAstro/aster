@@ -23,6 +23,8 @@ use super::dashboard::{Dashboard, DashboardAction, ServiceState, TerminalGuard};
 use super::log_files::ServiceLogFiles;
 use super::plan::{DevPlan, ServicePlan};
 use super::process::{LogEvent, ProcessLogSenders, ServiceProcess};
+#[cfg(unix)]
+use super::session::{ServiceSpec, SessionClient, SessionCommand, SessionEvent, SessionServer};
 
 pub struct DevOptions {
     pub watch: bool,
@@ -77,6 +79,21 @@ pub fn run_dev(
         }
     });
     let control = plan.control_port.map(ControlServer::start).transpose()?;
+    #[cfg(unix)]
+    let session = SessionServer::from_environment(
+        plan.services
+            .iter()
+            .map(|service| ServiceSpec {
+                name: service.name.clone(),
+                port: service.port,
+                open_url: service.open_url.clone(),
+            })
+            .collect(),
+    )?;
+    #[cfg(unix)]
+    let has_remote_ui = session.is_some();
+    #[cfg(not(unix))]
+    let has_remote_ui = false;
     let (watch_rx, _watcher) = if options.watch {
         let (rx, watcher) = start_watcher(&plan)?;
         (Some(rx), Some(watcher))
@@ -135,6 +152,8 @@ pub fn run_dev(
                 &durable_log_tx,
                 &mut dashboard,
                 options.ui,
+                #[cfg(unix)]
+                session.as_ref(),
             );
 
             while let Ok(result) = start_rx.try_recv() {
@@ -154,10 +173,22 @@ pub fn run_dev(
                 match result.outcome {
                     StartOutcome::Running(process) => {
                         runtime.process = Some(process);
-                        dashboard.set_state(&result.service, ServiceState::Running);
+                        set_service_state(
+                            &mut dashboard,
+                            #[cfg(unix)]
+                            session.as_ref(),
+                            &result.service,
+                            ServiceState::Running,
+                        );
                     }
                     StartOutcome::Stopped => {
-                        dashboard.set_state(&result.service, ServiceState::Stopped);
+                        set_service_state(
+                            &mut dashboard,
+                            #[cfg(unix)]
+                            session.as_ref(),
+                            &result.service,
+                            ServiceState::Stopped,
+                        );
                     }
                 }
                 suppress_until = Instant::now() + Duration::from_millis(700);
@@ -179,11 +210,13 @@ pub fn run_dev(
                         projects.clone(),
                         &graph,
                         options.use_cache,
-                        options.ui,
+                        options.ui || has_remote_ui,
                         &log_tx,
                         &system_tx,
                         &durable_log_tx,
                         &mut dashboard,
+                        #[cfg(unix)]
+                        session.as_ref(),
                         runtimes.get_mut(&name).expect("runtime exists"),
                         &reason,
                         start_tx.clone(),
@@ -205,7 +238,13 @@ pub fn run_dev(
                     .and_then(|process| process.poll().ok().flatten());
                 if let Some(code) = exited {
                     runtime.process.take();
-                    dashboard.set_state(&service.name, ServiceState::Stopped);
+                    set_service_state(
+                        &mut dashboard,
+                        #[cfg(unix)]
+                        session.as_ref(),
+                        &service.name,
+                        ServiceState::Stopped,
+                    );
                     emit_system(
                         &system_tx,
                         &service.name,
@@ -213,6 +252,32 @@ pub fn run_dev(
                         true,
                     );
                     needs_draw = true;
+                }
+            }
+
+            #[cfg(unix)]
+            if let Some(session) = session.as_ref() {
+                while let Some(command) = session.try_command() {
+                    match command {
+                        SessionCommand::Restart { service } => {
+                            if plan.services.iter().any(|item| item.name == service) {
+                                queue_restart(
+                                    &mut pending_starts,
+                                    &service,
+                                    "attached dashboard restart",
+                                    &system_tx,
+                                    &mut dashboard,
+                                );
+                                set_service_state(
+                                    &mut dashboard,
+                                    Some(session),
+                                    &service,
+                                    ServiceState::Restarting,
+                                );
+                                needs_draw = true;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -465,11 +530,123 @@ pub fn run_dev(
     for process in &mut shutdown_processes {
         process.finish_terminate(shutdown_deadline);
     }
-    drain_logs(&log_rx, &system_rx, &durable_log_tx, &mut dashboard, false);
+    drain_logs(
+        &log_rx,
+        &system_rx,
+        &durable_log_tx,
+        &mut dashboard,
+        false,
+        #[cfg(unix)]
+        session.as_ref(),
+    );
     drop(durable_log_tx);
     let _ = durable_log_handle.join();
     drop(control);
     run_result?;
+    Ok(())
+}
+
+fn set_service_state(
+    dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
+    service: &str,
+    state: ServiceState,
+) {
+    dashboard.set_state(service, state);
+    #[cfg(unix)]
+    if let Some(session) = session {
+        session.publish(SessionEvent::State {
+            service: service.to_string(),
+            state,
+        });
+    }
+}
+
+#[cfg(unix)]
+pub fn attach_dashboard(workspace_root: &Path, socket: &Path) -> Result<()> {
+    executor::request_graceful_signal_handling();
+    let mut client = SessionClient::connect(socket)?;
+    let services = loop {
+        match client.events.recv_timeout(Duration::from_secs(5)) {
+            Ok(SessionEvent::Snapshot { services }) => break services,
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "supervisor did not provide a dashboard snapshot: {error}"
+                ))
+            }
+        }
+    };
+    if services.is_empty() {
+        return Err(anyhow::anyhow!(
+            "service supervisor reported an empty dashboard"
+        ));
+    }
+    let mut dashboard = Dashboard::from_specs(
+        services
+            .into_iter()
+            .map(|service| (service.name, service.port, service.open_url))
+            .collect(),
+    );
+    let mut guard = TerminalGuard::enter()?;
+    let header = workspace_header(workspace_root);
+    let mut needs_draw = true;
+    loop {
+        if executor::shutdown_requested() {
+            break;
+        }
+        loop {
+            match client.events.try_recv() {
+                Ok(SessionEvent::Snapshot { .. }) => {}
+                Ok(SessionEvent::State { service, state }) => dashboard.set_state(&service, state),
+                Ok(SessionEvent::Log(event)) => dashboard.push_log(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow::anyhow!("service supervisor disconnected"));
+                }
+            }
+            needs_draw = true;
+        }
+        if needs_draw {
+            dashboard.draw(&mut guard.terminal, &header, None)?;
+            needs_draw = false;
+        }
+        if event::poll(Duration::from_millis(75))? {
+            match event::read()? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    match dashboard.handle_key(key) {
+                        DashboardAction::Quit => break,
+                        DashboardAction::Restart(service) => {
+                            client.send(&SessionCommand::Restart { service })?;
+                            needs_draw = true;
+                        }
+                        DashboardAction::Open => {
+                            if let Some(url) = dashboard.active_url() {
+                                if let Err(error) = open_url(url) {
+                                    let active = dashboard.active_name().to_string();
+                                    dashboard.push_system(
+                                        &active,
+                                        format!("failed to open browser: {error}"),
+                                    );
+                                }
+                            }
+                            needs_draw = true;
+                        }
+                        DashboardAction::ToggleMouse(enabled) => {
+                            guard.set_mouse_capture(enabled)?;
+                            needs_draw = true;
+                        }
+                        DashboardAction::Draw => needs_draw = true,
+                        DashboardAction::None => {}
+                    }
+                }
+                Event::Resize(_, _) => needs_draw = true,
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 
@@ -485,6 +662,7 @@ fn begin_start_service(
     system_tx: &std::sync::mpsc::Sender<LogEvent>,
     durable_log_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
     runtime: &mut Runtime,
     reason: &str,
     result_tx: std::sync::mpsc::Sender<StartResult>,
@@ -497,7 +675,13 @@ fn begin_start_service(
     } else {
         ServiceState::Restarting
     };
-    dashboard.set_state(&service.name, state);
+    set_service_state(
+        dashboard,
+        #[cfg(unix)]
+        session,
+        &service.name,
+        state,
+    );
     if reason != "initial start" {
         emit_system(
             system_tx,
@@ -899,6 +1083,7 @@ fn drain_logs(
     durable_log_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
     ui: bool,
+    #[cfg(unix)] session: Option<&SessionServer>,
 ) -> bool {
     let mut consumed = false;
     while let Ok(event) = system_rx.try_recv() {
@@ -908,10 +1093,18 @@ fn drain_logs(
             let stream = if event.stderr { "!" } else { "|" };
             println!("[{}] {stream} {}", event.service, event.line);
         }
+        #[cfg(unix)]
+        if let Some(session) = session {
+            session.publish(SessionEvent::Log(event.clone()));
+        }
         dashboard.push_log(event);
     }
     while let Ok(event) = process_rx.try_recv() {
         consumed = true;
+        #[cfg(unix)]
+        if let Some(session) = session {
+            session.publish(SessionEvent::Log(event.clone()));
+        }
         dashboard.push_log(event);
     }
     consumed

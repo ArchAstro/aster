@@ -44,7 +44,8 @@ const SERVICE_COLORS: [Color; 6] = [
     Color::Blue,
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceState {
     Starting,
     Running,
@@ -256,7 +257,7 @@ impl Dashboard {
         )
     }
 
-    fn from_specs(services: Vec<(String, Option<u16>, Option<String>)>) -> Self {
+    pub(crate) fn from_specs(services: Vec<(String, Option<u16>, Option<String>)>) -> Self {
         Self {
             panes: services
                 .into_iter()
