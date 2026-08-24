@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use walkdir::WalkDir;
 
 use crate::cli::OutputMode;
 use crate::config::WorkspaceConfig;
@@ -41,6 +43,12 @@ enum StartOutcome {
 struct StartResult {
     service: String,
     outcome: StartOutcome,
+}
+
+struct ActiveStart {
+    service: String,
+    generated_before: Option<HashMap<PathBuf, OutputIdentity>>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 pub fn run_dev(
@@ -94,7 +102,7 @@ pub fn run_dev(
         .collect();
     let projects = Arc::new(projects);
     let (start_tx, start_rx) = mpsc::channel::<StartResult>();
-    let mut active_start: Option<(String, std::thread::JoinHandle<()>)> = None;
+    let mut active_start: Option<ActiveStart> = None;
     let mut pending_starts = plan
         .services
         .iter()
@@ -108,6 +116,7 @@ pub fn run_dev(
     // point. Suppress only configured generated paths; genuine source edits
     // remain eligible for a follow-up restart.
     let mut suppress_until = Instant::now() + Duration::from_millis(700);
+    let mut generated_outputs = GeneratedOutputIdentities::default();
     let watch_debounce = Duration::from_millis(config.watch.debounce_ms.unwrap_or(300));
     let mut pending_watch_paths = Vec::new();
     let mut watch_deadline: Option<Instant> = None;
@@ -129,9 +138,15 @@ pub fn run_dev(
             );
 
             while let Ok(result) = start_rx.try_recv() {
-                if let Some((name, handle)) = active_start.take() {
-                    debug_assert_eq!(name, result.service);
-                    let _ = handle.join();
+                if let Some(active) = active_start.take() {
+                    debug_assert_eq!(active.service, result.service);
+                    let _ = active.handle.join();
+                    if let Some(before_start) = active.generated_before {
+                        generated_outputs.record_dispatch(
+                            before_start,
+                            suppressed_path_snapshot(&plan, workspace_root, &ignore),
+                        );
+                    }
                 }
                 let runtime = runtimes
                     .get_mut(&result.service)
@@ -155,6 +170,9 @@ pub fn run_dev(
                         .iter()
                         .find(|service| service.name == name)
                         .expect("queued service exists");
+                    let before_start = options
+                        .watch
+                        .then(|| suppressed_path_snapshot(&plan, workspace_root, &ignore));
                     let handle = begin_start_service(
                         service,
                         workspace_root,
@@ -170,7 +188,11 @@ pub fn run_dev(
                         &reason,
                         start_tx.clone(),
                     );
-                    active_start = Some((name, handle));
+                    active_start = Some(ActiveStart {
+                        service: name,
+                        generated_before: before_start,
+                        handle,
+                    });
                     needs_draw = true;
                 }
             }
@@ -215,6 +237,7 @@ pub fn run_dev(
                         &ignore,
                         &changed,
                         active_start.is_some() || Instant::now() < suppress_until,
+                        &mut generated_outputs,
                     );
                     for name in affected {
                         if plan.services.iter().any(|service| service.name == name) {
@@ -418,8 +441,8 @@ pub fn run_dev(
     eprintln!("[services] shutting down services...");
     executor::request_shutdown();
     pending_starts.clear();
-    if let Some((_, handle)) = active_start.take() {
-        let _ = handle.join();
+    if let Some(active) = active_start.take() {
+        let _ = active.handle.join();
     }
     let mut shutdown_processes = Vec::new();
     while let Ok(result) = start_rx.try_recv() {
@@ -698,6 +721,7 @@ fn affected_services(
     ignore: &WorkspaceIgnore,
     paths: &[PathBuf],
     suppress_generated: bool,
+    generated_outputs: &mut GeneratedOutputIdentities,
 ) -> Vec<String> {
     let mut affected = HashSet::new();
     for service in &plan.services {
@@ -706,7 +730,9 @@ fn affected_services(
             if ignore.is_ignored(relative) {
                 continue;
             }
-            if suppress_generated && ignore.is_suppressed(relative) {
+            if ignore.is_suppressed(relative)
+                && should_suppress_generated_path(path, suppress_generated, generated_outputs)
+            {
                 continue;
             }
             let owners = service.watch.owners_of(path);
@@ -726,11 +752,145 @@ fn affected_services(
     affected
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutputIdentity {
+    Missing,
+    File {
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+    },
+}
+
+#[derive(Default)]
+struct GeneratedOutputIdentities {
+    by_path: HashMap<PathBuf, OutputIdentity>,
+}
+
+impl GeneratedOutputIdentities {
+    fn record_dispatch(
+        &mut self,
+        before: HashMap<PathBuf, OutputIdentity>,
+        after: HashMap<PathBuf, OutputIdentity>,
+    ) {
+        let paths: HashSet<PathBuf> = before.keys().chain(after.keys()).cloned().collect();
+        for path in paths {
+            let old = before
+                .get(&path)
+                .cloned()
+                .unwrap_or(OutputIdentity::Missing);
+            let new = after.get(&path).cloned().unwrap_or(OutputIdentity::Missing);
+            if old != new {
+                self.by_path.insert(path, new);
+            }
+        }
+    }
+
+    fn matches_or_forget(&mut self, path: &Path) -> bool {
+        let Some(expected) = self.by_path.get(path) else {
+            return false;
+        };
+        if *expected == output_identity(path) {
+            return true;
+        }
+        self.by_path.remove(path);
+        false
+    }
+}
+
+fn suppressed_path_snapshot(
+    plan: &DevPlan,
+    workspace_root: &Path,
+    ignore: &WorkspaceIgnore,
+) -> HashMap<PathBuf, OutputIdentity> {
+    let mut snapshot = HashMap::new();
+    let mut roots = plan
+        .services
+        .iter()
+        .flat_map(|service| service.watch.watch_roots.iter().cloned())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    for root in roots {
+        let entries = WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(entry.path());
+                !ignore.is_ignored(relative)
+            });
+        for entry in entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.into_path();
+            let relative = path.strip_prefix(workspace_root).unwrap_or(&path);
+            if ignore.is_suppressed(relative) {
+                snapshot.insert(path.clone(), output_identity(&path));
+            }
+        }
+    }
+    snapshot
+}
+
+fn output_identity(path: &Path) -> OutputIdentity {
+    let Ok(metadata) = fs::metadata(path) else {
+        return OutputIdentity::Missing;
+    };
+    OutputIdentity::File {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+fn should_suppress_generated_path(
+    path: &Path,
+    cooldown_active: bool,
+    generated_outputs: &mut GeneratedOutputIdentities,
+) -> bool {
+    cooldown_active || generated_outputs.matches_or_forget(path)
+}
+
 fn is_meaningful_event(kind: &notify::EventKind) -> bool {
     matches!(
         kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_generated_event_is_ignored_but_changed_identity_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let generated = temp.path().join("generated.js");
+        let before = HashMap::from([(generated.clone(), OutputIdentity::Missing)]);
+        fs::write(&generated, "generated by prerequisite").unwrap();
+
+        let mut identities = GeneratedOutputIdentities::default();
+        identities.record_dispatch(
+            before,
+            HashMap::from([(generated.clone(), output_identity(&generated))]),
+        );
+
+        // This models an FSEvent delivered after the fixed cooldown elapsed.
+        assert!(should_suppress_generated_path(
+            &generated,
+            false,
+            &mut identities
+        ));
+
+        fs::write(&generated, "subsequent manual edit with a changed identity").unwrap();
+        assert!(!should_suppress_generated_path(
+            &generated,
+            false,
+            &mut identities
+        ));
+    }
 }
 
 fn drain_logs(
