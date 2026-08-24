@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_GROUP: &str = "__aster_default__";
 const SERVE_ENV: &str = "ASTER_INTERNAL_DAEMON_SERVE";
 const READY_SOCKET_ENV: &str = "ASTER_INTERNAL_DAEMON_READY_SOCKET";
@@ -86,6 +86,9 @@ pub struct LaunchOptions {
     pub watch: bool,
     pub use_cache: bool,
     pub executable: PathBuf,
+    /// Snapshot from the requesting CLI, so the daemon cannot leak values
+    /// inherited from the invocation that happened to start it.
+    pub environment: BTreeMap<String, String>,
 }
 
 impl LaunchOptions {
@@ -102,6 +105,7 @@ impl LaunchOptions {
             watch: true,
             use_cache: true,
             executable,
+            environment: unicode_environment()?,
         })
     }
 }
@@ -123,6 +127,7 @@ enum Operation {
         watch: bool,
         use_cache: bool,
         executable: PathBuf,
+        environment: BTreeMap<String, String>,
     },
     ListWorkspace {
         workspace: PathBuf,
@@ -163,6 +168,28 @@ fn daemon_error(code: DaemonErrorCode, message: impl Into<String>) -> DaemonErro
         message: message.into(),
         diagnostics: None,
     }
+}
+
+fn unicode_environment() -> DaemonResult<BTreeMap<String, String>> {
+    std::env::vars_os()
+        .map(|(key, value)| {
+            let key = key.into_string().map_err(|_| {
+                daemon_error(
+                    DaemonErrorCode::InvalidRequest,
+                    "daemon mode requires Unicode environment variable names",
+                )
+            })?;
+            let value = value.into_string().map_err(|_| {
+                daemon_error(
+                    DaemonErrorCode::InvalidRequest,
+                    format!(
+                        "daemon mode requires a Unicode value for environment variable '{key}'"
+                    ),
+                )
+            })?;
+            Ok((key, value))
+        })
+        .collect()
 }
 
 fn normalize_group(group: Option<&str>) -> DaemonResult<(String, Option<String>)> {
@@ -293,6 +320,7 @@ mod platform {
             watch: options.watch,
             use_cache: options.use_cache,
             executable: options.executable,
+            environment: options.environment,
         };
         match request(&paths.socket, operation)? {
             ResponseValue::Launch(result) => Ok(result),
@@ -302,15 +330,16 @@ mod platform {
 
     pub(super) fn list_workspace(workspace: &Path) -> DaemonResult<Vec<BundleDescriptor>> {
         let paths = RuntimePaths::secure()?;
-        let executable =
-            std::env::current_exe().map_err(internal("failed to locate Aster executable"))?;
-        ensure_daemon(&paths, &executable)?;
-        match request(
+        let Some(response) = request_if_running(
             &paths.socket,
             Operation::ListWorkspace {
                 workspace: workspace.to_path_buf(),
             },
-        )? {
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        match response {
             ResponseValue::Bundles(value) => Ok(value),
             _ => Err(protocol_mismatch()),
         }
@@ -321,16 +350,17 @@ mod platform {
         group: Option<&str>,
     ) -> DaemonResult<Vec<BundleDescriptor>> {
         let paths = RuntimePaths::secure()?;
-        let executable =
-            std::env::current_exe().map_err(internal("failed to locate Aster executable"))?;
-        ensure_daemon(&paths, &executable)?;
-        match request(
+        let Some(response) = request_if_running(
             &paths.socket,
             Operation::StopWorkspace {
                 workspace: workspace.to_path_buf(),
                 group: group.map(str::to_string),
             },
-        )? {
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        match response {
             ResponseValue::Stopped(value) => Ok(value),
             _ => Err(protocol_mismatch()),
         }
@@ -338,13 +368,24 @@ mod platform {
 
     pub(super) fn stop_all() -> DaemonResult<Vec<BundleDescriptor>> {
         let paths = RuntimePaths::secure()?;
-        let executable =
-            std::env::current_exe().map_err(internal("failed to locate Aster executable"))?;
-        ensure_daemon(&paths, &executable)?;
-        match request(&paths.socket, Operation::StopAll)? {
-            ResponseValue::Stopped(value) => Ok(value),
-            _ => Err(protocol_mismatch()),
+        let Some(response) = request_if_running(&paths.socket, Operation::StopAll)? else {
+            return Ok(Vec::new());
+        };
+        let stopped = match response {
+            ResponseValue::Stopped(value) => value,
+            _ => return Err(protocol_mismatch()),
+        };
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while paths.socket.exists() || paths.pid.exists() {
+            if Instant::now() >= deadline {
+                return Err(daemon_error(
+                    DaemonErrorCode::DaemonUnavailable,
+                    "daemon did not exit after stopping all bundles",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
+        Ok(stopped)
     }
 
     pub(super) fn register_ready(
@@ -596,6 +637,31 @@ mod platform {
         }
     }
 
+    fn request_if_running(
+        socket: &Path,
+        operation: Operation,
+    ) -> DaemonResult<Option<ResponseValue>> {
+        match endpoint_kind(socket)? {
+            None => Ok(None),
+            Some(false) => Err(daemon_error(
+                DaemonErrorCode::EndpointCollision,
+                format!("daemon endpoint {} is not a socket", socket.display()),
+            )),
+            Some(true) => match request(socket, operation) {
+                Ok(value) => Ok(Some(value)),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        DaemonErrorCode::Internal | DaemonErrorCode::DaemonUnavailable
+                    ) && ping_existing(socket).is_err() =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
     fn ping_existing(socket: &Path) -> DaemonResult<u32> {
         match request(socket, Operation::Ping)? {
             ResponseValue::Pong { daemon_pid } => Ok(daemon_pid),
@@ -703,6 +769,7 @@ mod platform {
                 watch,
                 use_cache,
                 executable,
+                environment,
             } => {
                 if *stopping_all {
                     return write_error(
@@ -738,6 +805,7 @@ mod platform {
                     display_group: display_group.as_deref(),
                     watch,
                     use_cache,
+                    environment: &environment,
                     ready_socket: &paths.ready,
                     bundle_id: &bundle_id,
                     group: &group,
@@ -807,6 +875,7 @@ mod platform {
         display_group: Option<&'a str>,
         watch: bool,
         use_cache: bool,
+        environment: &'a BTreeMap<String, String>,
         ready_socket: &'a Path,
         bundle_id: &'a str,
         group: &'a str,
@@ -828,6 +897,8 @@ mod platform {
         let mut command = Command::new(options.executable);
         command
             .current_dir(options.workspace)
+            .env_clear()
+            .envs(options.environment)
             .args(["services", "up"]);
         if let Some(group) = options.display_group {
             command.arg(group);

@@ -1188,6 +1188,7 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
                 watch: false,
                 use_cache: true,
                 executable,
+                environment: std::env::vars().collect(),
             })
             .unwrap()
         })
@@ -1216,6 +1217,218 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
     });
     std::env::remove_var("ASTER_DAEMON_RUNTIME_DIR");
     std::env::remove_var("ASTER_PORT_LEASE_DIR");
+}
+
+struct DaemonCliGuard {
+    runtime_dir: std::path::PathBuf,
+    lease_dir: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+}
+
+impl DaemonCliGuard {
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command
+            .current_dir(&self.cwd)
+            .env("ASTER_DAEMON_RUNTIME_DIR", &self.runtime_dir)
+            .env("ASTER_PORT_LEASE_DIR", &self.lease_dir);
+        command
+    }
+}
+
+impl Drop for DaemonCliGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .command()
+            .args(["services", "daemon", "stop"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    let group_config = group.map_or_else(String::new, |group| {
+        format!("[dev.service_groups]\n{group} = {{ services = [\"web\", \"worker\"] }}\n")
+    });
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            "[dev.ports.http]\ndefault = {port}\n\n[dev.services.web]\ntarget = \"//app:web\"\nport = \"http\"\n\n[dev.services.worker]\ntarget = \"//app:worker\"\n\n{group_config}"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.web]\ncommand = \"python3 -m http.server {port}\"\nstream = true\n\n[targets.worker]\ncommand = \"sleep 60\"\nstream = true\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn daemon_cli_manages_and_lists_worktree_bundles() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    write_daemon_workspace(&root, port, Some("intern"));
+    let guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: root.clone(),
+    };
+
+    let absent = guard
+        .command()
+        .args(["--json", "services", "list"])
+        .output()
+        .unwrap();
+    assert!(absent.status.success(), "{absent:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&absent.stdout).unwrap()["bundles"],
+        serde_json::json!([])
+    );
+    assert!(!guard.runtime_dir.join("daemon.sock").exists());
+
+    let first = guard
+        .command()
+        .args([
+            "--json",
+            "services",
+            "up",
+            "intern",
+            "--daemon",
+            "--no-watch",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["status"], "started");
+    assert_eq!(
+        first["bundle"]["services"],
+        serde_json::json!(["web", "worker"])
+    );
+    assert_eq!(first["bundle"]["ports"]["http"], port);
+
+    let second = guard
+        .command()
+        .args([
+            "--json",
+            "services",
+            "up",
+            "intern",
+            "--daemon",
+            "--no-watch",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "{second:?}");
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["status"], "already_running");
+    assert_eq!(
+        second["bundle"]["supervisor_pid"],
+        first["bundle"]["supervisor_pid"]
+    );
+
+    let listed = guard
+        .command()
+        .args(["--json", "services", "list"])
+        .output()
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed["workspace"],
+        root.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
+    assert_eq!(listed["bundles"][0]["group"], "intern");
+    assert_eq!(listed["bundles"][0]["display_group"], "intern");
+    assert_eq!(listed["bundles"][0]["state"], "running");
+    assert_eq!(
+        listed["bundles"][0]["services"],
+        serde_json::json!(["web", "worker"])
+    );
+    assert_eq!(listed["bundles"][0]["ports"]["http"], port);
+
+    let down = guard
+        .command()
+        .args(["--json", "services", "down", "intern"])
+        .output()
+        .unwrap();
+    assert!(down.status.success(), "{down:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&down.stdout).unwrap()["stopped"],
+        1
+    );
+    wait_until(Duration::from_secs(10), || {
+        !guard.runtime_dir.join("daemon.sock").exists()
+    });
+}
+
+#[test]
+fn daemon_cli_isolates_worktrees_and_supports_global_stop() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    let first_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    drop((first_listener, second_listener));
+    write_daemon_workspace(&first_root, first_port, None);
+    write_daemon_workspace(&second_root, second_port, None);
+    let mut guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: first_root.clone(),
+    };
+
+    for root in [&first_root, &second_root] {
+        guard.cwd.clone_from(root);
+        let up = guard
+            .command()
+            .args(["services", "up", "--daemon", "--no-watch"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{up:?}");
+    }
+    for (root, other) in [(&first_root, &second_root), (&second_root, &first_root)] {
+        guard.cwd.clone_from(root);
+        let list = guard
+            .command()
+            .args(["--json", "services", "list"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8(list.stdout).unwrap();
+        assert!(list.contains(root.canonicalize().unwrap().to_string_lossy().as_ref()));
+        assert!(!list.contains(other.canonicalize().unwrap().to_string_lossy().as_ref()));
+    }
+
+    guard.cwd.clone_from(&first_root);
+    assert!(guard
+        .command()
+        .args(["services", "down"])
+        .status()
+        .unwrap()
+        .success());
+    guard.cwd = temp.path().to_path_buf();
+    assert!(guard
+        .command()
+        .args(["services", "daemon", "stop"])
+        .status()
+        .unwrap()
+        .success());
+    wait_until(Duration::from_secs(10), || {
+        !guard.runtime_dir.join("daemon.sock").exists()
+            && TcpStream::connect(("127.0.0.1", first_port)).is_err()
+            && TcpStream::connect(("127.0.0.1", second_port)).is_err()
+    });
 }
 
 #[test]

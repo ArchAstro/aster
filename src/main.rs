@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, ServicesCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
+    ProjectInfo, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -74,9 +74,32 @@ fn run() -> Result<()> {
 
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
-    // Handle init command specially - it works even without an existing workspace
+    // Handle init and daemon lifecycle commands before requiring a workspace.
     if matches!(command, Commands::Init) {
         return handle_init(&cwd, cli.verbose);
+    }
+    if let Commands::Services {
+        command: ServicesCommands::Daemon { command },
+    } = &command
+    {
+        return match command {
+            ServicesDaemonCommands::Stop => {
+                let stopped = aster::dev::stop_all_bundles()?;
+                if output_mode == OutputMode::Json {
+                    output_json(&serde_json::json!({"stopped": stopped.len()}))?;
+                } else if output_mode != OutputMode::Quiet {
+                    println!(
+                        "Stopped {} daemon-managed service bundle{}.",
+                        stopped.len(),
+                        if stopped.len() == 1 { "" } else { "s" }
+                    );
+                }
+                Ok(())
+            }
+            ServicesDaemonCommands::Serve => {
+                aster::dev::serve_from_environment().map_err(Into::into)
+            }
+        };
     }
 
     // Explicit numeric port cleanup is useful even outside an Aster workspace.
@@ -101,6 +124,71 @@ fn run() -> Result<()> {
     let workspace_root = find_workspace_root(&cwd).context(
         "Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.",
     )?;
+
+    // Daemon inspection and worktree shutdown need configuration for stable
+    // reporting, but do not require project/plugin discovery.
+    if let Commands::Services { command } = &command {
+        match command {
+            ServicesCommands::List => {
+                let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+                let bundles = aster::dev::list_workspace_bundles(&workspace_root)?;
+                let report = aster::dev::service_bundles_report(&workspace_root, bundles)?;
+                if output_mode == OutputMode::Json {
+                    output_json(&report)?;
+                } else if output_mode != OutputMode::Quiet {
+                    print!(
+                        "{}",
+                        aster::dev::format_service_bundles(&report, &workspace_config.dev)
+                    );
+                }
+                return Ok(());
+            }
+            ServicesCommands::Down { group } => {
+                let stopped =
+                    aster::dev::stop_workspace_bundles(&workspace_root, group.as_deref())?;
+                if output_mode == OutputMode::Json {
+                    output_json(&serde_json::json!({"stopped": stopped.len()}))?;
+                } else if output_mode != OutputMode::Quiet {
+                    println!(
+                        "Stopped {} daemon-managed service bundle{} in this worktree.",
+                        stopped.len(),
+                        if stopped.len() == 1 { "" } else { "s" }
+                    );
+                }
+                return Ok(());
+            }
+            ServicesCommands::Up {
+                group,
+                no_watch,
+                daemon: true,
+                ..
+            } => {
+                // Configuration is loaded here to preserve normal workspace
+                // diagnostics; full discovery and validation happen in the child.
+                WorkspaceConfig::load(&workspace_root)?;
+                let mut options = aster::dev::LaunchOptions::new(&workspace_root)?;
+                options.group.clone_from(group);
+                options.watch = !no_watch;
+                options.use_cache = !cli.no_cache;
+                let result = aster::dev::launch_bundle(options)?;
+                if output_mode == OutputMode::Json {
+                    output_json(&result)?;
+                } else if output_mode != OutputMode::Quiet {
+                    let action = match result.status {
+                        aster::dev::LaunchStatus::Started => "Started",
+                        aster::dev::LaunchStatus::AlreadyRunning => "Already running",
+                    };
+                    let group = result.bundle.display_group.as_deref().unwrap_or("default");
+                    println!(
+                        "{action} service bundle '{group}' (supervisor {}).",
+                        result.bundle.supervisor_pid
+                    );
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     // Reading existing logs does not require project discovery or graph validation.
     if let Commands::Services {
@@ -1037,6 +1125,7 @@ fn run() -> Result<()> {
                 no_watch,
                 no_ui,
                 dry_run,
+                daemon: false,
             } => {
                 let workspace_config = WorkspaceConfig::load(&workspace_root)?;
                 let graph = build_target_graph(&projects);
@@ -1079,6 +1168,15 @@ fn run() -> Result<()> {
                     &selected,
                     aster::dev::KillPortsOptions { dry_run },
                 )?;
+            }
+            ServicesCommands::Up { daemon: true, .. } => {
+                unreachable!("daemon service up handled before discovery")
+            }
+            ServicesCommands::List | ServicesCommands::Down { .. } => {
+                unreachable!("daemon worktree commands handled before discovery")
+            }
+            ServicesCommands::Daemon { .. } => {
+                unreachable!("daemon lifecycle handled before workspace discovery")
             }
             ServicesCommands::Logs { .. } => unreachable!("service logs handled before discovery"),
             ServicesCommands::Ports => unreachable!("service ports handled before discovery"),
