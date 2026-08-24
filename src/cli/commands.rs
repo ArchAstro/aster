@@ -276,12 +276,31 @@ pub enum ServicesCommands {
         no_watch: bool,
 
         /// Use line-oriented logs instead of the interactive dashboard
-        #[arg(long)]
+        #[arg(long, conflicts_with = "daemon")]
         no_ui: bool,
 
         /// Resolve and validate the service plan without starting processes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "daemon")]
         dry_run: bool,
+
+        /// Run the service bundle headlessly under the per-user daemon
+        #[arg(long)]
+        daemon: bool,
+    },
+
+    /// List daemon-managed bundles in the current worktree
+    List,
+
+    /// Stop daemon-managed bundles in the current worktree
+    Down {
+        /// Optional exact group; omit to stop every bundle in this worktree
+        group: Option<String>,
+    },
+
+    /// Manage the per-user service daemon
+    Daemon {
+        #[command(subcommand)]
+        command: ServicesDaemonCommands,
     },
 
     /// Read the durable log for a configured service
@@ -308,6 +327,16 @@ pub enum ServicesCommands {
         #[command(subcommand)]
         command: TlsCommands,
     },
+}
+
+/// Per-user service daemon commands.
+#[derive(Subcommand)]
+pub enum ServicesDaemonCommands {
+    /// Stop every machine-wide bundle and the daemon
+    Stop,
+    /// Run the daemon server (internal use only)
+    #[command(hide = true)]
+    Serve,
 }
 
 /// Local TLS edge commands.
@@ -386,6 +415,78 @@ mod tests {
         assert_eq!(group.as_deref(), Some("intern"));
 
         assert!(Cli::try_parse_from(["aster", "services", "up", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn services_up_daemon_flags_are_explicitly_validated() {
+        let cli = Cli::try_parse_from(["aster", "services", "up", "intern", "--daemon"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Services {
+                command: ServicesCommands::Up {
+                    group: Some(group),
+                    daemon: true,
+                    ..
+                }
+            }) if group == "intern"
+        ));
+        assert!(Cli::try_parse_from(["aster", "services", "up", "--daemon", "--dry-run"]).is_err());
+        assert!(Cli::try_parse_from(["aster", "services", "up", "--daemon", "--no-ui"]).is_err());
+    }
+
+    #[test]
+    fn services_list_down_and_daemon_have_strict_arity() {
+        assert!(matches!(
+            Cli::try_parse_from(["aster", "services", "list"])
+                .unwrap()
+                .command,
+            Some(Commands::Services {
+                command: ServicesCommands::List
+            })
+        ));
+        assert!(Cli::try_parse_from(["aster", "services", "list", "extra"]).is_err());
+
+        for (args, expected) in [
+            (vec!["aster", "services", "down"], None),
+            (vec!["aster", "services", "down", "intern"], Some("intern")),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Commands::Services {
+                command: ServicesCommands::Down { group },
+            }) = cli.command
+            else {
+                panic!("expected services down command");
+            };
+            assert_eq!(group.as_deref(), expected);
+        }
+        assert!(Cli::try_parse_from(["aster", "services", "down", "one", "two"]).is_err());
+
+        assert!(matches!(
+            Cli::try_parse_from(["aster", "services", "daemon", "stop"])
+                .unwrap()
+                .command,
+            Some(Commands::Services {
+                command: ServicesCommands::Daemon {
+                    command: ServicesDaemonCommands::Stop
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aster", "services", "daemon", "serve"])
+                .unwrap()
+                .command,
+            Some(Commands::Services {
+                command: ServicesCommands::Daemon {
+                    command: ServicesDaemonCommands::Serve
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["aster", "services", "daemon", "stop", "extra"]).is_err());
+        let help = Cli::try_parse_from(["aster", "services", "daemon", "--help"])
+            .err()
+            .expect("help exits through clap")
+            .to_string();
+        assert!(!help.contains("serve"));
     }
 
     #[test]

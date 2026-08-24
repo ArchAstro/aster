@@ -9,6 +9,7 @@ mod port_cleanup;
 mod port_report;
 mod process;
 mod runner;
+mod service_report;
 mod tls;
 
 #[doc(hidden)]
@@ -28,4 +29,8 @@ pub use port_cleanup::{
 };
 pub use port_report::{format_workspace_ports, workspace_ports_report, WorkspacePortsReport};
 pub use runner::{run_dev, DevOptions};
+pub use service_report::{
+    format_service_bundles, service_bundles_report, ServiceBundleReport, ServiceBundleState,
+    ServiceBundlesReport,
+};
 pub use tls::{serve_tls, setup_tls};
