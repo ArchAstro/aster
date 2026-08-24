@@ -311,7 +311,16 @@ aster services up
 aster services up intern
 aster services up --no-ui
 aster services up --dry-run
+aster services up --daemon
 ```
+
+Set `daemon = true` under `[dev]` to keep service ownership in Aster's per-user
+daemon by default. Ordinary `aster services up` still opens the dashboard, but
+`q` only detaches it; the bundle continues running. Re-running the command
+reattaches, and `r` restarts the focused service through the supervisor. Use
+`--no-ui` for a detached launch, `services list` to inspect worktree bundles,
+`services down [group]` to stop them, or `services daemon stop` for all bundles.
+The explicit `--daemon` flag remains a headless one-shot launch.
 
 Service stdout, stderr, and Aster lifecycle messages are also persisted to
 `.aster/logs/<worktree>/<service>/logs.txt` in the workspace. Each service log
@@ -404,6 +413,7 @@ Configure the harness in the workspace-root `aster.toml`:
 
 ```toml
 [dev]
+daemon = true
 port_env_files = [".env", ".env.local"]
 control_port = "control"
 

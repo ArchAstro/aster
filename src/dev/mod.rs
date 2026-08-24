@@ -10,15 +10,17 @@ mod port_report;
 mod process;
 mod runner;
 mod service_report;
+mod session;
 mod tls;
 
+pub use daemon::{
+    attach_bundle, launch_bundle, list_workspace_bundles, ping_daemon, stop_all_bundles,
+    stop_workspace_bundles, BundleDescriptor, BundleState, DaemonError, DaemonErrorCode,
+    DaemonResult, LaunchOptions, LaunchResult, LaunchStatus, DEFAULT_GROUP, PROTOCOL_VERSION,
+    SUPERVISOR_ENV,
+};
 #[doc(hidden)]
 pub use daemon::{is_internal_serve_invocation, register_supervisor_ready, serve_from_environment};
-pub use daemon::{
-    launch_bundle, list_workspace_bundles, ping_daemon, stop_all_bundles, stop_workspace_bundles,
-    BundleDescriptor, BundleState, DaemonError, DaemonErrorCode, DaemonResult, LaunchOptions,
-    LaunchResult, LaunchStatus, DEFAULT_GROUP, PROTOCOL_VERSION,
-};
 pub use log_files::show_service_logs;
 pub use plan::{
     resolve_dev_plan, resolve_dev_ports, resolve_static_dev_ports, DevPlan, ServicePlan,
@@ -28,6 +30,8 @@ pub use port_cleanup::{
     KillPortsOptions,
 };
 pub use port_report::{format_workspace_ports, workspace_ports_report, WorkspacePortsReport};
+#[cfg(unix)]
+pub use runner::attach_dashboard;
 pub use runner::{run_dev, DevOptions};
 pub use service_report::{
     format_service_bundles, service_bundles_report, ServiceBundleReport, ServiceBundleState,

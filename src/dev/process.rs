@@ -13,7 +13,7 @@ use crate::executor::command::parse_command;
 use crate::executor::{register_supervised_child, unregister_supervised_child};
 use crate::plugins::Target;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct LogEvent {
     pub service: String,
     pub line: String,

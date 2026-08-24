@@ -38,6 +38,10 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevWorkspaceConfig {
+    /// Run service bundles under the per-user daemon by default.
+    #[serde(default)]
+    pub daemon: bool,
+
     /// Environment files consulted when resolving named ports. Later files win.
     #[serde(default)]
     pub port_env_files: Vec<String>,
@@ -762,6 +766,20 @@ port_env = { PORT = "http", DATABASE_PORT = "database" }
             result.unwrap().canonicalize().unwrap(),
             root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn test_workspace_config_load_with_dev_daemon_default() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("aster.toml"), "[dev]\ndaemon = true\n").unwrap();
+
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert!(config.dev.daemon);
+
+        fs::write(root.join("aster.toml"), "").unwrap();
+        let config = WorkspaceConfig::load(root).unwrap();
+        assert!(!config.dev.daemon);
     }
 
     #[test]

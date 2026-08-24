@@ -160,31 +160,51 @@ fn run() -> Result<()> {
             ServicesCommands::Up {
                 group,
                 no_watch,
-                daemon: true,
-                ..
+                no_ui,
+                dry_run,
+                daemon,
             } => {
                 // Configuration is loaded here to preserve normal workspace
                 // diagnostics; full discovery and validation happen in the child.
-                WorkspaceConfig::load(&workspace_root)?;
-                let mut options = aster::dev::LaunchOptions::new(&workspace_root)?;
-                options.group.clone_from(group);
-                options.watch = !no_watch;
-                options.use_cache = !cli.no_cache;
-                let result = aster::dev::launch_bundle(options)?;
-                if output_mode == OutputMode::Json {
-                    output_json(&result)?;
-                } else if output_mode != OutputMode::Quiet {
-                    let action = match result.status {
-                        aster::dev::LaunchStatus::Started => "Started",
-                        aster::dev::LaunchStatus::AlreadyRunning => "Already running",
-                    };
-                    let group = result.bundle.display_group.as_deref().unwrap_or("default");
-                    println!(
-                        "{action} service bundle '{group}' (supervisor {}).",
-                        result.bundle.supervisor_pid
-                    );
+                let workspace_config = WorkspaceConfig::load(&workspace_root)?;
+                let daemon_supervisor = env::var_os(aster::dev::SUPERVISOR_ENV).is_some()
+                    && env::var_os("ASTER_INTERNAL_DAEMON_READY_SOCKET").is_some();
+                let use_daemon =
+                    !daemon_supervisor && (*daemon || (workspace_config.dev.daemon && !dry_run));
+                if use_daemon {
+                    let mut options = aster::dev::LaunchOptions::new(&workspace_root)?;
+                    options.group.clone_from(group);
+                    options.watch = !no_watch;
+                    options.use_cache = !cli.no_cache;
+                    let result = aster::dev::launch_bundle(options)?;
+                    let attach_ui = workspace_config.dev.daemon
+                        && !daemon
+                        && !no_ui
+                        && matches!(output_mode, OutputMode::Normal | OutputMode::Verbose);
+                    if attach_ui {
+                        #[cfg(unix)]
+                        {
+                            let socket =
+                                aster::dev::attach_bundle(&workspace_root, group.as_deref())?;
+                            aster::dev::attach_dashboard(&workspace_root, &socket)?;
+                        }
+                        #[cfg(not(unix))]
+                        unreachable!("daemon launch rejects unsupported platforms");
+                    } else if output_mode == OutputMode::Json {
+                        output_json(&result)?;
+                    } else if output_mode != OutputMode::Quiet {
+                        let action = match result.status {
+                            aster::dev::LaunchStatus::Started => "Started",
+                            aster::dev::LaunchStatus::AlreadyRunning => "Already running",
+                        };
+                        let group = result.bundle.display_group.as_deref().unwrap_or("default");
+                        println!(
+                            "{action} service bundle '{group}' (supervisor {}).",
+                            result.bundle.supervisor_pid
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
             _ => {}
         }
