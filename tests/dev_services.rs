@@ -427,13 +427,9 @@ import os
 import sys
 
 port = int(sys.argv[1])
-with open("../app-events.log", "a") as events:
-    events.write(f"{port}:{os.environ['PORT']}\n")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        with open("../app-events.log", "a") as events:
-            events.write("request\n")
         body = f"app-port={port};env-port={os.environ['PORT']}".encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -442,7 +438,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+with open("../app-events.log", "a") as events:
+    events.write(f"{port}:{os.environ['PORT']}\n")
+server.serve_forever()
 "#,
     )
     .unwrap();
@@ -460,34 +459,21 @@ import socketserver
 
 listen_port = int(os.environ["LISTEN_PORT"])
 upstream_port = int(os.environ["UPSTREAM_PORT"])
-
-def log(message):
-    with open("../proxy-events.log", "a") as events:
-        events.write(message + "\n")
-
-log(f"{listen_port}:{upstream_port}:{os.environ['ASTER_PROXY_LISTEN_PORT']}:{os.environ['ASTER_PROXY_UPSTREAM_PORT']}:{os.environ['ASTER_PROXY_SERVICE_NAME']}")
+with open("../proxy-events.log", "a") as events:
+    events.write(f"{listen_port}:{upstream_port}:{os.environ['ASTER_PROXY_LISTEN_PORT']}:{os.environ['ASTER_PROXY_UPSTREAM_PORT']}:{os.environ['ASTER_PROXY_SERVICE_NAME']}\n")
 print(f"proxy-ready {listen_port}->{upstream_port}", flush=True)
 
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
-        log("accepted")
-        try:
-            with socket.create_connection(("127.0.0.1", upstream_port)) as upstream:
-                log("connected-upstream")
-                peers = {self.request: upstream, upstream: self.request}
-                while True:
-                    readable, _, _ = select.select(list(peers), [], [])
-                    for source in readable:
-                        data = source.recv(65536)
-                        if not data:
-                            log("eof")
-                            return
-                        direction = "client-to-upstream" if source is self.request else "upstream-to-client"
-                        log(f"{direction}:{len(data)}")
-                        peers[source].sendall(data)
-        except Exception as error:
-            log(f"error:{error!r}")
-            raise
+        with socket.create_connection(("127.0.0.1", upstream_port)) as upstream:
+            peers = {self.request: upstream, upstream: self.request}
+            while True:
+                readable, _, _ = select.select(list(peers), [], [])
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    peers[source].sendall(data)
 
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -520,6 +506,18 @@ Server(("127.0.0.1", listen_port), Handler).serve_forever()
 
     // Proxy boundary: the advertised port belongs to the sidecar while the app receives the upstream port.
     let mut proxied = launch(true);
+    let upstream_ready = condition_met(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", upstream_port)).is_ok()
+    });
+    if !upstream_ready {
+        fail_with_process_diagnostics(
+            &mut proxied,
+            &root.join("app-events.log"),
+            &root.join("aster-proxied.stdout"),
+            &root.join("aster-proxied.stderr"),
+            "upstream app never bound its port",
+        );
+    }
     let expected_proxied_body = format!("app-port={upstream_port};env-port={upstream_port}");
     let mut last_proxy_attempt = String::new();
     let proxied_ready = condition_met(Duration::from_secs(20), || {
@@ -547,21 +545,12 @@ Server(("127.0.0.1", listen_port), Handler).serve_forever()
         );
     }
     assert_eq!(
-        fs::read_to_string(root.join("app-events.log"))
-            .unwrap()
-            .lines()
-            .next(),
-        Some(format!("{upstream_port}:{upstream_port}").as_str())
+        fs::read_to_string(root.join("app-events.log")).unwrap(),
+        format!("{upstream_port}:{upstream_port}\n")
     );
     assert_eq!(
-        fs::read_to_string(root.join("proxy-events.log"))
-            .unwrap()
-            .lines()
-            .next(),
-        Some(
-            format!("{advertised_port}:{upstream_port}:{advertised_port}:{upstream_port}:platform")
-                .as_str()
-        )
+        fs::read_to_string(root.join("proxy-events.log")).unwrap(),
+        format!("{advertised_port}:{upstream_port}:{advertised_port}:{upstream_port}:platform\n")
     );
     wait_until(Duration::from_secs(5), || {
         Command::new(env!("CARGO_BIN_EXE_aster"))
