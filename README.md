@@ -312,6 +312,7 @@ aster services up intern
 aster services up --no-ui
 aster services up --dry-run
 aster services up --daemon
+aster services up main --proxy
 ```
 
 Set `daemon = true` under `[dev]` to keep service ownership in Aster's per-user
@@ -528,6 +529,47 @@ remain available in service target commands and `env` for composite values such
 as URLs. Port references do not implicitly start services; groups remain the
 process-selection contract. These templates are separate from the `{files}`
 target capability. `open_path` controls the dashboard's browser URL.
+
+### Optional service proxies
+
+A service can declare a proxy target without changing its normal launch. Pass
+`--proxy` to insert every proxy configured by the selected service group:
+
+```toml
+[dev.ports.platform]
+default = 4000
+
+[dev.ports.platform-proxy-upstream]
+allocation = "dynamic"
+range = [14000, 14999]
+
+[dev.services.platform]
+target = "//services/platform:dev"
+port = "platform"
+port_env = { PHX_PORT = "platform" }
+
+[dev.services.platform.proxy]
+target = "//services/go/platform-proxy-logger:dev"
+upstream_port = "platform-proxy-upstream"
+env = { PLATFORM_PROXY_LISTEN_ADDR = "127.0.0.1:{proxy.listen_port}", PLATFORM_PROXY_UPSTREAM_URL = "http://127.0.0.1:{proxy.upstream_port}" }
+```
+
+Without the flag, `platform` binds its advertised `platform` port directly.
+With `aster services up main --proxy`, the generated `platform-proxy` sidecar
+binds that same advertised port and Platform binds `platform-proxy-upstream`.
+`services ports`, `{ports.platform}`, and other service discovery continue to
+report the original `platform` port. For the underlying service, `{port}`,
+`ASTER_SERVICE_PORT`, and `port_env` entries that reference its own port switch
+to the upstream port.
+
+Proxy commands and proxy `env` values support `{port}` for the advertised port,
+all normal `{ports.<name>}` templates, plus `{proxy.listen_port}` and
+`{proxy.upstream_port}`. Aster also supplies `ASTER_PROXY_SERVICE_NAME`,
+`ASTER_PROXY_LISTEN_PORT`, and `ASTER_PROXY_UPSTREAM_PORT`. The upstream port is
+leased only when proxy mode is enabled. If a daemon-managed group is already
+running in the other mode, stop it with `aster services down <group>` before
+relaunching. Proxy output is available through `aster services logs
+<service>-proxy`.
 
 When `control_port` is configured, Aster accepts the platform launcher's
 line-delimited JSON commands on localhost: `status`, `list_services`,

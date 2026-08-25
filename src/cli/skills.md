@@ -188,6 +188,7 @@ aster services up intern
 aster services up --dry-run
 aster services up --no-ui
 aster services up --no-watch
+aster services up main --proxy
 ```
 
 With no group argument, the `main` group and services absent from every group
@@ -201,6 +202,14 @@ Static ports retain their configured values. Dynamic named ports are selected
 from their ranges as one collision-free bundle per supervisor and released at
 exit. Use `port_env` for direct numeric environment values and `{ports.name}`
 inside `env` or target commands for URLs and other composite values.
+
+A service may configure an optional target under `[dev.services.<name>.proxy]`
+with a distinct named `upstream_port` and proxy-specific `env`. `services up
+<group> --proxy` keeps the service's advertised named port on the proxy and
+moves only the underlying service to the upstream port. Other services and
+`services ports` still resolve the original service port. Proxy env supports
+`{proxy.listen_port}` and `{proxy.upstream_port}`; Aster also supplies the
+matching `ASTER_PROXY_*` variables. Without `--proxy`, the declaration is inert.
 
 ## Serve trusted local HTTPS
 

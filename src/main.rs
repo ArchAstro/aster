@@ -163,6 +163,7 @@ fn run() -> Result<()> {
                 no_ui,
                 dry_run,
                 daemon,
+                proxy,
             } => {
                 // Configuration is loaded here to preserve normal workspace
                 // diagnostics; full discovery and validation happen in the child.
@@ -176,6 +177,7 @@ fn run() -> Result<()> {
                     options.group.clone_from(group);
                     options.watch = !no_watch;
                     options.use_cache = !cli.no_cache;
+                    options.proxy = *proxy;
                     let result = aster::dev::launch_bundle(options)?;
                     let attach_ui = workspace_config.dev.daemon
                         && !daemon
@@ -1146,6 +1148,7 @@ fn run() -> Result<()> {
                 no_ui,
                 dry_run,
                 daemon: false,
+                proxy,
             } => {
                 let workspace_config = WorkspaceConfig::load(&workspace_root)?;
                 let graph = build_target_graph(&projects);
@@ -1156,6 +1159,7 @@ fn run() -> Result<()> {
                     &workspace_root,
                     &workspace_config.dev,
                     group.as_deref(),
+                    proxy,
                     &projects,
                     &graph,
                     &registry,

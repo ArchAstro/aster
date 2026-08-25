@@ -105,7 +105,15 @@ pub fn format_service_bundles(
             let configured_port = config
                 .services
                 .get(service)
-                .and_then(|service| service.port.as_deref());
+                .and_then(|service| service.port.as_deref())
+                .or_else(|| {
+                    service.strip_suffix("-proxy").and_then(|upstream| {
+                        config
+                            .services
+                            .get(upstream)
+                            .and_then(|service| service.proxy.as_ref().and(service.port.as_deref()))
+                    })
+                });
             let (port_name, port) = configured_port
                 .and_then(|name| bundle.ports.get(name).map(|port| (name, *port)))
                 .map_or_else(

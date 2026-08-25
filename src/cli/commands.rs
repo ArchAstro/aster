@@ -286,6 +286,10 @@ pub enum ServicesCommands {
         /// Run the service bundle headlessly under the per-user daemon
         #[arg(long)]
         daemon: bool,
+
+        /// Start configured per-service proxies on their advertised ports
+        #[arg(long)]
+        proxy: bool,
     },
 
     /// List daemon-managed bundles in the current worktree
@@ -415,6 +419,21 @@ mod tests {
         assert_eq!(group.as_deref(), Some("intern"));
 
         assert!(Cli::try_parse_from(["aster", "services", "up", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn services_up_accepts_optional_proxy_flag() {
+        let cli = Cli::try_parse_from(["aster", "services", "up", "main", "--proxy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Services {
+                command: ServicesCommands::Up {
+                    group: Some(group),
+                    proxy: true,
+                    ..
+                }
+            }) if group == "main"
+        ));
     }
 
     #[test]
