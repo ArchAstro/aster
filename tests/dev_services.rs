@@ -489,11 +489,16 @@ Server(("127.0.0.1", listen_port), Handler).serve_forever()
         if proxy {
             command.arg("--proxy");
         }
+        let mode = if proxy { "proxied" } else { "direct" };
         command
             .current_dir(root)
             .env("ASTER_PORT_LEASE_DIR", &lease_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(
+                fs::File::create(root.join(format!("aster-{mode}.stdout"))).unwrap(),
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(root.join(format!("aster-{mode}.stderr"))).unwrap(),
+            ))
             .spawn()
             .unwrap()
     };
@@ -501,9 +506,21 @@ Server(("127.0.0.1", listen_port), Handler).serve_forever()
     // Proxy boundary: the advertised port belongs to the sidecar while the app receives the upstream port.
     let mut proxied = launch(true);
     let expected_proxied_body = format!("app-port={upstream_port};env-port={upstream_port}");
-    wait_until(Duration::from_secs(20), || {
+    let proxied_ready = condition_met(Duration::from_secs(20), || {
         http_get(advertised_port).is_ok_and(|response| response.contains(&expected_proxied_body))
     });
+    if !proxied_ready {
+        fail_with_process_diagnostics(
+            &mut proxied,
+            &root.join("proxy-events.log"),
+            &root.join("aster-proxied.stdout"),
+            &root.join("aster-proxied.stderr"),
+            &format!(
+                "proxied request never reached the app; app events:\n{}",
+                fs::read_to_string(root.join("app-events.log")).unwrap_or_default()
+            ),
+        );
+    }
     assert_eq!(
         fs::read_to_string(root.join("app-events.log")).unwrap(),
         format!("{upstream_port}:{upstream_port}\n")
@@ -548,9 +565,18 @@ Server(("127.0.0.1", listen_port), Handler).serve_forever()
     // Optional path: without the flag, the app returns to the same advertised port and no proxy starts.
     let mut direct = launch(false);
     let expected_direct_body = format!("app-port={advertised_port};env-port={advertised_port}");
-    wait_until(Duration::from_secs(20), || {
+    let direct_ready = condition_met(Duration::from_secs(20), || {
         http_get(advertised_port).is_ok_and(|response| response.contains(&expected_direct_body))
     });
+    if !direct_ready {
+        fail_with_process_diagnostics(
+            &mut direct,
+            &root.join("app-events.log"),
+            &root.join("aster-direct.stdout"),
+            &root.join("aster-direct.stderr"),
+            "direct request never reached the app",
+        );
+    }
     assert_eq!(
         occurrences(&root.join("proxy-events.log"), ":platform\n"),
         1
