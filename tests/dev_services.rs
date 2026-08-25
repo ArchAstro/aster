@@ -144,54 +144,9 @@ fn http_get(port: u16) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        response.extend_from_slice(&buffer[..read]);
-        if http_response_is_complete(&response) {
-            break;
-        }
-    }
-    String::from_utf8(response)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-fn http_response_is_complete(response: &[u8]) -> bool {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(headers) = std::str::from_utf8(&response[..header_end]) else {
-        return false;
-    };
-    let Some(content_length) = headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().ok())
-            .flatten()
-    }) else {
-        return false;
-    };
-    response.len() >= header_end + 4 + content_length
-}
-
-#[test]
-fn http_get_returns_after_the_complete_body_without_waiting_for_eof() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .unwrap();
-        thread::sleep(Duration::from_secs(1));
-    });
-
-    assert!(http_get(port).unwrap().ends_with("\r\n\r\nok"));
-    server.join().unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn terminate_aster(child: &mut std::process::Child) {
