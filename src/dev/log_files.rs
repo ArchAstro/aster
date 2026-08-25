@@ -67,11 +67,21 @@ pub fn show_service_logs(
     config: &DevWorkspaceConfig,
     service: &str,
 ) -> Result<()> {
-    if !config.services.contains_key(service) {
+    let configured = config.services.contains_key(service)
+        || service.strip_suffix("-proxy").is_some_and(|upstream| {
+            config
+                .services
+                .get(upstream)
+                .is_some_and(|service| service.proxy.is_some())
+        });
+    if !configured {
         let mut available = config
             .services
             .keys()
-            .map(String::as_str)
+            .cloned()
+            .chain(config.services.iter().filter_map(|(name, service)| {
+                service.proxy.as_ref().map(|_| format!("{name}-proxy"))
+            }))
             .collect::<Vec<_>>();
         available.sort_unstable();
         if available.is_empty() {

@@ -36,6 +36,7 @@ pub fn resolve_dev_plan(
     workspace_root: &Path,
     config: &DevWorkspaceConfig,
     group: Option<&str>,
+    enable_proxies: bool,
     projects: &[DiscoveredProject],
     graph: &TargetGraph,
     plugins: &PluginRegistry,
@@ -45,6 +46,13 @@ pub fn resolve_dev_plan(
     }
 
     let selected = select_service_names(config, group)?;
+    if enable_proxies
+        && !selected
+            .iter()
+            .any(|name| config.services[*name].proxy.is_some())
+    {
+        bail!("--proxy requested but no selected services configure a proxy");
+    }
     let group_control_port = match group {
         Some(group) => config
             .service_groups
@@ -60,7 +68,8 @@ pub fn resolve_dev_plan(
         .map(|project| (format!("//{}", project.relative_path.display()), project))
         .collect();
     let selected_control_port = group_control_port.or(config.control_port.as_deref());
-    let active_ports = collect_active_ports(config, &selected, selected_control_port)?;
+    let active_ports =
+        collect_active_ports(config, &selected, selected_control_port, enable_proxies)?;
     let selected_services = selected
         .iter()
         .map(|name| ((*name).to_string(), config.services[*name].port.clone()))
@@ -86,12 +95,21 @@ pub fn resolve_dev_plan(
             continue;
         }
 
-        let port = match service.port.as_deref() {
+        let proxy = enable_proxies.then_some(service.proxy.as_ref()).flatten();
+        let runtime_port_name = proxy
+            .map(|proxy| proxy.upstream_port.as_str())
+            .or(service.port.as_deref());
+        let port = match runtime_port_name {
             Some(port_name) => Some(*ports.get(port_name).ok_or_else(|| {
                 anyhow!("service '{name}' references unknown port '{port_name}'")
             })?),
             None => None,
         };
+        let advertised_port = service
+            .port
+            .as_deref()
+            .and_then(|port_name| ports.get(port_name))
+            .copied();
         let service_file_env = load_env_files(workspace_root, &service.env_files)?;
         let mut service_env = service_file_env;
         for key in &service.inherit_env {
@@ -109,12 +127,16 @@ pub fn resolve_dev_plan(
             );
         }
         for (key, port_name) in &service.port_env {
-            let port = ports.get(port_name).ok_or_else(|| {
-                anyhow!(
-                    "service '{name}' port_env key '{key}' references unknown port '{port_name}'"
-                )
-            })?;
-            service_env.insert(key.clone(), port.to_string());
+            let value = if proxy.is_some() && service.port.as_ref() == Some(port_name) {
+                port.expect("proxied service validation requires a runtime port")
+            } else {
+                *ports.get(port_name).ok_or_else(|| {
+                    anyhow!(
+                        "service '{name}' port_env key '{key}' references unknown port '{port_name}'"
+                    )
+                })?
+            };
+            service_env.insert(key.clone(), value.to_string());
         }
         service_env.insert("ASTER_SERVICE_NAME".to_string(), name.clone());
         if let Some(port) = port {
@@ -136,41 +158,26 @@ pub fn resolve_dev_plan(
         };
         let (target_address, mut target, project_root, watch, open_url) =
             if let Some(target_address) = &service.target {
-                let (project_address, _) = target_address.split_once(':').ok_or_else(|| {
-                    anyhow!(
-                        "service '{name}' target must use //project:target syntax: {target_address}"
-                    )
-                })?;
-                let project = project_by_address.get(project_address).ok_or_else(|| {
-                    anyhow!("service '{name}' references unknown project {project_address}")
-                })?;
-                let node = graph.get(target_address).ok_or_else(|| {
-                    anyhow!("service '{name}' references unknown target {target_address}")
-                })?;
-                let target = project
-                    .targets
-                    .get(&node.target_name)
-                    .ok_or_else(|| anyhow!("target definition missing for {target_address}"))?;
-                if !target.stream {
-                    bail!("service '{name}' target {target_address} must set stream = true");
-                }
-                let watch = WatchPlan::build(
-                    std::slice::from_ref(target_address),
+                let (target, project_root, watch) = resolve_stream_target(
+                    name,
+                    target_address,
+                    &project_by_address,
                     projects,
                     graph,
                     plugins,
-                )
-                .with_context(|| format!("failed to build watch plan for service '{name}'"))?;
+                )?;
                 (
                     target_address.clone(),
-                    target.clone(),
-                    project.root.clone(),
+                    target,
+                    project_root,
                     watch,
                     service.port.as_ref().and_then(|port_name| {
                         tls_open_urls
                             .get(port_name)
                             .map(|base| format!("{base}{path}"))
-                            .or_else(|| port.map(|port| format!("http://localhost:{port}{path}")))
+                            .or_else(|| {
+                                advertised_port.map(|port| format!("http://localhost:{port}{path}"))
+                            })
                     }),
                 )
             } else {
@@ -219,6 +226,55 @@ pub fn resolve_dev_plan(
             env: service_env,
             watch,
         });
+
+        if let Some(proxy) = proxy {
+            let proxy_name = format!("{name}-proxy");
+            let listen_port =
+                advertised_port.expect("proxied service validation requires an advertised port");
+            let upstream_port = port.expect("proxied service validation requires an upstream port");
+            let (mut target, project_root, watch) = resolve_stream_target(
+                &proxy_name,
+                &proxy.target,
+                &project_by_address,
+                projects,
+                graph,
+                plugins,
+            )?;
+            target.command =
+                expand_proxy_template(&target.command, listen_port, upstream_port, &ports)
+                    .with_context(|| format!("invalid command for service '{proxy_name}'"))?;
+            let mut proxy_env = HashMap::new();
+            for (key, value) in &proxy.env {
+                proxy_env.insert(
+                    key.clone(),
+                    expand_proxy_template(value, listen_port, upstream_port, &ports).with_context(
+                        || format!("invalid env value for service '{proxy_name}' key '{key}'"),
+                    )?,
+                );
+            }
+            proxy_env.insert("ASTER_SERVICE_NAME".to_string(), proxy_name.clone());
+            proxy_env.insert("ASTER_SERVICE_PORT".to_string(), listen_port.to_string());
+            proxy_env.insert("ASTER_PROXY_SERVICE_NAME".to_string(), name.to_string());
+            proxy_env.insert(
+                "ASTER_PROXY_LISTEN_PORT".to_string(),
+                listen_port.to_string(),
+            );
+            proxy_env.insert(
+                "ASTER_PROXY_UPSTREAM_PORT".to_string(),
+                upstream_port.to_string(),
+            );
+            validate_environment(&proxy_name, &proxy_env)?;
+            services.push(ServicePlan {
+                name: proxy_name,
+                target_address: proxy.target.clone(),
+                target,
+                project_root,
+                port: Some(listen_port),
+                open_url: None,
+                env: proxy_env,
+                watch,
+            });
+        }
     }
 
     if services.is_empty() {
@@ -234,6 +290,37 @@ pub fn resolve_dev_plan(
         control_port,
         _port_lease: port_lease,
     })
+}
+
+fn resolve_stream_target(
+    service_name: &str,
+    target_address: &str,
+    project_by_address: &HashMap<String, &DiscoveredProject>,
+    projects: &[DiscoveredProject],
+    graph: &TargetGraph,
+    plugins: &PluginRegistry,
+) -> Result<(Target, PathBuf, WatchPlan)> {
+    let (project_address, _) = target_address.split_once(':').ok_or_else(|| {
+        anyhow!(
+            "service '{service_name}' target must use //project:target syntax: {target_address}"
+        )
+    })?;
+    let project = project_by_address.get(project_address).ok_or_else(|| {
+        anyhow!("service '{service_name}' references unknown project {project_address}")
+    })?;
+    let node = graph.get(target_address).ok_or_else(|| {
+        anyhow!("service '{service_name}' references unknown target {target_address}")
+    })?;
+    let target = project
+        .targets
+        .get(&node.target_name)
+        .ok_or_else(|| anyhow!("target definition missing for {target_address}"))?;
+    if !target.stream {
+        bail!("service '{service_name}' target {target_address} must set stream = true");
+    }
+    let watch = WatchPlan::build(&[target_address.to_string()], projects, graph, plugins)
+        .with_context(|| format!("failed to build watch plan for service '{service_name}'"))?;
+    Ok((target.clone(), project.root.clone(), watch))
 }
 
 fn resolve_tls_open_urls(
@@ -324,6 +411,7 @@ fn collect_active_ports(
     config: &DevWorkspaceConfig,
     selected: &HashSet<&str>,
     control_port: Option<&str>,
+    enable_proxies: bool,
 ) -> Result<HashSet<String>> {
     let mut active = HashSet::new();
     if let Some(port) = control_port {
@@ -336,6 +424,11 @@ fn collect_active_ports(
             active.insert(port.clone());
         }
         active.extend(service.port_env.values().cloned());
+        if enable_proxies {
+            if let Some(proxy) = &service.proxy {
+                active.insert(proxy.upstream_port.clone());
+            }
+        }
         // TLS routes consume upstream ports but do not own their listeners.
         // They may intentionally point at services outside this supervisor.
     }
@@ -723,6 +816,23 @@ fn expand_template(
     Ok(expanded)
 }
 
+fn expand_proxy_template(
+    value: &str,
+    listen_port: u16,
+    upstream_port: u16,
+    ports: &HashMap<String, u16>,
+) -> Result<String> {
+    let expanded = value
+        .replace("{proxy.listen_port}", &listen_port.to_string())
+        .replace("{proxy.upstream_port}", &upstream_port.to_string());
+    if let Some(start) = expanded.find("{proxy.") {
+        let rest = &expanded[start..];
+        let end = rest.find('}').unwrap_or(rest.len().saturating_sub(1));
+        bail!("references unknown proxy template {}", &rest[..=end]);
+    }
+    expand_template(&expanded, Some(listen_port), ports)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +845,7 @@ mod tests {
         DevServiceConfig {
             target: Some(target.to_string()),
             tls_proxy: None,
+            proxy: None,
             port: None,
             open_path: None,
             env_files: Vec::new(),
@@ -771,6 +882,7 @@ mod tests {
                     },
                 ],
             }),
+            proxy: None,
             port: Some("https".to_string()),
             open_path: None,
             env_files: Vec::new(),

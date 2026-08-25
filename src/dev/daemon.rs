@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 3;
-const PREVIOUS_PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
+const PREVIOUS_PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_GROUP: &str = "__aster_default__";
 const SERVE_ENV: &str = "ASTER_INTERNAL_DAEMON_SERVE";
 const READY_SOCKET_ENV: &str = "ASTER_INTERNAL_DAEMON_READY_SOCKET";
@@ -90,6 +90,7 @@ pub struct LaunchOptions {
     pub group: Option<String>,
     pub watch: bool,
     pub use_cache: bool,
+    pub proxy: bool,
     pub executable: PathBuf,
     /// Snapshot from the requesting CLI, so the daemon cannot leak values
     /// inherited from the invocation that happened to start it.
@@ -109,6 +110,7 @@ impl LaunchOptions {
             group: None,
             watch: true,
             use_cache: true,
+            proxy: false,
             executable,
             environment: unicode_environment()?,
         })
@@ -131,6 +133,7 @@ enum Operation {
         group: Option<String>,
         watch: bool,
         use_cache: bool,
+        proxy: bool,
         executable: PathBuf,
         environment: BTreeMap<String, String>,
     },
@@ -254,6 +257,7 @@ mod platform {
         startup_log: PathBuf,
         ready_deadline: Instant,
         waiters: Vec<(UnixStream, LaunchStatus)>,
+        proxy: bool,
     }
 
     #[derive(Debug, Deserialize)]
@@ -330,6 +334,7 @@ mod platform {
             group: options.group,
             watch: options.watch,
             use_cache: options.use_cache,
+            proxy: options.proxy,
             executable: options.executable,
             environment: options.environment,
         };
@@ -852,6 +857,7 @@ mod platform {
                 group,
                 watch,
                 use_cache,
+                proxy,
                 executable,
                 environment,
             } => {
@@ -869,6 +875,19 @@ mod platform {
                     group: group.clone(),
                 };
                 if let Some(bundle) = bundles.get_mut(&key) {
+                    if bundle.proxy != proxy {
+                        let running_mode = if bundle.proxy { "with" } else { "without" };
+                        let requested_mode = if proxy { "with" } else { "without" };
+                        return write_error(
+                            &mut stream,
+                            daemon_error(
+                                DaemonErrorCode::Busy,
+                                format!(
+                                    "service bundle is already running {running_mode} proxies; stop it before launching {requested_mode} proxies"
+                                ),
+                            ),
+                        );
+                    }
                     if bundle.descriptor.state == BundleState::Running {
                         return write_value(
                             &mut stream,
@@ -891,6 +910,7 @@ mod platform {
                     display_group: display_group.as_deref(),
                     watch,
                     use_cache,
+                    proxy,
                     environment: &environment,
                     ready_socket: &paths.ready,
                     bundle_id: &bundle_id,
@@ -918,6 +938,7 @@ mod platform {
                         startup_log,
                         ready_deadline: Instant::now() + START_TIMEOUT,
                         waiters: vec![(stream, LaunchStatus::Started)],
+                        proxy,
                     },
                 );
                 Ok(())
@@ -981,6 +1002,7 @@ mod platform {
         display_group: Option<&'a str>,
         watch: bool,
         use_cache: bool,
+        proxy: bool,
         environment: &'a BTreeMap<String, String>,
         ready_socket: &'a Path,
         bundle_id: &'a str,
@@ -1016,6 +1038,9 @@ mod platform {
         }
         if !options.use_cache {
             command.arg("--no-cache");
+        }
+        if options.proxy {
+            command.arg("--proxy");
         }
         command
             .env(READY_SOCKET_ENV, options.ready_socket)

@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -138,6 +138,15 @@ fn reserve_consecutive_dynamic_bundles() -> (u16, u16) {
         }
     }
     panic!("could not find two consecutive free dynamic port bundles");
+}
+
+fn http_get(port: u16) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn terminate_aster(child: &mut std::process::Child) {
@@ -367,6 +376,186 @@ stream = true
     assert!(empty_ports.status.success());
     let report: serde_json::Value = serde_json::from_slice(&empty_ports.stdout).unwrap();
     assert!(report["instances"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn optional_service_proxy_preserves_the_advertised_port_end_to_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    let advertised_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let advertised_port = advertised_reservation.local_addr().unwrap().port();
+    let upstream_reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let upstream_port = upstream_reservation.local_addr().unwrap().port();
+
+    // Setup: one real HTTP service and one real TCP proxy are ordinary stream targets.
+    fs::create_dir(root.join(".git")).unwrap();
+    for project in ["app", "proxy"] {
+        fs::create_dir(root.join(project)).unwrap();
+        fs::write(
+            root.join(project).join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports]
+platform = {advertised_port}
+platform-upstream = {upstream_port}
+
+[dev.services.platform]
+target = "//app:dev"
+port = "platform"
+port_env = {{ PORT = "platform" }}
+proxy = {{ target = "//proxy:dev", upstream_port = "platform-upstream", env = {{ LISTEN_PORT = "{{proxy.listen_port}}", UPSTREAM_PORT = "{{proxy.upstream_port}}" }} }}
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.dev]\ncommand = \"python3 server.py {port}\"\nstream = true\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/server.py"),
+        r#"import http.server
+import os
+import sys
+
+port = int(sys.argv[1])
+with open("../app-events.log", "a") as events:
+    events.write(f"{port}:{os.environ['PORT']}\n")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f"app-port={port};env-port={os.environ['PORT']}".encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_):
+        pass
+
+http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("proxy/aster.toml"),
+        "[targets.dev]\ncommand = \"python3 proxy.py\"\nstream = true\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("proxy/proxy.py"),
+        r#"import os
+import select
+import socket
+import socketserver
+
+listen_port = int(os.environ["LISTEN_PORT"])
+upstream_port = int(os.environ["UPSTREAM_PORT"])
+with open("../proxy-events.log", "a") as events:
+    events.write(f"{listen_port}:{upstream_port}:{os.environ['ASTER_PROXY_LISTEN_PORT']}:{os.environ['ASTER_PROXY_UPSTREAM_PORT']}:{os.environ['ASTER_PROXY_SERVICE_NAME']}\n")
+print(f"proxy-ready {listen_port}->{upstream_port}", flush=True)
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        with socket.create_connection(("127.0.0.1", upstream_port)) as upstream:
+            peers = {self.request: upstream, upstream: self.request}
+            while True:
+                readable, _, _ = select.select(list(peers), [], [])
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    peers[source].sendall(data)
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+Server(("127.0.0.1", listen_port), Handler).serve_forever()
+"#,
+    )
+    .unwrap();
+    drop((advertised_reservation, upstream_reservation));
+
+    let launch = |proxy: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command.args(["services", "up", "--no-ui", "--no-watch"]);
+        if proxy {
+            command.arg("--proxy");
+        }
+        command
+            .current_dir(root)
+            .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    // Proxy boundary: the advertised port belongs to the sidecar while the app receives the upstream port.
+    let mut proxied = launch(true);
+    let expected_proxied_body = format!("app-port={upstream_port};env-port={upstream_port}");
+    wait_until(Duration::from_secs(20), || {
+        http_get(advertised_port).is_ok_and(|response| response.contains(&expected_proxied_body))
+    });
+    assert_eq!(
+        fs::read_to_string(root.join("app-events.log")).unwrap(),
+        format!("{upstream_port}:{upstream_port}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("proxy-events.log")).unwrap(),
+        format!("{advertised_port}:{upstream_port}:{advertised_port}:{upstream_port}:platform\n")
+    );
+    wait_until(Duration::from_secs(5), || {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .args(["services", "logs", "platform-proxy"])
+            .current_dir(root)
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("proxy-ready")
+            })
+    });
+
+    // Published state: service discovery still maps platform to its original advertised port.
+    let ports = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["--json", "services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(ports.status.success(), "{ports:?}");
+    let report: serde_json::Value = serde_json::from_slice(&ports.stdout).unwrap();
+    let instance = &report["instances"][0];
+    assert_eq!(instance["services"][0]["name"], "platform");
+    assert_eq!(instance["services"][0]["port_name"], "platform");
+    assert_eq!(instance["services"][0]["port"], advertised_port);
+    assert_eq!(instance["ports"]["platform"], advertised_port);
+    assert_eq!(instance["ports"]["platform-upstream"], upstream_port);
+
+    terminate_aster(&mut proxied);
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", advertised_port)).is_err()
+            && TcpStream::connect(("127.0.0.1", upstream_port)).is_err()
+    });
+
+    // Optional path: without the flag, the app returns to the same advertised port and no proxy starts.
+    let mut direct = launch(false);
+    let expected_direct_body = format!("app-port={advertised_port};env-port={advertised_port}");
+    wait_until(Duration::from_secs(20), || {
+        http_get(advertised_port).is_ok_and(|response| response.contains(&expected_direct_body))
+    });
+    assert_eq!(
+        occurrences(&root.join("proxy-events.log"), ":platform\n"),
+        1
+    );
+    terminate_aster(&mut direct);
 }
 
 #[test]
@@ -1187,6 +1376,7 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
                 group: None,
                 watch: false,
                 use_cache: true,
+                proxy: false,
                 executable,
                 environment: std::env::vars().collect(),
             })
@@ -1272,6 +1462,111 @@ fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
         "[targets.web]\ncommand = \"python3 -m http.server {port}\"\nstream = true\n\n[targets.worker]\ncommand = \"sleep 60\"\nstream = true\n",
     )
     .unwrap();
+}
+
+fn write_proxy_daemon_workspace(root: &Path, advertised_port: u16, upstream_port: u16) {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    for project in ["app", "proxy"] {
+        fs::create_dir_all(root.join(project)).unwrap();
+        fs::write(
+            root.join(project).join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            root.join(project).join("aster.toml"),
+            "[targets.dev]\ncommand = \"sleep 60\"\nstream = true\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports]
+http = {advertised_port}
+http-upstream = {upstream_port}
+
+[dev.services.web]
+target = "//app:dev"
+port = "http"
+proxy = {{ target = "//proxy:dev", upstream_port = "http-upstream" }}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn daemon_rejects_reattach_with_a_different_proxy_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let advertised = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let advertised_port = advertised.local_addr().unwrap().port();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    write_proxy_daemon_workspace(&root, advertised_port, upstream_port);
+    drop((advertised, upstream));
+    let guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: root,
+    };
+
+    let first = guard
+        .command()
+        .args([
+            "--json",
+            "services",
+            "up",
+            "--daemon",
+            "--no-watch",
+            "--proxy",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_json["status"], "started");
+    assert_eq!(
+        first_json["bundle"]["services"],
+        serde_json::json!(["web", "web-proxy"])
+    );
+    assert_eq!(first_json["bundle"]["ports"]["http"], advertised_port);
+    assert_eq!(
+        first_json["bundle"]["ports"]["http-upstream"],
+        upstream_port
+    );
+
+    let mismatch = guard
+        .command()
+        .args(["--json", "services", "up", "--daemon", "--no-watch"])
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success(), "{mismatch:?}");
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr)
+            .contains("already running with proxies; stop it before launching without proxies"),
+        "{mismatch:?}"
+    );
+
+    let same_mode = guard
+        .command()
+        .args([
+            "--json",
+            "services",
+            "up",
+            "--daemon",
+            "--no-watch",
+            "--proxy",
+        ])
+        .output()
+        .unwrap();
+    assert!(same_mode.status.success(), "{same_mode:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&same_mode.stdout).unwrap()["status"],
+        "already_running"
+    );
 }
 
 #[test]

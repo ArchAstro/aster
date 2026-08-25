@@ -130,6 +130,35 @@ impl DevWorkspaceConfig {
                     bail!("service '{name}' must configure exactly one of target or tls_proxy")
                 }
             }
+            if let Some(proxy) = &service.proxy {
+                if service.target.is_none() {
+                    bail!("service '{name}' can configure proxy only with an ordinary target");
+                }
+                let port = service
+                    .port
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("proxied service '{name}' requires a port"))?;
+                if !self.ports.contains_key(port) {
+                    bail!("proxied service '{name}' references unknown port '{port}'");
+                }
+                if !self.ports.contains_key(&proxy.upstream_port) {
+                    bail!(
+                        "service '{name}' proxy references unknown upstream_port '{}'",
+                        proxy.upstream_port
+                    );
+                }
+                if proxy.upstream_port == port {
+                    bail!(
+                        "service '{name}' proxy upstream_port must differ from its advertised port '{port}'"
+                    );
+                }
+                let proxy_name = format!("{name}-proxy");
+                if self.services.contains_key(&proxy_name) {
+                    bail!(
+                        "service '{name}' proxy conflicts with configured service '{proxy_name}'"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -351,6 +380,8 @@ pub struct DevServiceConfig {
     pub target: Option<String>,
     /// Built-in loopback TLS reverse proxy. Mutually exclusive with `target`.
     pub tls_proxy: Option<DevTlsProxyConfig>,
+    /// Optional sidecar inserted in front of this service when `services up --proxy` is used.
+    pub proxy: Option<DevServiceProxyConfig>,
     /// Named port from `[dev.ports]`.
     pub port: Option<String>,
     /// Optional browser path appended to `http://localhost:<port>`.
@@ -371,6 +402,21 @@ pub struct DevServiceConfig {
     /// Stable startup/display order. Ties are sorted by service name.
     #[serde(default)]
     pub order: i32,
+}
+
+/// An optional target that listens on a service's advertised port and forwards
+/// to the service on a separate named port.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevServiceProxyConfig {
+    /// Address of a `stream = true` proxy target.
+    pub target: String,
+    /// Named port used by the underlying service while the proxy is enabled.
+    pub upstream_port: String,
+    /// Environment passed only to the proxy target. Values support normal port
+    /// templates plus `{proxy.listen_port}` and `{proxy.upstream_port}`.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Built-in local HTTPS service configuration.
@@ -642,6 +688,47 @@ port_env = { PORT = "http", DATABASE_PORT = "database" }
             panic!("expected explicit static port");
         };
         assert_eq!(database.allocation, Some(StaticPortAllocation::Static));
+    }
+
+    #[test]
+    fn parses_service_proxy_and_validates_distinct_ports() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("aster.toml"),
+            r#"
+[dev.ports]
+platform = 4000
+platform-upstream = 14000
+
+[dev.services.platform]
+target = "//platform:dev"
+port = "platform"
+proxy = { target = "//proxy:dev", upstream_port = "platform-upstream", env = { LISTEN = "{proxy.listen_port}", UPSTREAM = "{proxy.upstream_port}" } }
+"#,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(temp.path()).unwrap();
+        let proxy = config.dev.services["platform"].proxy.as_ref().unwrap();
+        assert_eq!(proxy.target, "//proxy:dev");
+        assert_eq!(proxy.upstream_port, "platform-upstream");
+        assert_eq!(proxy.env["LISTEN"], "{proxy.listen_port}");
+
+        fs::write(
+            temp.path().join("aster.toml"),
+            r#"
+[dev.ports]
+platform = 4000
+
+[dev.services.platform]
+target = "//platform:dev"
+port = "platform"
+proxy = { target = "//proxy:dev", upstream_port = "platform" }
+"#,
+        )
+        .unwrap();
+        let error = WorkspaceConfig::load(temp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("must differ from its advertised port"));
     }
 
     #[test]
