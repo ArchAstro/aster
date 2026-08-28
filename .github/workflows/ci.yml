@@ -25,15 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-      # This multi-supervisor test intentionally releases candidate ports before
-      # launch. Isolate it on macOS, where concurrent process tests can claim or
-      # starve those ports long enough to exceed its startup assertion.
+      # Supervisor tests bind real ports. Isolate that crate on macOS: concurrent
+      # process tests can claim or starve those ports long enough to exceed
+      # startup assertions.
       - if: runner.os == 'macOS'
         run: |
-          cargo test --locked --all-targets --all-features -- \
-            --skip dynamic_port_bundles_are_distinct_propagated_and_released
-          cargo test --locked --test dev_services --all-features \
-            dynamic_port_bundles_are_distinct_propagated_and_released
+          cargo test --locked --lib --bins --all-features
+          cargo test --locked --all-features \
+            --test config_bug_bash \
+            --test dev_tls \
+            --test integration \
+            --test watch_tests
+          cargo test --locked --test dev_services --all-features -- --test-threads=1
       - if: runner.os != 'macOS'
         run: cargo test --locked --all-targets --all-features
       - run: scripts/test-dynamic-service-ports
