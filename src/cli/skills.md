@@ -329,6 +329,9 @@ Target commands use shell-style quoting but execute the parsed program directly.
 Pipes, redirects, substitutions, and `&&` require an explicit shell command such
 as `sh -c 'generator | formatter > output'`. `{files}` is expanded safely only
 for targets declaring `files_list` and must occupy a standalone argument.
+Captured targets receive a closed stdin, so tools that prompt on a TTY fail
+instead of hanging; `stream = true` and `aster run --stream` inherit the
+caller's terminal.
 
 ## Common end-to-end flows
 

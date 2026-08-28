@@ -128,6 +128,75 @@ cache = { enabled = false }
     assert!(!child_exists, "target process survived Aster termination");
 }
 
+#[cfg(unix)]
+#[test]
+fn captured_targets_do_not_hang_on_stdin_prompts() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.prompt]
+command = "sh -c 'read -r _ignored; printf ready > marker'"
+cache = { enabled = false }
+"#,
+    );
+
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:prompt", "--no-cache"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Keep Aster's stdin write-end open. If the target inherited it, `read`
+    // would block until this process closed the pipe — the #72 hang.
+    let _stdin = aster.stdin.take();
+    let mut stdout = aster.stdout.take().unwrap();
+    let mut stderr = aster.stderr.take().unwrap();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).ok();
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).ok();
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match aster.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = aster.kill();
+                let _ = aster.wait();
+                panic!("aster hung: captured target inherited stdin and blocked on read");
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_handle.join().unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_handle.join().unwrap()).into_owned();
+    assert!(
+        status.success(),
+        "aster failed: status={status:?} stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("app/marker")).unwrap(),
+        "ready"
+    );
+}
+
 #[test]
 fn heterogeneous_run_preserves_quoted_arguments() {
     let tmp = TempDir::new().unwrap();
