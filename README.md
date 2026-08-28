@@ -236,6 +236,10 @@ command = "sh -c 'generator | formatter > src/generated.rs'"
 cache = { enabled = false }
 ```
 
+Captured targets receive a closed stdin, so tools that prompt on a TTY fail
+instead of hanging behind Aster's progress UI. Targets with `stream = true` or
+`aster run --stream` inherit the caller's terminal.
+
 Only the `files_list` capability is supported. When present, `{files}` is
 required to be a standalone command argument and is safely expanded into
 individual path arguments. It cannot be embedded in a quoted shell script or

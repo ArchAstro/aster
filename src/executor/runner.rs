@@ -62,6 +62,10 @@ pub struct Executor<'a> {
     /// Whether to use caching
     use_cache: bool,
     /// Whether child targets should receive a closed stdin.
+    ///
+    /// Captured execution always uses a closed stdin so tools that prompt on a
+    /// TTY fail instead of hanging behind Aster's progress UI. Streaming
+    /// targets inherit the caller's terminal separately.
     null_stdin: bool,
 }
 
@@ -73,7 +77,7 @@ impl<'a> Executor<'a> {
             output_mode: OutputMode::Normal,
             full_logs: false,
             use_cache: true,
-            null_stdin: false,
+            null_stdin: true,
         }
     }
 
@@ -84,7 +88,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs: false,
             use_cache: true,
-            null_stdin: false,
+            null_stdin: true,
         }
     }
 
@@ -99,7 +103,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache: true,
-            null_stdin: false,
+            null_stdin: true,
         }
     }
 
@@ -115,14 +119,15 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache,
-            null_stdin: false,
+            null_stdin: true,
         }
     }
 
     /// Prevent targets from reading the caller's terminal.
     ///
-    /// This is used for dev-service prerequisites, which execute in a worker
-    /// while the dashboard remains the foreground terminal process.
+    /// Captured execution already closes stdin. This is kept so call sites such
+    /// as dev-service prerequisites can document that the child must not share
+    /// the dashboard's terminal.
     pub fn with_null_stdin(mut self) -> Self {
         self.null_stdin = true;
         self
@@ -1144,6 +1149,9 @@ fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if null_stdin {
+        // Closed stdin makes isatty(0) false even after setsid(): the child
+        // still inherits a TTY *fd* unless we replace it. Tools that prompt
+        // when stdin is a TTY then hang behind the progress UI.
         cmd.stdin(Stdio::null());
     }
 
@@ -2016,5 +2024,46 @@ mod tests {
         assert!(!result.cached);
         assert_eq!(result.output, "test output");
         assert_eq!(result.duration_ms, 100);
+    }
+
+    #[test]
+    fn captured_execution_closes_stdin_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Executor::new(tmp.path()).null_stdin);
+        assert!(
+            Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json).null_stdin
+        );
+        assert!(
+            Executor::with_options(tmp.path(), crate::cli::output::OutputMode::Json, false)
+                .null_stdin
+        );
+        assert!(
+            Executor::with_all_options(
+                tmp.path(),
+                crate::cli::output::OutputMode::Json,
+                false,
+                false
+            )
+            .null_stdin
+        );
+        assert!(Executor::new(tmp.path()).with_null_stdin().null_stdin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_command_stdin_is_not_a_tty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = run_command(
+            "//a:prompt",
+            "sh -c 'if [ -t 0 ]; then echo tty; else echo not-a-tty; fi'",
+            tmp.path(),
+            true,
+        );
+        assert!(result.success, "command failed: {}", result.output);
+        assert!(
+            result.output.contains("not-a-tty"),
+            "expected closed stdin, got: {}",
+            result.output
+        );
     }
 }
