@@ -182,6 +182,9 @@ impl<'a> Executor<'a> {
                 return Err(format!("No '{target}' target defined for {project_addr}"));
             }
         };
+        if target_def.exports_vars() {
+            return Err(crate::plugins::exporter_requires_services_up(&target_addr));
+        }
         let command = &target_def.command;
 
         // Use target's working_dir if set, otherwise use project root
@@ -326,6 +329,25 @@ impl<'a> Executor<'a> {
     ) -> Vec<ExecutionResult> {
         if targets_to_run.is_empty() {
             return Vec::new();
+        }
+
+        if let Some(address) = targets_to_run.iter().find(|address| {
+            parse_target_address(address)
+                .and_then(|(project_addr, target_name)| {
+                    project_map
+                        .get(&project_addr)
+                        .and_then(|project| project.targets.get(&target_name))
+                })
+                .is_some_and(|target| target.exports_vars())
+        }) {
+            return vec![ExecutionResult {
+                address: address.clone(),
+                success: false,
+                skipped: false,
+                cached: false,
+                output: crate::plugins::exporter_requires_services_up(address),
+                duration_ms: 0,
+            }];
         }
 
         if self.output_mode != OutputMode::Json {

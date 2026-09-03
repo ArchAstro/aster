@@ -85,6 +85,13 @@ impl Target {
     }
 }
 
+/// Error text used when an exporter target is invoked outside `aster services up`.
+pub fn exporter_requires_services_up(address: &str) -> String {
+    format!(
+        "Target '{address}' exports runtime variables and can only be run by `aster services up`"
+    )
+}
+
 /// Context passed to plugins for target detection
 ///
 /// Contains all the raw information a plugin needs to determine targets

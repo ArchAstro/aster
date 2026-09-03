@@ -289,6 +289,56 @@ stream = true
 }
 
 #[test]
+fn exported_variable_targets_are_rejected_outside_services_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("producer")).unwrap();
+    fs::write(root.join("producer/package.json"), r#"{"name":"producer"}"#).unwrap();
+    fs::write(
+        root.join("producer/aster.toml"),
+        r#"
+[targets.dev]
+command = "sleep 30"
+stream = true
+exports_vars = true
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        r#"
+[dev.services.producer]
+target = "//producer:dev"
+"#,
+    )
+    .unwrap();
+
+    let cases: &[&[&str]] = &[
+        &["run", "//producer:dev"],
+        &["dev", "//producer"],
+        &["watch", "//producer:dev", "--no-initial"],
+    ];
+    for args in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .args(*args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{args:?} should reject exporter targets\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("aster services up") || stderr.contains("aster services up"),
+            "{args:?} should name the services-up restriction\nstdout={stdout}\nstderr={stderr}"
+        );
+    }
+}
+
+#[test]
 fn services_kill_ports_previews_then_clears_configured_listener() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

@@ -27,7 +27,7 @@ use aster::git::{
     AffectedIgnore,
 };
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
-use aster::plugins::{PluginRegistry, Target, TargetCapability};
+use aster::plugins::{exporter_requires_services_up, PluginRegistry, Target, TargetCapability};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet};
@@ -1038,6 +1038,13 @@ fn run() -> Result<()> {
 
             let primary_targets: std::collections::HashSet<String> =
                 filtered_targets.into_iter().collect();
+            let mut closure = primary_targets.clone();
+            if !no_deps {
+                for address in &primary_targets {
+                    collect_target_deps(address, &project_map, &mut closure);
+                }
+            }
+            reject_exporter_addresses(&closure, &projects)?;
             let all_project_refs: Vec<_> = projects.iter().collect();
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
@@ -1510,6 +1517,33 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn exporter_addresses(projects: &[DiscoveredProject]) -> HashSet<String> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .targets
+                .iter()
+                .filter(|(_, target)| target.exports_vars())
+                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
+        })
+        .collect()
+}
+
+fn reject_exporter_addresses<'a, I>(addresses: I, projects: &[DiscoveredProject]) -> Result<()>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let exporters = exporter_addresses(projects);
+    if let Some(exporter) = addresses
+        .into_iter()
+        .find(|address| exporters.contains(*address))
+    {
+        anyhow::bail!("{}", exporter_requires_services_up(exporter));
+    }
+    Ok(())
+}
+
 fn reject_exporters_from_execution(
     target_name: &str,
     primary_projects: &[&DiscoveredProject],
@@ -1519,28 +1553,11 @@ fn reject_exporters_from_execution(
         .iter()
         .map(|project| (format!("//{}", project.relative_path.display()), project))
         .collect::<HashMap<_, _>>();
-    let exporter_addresses = projects
-        .iter()
-        .flat_map(|project| {
-            project
-                .targets
-                .iter()
-                .filter(|(_, target)| target.exports_vars())
-                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
-        })
-        .collect::<HashSet<_>>();
     for project in primary_projects {
         let address = format!("//{}:{target_name}", project.relative_path.display());
         let mut closure = HashSet::from([address.clone()]);
         collect_target_deps(&address, &project_map, &mut closure);
-        if let Some(exporter) = closure
-            .iter()
-            .find(|address| exporter_addresses.contains(*address))
-        {
-            anyhow::bail!(
-                "Target '{exporter}' exports runtime variables and can only be run by `aster services up`"
-            );
-        }
+        reject_exporter_addresses(&closure, projects)?;
     }
     Ok(())
 }
@@ -1617,29 +1634,15 @@ fn handle_watch(
         return Err(anyhow::anyhow!("{cycle}"));
     }
 
-    let exporter_addresses = projects
-        .iter()
-        .flat_map(|project| {
-            project
-                .targets
-                .iter()
-                .filter(|(_, target)| target.exports_vars())
-                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
-        })
-        .collect::<HashSet<_>>();
     let registry = PluginRegistry::with_all_plugins();
 
     let plan = WatchPlan::build(&resolved, &projects, &graph, &registry)?;
-    if let Some(exporter) = plan
+    let planned = plan
         .targets
         .iter()
-        .find(|target| exporter_addresses.contains(&target.address))
-    {
-        return Err(anyhow::anyhow!(
-            "Target '{}' exports runtime variables and can only be run by `aster services up`",
-            exporter.address
-        ));
-    }
+        .map(|target| target.address.clone())
+        .collect::<HashSet<_>>();
+    reject_exporter_addresses(&planned, &projects)?;
 
     let workspace_config = WorkspaceConfig::load(workspace_root)?;
     let ignore = WorkspaceIgnore::build(&workspace_config.watch)?;

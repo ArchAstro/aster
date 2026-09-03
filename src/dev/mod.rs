@@ -21,7 +21,10 @@ pub use daemon::{
     SUPERVISOR_ENV,
 };
 #[doc(hidden)]
-pub use daemon::{is_internal_serve_invocation, register_supervisor_ready, serve_from_environment};
+pub use daemon::{
+    is_internal_serve_invocation, register_supervisor_extend_deadline, register_supervisor_ready,
+    serve_from_environment,
+};
 pub use log_files::show_service_logs;
 pub use plan::{
     resolve_dev_plan, resolve_dev_ports, resolve_static_dev_ports, DevPlan, ServicePlan,
