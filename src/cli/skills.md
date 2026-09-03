@@ -203,6 +203,13 @@ from their ranges as one collision-free bundle per supervisor and released at
 exit. Use `port_env` for direct numeric environment values and `{ports.name}`
 inside `env` or target commands for URLs and other composite values.
 
+On Unix, a streaming target may set `exports_vars = true`. Aster gives each
+producer generation a private `ASTER_EXPORT_VAR_PATH` FIFO. The producer writes
+newline-terminated JSON objects with string keys and values. Direct target
+dependencies wait for the first valid snapshot and receive only names listed in
+their service's `inherit_env`; an effective value change restarts the consumer.
+Exporter targets are valid only under `aster services up`.
+
 A service may configure an optional target under `[dev.services.<name>.proxy]`
 with a distinct named `upstream_port` and proxy-specific `env`. `services up
 <group> --proxy` keeps the service's advertised named port on the proxy and

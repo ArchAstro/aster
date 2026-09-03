@@ -240,7 +240,9 @@ mod platform {
     const PID_NAME: &str = "daemon.pid";
     const LOG_NAME: &str = "daemon.log";
     const READY_NAME: &str = "ready.sock";
-    const START_TIMEOUT: Duration = Duration::from_secs(20);
+    // Exporting services own a 20-second first-snapshot deadline. Leave a
+    // bounded handoff margin for the supervisor to report that result.
+    const START_TIMEOUT: Duration = Duration::from_secs(25);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const IDLE_GRACE: Duration = Duration::from_millis(500);
     const STOP_GRACE: Duration = Duration::from_secs(5);

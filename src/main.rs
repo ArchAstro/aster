@@ -675,6 +675,8 @@ fn run() -> Result<()> {
                 .filter(|p| lang.is_empty() || p.has_any_language(&lang))
                 .collect();
 
+            reject_exporters_from_execution(&target, &affected_projects, &projects)?;
+
             if affected_projects.is_empty() {
                 if output_mode == OutputMode::Json {
                     let output = build_execution_output(&[]);
@@ -1254,6 +1256,7 @@ fn run() -> Result<()> {
             // Select initial projects
             let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            reject_exporters_from_execution(&run_args.target, &initial, &projects)?;
 
             // Build set of primary projects (originally selected, before expansion)
             // Only these will run the requested target; dependency projects are included
@@ -1507,6 +1510,41 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn reject_exporters_from_execution(
+    target_name: &str,
+    primary_projects: &[&DiscoveredProject],
+    projects: &[DiscoveredProject],
+) -> Result<()> {
+    let project_map = projects
+        .iter()
+        .map(|project| (format!("//{}", project.relative_path.display()), project))
+        .collect::<HashMap<_, _>>();
+    let exporter_addresses = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .targets
+                .iter()
+                .filter(|(_, target)| target.exports_vars())
+                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
+        })
+        .collect::<HashSet<_>>();
+    for project in primary_projects {
+        let address = format!("//{}:{target_name}", project.relative_path.display());
+        let mut closure = HashSet::from([address.clone()]);
+        collect_target_deps(&address, &project_map, &mut closure);
+        if let Some(exporter) = closure
+            .iter()
+            .find(|address| exporter_addresses.contains(*address))
+        {
+            anyhow::bail!(
+                "Target '{exporter}' exports runtime variables and can only be run by `aster services up`"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Handle the `watch` command.
 #[allow(clippy::too_many_arguments)]
 fn handle_watch(
@@ -1579,9 +1617,29 @@ fn handle_watch(
         return Err(anyhow::anyhow!("{cycle}"));
     }
 
+    let exporter_addresses = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .targets
+                .iter()
+                .filter(|(_, target)| target.exports_vars())
+                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
+        })
+        .collect::<HashSet<_>>();
     let registry = PluginRegistry::with_all_plugins();
 
     let plan = WatchPlan::build(&resolved, &projects, &graph, &registry)?;
+    if let Some(exporter) = plan
+        .targets
+        .iter()
+        .find(|target| exporter_addresses.contains(&target.address))
+    {
+        return Err(anyhow::anyhow!(
+            "Target '{}' exports runtime variables and can only be run by `aster services up`",
+            exporter.address
+        ));
+    }
 
     let workspace_config = WorkspaceConfig::load(workspace_root)?;
     let ignore = WorkspaceIgnore::build(&workspace_config.watch)?;

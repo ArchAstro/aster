@@ -2,6 +2,7 @@
 
 mod daemon;
 mod dashboard;
+mod export_vars;
 mod log_files;
 mod plan;
 mod port_allocator;

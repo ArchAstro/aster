@@ -158,6 +158,137 @@ fn terminate_aster(child: &mut std::process::Child) {
 }
 
 #[test]
+fn exported_variables_gate_and_restart_only_direct_consumers() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    for project in ["producer", "consumer", "transitive", "sibling"] {
+        fs::create_dir(root.join(project)).unwrap();
+        fs::write(
+            root.join(project).join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("producer/publish.sh"),
+        r#"#!/bin/sh
+printf '%s\n' '{"TOKEN":"one","PRIVATE":"hidden"}' > "$ASTER_EXPORT_VAR_PATH"
+while [ ! -f ../consumer.ready ]; do sleep 0.05; done
+sleep 0.2
+printf '%s\n' '{"TOKEN":"two","PRIVATE":"hidden"}' > "$ASTER_EXPORT_VAR_PATH"
+sleep 30
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("run.sh"),
+        r#"#!/bin/sh
+name="$1"
+printf '%s:%s\n' "$name" "${TOKEN-unset}" >> ../events.log
+if [ "$name" = consumer ]; then touch ../consumer.ready; fi
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        r#"
+[dev.services.producer]
+target = "//producer:dev"
+
+[dev.services.consumer]
+target = "//consumer:dev"
+inherit_env = ["TOKEN"]
+
+[dev.services.transitive]
+target = "//transitive:dev"
+inherit_env = ["TOKEN"]
+
+[dev.services.sibling]
+target = "//sibling:dev"
+inherit_env = ["TOKEN"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("producer/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh publish.sh"
+stream = true
+exports_vars = true
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("consumer/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh ../run.sh consumer"
+stream = true
+depends_on = ["//producer:dev"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("transitive/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh ../run.sh transitive"
+stream = true
+depends_on = ["//consumer:dev"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("sibling/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh ../run.sh sibling"
+stream = true
+"#,
+    )
+    .unwrap();
+
+    let stdout = fs::File::create(root.join("stdout.log")).unwrap();
+    let stderr = fs::File::create(root.join("stderr.log")).unwrap();
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .env_remove("TOKEN")
+        .current_dir(root)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let events = root.join("events.log");
+    if !condition_met(Duration::from_secs(15), || {
+        occurrences(&events, "consumer:one") == 1
+            && occurrences(&events, "consumer:two") == 1
+            && occurrences(&events, "transitive:unset") == 1
+            && occurrences(&events, "sibling:unset") == 1
+    }) {
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            &root.join("stdout.log"),
+            &root.join("stderr.log"),
+            "exported-variable reconciliation did not settle",
+        );
+    }
+    assert_eq!(occurrences(&events, "transitive:"), 1);
+    assert_eq!(occurrences(&events, "sibling:"), 1);
+    assert!(!fs::read_to_string(root.join("stdout.log"))
+        .unwrap_or_default()
+        .contains("hidden"));
+    assert!(!fs::read_to_string(root.join("stderr.log"))
+        .unwrap_or_default()
+        .contains("hidden"));
+    terminate_aster(&mut aster);
+}
+
+#[test]
 fn services_kill_ports_previews_then_clears_configured_listener() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
