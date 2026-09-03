@@ -305,6 +305,18 @@ exports_vars = true
 "#,
     )
     .unwrap();
+    fs::create_dir(root.join("consumer")).unwrap();
+    fs::write(root.join("consumer/package.json"), r#"{"name":"consumer"}"#).unwrap();
+    fs::write(
+        root.join("consumer/aster.toml"),
+        r#"
+[targets.dev]
+command = "echo ok"
+stream = true
+depends_on = ["//producer:dev"]
+"#,
+    )
+    .unwrap();
     fs::write(
         root.join("aster.toml"),
         r#"
@@ -318,6 +330,8 @@ target = "//producer:dev"
         &["run", "//producer:dev"],
         &["dev", "//producer"],
         &["watch", "//producer:dev", "--no-initial"],
+        &["run", "//consumer:dev"],
+        &["dev", "//consumer"],
     ];
     for args in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -336,6 +350,18 @@ target = "//producer:dev"
             "{args:?} should name the services-up restriction\nstdout={stdout}\nstderr={stderr}"
         );
     }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["run", "//consumer:dev", "--no-deps"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "--no-deps should still run a non-exporter primary\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

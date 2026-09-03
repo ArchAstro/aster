@@ -351,7 +351,7 @@ fn order_service_graph(
         })
         .collect::<HashSet<_>>();
     #[cfg(not(unix))]
-    if !exporter_addresses.is_empty() {
+    if services.iter().any(|service| service.target.exports_vars()) {
         bail!("exports_vars targets require the Unix service supervisor");
     }
     let mut instances: HashMap<String, Vec<String>> = HashMap::new();

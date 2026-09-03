@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u16 = 4;
-const PREVIOUS_PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 5;
+const PREVIOUS_PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_GROUP: &str = "__aster_default__";
 const SERVE_ENV: &str = "ASTER_INTERNAL_DAEMON_SERVE";
 const READY_SOCKET_ENV: &str = "ASTER_INTERNAL_DAEMON_READY_SOCKET";

@@ -191,6 +191,7 @@ pub fn run_dev(
     let watch_debounce = Duration::from_millis(config.watch.debounce_ms.unwrap_or(300));
     let mut pending_watch_paths = Vec::new();
     let mut watch_deadline: Option<Instant> = None;
+    let mut last_ready_extend = Instant::now();
     let mut quitting = false;
 
     if producers.is_empty() {
@@ -283,6 +284,7 @@ pub fn run_dev(
                                     workspace_root,
                                     Duration::from_secs(SNAPSHOT_PROGRESS_SECS),
                                 );
+                                last_ready_extend = Instant::now();
                             }
                             set_service_state(
                                 &mut dashboard,
@@ -410,6 +412,9 @@ pub fn run_dev(
                         }
                         state.epoch = state.epoch.saturating_add(1);
                         state.healthy = false;
+                        if state.waiting_since.is_none() {
+                            state.waiting_since = Some(Instant::now());
+                        }
                         emit_system(
                             &system_tx,
                             &producer,
@@ -441,9 +446,14 @@ pub fn run_dev(
             }
 
             if !supervisor_registered {
+                if active_start.is_some() && last_ready_extend.elapsed() >= Duration::from_secs(10)
+                {
+                    extend_ready_deadline(workspace_root, Duration::from_secs(READY_PROGRESS_SECS));
+                    last_ready_extend = Instant::now();
+                }
                 if let Some((name, _)) = producers.iter().find(|(_, producer)| {
                     producer.waiting_since.is_some_and(|started| {
-                        started.elapsed() >= FIRST_SNAPSHOT_TIMEOUT && producer.values.is_none()
+                        started.elapsed() >= FIRST_SNAPSHOT_TIMEOUT && !producer.healthy
                     })
                 }) {
                     anyhow::bail!(
@@ -509,6 +519,7 @@ pub fn run_dev(
                             workspace_root,
                             Duration::from_secs(READY_PROGRESS_SECS),
                         );
+                        last_ready_extend = Instant::now();
                     }
                     let handle = begin_start_service(
                         service,

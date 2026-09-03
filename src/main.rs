@@ -675,7 +675,7 @@ fn run() -> Result<()> {
                 .filter(|p| lang.is_empty() || p.has_any_language(&lang))
                 .collect();
 
-            reject_exporters_from_execution(&target, &affected_projects, &projects)?;
+            reject_exporters_from_execution(&target, &affected_projects, &projects, true)?;
 
             if affected_projects.is_empty() {
                 if output_mode == OutputMode::Json {
@@ -1263,7 +1263,12 @@ fn run() -> Result<()> {
             // Select initial projects
             let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            reject_exporters_from_execution(&run_args.target, &initial, &projects)?;
+            reject_exporters_from_execution(
+                &run_args.target,
+                &initial,
+                &projects,
+                !run_args.no_deps,
+            )?;
 
             // Build set of primary projects (originally selected, before expansion)
             // Only these will run the requested target; dependency projects are included
@@ -1548,6 +1553,7 @@ fn reject_exporters_from_execution(
     target_name: &str,
     primary_projects: &[&DiscoveredProject],
     projects: &[DiscoveredProject],
+    expand_deps: bool,
 ) -> Result<()> {
     let project_map = projects
         .iter()
@@ -1556,7 +1562,9 @@ fn reject_exporters_from_execution(
     for project in primary_projects {
         let address = format!("//{}:{target_name}", project.relative_path.display());
         let mut closure = HashSet::from([address.clone()]);
-        collect_target_deps(&address, &project_map, &mut closure);
+        if expand_deps {
+            collect_target_deps(&address, &project_map, &mut closure);
+        }
         reject_exporter_addresses(&closure, projects)?;
     }
     Ok(())

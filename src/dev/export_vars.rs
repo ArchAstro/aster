@@ -86,10 +86,10 @@ fn parse_snapshot(bytes: &[u8]) -> Result<HashMap<String, String>, String> {
 
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let values = serde::de::Deserializer::deserialize_map(&mut deserializer, SnapshotVisitor)
-        .map_err(|error| format!("invalid JSON snapshot: {error}"))?;
+        .map_err(|_| "invalid JSON snapshot".to_string())?;
     deserializer
         .end()
-        .map_err(|error| format!("trailing JSON data: {error}"))?;
+        .map_err(|_| "trailing JSON data".to_string())?;
     for (name, value) in &values {
         if !valid_environment_name(name) {
             return Err(format!("invalid environment variable name '{name}'"));
@@ -332,6 +332,24 @@ mod tests {
             b"{\"A\":1}\n".as_slice(),
         ] {
             assert!(JsonlParser::default().push(input).pop().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn parser_errors_do_not_include_payload_values() {
+        for input in [
+            b"\"leaked-secret-token\"\n".as_slice(),
+            b"{\"TOKEN\":\"leaked-secret-token\"} extra\n".as_slice(),
+        ] {
+            let error = JsonlParser::default()
+                .push(input)
+                .pop()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                !error.contains("leaked-secret-token"),
+                "parser error leaked payload: {error}"
+            );
         }
     }
 
