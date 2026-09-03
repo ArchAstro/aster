@@ -457,7 +457,7 @@ pub fn run_dev(
                     })
                 }) {
                     anyhow::bail!(
-                        "variable exporter '{name}' did not publish an initial snapshot within 20 seconds"
+                        "variable exporter '{name}' did not become healthy within 20 seconds"
                     );
                 }
             }

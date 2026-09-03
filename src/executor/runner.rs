@@ -144,8 +144,9 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         _graph: &ProjectGraph,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, None, primary_projects)
+        self.execute_internal(target, projects, None, primary_projects, expand_deps)
     }
 
     /// Execute a target with command overrides for specific targets
@@ -158,8 +159,15 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         command_overrides: &HashMap<String, String>,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, Some(command_overrides), primary_projects)
+        self.execute_internal(
+            target,
+            projects,
+            Some(command_overrides),
+            primary_projects,
+            expand_deps,
+        )
     }
 
     /// Execute a target with streaming output (for long-running processes like dev servers)
@@ -280,6 +288,7 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         command_overrides: Option<&HashMap<String, String>>,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
         if projects.is_empty() {
             return Vec::new();
@@ -310,8 +319,9 @@ impl<'a> Executor<'a> {
                 // Add the requested target
                 targets_to_run.insert(target_addr.clone());
 
-                // Recursively collect target dependencies
-                collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+                if expand_deps {
+                    collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+                }
             }
         }
 

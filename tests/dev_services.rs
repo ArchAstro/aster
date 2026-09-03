@@ -302,6 +302,10 @@ fn exported_variable_targets_are_rejected_outside_services_up() {
 command = "sleep 30"
 stream = true
 exports_vars = true
+
+[targets.web]
+command = "echo ok"
+depends_on = ["//self:dev"]
 "#,
     )
     .unwrap();
@@ -332,6 +336,7 @@ target = "//producer:dev"
         &["watch", "//producer:dev", "--no-initial"],
         &["run", "//consumer:dev"],
         &["dev", "//consumer"],
+        &["web", "//producer"],
     ];
     for args in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_aster"))
@@ -351,17 +356,23 @@ target = "//producer:dev"
         );
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["run", "//consumer:dev", "--no-deps"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "--no-deps should still run a non-exporter primary\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for args in [
+        ["run", "//consumer:dev", "--no-deps"].as_slice(),
+        ["dev", "//consumer", "--no-deps"].as_slice(),
+        ["web", "//producer", "--no-deps"].as_slice(),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} should still run a non-exporter primary\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

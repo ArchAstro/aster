@@ -952,9 +952,16 @@ fn run() -> Result<()> {
                     &all_project_refs,
                     &command_overrides,
                     Some(&effective_primary_addrs),
+                    true,
                 )
             } else {
-                executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
+                executor.execute(
+                    &target,
+                    &all_project_refs,
+                    &graph,
+                    Some(&primary_addrs),
+                    true,
+                )
             };
 
             // Output results based on mode
@@ -1378,6 +1385,7 @@ fn run() -> Result<()> {
                     &executor_projects,
                     &command_overrides,
                     Some(&primary_projects),
+                    !run_args.no_deps,
                 )
             } else {
                 // Pass ALL projects so executor can resolve target-level dependencies
@@ -1394,6 +1402,7 @@ fn run() -> Result<()> {
                     &executor_projects,
                     &graph,
                     Some(&primary_projects),
+                    !run_args.no_deps,
                 )
             };
 
