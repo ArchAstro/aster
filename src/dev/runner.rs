@@ -307,6 +307,7 @@ pub fn run_dev(
                                 &result.service,
                                 &plan,
                                 &mut runtimes,
+                                &mut producers,
                                 &mut pending_starts,
                                 &system_tx,
                                 &mut dashboard,
@@ -335,12 +336,31 @@ pub fn run_dev(
                         generation,
                         values,
                     } => {
+                        let Some(service) = plan
+                            .services
+                            .iter()
+                            .find(|service| service.name == producer)
+                        else {
+                            continue;
+                        };
+                        let Some(runtime) = runtimes.get(&producer) else {
+                            continue;
+                        };
+                        if runtime.generation != generation || runtime.process.is_none() {
+                            continue;
+                        }
+                        let ExportResolution::Ready(current_inputs) =
+                            resolve_exported_environment(service, &producers)
+                        else {
+                            continue;
+                        };
+                        if !applied_exports_are_current(runtime, &current_inputs) {
+                            continue;
+                        }
                         let Some(state) = producers.get_mut(&producer) else {
                             continue;
                         };
-                        if state.generation != generation
-                            || runtimes[&producer].generation != generation
-                        {
+                        if state.generation != generation {
                             continue;
                         }
                         state.epoch = state.epoch.saturating_add(1);
@@ -372,28 +392,59 @@ pub fn run_dev(
                                 ExportResolution::Ready(_)
                                     if runtimes[&service.name].process.is_some() =>
                                 {
-                                    queue_restart(
-                                        &mut pending_starts,
-                                        &service.name,
-                                        "effective exported environment changed",
-                                        &system_tx,
-                                        &mut dashboard,
-                                    );
-                                }
-                                ExportResolution::Ready(_) | ExportResolution::Pending => {}
-                                ExportResolution::Conflict(message) => {
-                                    emit_system(&system_tx, &service.name, message, true);
-                                    if runtimes[&service.name].process.is_some() {
-                                        hold_service(
+                                    if service.target.exports_vars() {
+                                        hold_exporter_tree(
                                             &service.name,
-                                            "exported variable sources conflict",
+                                            "effective exported environment changed",
+                                            &plan,
                                             &mut runtimes,
+                                            &mut producers,
                                             &mut pending_starts,
                                             &system_tx,
                                             &mut dashboard,
                                             #[cfg(unix)]
                                             session.as_ref(),
                                         );
+                                    } else {
+                                        queue_restart(
+                                            &mut pending_starts,
+                                            &service.name,
+                                            "effective exported environment changed",
+                                            &system_tx,
+                                            &mut dashboard,
+                                        );
+                                    }
+                                }
+                                ExportResolution::Ready(_) | ExportResolution::Pending => {}
+                                ExportResolution::Conflict(message) => {
+                                    emit_system(&system_tx, &service.name, message, true);
+                                    if runtimes[&service.name].process.is_some() {
+                                        if service.target.exports_vars() {
+                                            hold_exporter_tree(
+                                                &service.name,
+                                                "exported variable sources conflict",
+                                                &plan,
+                                                &mut runtimes,
+                                                &mut producers,
+                                                &mut pending_starts,
+                                                &system_tx,
+                                                &mut dashboard,
+                                                #[cfg(unix)]
+                                                session.as_ref(),
+                                            );
+                                        } else {
+                                            hold_service(
+                                                &service.name,
+                                                "exported variable sources conflict",
+                                                &mut runtimes,
+                                                &mut producers,
+                                                &mut pending_starts,
+                                                &system_tx,
+                                                &mut dashboard,
+                                                #[cfg(unix)]
+                                                session.as_ref(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -425,6 +476,7 @@ pub fn run_dev(
                             &producer,
                             &plan,
                             &mut runtimes,
+                            &mut producers,
                             &mut pending_starts,
                             &system_tx,
                             &mut dashboard,
@@ -487,6 +539,7 @@ pub fn run_dev(
                             &name,
                             &plan,
                             &mut runtimes,
+                            &mut producers,
                             &mut pending_starts,
                             &system_tx,
                             &mut dashboard,
@@ -577,14 +630,13 @@ pub fn run_dev(
                         true,
                     );
                     if let Some(producer) = producers.get_mut(&service.name) {
-                        let had_snapshot = producer.values.is_some();
                         producer.epoch = producer.epoch.saturating_add(1);
                         producer.values = None;
                         producer.healthy = false;
                         producer.waiting_since = None;
-                        if !had_snapshot && !supervisor_registered {
+                        if !supervisor_registered {
                             anyhow::bail!(
-                                "variable exporter '{}' exited before publishing its initial snapshot",
+                                "variable exporter '{}' exited before all variable exporters became ready",
                                 service.name
                             );
                         }
@@ -592,6 +644,7 @@ pub fn run_dev(
                             &service.name,
                             &plan,
                             &mut runtimes,
+                            &mut producers,
                             &mut pending_starts,
                             &system_tx,
                             &mut dashboard,
@@ -968,6 +1021,12 @@ fn resolve_exported_environment(
     })
 }
 
+fn applied_exports_are_current(runtime: &Runtime, resolved: &ResolvedExports) -> bool {
+    runtime.applied_exports == resolved.values
+        && runtime.applied_epochs == resolved.epochs
+        && runtime.applied_sources == resolved.sources
+}
+
 fn service_is_startable(
     service: &ServicePlan,
     runtimes: &HashMap<String, Runtime>,
@@ -991,12 +1050,21 @@ fn hold_service(
     name: &str,
     reason: &str,
     runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
     pending: &mut VecDeque<(String, String)>,
     system_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
     #[cfg(unix)] session: Option<&SessionServer>,
 ) {
     let runtime = runtimes.get_mut(name).expect("runtime exists");
+    if let Some(producer) = producers.get_mut(name) {
+        runtime.generation = runtime.generation.saturating_add(1);
+        producer.generation = runtime.generation;
+        producer.epoch = producer.epoch.saturating_add(1);
+        producer.values = None;
+        producer.healthy = false;
+        producer.waiting_since = None;
+    }
     #[cfg(unix)]
     runtime.export_endpoint.take();
     if let Some(mut process) = runtime.process.take() {
@@ -1016,10 +1084,47 @@ fn hold_service(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn hold_exporter_tree(
+    name: &str,
+    reason: &str,
+    plan: &DevPlan,
+    runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
+    pending: &mut VecDeque<(String, String)>,
+    system_tx: &std::sync::mpsc::Sender<LogEvent>,
+    dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
+) {
+    stop_dependent_services(
+        name,
+        plan,
+        runtimes,
+        producers,
+        pending,
+        system_tx,
+        dashboard,
+        #[cfg(unix)]
+        session,
+    );
+    hold_service(
+        name,
+        reason,
+        runtimes,
+        producers,
+        pending,
+        system_tx,
+        dashboard,
+        #[cfg(unix)]
+        session,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stop_dependent_services(
     producer: &str,
     plan: &DevPlan,
     runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
     pending: &mut VecDeque<(String, String)>,
     system_tx: &std::sync::mpsc::Sender<LogEvent>,
     dashboard: &mut Dashboard,
@@ -1049,6 +1154,7 @@ fn stop_dependent_services(
             &service.name,
             "required exported variables unavailable",
             runtimes,
+            producers,
             pending,
             system_tx,
             dashboard,
@@ -1682,6 +1788,28 @@ mod tests {
             resolve_exported_environment(&service, &producers),
             ExportResolution::Pending
         ));
+    }
+
+    #[test]
+    fn applied_export_epochs_fence_stale_nested_exporters() {
+        let runtime = Runtime {
+            process: None,
+            #[cfg(unix)]
+            export_endpoint: None,
+            generation: 1,
+            applied_exports: HashMap::from([("TOKEN".to_string(), "one".to_string())]),
+            applied_epochs: HashMap::from([("producer".to_string(), 3)]),
+            applied_sources: HashSet::from(["producer".to_string()]),
+        };
+        let mut resolved = ResolvedExports {
+            values: runtime.applied_exports.clone(),
+            epochs: runtime.applied_epochs.clone(),
+            sources: runtime.applied_sources.clone(),
+        };
+        assert!(applied_exports_are_current(&runtime, &resolved));
+
+        resolved.epochs.insert("producer".to_string(), 4);
+        assert!(!applied_exports_are_current(&runtime, &resolved));
     }
 
     #[test]

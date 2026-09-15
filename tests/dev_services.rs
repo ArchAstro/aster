@@ -289,6 +289,237 @@ stream = true
 }
 
 #[test]
+fn nested_exporter_is_held_until_restarted_with_current_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    for project in ["producer", "nested", "blocker", "consumer"] {
+        fs::create_dir(root.join(project)).unwrap();
+        fs::write(
+            root.join(project).join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("producer/publish.sh"),
+        r#"#!/bin/sh
+printf '%s\n' '{"TOKEN":"one"}' > "$ASTER_EXPORT_VAR_PATH"
+while [ ! -f ../nested.ready ] || [ ! -f ../blocker.started ]; do sleep 0.02; done
+printf '%s\n' '{"TOKEN":"two"}' > "$ASTER_EXPORT_VAR_PATH"
+sleep 30
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("nested/publish.sh"),
+        r#"#!/bin/sh
+printf '{"DERIVED":"%s"}\n' "$TOKEN" > "$ASTER_EXPORT_VAR_PATH"
+touch ../nested.ready
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("consumer/run.sh"),
+        r#"#!/bin/sh
+printf 'consumer:%s\n' "$DERIVED" >> ../events.log
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        r#"
+[dev.services.producer]
+target = "//producer:dev"
+order = 0
+
+[dev.services.nested]
+target = "//nested:dev"
+inherit_env = ["TOKEN"]
+order = 1
+
+[dev.services.blocker]
+target = "//blocker:dev"
+order = 2
+
+[dev.services.consumer]
+target = "//consumer:dev"
+inherit_env = ["DERIVED"]
+order = 3
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("producer/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh publish.sh"
+stream = true
+exports_vars = true
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("nested/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh publish.sh"
+stream = true
+exports_vars = true
+depends_on = ["//producer:dev"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("blocker/aster.toml"),
+        r#"
+[targets.prepare]
+command = "sh -c 'touch ../blocker.started; sleep 1'"
+
+[targets.dev]
+command = "sleep 30"
+stream = true
+depends_on = ["//self:prepare"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("consumer/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh run.sh"
+stream = true
+depends_on = ["//nested:dev"]
+"#,
+    )
+    .unwrap();
+
+    let stdout = fs::File::create(root.join("stdout.log")).unwrap();
+    let stderr = fs::File::create(root.join("stderr.log")).unwrap();
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let events = root.join("events.log");
+    if !condition_met(Duration::from_secs(15), || {
+        occurrences(&events, "consumer:two") == 1
+    }) {
+        fail_with_process_diagnostics(
+            &mut aster,
+            &events,
+            &root.join("stdout.log"),
+            &root.join("stderr.log"),
+            "nested exporter did not restart with current inputs",
+        );
+    }
+    assert_eq!(occurrences(&events, "consumer:one"), 0);
+    terminate_aster(&mut aster);
+}
+
+#[test]
+fn exporter_exit_before_global_readiness_fails_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    for project in ["early", "slow"] {
+        fs::create_dir(root.join(project)).unwrap();
+        fs::write(
+            root.join(project).join("package.json"),
+            format!(r#"{{"name":"{project}"}}"#),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("aster.toml"),
+        r#"
+[dev.services.early]
+target = "//early:dev"
+order = 0
+
+[dev.services.slow]
+target = "//slow:dev"
+order = 1
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("early/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh publish.sh"
+stream = true
+exports_vars = true
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("early/publish.sh"),
+        r#"#!/bin/sh
+printf '%s\n' '{"EARLY":"ready"}' > "$ASTER_EXPORT_VAR_PATH"
+sleep 0.3
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("slow/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh publish.sh"
+stream = true
+exports_vars = true
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("slow/publish.sh"),
+        r#"#!/bin/sh
+sleep 3
+printf '%s\n' '{"SLOW":"ready"}' > "$ASTER_EXPORT_VAR_PATH"
+sleep 30
+"#,
+    )
+    .unwrap();
+
+    let stdout_path = root.join("stdout.log");
+    let stderr_path = root.join("stderr.log");
+    let stdout = fs::File::create(&stdout_path).unwrap();
+    let stderr = fs::File::create(&stderr_path).unwrap();
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .current_dir(root)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+
+    if !condition_met(Duration::from_secs(5), || {
+        aster.try_wait().unwrap().is_some()
+    }) {
+        fail_with_process_diagnostics(
+            &mut aster,
+            &root.join("events.log"),
+            &stdout_path,
+            &stderr_path,
+            "startup did not fail after a pre-ready exporter exited",
+        );
+    }
+    let status = aster.try_wait().unwrap().expect("Aster exited");
+    assert!(!status.success());
+    let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+    assert!(
+        stderr.contains("exited before all variable exporters became ready"),
+        "unexpected startup error: {stderr}"
+    );
+}
+
+#[test]
 fn exported_variable_targets_are_rejected_outside_services_up() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
