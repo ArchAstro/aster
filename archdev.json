@@ -1,14 +1,21 @@
 {
   "app": "dap_033y70rWJriCRNyb9uL0Pm",
   "publish": {
-    "auto": true
+    "auto": true,
+    "model": "platform/xai/grok-latest-thinking-high"
   },
   "pipelines": {
     "branch-validation": {
       "steps": [
         {
           "id": "format",
-          "run": ["cargo", "fmt", "--all", "--", "--check"]
+          "run": [
+            "cargo",
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+          ]
         },
         {
           "id": "lint",
@@ -44,5 +51,8 @@
   "local": {
     "project_id": "project_44269112-848d-478d-b3a7-7314f786cf5a",
     "repo_name": "aster"
+  },
+  "factory": {
+    "model": "platform/xai/grok-latest-thinking-high"
   }
 }
