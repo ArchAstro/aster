@@ -66,6 +66,9 @@ impl ServiceProcess {
         env: &HashMap<String, String>,
         log_senders: ProcessLogSenders,
     ) -> Result<Self> {
+        if target.exports_vars() && !env.contains_key(super::export_vars::EXPORT_PATH_ENV) {
+            anyhow::bail!(crate::plugins::exporter_requires_services_up(service));
+        }
         let parsed = parse_command(&target.command)?;
         let working_dir = target.working_dir.as_deref().unwrap_or(project_root);
         let mut command = Command::new(&parsed.program);

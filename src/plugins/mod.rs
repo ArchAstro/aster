@@ -43,6 +43,10 @@ pub enum TargetCapability {
     /// Target can treat warnings as errors
     /// (e.g., fail build on compiler warnings)
     WarningsAsErrors,
+    /// Internal marker for a streaming service target that publishes runtime
+    /// variables. This is configured by `exports_vars`, not by the public
+    /// `capabilities` list.
+    ExportsVars,
 }
 
 /// A build target with its command and dependencies
@@ -72,6 +76,20 @@ pub struct Target {
     /// Targets sharing a resource are serialized via per-resource mutexes
     /// while non-contending targets still run in parallel.
     pub exclusive_resources: Vec<String>,
+}
+
+impl Target {
+    /// Whether this target publishes variable snapshots while supervised.
+    pub fn exports_vars(&self) -> bool {
+        self.capabilities.contains(&TargetCapability::ExportsVars)
+    }
+}
+
+/// Error text used when an exporter target is invoked outside `aster services up`.
+pub fn exporter_requires_services_up(address: &str) -> String {
+    format!(
+        "Target '{address}' exports runtime variables and can only be run by `aster services up`"
+    )
 }
 
 /// Context passed to plugins for target detection

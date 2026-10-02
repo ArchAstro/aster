@@ -380,7 +380,7 @@ If a project has a target named `services`, run it explicitly with
 `aster target services <project selectors>`. The same escape hatch works for
 any target name that conflicts with a built-in Aster command.
 
-Services are mappings to ordinary `stream = true` targets. Their non-stream
+Services are mappings to `stream = true` targets. Their non-stream
 target dependencies are pre-start steps: Aster runs them before the service
 starts and again before a dependency-triggered or manual restart. The same
 transitive target graph determines which project directories are watched.
@@ -533,6 +533,52 @@ remain available in service target commands and `env` for composite values such
 as URLs. Port references do not implicitly start services; groups remain the
 process-selection contract. These templates are separate from the `{files}`
 target capability. `open_path` controls the dashboard's browser URL.
+
+### Runtime variable exporters
+
+A supervised target can publish configuration it discovers while starting or
+running. Exporters are Unix-only and must be streaming service targets:
+
+```toml
+# services/credentials/aster.toml
+[targets.dev]
+command = "./publish-credentials"
+stream = true
+exports_vars = true
+
+# services/api/aster.toml
+[targets.dev]
+command = "./start-api"
+stream = true
+depends_on = ["//services/credentials:dev"]
+
+# workspace-root aster.toml
+[dev.services.credentials]
+target = "//services/credentials:dev"
+
+[dev.services.api]
+target = "//services/api:dev"
+inherit_env = ["DISCOVERED_TOKEN"]
+```
+
+Before each exporter generation starts, Aster creates a private mode-0600
+named pipe and passes its path as `ASTER_EXPORT_VAR_PATH`. The producer writes
+one complete JSON object per line; keys and values must be strings and each
+record is a complete snapshot:
+
+```json
+{"DISCOVERED_TOKEN":"example"}
+```
+
+Consumers wait for the first valid snapshot. Only direct target dependencies
+may consume exported values, and `inherit_env` is the per-service allowlist.
+Exports override env-file and ambient values; explicit service `env`, resolved
+ports, Aster's internal variables, and leading command assignments remain
+final. A changed effective environment restarts the affected consumer, while
+identical, unused, or masked changes do not. If a producer exits or publishes
+invalid data, Aster stops consumers that used its values and holds them until a
+healthy snapshot is available. Records are limited to 64 KiB, malformed data
+is never logged, and exporter targets cannot be run outside `aster services up`.
 
 ### Optional service proxies
 

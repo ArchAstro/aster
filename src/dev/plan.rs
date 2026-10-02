@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{DevPortConfig, DevWorkspaceConfig};
 use crate::discovery::DiscoveredProject;
+use crate::executor::command::parse_command;
 use crate::graph::TargetGraph;
 use crate::plugins::{PluginRegistry, Target};
 use crate::watch::WatchPlan;
@@ -29,6 +30,12 @@ pub struct ServicePlan {
     pub port: Option<u16>,
     pub open_url: Option<String>,
     pub env: HashMap<String, String>,
+    /// Service names whose streaming targets must be ready first.
+    pub dependencies: Vec<String>,
+    /// Exported variable names this service is permitted to consume.
+    pub inherit_env: HashSet<String>,
+    /// Higher-precedence environment names that exported snapshots cannot replace.
+    pub protected_env: HashSet<String>,
     pub watch: WatchPlan,
 }
 
@@ -112,6 +119,11 @@ pub fn resolve_dev_plan(
             .copied();
         let service_file_env = load_env_files(workspace_root, &service.env_files)?;
         let mut service_env = service_file_env;
+        let mut protected_env = service.env.keys().cloned().collect::<HashSet<_>>();
+        protected_env.extend(service.port_env.keys().cloned());
+        protected_env.insert("ASTER_SERVICE_NAME".to_string());
+        protected_env.insert("ASTER_SERVICE_PORT".to_string());
+        protected_env.insert("ASTER_RESOLVED_PORTS".to_string());
         for key in &service.inherit_env {
             validate_environment_key(name, key)?;
             if let Ok(value) = env::var(key) {
@@ -215,6 +227,13 @@ pub fn resolve_dev_plan(
             };
         target.command = expand_template(&target.command, port, &ports)
             .with_context(|| format!("invalid command for service '{name}'"))?;
+        protected_env.extend(
+            parse_command(&target.command)?
+                .env
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+        protected_env.insert("ASTER_EXPORT_VAR_PATH".to_string());
 
         services.push(ServicePlan {
             name: name.clone(),
@@ -224,6 +243,9 @@ pub fn resolve_dev_plan(
             port,
             open_url,
             env: service_env,
+            dependencies: Vec::new(),
+            inherit_env: service.inherit_env.iter().cloned().collect(),
+            protected_env,
             watch,
         });
 
@@ -243,6 +265,20 @@ pub fn resolve_dev_plan(
             target.command =
                 expand_proxy_template(&target.command, listen_port, upstream_port, &ports)
                     .with_context(|| format!("invalid command for service '{proxy_name}'"))?;
+            let mut proxy_protected_env = HashSet::from([
+                "ASTER_SERVICE_NAME".to_string(),
+                "ASTER_SERVICE_PORT".to_string(),
+                "ASTER_PROXY_SERVICE_NAME".to_string(),
+                "ASTER_PROXY_LISTEN_PORT".to_string(),
+                "ASTER_PROXY_UPSTREAM_PORT".to_string(),
+                "ASTER_EXPORT_VAR_PATH".to_string(),
+            ]);
+            proxy_protected_env.extend(
+                parse_command(&target.command)?
+                    .env
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
             let mut proxy_env = HashMap::new();
             for (key, value) in &proxy.env {
                 proxy_env.insert(
@@ -272,6 +308,9 @@ pub fn resolve_dev_plan(
                 port: Some(listen_port),
                 open_url: None,
                 env: proxy_env,
+                dependencies: vec![name.clone()],
+                inherit_env: HashSet::new(),
+                protected_env: proxy_protected_env,
                 watch,
             });
         }
@@ -284,12 +323,99 @@ pub fn resolve_dev_plan(
         }
     }
 
+    let services = order_service_graph(services, projects)?;
+
     Ok(DevPlan {
         services,
         ports,
         control_port,
         _port_lease: port_lease,
     })
+}
+
+/// Connect selected service instances through direct streaming-target edges and
+/// return a stable topological order. Existing configured order remains the tie
+/// breaker because `services` arrives in that order.
+fn order_service_graph(
+    mut services: Vec<ServicePlan>,
+    projects: &[DiscoveredProject],
+) -> Result<Vec<ServicePlan>> {
+    let exporter_addresses = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .targets
+                .iter()
+                .filter(|(_, target)| target.exports_vars())
+                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
+        })
+        .collect::<HashSet<_>>();
+    #[cfg(not(unix))]
+    if services.iter().any(|service| service.target.exports_vars()) {
+        bail!("exports_vars targets require the Unix service supervisor");
+    }
+    let mut instances: HashMap<String, Vec<String>> = HashMap::new();
+    for service in &services {
+        instances
+            .entry(service.target_address.clone())
+            .or_default()
+            .push(service.name.clone());
+    }
+    for address in &exporter_addresses {
+        if let Some(names) = instances.get(address) {
+            if names.len() != 1 {
+                bail!(
+                    "variable exporter {address} has multiple selected service instances: {}",
+                    names.join(", ")
+                );
+            }
+        }
+    }
+
+    for service in &mut services {
+        for dependency in &service.target.depends_on {
+            match instances.get(dependency) {
+                Some(names)
+                    if names.len() == 1 && !service.dependencies.contains(&names[0]) =>
+                {
+                    service.dependencies.push(names[0].clone());
+                }
+                Some(names) if names.len() == 1 => {}
+                Some(names) if exporter_addresses.contains(dependency) => bail!(
+                    "variable exporter {dependency} has multiple selected service instances: {}",
+                    names.join(", ")
+                ),
+                Some(_) => {}
+                None if exporter_addresses.contains(dependency) => bail!(
+                    "service '{}' depends on variable exporter {dependency}, but that producer is not selected",
+                    service.name
+                ),
+                None => {}
+            }
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(services.len());
+    let mut emitted = HashSet::new();
+    while !services.is_empty() {
+        let Some(index) = services.iter().position(|service| {
+            service
+                .dependencies
+                .iter()
+                .all(|dependency| emitted.contains(dependency))
+        }) else {
+            let names = services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("service dependency cycle among: {names}");
+        };
+        let service = services.remove(index);
+        emitted.insert(service.name.clone());
+        ordered.push(service);
+    }
+    Ok(ordered)
 }
 
 fn resolve_stream_target(

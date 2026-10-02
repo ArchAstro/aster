@@ -103,11 +103,15 @@ impl TargetResolver {
                         Self::resolve_self_references(&rich.depends_on, project_address)
                     };
 
-                    let capabilities = if rich.capabilities.is_empty() {
+                    let mut capabilities = if rich.capabilities.is_empty() {
                         existing.map(|e| e.capabilities.clone()).unwrap_or_default()
                     } else {
                         Self::parse_capabilities(&rich.capabilities)
                     };
+                    capabilities.remove(&TargetCapability::ExportsVars);
+                    if rich.exports_vars {
+                        capabilities.insert(TargetCapability::ExportsVars);
+                    }
 
                     let files_glob = rich
                         .files_glob
@@ -277,6 +281,7 @@ mod tests {
             capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
             files_glob: files_glob.map(|s| s.to_string()),
             stream: false,
+            exports_vars: false,
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec![],
@@ -517,6 +522,23 @@ mod tests {
         assert_eq!(integration_target.files_glob, Some("*_test.go".to_string()));
     }
 
+    #[test]
+    fn test_rich_exporter_marker_survives_alias_resolution() {
+        let mut custom = HashMap::new();
+        let mut exporter = match rich("./publish", vec![], vec![], None) {
+            TargetConfig::Rich(config) => config,
+            _ => unreachable!(),
+        };
+        exporter.stream = true;
+        exporter.exports_vars = true;
+        custom.insert("exporter".to_string(), TargetConfig::Rich(exporter));
+        custom.insert("exporter-alias".to_string(), alias("exporter", vec![]));
+
+        let targets = TargetResolver::resolve(&HashMap::new(), &custom, "//app");
+        assert!(targets["exporter"].exports_vars());
+        assert!(targets["exporter-alias"].exports_vars());
+    }
+
     fn alias(alias_name: &str, depends_on: Vec<&str>) -> TargetConfig {
         TargetConfig::Alias(crate::config::AliasTargetConfig {
             alias: alias_name.to_string(),
@@ -677,6 +699,7 @@ mod tests {
             capabilities: vec![],
             files_glob: None,
             stream: false,
+            exports_vars: false,
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec!["custom_resource".to_string()],

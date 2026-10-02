@@ -118,6 +118,12 @@ pub struct RichTargetConfig {
     #[serde(default)]
     pub stream: bool,
 
+    /// Publish runtime-discovered variables to directly dependent services.
+    /// Exporters are supported only for streaming targets managed by the
+    /// service supervisor.
+    #[serde(default)]
+    pub exports_vars: bool,
+
     /// Cache configuration overrides
     #[serde(default)]
     pub cache: Option<CacheConfig>,
@@ -171,6 +177,14 @@ impl TargetConfig {
         match self {
             TargetConfig::Simple(_) | TargetConfig::Alias(_) => false,
             TargetConfig::Rich(rich) => rich.stream,
+        }
+    }
+
+    /// Get the runtime variable exporter flag (false for simple/alias format).
+    pub fn exports_vars(&self) -> bool {
+        match self {
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => false,
+            TargetConfig::Rich(rich) => rich.exports_vars,
         }
     }
 
@@ -258,6 +272,13 @@ pub(super) fn validate_aster_config(
         let TargetConfig::Rich(target) = target else {
             continue;
         };
+
+        if target.exports_vars && !target.stream {
+            anyhow::bail!(
+                "Target '{target_name}' in {} sets exports_vars = true but is not streaming; variable exporters must also set stream = true",
+                path.display()
+            );
+        }
 
         for capability in &target.capabilities {
             if capability != "files_list" {
@@ -589,6 +610,37 @@ command = "pytest"
         let test = config.targets.get("test").unwrap();
         assert_eq!(test.command(), "pytest");
         assert!(!test.stream());
+    }
+
+    #[test]
+    fn test_variable_exporter_requires_streaming_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.exporter]
+command = "./publish"
+exports_vars = true
+"#,
+        )
+        .unwrap();
+
+        let error = parse_aster_toml(&toml_path).unwrap_err().to_string();
+        assert!(error.contains("exports_vars = true"));
+
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.exporter]
+command = "./publish"
+stream = true
+exports_vars = true
+"#,
+        )
+        .unwrap();
+        let config = parse_aster_toml(&toml_path).unwrap();
+        assert!(config.targets["exporter"].exports_vars());
     }
 
     #[test]

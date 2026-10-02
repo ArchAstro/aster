@@ -20,6 +20,8 @@ use crate::graph::TargetGraph;
 use crate::watch::WorkspaceIgnore;
 
 use super::dashboard::{Dashboard, DashboardAction, ServiceState, TerminalGuard};
+#[cfg(unix)]
+use super::export_vars::{ExportEndpoint, ExportEvent, EXPORT_PATH_ENV};
 use super::log_files::ServiceLogFiles;
 use super::plan::{DevPlan, ServicePlan};
 use super::process::{LogEvent, ProcessLogSenders, ServiceProcess};
@@ -35,16 +37,57 @@ pub struct DevOptions {
 
 struct Runtime {
     process: Option<ServiceProcess>,
+    #[cfg(unix)]
+    export_endpoint: Option<ExportEndpoint>,
+    generation: u64,
+    applied_exports: HashMap<String, String>,
+    applied_epochs: HashMap<String, u64>,
+    applied_sources: HashSet<String>,
 }
 
+#[derive(Default)]
+struct ProducerState {
+    generation: u64,
+    epoch: u64,
+    values: Option<HashMap<String, String>>,
+    healthy: bool,
+    waiting_since: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResolvedExports {
+    values: HashMap<String, String>,
+    epochs: HashMap<String, u64>,
+    sources: HashSet<String>,
+}
+
+#[derive(Debug)]
+enum ExportResolution {
+    Ready(ResolvedExports),
+    Pending,
+    Conflict(String),
+}
+
+const FIRST_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+const READY_HANDOFF_SECS: u64 = 5;
+const EXPORTER_PREREQ_BUDGET_SECS: u64 = 60;
+const READY_PROGRESS_SECS: u64 =
+    FIRST_SNAPSHOT_TIMEOUT.as_secs() + READY_HANDOFF_SECS + EXPORTER_PREREQ_BUDGET_SECS;
+const SNAPSHOT_PROGRESS_SECS: u64 = FIRST_SNAPSHOT_TIMEOUT.as_secs() + READY_HANDOFF_SECS;
+
 enum StartOutcome {
-    Running(ServiceProcess),
+    Running {
+        process: ServiceProcess,
+        #[cfg(unix)]
+        export_endpoint: Option<ExportEndpoint>,
+    },
     Stopped,
 }
 
 struct StartResult {
     service: String,
     outcome: StartOutcome,
+    resolved_exports: ResolvedExports,
 }
 
 struct ActiveStart {
@@ -100,23 +143,34 @@ pub fn run_dev(
     } else {
         (None, None)
     };
-    super::daemon::register_supervisor_ready(
-        workspace_root,
-        plan.services
-            .iter()
-            .map(|service| service.name.clone())
-            .collect(),
-        plan.ports
-            .iter()
-            .map(|(name, port)| (name.clone(), *port))
-            .collect(),
-    )?;
+    let mut supervisor_registered = false;
     let mut dashboard = Dashboard::new(&plan.services);
     let mut runtimes: HashMap<String, Runtime> = plan
         .services
         .iter()
-        .map(|service| (service.name.clone(), Runtime { process: None }))
+        .map(|service| {
+            (
+                service.name.clone(),
+                Runtime {
+                    process: None,
+                    #[cfg(unix)]
+                    export_endpoint: None,
+                    generation: 0,
+                    applied_exports: HashMap::new(),
+                    applied_epochs: HashMap::new(),
+                    applied_sources: HashSet::new(),
+                },
+            )
+        })
         .collect();
+    let mut producers = plan
+        .services
+        .iter()
+        .filter(|service| service.target.exports_vars())
+        .map(|service| (service.name.clone(), ProducerState::default()))
+        .collect::<HashMap<_, _>>();
+    #[cfg(unix)]
+    let (export_tx, export_rx) = mpsc::channel::<ExportEvent>();
     let projects = Arc::new(projects);
     let (start_tx, start_rx) = mpsc::channel::<StartResult>();
     let mut active_start: Option<ActiveStart> = None;
@@ -137,7 +191,13 @@ pub fn run_dev(
     let watch_debounce = Duration::from_millis(config.watch.debounce_ms.unwrap_or(300));
     let mut pending_watch_paths = Vec::new();
     let mut watch_deadline: Option<Instant> = None;
+    let mut last_ready_extend = Instant::now();
     let mut quitting = false;
+
+    if producers.is_empty() {
+        register_ready(workspace_root, &plan)?;
+        supervisor_registered = true;
+    }
 
     let run_result = (|| -> Result<()> {
         while !quitting
@@ -167,21 +227,94 @@ pub fn run_dev(
                         );
                     }
                 }
-                let runtime = runtimes
-                    .get_mut(&result.service)
-                    .expect("start result service exists");
                 match result.outcome {
-                    StartOutcome::Running(process) => {
-                        runtime.process = Some(process);
-                        set_service_state(
-                            &mut dashboard,
+                    StartOutcome::Running {
+                        mut process,
+                        #[cfg(unix)]
+                        export_endpoint,
+                    } => {
+                        let service = plan
+                            .services
+                            .iter()
+                            .find(|service| service.name == result.service)
+                            .expect("start result service exists");
+                        let current = resolve_exported_environment(service, &producers);
+                        let keep_running = match &current {
+                            ExportResolution::Ready(resolved) => {
+                                resolved.values == result.resolved_exports.values
+                            }
+                            ExportResolution::Pending | ExportResolution::Conflict(_) => false,
+                        };
+                        if !keep_running {
+                            process.terminate(Duration::from_secs(3));
                             #[cfg(unix)]
-                            session.as_ref(),
-                            &result.service,
-                            ServiceState::Running,
-                        );
+                            drop(export_endpoint);
+                            if let ExportResolution::Conflict(message) = current {
+                                emit_system(&system_tx, &result.service, message, true);
+                            }
+                            queue_restart(
+                                &mut pending_starts,
+                                &result.service,
+                                "exported variables changed during start",
+                                &system_tx,
+                                &mut dashboard,
+                            );
+                        } else {
+                            let ExportResolution::Ready(current) = current else {
+                                unreachable!("keep_running requires a ready export resolution");
+                            };
+                            let runtime = runtimes
+                                .get_mut(&result.service)
+                                .expect("start result service exists");
+                            runtime.process = Some(process);
+                            #[cfg(unix)]
+                            {
+                                runtime.export_endpoint = export_endpoint;
+                            }
+                            runtime.applied_exports = result.resolved_exports.values;
+                            runtime.applied_sources = result.resolved_exports.sources;
+                            runtime.applied_epochs = current.epochs;
+                            if let Some(state) = producers.get_mut(&result.service) {
+                                if state.values.is_none() {
+                                    state.waiting_since = Some(Instant::now());
+                                }
+                            }
+                            if !supervisor_registered && producers.contains_key(&result.service) {
+                                extend_ready_deadline(
+                                    workspace_root,
+                                    Duration::from_secs(SNAPSHOT_PROGRESS_SECS),
+                                );
+                                last_ready_extend = Instant::now();
+                            }
+                            set_service_state(
+                                &mut dashboard,
+                                #[cfg(unix)]
+                                session.as_ref(),
+                                &result.service,
+                                ServiceState::Running,
+                            );
+                        }
                     }
                     StartOutcome::Stopped => {
+                        if producers.contains_key(&result.service) {
+                            if !supervisor_registered {
+                                anyhow::bail!(
+                                    "variable exporter '{}' exited before publishing its initial snapshot",
+                                    result.service
+                                );
+                            }
+                            stop_dependent_services(
+                                &result.service,
+                                &plan,
+                                &mut runtimes,
+                                &mut producers,
+                                &mut pending_starts,
+                                &system_tx,
+                                &mut dashboard,
+                                #[cfg(unix)]
+                                session.as_ref(),
+                            );
+                        }
                         set_service_state(
                             &mut dashboard,
                             #[cfg(unix)]
@@ -194,8 +327,226 @@ pub fn run_dev(
                 suppress_until = Instant::now() + Duration::from_millis(700);
                 needs_draw = true;
             }
+
+            #[cfg(unix)]
+            while let Ok(event) = export_rx.try_recv() {
+                match event {
+                    ExportEvent::Snapshot {
+                        producer,
+                        generation,
+                        values,
+                    } => {
+                        let Some(service) = plan
+                            .services
+                            .iter()
+                            .find(|service| service.name == producer)
+                        else {
+                            continue;
+                        };
+                        let Some(runtime) = runtimes.get(&producer) else {
+                            continue;
+                        };
+                        if runtime.generation != generation || runtime.process.is_none() {
+                            continue;
+                        }
+                        let ExportResolution::Ready(current_inputs) =
+                            resolve_exported_environment(service, &producers)
+                        else {
+                            continue;
+                        };
+                        if !applied_exports_are_current(runtime, &current_inputs) {
+                            continue;
+                        }
+                        let Some(state) = producers.get_mut(&producer) else {
+                            continue;
+                        };
+                        if state.generation != generation {
+                            continue;
+                        }
+                        state.epoch = state.epoch.saturating_add(1);
+                        state.values = Some(values);
+                        state.healthy = true;
+                        state.waiting_since = None;
+                        emit_system(
+                            &system_tx,
+                            &producer,
+                            format!("accepted exported variable snapshot epoch {}", state.epoch),
+                            false,
+                        );
+                        for service in &plan.services {
+                            if service.name == producer || !service.dependencies.contains(&producer)
+                            {
+                                continue;
+                            }
+                            match resolve_exported_environment(service, &producers) {
+                                ExportResolution::Ready(resolved)
+                                    if runtimes[&service.name].process.is_some()
+                                        && resolved.values
+                                            == runtimes[&service.name].applied_exports =>
+                                {
+                                    let runtime =
+                                        runtimes.get_mut(&service.name).expect("runtime exists");
+                                    runtime.applied_epochs = resolved.epochs;
+                                    runtime.applied_sources = resolved.sources;
+                                }
+                                ExportResolution::Ready(_)
+                                    if runtimes[&service.name].process.is_some() =>
+                                {
+                                    if service.target.exports_vars() {
+                                        hold_exporter_tree(
+                                            &service.name,
+                                            "effective exported environment changed",
+                                            &plan,
+                                            &mut runtimes,
+                                            &mut producers,
+                                            &mut pending_starts,
+                                            &system_tx,
+                                            &mut dashboard,
+                                            #[cfg(unix)]
+                                            session.as_ref(),
+                                        );
+                                    } else {
+                                        queue_restart(
+                                            &mut pending_starts,
+                                            &service.name,
+                                            "effective exported environment changed",
+                                            &system_tx,
+                                            &mut dashboard,
+                                        );
+                                    }
+                                }
+                                ExportResolution::Ready(_) | ExportResolution::Pending => {}
+                                ExportResolution::Conflict(message) => {
+                                    emit_system(&system_tx, &service.name, message, true);
+                                    if runtimes[&service.name].process.is_some() {
+                                        if service.target.exports_vars() {
+                                            hold_exporter_tree(
+                                                &service.name,
+                                                "exported variable sources conflict",
+                                                &plan,
+                                                &mut runtimes,
+                                                &mut producers,
+                                                &mut pending_starts,
+                                                &system_tx,
+                                                &mut dashboard,
+                                                #[cfg(unix)]
+                                                session.as_ref(),
+                                            );
+                                        } else {
+                                            hold_service(
+                                                &service.name,
+                                                "exported variable sources conflict",
+                                                &mut runtimes,
+                                                &mut producers,
+                                                &mut pending_starts,
+                                                &system_tx,
+                                                &mut dashboard,
+                                                #[cfg(unix)]
+                                                session.as_ref(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ExportEvent::Invalid {
+                        producer,
+                        generation,
+                        reason,
+                    } => {
+                        let Some(state) = producers.get_mut(&producer) else {
+                            continue;
+                        };
+                        if state.generation != generation {
+                            continue;
+                        }
+                        state.epoch = state.epoch.saturating_add(1);
+                        state.healthy = false;
+                        if state.waiting_since.is_none() {
+                            state.waiting_since = Some(Instant::now());
+                        }
+                        emit_system(
+                            &system_tx,
+                            &producer,
+                            format!("rejected exported variable update: {reason}"),
+                            true,
+                        );
+                        stop_dependent_services(
+                            &producer,
+                            &plan,
+                            &mut runtimes,
+                            &mut producers,
+                            &mut pending_starts,
+                            &system_tx,
+                            &mut dashboard,
+                            #[cfg(unix)]
+                            session.as_ref(),
+                        );
+                    }
+                }
+                needs_draw = true;
+            }
+
+            if !supervisor_registered
+                && producers
+                    .values()
+                    .all(|producer| producer.healthy && producer.values.is_some())
+            {
+                register_ready(workspace_root, &plan)?;
+                supervisor_registered = true;
+            }
+
+            if !supervisor_registered {
+                if active_start.is_some() && last_ready_extend.elapsed() >= Duration::from_secs(10)
+                {
+                    extend_ready_deadline(workspace_root, Duration::from_secs(READY_PROGRESS_SECS));
+                    last_ready_extend = Instant::now();
+                }
+                if let Some((name, _)) = producers.iter().find(|(_, producer)| {
+                    producer.waiting_since.is_some_and(|started| {
+                        started.elapsed() >= FIRST_SNAPSHOT_TIMEOUT && !producer.healthy
+                    })
+                }) {
+                    anyhow::bail!(
+                        "variable exporter '{name}' did not become healthy within 20 seconds"
+                    );
+                }
+            }
             if active_start.is_none() {
-                if let Some((name, reason)) = pending_starts.pop_front() {
+                let mut startable = None;
+                for (index, (name, _)) in pending_starts.iter().enumerate() {
+                    let service = plan
+                        .services
+                        .iter()
+                        .find(|service| service.name == *name)
+                        .expect("queued service exists");
+                    if service_is_startable(service, &runtimes, &producers) {
+                        startable = Some(index);
+                        break;
+                    }
+                }
+                if let Some(index) = startable {
+                    let (name, reason) = pending_starts
+                        .remove(index)
+                        .expect("startable queue position exists");
+                    if reason != "initial start"
+                        && producers
+                            .get(&name)
+                            .is_some_and(|producer| producer.values.is_some())
+                    {
+                        stop_dependent_services(
+                            &name,
+                            &plan,
+                            &mut runtimes,
+                            &mut producers,
+                            &mut pending_starts,
+                            &system_tx,
+                            &mut dashboard,
+                            #[cfg(unix)]
+                            session.as_ref(),
+                        );
+                    }
                     let service = plan
                         .services
                         .iter()
@@ -204,6 +555,25 @@ pub fn run_dev(
                     let before_start = options
                         .watch
                         .then(|| suppressed_path_snapshot(&plan, workspace_root, &ignore));
+                    let resolved_exports = match resolve_exported_environment(service, &producers) {
+                        ExportResolution::Ready(resolved) => resolved,
+                        ExportResolution::Conflict(message) => {
+                            emit_system(&system_tx, &name, message, true);
+                            pending_starts.push_front((name, reason));
+                            continue;
+                        }
+                        ExportResolution::Pending => {
+                            pending_starts.push_front((name, reason));
+                            continue;
+                        }
+                    };
+                    if !supervisor_registered {
+                        extend_ready_deadline(
+                            workspace_root,
+                            Duration::from_secs(READY_PROGRESS_SECS),
+                        );
+                        last_ready_extend = Instant::now();
+                    }
                     let handle = begin_start_service(
                         service,
                         workspace_root,
@@ -219,6 +589,10 @@ pub fn run_dev(
                         session.as_ref(),
                         runtimes.get_mut(&name).expect("runtime exists"),
                         &reason,
+                        resolved_exports,
+                        #[cfg(unix)]
+                        export_tx.clone(),
+                        producers.get_mut(&name),
                         start_tx.clone(),
                     );
                     active_start = Some(ActiveStart {
@@ -231,13 +605,17 @@ pub fn run_dev(
             }
 
             for service in &plan.services {
-                let runtime = runtimes.get_mut(&service.name).expect("runtime exists");
-                let exited = runtime
+                let exited = runtimes
+                    .get_mut(&service.name)
+                    .expect("runtime exists")
                     .process
                     .as_mut()
                     .and_then(|process| process.poll().ok().flatten());
                 if let Some(code) = exited {
+                    let runtime = runtimes.get_mut(&service.name).expect("runtime exists");
                     runtime.process.take();
+                    #[cfg(unix)]
+                    runtime.export_endpoint.take();
                     set_service_state(
                         &mut dashboard,
                         #[cfg(unix)]
@@ -251,6 +629,29 @@ pub fn run_dev(
                         format!("process exited with code {code}"),
                         true,
                     );
+                    if let Some(producer) = producers.get_mut(&service.name) {
+                        producer.epoch = producer.epoch.saturating_add(1);
+                        producer.values = None;
+                        producer.healthy = false;
+                        producer.waiting_since = None;
+                        if !supervisor_registered {
+                            anyhow::bail!(
+                                "variable exporter '{}' exited before all variable exporters became ready",
+                                service.name
+                            );
+                        }
+                        stop_dependent_services(
+                            &service.name,
+                            &plan,
+                            &mut runtimes,
+                            &mut producers,
+                            &mut pending_starts,
+                            &system_tx,
+                            &mut dashboard,
+                            #[cfg(unix)]
+                            session.as_ref(),
+                        );
+                    }
                     needs_draw = true;
                 }
             }
@@ -511,11 +912,22 @@ pub fn run_dev(
     }
     let mut shutdown_processes = Vec::new();
     while let Ok(result) = start_rx.try_recv() {
-        if let StartOutcome::Running(process) = result.outcome {
+        if let StartOutcome::Running {
+            process,
+            #[cfg(unix)]
+            export_endpoint,
+        } = result.outcome
+        {
+            #[cfg(unix)]
+            drop(export_endpoint);
             shutdown_processes.push(process);
         }
     }
     for service in plan.services.iter().rev() {
+        #[cfg(unix)]
+        runtimes
+            .get_mut(&service.name)
+            .and_then(|runtime| runtime.export_endpoint.take());
         if let Some(process) = runtimes
             .get_mut(&service.name)
             .and_then(|runtime| runtime.process.take())
@@ -544,6 +956,212 @@ pub fn run_dev(
     drop(control);
     run_result?;
     Ok(())
+}
+
+fn register_ready(workspace_root: &Path, plan: &DevPlan) -> Result<()> {
+    super::daemon::register_supervisor_ready(
+        workspace_root,
+        plan.services
+            .iter()
+            .map(|service| service.name.clone())
+            .collect(),
+        plan.ports
+            .iter()
+            .map(|(name, port)| (name.clone(), *port))
+            .collect(),
+    )?;
+    Ok(())
+}
+
+fn extend_ready_deadline(workspace_root: &Path, extra: Duration) {
+    let _ = super::daemon::register_supervisor_extend_deadline(workspace_root, extra);
+}
+
+fn resolve_exported_environment(
+    service: &ServicePlan,
+    producers: &HashMap<String, ProducerState>,
+) -> ExportResolution {
+    let mut environment = HashMap::new();
+    let mut epochs = HashMap::new();
+    let mut sources = HashMap::<String, String>::new();
+    let mut used_sources = HashSet::new();
+    for dependency in &service.dependencies {
+        let Some(producer) = producers.get(dependency) else {
+            continue;
+        };
+        if !producer.healthy {
+            return ExportResolution::Pending;
+        }
+        let Some(values) = producer.values.as_ref() else {
+            return ExportResolution::Pending;
+        };
+        for name in &service.inherit_env {
+            if service.protected_env.contains(name) {
+                continue;
+            }
+            let Some(value) = values.get(name) else {
+                continue;
+            };
+            if let Some(existing) = sources.insert(name.clone(), dependency.clone()) {
+                return ExportResolution::Conflict(format!(
+                    "service '{}' consumes exported variable '{name}' from both '{existing}' and '{dependency}'",
+                    service.name
+                ));
+            }
+            environment.insert(name.clone(), value.clone());
+            used_sources.insert(dependency.clone());
+        }
+        epochs.insert(dependency.clone(), producer.epoch);
+    }
+
+    ExportResolution::Ready(ResolvedExports {
+        values: environment,
+        epochs,
+        sources: used_sources,
+    })
+}
+
+fn applied_exports_are_current(runtime: &Runtime, resolved: &ResolvedExports) -> bool {
+    runtime.applied_exports == resolved.values
+        && runtime.applied_epochs == resolved.epochs
+        && runtime.applied_sources == resolved.sources
+}
+
+fn service_is_startable(
+    service: &ServicePlan,
+    runtimes: &HashMap<String, Runtime>,
+    producers: &HashMap<String, ProducerState>,
+) -> bool {
+    if service.dependencies.iter().any(|dependency| {
+        runtimes
+            .get(dependency)
+            .is_none_or(|runtime| runtime.process.is_none())
+    }) {
+        return false;
+    }
+    matches!(
+        resolve_exported_environment(service, producers),
+        ExportResolution::Ready(_)
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hold_service(
+    name: &str,
+    reason: &str,
+    runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
+    pending: &mut VecDeque<(String, String)>,
+    system_tx: &std::sync::mpsc::Sender<LogEvent>,
+    dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
+) {
+    let runtime = runtimes.get_mut(name).expect("runtime exists");
+    if let Some(producer) = producers.get_mut(name) {
+        runtime.generation = runtime.generation.saturating_add(1);
+        producer.generation = runtime.generation;
+        producer.epoch = producer.epoch.saturating_add(1);
+        producer.values = None;
+        producer.healthy = false;
+        producer.waiting_since = None;
+    }
+    #[cfg(unix)]
+    runtime.export_endpoint.take();
+    if let Some(mut process) = runtime.process.take() {
+        process.terminate(Duration::from_secs(3));
+    }
+    runtime.applied_exports.clear();
+    runtime.applied_epochs.clear();
+    runtime.applied_sources.clear();
+    set_service_state(
+        dashboard,
+        #[cfg(unix)]
+        session,
+        name,
+        ServiceState::Restarting,
+    );
+    queue_restart(pending, name, reason, system_tx, dashboard);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hold_exporter_tree(
+    name: &str,
+    reason: &str,
+    plan: &DevPlan,
+    runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
+    pending: &mut VecDeque<(String, String)>,
+    system_tx: &std::sync::mpsc::Sender<LogEvent>,
+    dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
+) {
+    stop_dependent_services(
+        name,
+        plan,
+        runtimes,
+        producers,
+        pending,
+        system_tx,
+        dashboard,
+        #[cfg(unix)]
+        session,
+    );
+    hold_service(
+        name,
+        reason,
+        runtimes,
+        producers,
+        pending,
+        system_tx,
+        dashboard,
+        #[cfg(unix)]
+        session,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stop_dependent_services(
+    producer: &str,
+    plan: &DevPlan,
+    runtimes: &mut HashMap<String, Runtime>,
+    producers: &mut HashMap<String, ProducerState>,
+    pending: &mut VecDeque<(String, String)>,
+    system_tx: &std::sync::mpsc::Sender<LogEvent>,
+    dashboard: &mut Dashboard,
+    #[cfg(unix)] session: Option<&SessionServer>,
+) {
+    let mut affected = HashSet::new();
+    let mut frontier = vec![producer.to_string()];
+    while let Some(current) = frontier.pop() {
+        for service in &plan.services {
+            if affected.contains(&service.name)
+                || !runtimes[&service.name].applied_sources.contains(&current)
+            {
+                continue;
+            }
+            affected.insert(service.name.clone());
+            if service.target.exports_vars() {
+                frontier.push(service.name.clone());
+            }
+        }
+    }
+
+    for service in plan.services.iter().rev() {
+        if !affected.contains(&service.name) {
+            continue;
+        }
+        hold_service(
+            &service.name,
+            "required exported variables unavailable",
+            runtimes,
+            producers,
+            pending,
+            system_tx,
+            dashboard,
+            #[cfg(unix)]
+            session,
+        );
+    }
 }
 
 fn set_service_state(
@@ -665,10 +1283,24 @@ fn begin_start_service(
     #[cfg(unix)] session: Option<&SessionServer>,
     runtime: &mut Runtime,
     reason: &str,
+    resolved_exports: ResolvedExports,
+    #[cfg(unix)] export_tx: std::sync::mpsc::Sender<ExportEvent>,
+    producer_state: Option<&mut ProducerState>,
     result_tx: std::sync::mpsc::Sender<StartResult>,
 ) -> std::thread::JoinHandle<()> {
+    #[cfg(unix)]
+    runtime.export_endpoint.take();
     if let Some(mut process) = runtime.process.take() {
         process.terminate(Duration::from_secs(3));
+    }
+    runtime.generation = runtime.generation.saturating_add(1);
+    let generation = runtime.generation;
+    if let Some(producer) = producer_state {
+        producer.generation = generation;
+        producer.epoch = producer.epoch.saturating_add(1);
+        producer.values = None;
+        producer.healthy = false;
+        producer.waiting_since = None;
     }
     let state = if reason == "initial start" {
         ServiceState::Starting
@@ -707,7 +1339,8 @@ fn begin_start_service(
     let target_address = service.target_address.clone();
     let target = service.target.clone();
     let project_root = service.project_root.clone();
-    let env = service.env.clone();
+    let mut env = service.env.clone();
+    env.extend(resolved_exports.values.clone());
     let workspace_root = workspace_root.to_path_buf();
     let log_tx = log_tx.clone();
     let system_tx = system_tx.clone();
@@ -735,6 +1368,7 @@ fn begin_start_service(
             let _ = result_tx.send(StartResult {
                 service: service_name,
                 outcome: StartOutcome::Stopped,
+                resolved_exports,
             });
             return;
         }
@@ -748,6 +1382,7 @@ fn begin_start_service(
             let _ = result_tx.send(StartResult {
                 service: service_name,
                 outcome: StartOutcome::Stopped,
+                resolved_exports,
             });
             return;
         }
@@ -757,6 +1392,34 @@ fn begin_start_service(
             format!("starting {target_address}"),
             false,
         );
+        #[cfg(unix)]
+        let export_endpoint = if target.exports_vars() {
+            match ExportEndpoint::create(&service_name, generation, export_tx) {
+                Ok(endpoint) => {
+                    env.insert(
+                        EXPORT_PATH_ENV.to_string(),
+                        endpoint.path().to_string_lossy().into_owned(),
+                    );
+                    Some(endpoint)
+                }
+                Err(error) => {
+                    emit_system(
+                        &system_tx,
+                        &service_name,
+                        format!("failed to create variable export endpoint: {error:#}"),
+                        true,
+                    );
+                    let _ = result_tx.send(StartResult {
+                        service: service_name,
+                        outcome: StartOutcome::Stopped,
+                        resolved_exports,
+                    });
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let outcome = match ServiceProcess::spawn(
             &service_name,
             &target,
@@ -764,7 +1427,11 @@ fn begin_start_service(
             &env,
             ProcessLogSenders::new(log_tx, system_tx.clone(), durable_log_tx, ui),
         ) {
-            Ok(process) => StartOutcome::Running(process),
+            Ok(process) => StartOutcome::Running {
+                process,
+                #[cfg(unix)]
+                export_endpoint,
+            },
             Err(error) => {
                 emit_system(
                     &system_tx,
@@ -778,6 +1445,7 @@ fn begin_start_service(
         let _ = result_tx.send(StartResult {
             service: service_name,
             outcome,
+            resolved_exports,
         });
     })
 }
@@ -1047,6 +1715,102 @@ fn is_meaningful_event(kind: &notify::EventKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn export_consumer(dependencies: &[&str], inherit: &[&str], protected: &[&str]) -> ServicePlan {
+        ServicePlan {
+            name: "consumer".to_string(),
+            target_address: "//consumer:dev".to_string(),
+            target: crate::plugins::Target::default(),
+            project_root: PathBuf::new(),
+            port: None,
+            open_url: None,
+            env: HashMap::new(),
+            dependencies: dependencies
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            inherit_env: inherit.iter().map(|value| (*value).to_string()).collect(),
+            protected_env: protected.iter().map(|value| (*value).to_string()).collect(),
+            watch: crate::watch::WatchPlan::empty(),
+        }
+    }
+
+    fn ready_producer(epoch: u64, values: &[(&str, &str)]) -> ProducerState {
+        ProducerState {
+            generation: 1,
+            epoch,
+            values: Some(
+                values
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+            ),
+            healthy: true,
+            waiting_since: None,
+        }
+    }
+
+    #[test]
+    fn exported_environment_applies_allowlist_and_precedence() {
+        let service = export_consumer(&["producer"], &["TOKEN", "PRIVATE"], &["TOKEN"]);
+        let producers = HashMap::from([(
+            "producer".to_string(),
+            ready_producer(4, &[("TOKEN", "masked"), ("PRIVATE", "selected")]),
+        )]);
+
+        let ExportResolution::Ready(resolved) = resolve_exported_environment(&service, &producers)
+        else {
+            panic!("expected a ready exported environment");
+        };
+        assert_eq!(
+            resolved.values,
+            HashMap::from([("PRIVATE".to_string(), "selected".to_string())])
+        );
+        assert_eq!(resolved.epochs["producer"], 4);
+        assert_eq!(resolved.sources, HashSet::from(["producer".to_string()]));
+    }
+
+    #[test]
+    fn exported_environment_waits_for_health_and_rejects_collisions() {
+        let service = export_consumer(&["first", "second"], &["TOKEN"], &[]);
+        let mut producers = HashMap::from([
+            ("first".to_string(), ready_producer(1, &[("TOKEN", "one")])),
+            ("second".to_string(), ready_producer(1, &[("TOKEN", "two")])),
+        ]);
+        let ExportResolution::Conflict(error) = resolve_exported_environment(&service, &producers)
+        else {
+            panic!("expected a colliding exported environment");
+        };
+        assert!(error.contains("from both 'first' and 'second'"));
+
+        producers.get_mut("second").unwrap().healthy = false;
+        assert!(matches!(
+            resolve_exported_environment(&service, &producers),
+            ExportResolution::Pending
+        ));
+    }
+
+    #[test]
+    fn applied_export_epochs_fence_stale_nested_exporters() {
+        let runtime = Runtime {
+            process: None,
+            #[cfg(unix)]
+            export_endpoint: None,
+            generation: 1,
+            applied_exports: HashMap::from([("TOKEN".to_string(), "one".to_string())]),
+            applied_epochs: HashMap::from([("producer".to_string(), 3)]),
+            applied_sources: HashSet::from(["producer".to_string()]),
+        };
+        let mut resolved = ResolvedExports {
+            values: runtime.applied_exports.clone(),
+            epochs: runtime.applied_epochs.clone(),
+            sources: runtime.applied_sources.clone(),
+        };
+        assert!(applied_exports_are_current(&runtime, &resolved));
+
+        resolved.epochs.insert("producer".to_string(), 4);
+        assert!(!applied_exports_are_current(&runtime, &resolved));
+    }
 
     #[test]
     fn delayed_generated_event_is_ignored_but_changed_identity_restarts() {

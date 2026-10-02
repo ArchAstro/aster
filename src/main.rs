@@ -27,7 +27,7 @@ use aster::git::{
     AffectedIgnore,
 };
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
-use aster::plugins::{PluginRegistry, Target, TargetCapability};
+use aster::plugins::{exporter_requires_services_up, PluginRegistry, Target, TargetCapability};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet};
@@ -675,6 +675,8 @@ fn run() -> Result<()> {
                 .filter(|p| lang.is_empty() || p.has_any_language(&lang))
                 .collect();
 
+            reject_exporters_from_execution(&target, &affected_projects, &projects, true)?;
+
             if affected_projects.is_empty() {
                 if output_mode == OutputMode::Json {
                     let output = build_execution_output(&[]);
@@ -950,9 +952,16 @@ fn run() -> Result<()> {
                     &all_project_refs,
                     &command_overrides,
                     Some(&effective_primary_addrs),
+                    true,
                 )
             } else {
-                executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
+                executor.execute(
+                    &target,
+                    &all_project_refs,
+                    &graph,
+                    Some(&primary_addrs),
+                    true,
+                )
             };
 
             // Output results based on mode
@@ -1036,6 +1045,13 @@ fn run() -> Result<()> {
 
             let primary_targets: std::collections::HashSet<String> =
                 filtered_targets.into_iter().collect();
+            let mut closure = primary_targets.clone();
+            if !no_deps {
+                for address in &primary_targets {
+                    collect_target_deps(address, &project_map, &mut closure);
+                }
+            }
+            reject_exporter_addresses(&closure, &projects)?;
             let all_project_refs: Vec<_> = projects.iter().collect();
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
@@ -1254,6 +1270,12 @@ fn run() -> Result<()> {
             // Select initial projects
             let initial = select_projects(&run_args, &graph, &projects, &cwd, &workspace_root)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            reject_exporters_from_execution(
+                &run_args.target,
+                &initial,
+                &projects,
+                !run_args.no_deps,
+            )?;
 
             // Build set of primary projects (originally selected, before expansion)
             // Only these will run the requested target; dependency projects are included
@@ -1363,6 +1385,7 @@ fn run() -> Result<()> {
                     &executor_projects,
                     &command_overrides,
                     Some(&primary_projects),
+                    !run_args.no_deps,
                 )
             } else {
                 // Pass ALL projects so executor can resolve target-level dependencies
@@ -1379,6 +1402,7 @@ fn run() -> Result<()> {
                     &executor_projects,
                     &graph,
                     Some(&primary_projects),
+                    !run_args.no_deps,
                 )
             };
 
@@ -1507,6 +1531,54 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn exporter_addresses(projects: &[DiscoveredProject]) -> HashSet<String> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .targets
+                .iter()
+                .filter(|(_, target)| target.exports_vars())
+                .map(move |(name, _)| format!("//{}:{name}", project.relative_path.display()))
+        })
+        .collect()
+}
+
+fn reject_exporter_addresses<'a, I>(addresses: I, projects: &[DiscoveredProject]) -> Result<()>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let exporters = exporter_addresses(projects);
+    if let Some(exporter) = addresses
+        .into_iter()
+        .find(|address| exporters.contains(*address))
+    {
+        anyhow::bail!("{}", exporter_requires_services_up(exporter));
+    }
+    Ok(())
+}
+
+fn reject_exporters_from_execution(
+    target_name: &str,
+    primary_projects: &[&DiscoveredProject],
+    projects: &[DiscoveredProject],
+    expand_deps: bool,
+) -> Result<()> {
+    let project_map = projects
+        .iter()
+        .map(|project| (format!("//{}", project.relative_path.display()), project))
+        .collect::<HashMap<_, _>>();
+    for project in primary_projects {
+        let address = format!("//{}:{target_name}", project.relative_path.display());
+        let mut closure = HashSet::from([address.clone()]);
+        if expand_deps {
+            collect_target_deps(&address, &project_map, &mut closure);
+        }
+        reject_exporter_addresses(&closure, projects)?;
+    }
+    Ok(())
+}
+
 /// Handle the `watch` command.
 #[allow(clippy::too_many_arguments)]
 fn handle_watch(
@@ -1582,6 +1654,12 @@ fn handle_watch(
     let registry = PluginRegistry::with_all_plugins();
 
     let plan = WatchPlan::build(&resolved, &projects, &graph, &registry)?;
+    let planned = plan
+        .targets
+        .iter()
+        .map(|target| target.address.clone())
+        .collect::<HashSet<_>>();
+    reject_exporter_addresses(&planned, &projects)?;
 
     let workspace_config = WorkspaceConfig::load(workspace_root)?;
     let ignore = WorkspaceIgnore::build(&workspace_config.watch)?;

@@ -3,9 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-pub const PROTOCOL_VERSION: u16 = 4;
-const PREVIOUS_PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 5;
+const PREVIOUS_PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_GROUP: &str = "__aster_default__";
 const SERVE_ENV: &str = "ASTER_INTERNAL_DAEMON_SERVE";
 const READY_SOCKET_ENV: &str = "ASTER_INTERNAL_DAEMON_READY_SOCKET";
@@ -240,7 +241,9 @@ mod platform {
     const PID_NAME: &str = "daemon.pid";
     const LOG_NAME: &str = "daemon.log";
     const READY_NAME: &str = "ready.sock";
-    const START_TIMEOUT: Duration = Duration::from_secs(20);
+    // Initial bound until the supervisor can extend the deadline as it starts
+    // exporters. Each generation refreshes this window; see runner.rs.
+    const START_TIMEOUT: Duration = Duration::from_secs(25);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const IDLE_GRACE: Duration = Duration::from_millis(500);
     const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -271,6 +274,14 @@ mod platform {
         services: Vec<String>,
         ports: BTreeMap<String, u16>,
         attach_socket: Option<PathBuf>,
+        #[serde(default = "ready_record_default")]
+        ready: bool,
+        #[serde(default)]
+        extend_deadline_secs: Option<u64>,
+    }
+
+    fn ready_record_default() -> bool {
+        true
     }
 
     pub(super) fn is_serve_invocation() -> bool {
@@ -419,14 +430,19 @@ mod platform {
         Ok(stopped)
     }
 
-    pub(super) fn register_ready(
-        workspace: &Path,
-        services: Vec<String>,
-        ports: BTreeMap<String, u16>,
-    ) -> DaemonResult<()> {
+    fn send_ready_record(record: serde_json::Value) -> DaemonResult<()> {
         let Some(socket) = std::env::var_os(READY_SOCKET_ENV) else {
             return Ok(());
         };
+        let datagram =
+            UnixDatagram::unbound().map_err(internal("failed to create readiness channel"))?;
+        datagram
+            .send_to(record.to_string().as_bytes(), socket)
+            .map_err(internal("failed to register supervisor readiness"))?;
+        Ok(())
+    }
+
+    fn ready_identity(workspace: &Path) -> DaemonResult<(String, String, Option<String>, PathBuf)> {
         let bundle_id = std::env::var(READY_ID_ENV).map_err(|_| {
             daemon_error(DaemonErrorCode::InvalidRequest, "missing daemon bundle id")
         })?;
@@ -436,19 +452,38 @@ mod platform {
             .ok()
             .filter(|value| !value.is_empty());
         let workspace = canonical_directory(workspace, "workspace")?;
+        Ok((bundle_id, group, display_group, workspace))
+    }
+
+    pub(super) fn register_ready(
+        workspace: &Path,
+        services: Vec<String>,
+        ports: BTreeMap<String, u16>,
+    ) -> DaemonResult<()> {
+        if std::env::var_os(READY_SOCKET_ENV).is_none() {
+            return Ok(());
+        }
+        let (bundle_id, group, display_group, workspace) = ready_identity(workspace)?;
         let attach_socket =
             std::env::var_os(super::super::session::ATTACH_SOCKET_ENV).map(PathBuf::from);
-        let record = serde_json::json!({
+        send_ready_record(serde_json::json!({
             "version": PROTOCOL_VERSION, "bundle_id": bundle_id, "workspace": workspace,
             "group": group, "display_group": display_group, "supervisor_pid": std::process::id(),
             "services": services, "ports": ports, "attach_socket": attach_socket,
-        });
-        let datagram =
-            UnixDatagram::unbound().map_err(internal("failed to create readiness channel"))?;
-        datagram
-            .send_to(record.to_string().as_bytes(), socket)
-            .map_err(internal("failed to register supervisor readiness"))?;
-        Ok(())
+        }))
+    }
+
+    pub(super) fn extend_ready_deadline(workspace: &Path, extra: Duration) -> DaemonResult<()> {
+        if std::env::var_os(READY_SOCKET_ENV).is_none() {
+            return Ok(());
+        }
+        let (bundle_id, group, display_group, workspace) = ready_identity(workspace)?;
+        send_ready_record(serde_json::json!({
+            "version": PROTOCOL_VERSION, "bundle_id": bundle_id, "workspace": workspace,
+            "group": group, "display_group": display_group, "supervisor_pid": std::process::id(),
+            "services": [], "ports": {}, "attach_socket": Option::<PathBuf>::None,
+            "ready": false, "extend_deadline_secs": extra.as_secs(),
+        }))
     }
 
     pub(super) struct RuntimePaths {
@@ -1097,6 +1132,14 @@ mod platform {
             {
                 continue;
             }
+            if !record.ready {
+                if let Some(seconds) = record.extend_deadline_secs {
+                    if bundle.descriptor.state == BundleState::Starting {
+                        bundle.ready_deadline = Instant::now() + Duration::from_secs(seconds);
+                    }
+                }
+                continue;
+            }
             bundle.descriptor.state = BundleState::Running;
             bundle.descriptor.services = record.services;
             bundle.descriptor.ports = record.ports;
@@ -1336,6 +1379,7 @@ mod platform {
 #[cfg(not(unix))]
 mod platform {
     use super::*;
+    use std::time::Duration;
     fn unsupported<T>() -> DaemonResult<T> {
         Err(daemon_error(
             DaemonErrorCode::UnsupportedPlatform,
@@ -1371,6 +1415,9 @@ mod platform {
         _: Vec<String>,
         _: BTreeMap<String, u16>,
     ) -> DaemonResult<()> {
+        Ok(())
+    }
+    pub(super) fn extend_ready_deadline(_: &Path, _: Duration) -> DaemonResult<()> {
         Ok(())
     }
 }
@@ -1412,6 +1459,10 @@ pub fn register_supervisor_ready(
     ports: BTreeMap<String, u16>,
 ) -> DaemonResult<()> {
     platform::register_ready(workspace, services, ports)
+}
+
+pub fn register_supervisor_extend_deadline(workspace: &Path, extra: Duration) -> DaemonResult<()> {
+    platform::extend_ready_deadline(workspace, extra)
 }
 
 fn protocol_mismatch() -> DaemonError {

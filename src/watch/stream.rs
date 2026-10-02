@@ -106,6 +106,9 @@ impl StreamSupervisor {
         if self.children.contains_key(target_addr) {
             return Err(anyhow!("{target_addr} already running"));
         }
+        if target.exports_vars() {
+            anyhow::bail!(crate::plugins::exporter_requires_services_up(target_addr));
+        }
 
         let child = spawn_child(target, project_root)
             .with_context(|| format!("failed to spawn {target_addr}"))?;
@@ -218,6 +221,7 @@ fn spawn_child(target: &Target, project_root: &Path) -> Result<StreamChild> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::TargetCapability;
     use std::path::PathBuf;
 
     fn mk_target(cmd: &str) -> Target {
@@ -229,6 +233,20 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn spawn_rejects_variable_exporters() {
+        let dir = tempdir();
+        let mut sup = StreamSupervisor::new(Duration::from_secs(1));
+        let mut target = mk_target("sleep 5");
+        target.capabilities.insert(TargetCapability::ExportsVars);
+        let error = sup
+            .spawn("//a:dev", &target, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aster services up"));
+        assert!(!sup.is_running("//a:dev"));
     }
 
     #[test]

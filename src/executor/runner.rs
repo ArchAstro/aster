@@ -149,8 +149,9 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         _graph: &ProjectGraph,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, None, primary_projects)
+        self.execute_internal(target, projects, None, primary_projects, expand_deps)
     }
 
     /// Execute a target with command overrides for specific targets
@@ -163,8 +164,15 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         command_overrides: &HashMap<String, String>,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, Some(command_overrides), primary_projects)
+        self.execute_internal(
+            target,
+            projects,
+            Some(command_overrides),
+            primary_projects,
+            expand_deps,
+        )
     }
 
     /// Execute a target with streaming output (for long-running processes like dev servers)
@@ -187,6 +195,9 @@ impl<'a> Executor<'a> {
                 return Err(format!("No '{target}' target defined for {project_addr}"));
             }
         };
+        if target_def.exports_vars() {
+            return Err(crate::plugins::exporter_requires_services_up(&target_addr));
+        }
         let command = &target_def.command;
 
         // Use target's working_dir if set, otherwise use project root
@@ -282,6 +293,7 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         command_overrides: Option<&HashMap<String, String>>,
         primary_projects: Option<&HashSet<String>>,
+        expand_deps: bool,
     ) -> Vec<ExecutionResult> {
         if projects.is_empty() {
             return Vec::new();
@@ -312,8 +324,9 @@ impl<'a> Executor<'a> {
                 // Add the requested target
                 targets_to_run.insert(target_addr.clone());
 
-                // Recursively collect target dependencies
-                collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+                if expand_deps {
+                    collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
+                }
             }
         }
 
@@ -331,6 +344,25 @@ impl<'a> Executor<'a> {
     ) -> Vec<ExecutionResult> {
         if targets_to_run.is_empty() {
             return Vec::new();
+        }
+
+        if let Some(address) = targets_to_run.iter().find(|address| {
+            parse_target_address(address)
+                .and_then(|(project_addr, target_name)| {
+                    project_map
+                        .get(&project_addr)
+                        .and_then(|project| project.targets.get(&target_name))
+                })
+                .is_some_and(|target| target.exports_vars())
+        }) {
+            return vec![ExecutionResult {
+                address: address.clone(),
+                success: false,
+                skipped: false,
+                cached: false,
+                output: crate::plugins::exporter_requires_services_up(address),
+                duration_ms: 0,
+            }];
         }
 
         if self.output_mode != OutputMode::Json {
