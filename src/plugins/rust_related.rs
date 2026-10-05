@@ -276,7 +276,14 @@ enum Item {
     },
     MacroDef(String),
     MacroUse(String),
-    Str(String),
+    /// A function marked `#[test]` (or `#[tokio::test]` …).
+    TestFn {
+        inline: Vec<String>,
+        name: String,
+    },
+    /// A string literal, and whether it is the first argument of a
+    /// path-taking call such as `.join("x")` or `read_dir("x")`.
+    Str(String, bool),
 }
 
 fn is_tok(tok: Option<&Tok>, expected: &Tok) -> bool {
@@ -361,7 +368,27 @@ fn impl_self_range(toks: &[Tok], start: usize) -> Option<(usize, usize)> {
     let mut i = start + 1;
     let mut depth = 0i32;
     let mut self_start = i;
+    let mut trait_start = i;
+    let mut generics_end = start + 1;
+    let mut for_at: Option<usize> = None;
     let mut generics_done = false;
+    // `impl<T: Bound> Trait for T` implements the trait for every type, so
+    // the trait path stands in for the self type.
+    let range = |self_start: usize,
+                 end: usize,
+                 for_at: Option<usize>,
+                 trait_start: usize,
+                 generics_end: usize| {
+        let blanket = for_at.is_some()
+            && end == self_start + 1
+            && matches!(&toks[self_start], Tok::Ident(param)
+                if toks[start + 1..generics_end].contains(&Tok::Ident(param.clone())));
+        if blanket {
+            (trait_start, end)
+        } else {
+            (self_start, end)
+        }
+    };
     while i < toks.len() {
         match &toks[i] {
             Tok::Punct('<') => depth += 1,
@@ -371,16 +398,23 @@ fn impl_self_range(toks: &[Tok], start: usize) -> Option<(usize, usize)> {
                 depth -= 1;
                 if depth == 0 && !generics_done {
                     generics_done = true;
+                    generics_end = i;
                     self_start = i + 1;
+                    trait_start = i + 1;
                 }
             }
             Tok::Ident(kw)
                 if depth == 0 && kw == "for" && !is_tok(toks.get(i + 1), &Tok::Punct('<')) =>
             {
                 self_start = i + 1;
+                for_at = Some(i);
             }
-            Tok::Ident(kw) if depth == 0 && kw == "where" => return Some((self_start, i)),
-            Tok::Punct('{' | ';') if depth == 0 => return Some((self_start, i)),
+            Tok::Ident(kw) if depth == 0 && kw == "where" => {
+                return Some(range(self_start, i, for_at, trait_start, generics_end))
+            }
+            Tok::Punct('{' | ';') if depth == 0 => {
+                return Some(range(self_start, i, for_at, trait_start, generics_end))
+            }
             _ => {}
         }
         if i == start + 1 && !matches!(toks[i], Tok::Punct('<')) {
@@ -391,6 +425,51 @@ fn impl_self_range(toks: &[Tok], start: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Whether the attribute opening at `open` (`[`) is a test attribute such
+/// as `#[test]` or `#[tokio::test(flavor = "multi_thread")]`.
+fn is_test_attr(toks: &[Tok], open: usize) -> bool {
+    let mut depth = 0usize;
+    for (offset, tok) in toks[open..].iter().enumerate() {
+        match tok {
+            Tok::Punct('[') => depth += 1,
+            Tok::Punct(']') => {
+                depth -= 1;
+                if depth == 0 {
+                    return false;
+                }
+            }
+            Tok::Ident(id) if id == "test" && depth == 1 => {
+                let i = open + offset;
+                let before_ok = matches!(toks[i - 1], Tok::Punct('[') | Tok::PathSep);
+                let after_ok = matches!(toks.get(i + 1), Some(Tok::Punct(']' | '(')));
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Calls whose string argument is a path: a bare name there names a file or
+/// directory.
+const PATH_CALLS: &[&str] = &[
+    "join",
+    "push",
+    "read_dir",
+    "read_to_string",
+    "read",
+    "open",
+    "exists",
+    "is_dir",
+    "is_file",
+    "with_file_name",
+    "include_str",
+    "include_bytes",
+    "include",
+];
+
 /// Extract the module-relevant items from a token stream.
 fn extract(toks: &[Tok]) -> Vec<Item> {
     let mut items = Vec::new();
@@ -399,13 +478,24 @@ fn extract(toks: &[Tok]) -> Vec<Item> {
     let mut pending_inline: Option<String> = None;
     let mut pending_path_attr: Option<String> = None;
     let mut impl_range: Option<(usize, usize)> = None;
+    let mut pending_test = false;
     let mut i = 0;
     let inline_names =
         |inline: &[(String, usize)]| inline.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
 
     while i < toks.len() {
         match &toks[i] {
-            Tok::Str(s) => items.push(Item::Str(s.clone())),
+            Tok::Str(s) => {
+                let path_arg = i >= 2
+                    && is_tok(toks.get(i - 1), &Tok::Punct('('))
+                    && matches!(&toks[i - 2], Tok::Ident(f) if PATH_CALLS.contains(&f.as_str()));
+                items.push(Item::Str(s.clone(), path_arg));
+            }
+            Tok::Punct('#')
+                if is_tok(toks.get(i + 1), &Tok::Punct('[')) && is_test_attr(toks, i + 1) =>
+            {
+                pending_test = true;
+            }
             Tok::Punct('#') => {
                 // #[path = "..."]
                 if let (
@@ -423,7 +513,7 @@ fn extract(toks: &[Tok]) -> Vec<Item> {
                 ) {
                     if attr == "path" {
                         pending_path_attr = Some(value.clone());
-                        items.push(Item::Str(value.clone()));
+                        items.push(Item::Str(value.clone(), true));
                         i += 6;
                         continue;
                     }
@@ -466,6 +556,15 @@ fn extract(toks: &[Tok]) -> Vec<Item> {
                             }
                             _ => {}
                         }
+                    }
+                }
+                if id == "fn" && pending_test {
+                    pending_test = false;
+                    if let Some(Tok::Ident(name)) = toks.get(i + 1) {
+                        items.push(Item::TestFn {
+                            inline: inline_names(&inline),
+                            name: name.clone(),
+                        });
                     }
                 }
                 if id == "impl" && !after_sep_or_dot {
@@ -587,6 +686,8 @@ struct Package {
     items: HashMap<PathBuf, Vec<Item>>,
     /// Owners of every source file.
     owners: HashMap<PathBuf, BTreeSet<Owner>>,
+    /// Targets whose root file could not be read.
+    missing_roots: Vec<String>,
 }
 
 impl Package {
@@ -620,6 +721,7 @@ impl Package {
             others: Vec::new(),
             items: HashMap::new(),
             owners: HashMap::new(),
+            missing_roots: Vec::new(),
         };
 
         let lib_root = pkg
@@ -640,6 +742,11 @@ impl Package {
         for (owner, root) in pkg.target_roots() {
             let target = pkg.walk_target(owner, &root);
             pkg.others.push(target);
+        }
+        for target in pkg.lib.iter().chain(&pkg.others) {
+            if target.files.is_empty() {
+                pkg.missing_roots.push(target.owner.to_string());
+            }
         }
         Ok(pkg)
     }
@@ -672,17 +779,30 @@ impl Package {
                 let Some(name) = entry.get("name").and_then(Value::as_str) else {
                     continue;
                 };
-                let default_path = match kind {
-                    None => format!("src/bin/{name}.rs"),
-                    Some(AuxKind::Test) => format!("tests/{name}.rs"),
-                    Some(AuxKind::Bench) => format!("benches/{name}.rs"),
-                    Some(AuxKind::Example) => format!("examples/{name}.rs"),
+                // Cargo's inference for a target without `path`.
+                let dir = match kind {
+                    None => "src/bin",
+                    Some(AuxKind::Test) => "tests",
+                    Some(AuxKind::Bench) => "benches",
+                    Some(AuxKind::Example) => "examples",
                 };
+                let mut candidates = Vec::new();
+                if kind.is_none() && name == self.name {
+                    candidates.push(PathBuf::from("src/main.rs"));
+                }
+                candidates.push(PathBuf::from(format!("{dir}/{name}.rs")));
+                candidates.push(PathBuf::from(format!("{dir}/{name}/main.rs")));
                 let path = entry
                     .get("path")
                     .and_then(Value::as_str)
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(default_path));
+                    .unwrap_or_else(|| {
+                        candidates
+                            .iter()
+                            .find(|c| self.dir.join(c).is_file())
+                            .cloned()
+                            .unwrap_or_else(|| candidates[0].clone())
+                    });
                 let owner = match kind {
                     None => Owner::Bin(name.to_string()),
                     Some(kind) => Owner::Aux(kind, name.to_string()),
@@ -1349,6 +1469,21 @@ const TARGET_FLAGS: &[&str] = &[
     "--bench",
     "--doc",
 ];
+/// `cargo test` options whose value is a separate argument.
+const CARGO_VALUE_FLAGS: &[&str] = &[
+    "--features",
+    "-F",
+    "--profile",
+    "--target",
+    "--target-dir",
+    "-j",
+    "--jobs",
+    "--color",
+    "--message-format",
+    "--config",
+    "-Z",
+    "--lockfile-path",
+];
 const LIBTEST_VALUE_FLAGS: &[&str] = &[
     "--test-threads",
     "--skip",
@@ -1434,7 +1569,15 @@ impl CargoTest {
                 f if TARGET_FLAGS.contains(&f) => {
                     return Err(format!("the command already selects test targets ({f})"));
                 }
-                _ => common.push(part),
+                _ => {
+                    let takes_value = common
+                        .last()
+                        .is_some_and(|p: &String| CARGO_VALUE_FLAGS.contains(&p.as_str()));
+                    if !part.starts_with('-') && !takes_value {
+                        return Err("the command already filters tests by name".into());
+                    }
+                    common.push(part);
+                }
             }
         }
         let mut previous: Option<&str> = None;
@@ -1531,6 +1674,12 @@ impl Selector<'_> {
             Ok(in_scope) => in_scope,
             Err(reason) => return full(vec![format!("full run: {reason}")]),
         };
+        if !self.package.missing_roots.is_empty() {
+            return full(vec![format!(
+                "full run: cannot find the root file of {}",
+                self.package.missing_roots.join(", ")
+            )]);
+        }
         let touched = self.classify(files);
         if let Some(reason) = touched.full_reason {
             self.explanation.push(format!("full run: {reason}"));
@@ -1629,40 +1778,44 @@ impl Selector<'_> {
                     related_modules.iter().map(|m| module_name(m)),
                 );
             }
-            if related.contains(&Vec::new()) {
-                self.explanation.push(
-                    "the crate root is related; its own unit tests run only when src/lib.rs changes"
-                        .to_string(),
-                );
-            }
             let pkg = ["-p".to_string(), root.clone()];
             if !filters.is_empty() {
                 let mut selection = pkg.to_vec();
                 selection.push("--lib".to_string());
                 commands.push(self.cargo.render(&selection, &filters));
-                if self.cargo.all_targets {
-                    self.explanation.push(
-                        "doctests: not run (the original command uses --all-targets, which excludes them)"
-                            .to_string(),
-                    );
-                } else {
-                    let mut doc_filters = filters.clone();
-                    if let Some(lib) = &self.package.lib {
-                        for (file, module) in &lib.files {
-                            if related.contains(module) && !module.is_empty() {
-                                doc_filters.push(file.to_string_lossy().replace('\\', "/"));
-                            }
-                        }
-                    }
-                    let mut selection = pkg.to_vec();
-                    selection.push("--doc".to_string());
-                    commands.push(self.cargo.render(&selection, &doc_filters));
+            }
+            // Tests in the crate root have no module prefix to filter on, so
+            // they run by exact name whenever any library module is related.
+            let root_tests = self.root_test_names();
+            if !related.is_empty() && !root_tests.is_empty() {
+                self.explain_list(
+                    &format!("crate root tests ({})", root_tests.len()),
+                    root_tests.iter().cloned(),
+                );
+                let mut selection = pkg.to_vec();
+                selection.push("--lib".to_string());
+                let mut filters = vec!["--exact".to_string()];
+                filters.extend(root_tests);
+                commands.push(self.cargo.render(&selection, &filters));
+            }
+            if related.is_empty() {
+                if self.package.lib.is_some() {
                     self.explanation
-                        .push("doctests: filtered to the related modules".to_string());
+                        .push("library unit tests and doctests: none related".to_string());
                 }
-            } else if self.package.lib.is_some() {
+            } else if self.cargo.all_targets {
+                self.explanation.push(
+                    "doctests: not run (the original command uses --all-targets, which excludes them)"
+                        .to_string(),
+                );
+            } else {
+                // Doc comments are not analysed, so any doctest may reach a
+                // related module.
+                let mut selection = pkg.to_vec();
+                selection.push("--doc".to_string());
+                commands.push(self.cargo.render(&selection, &[]));
                 self.explanation
-                    .push("library unit tests: none related; doctests: none related".to_string());
+                    .push("doctests: all run (doc comments are not analysed)".to_string());
             }
             let mut selection = pkg.to_vec();
             let mut names = Vec::new();
@@ -1702,17 +1855,42 @@ impl Selector<'_> {
             commands.push(self.cargo.render(&selection, &[]));
         }
         if commands.is_empty() {
-            self.explanation
-                .push("no tests are related to the changed files".to_string());
-            return FilesListSelection {
-                plan: FilesListPlan::Nothing,
-                explanation: self.explanation,
-            };
+            // Files changed but none mapped to a test. Run everything rather
+            // than report a skip.
+            self.explanation.push(
+                "full run: no test maps to the changed files, so nothing can be ruled out"
+                    .to_string(),
+            );
+            return full(self.explanation);
         }
         FilesListSelection {
             plan: FilesListPlan::Commands(commands),
             explanation: self.explanation,
         }
+    }
+
+    /// Full names of the `#[test]` functions in the library root file.
+    fn root_test_names(&self) -> Vec<String> {
+        let Some(lib) = &self.package.lib else {
+            return Vec::new();
+        };
+        let Some((root, _)) = lib.files.iter().find(|(_, m)| m.is_empty()) else {
+            return Vec::new();
+        };
+        self.package
+            .items
+            .get(root)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| match item {
+                Item::TestFn { inline, name } => {
+                    let mut path = inline.clone();
+                    path.push(name.clone());
+                    Some(path.join("::"))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn explain_list(&mut self, title: &str, items: impl Iterator<Item = String>) {
@@ -1816,15 +1994,20 @@ impl Selector<'_> {
             // A non-Rust file: find the sources that name it.
             let mentions = self.mentions(&file);
             if mentions.is_empty() {
-                self.explanation
-                    .push(format!("{shown}: no Rust source names it; ignored"));
-                continue;
+                touched.full_reason = Some(format!(
+                    "{shown} is not a Rust source and no source names it"
+                ));
+                return touched;
             }
             let mut described = Vec::new();
             for mention in mentions {
                 match mention {
                     Mention::Owner(Owner::Build) => {
                         touched.full_reason = Some(format!("{shown} is named by the build script"));
+                        return touched;
+                    }
+                    Mention::Owner(Owner::Lib(module)) if module.is_empty() => {
+                        touched.full_reason = Some(format!("{shown} is named by the library root"));
                         return touched;
                     }
                     Mention::Owner(owner) => {
@@ -1879,9 +2062,14 @@ impl Selector<'_> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let names = |s: &str, source: &Path| {
-            let sibling = source.parent() == Some(file_dir.as_path());
-            mentions_name(s, basename, sibling) || dir_names.iter().any(|d| mentions_dir(s, d))
+        // A bare directory name counts when it is passed to a path call
+        // (`dir.join("fixtures")`).
+        let names = |s: &str, path_arg: bool, source: &Path| {
+            let sibling = path_arg || source.parent() == Some(file_dir.as_path());
+            mentions_name(s, basename, sibling)
+                || dir_names
+                    .iter()
+                    .any(|d| mentions_dir(s, d) || (path_arg && s == d.as_str()))
         };
 
         let mut found = BTreeSet::new();
@@ -1889,7 +2077,7 @@ impl Selector<'_> {
             let source = normalize(&self.package.dir.join(path));
             if items
                 .iter()
-                .any(|item| matches!(item, Item::Str(s) if names(s, &source)))
+                .any(|item| matches!(item, Item::Str(s, path_arg) if names(s, *path_arg, &source)))
             {
                 for owner in self.package.owners.get(path).into_iter().flatten() {
                     found.insert(Mention::Owner(owner.clone()));
@@ -1904,10 +2092,9 @@ impl Selector<'_> {
                 let Ok(src) = std::fs::read_to_string(&source) else {
                     continue;
                 };
-                if lex(&src)
-                    .iter()
-                    .any(|t| matches!(t, Tok::Str(s) if names(s, &source)))
-                {
+                if extract(&lex(&src)).iter().any(
+                    |item| matches!(item, Item::Str(s, path_arg) if names(s, *path_arg, &source)),
+                ) {
                     found.insert(Mention::Member(member.name.clone()));
                     break;
                 }
@@ -1962,6 +2149,8 @@ impl Selector<'_> {
             if !matches!(target.owner, Owner::Aux(..)) || selected.contains(&target.owner) {
                 continue;
             }
+            // Any sign that the test runs one of the package's binaries links
+            // it to every related binary; names are not matched.
             let runs_related_bin = !bins.is_empty()
                 && target.files.keys().any(|file| {
                     self.package
@@ -1969,19 +2158,31 @@ impl Selector<'_> {
                         .get(file)
                         .into_iter()
                         .flatten()
-                        .any(|item| {
-                            let Item::Str(s) = item else { return false };
-                            s.match_indices("CARGO_BIN_EXE_").any(|(i, _)| {
-                                let name = &s[i + "CARGO_BIN_EXE_".len()..];
-                                name.is_empty() || bins.iter().any(|b| name.starts_with(b.as_str()))
-                            })
-                        })
+                        .any(spawns_package_binary)
                 });
             if runs_related_bin || reaches_related(target) {
                 selected.insert(target.owner.clone());
             }
         }
         selected
+    }
+}
+
+/// Whether an item shows a test running the package's binaries:
+/// `env!("CARGO_BIN_EXE_…")`, assert_cmd's `cargo_bin`, or escargot.
+fn spawns_package_binary(item: &Item) -> bool {
+    const MARKERS: &[&str] = &[
+        "cargo_bin",
+        "cargo_bin_cmd",
+        "assert_cmd",
+        "escargot",
+        "CargoBuild",
+    ];
+    match item {
+        Item::Str(s, _) => s.contains("CARGO_BIN_"),
+        Item::Path { raw, .. } => raw.segs.iter().any(|seg| MARKERS.contains(&seg.as_str())),
+        Item::MacroUse(name) => MARKERS.contains(&name.as_str()),
+        _ => false,
     }
 }
 
@@ -2141,10 +2342,7 @@ mod tests {
             commands[0],
             "cargo test --locked -p demo-crate --lib -- a:: b:: c::"
         );
-        assert_eq!(
-            commands[1],
-            "cargo test --locked -p demo-crate --doc -- a:: b:: c:: src/a.rs src/b/mod.rs src/c.rs"
-        );
+        assert_eq!(commands[1], "cargo test --locked -p demo-crate --doc");
         // uses_a reaches c through a → b; uses_d and shared do not.
         assert_eq!(
             commands[2],
@@ -2227,8 +2425,9 @@ mod tests {
             "cargo test -p demo-crate --lib -- a:: b:: c::"
         );
 
+        // A file no source names runs the original command.
         let selection = run(&tmp, "cargo test --all-targets", &["README.md"]);
-        assert_eq!(selection.plan, FilesListPlan::Nothing);
+        assert_eq!(selection.plan, FilesListPlan::Full);
     }
 
     #[test]
@@ -2358,6 +2557,123 @@ mod tests {
     }
 
     #[test]
+    fn crate_root_tests_run_by_exact_name_when_the_root_is_related() {
+        let tmp = fixture();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn root_uses_b() { assert!(super::b::helper() > 0); }\n    #[tokio::test]\n    async fn root_async() {}\n}\n",
+        );
+        let selection = run(&tmp, "cargo test --all-targets", &["src/c.rs"]);
+        assert_eq!(
+            commands(&selection)[1],
+            "cargo test -p demo-crate --lib -- --exact tests::root_uses_b tests::root_async"
+        );
+        // Any related module brings in the root's tests.
+        let selection = run(&tmp, "cargo test --all-targets", &["src/d.rs"]);
+        assert!(commands(&selection).iter().any(|c| c.contains("--exact")));
+    }
+
+    #[test]
+    fn declared_bins_without_a_path_follow_cargo_inference() {
+        let tmp = fixture();
+        let dir = tmp.path();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"demo-crate\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"demo-crate\"\n",
+        )
+        .unwrap();
+        write(dir, "src/main.rs", "fn main() { demo_crate::d::d(); }\n");
+        write(
+            dir,
+            "tests/cli.rs",
+            "#[test]\nfn runs() { let _ = env!(\"CARGO_BIN_EXE_demo-crate\"); }\n",
+        );
+        let selection = run(&tmp, "cargo test --all-targets", &["src/d.rs"]);
+        assert_eq!(
+            commands(&selection)[1],
+            "cargo test -p demo-crate --bins --test cli --test uses_d"
+        );
+
+        // A declared target whose file does not exist cannot be analysed.
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"demo-crate\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"gone\"\n",
+        )
+        .unwrap();
+        let selection = run(&tmp, "cargo test --all-targets", &["src/d.rs"]);
+        assert_eq!(selection.plan, FilesListPlan::Full);
+    }
+
+    #[test]
+    fn unnamed_files_beside_sources_run_in_full() {
+        let tmp = fixture();
+        write(tmp.path(), "tests/golden/one.json", "{}\n");
+        let selection = run(&tmp, "cargo test --all-targets", &["tests/golden/one.json"]);
+        assert_eq!(selection.plan, FilesListPlan::Full);
+
+        // A path call with the bare directory name counts as naming it.
+        write(
+            tmp.path(),
+            "tests/uses_d.rs",
+            "#[test]\nfn it() { let _ = std::path::Path::new(\"tests\").join(\"golden\"); }\n",
+        );
+        let selection = run(&tmp, "cargo test --all-targets", &["tests/golden/one.json"]);
+        assert_eq!(
+            commands(&selection),
+            vec!["cargo test -p demo-crate --test uses_d".to_string()]
+        );
+    }
+
+    #[test]
+    fn tests_that_run_the_binary_through_assert_cmd_follow_it() {
+        let tmp = fixture();
+        write(tmp.path(), "src/main.rs", "fn main() {}\n");
+        write(
+            tmp.path(),
+            "tests/cli.rs",
+            "use assert_cmd::Command;\n#[test]\nfn runs() { Command::cargo_bin(\"demo\").unwrap(); }\n",
+        );
+        let selection = run(&tmp, "cargo test --all-targets", &["src/main.rs"]);
+        assert_eq!(
+            commands(&selection),
+            vec!["cargo test -p demo-crate --bins --test cli".to_string()]
+        );
+    }
+
+    #[test]
+    fn blanket_impls_seed_the_trait_module() {
+        let tmp = fixture();
+        write(
+            tmp.path(),
+            "src/b/inner.rs",
+            "pub trait Ext {}\npub fn one() -> u8 { 1 }\n",
+        );
+        write(
+            tmp.path(),
+            "src/d.rs",
+            "impl<T: Clone> crate::b::inner::Ext for T {}\n",
+        );
+        let selection = run(&tmp, "cargo test --all-targets", &["src/d.rs"]);
+        assert_eq!(
+            commands(&selection)[0],
+            "cargo test -p demo-crate --lib -- a:: b:: d::"
+        );
+    }
+
+    #[test]
+    fn positional_test_names_in_the_command_run_unchanged() {
+        let tmp = fixture();
+        let selection = run(&tmp, "cargo test --features fast some_test", &["src/a.rs"]);
+        assert_eq!(selection.plan, FilesListPlan::Full);
+        let selection = run(&tmp, "cargo test --features fast", &["src/a.rs"]);
+        assert_eq!(
+            commands(&selection)[0],
+            "cargo test --features fast -p demo-crate --lib -- a::"
+        );
+    }
+
+    #[test]
     fn lexer_ignores_comments_and_keeps_strings() {
         let toks = lex(
             "// crate::a\n/* crate::b /* nested */ */ let s = r#\"x\"y\"#; 'a'; '\\''; &'b str",
@@ -2410,7 +2726,7 @@ mod tests {
             "pub const NAME: &str = \"README.md\";\n",
         );
         let selection = run(&tmp, "cargo test --all-targets", &["README.md"]);
-        assert_eq!(selection.plan, FilesListPlan::Nothing);
+        assert_eq!(selection.plan, FilesListPlan::Full);
 
         write(
             tmp.path(),

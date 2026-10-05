@@ -718,21 +718,24 @@ fn run() -> Result<()> {
             // Narrow targets to changed files and apply warnings-as-errors.
             // Under --dependents, a project whose dependency changed cannot be
             // narrowed to its own files.
-            let registry = PluginRegistry::with_all_plugins();
-            let dependency_changed: HashSet<String> = if dependents {
-                directly_affected_addrs
-                    .iter()
-                    .flat_map(|addr| {
-                        let mut reached =
-                            affected_with_dependents(HashSet::from([addr.clone()]), &graph);
-                        reached.remove(addr);
-                        reached
-                    })
-                    .collect()
-            } else {
-                HashSet::new()
-            };
             let command_plan = if only_affected_files || warnings_as_errors {
+                let registry = PluginRegistry::with_all_plugins();
+                // A project cannot be narrowed to its own files when a
+                // project it depends on also changed.
+                let dependency_changed: HashSet<String> = if only_affected_files {
+                    directly_affected_addrs
+                        .iter()
+                        .flat_map(|addr| {
+                            let mut reached =
+                                affected_with_dependents(HashSet::from([addr.clone()]), &graph);
+                            reached.remove(addr);
+                            reached
+                        })
+                        .filter(|addr| primary_addrs.contains(addr))
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
                 let mut changed_list: Vec<PathBuf> = changed_files.iter().cloned().collect();
                 changed_list.sort();
                 Some(plan_affected_commands(

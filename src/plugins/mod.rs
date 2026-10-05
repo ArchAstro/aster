@@ -55,6 +55,11 @@ pub enum FilesListPlan {
     Commands(Vec<String>),
     /// None of the changed files is relevant to this target.
     Nothing,
+    /// The plugin's `with_files_list` declined to rewrite the command. Plugins
+    /// differ on whether that means "nothing to run" or "run everything", so
+    /// a requested target is skipped (the long-standing behaviour) while a
+    /// prerequisite target runs in full.
+    Declined,
 }
 
 /// A [`FilesListPlan`] plus the reasoning behind it, shown by `--dry-run` and
@@ -219,8 +224,8 @@ pub trait LanguagePlugin: Send + Sync {
     ///
     /// Plugins that need to read the project (for example to follow imports)
     /// override this. The default delegates to [`Self::with_files_list`]: a
-    /// modified command runs instead of the original, and `None` means no
-    /// changed file is relevant.
+    /// modified command runs instead of the original, and `None` becomes
+    /// [`FilesListPlan::Declined`].
     ///
     /// - project_dir: absolute project directory
     /// - files: changed file paths relative to `project_dir`
@@ -233,7 +238,7 @@ pub trait LanguagePlugin: Send + Sync {
     ) -> FilesListSelection {
         match self.with_files_list(target_name, command, files) {
             Some(command) => FilesListSelection::new(FilesListPlan::Commands(vec![command])),
-            None => FilesListSelection::new(FilesListPlan::Nothing),
+            None => FilesListSelection::new(FilesListPlan::Declined),
         }
     }
 

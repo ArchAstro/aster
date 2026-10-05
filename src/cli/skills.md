@@ -123,8 +123,8 @@ also changed, runs in full. `--dry-run` shows each chosen command and why.
 Rust `cargo test` targets run only related tests: unit tests filtered to the
 modules that transitively import a changed module, integration tests that
 changed or import one, and workspace members that depend on a changed crate.
-Manifest, lockfile, toolchain, build-script and library-root changes run the
-original command.
+Manifest, lockfile, toolchain, build-script and library-root changes, and any
+change that maps to no test, run the original command.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 

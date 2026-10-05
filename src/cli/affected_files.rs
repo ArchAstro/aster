@@ -44,7 +44,7 @@ pub struct AffectedRequest<'a> {
     pub changed_files: &'a [PathBuf],
     /// Addresses of the primary projects.
     pub primary: &'a HashSet<String>,
-    /// Projects with a changed dependency (empty without `--dependents`).
+    /// Primary projects with a changed dependency.
     pub dependency_changed: &'a HashSet<String>,
     pub only_affected_files: bool,
     pub warnings_as_errors: bool,
@@ -140,13 +140,16 @@ pub fn plan_affected_commands(
                                 plan.overrides.insert(addr, CommandOverride::Run(commands));
                             }
                         }
-                        FilesListPlan::Nothing if is_requested => {
+                        FilesListPlan::Declined if !is_requested => {
+                            plan.note(&addr, "the plugin did not narrow it; running in full");
+                        }
+                        FilesListPlan::Nothing | FilesListPlan::Declined if is_requested => {
                             plan.note(&addr, "skipped: no changed files are relevant to it");
                             plan.primary.remove(&project_addr);
                             plan.skipped.push(addr);
                             break;
                         }
-                        FilesListPlan::Nothing => {
+                        FilesListPlan::Nothing | FilesListPlan::Declined => {
                             plan.note(&addr, "skipped: no changed files are relevant to it");
                             plan.overrides.insert(
                                 addr,
