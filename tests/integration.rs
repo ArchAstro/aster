@@ -3250,6 +3250,53 @@ cache = { enabled = false }
 
 #[cfg(unix)]
 #[test]
+fn test_only_affected_files_runs_in_full_when_a_dependency_also_changed() {
+    // web depends on core, and both change in the same commit. Without
+    // --dependents, web is still selected for its own file, but that file
+    // list does not describe the core change, so web runs in full.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_recorder(&tmp);
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_aster_toml(
+        &tmp,
+        "libs/core/aster.toml",
+        "[targets.test]\ncommand = \"../../record.sh core {files}\"\ncapabilities = [\"files_list\"]\ncache = { enabled = false }\n",
+    );
+    write_package_json(
+        &tmp,
+        "apps/web/package.json",
+        r#"{"name": "web", "dependencies": {"core": "file:../../libs/core"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "apps/web/aster.toml",
+        "[targets.test]\ncommand = \"../../record.sh web {files}\"\ncapabilities = [\"files_list\"]\ncache = { enabled = false }\n",
+    );
+    git_commit(&tmp, "Initial commit");
+
+    write_fixture(&tmp, "libs/core/index.js", "export const x = 1;\n");
+    write_fixture(&tmp, "apps/web/page.js", "export const y = 2;\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--only-affected-files"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "aster failed: {output:?}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("core.args")).unwrap(),
+        "index.js\n"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("web.args"))
+            .unwrap()
+            .trim(),
+        ""
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_only_affected_files_reaches_a_same_project_dependency_target() {
     // CI calls a wrapper target (test-ci) whose only job is to depend on
     // the file-aware test target.
