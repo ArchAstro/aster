@@ -17,21 +17,27 @@
 //!    `macro_rules!` macros defined in another module.
 //! 3. Changed library modules are the seeds. A changed module that implements
 //!    a type from another module (`impl Trait for other::Type`) also seeds
-//!    that module, since users of the type can observe the impl. The related
-//!    modules are every module that transitively references a seed.
-//! 4. Library unit tests run filtered to the related module paths. Bins,
-//!    integration tests, benches and examples run when one of their files
-//!    changed or they reference a related module through the crate name
-//!    (tests that spawn the binary through `CARGO_BIN_EXE_*` run when the
-//!    binary is related).
+//!    that module, since users of the type can observe the impl; a blanket
+//!    impl (`impl<T: Bound> Trait for T`) seeds the trait's module. The
+//!    related modules are every module that transitively references a seed.
+//! 4. Library unit tests run filtered to the related module paths. `#[test]`
+//!    functions in the crate root file run by exact name whenever any module
+//!    is related, and doctests run unfiltered (doc comments are not
+//!    analysed). Bins, integration tests, benches and examples run when one
+//!    of their files changed or they reference a related module through the
+//!    crate name. A test that runs a binary (`CARGO_BIN_EXE_*`, assert_cmd's
+//!    `cargo_bin`, escargot) runs whenever any binary is related.
 //! 5. A non-Rust file maps to the Rust sources whose string literals name it
-//!    or one of its directories (`include_str!`, fixture paths). One that no
-//!    source names cannot affect a test and is ignored.
+//!    as a path, or pass it or one of its directories to a path call
+//!    (`include_str!`, `dir.join("fixtures")`).
 //! 6. Other workspace members that changed, or that depend on a changed
 //!    package through a path dependency, run in full.
 //!
-//! Manifests, lockfiles, toolchain files, the build script, the library root
-//! and Rust files outside every target run the original command unchanged.
+//! Anything the analysis cannot map runs the original command unchanged:
+//! manifests, lockfiles, toolchain files, the build script, the library root
+//! and files it names, Rust files outside every target, non-Rust files no
+//! source names, declared targets whose root file is missing, and a change
+//! that reaches no test. With files changed, the target is never skipped.
 
 use super::{FilesListPlan, FilesListSelection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
