@@ -34,6 +34,17 @@ use super::shutdown_requested;
 #[cfg(any(unix, windows))]
 use super::{register_supervised_child, unregister_supervised_child};
 
+/// Replacement for a target's command, used by `aster affected
+/// --only-affected-files` and `--warnings-as-errors`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOverride {
+    /// Run these commands in order instead of the target's command; the
+    /// target fails at the first command that fails.
+    Run(Vec<String>),
+    /// Do not run the target; it reports as skipped with this reason.
+    Skip(String),
+}
+
 /// Result of executing a target command on a project
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -161,7 +172,7 @@ impl<'a> Executor<'a> {
         &self,
         target: &str,
         projects: &[&DiscoveredProject],
-        command_overrides: &HashMap<String, String>,
+        command_overrides: &HashMap<String, CommandOverride>,
         primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
         self.execute_internal(target, projects, Some(command_overrides), primary_projects)
@@ -280,7 +291,7 @@ impl<'a> Executor<'a> {
         &self,
         target: &str,
         projects: &[&DiscoveredProject],
-        command_overrides: Option<&HashMap<String, String>>,
+        command_overrides: Option<&HashMap<String, CommandOverride>>,
         primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
         if projects.is_empty() {
@@ -326,7 +337,7 @@ impl<'a> Executor<'a> {
         &self,
         targets_to_run: &HashSet<String>,
         project_map: &HashMap<String, &DiscoveredProject>,
-        command_overrides: Option<&HashMap<String, String>>,
+        command_overrides: Option<&HashMap<String, CommandOverride>>,
         target_label_for_logs: &str,
     ) -> Vec<ExecutionResult> {
         if targets_to_run.is_empty() {
@@ -443,7 +454,7 @@ impl<'a> Executor<'a> {
         project_map: &HashMap<String, &DiscoveredProject>,
         progress: &mut ProgressDisplay,
         show_progress: bool,
-        command_overrides: Option<&HashMap<String, String>>,
+        command_overrides: Option<&HashMap<String, CommandOverride>>,
         cache_store: Option<&CacheStore>,
         plugin_registry: &PluginRegistry,
         computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
@@ -491,12 +502,29 @@ impl<'a> Executor<'a> {
 
             // Get the command for this target
             // Check for command override first (used with --only-affected-files)
-            let command = if let Some(overrides) = command_overrides {
-                if let Some(override_cmd) = overrides.get(target_addr) {
-                    override_cmd.clone()
+            let commands: Vec<String> = if let Some(overrides) = command_overrides {
+                if let Some(command_override) = overrides.get(target_addr) {
+                    match command_override {
+                        CommandOverride::Run(commands) => commands.clone(),
+                        CommandOverride::Skip(reason) => {
+                            let result = ExecutionResult {
+                                address: target_addr.clone(),
+                                success: true,
+                                skipped: true,
+                                cached: false,
+                                output: format!("Skipped: {reason}"),
+                                duration_ms: 0,
+                            };
+                            if show_progress {
+                                progress.mark_skipped(target_addr);
+                            }
+                            let _ = tx.send(result);
+                            continue;
+                        }
+                    }
                 } else {
                     match project.targets.get(&target_name) {
-                        Some(t) => t.command.clone(),
+                        Some(t) => vec![t.command.clone()],
                         None => {
                             // No target defined - skip
                             let result = ExecutionResult {
@@ -517,7 +545,7 @@ impl<'a> Executor<'a> {
                 }
             } else {
                 match project.targets.get(&target_name) {
-                    Some(t) => t.command.clone(),
+                    Some(t) => vec![t.command.clone()],
                     None => {
                         // No target defined - skip
                         let result = ExecutionResult {
@@ -536,6 +564,8 @@ impl<'a> Executor<'a> {
                     }
                 }
             };
+            // Cache keys and logs see one command per line.
+            let command = commands.join("\n");
 
             // Check cache if enabled. A miss carries the exact hash that may
             // be stored after successful execution; `None` means this target
@@ -596,6 +626,7 @@ impl<'a> Executor<'a> {
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
             let command_clone = command.clone();
+            let commands_clone = commands.clone();
             let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
             let env_snapshot_clone = env_snapshot.clone();
@@ -649,7 +680,7 @@ impl<'a> Executor<'a> {
                     let _ = tx_clone.send(result.clone());
                     return result;
                 }
-                let mut result = run_command(&addr, &command_clone, &working_dir, null_stdin);
+                let mut result = run_commands(&addr, &commands_clone, &working_dir, null_stdin);
                 if shutdown_requested() {
                     result.success = false;
                     result.skipped = true;
@@ -1107,6 +1138,46 @@ fn is_default_cacheable_target(target_name: &str) -> bool {
         target_name,
         "deps" | "build" | "test" | "lint" | "format" | "typecheck" | "check"
     )
+}
+
+/// Run commands in order, stopping at the first failure.
+///
+/// A target has one command; several come only from a
+/// [`CommandOverride::Run`] that splits the target into narrower invocations.
+fn run_commands(
+    address: &str,
+    commands: &[String],
+    working_dir: &Path,
+    null_stdin: bool,
+) -> ExecutionResult {
+    if let [command] = commands {
+        return run_command(address, command, working_dir, null_stdin);
+    }
+    let mut combined = ExecutionResult {
+        address: address.to_string(),
+        success: true,
+        skipped: false,
+        cached: false,
+        output: String::new(),
+        duration_ms: 0,
+    };
+    for command in commands {
+        if shutdown_requested() {
+            break;
+        }
+        let result = run_command(address, command, working_dir, null_stdin);
+        if !combined.output.is_empty() && !combined.output.ends_with('\n') {
+            combined.output.push('\n');
+        }
+        combined.output.push_str(&format!("$ {command}\n"));
+        combined.output.push_str(&result.output);
+        combined.duration_ms += result.duration_ms;
+        if !result.success {
+            combined.success = false;
+            break;
+        }
+    }
+    combined
 }
 
 /// Run a command in a directory and capture output
@@ -2065,5 +2136,21 @@ mod tests {
             "expected closed stdin, got: {}",
             result.output
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_commands_run_in_order_and_stop_at_the_first_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = vec![
+            "sh -c 'echo first'".to_string(),
+            "sh -c 'echo second; exit 3'".to_string(),
+            "sh -c 'echo third'".to_string(),
+        ];
+        let result = run_commands("//a:test", &commands, tmp.path(), true);
+        assert!(!result.success);
+        assert!(result.output.contains("$ sh -c 'echo first'\nfirst"));
+        assert!(result.output.contains("second"));
+        assert!(!result.output.contains("third"), "{}", result.output);
     }
 }

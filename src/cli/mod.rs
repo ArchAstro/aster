@@ -2,6 +2,7 @@
 //!
 //! Provides the command-line interface using clap derive macros.
 
+pub mod affected_files;
 pub mod commands;
 pub mod output;
 pub mod run;

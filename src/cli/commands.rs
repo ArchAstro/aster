@@ -160,9 +160,10 @@ pub enum Commands {
 
         /// Pass affected files to targets that support it
         ///
-        /// For targets with FilesList capability, passes only the changed files
-        /// instead of running the full target. Useful for running tests only
-        /// on files that changed.
+        /// Targets with the files_list capability (the requested target and
+        /// same-project targets it depends on) run on the project's changed
+        /// files only; Rust `cargo test` targets run the tests related to the
+        /// change. Projects selected only through --dependents run in full.
         #[arg(long)]
         only_affected_files: bool,
 

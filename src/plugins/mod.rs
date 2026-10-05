@@ -45,6 +45,38 @@ pub enum TargetCapability {
     WarningsAsErrors,
 }
 
+/// How a files-list target should run for a set of changed files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesListPlan {
+    /// Run the target's command unchanged.
+    Full,
+    /// Run these commands in order instead of the target's command. The
+    /// target fails at the first command that fails.
+    Commands(Vec<String>),
+    /// None of the changed files is relevant to this target.
+    Nothing,
+}
+
+/// A [`FilesListPlan`] plus the reasoning behind it, shown by `--dry-run` and
+/// `--verbose`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesListSelection {
+    /// What to run.
+    pub plan: FilesListPlan,
+    /// Human-readable lines explaining how the plan was chosen.
+    pub explanation: Vec<String>,
+}
+
+impl FilesListSelection {
+    /// A selection with no explanation.
+    pub fn new(plan: FilesListPlan) -> Self {
+        Self {
+            plan,
+            explanation: Vec::new(),
+        }
+    }
+}
+
 /// A build target with its command and dependencies
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Target {
@@ -183,6 +215,28 @@ pub trait LanguagePlugin: Send + Sync {
         None
     }
 
+    /// Choose what a files-list target runs for a set of changed files.
+    ///
+    /// Plugins that need to read the project (for example to follow imports)
+    /// override this. The default delegates to [`Self::with_files_list`]: a
+    /// modified command runs instead of the original, and `None` means no
+    /// changed file is relevant.
+    ///
+    /// - project_dir: absolute project directory
+    /// - files: changed file paths relative to `project_dir`
+    fn select_for_files(
+        &self,
+        _project_dir: &Path,
+        target_name: &str,
+        command: &str,
+        files: &[PathBuf],
+    ) -> FilesListSelection {
+        match self.with_files_list(target_name, command, files) {
+            Some(command) => FilesListSelection::new(FilesListPlan::Commands(vec![command])),
+            None => FilesListSelection::new(FilesListPlan::Nothing),
+        }
+    }
+
     /// Modify a command to treat warnings as errors
     ///
     /// Called when a target has the WarningsAsErrors capability and
@@ -231,6 +285,7 @@ pub mod python;
 pub mod registry;
 pub mod ruby;
 pub mod rust;
+mod rust_related;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;

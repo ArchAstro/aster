@@ -3161,3 +3161,293 @@ test = ["pytest"]
          stdout: {stdout}, stderr: {stderr}"
     );
 }
+
+/// Write an executable `record.sh` at the workspace root. Each run writes its
+/// file arguments to `<name>.args` beside the script, so a test can tell
+/// whether a target ran and with which files.
+fn write_recorder(tmp: &TempDir) {
+    write_fixture(
+        tmp,
+        "record.sh",
+        "#!/bin/sh\nname=$1\nshift\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/$name.args\"\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp.path().join("record.sh");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_only_affected_files_runs_dependents_in_full() {
+    // web depends on core. Both test targets take a files list.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_recorder(&tmp);
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_aster_toml(
+        &tmp,
+        "libs/core/aster.toml",
+        r#"
+[targets.test]
+command = "../../record.sh core {files}"
+capabilities = ["files_list"]
+cache = { enabled = false }
+"#,
+    );
+    write_package_json(
+        &tmp,
+        "apps/web/package.json",
+        r#"{"name": "web", "dependencies": {"core": "file:../../libs/core"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "apps/web/aster.toml",
+        r#"
+[targets.test]
+command = "../../record.sh web {files}"
+capabilities = ["files_list"]
+cache = { enabled = false }
+"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    // Only core changes. web is selected through --dependents and has no
+    // changed files of its own.
+    write_fixture(&tmp, "libs/core/index.js", "export const x = 1;\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--dependents",
+            "--only-affected-files",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "aster failed: {output:?}");
+
+    // core runs on its changed file; web runs its whole suite (the
+    // placeholder expands to nothing) instead of being skipped.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("core.args")).unwrap(),
+        "index.js\n"
+    );
+    let web_args = fs::read_to_string(tmp.path().join("web.args")).unwrap_or_else(|_| {
+        panic!(
+            "web:test did not run; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(web_args.trim(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_only_affected_files_reaches_a_same_project_dependency_target() {
+    // CI calls a wrapper target (test-ci) whose only job is to depend on
+    // the file-aware test target.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_recorder(&tmp);
+    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_aster_toml(
+        &tmp,
+        "libs/core/aster.toml",
+        r#"
+[targets.test]
+command = "../../record.sh core {files}"
+capabilities = ["files_list"]
+files_glob = "*.test.js"
+cache = { enabled = false }
+
+[targets.test-ci]
+command = "true"
+depends_on = ["//self:test"]
+cache = { enabled = false }
+"#,
+    );
+    git_commit(&tmp, "Initial commit");
+
+    write_fixture(&tmp, "libs/core/a.test.js", "test\n");
+    write_fixture(&tmp, "libs/core/a.js", "code\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test-ci",
+            "--base=HEAD",
+            "--only-affected-files",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "aster failed: {output:?}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("core.args")).unwrap(),
+        "a.test.js\n"
+    );
+
+    // With no matching file the dependency target is skipped, while the
+    // wrapper still runs.
+    git_commit(&tmp, "Add files");
+    write_fixture(&tmp, "libs/core/a.js", "changed\n");
+    fs::remove_file(tmp.path().join("core.args")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "affected",
+            "test-ci",
+            "--base=HEAD",
+            "--only-affected-files",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "aster failed: {output:?}");
+    assert!(!tmp.path().join("core.args").exists());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let status_of = |address: &str| {
+        json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["address"] == address)
+            .map(|r| r["status"].as_str().unwrap().to_string())
+    };
+    assert_eq!(status_of("//libs/core:test").as_deref(), Some("skipped"));
+    assert_eq!(status_of("//libs/core:test-ci").as_deref(), Some("passed"));
+}
+
+/// The canonical end-to-end story for Rust related-test selection: a real
+/// crate, a real git change, aster choosing the tests, and cargo running
+/// them.
+#[test]
+fn test_only_affected_files_runs_rust_tests_related_to_the_change() {
+    // Setup: a crate where `a` calls `b`, `b` calls `c`, and `d` stands
+    // alone. Each module has one unit test, and each integration test
+    // exercises one module through the crate's public path.
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_fixture(
+        &tmp,
+        "crates/chain/Cargo.toml",
+        "[package]\nname = \"chain\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write_fixture(
+        &tmp,
+        "crates/chain/src/lib.rs",
+        "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n",
+    );
+    for (module, body) in [
+        ("a", "crate::b::b() + 1"),
+        ("b", "super::c::c() + 1"),
+        ("c", "1"),
+        ("d", "7"),
+    ] {
+        write_fixture(
+            &tmp,
+            &format!("crates/chain/src/{module}.rs"),
+            &format!(
+                "pub fn {module}() -> u32 {{ {body} }}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn {module}_works() {{\n        assert!(super::{module}() > 0);\n    }}\n}}\n"
+            ),
+        );
+    }
+    write_fixture(
+        &tmp,
+        "crates/chain/tests/through_a.rs",
+        "#[test]\nfn a_is_three() { assert_eq!(chain::a::a(), 3); }\n",
+    );
+    write_fixture(
+        &tmp,
+        "crates/chain/tests/through_d.rs",
+        "#[test]\nfn d_is_seven() { assert_eq!(chain::d::d(), 7); }\n",
+    );
+    write_fixture(&tmp, "crates/chain/.gitignore", "target/\n");
+    git_commit(&tmp, "Initial commit");
+
+    // Change: the leaf module c.
+    write_fixture(
+        &tmp,
+        "crates/chain/src/c.rs",
+        "pub fn c() -> u32 { 2 - 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn c_works() {\n        assert!(super::c() > 0);\n    }\n}\n",
+    );
+
+    // The dry run explains the selection without running cargo.
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--only-affected-files",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "dry run failed: {output:?}");
+    assert!(
+        stdout.contains("command: cargo test -p chain --lib -- a:: b:: c::"),
+        "dry run should show the narrowed unit-test command: {stdout}"
+    );
+    assert!(
+        stdout.contains("command: cargo test -p chain --test through_a"),
+        "dry run should select only the integration test that reaches c: {stdout}"
+    );
+
+    // Run: aster executes the narrowed commands through cargo.
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("CARGO_TARGET_DIR", tmp.path().join("target"))
+        .args([
+            "--json",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--only-affected-files",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "aster failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let test_output = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "//crates/chain:test")
+        .and_then(|r| r["output"].as_str())
+        .unwrap_or_else(|| panic!("no output for //crates/chain:test: {stdout}"))
+        .to_string();
+
+    // Observe: the tests of every module that reaches c ran, plus the one
+    // integration test through a; d's unit and integration tests did not.
+    for ran in [
+        "a::tests::a_works",
+        "b::tests::b_works",
+        "c::tests::c_works",
+        "a_is_three",
+    ] {
+        assert!(
+            test_output.contains(&format!("test {ran} ... ok")),
+            "{ran} should run: {test_output}"
+        );
+    }
+    for skipped in ["d_works", "d_is_seven"] {
+        assert!(
+            !test_output.contains(skipped),
+            "{skipped} should not run: {test_output}"
+        );
+    }
+}

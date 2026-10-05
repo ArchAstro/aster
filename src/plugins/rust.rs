@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use toml::Value;
 
-use super::{LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
+use super::{
+    FilesListPlan, FilesListSelection, LanguagePlugin, LocalDependency, ProjectMetadata, Target,
+    TargetCapability, TargetContext,
+};
 
 /// Rust plugin for discovering and parsing Cargo projects
 pub struct RustPlugin;
@@ -144,13 +147,13 @@ impl LanguagePlugin for RustPlugin {
             },
         );
 
-        // test target
+        // test target: `--only-affected-files` narrows it to related tests
         targets.insert(
             "test".to_string(),
             Target {
                 command: "cargo test".to_string(),
                 depends_on: base_deps.clone(),
-                capabilities: HashSet::new(),
+                capabilities: HashSet::from([TargetCapability::FilesList]),
                 files_glob: None,
                 stream: false,
                 cache: None,
@@ -198,6 +201,21 @@ impl LanguagePlugin for RustPlugin {
         }
 
         Ok(targets)
+    }
+
+    /// Narrow a `cargo test` command to the tests related to `files`; see
+    /// `rust_related` for the selection rules. Other commands run unchanged.
+    fn select_for_files(
+        &self,
+        project_dir: &Path,
+        _target_name: &str,
+        command: &str,
+        files: &[PathBuf],
+    ) -> FilesListSelection {
+        if files.is_empty() {
+            return FilesListSelection::new(FilesListPlan::Nothing);
+        }
+        super::rust_related::select(project_dir, command, files)
     }
 
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
