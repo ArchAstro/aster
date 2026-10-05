@@ -232,8 +232,11 @@ expansion are not interpreted.
 Because `a && b` would run `a` with `&&`, `b` and b's arguments as extra
 arguments, Aster refuses to load a target command that contains an unquoted
 `|`, `&`, `;`, `<` or `>` (for example `&&`, `||`, `|`, `;`, `&`, `>`, `>>`,
-`<`, `2>`, `2>&1`, `2>/dev/null`), or an unquoted `$(…)` or backtick
-substitution. The error names the target, its `aster.toml`, and the word.
+`<`, `2>`, `2>&1`, `2>/dev/null`), an unquoted `$(…)` or backtick
+substitution, or an unquoted line break between two words in a multi-line
+command (a shell would start a second command there; Aster would pass the next
+line as arguments). Leading and trailing line breaks and `\` line
+continuations are fine. The error names the target, its `aster.toml`, and the word.
 Every command that reads configuration fails, including `aster list` and
 `aster graph`. Operators inside quotes or escaped with a backslash are literal
 arguments and are accepted, so `grep '|' notes.txt` is fine.

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::workspace::{AffectedWorkspaceConfig, WatchWorkspaceConfig};
 use crate::address::Address;
-use crate::executor::command::find_unquoted_shell_operator;
+use crate::executor::command::{find_unquoted_shell_operator, LINE_BREAK};
 
 /// Configuration from an aster.toml file
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -257,6 +257,16 @@ pub(super) fn validate_aster_config(
         }
 
         if let Some(token) = find_unquoted_shell_operator(target.command()) {
+            if token == LINE_BREAK {
+                anyhow::bail!(
+                    "Target '{target_name}' in {} has a line break between words, but Aster \
+                     runs target commands without a shell, so the next line would become \
+                     arguments to the first program instead of a second command. Run a \
+                     shell explicitly (`bash -c '...'`), split the steps into targets joined \
+                     with depends_on, or end the line with `\\` to continue one command.",
+                    path.display()
+                );
+            }
             anyhow::bail!(
                 "Target '{target_name}' in {} uses shell syntax `{token}`, but Aster runs \
                  target commands without a shell, so `{token}` would reach the program as \
@@ -458,6 +468,41 @@ depends_on = ["//self:deps"]
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unquoted_line_break_between_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            "[targets.e2e]\ncommand = \"\"\"\nmix format --check-formatted t.exs\nmix test t.exs\n\"\"\"\n",
+        )
+        .unwrap();
+
+        let error = format!("{:#}", parse_aster_toml(&toml_path).unwrap_err());
+
+        assert!(
+            error.contains("Target 'e2e'")
+                && error.contains("line break between words")
+                && error.contains("bash -c"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_line_breaks_inside_an_explicit_shell_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            "[targets.e2e]\ncommand = \"\"\"\nbash -c '\n  mix format --check-formatted t.exs\n  mix test t.exs\n'\n\"\"\"\n\n[targets.long]\ncommand = \"\"\"\ntool --one \\\\\n  --two\n\"\"\"\n",
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        assert_eq!(config.targets.len(), 2);
     }
 
     #[test]

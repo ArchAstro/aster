@@ -47,6 +47,10 @@ pub(crate) fn parse_command(command: &str) -> Result<ParsedCommand> {
     })
 }
 
+/// Reported by [`find_unquoted_shell_operator`] for an unquoted line break
+/// that separates two words.
+pub(crate) const LINE_BREAK: &str = "\n";
+
 /// Returns the first word of `command` that contains an unquoted, unescaped
 /// shell control or redirection character (`|`, `&`, `;`, `<`, `>`) or an
 /// unquoted command substitution (`$(` or a backtick), as written.
@@ -55,11 +59,19 @@ pub(crate) fn parse_command(command: &str) -> Result<ParsedCommand> {
 /// literal argument. Operators inside single or double quotes, or escaped
 /// with a backslash, are deliberate literals and are not reported, so
 /// `bash -c 'a && b'` and `grep '|'` are accepted.
+///
+/// An unquoted line break between two words is reported as
+/// [`LINE_BREAK`]: a shell would end the command there and start another,
+/// while Aster treats it as whitespace and passes the next line to the first
+/// program as arguments. Leading and trailing line breaks, line breaks inside
+/// quotes, and backslash-newline continuations are accepted.
 pub(crate) fn find_unquoted_shell_operator(command: &str) -> Option<&str> {
     let mut chars = command.char_indices().peekable();
     let mut word_start: Option<usize> = None;
     let mut word_has_operator = false;
     let mut quote: Option<char> = None;
+    let mut seen_word = false;
+    let mut line_break_after_word = false;
 
     while let Some((index, c)) = chars.next() {
         if let Some(open) = quote {
@@ -78,11 +90,18 @@ pub(crate) fn find_unquoted_shell_operator(command: &str) -> Option<&str> {
                 if word_has_operator {
                     return Some(&command[start..index]);
                 }
+                seen_word = true;
             }
             word_has_operator = false;
+            if c == '\n' && seen_word {
+                line_break_after_word = true;
+            }
             continue;
         }
 
+        if word_start.is_none() && line_break_after_word {
+            return Some(LINE_BREAK);
+        }
         word_start.get_or_insert(index);
         match c {
             '\\' => {
@@ -183,6 +202,37 @@ mod tests {
             Some(">out.txt")
         );
         assert_eq!(find_unquoted_shell_operator("x=1 tool a|b"), Some("a|b"));
+    }
+
+    #[test]
+    fn finds_unquoted_line_break_between_words() {
+        assert_eq!(find_unquoted_shell_operator("a\nb"), Some(LINE_BREAK));
+        assert_eq!(
+            find_unquoted_shell_operator("mix format --check-formatted t.exs\nmix test t.exs"),
+            Some(LINE_BREAK)
+        );
+        assert_eq!(
+            find_unquoted_shell_operator("tool --verbose\r\n  --flag"),
+            Some(LINE_BREAK)
+        );
+        assert_eq!(find_unquoted_shell_operator("a \n\n b"), Some(LINE_BREAK));
+    }
+
+    #[test]
+    fn allows_leading_trailing_quoted_and_continued_line_breaks() {
+        for command in [
+            "\n  tool --flag\n",
+            "tool --flag\n\n",
+            "bash -c '\n  lint\n  test\n'",
+            "bash -c \"lint\ntest\"",
+            "tool --one \\\n  --two",
+        ] {
+            assert_eq!(find_unquoted_shell_operator(command), None, "{command:?}");
+        }
+        assert_eq!(
+            parse_command("tool --one \\\n  --two").unwrap().args,
+            vec!["--one", "--two"]
+        );
     }
 
     #[test]

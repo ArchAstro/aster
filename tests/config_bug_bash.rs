@@ -79,6 +79,8 @@ fn configuration_scenario_matrix() {
         Scenario { name: "unquoted && in simple target", input: "[targets]\ncheck = \"lint && test\"\n", expected: Expected::Reject },
         Scenario { name: "unquoted pipe in rich target", input: "[targets.gen]\ncommand = \"generator | formatter\"\n", expected: Expected::Reject },
         Scenario { name: "unquoted redirect in multiline command", input: "[targets.run]\ncommand = '''\ntool --verbose\n  2>&1\n'''\n", expected: Expected::Reject },
+        Scenario { name: "unquoted line break between commands", input: "[targets.run]\ncommand = \"\"\"\nlint\ntest\n\"\"\"\n", expected: Expected::Reject },
+        Scenario { name: "line breaks inside an explicit shell", input: "[targets.run]\ncommand = \"\"\"\nbash -c '\n  lint\n  test\n'\n\"\"\"\n", expected: Expected::Accept },
         Scenario { name: "operators inside an explicit shell", input: "[targets]\ncheck = \"bash -c 'lint && test | tee out.log'\"\n", expected: Expected::Accept },
         Scenario { name: "unterminated string", input: "name = \"aster\n", expected: Expected::Reject },
     ];
