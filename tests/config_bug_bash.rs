@@ -76,6 +76,10 @@ fn configuration_scenario_matrix() {
         Scenario { name: "unsupported capability", input: "[targets.test]\ncommand = \"true\"\ncapabilities = [\"file_list\"]\n", expected: Expected::Reject },
         Scenario { name: "invalid files glob", input: "[targets.test]\ncommand = \"true\"\nfiles_glob = \"[\"\n", expected: Expected::Reject },
         Scenario { name: "invalid cache glob", input: "[targets.test]\ncommand = \"true\"\n[targets.test.cache]\ninclude = [\"[\"]\n", expected: Expected::Reject },
+        Scenario { name: "unquoted && in simple target", input: "[targets]\ncheck = \"lint && test\"\n", expected: Expected::Reject },
+        Scenario { name: "unquoted pipe in rich target", input: "[targets.gen]\ncommand = \"generator | formatter\"\n", expected: Expected::Reject },
+        Scenario { name: "unquoted redirect in multiline command", input: "[targets.run]\ncommand = '''\ntool --verbose\n  2>&1\n'''\n", expected: Expected::Reject },
+        Scenario { name: "operators inside an explicit shell", input: "[targets]\ncheck = \"bash -c 'lint && test | tee out.log'\"\n", expected: Expected::Accept },
         Scenario { name: "unterminated string", input: "name = \"aster\n", expected: Expected::Reject },
     ];
 

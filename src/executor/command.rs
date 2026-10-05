@@ -1,7 +1,9 @@
 //! Parse target command strings into direct process invocations.
 //!
 //! Aster intentionally does not invoke a shell. Shell-style quoting and escaping
-//! are accepted, but operators such as pipes and redirects are ordinary arguments.
+//! are accepted. Unquoted shell operators such as `&&`, pipes and redirects
+//! would reach the program as ordinary arguments, so configuration loading
+//! rejects them with [`find_unquoted_shell_operator`].
 
 use anyhow::{anyhow, Context, Result};
 
@@ -45,6 +47,62 @@ pub(crate) fn parse_command(command: &str) -> Result<ParsedCommand> {
     })
 }
 
+/// Returns the first word of `command` that contains an unquoted, unescaped
+/// shell control or redirection character (`|`, `&`, `;`, `<`, `>`) or an
+/// unquoted command substitution (`$(` or a backtick), as written.
+///
+/// A shell would interpret such a word; Aster passes it to the program as a
+/// literal argument. Operators inside single or double quotes, or escaped
+/// with a backslash, are deliberate literals and are not reported, so
+/// `bash -c 'a && b'` and `grep '|'` are accepted.
+pub(crate) fn find_unquoted_shell_operator(command: &str) -> Option<&str> {
+    let mut chars = command.char_indices().peekable();
+    let mut word_start: Option<usize> = None;
+    let mut word_has_operator = false;
+    let mut quote: Option<char> = None;
+
+    while let Some((index, c)) = chars.next() {
+        if let Some(open) = quote {
+            match c {
+                '\\' if open == '"' => {
+                    chars.next();
+                }
+                c if c == open => quote = None,
+                _ => {}
+            }
+            continue;
+        }
+
+        if c.is_whitespace() {
+            if let Some(start) = word_start.take() {
+                if word_has_operator {
+                    return Some(&command[start..index]);
+                }
+            }
+            word_has_operator = false;
+            continue;
+        }
+
+        word_start.get_or_insert(index);
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' | '"' => quote = Some(c),
+            '|' | '&' | ';' | '<' | '>' | '`' => word_has_operator = true,
+            '$' if chars.peek().is_some_and(|(_, next)| *next == '(') => {
+                word_has_operator = true;
+            }
+            _ => {}
+        }
+    }
+
+    match word_start {
+        Some(start) if word_has_operator => Some(&command[start..]),
+        _ => None,
+    }
+}
+
 pub(crate) fn quote_argument(value: &str) -> String {
     shell_words::quote(value).into_owned()
 }
@@ -84,6 +142,76 @@ mod tests {
     fn rejects_environment_without_program() {
         let error = parse_command("MODE=test").unwrap_err();
         assert!(error.to_string().contains("only environment variables"));
+    }
+
+    #[test]
+    fn finds_standalone_shell_operators() {
+        for (command, token) in [
+            ("a && b", "&&"),
+            ("a || b", "||"),
+            ("a | b", "|"),
+            ("a |& b", "|&"),
+            ("a ; b", ";"),
+            ("server &", "&"),
+            ("a > out.txt", ">"),
+            ("a >> out.txt", ">>"),
+            ("a < in.txt", "<"),
+            ("a 2> err.txt", "2>"),
+            ("a > out.txt 2>&1", ">"),
+            ("a 2>&1", "2>&1"),
+            ("a &> out.txt", "&>"),
+            ("a <<< text", "<<<"),
+        ] {
+            assert_eq!(
+                find_unquoted_shell_operator(command),
+                Some(token),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn finds_operators_attached_to_words() {
+        assert_eq!(find_unquoted_shell_operator("a&&b"), Some("a&&b"));
+        assert_eq!(find_unquoted_shell_operator("cd dir; make"), Some("dir;"));
+        assert_eq!(
+            find_unquoted_shell_operator("tool 2>/dev/null"),
+            Some("2>/dev/null")
+        );
+        assert_eq!(
+            find_unquoted_shell_operator("tool >out.txt"),
+            Some(">out.txt")
+        );
+        assert_eq!(find_unquoted_shell_operator("x=1 tool a|b"), Some("a|b"));
+    }
+
+    #[test]
+    fn finds_unquoted_command_substitution() {
+        assert_eq!(
+            find_unquoted_shell_operator("tool $(pwd)/bin"),
+            Some("$(pwd)/bin")
+        );
+        assert_eq!(find_unquoted_shell_operator("tool `pwd`"), Some("`pwd`"));
+    }
+
+    #[test]
+    fn allows_quoted_and_escaped_operators() {
+        for command in [
+            "bash -c 'a && b'",
+            "bash -c \"a && b | c > out\"",
+            "sh -c 'count=$(grep -c x f || true); echo $count >> log'",
+            "grep '|' file",
+            "grep \"|\" file",
+            "grep \\| file",
+            "echo 'a'\"&&\"'b'",
+            "tool --pattern='a|b' --sep=\";\"",
+            "bash -c \"echo \\\"&&\\\"\"",
+            "MODE=test FOO='a && b' tool --flag",
+            "tool $HOME/bin {files}",
+            "",
+        ] {
+            assert_eq!(find_unquoted_shell_operator(command), None, "{command}");
+        }
     }
 
     #[test]
