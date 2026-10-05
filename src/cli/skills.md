@@ -341,8 +341,8 @@ Target commands use shell-style quoting but execute the parsed program directly.
 Pipes, redirects, substitutions, and `&&` require an explicit shell command such
 as `sh -c 'generator | formatter > output'`, or separate targets joined with
 `depends_on`. Configuration loading (including `aster list` and `aster graph`)
-fails if a target command contains an unquoted `|`, `&`, `;`, `<`, `>`, `$(`
-or backtick, because Aster would pass it to the program as a literal argument;
+fails if a target command contains an unquoted `|`, `&`, `;`, `<`, `>`, `$(`,
+backtick, or a line break between two words, because Aster would pass it to the program as a literal argument;
 quote it if the program should receive it literally. `{files}` is expanded safely only
 for targets declaring `files_list` and must occupy a standalone argument.
 Captured targets receive a closed stdin, so tools that prompt on a TTY fail
