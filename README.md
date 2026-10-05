@@ -227,13 +227,32 @@ Run `aster project init` to generate a starter file.
 Target commands are parsed like a shell command line for quoting, escaping, and
 leading `NAME=value` environment assignments, but they are executed directly.
 Shell operators such as pipes, redirects, `&&`, substitutions, and glob
-expansion are not interpreted. If shell behavior is intentional, invoke it
-explicitly, for example:
+expansion are not interpreted.
+
+Because `a && b` would run `a` with `&&`, `b` and b's arguments as extra
+arguments, Aster refuses to load a target command that contains an unquoted
+`|`, `&`, `;`, `<` or `>` (for example `&&`, `||`, `|`, `;`, `&`, `>`, `>>`,
+`<`, `2>`, `2>&1`, `2>/dev/null`), or an unquoted `$(…)` or backtick
+substitution. The error names the target, its `aster.toml`, and the word.
+Every command that reads configuration fails, including `aster list` and
+`aster graph`. Operators inside quotes or escaped with a backslash are literal
+arguments and are accepted, so `grep '|' notes.txt` is fine.
+
+To run several steps, either split them into targets joined with `depends_on`,
+which gives each step its own log and cache entry, or invoke a shell
+explicitly:
 
 ```toml
 [targets.generate]
 command = "sh -c 'generator | formatter > src/generated.rs'"
 cache = { enabled = false }
+
+[targets.e2e]
+command = "mix test test/e2e_test.exs"
+depends_on = ["//self:format-check"]
+
+[targets.format-check]
+command = "mix format --check-formatted test/e2e_test.exs"
 ```
 
 Captured targets receive a closed stdin, so tools that prompt on a TTY fail

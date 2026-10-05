@@ -79,6 +79,75 @@ cache = { enabled = false }
     );
 }
 
+#[test]
+fn unquoted_shell_operator_fails_config_load_before_anything_runs() {
+    // Setup: a project whose second step hides behind `&&`. Aster runs
+    // commands without a shell, so this would run one `touch` with the
+    // arguments `first`, `&&`, `touch` and `second`; a second program of any
+    // other name would never run.
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.both]
+command = "touch first && touch second"
+cache = { enabled = false }
+"#,
+    );
+
+    // Listing and running both load the configuration, so both refuse it and
+    // name the target, the file and the operator.
+    for args in [&["list"][..], &["run", "//app:both"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(
+            stderr.contains("Target 'both'")
+                && stderr.contains("aster.toml")
+                && stderr.contains("`&&`")
+                && stderr.contains("bash -c"),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    // The refusal happens before any process starts.
+    assert!(!tmp.path().join("app/first").exists());
+}
+
+#[test]
+fn explicit_shell_runs_every_step_of_a_chained_command() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.both]
+command = "sh -c 'touch first && touch second'"
+cache = { enabled = false }
+"#,
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:both"])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(tmp.path().join("app/first").exists());
+    assert!(tmp.path().join("app/second").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn terminating_aster_cleans_up_the_target_process_group() {

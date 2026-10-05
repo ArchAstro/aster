@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::workspace::{AffectedWorkspaceConfig, WatchWorkspaceConfig};
 use crate::address::Address;
+use crate::executor::command::find_unquoted_shell_operator;
 
 /// Configuration from an aster.toml file
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -255,6 +256,17 @@ pub(super) fn validate_aster_config(
             })?;
         }
 
+        if let Some(token) = find_unquoted_shell_operator(target.command()) {
+            anyhow::bail!(
+                "Target '{target_name}' in {} uses shell syntax `{token}`, but Aster runs \
+                 target commands without a shell, so `{token}` would reach the program as \
+                 a literal argument. Run a shell explicitly (`bash -c '...'`), split the \
+                 steps into targets joined with depends_on, or quote `{token}` if the \
+                 program should receive it literally.",
+                path.display()
+            );
+        }
+
         let TargetConfig::Rich(target) = target else {
             continue;
         };
@@ -411,6 +423,67 @@ depends_on = ["//self:deps"]
         assert_eq!(build_target.depends_on(), &["//self:deps"]);
         assert!(build_target.capabilities().is_empty());
         assert_eq!(build_target.files_glob(), None);
+    }
+
+    #[test]
+    fn rejects_unquoted_shell_operators_in_target_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        for (targets, target, token) in [
+            (r#"check = "lint && test""#, "check", "&&"),
+            (
+                "[targets.e2e]\ncommand = \"mix format --check-formatted t.exs && mix test t.exs\"",
+                "e2e",
+                "&&",
+            ),
+            (r#"gen = "generator | formatter""#, "gen", "|"),
+            (r#"quiet = "tool 2>/dev/null""#, "quiet", "2>/dev/null"),
+            (r#"merged = "tool 2>&1""#, "merged", "2>&1"),
+            (r#"fallback = "a || b""#, "fallback", "||"),
+            (r#"seq = "a ; b""#, "seq", ";"),
+        ] {
+            let body = if targets.starts_with('[') {
+                targets.to_string()
+            } else {
+                format!("[targets]\n{targets}")
+            };
+            std::fs::write(&toml_path, body).unwrap();
+            let error = format!("{:#}", parse_aster_toml(&toml_path).unwrap_err());
+            assert!(
+                error.contains(&format!("Target '{target}'"))
+                    && error.contains(&format!("`{token}`"))
+                    && error.contains(&toml_path.display().to_string())
+                    && error.contains("bash -c")
+                    && error.contains("depends_on"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_quoted_shell_operators_and_explicit_shells() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets]
+both = "bash -c 'pnpm exec vitest run a.test.ts && pnpm exec vitest run b.test.ts'"
+pipe = "sh -c 'generator | formatter > out.txt 2>&1'"
+literal = "grep '|' notes.txt"
+env = "ARCHDEV_CTL_TEST_RUN='^(TestA|TestB)$' scripts/test.sh"
+alias = { alias = "both" }
+
+[targets.files]
+command = "pytest {files}"
+capabilities = ["files_list"]
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        assert_eq!(config.targets.len(), 6);
     }
 
     #[test]
