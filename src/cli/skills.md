@@ -110,9 +110,21 @@ aster affected test --base=main --warnings-as-errors
 
 Affected analysis compares against the merge base of `HEAD` and `--base`, then
 adds uncommitted changes. `--head <ref>` compares committed refs explicitly.
-`--dry-run` previews selection. `--only-affected-files` narrows targets that
-declare the `files_list` capability. CI checkouts need enough Git history to
+`--dry-run` previews selection. CI checkouts need enough Git history to
 resolve the merge base.
+
+`--only-affected-files` narrows targets that declare the `files_list`
+capability to each project's changed files: the requested target and any
+same-project target it depends on (so a `test-ci` wrapper that depends on
+`//self:test` narrows `test`). A requested target with no relevant files is
+skipped. A project selected only through `--dependents`, or whose dependency
+also changed, runs in full. `--dry-run` shows each chosen command and why.
+
+Rust `cargo test` targets run only related tests: unit tests filtered to the
+modules that transitively import a changed module, integration tests that
+changed or import one, and workspace members that depend on a changed crate.
+Manifest, lockfile, toolchain, build-script and library-root changes run the
+original command.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 

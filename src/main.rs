@@ -10,6 +10,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use aster::cli::affected_files::{
+    apply_warnings_as_errors, plan_affected_commands, AffectedRequest,
+};
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
@@ -20,16 +23,15 @@ use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
     collect_target_deps, compute_target_levels, install_signal_handler, parse_target_address,
-    shutdown_signal, Executor,
+    shutdown_signal, CommandOverride, Executor,
 };
 use aster::git::{
     affected_with_dependents, files_to_projects, select_affected_lane, AffectedDetector,
     AffectedIgnore,
 };
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
-use aster::plugins::{PluginRegistry, Target, TargetCapability};
+use aster::plugins::PluginRegistry;
 use chrono::{DateTime, Utc};
-use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -713,6 +715,51 @@ fn run() -> Result<()> {
                 }
             }
 
+            // Narrow targets to changed files and apply warnings-as-errors.
+            // Under --dependents, a project whose dependency changed cannot be
+            // narrowed to its own files.
+            let registry = PluginRegistry::with_all_plugins();
+            let dependency_changed: HashSet<String> = if dependents {
+                directly_affected_addrs
+                    .iter()
+                    .flat_map(|addr| {
+                        let mut reached =
+                            affected_with_dependents(HashSet::from([addr.clone()]), &graph);
+                        reached.remove(addr);
+                        reached
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let command_plan = if only_affected_files || warnings_as_errors {
+                let mut changed_list: Vec<PathBuf> = changed_files.iter().cloned().collect();
+                changed_list.sort();
+                Some(plan_affected_commands(
+                    &AffectedRequest {
+                        target: &target,
+                        projects: &ordered,
+                        changed_files: &changed_list,
+                        primary: &primary_addrs,
+                        dependency_changed: &dependency_changed,
+                        only_affected_files,
+                        warnings_as_errors,
+                    },
+                    &registry,
+                )?)
+            } else {
+                None
+            };
+            let primary_addrs = command_plan
+                .as_ref()
+                .map(|plan| plan.primary.clone())
+                .unwrap_or(primary_addrs);
+            let no_notes: HashMap<String, Vec<String>> = HashMap::new();
+            let target_notes = command_plan
+                .as_ref()
+                .map(|plan| &plan.notes)
+                .unwrap_or(&no_notes);
+
             // Dry run: show the full execution graph with rationale
             if dry_run {
                 // Build project map from ALL projects (same as executor would)
@@ -766,6 +813,12 @@ fn run() -> Result<()> {
                         address: String,
                         reason: String,
                         files: Vec<String>,
+                        /// Commands replacing the target's own command.
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        commands: Vec<String>,
+                        /// How the target's command was chosen.
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        selection: Vec<String>,
                     }
                     #[derive(serde::Serialize)]
                     struct DryRunOutput {
@@ -774,6 +827,9 @@ fn run() -> Result<()> {
                         head: Option<String>,
                         targets: Vec<DryRunTarget>,
                         count: usize,
+                        /// Requested targets dropped by --only-affected-files.
+                        #[serde(skip_serializing_if = "Vec::is_empty")]
+                        skipped: Vec<String>,
                     }
                     let mut all_targets = Vec::new();
                     for level in &levels {
@@ -790,10 +846,22 @@ fn run() -> Result<()> {
                             } else {
                                 vec![]
                             };
+                            let commands = match command_plan
+                                .as_ref()
+                                .and_then(|plan| plan.overrides.get(target_addr))
+                            {
+                                Some(CommandOverride::Run(commands)) => commands.clone(),
+                                _ => vec![],
+                            };
                             all_targets.push(DryRunTarget {
                                 address: target_addr.clone(),
                                 reason,
                                 files,
+                                commands,
+                                selection: target_notes
+                                    .get(target_addr)
+                                    .cloned()
+                                    .unwrap_or_default(),
                             });
                         }
                     }
@@ -804,6 +872,10 @@ fn run() -> Result<()> {
                         head: head.clone(),
                         targets: all_targets,
                         count,
+                        skipped: command_plan
+                            .as_ref()
+                            .map(|plan| plan.skipped.clone())
+                            .unwrap_or_default(),
                     };
                     output_json(&output)?;
                 } else if output_mode != OutputMode::Quiet {
@@ -812,6 +884,21 @@ fn run() -> Result<()> {
                         .iter()
                         .filter(|t| rationale_for(t) == "target dependency")
                         .count();
+
+                    if let Some(plan) = &command_plan {
+                        if !plan.skipped.is_empty() {
+                            println!();
+                            println!(
+                                "Skipped by --only-affected-files (no relevant changed files):"
+                            );
+                            for addr in &plan.skipped {
+                                println!("  {addr}");
+                                for line in target_notes.get(addr).into_iter().flatten() {
+                                    println!("    > {line}");
+                                }
+                            }
+                        }
+                    }
 
                     println!();
                     if dep_count > 0 {
@@ -842,6 +929,9 @@ fn run() -> Result<()> {
                                     }
                                 }
                             }
+                            for line in target_notes.get(target_addr).into_iter().flatten() {
+                                println!("    > {line}");
+                            }
                         }
                     }
                 }
@@ -856,100 +946,32 @@ fn run() -> Result<()> {
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
             let all_project_refs: Vec<_> = projects.iter().collect();
 
-            // Build command overrides for files-list and warnings-as-errors
-            let results = if only_affected_files || warnings_as_errors {
-                let mut command_overrides: HashMap<String, String> = HashMap::new();
-                let mut effective_primary_addrs = primary_addrs.clone();
-
-                // Create plugin registry for capability handling
-                let registry = PluginRegistry::with_all_plugins();
-
-                for project in &ordered {
-                    let project_addr = format!("//{}", project.relative_path.display());
-                    let target_addr = format!("{project_addr}:{target}");
-
-                    if let Some(target_def) = project.targets.get(&target) {
-                        let mut modified_cmd: Option<String> = None;
-                        let mut files_list_attempted = false;
-
-                        // Apply files-list if requested and supported
-                        if only_affected_files
-                            && target_def
-                                .capabilities
-                                .contains(&TargetCapability::FilesList)
-                        {
-                            files_list_attempted = true;
-
-                            let project_files: Vec<PathBuf> = changed_files
-                                .iter()
-                                .filter(|f| f.starts_with(&project.relative_path))
-                                .map(|f| {
-                                    f.strip_prefix(&project.relative_path)
-                                        .unwrap_or(f)
-                                        .to_path_buf()
-                                })
-                                .collect();
-
-                            modified_cmd = apply_files_to_command(
-                                target_def,
-                                &project_files,
-                                &target,
-                                &project.plugin_name,
-                                &registry,
-                            )?;
-                        }
-
-                        // Apply warnings-as-errors if requested and supported
-                        if warnings_as_errors
-                            && target_def
-                                .capabilities
-                                .contains(&TargetCapability::WarningsAsErrors)
-                        {
-                            // Build a temporary target with possibly modified command
-                            let cmd_to_modify =
-                                modified_cmd.as_ref().unwrap_or(&target_def.command).clone();
-                            let temp_target = Target {
-                                command: cmd_to_modify,
-                                ..target_def.clone()
-                            };
-                            if let Some(warnings_cmd) = apply_warnings_as_errors(
-                                &temp_target,
-                                &target,
-                                &project.plugin_name,
-                                &registry,
-                            ) {
-                                modified_cmd = Some(warnings_cmd);
-                            }
-                        }
-
-                        if let Some(cmd) = modified_cmd {
-                            command_overrides.insert(target_addr, cmd);
-                        } else if files_list_attempted {
-                            // --only-affected-files was set and the target supports FilesList,
-                            // but no relevant files matched (e.g., only source files changed,
-                            // no test files). Skip this project instead of running the full suite.
-                            effective_primary_addrs.remove(&project_addr);
-                            if output_mode == OutputMode::Verbose {
-                                eprintln!(
-                                    "[aster] Skipping {target_addr}: no matching files for --only-affected-files"
-                                );
-                            }
+            let results = if let Some(plan) = &command_plan {
+                if output_mode == OutputMode::Verbose {
+                    let mut addresses: Vec<&String> = plan.notes.keys().collect();
+                    addresses.sort();
+                    for addr in addresses {
+                        for line in &plan.notes[addr] {
+                            eprintln!("[aster] {addr}: {line}");
                         }
                     }
+                    for addr in &plan.skipped {
+                        eprintln!(
+                            "[aster] Skipping {addr}: no matching files for --only-affected-files"
+                        );
+                    }
+                    if !plan.overrides.is_empty() {
+                        eprintln!(
+                            "[aster] Using modified commands for {} targets",
+                            plan.overrides.len()
+                        );
+                    }
                 }
-
-                if output_mode == OutputMode::Verbose && !command_overrides.is_empty() {
-                    eprintln!(
-                        "[aster] Using modified commands for {} targets",
-                        command_overrides.len()
-                    );
-                }
-
                 executor.execute_with_command_overrides(
                     &target,
                     &all_project_refs,
-                    &command_overrides,
-                    Some(&effective_primary_addrs),
+                    &plan.overrides,
+                    Some(&plan.primary),
                 )
             } else {
                 executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
@@ -1321,7 +1343,7 @@ fn run() -> Result<()> {
 
             let results = if run_args.warnings_as_errors {
                 // Build command overrides for warnings-as-errors
-                let mut command_overrides: HashMap<String, String> = HashMap::new();
+                let mut command_overrides: HashMap<String, CommandOverride> = HashMap::new();
 
                 // Create plugin registry for capability handling
                 let registry = PluginRegistry::with_all_plugins();
@@ -1337,7 +1359,8 @@ fn run() -> Result<()> {
                             &project.plugin_name,
                             &registry,
                         ) {
-                            command_overrides.insert(target_addr, modified_cmd);
+                            command_overrides
+                                .insert(target_addr, CommandOverride::Run(vec![modified_cmd]));
                         }
                     }
                 }
@@ -1897,189 +1920,6 @@ fn generate_aster_toml_content(
     content
 }
 
-/// Apply files to a command, handling both {files} placeholder and plugin-based file injection
-///
-/// Returns Some(modified_command) if files were applied, None to use original command.
-fn apply_files_to_command(
-    target: &Target,
-    files: &[PathBuf],
-    target_name: &str,
-    plugin_name: &str,
-    registry: &PluginRegistry,
-) -> Result<Option<String>> {
-    if files.is_empty() {
-        return Ok(None);
-    }
-
-    // Filter files by files_glob if specified
-    let filtered_files: Vec<PathBuf> = if let Some(glob_pattern) = &target.files_glob {
-        match Glob::new(glob_pattern) {
-            Ok(glob) => {
-                let matcher: GlobMatcher = glob.compile_matcher();
-                files
-                    .iter()
-                    .filter(|f| {
-                        // Match against filename only
-                        f.file_name()
-                            .map(|name| matcher.is_match(name))
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect()
-            }
-            Err(_) => files.to_vec(), // Invalid glob, use all files
-        }
-    } else {
-        files.to_vec()
-    };
-
-    if filtered_files.is_empty() {
-        return Ok(None);
-    }
-
-    // Expand only standalone argv placeholders. Textual substitution inside
-    // an already quoted argument (especially `sh -c '... {files}'`) can turn a
-    // filename into shell syntax after the outer command is parsed.
-    if target.command.contains("{files}") {
-        let parts = shell_words::split(&target.command)
-            .with_context(|| format!("invalid command quoting: {}", target.command))?;
-        if parts
-            .iter()
-            .any(|part| part.contains("{files}") && part != "{files}")
-        {
-            anyhow::bail!(
-                "{{files}} must be a standalone command argument, not embedded in a quoted or \
-                 combined argument: {}",
-                target.command
-            );
-        }
-        let program_index = parts
-            .iter()
-            .position(|part| !is_environment_assignment(part))
-            .context("command contains only environment assignments")?;
-        let placeholder_positions = parts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, part)| (part == "{files}").then_some(index))
-            .collect::<Vec<_>>();
-        if placeholder_positions.len() != 1 {
-            anyhow::bail!("command must contain exactly one {{files}} placeholder");
-        }
-        let placeholder_index = placeholder_positions[0];
-        if placeholder_index == program_index {
-            anyhow::bail!("{{files}} cannot be used as the executable");
-        }
-        if parts[program_index..placeholder_index]
-            .iter()
-            .any(|part| is_command_interpreter_token(part))
-        {
-            anyhow::bail!(
-                "{{files}} cannot be expanded directly through a command interpreter; \
-                 use a fixed wrapper executable instead"
-            );
-        }
-
-        let mut expanded = Vec::new();
-        for part in parts {
-            if part == "{files}" {
-                expanded.extend(
-                    filtered_files
-                        .iter()
-                        .map(|file| file.to_string_lossy().into_owned()),
-                );
-            } else {
-                expanded.push(part);
-            }
-        }
-        return Ok(Some(
-            expanded
-                .iter()
-                .map(|part| aster::executor::quote_command_argument(part))
-                .collect::<Vec<_>>()
-                .join(" "),
-        ));
-    }
-
-    // Fall back to plugin's with_files_list for language-specific handling
-    if let Some(plugin) = registry.find_by_name(plugin_name) {
-        return Ok(plugin.with_files_list(target_name, &target.command, &filtered_files));
-    }
-
-    Ok(None)
-}
-
-fn is_environment_assignment(value: &str) -> bool {
-    let Some((name, _)) = value.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-}
-
-fn is_command_interpreter_token(value: &str) -> bool {
-    let name = Path::new(value)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(value)
-        .to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "sh" | "bash"
-            | "dash"
-            | "zsh"
-            | "ksh"
-            | "fish"
-            | "pwsh"
-            | "powershell"
-            | "cmd"
-            | "env"
-            | "sudo"
-            | "xargs"
-            | "node"
-            | "nodejs"
-            | "deno"
-            | "bun"
-            | "ruby"
-            | "perl"
-            | "php"
-            | "lua"
-    ) || name.starts_with("python")
-        || name.starts_with("pypy")
-        || name.starts_with("ruby")
-}
-
-/// Apply warnings-as-errors to a command
-///
-/// Returns Some(modified_command) if the target supports warnings-as-errors,
-/// None otherwise.
-fn apply_warnings_as_errors(
-    target: &Target,
-    target_name: &str,
-    plugin_name: &str,
-    registry: &PluginRegistry,
-) -> Option<String> {
-    // Check if target has WarningsAsErrors capability
-    if !target
-        .capabilities
-        .contains(&TargetCapability::WarningsAsErrors)
-    {
-        return None;
-    }
-
-    // Use plugin's with_warnings_as_errors for language-specific handling
-    if let Some(plugin) = registry.find_by_name(plugin_name) {
-        return plugin.with_warnings_as_errors(target_name, &target.command);
-    }
-
-    None
-}
-
 /// Format a timestamp as a human-readable relative time
 ///
 /// Known source-language names for --lang validation
@@ -2151,107 +1991,5 @@ fn format_relative_time(timestamp: &str) -> String {
             dt.format("%Y-%m-%d").to_string()
         }
         Err(_) => timestamp.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod file_command_tests {
-    use super::*;
-
-    fn files_target(command: &str) -> Target {
-        Target {
-            command: command.to_string(),
-            depends_on: vec![],
-            capabilities: HashSet::from([TargetCapability::FilesList]),
-            files_glob: None,
-            stream: false,
-            cache: None,
-            invalidates_cache: false,
-            working_dir: None,
-            exclusive_resources: vec![],
-        }
-    }
-
-    #[test]
-    fn files_placeholder_expands_to_literal_arguments() {
-        let file = PathBuf::from("tests/x;touch${IFS}pwned.js");
-        let expanded = apply_files_to_command(
-            &files_target("./capture {files}"),
-            std::slice::from_ref(&file),
-            "test",
-            "unknown",
-            &PluginRegistry::new(),
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            shell_words::split(&expanded).unwrap(),
-            vec!["./capture".to_string(), file.to_string_lossy().into_owned()]
-        );
-    }
-
-    #[test]
-    fn files_placeholder_inside_shell_script_is_rejected() {
-        let error = apply_files_to_command(
-            &files_target("sh -c 'tool {files}'"),
-            &[PathBuf::from("test.js")],
-            "test",
-            "unknown",
-            &PluginRegistry::new(),
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("{files} must be a standalone command argument"));
-    }
-
-    #[test]
-    fn files_placeholder_as_executable_is_rejected() {
-        let error = apply_files_to_command(
-            &files_target("{files} --flag"),
-            &[PathBuf::from("tool")],
-            "test",
-            "unknown",
-            &PluginRegistry::new(),
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("cannot be used as the executable"));
-    }
-
-    #[test]
-    fn files_placeholder_as_interpreter_input_is_rejected() {
-        let error = apply_files_to_command(
-            &files_target("sh -c {files}"),
-            &[PathBuf::from("touch pwned")],
-            "test",
-            "unknown",
-            &PluginRegistry::new(),
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("cannot be expanded directly through a command interpreter"));
-    }
-
-    #[test]
-    fn files_placeholder_cannot_hide_an_interpreter_behind_a_launcher() {
-        let error = apply_files_to_command(
-            &files_target("nice -n 5 /bin/sh -c {files}"),
-            &[PathBuf::from("touch pwned")],
-            "test",
-            "unknown",
-            &PluginRegistry::new(),
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("cannot be expanded directly through a command interpreter"));
     }
 }

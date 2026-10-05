@@ -271,6 +271,60 @@ aster affected test --dry-run
 Aster compares `HEAD` with the merge base of `HEAD` and `--base`, then includes
 uncommitted changes. CI must fetch enough history for the merge base to exist.
 
+### Running only the affected files
+
+```console
+aster affected test --base=main --only-affected-files
+aster affected test-ci --base=main --dependents --only-affected-files --dry-run
+```
+
+`--only-affected-files` narrows targets that declare the `files_list`
+capability to each project's changed files. The requested target is narrowed,
+and so is every target of the same project that it depends on, so a wrapper
+such as `test-ci = { command = "true", depends_on = ["//self:test"] }` narrows
+its `test` prerequisite. A `{files}` placeholder expands to the changed files
+(after `files_glob`); otherwise the language plugin rewrites the command.
+
+- A requested target with no relevant changed files is skipped; a narrowed
+  prerequisite with none is reported as skipped while its wrapper still runs.
+- A project with no changed files of its own, selected only through
+  `--dependents`, runs its targets in full. So does a project whose
+  dependency also changed. Its own file list does not describe the change.
+- `--dry-run` prints the chosen commands and the reasoning under each target;
+  `--json` adds them as `commands` and `selection`.
+
+Rust test targets (the detected `test` target, or any target whose command is
+`cargo test …` and declares `files_list`) run only the tests related to the
+change, the way `vitest related` follows importers:
+
+- Aster walks each crate target from its root through `mod` declarations and
+  builds a module graph from `crate::`, `super::`, `self::`, `use` aliases,
+  glob imports and `macro_rules!` invocations. The related modules are the
+  changed modules plus every module that transitively references one. A
+  changed module that implements another module's type also marks that
+  module changed.
+- Library unit tests run filtered to the related module paths
+  (`cargo test -p <crate> --lib -- a:: b::`). Integration tests, benches and
+  examples run when they changed or reference a related module through the
+  crate name; tests that spawn the binary (`CARGO_BIN_EXE_*`) run when the
+  binary is related. Doctests run filtered the same way unless the command
+  uses `--all-targets`, which excludes them.
+- A non-Rust file maps to the sources whose string literals name it by path
+  (`include_str!("../fixtures/x.json")`, `"port/index.toml"`). A file no source
+  names is ignored.
+- Other workspace members that changed, or that depend on a changed member
+  through a path dependency, run in full with `-p`.
+- `Cargo.toml`, `Cargo.lock`, toolchain files, `.cargo/config*`, the build
+  script, the library root and `.rs` files outside every target run the
+  original command. So do commands that already pick test targets or filters,
+  and changes that relate most of the library.
+
+The analysis is textual. It over-approximates (libtest filters match
+substrings, and module granularity selects every test in a related module).
+It can miss dependencies it cannot see: trait impls reached only through
+generics, files read by walking a whole directory, and files named without a
+path (`dir.join("data.json")` from another directory).
+
 Workspace-relative files can be excluded from affected analysis in the root
 `aster.toml`:
 
