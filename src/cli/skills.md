@@ -105,6 +105,7 @@ aster affected test --base=main
 aster affected test --base=origin/main --dependents
 aster affected lint --base=HEAD --dry-run
 aster affected test --base=main --only-affected-files
+aster affected test --base=main --related
 aster affected test --base=main --warnings-as-errors
 ```
 
@@ -125,6 +126,39 @@ modules that transitively import a changed module, integration tests that
 changed or import one, and workspace members that depend on a changed crate.
 Manifest, lockfile, toolchain, build-script and library-root changes, and any
 change that maps to no test, run the original command.
+
+`--related` runs only the tests a change reaches, across projects, with no
+target configuration:
+
+```console
+aster affected test --base=main --related
+aster affected test-ci --base=main --related --dry-run
+```
+
+Aster parses Elixir, TypeScript/JavaScript, Go and Python sources, maps the
+diff's hunks to the functions, types and tests they touch, and follows
+references to the affected tests. `mix test`, Vitest/Jest/Mocha, `bun test`,
+`go test` and `pytest` commands run narrowed to those tests (Go by test
+name); a `{files}` placeholder receives the selected test files. Dependents
+run only when they refer to something that changed, so do not combine it
+with `--dependents`. Comment-only changes select nothing. Manifests,
+lockfiles, tool configuration, files no source names, changes that reach no
+test, and dependencies across languages run the project in full.
+A project that depends on another without importing it (its tests launch
+that project's binary or read its files) runs in full when the dependency
+changes, unless its `aster.toml` says which sources use it:
+`[consumes."//services/gateway"]` with `infer = true` (definitions whose
+string literals name a path inside the dependency) and/or `files = [globs]`
+(sources relative to the project; `//` starts at the workspace root). Those
+definitions and the tests that reach them run, and the narrowing carries on
+to the project's own dependents. The key must be listed in `depends_on`; an
+entry that finds nothing runs the project in full, and `--dry-run` says why.
+A shard project whose target is a one-liner such as
+`bash -c 'cd ../core && MIX_TEST_PARTITION=1 exec mix test --partitions 2'`
+runs its slice of the tests selected in `//core`, and test targets that the
+requested target depends on in other projects are narrowed the same way.
+`--dry-run` shows each narrowed command and the reference chain behind
+every selected test file.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 

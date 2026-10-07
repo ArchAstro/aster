@@ -17,7 +17,11 @@ use std::path::{Path, PathBuf};
 
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
-use crate::plugins::{FilesListPlan, FilesListSelection, PluginRegistry, Target, TargetCapability};
+use crate::plugins::related_tests::Delegated;
+use crate::plugins::{
+    FilesListPlan, FilesListSelection, PluginRegistry, RelatedTest, Target, TargetCapability,
+};
+use crate::related::{Outcome, Related};
 
 /// What an affected run executes once files lists and warnings-as-errors are
 /// applied.
@@ -48,6 +52,20 @@ pub struct AffectedRequest<'a> {
     pub dependency_changed: &'a HashSet<String>,
     pub only_affected_files: bool,
     pub warnings_as_errors: bool,
+    /// The source-level analysis under `--related`.
+    pub related: Option<&'a Related>,
+    /// Every discovered project, for targets that run in another project.
+    pub all_projects: &'a [DiscoveredProject],
+}
+
+/// How a project's targets are narrowed.
+enum Narrowing<'a> {
+    /// Run as written, for this reason.
+    Full(String),
+    /// Narrow files-list targets to the project's own changed files.
+    OwnFiles,
+    /// Narrow test commands to the tests the change reaches.
+    Related(&'a Outcome),
 }
 
 /// Choose the command overrides for an affected run.
@@ -61,6 +79,37 @@ pub fn plan_affected_commands(
     };
     let target = request.target;
 
+    // Under --related, targets that a project running in full depends on
+    // are pinned before any other project's selection can narrow them.
+    let planner = request.related.map(|related| {
+        let mut planner = RelatedPlanner {
+            lookup: Lookup::new(request.all_projects),
+            related,
+            registry,
+            pinned: HashSet::new(),
+        };
+        let mut pinned = HashSet::new();
+        for project in request.projects {
+            let addr = address(project);
+            let narrowed = related.projects.get(&addr).is_some_and(|outcome| {
+                outcome.analysed
+                    && (outcome.full.is_none() || planner.follows_runners(&addr, target, outcome))
+            });
+            if !narrowed {
+                pinned.extend(
+                    planner
+                        .lookup
+                        .closure(&addr, target)
+                        .into_iter()
+                        .skip(1)
+                        .map(|(project, name)| format!("{project}:{name}")),
+                );
+            }
+        }
+        planner.pinned = pinned;
+        planner
+    });
+
     for project in request.projects {
         let project_addr = format!("//{}", project.relative_path.display());
         let target_addr = format!("{project_addr}:{target}");
@@ -69,7 +118,10 @@ pub fn plan_affected_commands(
         };
         let mut requested: Option<Vec<String>> = None;
 
-        if request.only_affected_files {
+        let outcome = request
+            .related
+            .and_then(|related| related.projects.get(&project_addr));
+        if request.only_affected_files || request.related.is_some() {
             let file_aware: Vec<String> = same_project_chain(project, &project_addr, target)
                 .into_iter()
                 .filter(|name| {
@@ -90,75 +142,113 @@ pub fn plan_affected_commands(
                 })
                 .collect();
 
-            let full_reason = if project_files.is_empty() {
-                Some("no changed files of its own (selected as a dependent); running in full")
-            } else if request.dependency_changed.contains(&project_addr) {
-                Some("a project it depends on changed; running in full")
-            } else {
-                None
+            let narrowing = match outcome {
+                Some(outcome) => match &outcome.full {
+                    Some(_)
+                        if planner.as_ref().is_some_and(|planner| {
+                            planner.follows_runners(&project_addr, target, outcome)
+                        }) =>
+                    {
+                        Narrowing::Related(outcome)
+                    }
+                    Some(reason) => Narrowing::Full(format!("{reason}; running in full")),
+                    None if outcome.analysed => Narrowing::Related(outcome),
+                    // Not analysed at source level: its plugin narrows it to
+                    // its own changed files.
+                    None => Narrowing::OwnFiles,
+                },
+                None if request.related.is_some() => {
+                    Narrowing::Full("selected without a source analysis; running in full".into())
+                }
+                None if project_files.is_empty() => Narrowing::Full(
+                    "no changed files of its own (selected as a dependent); running in full".into(),
+                ),
+                None if request.dependency_changed.contains(&project_addr) => {
+                    Narrowing::Full("a project it depends on changed; running in full".into())
+                }
+                None => Narrowing::OwnFiles,
             };
-            if file_aware.is_empty() {
-                // Nothing to narrow.
-            } else if let Some(reason) = full_reason {
-                plan.note(&target_addr, reason);
-                for name in &file_aware {
-                    if let Some(command) = full_command(&project.targets[name])? {
-                        let addr = format!("{project_addr}:{name}");
-                        plan.note(&addr, format!("command: {command}"));
-                        if name == target {
-                            requested = Some(vec![command]);
-                        } else {
-                            plan.overrides
-                                .insert(addr, CommandOverride::Run(vec![command]));
+            match narrowing {
+                Narrowing::Full(reason) => {
+                    if !file_aware.is_empty() || request.related.is_some() {
+                        plan.note(&target_addr, reason.as_str());
+                    }
+                    for name in &file_aware {
+                        if let Some(command) = full_command(&project.targets[name])? {
+                            let addr = format!("{project_addr}:{name}");
+                            plan.note(&addr, format!("command: {command}"));
+                            if name == target {
+                                requested = Some(vec![command]);
+                            } else {
+                                plan.overrides
+                                    .insert(addr, CommandOverride::Run(vec![command]));
+                            }
                         }
                     }
                 }
-            } else {
-                for name in &file_aware {
-                    let addr = format!("{project_addr}:{name}");
-                    let selection = select_files_for_target(
-                        &project.targets[name],
-                        &project_files,
-                        name,
-                        &project.plugin_name,
-                        registry,
-                        &project.root,
-                    )?;
-                    for line in selection.explanation {
-                        plan.note(&addr, line);
+                Narrowing::OwnFiles => {
+                    for name in &file_aware {
+                        let addr = format!("{project_addr}:{name}");
+                        let selection = select_files_for_target(
+                            &project.targets[name],
+                            &project_files,
+                            name,
+                            &project.plugin_name,
+                            registry,
+                            &project.root,
+                        )?;
+                        for line in selection.explanation {
+                            plan.note(&addr, line);
+                        }
+                        let is_requested = name == target;
+                        match selection.plan {
+                            FilesListPlan::Full => plan.note(&addr, "running in full"),
+                            FilesListPlan::Commands(commands) => {
+                                for command in &commands {
+                                    plan.note(&addr, format!("command: {command}"));
+                                }
+                                if is_requested {
+                                    requested = Some(commands);
+                                } else {
+                                    plan.overrides.insert(addr, CommandOverride::Run(commands));
+                                }
+                            }
+                            FilesListPlan::Declined if !is_requested => {
+                                plan.note(&addr, "the plugin did not narrow it; running in full");
+                            }
+                            FilesListPlan::Nothing | FilesListPlan::Declined if is_requested => {
+                                plan.note(&addr, "skipped: no changed files are relevant to it");
+                                plan.primary.remove(&project_addr);
+                                plan.skipped.push(addr);
+                                break;
+                            }
+                            FilesListPlan::Nothing | FilesListPlan::Declined => {
+                                plan.note(&addr, "skipped: no changed files are relevant to it");
+                                plan.overrides.insert(
+                                    addr,
+                                    CommandOverride::Skip(
+                                        "no changed files are relevant to it (--only-affected-files)"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        }
                     }
-                    let is_requested = name == target;
-                    match selection.plan {
-                        FilesListPlan::Full => plan.note(&addr, "running in full"),
-                        FilesListPlan::Commands(commands) => {
-                            for command in &commands {
-                                plan.note(&addr, format!("command: {command}"));
-                            }
-                            if is_requested {
-                                requested = Some(commands);
-                            } else {
-                                plan.overrides.insert(addr, CommandOverride::Run(commands));
-                            }
-                        }
-                        FilesListPlan::Declined if !is_requested => {
-                            plan.note(&addr, "the plugin did not narrow it; running in full");
-                        }
-                        FilesListPlan::Nothing | FilesListPlan::Declined if is_requested => {
-                            plan.note(&addr, "skipped: no changed files are relevant to it");
-                            plan.primary.remove(&project_addr);
-                            plan.skipped.push(addr);
-                            break;
-                        }
-                        FilesListPlan::Nothing | FilesListPlan::Declined => {
-                            plan.note(&addr, "skipped: no changed files are relevant to it");
-                            plan.overrides.insert(
-                                addr,
-                                CommandOverride::Skip(
-                                    "no changed files are relevant to it (--only-affected-files)"
-                                        .to_string(),
-                                ),
-                            );
-                        }
+                }
+                Narrowing::Related(outcome) => {
+                    let skipped = match &planner {
+                        Some(planner) => planner.plan_project(
+                            &mut plan,
+                            &project_addr,
+                            target,
+                            outcome,
+                            &mut requested,
+                        )?,
+                        None => None,
+                    };
+                    if let Some(skip) = skipped {
+                        plan.primary.remove(&project_addr);
+                        plan.skipped.push(skip);
                     }
                 }
             }
@@ -203,6 +293,430 @@ pub fn plan_affected_commands(
         }
     }
     Ok(plan)
+}
+
+/// A narrowed command longer than this runs as written instead.
+const MAX_COMMAND_BYTES: usize = 100_000;
+
+/// Projects by address and by directory.
+struct Lookup<'a> {
+    by_addr: HashMap<String, &'a DiscoveredProject>,
+    by_root: HashMap<PathBuf, &'a DiscoveredProject>,
+}
+
+impl<'a> Lookup<'a> {
+    fn new(projects: &'a [DiscoveredProject]) -> Self {
+        Self {
+            by_addr: projects.iter().map(|p| (address(p), p)).collect(),
+            by_root: projects.iter().map(|p| (p.root.clone(), p)).collect(),
+        }
+    }
+
+    /// `target` of `project_addr` followed by every target it transitively
+    /// depends on, in any project, as `(project address, target name)`.
+    fn closure(&self, project_addr: &str, target: &str) -> Vec<(String, String)> {
+        let start = (project_addr.to_string(), target.to_string());
+        let mut seen: HashSet<(String, String)> = HashSet::from([start.clone()]);
+        let mut order = vec![start.clone()];
+        let mut queue = VecDeque::from([start]);
+        while let Some((owner, name)) = queue.pop_front() {
+            let Some(def) = self.by_addr.get(&owner).and_then(|p| p.targets.get(&name)) else {
+                continue;
+            };
+            for dependency in &def.depends_on {
+                let Some((project, name)) = dependency.rsplit_once(':') else {
+                    continue;
+                };
+                let project = if project == "//self" { &owner } else { project };
+                let next = (project.to_string(), name.to_string());
+                if seen.insert(next.clone()) {
+                    order.push(next.clone());
+                    queue.push_back(next);
+                }
+            }
+        }
+        order
+    }
+
+    /// Where a target's command would run tests: in its own project, or in
+    /// the project a shell one-liner changes into (a shard of that project).
+    /// `None` when the one-liner changes into a directory that is not a
+    /// project.
+    fn runner(&self, owner: &'a DiscoveredProject, def: &Target) -> Option<Runner<'a>> {
+        let Some(delegated) = Delegated::parse(&def.command) else {
+            return Some(Runner {
+                project: owner,
+                command: def.command.clone(),
+                delegated: None,
+            });
+        };
+        let base = def.working_dir.as_deref().unwrap_or(&owner.root);
+        let project = match &delegated.dir {
+            Some(dir) => *self.by_root.get(&normalize(&base.join(dir)))?,
+            None => owner,
+        };
+        Some(Runner {
+            project,
+            command: delegated.command.clone(),
+            delegated: Some(delegated),
+        })
+    }
+}
+
+fn address(project: &DiscoveredProject) -> String {
+    format!("//{}", project.relative_path.display())
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The test command behind a target and the project whose tests it runs.
+struct Runner<'a> {
+    project: &'a DiscoveredProject,
+    command: String,
+    delegated: Option<Delegated>,
+}
+
+/// What `--related` does with one target.
+enum Narrowed<'a> {
+    /// Not a test command Aster can narrow.
+    NotRunner,
+    /// A test command that must run everything, and why.
+    AsWritten(String),
+    /// Run these commands; the outcome explains the selection.
+    Commands(Vec<String>, &'a Outcome),
+    /// None of the tests it runs reaches the change.
+    Nothing,
+}
+
+/// Shared inputs of a related plan.
+struct RelatedPlanner<'a> {
+    lookup: Lookup<'a>,
+    related: &'a Related,
+    registry: &'a PluginRegistry,
+    /// Targets a project running in full depends on; they run as written
+    /// whatever another project's selection says.
+    pinned: HashSet<String>,
+}
+
+impl<'a> RelatedPlanner<'a> {
+    fn tests(outcome: &Outcome) -> Vec<RelatedTest> {
+        outcome
+            .tests
+            .iter()
+            .map(|(file, selection)| RelatedTest {
+                file: file.clone(),
+                names: if selection.whole {
+                    Vec::new()
+                } else {
+                    selection.names.iter().cloned().collect()
+                },
+            })
+            .collect()
+    }
+
+    /// Narrow `def` of `owner` to the tests the change reaches in the
+    /// project the command runs in.
+    fn narrow(
+        &self,
+        owner: &'a DiscoveredProject,
+        name: &str,
+        def: &Target,
+    ) -> Result<Narrowed<'a>> {
+        let Some(runner) = self.lookup.runner(owner, def) else {
+            return Ok(Narrowed::NotRunner);
+        };
+        let project = runner.project;
+        let placeholder = runner.delegated.is_none()
+            && def.command.contains("{files}")
+            && def.capabilities.contains(&TargetCapability::FilesList);
+        let plugin = self.registry.find_by_name(&project.plugin_name);
+        let attempt = |tests: &[RelatedTest]| {
+            plugin.and_then(|p| p.related_tests(&project.root, &runner.command, tests))
+        };
+        if !placeholder && attempt(&[]).is_none() {
+            return Ok(Narrowed::NotRunner);
+        }
+        let Some(outcome) = self.related.projects.get(&address(project)) else {
+            return Ok(Narrowed::AsWritten("its project was not analysed".into()));
+        };
+        if let Some(reason) = &outcome.full {
+            return Ok(Narrowed::AsWritten(reason.clone()));
+        }
+        if !outcome.analysed {
+            return Ok(Narrowed::AsWritten(format!(
+                "{} is not analysed at source level",
+                address(project)
+            )));
+        }
+        let tests = Self::tests(outcome);
+        let plan = if placeholder {
+            let files: Vec<PathBuf> = tests.iter().map(|t| t.file.clone()).collect();
+            select_files_for_target(
+                def,
+                &files,
+                name,
+                &project.plugin_name,
+                self.registry,
+                &project.root,
+            )?
+            .plan
+        } else {
+            attempt(&tests).unwrap_or(FilesListPlan::Full)
+        };
+        Ok(match plan {
+            FilesListPlan::Commands(commands) => {
+                let commands: Vec<String> = commands
+                    .iter()
+                    .map(|command| match &runner.delegated {
+                        Some(delegated) => delegated.render(command),
+                        None => command.clone(),
+                    })
+                    .collect();
+                // Linux caps one argument at 128 KiB, and a shell script
+                // passed with `-c` is one argument.
+                if commands.iter().any(|c| c.len() > MAX_COMMAND_BYTES) {
+                    return Ok(Narrowed::AsWritten(format!(
+                        "{} selected test files do not fit on a command line",
+                        tests.len()
+                    )));
+                }
+                Narrowed::Commands(commands, outcome)
+            }
+            FilesListPlan::Nothing => Narrowed::Nothing,
+            FilesListPlan::Full | FilesListPlan::Declined => {
+                Narrowed::AsWritten("the command could not be narrowed".into())
+            }
+        })
+    }
+
+    /// Projects other than `project_addr` whose tests the target's
+    /// dependency closure runs.
+    fn runner_projects(&self, project_addr: &str, target: &str) -> HashSet<String> {
+        let mut found = HashSet::new();
+        for (owner_addr, name) in self.lookup.closure(project_addr, target) {
+            let Some(owner) = self.lookup.by_addr.get(&owner_addr) else {
+                continue;
+            };
+            let Some(def) = owner.targets.get(&name) else {
+                continue;
+            };
+            let Some(runner) = self.lookup.runner(owner, def) else {
+                continue;
+            };
+            let addr = address(runner.project);
+            let narrowable = self
+                .registry
+                .find_by_name(&runner.project.plugin_name)
+                .is_some_and(|p| {
+                    p.related_tests(&runner.project.root, &runner.command, &[])
+                        .is_some()
+                });
+            if narrowable && addr != project_addr {
+                found.insert(addr);
+            }
+        }
+        found
+    }
+
+    /// Whether a project that runs in full only because of dependencies can
+    /// be narrowed after all: every such dependency is a project whose
+    /// tests its targets run, so that project's selection is the whole
+    /// story. This is a shard project.
+    fn follows_runners(&self, project_addr: &str, target: &str, outcome: &Outcome) -> bool {
+        if outcome.full_own || outcome.full_via.is_empty() {
+            return false;
+        }
+        let runners = self.runner_projects(project_addr, target);
+        outcome.full_via.iter().all(|via| runners.contains(via))
+    }
+
+    /// Narrow the requested target of one project and everything it depends
+    /// on. Returns the requested target's address when nothing it runs
+    /// reaches the change and the project should be dropped.
+    fn plan_project(
+        &self,
+        plan: &mut AffectedCommands,
+        project_addr: &str,
+        target: &str,
+        outcome: &Outcome,
+        requested: &mut Option<Vec<String>>,
+    ) -> Result<Option<String>> {
+        let target_addr = format!("{project_addr}:{target}");
+        let mut requested_is_runner = true;
+        // Whether any test command in the closure still runs.
+        let mut runs = false;
+        let mut skips = 0;
+        for (owner_addr, name) in self.lookup.closure(project_addr, target) {
+            let Some(owner) = self.lookup.by_addr.get(&owner_addr).copied() else {
+                continue;
+            };
+            let Some(def) = owner.targets.get(&name) else {
+                continue;
+            };
+            let addr = format!("{owner_addr}:{name}");
+            let is_requested = addr == target_addr;
+            if !is_requested && self.pinned.contains(&addr) {
+                runs = true;
+                continue;
+            }
+            match self.narrow(owner, &name, def)? {
+                Narrowed::NotRunner => {
+                    if is_requested {
+                        requested_is_runner = false;
+                    }
+                }
+                Narrowed::AsWritten(reason) => {
+                    runs = true;
+                    plan.note(&addr, format!("{reason}; running as written"));
+                }
+                Narrowed::Commands(commands, selected) => {
+                    runs = true;
+                    if !plan.notes.contains_key(&addr) {
+                        // Explain only the tests this command runs: a file
+                        // it names, or a Go package it names.
+                        let named = |file: &Path| {
+                            let package = file
+                                .parent()
+                                .filter(|dir| !dir.as_os_str().is_empty())
+                                .map_or(".".to_string(), |dir| format!("./{}", dir.display()));
+                            let file = file.to_string_lossy();
+                            commands.iter().any(|command| {
+                                command.contains(file.as_ref())
+                                    || command
+                                        .split_whitespace()
+                                        .any(|part| part.trim_matches('\'') == package)
+                            })
+                        };
+                        for line in &selected.narrowed {
+                            plan.note(&addr, line.as_str());
+                        }
+                        for (file, selection) in &selected.tests {
+                            if !named(file) {
+                                continue;
+                            }
+                            for reason in &selection.reasons {
+                                plan.note(&addr, format!("{}: {reason}", file.display()));
+                            }
+                        }
+                        for command in &commands {
+                            plan.note(&addr, format!("command: {command}"));
+                        }
+                    }
+                    if is_requested {
+                        *requested = Some(commands);
+                    } else {
+                        plan.overrides.insert(addr, CommandOverride::Run(commands));
+                    }
+                }
+                Narrowed::Nothing => {
+                    skips += 1;
+                    if !plan.notes.contains_key(&addr) {
+                        plan.note(&addr, "skipped: no test it runs reaches the change");
+                    }
+                    if is_requested {
+                        return Ok(Some(addr));
+                    }
+                    plan.overrides.insert(
+                        addr,
+                        CommandOverride::Skip(
+                            "no test it runs reaches the change (--related)".into(),
+                        ),
+                    );
+                }
+            }
+        }
+        if !requested_is_runner {
+            // A wrapper that does nothing itself exists to run the test
+            // targets it depends on; with all of them skipped it has
+            // nothing to do.
+            let wrapper = self
+                .lookup
+                .by_addr
+                .get(project_addr)
+                .and_then(|p| p.targets.get(target))
+                .is_some_and(|def| is_inert(&def.command));
+            if !runs && skips > 0 && !outcome.changed && wrapper {
+                plan.note(&target_addr, "skipped: no test it runs reaches the change");
+                return Ok(Some(target_addr));
+            }
+            if !wrapper {
+                plan.note(
+                    &target_addr,
+                    "not a test command Aster can narrow; running as written",
+                );
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A command that does nothing: the body of a target that only groups the
+/// targets it depends on.
+fn is_inert(command: &str) -> bool {
+    let command = command.trim();
+    matches!(command, "true" | ":") || command.starts_with("echo ")
+}
+
+/// Projects that `--related` should run although nothing in them is
+/// affected: a project whose requested target runs another project's tests
+/// (a shard, or a wrapper that only groups test targets) follows that
+/// project.
+pub fn related_proxies(
+    projects: &[DiscoveredProject],
+    target: &str,
+    related: &Related,
+    registry: &PluginRegistry,
+) -> HashSet<String> {
+    let planner = RelatedPlanner {
+        lookup: Lookup::new(projects),
+        related,
+        registry,
+        pinned: HashSet::new(),
+    };
+    let needs_run = |addr: &String| {
+        related
+            .projects
+            .get(addr)
+            .is_some_and(|o| o.full.is_some() || !o.tests.is_empty())
+    };
+    projects
+        .iter()
+        .filter_map(|project| {
+            let addr = address(project);
+            let outcome = related.projects.get(&addr)?;
+            let def = project.targets.get(target)?;
+            if outcome.affected() {
+                return None;
+            }
+            let delegates = planner
+                .lookup
+                .runner(project, def)
+                .is_some_and(|runner| address(runner.project) != addr);
+            // A wrapper in a project with code of its own is not a proxy:
+            // its tests are that project's, and it runs when they are
+            // affected.
+            if !delegates && (outcome.has_sources || !is_inert(&def.command)) {
+                return None;
+            }
+            planner
+                .runner_projects(&addr, target)
+                .iter()
+                .any(needs_run)
+                .then_some(addr)
+        })
+        .collect()
 }
 
 /// The command a files-list target runs with no file list: a standalone

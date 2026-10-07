@@ -156,6 +156,15 @@ impl LanguagePlugin for ElixirPlugin {
         detect_standalone_targets(ctx, &content)
     }
 
+    fn related_tests(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+    ) -> Option<super::FilesListPlan> {
+        super::related_tests::mix(project_dir, command, tests)
+    }
+
     fn with_files_list(
         &self,
         target_name: &str,

@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aster::cli::affected_files::{
-    apply_warnings_as_errors, plan_affected_commands, AffectedRequest,
+    apply_warnings_as_errors, plan_affected_commands, related_proxies, AffectedRequest,
 };
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
@@ -586,6 +586,7 @@ fn run() -> Result<()> {
             lane,
             dry_run,
             only_affected_files,
+            related,
             warnings_as_errors,
             lang,
         } => {
@@ -643,8 +644,55 @@ fn run() -> Result<()> {
             // Keep a copy of directly affected for rationale tracking in dry-run
             let directly_affected_addrs = directly_affected.clone();
 
+            // Under --related the source graph decides which projects the
+            // change reaches and which of their tests observe it.
+            let related_analysis = if related {
+                let mut changes = detector
+                    .changes(&base, head.as_deref())
+                    .context("Failed to read the changed lines")?;
+                changes.retain(|change| changed_files.contains(&change.path));
+                for file in &changed_files {
+                    // No hunks known: the whole file counts as changed.
+                    if !changes.iter().any(|change| &change.path == file) {
+                        changes.push(aster::related::Change {
+                            path: file.clone(),
+                            deleted: !workspace_root.join(file).exists(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                changes.sort_by(|a, b| a.path.cmp(&b.path));
+                let analysis =
+                    aster::related::analyse(&workspace_root, &projects, &graph, &changes);
+                if output_mode == OutputMode::Verbose {
+                    eprintln!(
+                        "[aster] Analysed {} source files ({})",
+                        analysis.files_analysed, analysis.timings
+                    );
+                }
+                Some(analysis)
+            } else {
+                None
+            };
+
             // Expand with dependents if requested
-            let mut affected_addrs = if dependents {
+            let mut affected_addrs = if let Some(analysis) = &related_analysis {
+                let mut reached: HashSet<String> = analysis
+                    .projects
+                    .iter()
+                    .filter(|(_, outcome)| outcome.affected())
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                // Shard and wrapper projects follow the project whose tests
+                // they run.
+                reached.extend(related_proxies(
+                    &projects,
+                    &target,
+                    analysis,
+                    &PluginRegistry::with_all_plugins(),
+                ));
+                reached
+            } else if dependents {
                 affected_with_dependents(directly_affected, &graph)
             } else {
                 directly_affected
@@ -704,6 +752,8 @@ fn run() -> Result<()> {
                     "Affected projects ({}):",
                     if lane.is_some() {
                         "selected by lane"
+                    } else if related {
+                        "reached by the change"
                     } else if dependents {
                         "including dependents"
                     } else {
@@ -718,11 +768,11 @@ fn run() -> Result<()> {
             // Narrow targets to changed files and apply warnings-as-errors.
             // Under --dependents, a project whose dependency changed cannot be
             // narrowed to its own files.
-            let command_plan = if only_affected_files || warnings_as_errors {
+            let command_plan = if only_affected_files || related || warnings_as_errors {
                 let registry = PluginRegistry::with_all_plugins();
                 // A project cannot be narrowed to its own files when a
                 // project it depends on also changed.
-                let dependency_changed: HashSet<String> = if only_affected_files {
+                let dependency_changed: HashSet<String> = if only_affected_files || related {
                     directly_affected_addrs
                         .iter()
                         .flat_map(|addr| {
@@ -747,6 +797,8 @@ fn run() -> Result<()> {
                         dependency_changed: &dependency_changed,
                         only_affected_files,
                         warnings_as_errors,
+                        related: related_analysis.as_ref(),
+                        all_projects: &projects,
                     },
                     &registry,
                 )?)
@@ -891,9 +943,13 @@ fn run() -> Result<()> {
                     if let Some(plan) = &command_plan {
                         if !plan.skipped.is_empty() {
                             println!();
-                            println!(
-                                "Skipped by --only-affected-files (no relevant changed files):"
-                            );
+                            if related {
+                                println!("Skipped by --related (no test reaches the change):");
+                            } else {
+                                println!(
+                                    "Skipped by --only-affected-files (no relevant changed files):"
+                                );
+                            }
                             for addr in &plan.skipped {
                                 println!("  {addr}");
                                 for line in target_notes.get(addr).into_iter().flatten() {

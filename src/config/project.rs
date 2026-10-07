@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use globset::Glob;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::workspace::{AffectedWorkspaceConfig, WatchWorkspaceConfig};
@@ -32,6 +32,11 @@ pub struct AsterToml {
     #[serde(default)]
     pub targets: HashMap<String, TargetConfig>,
 
+    /// Which of this project's sources consume a dependency that
+    /// `--related` cannot follow at source level, by project address.
+    #[serde(default)]
+    pub consumes: BTreeMap<String, ConsumesConfig>,
+
     /// Workspace discovery settings are accepted because a repository-root
     /// project may share this file with workspace configuration.
     #[serde(default)]
@@ -42,6 +47,24 @@ pub struct AsterToml {
     pub affected: AffectedWorkspaceConfig,
     #[serde(default)]
     pub dev: super::workspace::DevWorkspaceConfig,
+}
+
+/// How one project consumes a dependency that is built or run rather than
+/// imported: `[consumes."//services/api"]`.
+///
+/// `--related` runs the whole project when such a dependency changes, unless
+/// the project says which of its sources use the dependency. Those sources,
+/// and the tests that reach them, run instead.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumesConfig {
+    /// Also count every definition whose string literals name a path inside
+    /// the dependency's directory.
+    pub infer: Option<bool>,
+    /// Source files that consume the dependency, as globs relative to the
+    /// project (`//` starts at the workspace root). An empty list states that
+    /// no source of the project consumes it.
+    pub files: Option<Vec<String>>,
 }
 
 /// Alias target configuration - references another target in the same project
@@ -224,12 +247,56 @@ pub fn parse_aster_toml(path: &Path) -> Result<AsterToml> {
         toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
     validate_aster_config(&config.depends_on, &config.targets, path)?;
+    validate_consumes(&config.consumes, &config.depends_on, path)?;
     config
         .dev
         .validate()
         .with_context(|| format!("Invalid service groups in {}", path.display()))?;
 
     Ok(config)
+}
+
+/// Validate `[consumes]`: each key must be a project the file depends on, and
+/// each entry must say how the project consumes it.
+pub(super) fn validate_consumes(
+    consumes: &BTreeMap<String, ConsumesConfig>,
+    depends_on: &[String],
+    path: &Path,
+) -> Result<()> {
+    for (key, entry) in consumes {
+        let address = Address::parse(key)
+            .with_context(|| format!("Invalid [consumes] key '{key}' in {}", path.display()))?;
+        if address.target.is_some() || address.is_recursive() {
+            anyhow::bail!(
+                "[consumes] key '{key}' in {} must be a project address such as //services/api",
+                path.display()
+            );
+        }
+        let depended = depends_on
+            .iter()
+            .any(|dep| dep.split(':').next() == Some(key.as_str()));
+        if !depended {
+            anyhow::bail!(
+                "[consumes.\"{key}\"] in {} names a project this project does not list in depends_on",
+                path.display()
+            );
+        }
+        if entry.infer.is_none() && entry.files.is_none() {
+            anyhow::bail!(
+                "[consumes.\"{key}\"] in {} sets neither `infer` nor `files`",
+                path.display()
+            );
+        }
+        for pattern in entry.files.iter().flatten() {
+            Glob::new(pattern.strip_prefix("//").unwrap_or(pattern)).with_context(|| {
+                format!(
+                    "Invalid files pattern '{pattern}' in [consumes.\"{key}\"] of {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Validate fields shared by the project and workspace views of aster.toml.
