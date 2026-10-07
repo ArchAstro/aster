@@ -2,8 +2,11 @@
 //!
 //! Detects files changed between git refs and uncommitted changes.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::related::Change;
 
 use anyhow::{Context, Result};
 use git2::{DiffOptions, Repository, StatusOptions};
@@ -107,6 +110,139 @@ impl AffectedDetector {
         }
 
         Ok(changed)
+    }
+
+    /// The merge base of `base` and `head`, as a tree.
+    fn merge_base_tree(&self, base: &str, head: &str) -> Result<git2::Tree<'_>> {
+        let commit = |name: &str, flag: &str| {
+            self.repo
+                .revparse_single(name)
+                .with_context(|| format!("Git ref '{name}' not found. Check your --{flag} value."))?
+                .peel_to_commit()
+                .with_context(|| format!("Could not get commit for ref '{name}'"))
+        };
+        let base_commit = commit(base, "base")?;
+        let head_commit = commit(head, "head")?;
+        let merge_base = self
+            .repo
+            .merge_base(base_commit.id(), head_commit.id())
+            .with_context(|| format!("Could not find merge base for '{base}' and '{head}'"))?;
+        self.repo
+            .find_commit(merge_base)
+            .context("Could not load merge-base commit")?
+            .tree()
+            .context("Could not get merge-base tree")
+    }
+
+    /// The changed line spans of every changed file, with the old content of
+    /// source files so that removed lines can be read.
+    ///
+    /// Covers the same range as [`Self::all_affected_files`]: merge base to
+    /// `head`, or to the working tree (untracked files included) when `head`
+    /// is `None`.
+    pub fn changes(&self, base: &str, head: Option<&str>) -> Result<Vec<Change>> {
+        let base_tree = self.merge_base_tree(base, head.unwrap_or("HEAD"))?;
+        let head_tree = match head {
+            Some(head) => Some(
+                self.repo
+                    .revparse_single(head)
+                    .and_then(|object| object.peel_to_tree())
+                    .with_context(|| format!("Could not get tree for ref '{head}'"))?,
+            ),
+            None => None,
+        };
+        let mut opts = DiffOptions::new();
+        opts.context_lines(0)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+        let diff = match &head_tree {
+            Some(head_tree) => {
+                self.repo
+                    .diff_tree_to_tree(Some(&base_tree), Some(head_tree), Some(&mut opts))
+            }
+            None => self
+                .repo
+                .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts)),
+        }
+        .context("Failed to compute diff")?;
+
+        // Keyed by the path a hunk belongs to: the old path of a deletion,
+        // the new path otherwise.
+        let changes: RefCell<Vec<Change>> = RefCell::new(Vec::new());
+        let key = |delta: &git2::DiffDelta| -> Option<(PathBuf, bool)> {
+            let deleted = delta.status() == git2::Delta::Deleted;
+            let file = if deleted {
+                delta.old_file()
+            } else {
+                delta.new_file()
+            };
+            file.path().map(|path| (path.to_path_buf(), deleted))
+        };
+        diff.foreach(
+            &mut |delta, _| {
+                if let Some((path, deleted)) = key(&delta) {
+                    let modified = delta.status() == git2::Delta::Modified;
+                    changes.borrow_mut().push(Change {
+                        path,
+                        deleted,
+                        // Filled in by the hunks; anything but a textual
+                        // modification counts as the whole file.
+                        new_lines: modified.then(Vec::new),
+                        old_lines: modified.then(Vec::new),
+                        ..Change::default()
+                    });
+                }
+                true
+            },
+            None,
+            Some(&mut |delta, hunk| {
+                let Some((path, _)) = key(&delta) else {
+                    return true;
+                };
+                let mut changes = changes.borrow_mut();
+                let Some(change) = changes.iter_mut().rev().find(|c| c.path == path) else {
+                    return true;
+                };
+                let span = |start: u32, lines: u32| {
+                    (lines > 0).then(|| (start as usize, (start + lines - 1) as usize))
+                };
+                if let Some(lines) = change.new_lines.as_mut() {
+                    lines.extend(span(hunk.new_start(), hunk.new_lines()));
+                }
+                if let Some(lines) = change.old_lines.as_mut() {
+                    lines.extend(span(hunk.old_start(), hunk.old_lines()));
+                }
+                true
+            }),
+            None,
+        )
+        .context("Failed to read diff hunks")?;
+
+        let blob = |tree: &git2::Tree, path: &Path| -> Option<String> {
+            let object = tree.get_path(path).ok()?.to_object(&self.repo).ok()?;
+            String::from_utf8(object.as_blob()?.content().to_vec()).ok()
+        };
+        let mut changes = changes.into_inner();
+        for change in &mut changes {
+            if crate::related::Family::of(&change.path).is_none() {
+                continue;
+            }
+            let hunks = change.new_lines.as_ref().map_or(0, Vec::len)
+                + change.old_lines.as_ref().map_or(0, Vec::len);
+            if change.new_lines.is_some() && hunks == 0 {
+                // Modified without a textual hunk: binary, or a mode change.
+                change.new_lines = None;
+                change.old_lines = None;
+            }
+            if change.deleted || change.old_lines.as_ref().is_some_and(|l| !l.is_empty()) {
+                change.old_source = blob(&base_tree, &change.path);
+            }
+            if let (Some(head_tree), false) = (&head_tree, change.deleted) {
+                change.new_source = blob(head_tree, &change.path);
+            }
+        }
+        Ok(changes)
     }
 
     /// Get all affected files based on base ref and optional head ref

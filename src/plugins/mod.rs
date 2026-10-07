@@ -82,6 +82,15 @@ impl FilesListSelection {
     }
 }
 
+/// A test file selected by `aster affected --related`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedTest {
+    /// Path relative to the project directory.
+    pub file: PathBuf,
+    /// Test names to run within the file; empty for the whole file.
+    pub names: Vec<String>,
+}
+
 /// A build target with its command and dependencies
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Target {
@@ -242,6 +251,24 @@ pub trait LanguagePlugin: Send + Sync {
         }
     }
 
+    /// Narrow a test command to the tests selected by
+    /// `aster affected --related`.
+    ///
+    /// Returns `None` when `command` is not a test command the plugin can
+    /// narrow, in which case it runs as written. [`FilesListPlan::Nothing`]
+    /// means the command would run none of the selected tests.
+    ///
+    /// - project_dir: absolute project directory
+    /// - tests: selected test files of this project's language
+    fn related_tests(
+        &self,
+        _project_dir: &Path,
+        _command: &str,
+        _tests: &[RelatedTest],
+    ) -> Option<FilesListPlan> {
+        None
+    }
+
     /// Modify a command to treat warnings as errors
     ///
     /// Called when a target has the WarningsAsErrors capability and
@@ -288,6 +315,7 @@ pub mod maven;
 pub mod nodejs;
 pub mod python;
 pub mod registry;
+pub(crate) mod related_tests;
 pub mod ruby;
 pub mod rust;
 mod rust_related;

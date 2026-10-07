@@ -82,6 +82,14 @@ fn configuration_scenario_matrix() {
         Scenario { name: "unquoted line break between commands", input: "[targets.run]\ncommand = \"\"\"\nlint\ntest\n\"\"\"\n", expected: Expected::Reject },
         Scenario { name: "line breaks inside an explicit shell", input: "[targets.run]\ncommand = \"\"\"\nbash -c '\n  lint\n  test\n'\n\"\"\"\n", expected: Expected::Accept },
         Scenario { name: "operators inside an explicit shell", input: "[targets]\ncheck = \"bash -c 'lint && test | tee out.log'\"\n", expected: Expected::Accept },
+        Scenario { name: "consumed dependency inferred", input: "depends_on = [\"//api:build\"]\n[consumes.\"//api\"]\ninfer = true\n", expected: Expected::Accept },
+        Scenario { name: "consumed dependency declared files", input: "depends_on = [\"//api\"]\n[consumes.\"//api\"]\nfiles = [\"test/support/*.ex\", \"//other/x.ex\"]\n", expected: Expected::Accept },
+        Scenario { name: "consumed dependency declared empty", input: "depends_on = [\"//api\"]\n[consumes.\"//api\"]\nfiles = []\n", expected: Expected::Accept },
+        Scenario { name: "consumed project not depended on", input: "depends_on = [\"//api\"]\n[consumes.\"//web\"]\ninfer = true\n", expected: Expected::Reject },
+        Scenario { name: "consumed target address", input: "depends_on = [\"//api\"]\n[consumes.\"//api:build\"]\ninfer = true\n", expected: Expected::Reject },
+        Scenario { name: "consumed entry says nothing", input: "depends_on = [\"//api\"]\n[consumes.\"//api\"]\n", expected: Expected::Reject },
+        Scenario { name: "consumed invalid glob", input: "depends_on = [\"//api\"]\n[consumes.\"//api\"]\nfiles = [\"[\"]\n", expected: Expected::Reject },
+        Scenario { name: "consumed unknown key", input: "depends_on = [\"//api\"]\n[consumes.\"//api\"]\ninfer = true\nmystery = 1\n", expected: Expected::Reject },
         Scenario { name: "unterminated string", input: "name = \"aster\n", expected: Expected::Reject },
     ];
 

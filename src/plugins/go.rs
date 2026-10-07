@@ -194,6 +194,15 @@ impl LanguagePlugin for GoPlugin {
         Ok(targets)
     }
 
+    fn related_tests(
+        &self,
+        _project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+    ) -> Option<super::FilesListPlan> {
+        super::related_tests::go(command, tests)
+    }
+
     fn with_files_list(
         &self,
         target_name: &str,

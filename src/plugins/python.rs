@@ -318,6 +318,15 @@ impl LanguagePlugin for PythonPlugin {
         Ok(targets)
     }
 
+    fn related_tests(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+    ) -> Option<super::FilesListPlan> {
+        super::related_tests::pytest(project_dir, command, tests)
+    }
+
     fn with_files_list(
         &self,
         target_name: &str,

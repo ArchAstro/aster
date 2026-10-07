@@ -476,6 +476,15 @@ impl LanguagePlugin for NodeJsPlugin {
         Ok(targets)
     }
 
+    fn related_tests(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+    ) -> Option<super::FilesListPlan> {
+        super::related_tests::node(project_dir, command, tests)
+    }
+
     fn with_files_list(
         &self,
         target_name: &str,

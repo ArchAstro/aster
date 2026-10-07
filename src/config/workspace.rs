@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::project::{validate_aster_config, TargetConfig};
+use super::project::{validate_aster_config, validate_consumes, ConsumesConfig, TargetConfig};
 
 /// Workspace-level configuration from the root aster.toml
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -32,6 +32,8 @@ pub struct WorkspaceConfig {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub targets: HashMap<String, TargetConfig>,
+    #[serde(default)]
+    pub consumes: std::collections::BTreeMap<String, ConsumesConfig>,
 }
 
 /// Configuration for `aster services up`.
@@ -537,6 +539,7 @@ impl WorkspaceConfig {
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
 
         validate_aster_config(&config.depends_on, &config.targets, &config_path)?;
+        validate_consumes(&config.consumes, &config.depends_on, &config_path)?;
         config.dev.validate().with_context(|| {
             format!("Invalid development services in {}", config_path.display())
         })?;

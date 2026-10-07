@@ -167,6 +167,16 @@ pub enum Commands {
         #[arg(long)]
         only_affected_files: bool,
 
+        /// Run only the tests that reach the change, across projects
+        ///
+        /// Builds a source-level dependency graph (Elixir, TypeScript and
+        /// JavaScript, Go, Python) and follows the changed functions, types
+        /// and modules to the tests that refer to them. Test commands run
+        /// narrowed to those tests; projects no change reaches are skipped.
+        /// Implies --dependents, decided per symbol instead of per project.
+        #[arg(long, conflicts_with = "only_affected_files")]
+        related: bool,
+
         /// Treat warnings as errors for targets that support it
         ///
         /// For targets with WarningsAsErrors capability, modifies the command
