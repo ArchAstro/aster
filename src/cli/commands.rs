@@ -119,7 +119,32 @@ pub enum Commands {
     /// Show the target dependency graph
     Graph {
         /// Specific target to show dependencies for (//path/to/project:target)
+        #[arg(conflicts_with = "source")]
         target: Option<String>,
+
+        /// Show the source graph of a change instead: each changed
+        /// definition and what uses it, down to the tests
+        ///
+        /// Covers the uncommitted changes in the working tree unless
+        /// --commit names something else. Files the change does not touch
+        /// are read from the working tree.
+        #[arg(long)]
+        source: bool,
+
+        /// Commit or range to show, read as `git diff` reads it (HEAD~3..HEAD,
+        /// origin/main...HEAD, or one ref to compare the working tree against)
+        #[arg(long, requires = "source")]
+        commit: Option<String>,
+
+        /// Only consider changed files under this directory (relative to the
+        /// workspace root)
+        #[arg(long, requires = "source")]
+        dir: Option<String>,
+
+        /// Only consider changed files with these extensions (comma-separated,
+        /// e.g. "ex,exs")
+        #[arg(long, value_delimiter = ',', requires = "source")]
+        ext: Vec<String>,
     },
 
     /// Show the dependency path between two targets

@@ -105,6 +105,29 @@ pub struct Related {
     pub files_analysed: usize,
     /// Where the analysis spent its time, for `--verbose`.
     pub timings: String,
+    /// Every definition the change reaches, ordered by file and line.
+    pub graph: Vec<GraphNode>,
+}
+
+/// One definition the change reaches, and the definition it was first
+/// reached through.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphNode {
+    pub file: PathBuf,
+    /// `None` for the code of a file outside every definition.
+    pub name: Option<String>,
+    pub kind: &'static str,
+    pub line: usize,
+    /// Address of the project that owns the file.
+    pub project: Option<String>,
+    /// The definition is test code.
+    pub test: bool,
+    /// Why the change itself touches this definition; `None` when it is
+    /// only reached through another one.
+    pub changed: Option<String>,
+    /// Index of the definition this one uses, which is how the change
+    /// reaches it.
+    pub via: Option<usize>,
 }
 
 const TOP: u32 = u32::MAX;
@@ -901,6 +924,7 @@ impl<'a> Index<'a> {
                 .zip(outcomes)
                 .map(|(project, outcome)| (address(project), outcome))
                 .collect(),
+            graph: self.graph(&run),
             files_analysed: 0,
             timings: String::new(),
         }
@@ -938,6 +962,57 @@ impl<'a> Index<'a> {
                 run.mark((other as u32, def as u32), Why::Changed(why));
             }
         }
+    }
+
+    /// Every definition `run` marked, each with the one it was reached
+    /// through.
+    fn graph(&self, run: &Run) -> Vec<GraphNode> {
+        let mut ids: Vec<DefId> = run.affected.keys().copied().collect();
+        let line = |id: &DefId| {
+            if id.1 == TOP {
+                0
+            } else {
+                self.def(*id).lines.0
+            }
+        };
+        ids.sort_by(|a, b| {
+            let (left, right) = (&self.sources[a.0 as usize], &self.sources[b.0 as usize]);
+            (&left.path, line(a), a.1).cmp(&(&right.path, line(b), b.1))
+        });
+        let position: HashMap<DefId, usize> =
+            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        ids.iter()
+            .map(|id| {
+                let source = &self.sources[id.0 as usize];
+                let def = self.def(*id);
+                let (changed, via) = match &run.affected[id] {
+                    Why::Changed(what) => (Some(what.clone()), None),
+                    Why::Via(parent) => match position.get(parent) {
+                        Some(parent) => (None, Some(*parent)),
+                        None => (Some("names a removed definition".to_string()), None),
+                    },
+                };
+                let kind = match def.kind {
+                    _ if id.1 == TOP => "file",
+                    DefKind::Function => "function",
+                    DefKind::Method => "method",
+                    DefKind::Type => "type",
+                    DefKind::Const => "const",
+                    DefKind::Macro => "macro",
+                    DefKind::Test => "test",
+                };
+                GraphNode {
+                    file: source.path.clone(),
+                    name: (id.1 != TOP).then(|| def.name.clone()),
+                    kind,
+                    line: line(id),
+                    project: source.project.map(|p| address(&self.projects[p])),
+                    test: source.facts.is_test_file && !source.ghost,
+                    changed,
+                    via,
+                }
+            })
+            .collect()
     }
 
     fn test_side(&self, source: &Source) -> bool {
