@@ -97,6 +97,9 @@ mod unix {
                 while !thread_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // On macOS an accepted socket inherits the
+                            // listener's non-blocking mode.
+                            let _ = stream.set_nonblocking(false);
                             let capacity = services.len().saturating_add(4000);
                             let (event_tx, event_rx) = mpsc::sync_channel(capacity);
                             if let Ok(mut clients) = thread_clients.lock() {
