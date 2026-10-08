@@ -7,6 +7,7 @@ pub mod commands;
 pub mod output;
 pub mod run;
 mod skills;
+pub mod source_graph;
 
 pub use commands::{
     CacheCommands, Cli, Commands, ProjectCommands, ServicesCommands, ServicesDaemonCommands,

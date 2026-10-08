@@ -38,5 +38,5 @@ mod js;
 mod python;
 mod resolve;
 
-pub use engine::{analyse, Change, Outcome, Related, TestSelection};
+pub use engine::{analyse, Change, GraphNode, Outcome, Related, TestSelection};
 pub use facts::Family;
