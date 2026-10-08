@@ -448,6 +448,11 @@ How a change is followed:
 - A definition nothing names is assumed to be called another way: a
   callback (`handle_call`, `mount`, anything marked `@impl`), a macro, a
   route. It affects every definition that uses its file.
+- Elixir code that lists modules at run time
+  (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
+  `:code.all_loaded()`) can call into any of them, so it is affected by
+  every source change in its own project and in the projects that one
+  depends on.
 - A file that is not source maps to the definitions whose string literals
   name it (by path from anywhere, by bare file name within its own
   project), to the Go declaration that embeds it (`//go:embed`), to the Go
