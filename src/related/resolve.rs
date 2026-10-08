@@ -125,6 +125,44 @@ impl Resolvers {
         resolvers
     }
 
+    /// Whether `spec` reads as naming code in the workspace rather than a
+    /// dependency from outside it: a relative path, a configured alias, a
+    /// workspace package. One that then resolves to nothing is code the
+    /// index cannot follow.
+    pub fn internal(&self, from: &Path, family: Family, spec: &str) -> bool {
+        match family {
+            Family::Js => {
+                if spec.starts_with('.') {
+                    // An asset (`./logo.svg`) is not code.
+                    let leaf = spec.rsplit('/').next().unwrap_or(spec);
+                    let named = leaf
+                        .rsplit_once('.')
+                        .is_some_and(|(stem, _)| !stem.is_empty());
+                    return !named || Family::of(Path::new(leaf)) == Some(Family::Js);
+                }
+                if spec.starts_with("@/") || spec.starts_with('~') || spec.starts_with('#') {
+                    return true;
+                }
+                let mut current = from.parent();
+                while let Some(dir) = current {
+                    if let Some(config) = self.js_configs.get(dir) {
+                        return config
+                            .paths
+                            .iter()
+                            .any(|(pattern, _)| match_pattern(pattern, spec).is_some());
+                    }
+                    current = dir.parent();
+                }
+                false
+            }
+            Family::Python => {
+                let first = spec.split('.').next().unwrap_or(spec);
+                spec.starts_with('.') || self.python_modules.contains_key(first)
+            }
+            Family::Elixir | Family::Go => false,
+        }
+    }
+
     /// The source files `spec` names when used from `from`.
     pub fn resolve(&self, ws: &Workspace, from: &Path, family: Family, spec: &str) -> Vec<PathBuf> {
         match family {
