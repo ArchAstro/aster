@@ -212,6 +212,9 @@ pub struct FileFacts {
     /// Loads a file whose name is computed, so what the file brings into a
     /// process cannot be listed.
     pub open_loads: bool,
+    /// Files a test runner's configuration tells it to load before every
+    /// test (`setupFiles`), as specifiers relative to this file.
+    pub preloads: Vec<String>,
     /// Nothing outside the file's unit can name what a test file declares
     /// (Go's `_test.go`).
     pub tests_private: bool,
@@ -240,6 +243,7 @@ impl FileFacts {
             members: false,
             loads_by_import: false,
             open_loads: false,
+            preloads: Vec::new(),
             tests_private: false,
             dynamic: None,
             embeds: Vec::new(),

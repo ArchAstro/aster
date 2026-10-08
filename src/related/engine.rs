@@ -161,6 +161,8 @@ struct Source {
     loose: Vec<Vec<String>>,
     /// Loads code the index could not follow.
     opaque: bool,
+    /// Units this runner configuration has loaded before every test.
+    preloaded: Vec<u32>,
 }
 
 struct Index<'a> {
@@ -239,6 +241,9 @@ struct Run<'a, 'b> {
     barred: HashSet<DefId>,
     /// Changed files that reach a test through such a chain.
     covered: HashSet<u32>,
+    /// Units loaded before every test that the change reaches through code
+    /// they load.
+    entered: HashSet<u32>,
     /// The size of the graph when it was last validated.
     validated: Option<(usize, usize)>,
     edges: usize,
@@ -695,7 +700,17 @@ impl<'a> Index<'a> {
                     .filter(|(qualifier, _)| qualifier == ".")
                     .filter_map(|(_, unit)| *unit),
             );
-            let linked = (calls, loose, opaque);
+            let preloaded: Vec<u32> = file
+                .preloads
+                .iter()
+                .filter(|_| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_runner_config)
+                })
+                .flat_map(|spec| resolve(path, family, spec))
+                .collect();
+            let linked = (calls, loose, opaque, preloaded);
             sources.push((uses, via, linked, imports, file_unit[i]));
         }
 
@@ -704,7 +719,7 @@ impl<'a> Index<'a> {
             .into_iter()
             .zip(sources)
             .map(
-                |(path, (uses, via, (calls, loose, opaque), imports, unit))| Source {
+                |(path, (uses, via, (calls, loose, opaque, preloaded), imports, unit))| Source {
                     facts: facts.remove(&path).expect("facts for every indexed path"),
                     project: owner(projects, &path),
                     ghost: ghosts.contains(&path),
@@ -716,6 +731,7 @@ impl<'a> Index<'a> {
                     imports,
                     loose,
                     opaque,
+                    preloaded,
                 },
             )
             .collect();
@@ -727,9 +743,8 @@ impl<'a> Index<'a> {
         }
         let mut preloads: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); projects.len()];
         for source in &sources {
-            let name = source.path.file_name().and_then(|n| n.to_str());
-            if let (Some(project), true) = (source.project, name.is_some_and(is_runner_config)) {
-                preloads[project].extend(source.uses.iter().flatten().copied());
+            if let Some(project) = source.project {
+                preloads[project].extend(source.preloaded.iter().copied());
             }
         }
         let mut unit_opaque = vec![false; unit_files.len()];
@@ -1102,11 +1117,16 @@ impl<'a> Index<'a> {
         // A file the runner loads before every test is no test's import,
         // so a change that reaches one reaches them all.
         for (project, units) in self.preloads.iter().enumerate() {
+            run.validate();
             let reached = run
                 .affected
                 .keys()
                 .map(|id| &self.sources[id.0 as usize])
-                .find(|source| units.contains(&source.unit) && !source.facts.is_test_file);
+                .find(|source| {
+                    units.contains(&source.unit)
+                        && !source.facts.is_test_file
+                        && (run.entered.contains(&source.unit) || !source.facts.loads_by_import)
+                });
             if let Some(source) = reached {
                 let reason = format!(
                     "{} is loaded before every test and the change reaches it",
@@ -1765,6 +1785,7 @@ impl<'a, 'b> Run<'a, 'b> {
             seeded: HashSet::new(),
             barred: HashSet::new(),
             covered: HashSet::new(),
+            entered: HashSet::new(),
             validated: None,
             edges: 0,
         }
@@ -1799,11 +1820,16 @@ impl<'a, 'b> Run<'a, 'b> {
         self.validated = Some(stamp);
         self.barred.clear();
         self.covered.clear();
+        self.entered.clear();
         let ix = self.ix;
+        // Where a process starts: a test file, or a file the runner loads
+        // before every test.
+        let preloaded = |unit: u32| ix.preloads.iter().any(|units| units.contains(&unit));
         let mut entries: BTreeMap<u32, Vec<DefId>> = BTreeMap::new();
         for id in self.affected.keys() {
             let source = &ix.sources[id.0 as usize];
-            if source.facts.is_test_file && !source.ghost && source.facts.loads_by_import {
+            let starts = source.facts.is_test_file || preloaded(source.unit);
+            if starts && !source.ghost && source.facts.loads_by_import {
                 entries.entry(source.unit).or_default().push(*id);
             }
         }
@@ -1854,9 +1880,16 @@ impl<'a, 'b> Run<'a, 'b> {
             // Backwards from the tests it reached, to the files that count.
             let mut seen: HashSet<DefId> = HashSet::new();
             let mut stack: Vec<DefId> = Vec::new();
+            let is_test = ix.sources[tests[0].0 as usize].facts.is_test_file;
             for test in tests {
                 if !reached.contains(&test) {
-                    self.barred.insert(test);
+                    if is_test {
+                        self.barred.insert(test);
+                    }
+                    continue;
+                }
+                if !is_test {
+                    self.entered.insert(unit);
                     continue;
                 }
                 if seen.insert(test) {

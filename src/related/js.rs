@@ -369,6 +369,18 @@ impl Walker<'_> {
         }
     }
 
+    fn preloads(&mut self, node: Node) {
+        if node.kind() == "string_fragment" {
+            let value = text(node, self.source);
+            if value.starts_with('.') {
+                self.facts.preloads.push(value.to_string());
+            }
+        }
+        for child in children(node) {
+            self.preloads(child);
+        }
+    }
+
     /// Record `object.property` as a member access, typed when the object
     /// is the instance of the enclosing class.
     fn member(&mut self, object: Option<Node>, property: &str, owner: Owner) {
@@ -662,6 +674,18 @@ impl Walker<'_> {
                 if let Some(name) = index.and_then(|i| string_value(i, self.source)) {
                     let name = name.to_string();
                     self.member(node.child_by_field_name("object"), &name, owner);
+                }
+            }
+            // `setupFiles: ["./setup.ts"]`, `globalSetup: …` in a runner's
+            // configuration.
+            "pair" => {
+                let key = node.child_by_field_name("key");
+                let names_setup = key.is_some_and(|key| {
+                    let key = text(key, self.source).to_ascii_lowercase();
+                    key.contains("setup") || key.contains("teardown")
+                });
+                if let (true, Some(value)) = (names_setup, node.child_by_field_name("value")) {
+                    self.preloads(value);
                 }
             }
             // `const { other: local } = value`.
