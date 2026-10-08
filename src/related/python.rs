@@ -2,8 +2,9 @@
 //! import bindings and pytest tests.
 
 use super::facts::{
-    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner,
+    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner, ANY_TYPE,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -19,6 +20,12 @@ struct Walker<'a> {
     facts: FileFacts,
     bindings: Vec<Binding>,
     inert: Vec<(usize, usize)>,
+    /// Inside a method: the name of its instance parameter and the class.
+    instance: Option<(String, String)>,
+    /// Names the file binds other than by importing them.
+    bound: HashSet<String>,
+    /// `name.member` accesses waiting to learn what `name` is.
+    named_members: Vec<(Owner, String, String)>,
 }
 
 pub fn extract(path: &Path, source: &str) -> FileFacts {
@@ -36,7 +43,13 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         facts,
         bindings: Vec::new(),
         inert: Vec::new(),
+        instance: None,
+        bound: HashSet::new(),
+        named_members: Vec::new(),
     };
+    walker.bind(tree.root_node());
+    walker.facts.members = true;
+    walker.facts.loads_by_import = true;
     for child in children(tree.root_node()) {
         walker.statement(child, child, None);
     }
@@ -134,8 +147,27 @@ impl Walker<'_> {
                 } else {
                     DefKind::Function
                 };
-                let owner = self.facts.push(Def::new(name.clone(), kind, span(whole)));
+                let mut def = Def::new(name.clone(), kind, span(whole));
+                let class_name = match class {
+                    Some(Owner::Def(index)) => Some(self.facts.defs[index].name.clone()),
+                    _ => None,
+                };
+                if kind == DefKind::Method {
+                    def.owner = class_name.clone();
+                }
+                // By convention the first parameter of a method is the
+                // instance (`self`) or the class (`cls`).
+                let receiver = node
+                    .child_by_field_name("parameters")
+                    .and_then(|parameters| parameters.named_child(0))
+                    .filter(|first| first.kind() == "identifier")
+                    .map(|first| text(first, self.source).to_string())
+                    .filter(|first| matches!(first.as_str(), "self" | "cls"));
+                let owner = self.facts.push(def);
+                let outer_instance =
+                    std::mem::replace(&mut self.instance, receiver.zip(class_name));
                 self.walk(node, owner);
+                self.instance = outer_instance;
                 self.facts.owner(owner).refs.remove(&name);
             }
             "class_definition" => {
@@ -143,9 +175,19 @@ impl Walker<'_> {
                     return;
                 };
                 let name = text(name, self.source).to_string();
-                let owner = self
-                    .facts
-                    .push(Def::new(name.clone(), DefKind::Type, span(whole)));
+                let mut def = Def::new(name.clone(), DefKind::Type, span(whole));
+                def.concrete = true;
+                if let Some(bases) = node.child_by_field_name("superclasses") {
+                    for base in children(bases) {
+                        match base.kind() {
+                            "identifier" => def.supers.push(text(base, self.source).to_string()),
+                            "keyword_argument" | "comment" => {}
+                            _ if base.is_named() => def.supers.push(ANY_TYPE.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                let owner = self.facts.push(def);
                 for child in children(node) {
                     if child.kind() == "block" {
                         for member in children(child) {
@@ -199,6 +241,61 @@ impl Walker<'_> {
             "string_content" => {
                 let value = text(node, self.source).to_string();
                 self.facts.owner(owner).string(&value);
+                return;
+            }
+            "attribute" => {
+                let object = node.child_by_field_name("object");
+                if let Some(attribute) = node.child_by_field_name("attribute") {
+                    let attribute = text(attribute, self.source).to_string();
+                    let on_instance = object.is_some_and(|object| {
+                        let name = text(object, self.source);
+                        match (&self.instance, object.kind()) {
+                            (Some((receiver, _)), "identifier") => name == receiver,
+                            (Some(_), "call") => name.starts_with("super("),
+                            _ => false,
+                        }
+                    });
+                    let named = object.filter(|o| o.kind() == "identifier");
+                    match (self.instance.clone().filter(|_| on_instance), named) {
+                        (Some((_, class)), _) => {
+                            self.facts.owner(owner).typed.insert((class, attribute));
+                        }
+                        (None, Some(name)) => {
+                            let name = text(name, self.source).to_string();
+                            self.named_members.push((owner, name, attribute));
+                        }
+                        (None, None) => {
+                            self.facts.owner(owner).members.insert(attribute);
+                        }
+                    }
+                }
+            }
+            // `getattr(value, "name")`.
+            "call"
+                if node
+                    .child_by_field_name("function")
+                    .is_some_and(|f| text(f, self.source) == "getattr") =>
+            {
+                let name = node
+                    .child_by_field_name("arguments")
+                    .and_then(|arguments| arguments.named_child(1))
+                    .filter(|name| name.kind() == "string")
+                    .map(|name| {
+                        text(name, self.source)
+                            .trim_matches(['"', '\''])
+                            .to_string()
+                    });
+                if let Some(name) = name {
+                    self.facts.owner(owner).members.insert(name);
+                }
+            }
+            // A class has its own instances.
+            "class_definition" if self.instance.is_some() => {
+                let outer = self.instance.take();
+                for child in children(node) {
+                    self.walk(child, owner);
+                }
+                self.instance = outer;
                 return;
             }
             "string" => {
@@ -276,8 +373,52 @@ impl Walker<'_> {
         }
     }
 
+    /// Collect every name the file binds by assigning or declaring it, so
+    /// that a name bound only by an import can be told apart.
+    fn bind(&mut self, node: Node) {
+        let field = |name: &str| node.child_by_field_name(name);
+        let target = match node.kind() {
+            "import_statement" | "import_from_statement" | "future_import_statement" => return,
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                field("left")
+            }
+            "as_pattern" => field("alias"),
+            "named_expression" | "function_definition" | "class_definition" => field("name"),
+            "parameters" | "lambda_parameters" | "global_statement" | "nonlocal_statement" => {
+                Some(node)
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.bind_names(target);
+        }
+        for child in children(node) {
+            self.bind(child);
+        }
+    }
+
+    fn bind_names(&mut self, node: Node) {
+        if node.kind() == "identifier" {
+            self.bound.insert(text(node, self.source).to_string());
+        }
+        for child in children(node) {
+            self.bind_names(child);
+        }
+    }
+
     fn apply_bindings(&mut self) {
         let bindings = std::mem::take(&mut self.bindings);
+        for (owner, name, member) in std::mem::take(&mut self.named_members) {
+            let imported: Vec<&Binding> = bindings.iter().filter(|b| b.local == name).collect();
+            let def = self.facts.owner(owner);
+            if self.bound.contains(&name) || imported.is_empty() {
+                def.members.insert(member);
+                continue;
+            }
+            for spec in imported.iter().flat_map(|binding| &binding.specs) {
+                def.outside.insert((spec.clone(), member.clone()));
+            }
+        }
         let mut owners: Vec<Owner> = (0..self.facts.defs.len()).map(Owner::Def).collect();
         owners.push(Owner::Top);
         for owner in owners {
@@ -303,6 +444,24 @@ impl Walker<'_> {
 mod tests {
     use super::*;
     use crate::related::facts::LineClass;
+
+    #[test]
+    fn tells_instance_members_from_other_values() {
+        let source = "import os\n\nclass Box(Base, metaclass=Meta):\n    def close(self, os):\n        self.lid.shut()\n        return super().close() + other.close() + getattr(self, \"seal\")()\n\n\ndef join(parts):\n    return os.path.join(parts)\n";
+        let facts = extract(Path::new("shop/box.py"), source);
+        let close = facts.defs.iter().find(|d| d.name == "close").unwrap();
+        assert!(close
+            .typed
+            .contains(&("Box".to_string(), "lid".to_string())));
+        assert!(close
+            .typed
+            .contains(&("Box".to_string(), "close".to_string())));
+        assert!(close.members.contains("shut") && close.members.contains("close"));
+        assert!(close.members.contains("seal"));
+        // `os` is also a parameter in this file, so `os.path` may be anything.
+        let join = facts.defs.iter().find(|d| d.name == "join").unwrap();
+        assert!(join.members.contains("path") && join.members.contains("join"));
+    }
 
     #[test]
     fn extracts_definitions_and_import_uses() {
@@ -336,6 +495,13 @@ class Cart(Base):
         assert!(cart.refs.contains("release"));
         let add = facts.defs.iter().find(|d| d.name == "add").unwrap();
         assert_eq!(add.kind, DefKind::Method);
+        assert_eq!(add.owner.as_deref(), Some("Cart"));
+        // `money.add` is a member of an imported module.
+        assert!(total
+            .outside
+            .contains(&("shop.money".to_string(), "add".to_string())));
+        assert!(!total.members.contains("add"));
+        assert_eq!(cart.supers, ["Base"]);
         assert!(facts.defs.iter().any(|d| d.name == "LIMIT"));
     }
 

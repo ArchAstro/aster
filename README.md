@@ -443,8 +443,30 @@ How a change is followed:
   code names a route's path, everything that goes through the router is
   affected instead.
 - Methods, and functions of an Elixir `defimpl`, are reached through a
-  value, so they are matched by name in the changed project and the projects
-  downstream of it.
+  value, so their callers need not import their file. They are matched by
+  name, against member accesses (`value.name`) in the changed project and
+  the projects downstream of it, with these exceptions:
+  - A member of a literal, of a built-in global (`Promise.resolve`), or of
+    something imported from outside the workspace (`path.join`) is not a
+    method of anything the workspace declares.
+  - In Go, `pkg.Name` is that package's `Name` and nothing else, and a
+    variable the function declares with a struct type of its own package
+    (`w *Worker`, `w := Worker{}`) calls that type's methods or those of the
+    types it embeds.
+  - `this.name` and `self.name` call the enclosing class's method, or one
+    from a class it extends or that extends it. A base class that cannot be
+    named (a mixin call) leaves the call open.
+- In Go, TypeScript, JavaScript and Python, code runs only once something
+  imports its file. A test is therefore selected only when every definition
+  on some chain from the change to the test is in a file the test's own
+  imports lead to. A test whose imports cannot all be followed (a computed
+  `import(name)`, an import of workspace code that resolves to no file) is
+  taken to load anything. This does not apply to Elixir, where the whole
+  application is loaded.
+- A file the test runner loads before every test (one a `vitest.*`,
+  `jest.config.*` or `playwright.config.*` file names, such as
+  `setupFiles`) is no test's import. A change that reaches one runs the
+  project in full.
 - A definition nothing names is assumed to be called another way: a
   callback (`handle_call`, `mount`, anything marked `@impl`), a macro, a
   route. It affects every definition that uses its file.

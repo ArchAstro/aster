@@ -2,8 +2,9 @@
 //! import bindings and test blocks.
 
 use super::facts::{
-    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner,
+    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner, ANY_TYPE,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -23,10 +24,55 @@ struct Walker<'a> {
     bindings: Vec<Binding>,
     inert: Vec<(usize, usize)>,
     has_tests: bool,
+    /// The class whose instance `this` is, where that is certain.
+    this_type: Option<String>,
+    /// Names the file binds other than by importing them.
+    bound: HashSet<String>,
+    /// `name.member` accesses waiting to learn what `name` is.
+    named_members: Vec<(Owner, String, String)>,
 }
+
+/// Objects every JavaScript runtime provides. A member of one is not a
+/// method of anything a workspace declares.
+const GLOBALS: &[&str] = &[
+    "Array",
+    "BigInt",
+    "Boolean",
+    "Buffer",
+    "Date",
+    "Error",
+    "Intl",
+    "JSON",
+    "Map",
+    "Math",
+    "Number",
+    "Object",
+    "Promise",
+    "Reflect",
+    "RegExp",
+    "Set",
+    "String",
+    "Symbol",
+    "URL",
+    "URLSearchParams",
+    "WeakMap",
+    "WeakSet",
+    "console",
+    "crypto",
+    "document",
+    "globalThis",
+    "localStorage",
+    "navigator",
+    "performance",
+    "process",
+    "sessionStorage",
+    "window",
+];
 
 pub fn extract(path: &Path, source: &str) -> FileFacts {
     let mut facts = FileFacts::new(Family::Js);
+    facts.members = true;
+    facts.loads_by_import = true;
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     // The TSX grammar reads JavaScript and JSX; only `.ts` needs the plain
     // one, where `<T>value` is a cast rather than an element.
@@ -46,7 +92,11 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         bindings: Vec::new(),
         inert: Vec::new(),
         has_tests: false,
+        this_type: None,
+        bound: HashSet::new(),
+        named_members: Vec::new(),
     };
+    walker.bind(tree.root_node());
     for child in children(tree.root_node()) {
         walker.statement(child, child);
     }
@@ -197,9 +247,11 @@ impl Walker<'_> {
             .child_by_field_name("name")
             .map(|n| text(n, self.source).to_string())
             .unwrap_or_else(|| "default".to_string());
-        let class = self
-            .facts
-            .push(Def::new(name.clone(), DefKind::Type, span(whole)));
+        let mut def = Def::new(name.clone(), DefKind::Type, span(whole));
+        def.concrete = true;
+        def.supers = self.extended(node);
+        let class = self.facts.push(def);
+        let outer = self.this_type.replace(name.clone());
         for child in children(node) {
             if child.kind() != "class_body" {
                 self.walk(child, class);
@@ -217,19 +269,135 @@ impl Walker<'_> {
                 match member_name {
                     // Constructing the class is a use of the class itself.
                     Some(member_name) if is_method && member_name != "constructor" => {
-                        let owner = self.facts.push(Def::new(
-                            member_name.clone(),
-                            DefKind::Method,
-                            span(member),
-                        ));
-                        self.walk(member, owner);
+                        let mut method =
+                            Def::new(member_name.clone(), DefKind::Method, span(member));
+                        method.owner = Some(name.clone());
+                        let owner = self.facts.push(method);
+                        // The member's own `this` is the instance; walking
+                        // its parts keeps that.
+                        for part in children(member) {
+                            self.walk(part, owner);
+                        }
                         self.facts.owner(owner).refs.remove(&member_name);
                     }
-                    _ => self.walk(member, class),
+                    _ => {
+                        for part in children(member) {
+                            self.walk(part, class);
+                        }
+                    }
                 }
             }
         }
+        self.this_type = outer;
         self.facts.owner(class).refs.remove(&name);
+    }
+
+    /// The classes a class extends. One that is not a plain name (a mixin
+    /// call, `ns.Base`) cannot be followed.
+    fn extended(&self, class: Node) -> Vec<String> {
+        let mut clauses = Vec::new();
+        for heritage in children(class) {
+            if heritage.kind() != "class_heritage" {
+                continue;
+            }
+            let extends: Vec<Node> = children(heritage)
+                .into_iter()
+                .filter(|c| c.kind() == "extends_clause")
+                .collect();
+            if extends.is_empty() {
+                // JavaScript: the heritage is the expression itself.
+                clauses.extend(children(heritage).into_iter().filter(|c| c.is_named()));
+            }
+            for clause in extends {
+                clauses.extend(clause.child_by_field_name("value"));
+            }
+        }
+        clauses
+            .into_iter()
+            .filter(|c| c.kind() != "implements_clause")
+            .map(|value| match value.kind() {
+                "identifier" => text(value, self.source).to_string(),
+                _ => ANY_TYPE.to_string(),
+            })
+            .collect()
+    }
+
+    /// Collect every name the file binds by declaring it, so that a name
+    /// bound only by an import, or not at all, can be told apart.
+    fn bind(&mut self, node: Node) {
+        let field = |name: &str| node.child_by_field_name(name);
+        let pattern = match node.kind() {
+            "import_statement" => return,
+            "variable_declarator" => {
+                // `const x = require("y")` is an import.
+                let loads = field("value").is_some_and(|v| loaded_spec(v, self.source).is_some());
+                field("name").filter(|_| !loads)
+            }
+            "required_parameter" | "optional_parameter" => field("pattern"),
+            "arrow_function" => field("parameter"),
+            "catch_clause" => field("parameter"),
+            "for_in_statement" => field("left"),
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "enum_declaration"
+            | "internal_module" => field("name"),
+            // JavaScript parameters are bare patterns.
+            "formal_parameters" => Some(node),
+            _ => None,
+        };
+        if let Some(pattern) = pattern {
+            self.bind_names(pattern);
+        }
+        for child in children(node) {
+            self.bind(child);
+        }
+    }
+
+    fn bind_names(&mut self, node: Node) {
+        if matches!(
+            node.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) {
+            self.bound.insert(text(node, self.source).to_string());
+        }
+        for child in children(node) {
+            self.bind_names(child);
+        }
+    }
+
+    /// Record `object.property` as a member access, typed when the object
+    /// is the instance of the enclosing class.
+    fn member(&mut self, object: Option<Node>, property: &str, owner: Owner) {
+        match object.map(|o| o.kind()) {
+            // A member of a literal is the language's own.
+            Some(
+                "array" | "string" | "template_string" | "number" | "regex" | "object" | "true"
+                | "false" | "null",
+            ) => return,
+            Some("identifier") => {
+                let name = object.map(|o| text(o, self.source)).unwrap_or_default();
+                self.named_members
+                    .push((owner, name.to_string(), property.to_string()));
+                return;
+            }
+            _ => {}
+        }
+        let on_instance = object.is_some_and(|o| matches!(o.kind(), "this" | "super"));
+        match self.this_type.clone().filter(|_| on_instance) {
+            Some(class) => {
+                self.facts
+                    .owner(owner)
+                    .typed
+                    .insert((class, property.to_string()));
+            }
+            None => {
+                self.facts.owner(owner).members.insert(property.to_string());
+            }
+        }
     }
 
     fn declarator(&mut self, node: Node, whole: Node) {
@@ -466,6 +634,10 @@ impl Walker<'_> {
             | "shorthand_property_identifier"
             | "shorthand_property_identifier_pattern" => {
                 let name = text(node, self.source).to_string();
+                if node.kind() == "shorthand_property_identifier_pattern" {
+                    // `const { name } = value` reads a member.
+                    self.facts.owner(owner).members.insert(name.clone());
+                }
                 self.facts.owner(owner).refs.insert(name);
                 return;
             }
@@ -478,9 +650,56 @@ impl Walker<'_> {
                 return;
             }
             "import_statement" => return self.import(node),
+            "member_expression" => {
+                if let Some(property) = node.child_by_field_name("property") {
+                    let property = text(property, self.source).to_string();
+                    self.member(node.child_by_field_name("object"), &property, owner);
+                }
+            }
+            // `value["name"]`.
+            "subscript_expression" => {
+                let index = node.child_by_field_name("index");
+                if let Some(name) = index.and_then(|i| string_value(i, self.source)) {
+                    let name = name.to_string();
+                    self.member(node.child_by_field_name("object"), &name, owner);
+                }
+            }
+            // `const { other: local } = value`.
+            "pair_pattern" => {
+                if let Some(key) = node.child_by_field_name("key") {
+                    let name = text(key, self.source).trim_matches(['"', '\'']).to_string();
+                    self.facts.owner(owner).members.insert(name);
+                }
+            }
+            // A function with its own `this`.
+            "function_expression"
+            | "function_declaration"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "class"
+            | "class_declaration"
+            | "abstract_class_declaration"
+                if self.this_type.is_some() =>
+            {
+                let outer = self.this_type.take();
+                for child in children(node) {
+                    self.walk(child, owner);
+                }
+                self.this_type = outer;
+                return;
+            }
             "call_expression" => {
                 if let Some(spec) = loaded_spec(node, self.source) {
                     self.facts.owner(owner).uses.insert(spec.to_string());
+                } else if node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| {
+                        function.kind() == "import" || text(function, self.source) == "require"
+                    })
+                {
+                    // `import(name)`: whatever `name` turns out to be.
+                    self.facts.open_loads = true;
                 }
                 if let Some(test) = self.test_call(node) {
                     self.has_tests = true;
@@ -530,6 +749,19 @@ impl Walker<'_> {
     /// references to the name it has there.
     fn apply_bindings(&mut self) {
         let bindings = std::mem::take(&mut self.bindings);
+        for (owner, name, member) in std::mem::take(&mut self.named_members) {
+            let imported: Vec<&Binding> = bindings.iter().filter(|b| b.local == name).collect();
+            let def = self.facts.owner(owner);
+            if self.bound.contains(&name) {
+                def.members.insert(member);
+            } else if !imported.is_empty() {
+                for binding in imported {
+                    def.outside.insert((binding.spec.clone(), member.clone()));
+                }
+            } else if !GLOBALS.contains(&name.as_str()) {
+                def.members.insert(member);
+            }
+        }
         let mut owners: Vec<Owner> = (0..self.facts.defs.len()).map(Owner::Def).collect();
         owners.push(Owner::Top);
         for owner in owners {
@@ -551,6 +783,41 @@ impl Walker<'_> {
 mod tests {
     use super::*;
     use crate::related::facts::LineClass;
+
+    #[test]
+    fn tells_values_from_globals_literals_and_shadowed_imports() {
+        let source = r#"import path from "node:path";
+import { store } from "./store";
+
+export function a(list, path) {
+  // The parameter hides the import.
+  return path.join(list);
+}
+
+export function b(list) {
+  return [1].join(",") + Promise.resolve(list).then + store.get(1) + list.find(1);
+}
+
+export async function c(name) {
+  const { open, close: shut } = await import(name);
+  return obj["send"]();
+}
+"#;
+        let facts = extract(Path::new("src/x.ts"), source);
+        let def = |name: &str| facts.defs.iter().find(|d| d.name == name).unwrap();
+        // `path` is bound in the file, so `path.join` may be anything.
+        assert!(def("a").members.contains("join"));
+        let b = def("b");
+        assert!(!b.members.contains("join") && !b.members.contains("resolve"));
+        assert!(b.members.contains("then") && b.members.contains("find"));
+        assert!(b
+            .outside
+            .contains(&("./store".to_string(), "get".to_string())));
+        let c = def("c");
+        assert!(c.members.contains("open") && c.members.contains("close"));
+        assert!(c.members.contains("send"));
+        assert!(facts.open_loads);
+    }
 
     #[test]
     fn extracts_declarations_and_import_uses() {
@@ -587,6 +854,20 @@ export class Cart extends Base {
         assert!(cart.refs.contains("audit"));
         let add = facts.defs.iter().find(|d| d.name == "add").unwrap();
         assert_eq!(add.kind, DefKind::Method);
+        // `this.items` is a member of the class; `.push` is called on a
+        // value of some other type.
+        assert_eq!(add.owner.as_deref(), Some("Cart"));
+        assert!(add
+            .typed
+            .contains(&("Cart".to_string(), "items".to_string())));
+        assert!(add.members.contains("push"));
+        assert!(cart.concrete);
+        assert_eq!(cart.supers, ["Base"]);
+        // `money.add` is a member of an import, `legacy.wrap` likewise.
+        assert!(total
+            .outside
+            .contains(&("@shop/money".to_string(), "add".to_string())));
+        assert!(!total.members.contains("add"));
         assert_eq!(facts.class_of(6), LineClass::Inert);
         assert_eq!(facts.class_of(1), LineClass::Import(0));
         assert_eq!(facts.imports[0].names, ["fmt", "read"]);

@@ -502,6 +502,143 @@ fn go_change_selects_test_functions_by_name() {
 }
 
 #[test]
+fn go_names_are_told_apart_by_package_and_receiver() {
+    let ws = Workspace::new(&[
+        ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
+        (
+            "svc/box/box.go",
+            "package box\n\nimport \"errors\"\n\ntype Lid struct{}\n\ntype Base struct{}\n\nfunc New() int { return 1 }\n\nfunc Fail() error { return errors.New(\"x\") }\n\nfunc (l *Lid) Close() int { return 1 }\n\nfunc (b *Base) Close() int { return 2 }\n\nfunc Shut(l *Lid) int { return l.Close() }\n\nfunc Rest(b *Base) int { return b.Close() }\n",
+        ),
+        (
+            "svc/box/box_test.go",
+            "package box\n\nimport \"testing\"\n\nfunc TestNew(t *testing.T) { New() }\n\nfunc TestFail(t *testing.T) { Fail() }\n\nfunc TestShut(t *testing.T) { Shut(nil) }\n\nfunc TestRest(t *testing.T) { Rest(nil) }\n",
+        ),
+    ]);
+    // `errors.New` is another package's function, not this one's `New`.
+    ws.edit(
+        "svc/box/box.go",
+        "{ return 1 }\n\nfunc Fail",
+        "{ return 3 }\n\nfunc Fail",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//svc:test"),
+        ["go test -run '^(TestNew)$' ./box"]
+    );
+
+    // `b.Close()` on a `*Base` cannot be `Lid`'s method.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit(
+        "svc/box/box.go",
+        "Close() int { return 1 }",
+        "Close() int { return 4 }",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//svc:test"),
+        ["go test -run '^(TestShut)$' ./box"]
+    );
+}
+
+#[test]
+fn a_method_reaches_only_the_tests_that_load_its_file() {
+    let ws = Workspace::new(&[
+        (
+            "post/package.json",
+            r#"{"name":"post","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "post/src/mail.ts",
+            "export class Mail {\n  send(text: string) {\n    return `mail:${text}`;\n  }\n}\n",
+        ),
+        (
+            "post/src/sms.ts",
+            "export class Sms {\n  send(text: string) {\n    return `sms:${text}`;\n  }\n}\n",
+        ),
+        // Calls `send` on whatever it is handed.
+        (
+            "post/src/notify.ts",
+            "import path from \"node:path\";\n\nexport function notify(channel: { send(text: string): string }, parts: string[]) {\n  return channel.send(path.join(...parts) + [\"a\"].join(\"\"));\n}\n",
+        ),
+        (
+            "post/src/mail.test.ts",
+            "import { Mail } from \"./mail\";\nit(\"mails\", () => { expect(new Mail().send(\"x\")).toBe(\"mail:x\"); });\n",
+        ),
+        (
+            "post/src/sms.test.ts",
+            "import { Sms } from \"./sms\";\nit(\"texts\", () => { expect(new Sms().send(\"x\")).toBe(\"sms:x\"); });\n",
+        ),
+        (
+            "post/src/notify-mail.test.ts",
+            "import { Mail } from \"./mail\";\nimport { notify } from \"./notify\";\nit(\"notifies\", () => { notify(new Mail(), [\"x\"]); });\n",
+        ),
+        (
+            "post/src/notify-sms.test.ts",
+            "import { Sms } from \"./sms\";\nimport { notify } from \"./notify\";\nit(\"notifies\", () => { notify(new Sms(), [\"x\"]); });\n",
+        ),
+        // Loads a file whose name is computed: it may load `mail.ts`.
+        (
+            "post/src/plugin.test.ts",
+            "import { notify } from \"./notify\";\nit(\"loads\", async () => { const m = await import(process.env.CHANNEL!); notify(new m.default(), [\"x\"]); });\n",
+        ),
+    ]);
+    ws.edit("post/src/mail.ts", "`mail:${text}`", "`mail: ${text}`");
+    // `sms.test.ts` and `notify-sms.test.ts` call a `send` too, but never
+    // load `mail.ts`.
+    assert_eq!(
+        ws.plan("test").commands("//post:test"),
+        ["npm test -- src/mail.test.ts src/notify-mail.test.ts src/plugin.test.ts"]
+    );
+}
+
+#[test]
+fn a_change_that_reaches_a_setup_file_runs_every_test() {
+    let ws = Workspace::new(&[
+        (
+            "post/package.json",
+            r#"{"name":"post","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "post/vitest.config.ts",
+            "export default { test: { setupFiles: [\"./test/setup.ts\"] } };\n",
+        ),
+        (
+            "post/src/clock.ts",
+            "export function now() {\n  return 1;\n}\n\nexport function later() {\n  return 2;\n}\n",
+        ),
+        // Runs before every test, none of which imports it.
+        (
+            "post/test/setup.ts",
+            "import { now } from \"../src/clock\";\n\nglobalThis.started = now();\n",
+        ),
+        (
+            "post/src/clock.test.ts",
+            "import { later, now } from \"./clock\";\nit(\"now\", () => { expect(now()).toBe(1); });\nit(\"later\", () => { expect(later()).toBe(2); });\n",
+        ),
+        (
+            "post/src/other.test.ts",
+            "it(\"reads the start\", () => { expect(globalThis.started).toBe(1); });\n",
+        ),
+    ]);
+    // The setup file does not use `later`.
+    ws.edit("post/src/clock.ts", "return 2", "return 3");
+    assert_eq!(
+        ws.plan("test").commands("//post:test"),
+        ["npm test -- src/clock.test.ts"]
+    );
+
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("post/src/clock.ts", "return 1", "return 0");
+    let plan = ws.plan("test");
+    // No narrowed command: the target runs as written.
+    assert!(plan.commands("//post:test").is_empty());
+    assert!(
+        plan.notes("//post:test")
+            .contains("post/test/setup.ts is loaded before every test"),
+        "{}",
+        plan.notes("//post:test")
+    );
+}
+
+#[test]
 fn python_change_selects_test_files_through_imports() {
     let ws = Workspace::new(&[
         (

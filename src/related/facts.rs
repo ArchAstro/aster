@@ -88,7 +88,29 @@ pub struct Def {
     /// Lists the modules of an application at run time, so it can reach
     /// code it never names.
     pub reflects: bool,
+    /// The type a method belongs to.
+    pub owner: Option<String>,
+    /// Types this type takes methods from: what it extends or embeds.
+    /// [`ANY_TYPE`] stands for one that cannot be named.
+    pub supers: Vec<String>,
+    /// A type whose methods are its own and its supers': a struct or a
+    /// class, not an interface or an alias.
+    pub concrete: bool,
+    /// Names accessed on a value (`value.name`) whose type is not known.
+    /// Only languages that set [`FileFacts::members`] fill this.
+    pub members: BTreeSet<String>,
+    /// Names accessed on a value of a type declared in this file's unit,
+    /// as `(type, name)`: `this.name` in a class, `w.name` for a Go
+    /// variable declared as `w *Worker`.
+    pub typed: BTreeSet<(String, String)>,
+    /// Names accessed on something imported, as `(specifier, name)`. A
+    /// module from outside the workspace holds nothing declared in it, so
+    /// the index keeps these only where the specifier resolves.
+    pub outside: BTreeSet<(String, String)>,
 }
+
+/// A super type that cannot be named: a mixin call, a type from elsewhere.
+pub const ANY_TYPE: &str = "*";
 
 impl Def {
     pub fn new(name: impl Into<String>, kind: DefKind, lines: (usize, usize)) -> Self {
@@ -107,6 +129,12 @@ impl Def {
             route: None,
             paths: Vec::new(),
             reflects: false,
+            owner: None,
+            supers: Vec::new(),
+            concrete: false,
+            members: BTreeSet::new(),
+            typed: BTreeSet::new(),
+            outside: BTreeSet::new(),
         }
     }
 
@@ -173,6 +201,20 @@ pub struct FileFacts {
     /// so a bare name refers to this file or to something it imports, and
     /// two modules' functions of the same name are told apart.
     pub qualified: bool,
+    /// Member accesses are recorded apart from other names (see
+    /// [`Def::members`]), so a method is matched against those alone
+    /// rather than against every identifier of the same name.
+    pub members: bool,
+    /// Code runs only once something imports its file, so a test can be
+    /// affected only by files its own imports lead to. Not so where a whole
+    /// application is loaded at once (Elixir).
+    pub loads_by_import: bool,
+    /// Loads a file whose name is computed, so what the file brings into a
+    /// process cannot be listed.
+    pub open_loads: bool,
+    /// Nothing outside the file's unit can name what a test file declares
+    /// (Go's `_test.go`).
+    pub tests_private: bool,
     /// Loads code by a computed name, which no static analysis can follow.
     pub dynamic: Option<&'static str>,
     /// `//go:embed` patterns, relative to the file's directory, with the
@@ -195,6 +237,10 @@ impl FileFacts {
             line_class: Vec::new(),
             is_test_file: false,
             qualified: false,
+            members: false,
+            loads_by_import: false,
+            open_loads: false,
+            tests_private: false,
             dynamic: None,
             embeds: Vec::new(),
             parse_error: false,
