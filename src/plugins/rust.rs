@@ -218,6 +218,15 @@ impl LanguagePlugin for RustPlugin {
         super::rust_related::select(project_dir, command, files)
     }
 
+    fn related_tests(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+    ) -> Option<FilesListPlan> {
+        super::rust_related::related(project_dir, command, tests)
+    }
+
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
         Some(Target {
             command: "cargo clean".to_string(),

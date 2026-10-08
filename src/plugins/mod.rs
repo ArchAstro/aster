@@ -318,7 +318,7 @@ pub mod registry;
 pub(crate) mod related_tests;
 pub mod ruby;
 pub mod rust;
-mod rust_related;
+pub(crate) mod rust_related;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;

@@ -4,7 +4,7 @@
 //! answers the narrower question of which tests can observe it, by building
 //! a dependency graph of the workspace's sources with tree-sitter:
 //!
-//! 1. Every Elixir, TypeScript/JavaScript, Go and Python file is parsed into
+//! 1. Every Elixir, TypeScript/JavaScript, Go, Python and Rust file is parsed into
 //!    its definitions (functions, methods, types, constants, tests), the
 //!    names each definition mentions, and the files it draws those names
 //!    from (imports, module names, package paths).
@@ -37,6 +37,7 @@ mod go;
 mod js;
 mod python;
 mod resolve;
+mod rust;
 
 pub use engine::{analyse, Change, GraphNode, Outcome, Related, TestSelection};
 pub use facts::Family;

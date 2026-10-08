@@ -456,13 +456,40 @@ How a change is followed:
   - `this.name` and `self.name` call the enclosing class's method, or one
     from a class it extends or that extends it. A base class that cannot be
     named (a mixin call) leaves the call open.
-- In Go, TypeScript, JavaScript and Python, code runs only once something
-  imports its file. A test is therefore selected only when every definition
+- In Go, TypeScript, JavaScript, Python and Rust, code runs only once
+  something imports its file (in Rust: once a module refers to another). A test is therefore selected only when every definition
   on some chain from the change to the test is in a file the test's own
   imports lead to. A test whose imports cannot all be followed (a computed
   `import(name)`, an import of workspace code that resolves to no file) is
   taken to load anything. This does not apply to Elixir, where the whole
   application is loaded.
+- Rust is read with its types:
+  - Tests written beside the code they test (`#[cfg(test)] mod tests`) are
+    test code though their file is not a test file. A selected test runs by
+    its full path with `--exact`; a file selected as a whole, and tests a
+    macro defines, run by their module's path. Doctests are not analysed
+    and run whenever the original command would run them.
+  - `value.name(…)` is a method call; `value.name` reads a field and calls
+    nothing. `Type::name` and `Self::name` are that type's.
+  - A value's type is taken from where it is written: a parameter, a
+    `let` with a type, a struct field, a struct literal, or the declared
+    return type of the call that made it (`let s = Arc::new(Store::new())`
+    is a `Store`). A method call on such a value reaches only that type's
+    methods and those of the traits it implements; a type from outside the
+    workspace has none.
+  - Where the type is not written, the call is matched by name, but only
+    from definitions that could hold such a value: the method's type, or
+    the trait it is called through, must be reachable from the types the
+    caller mentions and the signatures of what it calls.
+  - A method of a trait the workspace does not declare (`Display::fmt`,
+    `Drop::drop`, `From::from`) is called by formatting, operators and
+    conversions that name nothing. A change to one reaches every
+    definition that uses the type's file.
+  - A `macro_rules!` macro is found by its name wherever it is used.
+  - A test that runs the package's binary (`CARGO_BIN_EXE_*`, `assert_cmd`)
+    runs for any change to the package's sources.
+  - `Cargo.toml`, `Cargo.lock`, `build.rs`, the toolchain file and
+    `.cargo/` configuration run the project in full.
 - A file the test runner loads before every test (one a `vitest.*`,
   `jest.config.*` or `playwright.config.*` file names, such as
   `setupFiles`) is no test's import. A change that reaches one runs the
@@ -498,10 +525,9 @@ Where the source graph cannot see, Aster runs more:
   Python modules by computed name.
 - Inside the set `--dependents` would select, a project runs in full when
   it depends on an affected project in another language, on one Aster does
-  not analyse (Rust, Ruby, JVM), or on one it never imports from: such a
+  not analyse (Ruby, JVM), or on one it never imports from: such a
   dependency is on a built artifact or a binary, which the source graph
-  cannot follow. Rust projects with changed files still narrow their own
-  `cargo test` as described above. A project that says which of its sources
+  cannot follow. A project that says which of its sources
   use such a dependency runs only those and the tests that reach them (see
   below).
 - A command Aster cannot read as a test runner runs as written: a script

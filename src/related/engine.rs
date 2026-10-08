@@ -4,7 +4,7 @@
 use super::consumers::{self, Consume};
 use super::facts::{DefKind, Family, FileFacts, LineClass};
 use super::resolve::{Resolvers, Workspace};
-use super::{elixir, go, js, python};
+use super::{elixir, go, js, python, rust};
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -163,6 +163,12 @@ struct Source {
     opaque: bool,
     /// Units this runner configuration has loaded before every test.
     preloaded: Vec<u32>,
+    /// Typed member accesses of each definition that only linking could
+    /// tell (`Type::name` in a Rust path), as `(type, name)`; the last
+    /// entry is the top-level code.
+    late: Vec<Vec<(String, String)>>,
+    /// Units the file loads without any definition naming them.
+    brought: Vec<u32>,
 }
 
 struct Index<'a> {
@@ -188,7 +194,16 @@ struct Index<'a> {
     unit_types: HashMap<(u32, String), bool>,
     /// By type name: whether every type of that name is concrete, and the
     /// types it takes methods from and gives methods to.
-    types: HashMap<String, TypeLinks>,
+    types: HashMap<(Family, String), TypeLinks>,
+    /// Declared type names, numbered.
+    type_ids: HashMap<(Family, String), u32>,
+    /// For each type, the types whose values can yield one of it: through
+    /// a field, or what a method returns.
+    held_by: Vec<Vec<u32>>,
+    /// For each source with static types, the types each definition can
+    /// start from: those it mentions and those in the signatures of what
+    /// it calls. The last entry is the top-level code.
+    mentions: Vec<Vec<Vec<u32>>>,
     /// Definitions that hold a URL path literal.
     path_defs: Vec<DefId>,
     /// For each project, itself and every project that depends on it.
@@ -204,6 +219,9 @@ struct Index<'a> {
 
 #[derive(Default)]
 struct TypeLinks {
+    /// The workspace declares a type of this name; otherwise the name is
+    /// only known as something another type builds on.
+    declared: bool,
     concrete: bool,
     supers: BTreeSet<String>,
     subs: BTreeSet<String>,
@@ -246,6 +264,8 @@ struct Run<'a, 'b> {
     entered: HashSet<u32>,
     /// The size of the graph when it was last validated.
     validated: Option<(usize, usize)>,
+    /// What each unit uses, however indirectly, itself included.
+    closures: HashMap<u32, HashSet<u32>>,
     edges: usize,
 }
 
@@ -277,6 +297,30 @@ pub fn analyse(
             ghosts.insert(change.path.clone());
         }
     }
+    // Which Rust files are test code is decided by the module that
+    // declares them, not by the file.
+    let rust = super::resolve::RustIndex::build(
+        root,
+        facts
+            .iter()
+            .filter(|(_, facts)| facts.family == Family::Rust)
+            .map(|(path, _)| path),
+    );
+    for file in rust.test_files(&facts) {
+        if let Some(facts) = facts.get_mut(&file) {
+            facts.is_test_file = true;
+        }
+    }
+    // Only a test runs the package's binary to see what it does; product
+    // code that mentions the same names does not.
+    for facts in facts.values_mut().filter(|f| f.family == Family::Rust) {
+        let test_file = facts.is_test_file;
+        for def in facts.defs.iter_mut().chain([&mut facts.top]) {
+            if !test_file && !def.in_test {
+                def.reflects = None;
+            }
+        }
+    }
     let files_analysed = facts.len();
     let index = Index::build(root, projects, graph, &paths, facts, &ghosts);
     let indexed = started.elapsed();
@@ -297,6 +341,7 @@ fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
         Family::Js => js::extract(path, source),
         Family::Go => go::extract(path, source),
         Family::Python => python::extract(path, source),
+        Family::Rust => rust::extract(path, source),
     }
 }
 
@@ -431,6 +476,12 @@ fn is_trigger(project: &DiscoveredProject, relative: &Path) -> bool {
         "go" => {
             matches!(name, "go.mod" | "go.sum" | "go.work" | "go.work.sum")
                 || path.starts_with("vendor/")
+        }
+        "rust" => {
+            matches!(
+                name,
+                "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" | "build.rs"
+            ) || path.contains(".cargo/")
         }
         "python" => {
             matches!(
@@ -579,6 +630,46 @@ impl<'a> Index<'a> {
             seen.into_iter().collect()
         };
 
+        // What each function and method is declared to return, for typing
+        // a value by the call that made it.
+        type Returns<'f> = Vec<&'f Option<Vec<String>>>;
+        let mut function_returns: HashMap<(u32, &str), Returns> = HashMap::new();
+        let mut method_returns: HashMap<(Family, &str, &str), Returns> = HashMap::new();
+        let mut keeps_type: HashMap<(Family, &str), bool> = HashMap::new();
+        for (i, path) in ordered.iter().enumerate() {
+            let file = &facts[*path];
+            for def in file
+                .defs
+                .iter()
+                .filter(|d| file.static_types && !d.is_test())
+            {
+                match (def.kind, def.owner.as_deref()) {
+                    (DefKind::Function, _) => function_returns
+                        .entry((file_unit[i], def.name.as_str()))
+                        .or_default()
+                        .push(&def.returns),
+                    (DefKind::Method, owner) => {
+                        // A method keeps the type when all it returns is
+                        // its own.
+                        let own = owner.is_some_and(|owner| {
+                            def.returns
+                                .as_ref()
+                                .is_some_and(|r| r.iter().all(|name| name == owner))
+                        });
+                        *keeps_type
+                            .entry((file.family, def.name.as_str()))
+                            .or_insert(true) &= own;
+                        if let Some(owner) = owner {
+                            method_returns
+                                .entry((file.family, owner, def.name.as_str()))
+                                .or_default()
+                                .push(&def.returns);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut sources = Vec::with_capacity(ordered.len());
         for (i, path) in ordered.iter().enumerate() {
             let file = &facts[*path];
@@ -601,9 +692,28 @@ impl<'a> Index<'a> {
                 })
                 .collect();
             let uses_of = |def: &super::facts::Def, top: bool| -> Vec<u32> {
-                let mut units = shared.clone();
+                // Where calls name their module, a glob import is used by
+                // the definitions that mention a name it brings in, not by
+                // all of them.
+                let mut units = match family {
+                    Family::Rust => expand(shared.clone())
+                        .into_iter()
+                        .filter(|unit| {
+                            unit_files[*unit as usize].iter().any(|file| {
+                                let declared = &facts[ordered[*file as usize]].defs;
+                                declared.iter().any(|d| def.refs.contains(&d.name))
+                            })
+                        })
+                        .collect(),
+                    _ => shared.clone(),
+                };
                 for spec in &def.uses {
                     units.extend(resolve(path, family, spec));
+                }
+                if family == Family::Rust {
+                    for (spec, _) in &def.calls {
+                        units.extend(resolve(path, family, spec));
+                    }
                 }
                 for (qualifier, unit) in &go_imports {
                     let Some(unit) = unit else { continue };
@@ -662,11 +772,27 @@ impl<'a> Index<'a> {
                 def.calls
                     .iter()
                     .flat_map(|(module, function)| {
+                        // A Rust path leads to a file and leaves the names
+                        // of what it means inside it; any of them may be
+                        // the item, and a re-export may hold it.
+                        if family == Family::Rust {
+                            let mut named: Vec<(u32, String)> = Vec::new();
+                            for (file, rest) in resolvers.rust.follow(path, module) {
+                                let Some(unit) = unit_of(&file) else { continue };
+                                for unit in expand(BTreeSet::from([unit])) {
+                                    named.extend(rest.iter().map(|name| (unit, name.clone())));
+                                }
+                            }
+                            return named;
+                        }
                         let units = match family {
                             Family::Go => package(module).flatten().into_iter().collect(),
                             _ => resolve(path, family, module),
                         };
-                        units.into_iter().map(move |unit| (unit, function.clone()))
+                        units
+                            .into_iter()
+                            .map(|unit| (unit, function.clone()))
+                            .collect::<Vec<_>>()
                     })
                     .collect()
             };
@@ -692,6 +818,130 @@ impl<'a> Index<'a> {
             calls.push(calls_of(&file.top));
             let mut loose: Vec<Vec<String>> = file.defs.iter().map(loose_of).collect();
             loose.push(loose_of(&file.top));
+            // `Type::name` in a Rust path is a member of the type, when the
+            // file the path leads to (or one it re-exports, or one this
+            // file takes every name from) declares such a type.
+            let declares = |units: &[u32], name: &str| {
+                units.iter().any(|unit| {
+                    unit_files[*unit as usize].iter().any(|file| {
+                        facts[ordered[*file as usize]]
+                            .defs
+                            .iter()
+                            .any(|d| d.kind == DefKind::Type && d.name == name)
+                    })
+                })
+            };
+            let late_of = |def: &super::facts::Def| -> Vec<(String, String)> {
+                let mut typed = Vec::new();
+                if family != Family::Rust {
+                    return typed;
+                }
+                for (spec, _) in &def.calls {
+                    for (file, rest) in resolvers.rust.follow(path, spec) {
+                        let Some(unit) = unit_of(&file) else { continue };
+                        let mut units = expand(BTreeSet::from([unit]));
+                        if file == **path {
+                            units.extend(expand(shared.clone()));
+                        }
+                        for pair in rest.windows(2) {
+                            if declares(&units, &pair[0]) {
+                                typed.push((pair[0].clone(), pair[1].clone()));
+                            }
+                        }
+                    }
+                }
+                typed
+            };
+            let mut late: Vec<Vec<(String, String)>> = file.defs.iter().map(late_of).collect();
+            late.push(late_of(&file.top));
+            // A member called on what a call returns is a member of one of
+            // the types the callee is declared to return (marked `=`: the
+            // type is certain, wherever it is declared). Where the callee
+            // or its return type cannot be told, it is a member of
+            // anything.
+            let results_of = |def: &super::facts::Def| -> (Vec<(String, String)>, Vec<String>) {
+                let (mut typed, mut open) = (Vec::new(), Vec::new());
+                for (spec, through, member) in &def.results {
+                    let kept = through
+                        .iter()
+                        .all(|name| keeps_type.get(&(family, name.as_str())) != Some(&false));
+                    let mut declared: Vec<&Option<Vec<String>>> = Vec::new();
+                    for (target, rest) in resolvers.rust.follow(path, spec) {
+                        match rest.as_slice() {
+                            [.., owner, name] => declared.extend(
+                                method_returns
+                                    .get(&(family, owner.as_str(), name.as_str()))
+                                    .into_iter()
+                                    .flatten(),
+                            ),
+                            [name] => {
+                                let Some(unit) = unit_of(&target) else {
+                                    continue;
+                                };
+                                let mut units = expand(BTreeSet::from([unit]));
+                                if target == **path {
+                                    units.extend(expand(shared.clone()));
+                                }
+                                for unit in units {
+                                    declared.extend(
+                                        function_returns
+                                            .get(&(unit, name.as_str()))
+                                            .into_iter()
+                                            .flatten(),
+                                    );
+                                }
+                            }
+                            [] => {}
+                        }
+                    }
+                    let known =
+                        kept && !declared.is_empty() && declared.iter().all(|r| r.is_some());
+                    if !known {
+                        open.push(member.clone());
+                        continue;
+                    }
+                    for name in declared.into_iter().flatten().flatten() {
+                        typed.push((format!("={name}"), member.clone()));
+                    }
+                }
+                (typed, open)
+            };
+            for (index, def) in file.defs.iter().chain([&file.top]).enumerate() {
+                let (typed, open) = results_of(def);
+                late[index].extend(typed);
+                loose[index].extend(open);
+            }
+            // Methods of a trait the workspace does not declare: nothing
+            // need name them to call them.
+            let implicit: Vec<usize> = file
+                .defs
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| {
+                    def.implements.as_ref().is_some_and(|spec| {
+                        !resolvers
+                            .rust
+                            .follow(path, spec)
+                            .iter()
+                            .any(|(target, rest)| {
+                                let Some(unit) = unit_of(target) else {
+                                    return false;
+                                };
+                                let mut units = expand(BTreeSet::from([unit]));
+                                if target == *path {
+                                    units.extend(expand(shared.clone()));
+                                }
+                                rest.last().is_some_and(|name| declares(&units, name))
+                            })
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let brought: Vec<u32> = file
+                .brings
+                .iter()
+                .flat_map(|spec| resolve(path, family, spec))
+                .collect();
             let mut imports: Vec<u32> = shared.iter().copied().collect();
             // A dot import brings a package's names in unqualified.
             imports.extend(
@@ -710,7 +960,7 @@ impl<'a> Index<'a> {
                 })
                 .flat_map(|spec| resolve(path, family, spec))
                 .collect();
-            let linked = (calls, loose, opaque, preloaded);
+            let linked = (calls, loose, opaque, preloaded, late, implicit, brought);
             sources.push((uses, via, linked, imports, file_unit[i]));
         }
 
@@ -719,19 +969,42 @@ impl<'a> Index<'a> {
             .into_iter()
             .zip(sources)
             .map(
-                |(path, (uses, via, (calls, loose, opaque, preloaded), imports, unit))| Source {
-                    facts: facts.remove(&path).expect("facts for every indexed path"),
-                    project: owner(projects, &path),
-                    ghost: ghosts.contains(&path),
+                |(
                     path,
-                    unit,
-                    uses,
-                    via,
-                    calls,
-                    imports,
-                    loose,
-                    opaque,
-                    preloaded,
+                    (
+                        uses,
+                        via,
+                        (calls, loose, opaque, preloaded, late, implicit, brought),
+                        imports,
+                        unit,
+                    ),
+                )| {
+                    let mut facts = facts.remove(&path).expect("facts for every indexed path");
+                    for index in implicit {
+                        facts.defs[index].callback = true;
+                        // A trait from outside the workspace gives the type
+                        // no methods declared here, whatever shares its
+                        // name.
+                        if facts.defs[index].kind == DefKind::Type {
+                            facts.defs[index].supers.clear();
+                        }
+                    }
+                    Source {
+                        facts,
+                        project: owner(projects, &path),
+                        ghost: ghosts.contains(&path),
+                        path,
+                        unit,
+                        uses,
+                        via,
+                        calls,
+                        imports,
+                        loose,
+                        opaque,
+                        preloaded,
+                        late,
+                        brought,
+                    }
                 },
             )
             .collect();
@@ -740,6 +1013,10 @@ impl<'a> Index<'a> {
         let mut unit_uses: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); unit_files.len()];
         for source in &sources {
             unit_uses[source.unit as usize].extend(source.uses.iter().flatten().copied());
+            // A glob import loads its module whoever uses the names.
+            unit_uses[source.unit as usize].extend(source.imports.iter().copied());
+            // So does an import made for what it brings into scope.
+            unit_uses[source.unit as usize].extend(source.brought.iter().copied());
         }
         let mut preloads: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); projects.len()];
         for source in &sources {
@@ -751,15 +1028,44 @@ impl<'a> Index<'a> {
         for source in &sources {
             unit_opaque[source.unit as usize] |= source.opaque;
         }
+        // Code a macro expands to runs where the macro is used, so its
+        // users load what it does.
+        let mut macros: HashMap<&str, Vec<u32>> = HashMap::new();
+        for source in sources.iter().filter(|s| s.facts.macros_by_name) {
+            for def in source
+                .facts
+                .defs
+                .iter()
+                .filter(|d| d.kind == DefKind::Macro)
+            {
+                macros.entry(&def.name).or_default().push(source.unit);
+            }
+        }
+        for source in sources.iter().filter(|s| s.facts.macros_by_name) {
+            let defs = source.facts.defs.iter().chain([&source.facts.top]);
+            for name in defs.flat_map(|def| &def.members) {
+                let Some(name) = name.strip_suffix('!') else {
+                    continue;
+                };
+                if let Some(units) = macros.get(name) {
+                    unit_uses[source.unit as usize].extend(units.iter().copied());
+                }
+            }
+        }
         let unit_uses: Vec<Vec<u32>> = unit_uses
             .into_iter()
             .map(|uses| uses.into_iter().collect())
             .collect();
         let mut methods: HashSet<&str> = HashSet::new();
+        let mut macro_uses: HashSet<String> = HashSet::new();
         for source in &sources {
             for def in &source.facts.defs {
                 if def.kind == DefKind::Method {
                     methods.insert(&def.name);
+                }
+                // A macro used by its bare name is looked for as `name!`.
+                if def.kind == DefKind::Macro && source.facts.macros_by_name {
+                    macro_uses.insert(format!("{}!", def.name));
                 }
             }
         }
@@ -775,27 +1081,114 @@ impl<'a> Index<'a> {
             }
         }
         let mut unit_types: HashMap<(u32, String), bool> = HashMap::new();
-        let mut types: HashMap<String, TypeLinks> = HashMap::new();
+        let mut types: HashMap<(Family, String), TypeLinks> = HashMap::new();
         for source in &sources {
             for def in source.facts.defs.iter().filter(|d| d.kind == DefKind::Type) {
                 *unit_types
                     .entry((source.unit, def.name.clone()))
                     .or_insert(true) &= def.concrete;
-                let links = types.entry(def.name.clone()).or_insert_with(|| TypeLinks {
-                    concrete: true,
-                    ..TypeLinks::default()
-                });
-                links.concrete &= def.concrete;
+                let family = source.facts.family;
+                let links = types.entry((family, def.name.clone())).or_default();
+                links.concrete = (links.concrete || !links.declared) && def.concrete;
+                links.declared = true;
                 links.supers.extend(def.supers.iter().cloned());
                 for parent in &def.supers {
                     types
-                        .entry(parent.clone())
+                        .entry((family, parent.clone()))
                         .or_default()
                         .subs
                         .insert(def.name.clone());
                 }
             }
         }
+        // With static types, a definition can hold a value of a type only
+        // if the type is reachable from what it names: the types it
+        // mentions, the signatures of what it calls, and from each of those
+        // the types their fields and method signatures mention.
+        let mut type_ids: HashMap<(Family, String), u32> = HashMap::new();
+        for (family, name) in types.iter().filter(|(_, l)| l.declared).map(|(k, _)| k) {
+            let next = type_ids.len() as u32;
+            type_ids.insert((*family, name.clone()), next);
+        }
+        let named = |def: &super::facts::Def, family: Family, signature: bool| -> Vec<u32> {
+            let mut names: Vec<&str> = def.signature.iter().map(String::as_str).collect();
+            if !signature {
+                names.extend(def.refs.iter().map(String::as_str));
+                names.extend(def.typed.iter().map(|(on, _)| on.as_str()));
+                names.extend(def.calls.iter().flat_map(|(path, _)| path.split("::")));
+            }
+            let mut ids: Vec<u32> = names
+                .into_iter()
+                .filter_map(|name| type_ids.get(&(family, name.to_string())).copied())
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let mut held_by: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); type_ids.len()];
+        let mut signatures: HashMap<(Family, &str), Vec<u32>> = HashMap::new();
+        for source in sources.iter().filter(|s| s.facts.static_types) {
+            let family = source.facts.family;
+            let id = |name: &str| type_ids.get(&(family, name.to_string())).copied();
+            for def in &source.facts.defs {
+                let holder = match def.kind {
+                    DefKind::Type => id(&def.name),
+                    DefKind::Method => def.owner.as_deref().and_then(id),
+                    _ => None,
+                };
+                // A type yields what its declaration mentions and what its
+                // methods' signatures do.
+                if let Some(holder) = holder {
+                    for held in named(def, family, def.kind == DefKind::Method) {
+                        held_by[held as usize].insert(holder);
+                    }
+                }
+                match def.kind {
+                    DefKind::Function | DefKind::Const => signatures
+                        .entry((family, def.name.as_str()))
+                        .or_default()
+                        .extend(named(def, family, true)),
+                    DefKind::Macro => signatures
+                        .entry((family, def.name.as_str()))
+                        .or_default()
+                        .extend(named(def, family, false)),
+                    _ => {}
+                }
+            }
+        }
+        let mentions_of = |source: &Source, def: &super::facts::Def| -> Vec<u32> {
+            let family = source.facts.family;
+            let mut ids = named(def, family, false);
+            if let Some(owner) = &def.owner {
+                ids.extend(type_ids.get(&(family, owner.clone())));
+            }
+            let called = def
+                .refs
+                .iter()
+                .chain(&def.members)
+                .map(|name| name.strip_suffix('!').unwrap_or(name))
+                .chain(def.calls.iter().flat_map(|(path, _)| path.split("::")));
+            for name in called {
+                ids.extend(signatures.get(&(family, name)).into_iter().flatten());
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let mentions: Vec<Vec<Vec<u32>>> = sources
+            .iter()
+            .map(|source| {
+                if !source.facts.static_types {
+                    return Vec::new();
+                }
+                let defs = source.facts.defs.iter().chain([&source.facts.top]);
+                defs.map(|def| mentions_of(source, def)).collect()
+            })
+            .collect();
+        let held_by: Vec<Vec<u32>> = held_by
+            .into_iter()
+            .map(|holders| holders.into_iter().collect())
+            .collect();
         let mut method_refs: HashMap<String, Vec<(DefId, Option<String>)>> = HashMap::new();
         for (f, source) in sources.iter().enumerate() {
             for (d, units) in source.uses.iter().enumerate() {
@@ -813,7 +1206,7 @@ impl<'a> Index<'a> {
                     &source.facts.defs[d]
                 };
                 let mut call = |name: &String, on: Option<&String>| {
-                    if methods.contains(name.as_str()) {
+                    if methods.contains(name.as_str()) || macro_uses.contains(name) {
                         method_refs
                             .entry(name.clone())
                             .or_default()
@@ -821,6 +1214,22 @@ impl<'a> Index<'a> {
                     }
                 };
                 if source.facts.members {
+                    for (on, name) in &source.late[d] {
+                        // `=Type`: the type is certain if the workspace
+                        // declares it concrete; one it does not declare
+                        // at all holds none of its methods.
+                        let family = source.facts.family;
+                        match on.strip_prefix('=') {
+                            None => call(name, Some(on)),
+                            Some(certain) => match types.get(&(family, certain.to_string())) {
+                                Some(links) if links.declared && links.concrete => {
+                                    call(name, Some(on))
+                                }
+                                Some(links) if links.declared => call(name, None),
+                                _ => {}
+                            },
+                        }
+                    }
                     source.loose[d].iter().for_each(|name| call(name, None));
                     def.members.iter().for_each(|name| call(name, None));
                     def.typed.iter().for_each(|(on, name)| call(name, Some(on)));
@@ -894,14 +1303,22 @@ impl<'a> Index<'a> {
             method_refs,
             unit_types,
             types,
+            type_ids,
+            held_by,
+            mentions,
             path_defs,
             downstream,
         }
     }
 
-    /// Whether `id` is a definition of a test file.
-    fn in_test_file(&self, id: DefId) -> bool {
-        id != NO_DEF && self.sources[id.0 as usize].facts.is_test_file
+    /// Whether `id` is test code: a definition of a test file, or one
+    /// marked as test code in a file that holds both.
+    fn is_test(&self, id: DefId) -> bool {
+        if id == NO_DEF || id.0 == USERS {
+            return false;
+        }
+        let facts = &self.sources[id.0 as usize].facts;
+        facts.is_test_file || (id.1 != TOP && facts.defs[id.1 as usize].in_test)
     }
 
     /// Whether definition `id` refers to `name` of `unit`. The caller has
@@ -934,10 +1351,22 @@ impl<'a> Index<'a> {
     /// Types are followed by name, so two of the same name count as one. A
     /// type that is not concrete (an interface, one this workspace does not
     /// declare) can stand for any type.
-    fn dispatches(&self, unit: u32, receiver: &str, owner: &str) -> bool {
-        if self.unit_types.get(&(unit, receiver.to_string())) != Some(&true) {
-            return true;
+    fn dispatches(&self, candidate: DefId, receiver: &str, owner: &str) -> bool {
+        // `=Type` was resolved when the files were linked.
+        let (receiver, certain) = match receiver.strip_prefix('=') {
+            Some(receiver) => (receiver, true),
+            None => (receiver, false),
+        };
+        match self.known_type(candidate, receiver).filter(|_| !certain) {
+            Some(true) => {}
+            // A type the workspace declares nowhere and builds nothing on
+            // holds none of its methods.
+            Some(false) => return false,
+            None if certain => {}
+            None => return true,
         }
+        let family = self.sources[candidate.0 as usize].facts.family;
+        let static_types = self.sources[candidate.0 as usize].facts.static_types;
         let mut instances = vec![receiver];
         let mut seen: HashSet<&str> = HashSet::from([receiver]);
         while let Some(instance) = instances.pop() {
@@ -947,22 +1376,75 @@ impl<'a> Index<'a> {
                 if name == owner {
                     return true;
                 }
-                let Some(links) = self.types.get(name).filter(|links| links.concrete) else {
-                    return true;
-                };
-                for parent in &links.supers {
-                    if walked.insert(parent) {
-                        line.push(parent);
+                match self.types.get(&(family, name.to_string())) {
+                    Some(links) if links.declared && links.concrete => {
+                        for parent in &links.supers {
+                            if walked.insert(parent) {
+                                line.push(parent);
+                            }
+                        }
                     }
+                    // An interface, or a base that cannot be named: it may
+                    // stand for any type.
+                    Some(links) if links.declared => return true,
+                    _ if name == super::facts::ANY_TYPE => return true,
+                    // With static types, a name the workspace does not
+                    // declare is a type from outside it, with no methods
+                    // declared here. Elsewhere it may be a workspace type
+                    // under another name.
+                    _ if static_types => {}
+                    _ => return true,
                 }
             }
-            for sub in self.types.get(instance).into_iter().flat_map(|l| &l.subs) {
+            let links = self.types.get(&(family, instance.to_string()));
+            for sub in links.into_iter().flat_map(|l| &l.subs) {
                 if seen.insert(sub) {
                     instances.push(sub);
                 }
             }
         }
         false
+    }
+
+    /// Whether `receiver`, as `candidate` names it, is a concrete type the
+    /// workspace declares: in the candidate's own unit or, where types are
+    /// imported, in a unit the candidate uses. `Some(false)` when the name
+    /// is certainly not a workspace type at all, `None` when it cannot be
+    /// told (an interface, a type declared somewhere the candidate does
+    /// not visibly use).
+    fn known_type(&self, candidate: DefId, receiver: &str) -> Option<bool> {
+        let source = &self.sources[candidate.0 as usize];
+        let key = |unit: u32| (unit, receiver.to_string());
+        if self.unit_types.get(&key(source.unit)) == Some(&true) {
+            return Some(true);
+        }
+        if !source.facts.types_by_import {
+            return None;
+        }
+        let index = if candidate.1 == TOP {
+            source.facts.defs.len()
+        } else {
+            candidate.1 as usize
+        };
+        let mut found = false;
+        for unit in source.uses[index].iter().chain(&source.imports) {
+            match self.unit_types.get(&key(*unit)) {
+                Some(true) => found = true,
+                Some(false) => return None,
+                None => {}
+            }
+        }
+        if found {
+            return Some(true);
+        }
+        let family = source.facts.family;
+        let anywhere = self
+            .types
+            .get(&(family, receiver.to_string()))
+            .is_some_and(|links| {
+                links.declared || !links.subs.is_empty() || !links.supers.is_empty()
+            });
+        (!anywhere).then_some(false)
     }
 
     fn def(&self, id: DefId) -> &super::facts::Def {
@@ -1211,11 +1693,8 @@ impl<'a> Index<'a> {
             }
             let defs = source.facts.defs.iter().enumerate();
             let top = std::iter::once((TOP as usize, &source.facts.top));
-            for (def, _) in defs.chain(top).filter(|(_, d)| d.reflects) {
-                let why = format!(
-                    "{} changed, and this lists modules at run time",
-                    change.path.display()
-                );
+            for (def, how) in defs.chain(top).filter_map(|(i, d)| Some((i, d.reflects?))) {
+                let why = format!("{} changed, and this {how}", change.path.display());
                 run.mark((other as u32, def as u32), Why::Changed(why));
             }
         }
@@ -1253,7 +1732,12 @@ impl<'a> Index<'a> {
                 let def = self.def(*id);
                 // The nearest definition above this one that is shown.
                 let mut above = *id;
+                let mut steps = 0;
                 let (changed, via) = loop {
+                    steps += 1;
+                    if steps > 64 {
+                        break (Some("reached through hidden tests".to_string()), None);
+                    }
                     match &run.affected[&above] {
                         Why::Changed(what) => break (Some(what.clone()), None),
                         Why::Via(parent) => match position.get(parent) {
@@ -1278,7 +1762,7 @@ impl<'a> Index<'a> {
                     kind,
                     line: line(id),
                     project: source.project.map(|p| address(&self.projects[p])),
-                    test: source.facts.is_test_file && !source.ghost,
+                    test: self.is_test(*id) && !source.ghost,
                     changed,
                     via,
                 }
@@ -1327,7 +1811,7 @@ impl<'a> Index<'a> {
                 continue;
             }
             outcomes[project].touched = true;
-            if !source.facts.is_test_file {
+            if !self.is_test(*id) {
                 if !self.test_side(source) {
                     outcomes[project].product = true;
                 }
@@ -1787,8 +2271,28 @@ impl<'a, 'b> Run<'a, 'b> {
             covered: HashSet::new(),
             entered: HashSet::new(),
             validated: None,
+            closures: HashMap::new(),
             edges: 0,
         }
+    }
+
+    /// Whether what `unit` uses, however indirectly, includes one of
+    /// `units`.
+    fn leads_to(&mut self, unit: u32, units: &[u32]) -> bool {
+        let ix = self.ix;
+        let closure = self.closures.entry(unit).or_insert_with(|| {
+            let mut seen: HashSet<u32> = HashSet::from([unit]);
+            let mut stack = vec![unit];
+            while let Some(next) = stack.pop() {
+                for used in &ix.unit_uses[next as usize] {
+                    if seen.insert(*used) {
+                        stack.push(*used);
+                    }
+                }
+            }
+            seen
+        });
+        units.iter().any(|unit| closure.contains(unit))
     }
 
     fn edge(&mut self, from: DefId, to: DefId) {
@@ -1828,7 +2332,7 @@ impl<'a, 'b> Run<'a, 'b> {
         let mut entries: BTreeMap<u32, Vec<DefId>> = BTreeMap::new();
         for id in self.affected.keys() {
             let source = &ix.sources[id.0 as usize];
-            let starts = source.facts.is_test_file || preloaded(source.unit);
+            let starts = ix.is_test(*id) || preloaded(source.unit);
             if starts && !source.ghost && source.facts.loads_by_import {
                 entries.entry(source.unit).or_default().push(*id);
             }
@@ -1836,83 +2340,147 @@ impl<'a, 'b> Run<'a, 'b> {
         if entries.is_empty() {
             return;
         }
-        let mut back: HashMap<DefId, Vec<DefId>> = HashMap::new();
+        // The graph as arrays: this runs once for every file that holds a
+        // reached test.
+        let mut number: HashMap<DefId, u32> = HashMap::new();
+        let mut nodes: Vec<DefId> = Vec::new();
+        let mut index = |node: DefId, nodes: &mut Vec<DefId>| -> u32 {
+            *number.entry(node).or_insert_with(|| {
+                nodes.push(node);
+                (nodes.len() - 1) as u32
+            })
+        };
+        for id in self.affected.keys() {
+            index(*id, &mut nodes);
+        }
+        let mut edges: Vec<(u32, u32)> = Vec::new();
         for (from, users) in &self.out {
-            for user in users {
-                back.entry(*user).or_default().push(*from);
+            let known = |node: &DefId| node.0 == USERS || self.affected.contains_key(node);
+            if !known(from) {
+                continue;
+            }
+            let from = index(*from, &mut nodes);
+            for user in users.iter().filter(|user| known(user)) {
+                edges.push((from, index(*user, &mut nodes)));
             }
         }
+        let count = nodes.len();
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); count];
+        let mut back: Vec<Vec<u32>> = vec![Vec::new(); count];
+        for (from, user) in edges {
+            out[from as usize].push(user);
+            back[user as usize].push(from);
+        }
+        let unit: Vec<u32> = nodes.iter().map(|node| self.unit_of(*node)).collect();
+        let free: Vec<bool> = nodes.iter().map(|node| self.free.contains(node)).collect();
+        // A method of an `impl` is at hand wherever its type or its trait
+        // is, whichever file the `impl` is in.
+        let attached: Vec<&[u32]> = nodes
+            .iter()
+            .map(|node| match node {
+                (USERS, _) | (_, TOP) => &[][..],
+                (file, def) => ix.sources[*file as usize].via[*def as usize].as_slice(),
+            })
+            .collect();
+        let roots: Vec<(u32, Option<u32>)> = self
+            .roots
+            .iter()
+            .filter_map(|(root, file)| Some((*number.get(root)?, *file)))
+            .collect();
+
+        let mut loads = vec![false; ix.unit_uses.len()];
+        let mut loaded: Vec<u32> = Vec::new();
+        // Marks of the walk for the entry being checked: reached forwards,
+        // then seen backwards.
+        let mut reached = vec![0u32; count];
+        let mut seen = vec![0u32; count];
+        let mut parent = vec![u32::MAX; count];
+        let mut round = 0u32;
         let mut rewrites: Vec<(DefId, DefId)> = Vec::new();
-        for (unit, tests) in entries {
-            let mut loads: HashSet<u32> = HashSet::from([unit]);
-            let mut stack = vec![unit];
-            while let Some(next) = stack.pop() {
-                for used in &ix.unit_uses[next as usize] {
-                    if loads.insert(*used) {
-                        stack.push(*used);
+        for (entry, tests) in entries {
+            round += 1;
+            for unit in loaded.drain(..) {
+                loads[unit as usize] = false;
+            }
+            loads[entry as usize] = true;
+            loaded.push(entry);
+            let mut next = 0;
+            while next < loaded.len() {
+                for used in &ix.unit_uses[loaded[next] as usize] {
+                    if !loads[*used as usize] {
+                        loads[*used as usize] = true;
+                        loaded.push(*used);
                     }
                 }
+                next += 1;
             }
             // A test that loads something that cannot be followed may
             // load anything.
-            let anything = loads.iter().any(|unit| ix.unit_opaque[*unit as usize]);
-            let open = |run: &Self, node: DefId| {
-                (node.0 == USERS || run.affected.contains_key(&node))
-                    && (anything || run.free.contains(&node) || loads.contains(&run.unit_of(node)))
+            let anything = loaded.iter().any(|unit| ix.unit_opaque[*unit as usize]);
+            let open = |node: u32| {
+                let node = node as usize;
+                anything
+                    || free[node]
+                    || loads[unit[node] as usize]
+                    || attached[node].iter().any(|unit| loads[*unit as usize])
             };
             // Forwards from the change, through loaded code only.
-            let mut parent: HashMap<DefId, DefId> = HashMap::new();
-            let mut reached: HashSet<DefId> = HashSet::new();
-            let mut stack: Vec<DefId> = Vec::new();
-            for (root, _) in &self.roots {
-                if open(self, *root) && reached.insert(*root) {
+            let mut stack: Vec<u32> = Vec::new();
+            for (root, _) in &roots {
+                if reached[*root as usize] != round && open(*root) {
+                    reached[*root as usize] = round;
+                    parent[*root as usize] = u32::MAX;
                     stack.push(*root);
                 }
             }
             while let Some(node) = stack.pop() {
-                for user in self.out.get(&node).into_iter().flatten() {
-                    if open(self, *user) && reached.insert(*user) {
-                        parent.insert(*user, node);
+                for user in &out[node as usize] {
+                    if reached[*user as usize] != round && open(*user) {
+                        reached[*user as usize] = round;
+                        parent[*user as usize] = node;
                         stack.push(*user);
                     }
                 }
             }
             // Backwards from the tests it reached, to the files that count.
-            let mut seen: HashSet<DefId> = HashSet::new();
-            let mut stack: Vec<DefId> = Vec::new();
-            let is_test = ix.sources[tests[0].0 as usize].facts.is_test_file;
             for test in tests {
-                if !reached.contains(&test) {
+                let is_test = ix.is_test(test);
+                let node = number[&test];
+                if reached[node as usize] != round {
                     if is_test {
                         self.barred.insert(test);
                     }
                     continue;
                 }
                 if !is_test {
-                    self.entered.insert(unit);
+                    self.entered.insert(entry);
                     continue;
                 }
-                if seen.insert(test) {
-                    stack.push(test);
+                if seen[node as usize] != round {
+                    seen[node as usize] = round;
+                    stack.push(node);
                 }
                 // Explain the test by the chain that holds.
-                let mut via = parent.get(&test).copied();
-                while let Some(node) = via.filter(|node| node.0 == USERS) {
-                    via = parent.get(&node).copied();
+                let mut via = parent[node as usize];
+                while via != u32::MAX && nodes[via as usize].0 == USERS {
+                    via = parent[via as usize];
                 }
-                if let Some(via) = via {
-                    rewrites.push((test, via));
+                // Only a test itself: nothing is reached through one, so
+                // the chains stay free of loops.
+                if via != u32::MAX && test.1 != TOP && ix.def(test).is_test() {
+                    rewrites.push((test, nodes[via as usize]));
                 }
             }
             while let Some(node) = stack.pop() {
-                for from in back.get(&node).into_iter().flatten() {
-                    if reached.contains(from) && seen.insert(*from) {
+                for from in &back[node as usize] {
+                    if reached[*from as usize] == round && seen[*from as usize] != round {
+                        seen[*from as usize] = round;
                         stack.push(*from);
                     }
                 }
             }
-            for (root, file) in &self.roots {
-                if let (true, Some(file)) = (seen.contains(root), file) {
+            for (root, file) in &roots {
+                if let (true, Some(file)) = (seen[*root as usize] == round, file) {
                     self.covered.insert(*file);
                 }
             }
@@ -1929,7 +2497,7 @@ impl<'a, 'b> Run<'a, 'b> {
         self.validate();
         self.affected.keys().any(|id| {
             let source = &self.ix.sources[id.0 as usize];
-            source.facts.is_test_file && !source.ghost && !self.barred.contains(id)
+            self.ix.is_test(*id) && !source.ghost && !self.barred.contains(id)
         })
     }
 
@@ -1945,7 +2513,7 @@ impl<'a, 'b> Run<'a, 'b> {
             return;
         }
         let source = &self.ix.sources[id.0 as usize];
-        if source.facts.is_test_file && !source.ghost {
+        if self.ix.is_test(id) && !source.ghost {
             self.hit_test = true;
         }
         self.affected.insert(id, why);
@@ -2085,17 +2653,27 @@ impl<'a, 'b> Run<'a, 'b> {
             }
             let member = (def.kind == DefKind::Method).then_some(def.owner.as_deref());
             let mut referenced = self.symbol(source.unit, &def.name, member, id, id.0);
+            if def.kind == DefKind::Macro && source.facts.macros_by_name {
+                // In scope by its bare name, wherever that is.
+                let used_as = format!("{}!", def.name);
+                referenced |= self.symbol(source.unit, &used_as, Some(None), id, id.0);
+            }
             for alias in &def.aliases {
                 referenced |= self.symbol(source.unit, alias, member, id, id.0);
             }
             // Nothing names it, so something reaches it another way: a
             // framework callback, a macro expansion, reflection.
-            let unnamed = !referenced && !def.is_test() && !source.facts.is_test_file;
+            let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
             if def.callback || def.kind == DefKind::Macro || unnamed {
                 self.users(source.unit, id);
             }
-            for unit in &source.via[id.1 as usize] {
-                self.users(*unit, id);
+            // Users of a type or trait reach its implementation without
+            // naming it. With static types that takes a call nothing
+            // names; a named call is matched as one.
+            if !source.facts.static_types || def.callback {
+                for unit in &source.via[id.1 as usize] {
+                    self.users(*unit, id);
+                }
             }
         }
     }
@@ -2135,7 +2713,7 @@ impl<'a, 'b> Run<'a, 'b> {
     /// Mark every definition that uses `unit`.
     fn users(&mut self, unit: u32, from: DefId) {
         let ix = self.ix;
-        let from_test = ix.in_test_file(from);
+        let from_test = ix.is_test(from);
         // One node stands for the users, so that each definition of the
         // unit that reaches them is linked without marking them again.
         let node = (USERS, unit * 2 + u32::from(from_test));
@@ -2143,8 +2721,18 @@ impl<'a, 'b> Run<'a, 'b> {
         if !self.users_seen.insert((unit, from_test)) {
             return;
         }
-        for &user in &ix.users[unit as usize] {
-            if !from_test || ix.sources[user.0 as usize].facts.is_test_file {
+        // Tests written beside the code they test use it without importing
+        // anything.
+        let beside: Vec<DefId> = ix.unit_files[unit as usize]
+            .iter()
+            .flat_map(|&file| {
+                let defs = &ix.sources[file as usize].facts.defs;
+                (0..defs.len() as u32).map(move |def| (file, def))
+            })
+            .filter(|id| !ix.sources[id.0 as usize].facts.is_test_file && ix.is_test(*id))
+            .collect();
+        for &user in ix.users[unit as usize].iter().chain(&beside) {
+            if user != from && (!from_test || ix.is_test(user)) {
                 self.edge(node, user);
                 self.mark(user, Why::Via(from));
             }
@@ -2163,7 +2751,12 @@ impl<'a, 'b> Run<'a, 'b> {
         file: u32,
     ) -> bool {
         let owner = member.flatten();
-        let key = (from, file, name.to_string(), owner.map(str::to_string));
+        let key = (
+            from,
+            file,
+            format!("{name}{}", if member.is_some() { "()" } else { "" }),
+            owner.map(str::to_string),
+        );
         if !self.symbols_seen.insert(key) {
             return true;
         }
@@ -2171,7 +2764,7 @@ impl<'a, 'b> Run<'a, 'b> {
         let origin = &ix.sources[file as usize];
         let mut found = false;
         // Nothing but other tests builds on a test file.
-        let from_test = origin.facts.is_test_file;
+        let from_test = origin.facts.is_test_file || ix.is_test(from);
         // Where member accesses are told apart from other names, only they
         // can reach a method.
         if member.is_none() || !origin.facts.members {
@@ -2185,7 +2778,7 @@ impl<'a, 'b> Run<'a, 'b> {
                 .chain(local)
                 .collect();
             for candidate in candidates {
-                if from_test && !ix.sources[candidate.0 as usize].facts.is_test_file {
+                if from_test && !ix.is_test(candidate) {
                     continue;
                 }
                 if candidate != from && ix.refers(candidate, unit, name) {
@@ -2200,14 +2793,76 @@ impl<'a, 'b> Run<'a, 'b> {
             // it, unless the value it calls on is known to be of a type
             // that cannot hold this method.
             let reach = origin.project.map(|p| &ix.downstream[p]);
+            // With static types, the caller's file leads to the file of
+            // the method's type or of its trait. Not so for a method some
+            // outside trait calls, or for a macro, which is expanded where
+            // it is used.
+            let method = (from != NO_DEF && from.1 != TOP)
+                .then(|| ix.def(from))
+                .filter(|def| origin.facts.static_types && def.kind == DefKind::Method);
+            let typed_at: Option<Vec<u32>> = method.map(|_| {
+                let mut units = origin.via[from.1 as usize].clone();
+                units.push(origin.unit);
+                units
+            });
+            // A method an outside trait calls is reached through that
+            // trait by code that is generic over its value.
+            let implicit = method.is_some_and(|def| def.callback);
+            // The types a caller must be able to hold a value of: the
+            // method's own, or the trait it is called through.
+            let family = origin.facts.family;
+            let holders: Option<HashSet<u32>> = method.and_then(|def| {
+                let implemented = def
+                    .implements
+                    .as_deref()
+                    .and_then(|path| path.rsplit("::").next());
+                let targets: Vec<u32> = [def.owner.as_deref(), implemented]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|name| ix.type_ids.get(&(family, name.to_string())).copied())
+                    .collect();
+                if targets.is_empty() {
+                    return None;
+                }
+                let mut seen: HashSet<u32> = targets.iter().copied().collect();
+                let mut stack = targets;
+                while let Some(next) = stack.pop() {
+                    for holder in &ix.held_by[next as usize] {
+                        if seen.insert(*holder) {
+                            stack.push(*holder);
+                        }
+                    }
+                }
+                Some(seen)
+            });
             for (candidate, receiver) in ix.method_refs.get(name).into_iter().flatten() {
                 let candidate = *candidate;
                 let other = &ix.sources[candidate.0 as usize];
+                if let Some(units) = &typed_at {
+                    let caller = (candidate.1 != TOP).then(|| ix.def(candidate));
+                    let expands = caller.is_some_and(|def| def.kind == DefKind::Macro);
+                    let open = implicit && caller.is_some_and(|def| def.generic);
+                    if !expands && !open && !self.leads_to(other.unit, units) {
+                        continue;
+                    }
+                    let index = match candidate.1 {
+                        TOP => other.facts.defs.len(),
+                        def => def as usize,
+                    };
+                    let held = holders.as_ref().is_none_or(|holders| {
+                        ix.mentions[candidate.0 as usize]
+                            .get(index)
+                            .is_none_or(|types| types.iter().any(|t| holders.contains(t)))
+                    });
+                    if !expands && !open && !held {
+                        continue;
+                    }
+                }
                 let in_reach = match (reach, other.project) {
                     (Some(reach), Some(project)) => reach.contains(&project),
                     _ => true,
                 };
-                if from_test && !other.facts.is_test_file {
+                if from_test && !ix.is_test(candidate) {
                     continue;
                 }
                 if from_test && origin.facts.tests_private && other.unit != unit {
@@ -2217,7 +2872,7 @@ impl<'a, 'b> Run<'a, 'b> {
                     continue;
                 }
                 if let (Some(receiver), Some(owner)) = (receiver, owner) {
-                    if !ix.dispatches(other.unit, receiver, owner) {
+                    if !ix.dispatches(candidate, receiver, owner) {
                         continue;
                     }
                 }
