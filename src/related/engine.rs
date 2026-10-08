@@ -66,6 +66,10 @@ pub struct Outcome {
     pub declared: bool,
     /// Selected test files, relative to the project.
     pub tests: BTreeMap<PathBuf, TestSelection>,
+    /// Selected test files in a language other than the project's own,
+    /// which its test runner cannot be narrowed to: whatever runs them
+    /// runs as written.
+    pub outside: BTreeMap<PathBuf, TestSelection>,
     /// `full` comes from the project's own files rather than from a
     /// dependency.
     pub full_own: bool,
@@ -213,6 +217,10 @@ struct Index<'a> {
     /// `(dependent, dependency)` project pairs where the dependent's source
     /// uses a file of the dependency.
     imports: HashSet<(usize, usize)>,
+    /// The pairs among them where the file used is in the dependency's own
+    /// language: the dependent holds code that builds on the dependency's,
+    /// whatever language its own project is in.
+    native_imports: HashSet<(usize, usize)>,
     /// Each project's `[consumes]` entries by dependency.
     consumes: Vec<HashMap<usize, Consume>>,
 }
@@ -1275,14 +1283,21 @@ impl<'a> Index<'a> {
             .collect();
 
         let mut imports = HashSet::new();
+        let mut native_imports = HashSet::new();
         for source in &sources {
             let Some(dependent) = source.project else {
                 continue;
             };
             for unit in source.uses.iter().flatten() {
                 for &file in &unit_files[*unit as usize] {
-                    if let Some(dependency) = sources[file as usize].project {
+                    let used = &sources[file as usize];
+                    if let Some(dependency) = used.project {
                         imports.insert((dependent, dependency));
+                        if Family::of_plugin(&projects[dependency].plugin_name)
+                            == Some(used.facts.family)
+                        {
+                            native_imports.insert((dependent, dependency));
+                        }
                     }
                 }
             }
@@ -1292,6 +1307,7 @@ impl<'a> Index<'a> {
             projects,
             consumes: consumers::load(projects),
             imports,
+            native_imports,
             dependents,
             sources,
             by_path,
@@ -1799,6 +1815,7 @@ impl<'a> Index<'a> {
             outcome.touched = false;
             outcome.product = base_product[i] || forced[i];
             outcome.tests.clear();
+            outcome.outside.clear();
         }
         let mut ids: Vec<&DefId> = run.affected.keys().collect();
         ids.sort();
@@ -1817,19 +1834,20 @@ impl<'a> Index<'a> {
                 }
                 continue;
             }
-            // A test in another language is not something the project's
-            // test runner can be narrowed to; a command that is not a known
-            // runner still runs as written because the project is touched.
-            let plugin_family = Family::of_plugin(&self.projects[project].plugin_name);
-            if plugin_family != Some(source.facts.family) {
-                continue;
-            }
             let relative = source
                 .path
                 .strip_prefix(&self.projects[project].relative_path)
                 .unwrap_or(&source.path)
                 .to_path_buf();
-            let selection = outcomes[project].tests.entry(relative).or_default();
+            // A test in another language is not something the project's
+            // test runner can be narrowed to.
+            let plugin_family = Family::of_plugin(&self.projects[project].plugin_name);
+            let outcome = &mut outcomes[project];
+            let selection = if plugin_family == Some(source.facts.family) {
+                outcome.tests.entry(relative).or_default()
+            } else {
+                outcome.outside.entry(relative).or_default()
+            };
             if id.1 == TOP {
                 selection.whole = true;
             } else if self.def(*id).is_test() {
@@ -1841,7 +1859,11 @@ impl<'a> Index<'a> {
             }
         }
         for outcome in outcomes.iter_mut() {
-            for selection in outcome.tests.values_mut() {
+            for selection in outcome
+                .tests
+                .values_mut()
+                .chain(outcome.outside.values_mut())
+            {
                 let extra = selection.reasons.len().saturating_sub(MAX_REASONS);
                 selection.reasons.truncate(MAX_REASONS);
                 if extra > 0 {
@@ -1904,6 +1926,12 @@ impl<'a> Index<'a> {
                     let reason = if opaque {
                         format!("depends on {name}, whose change is not analysed")
                     } else if family(dependent) != family(dependency) {
+                        // Sources in the dependency's language that build
+                        // on its code are followed like any others, even
+                        // when their project is marked as another language.
+                        if self.follows_natively(dependent, dependency) {
+                            continue;
+                        }
                         format!("depends on {name}, which is in another language")
                     } else if !self.imports.contains(&(dependent, dependency)) {
                         // A declared dependency with no import behind it is
@@ -1945,6 +1973,26 @@ impl<'a> Index<'a> {
             }
             run.drain();
         }
+    }
+
+    /// Whether the source graph explains how `dependent` uses a dependency
+    /// in another language: its tests are all in the dependency's language
+    /// and build on the dependency's code, it declares no `[consumes]`
+    /// entry for it, and nothing in it names a path inside it. Tests in a
+    /// second language, or a path, mean the dependency is also used as
+    /// something built or launched.
+    fn follows_natively(&self, dependent: usize, dependency: usize) -> bool {
+        let family = Family::of_plugin(&self.projects[dependency].plugin_name);
+        let mut tests = self
+            .sources
+            .iter()
+            .filter(|s| s.project == Some(dependent) && !s.ghost && s.facts.is_test_file)
+            .peekable();
+        self.native_imports.contains(&(dependent, dependency))
+            && !self.consumes[dependent].contains_key(&dependency)
+            && tests.peek().is_some()
+            && tests.all(|s| Some(s.facts.family) == family)
+            && self.naming_defs(dependent, dependency).is_empty()
     }
 
     /// The definitions of `dependent` that consume `dependency`, as far as

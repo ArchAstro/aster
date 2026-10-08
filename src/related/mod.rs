@@ -28,6 +28,9 @@
 //! language, a language that is not analysed, no import at all) is honoured
 //! at project level, as `--dependents` would, unless the dependent says in
 //! `[consumes]` which of its sources use the dependency (see `consumers`).
+//! A file's language is its own, not its project's: a dependent whose tests
+//! are all in the dependency's language and build on its code is followed
+//! by source, whatever marker file its project carries.
 
 mod consumers;
 mod elixir;
