@@ -1257,6 +1257,8 @@ fn handle_control_connection(
 ) {
     use std::io::{BufRead, BufReader, Read, Write};
 
+    // On macOS an accepted socket inherits the listener's non-blocking mode.
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut line = String::new();
     let parsed = BufReader::new(&stream)

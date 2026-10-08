@@ -813,6 +813,11 @@ mod platform {
         bundles: &mut HashMap<BundleKey, ManagedBundle>,
         stopping_all: &mut bool,
     ) -> DaemonResult<()> {
+        // On macOS an accepted socket inherits the listener's non-blocking
+        // mode, and a read that beats the client's write would fail.
+        stream
+            .set_nonblocking(false)
+            .map_err(internal("failed to configure daemon connection"))?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut line = String::new();
         if let Err(error) = BufReader::new(
