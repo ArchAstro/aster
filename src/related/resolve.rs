@@ -3,6 +3,7 @@
 //! of known paths, so a file deleted by the change still resolves.
 
 use super::facts::{Family, FileFacts};
+use crate::plugins::rust_related::{self, LayoutKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -26,6 +27,178 @@ pub struct Resolvers {
     python_modules: HashMap<String, Vec<PathBuf>>,
     go_modules: Vec<(String, PathBuf)>,
     go_packages: HashMap<PathBuf, String>,
+    pub rust: RustIndex,
+}
+
+/// One crate target and where its modules live.
+pub struct RustTarget {
+    pub kind: LayoutKind,
+    /// Module path to file, relative to the workspace root.
+    by_module: HashMap<Vec<String>, PathBuf>,
+}
+
+/// The crates of the workspace: which target and module each Rust file is,
+/// so that a path can be followed to the file that declares what it names.
+#[derive(Default)]
+pub struct RustIndex {
+    pub targets: Vec<RustTarget>,
+    /// The targets a file is compiled into and its module path in each.
+    files: HashMap<PathBuf, Vec<(usize, Vec<String>)>>,
+    /// Library targets by crate name.
+    libs: HashMap<String, usize>,
+}
+
+impl RustIndex {
+    pub fn build<'p>(root: &Path, sources: impl Iterator<Item = &'p PathBuf>) -> Self {
+        let mut index = RustIndex::default();
+        // The package of a file is the nearest directory with a manifest.
+        let mut packages: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for path in sources {
+            let mut dir = path.parent();
+            while let Some(candidate) = dir {
+                if !seen.insert(candidate.to_path_buf()) {
+                    break;
+                }
+                if root.join(candidate).join("Cargo.toml").is_file() {
+                    packages.push(candidate.to_path_buf());
+                }
+                dir = candidate.parent();
+            }
+        }
+        packages.sort();
+        for dir in packages {
+            let Some(layout) = rust_related::layout(&root.join(&dir)) else {
+                continue;
+            };
+            for target in layout.targets {
+                let id = index.targets.len();
+                let mut by_module = HashMap::new();
+                for (file, module) in target.files {
+                    let file = normalize(&dir.join(file));
+                    index
+                        .files
+                        .entry(file.clone())
+                        .or_default()
+                        .push((id, module.clone()));
+                    by_module.entry(module).or_insert(file);
+                }
+                if target.kind == LayoutKind::Lib {
+                    index.libs.insert(layout.lib_name.clone(), id);
+                }
+                index.targets.push(RustTarget {
+                    kind: target.kind,
+                    by_module,
+                });
+            }
+        }
+        index
+    }
+
+    /// The targets `file` is compiled into, with its module path in each.
+    pub fn owners(&self, file: &Path) -> &[(usize, Vec<String>)] {
+        self.files.get(file).map_or(&[], Vec::as_slice)
+    }
+
+    /// Follow `path` (`crate::a::b::Name`) from `from` as far as modules
+    /// go: the file of the innermost module, and the segments left over,
+    /// which name something inside it. A path that leads to no module of
+    /// the workspace stays in `from`, whole.
+    pub fn follow(&self, from: &Path, path: &str) -> Vec<(PathBuf, Vec<String>)> {
+        let segments: Vec<String> = path.split("::").map(str::to_string).collect();
+        let mut found: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        for (target, module) in self.owners(from) {
+            let mut target = *target;
+            let mut base = module.clone();
+            let mut rest = &segments[..];
+            match rest.first().map(String::as_str) {
+                Some("crate") => {
+                    base.clear();
+                    rest = &rest[1..];
+                }
+                Some("self") => rest = &rest[1..],
+                Some("super") => {
+                    while rest.first().is_some_and(|s| s == "super") {
+                        if base.pop().is_none() {
+                            break;
+                        }
+                        rest = &rest[1..];
+                    }
+                }
+                Some(first) => {
+                    let mut child = base.clone();
+                    child.push(first.to_string());
+                    if !self.targets[target].by_module.contains_key(&child) {
+                        match self.libs.get(first) {
+                            Some(lib) => {
+                                target = *lib;
+                                base.clear();
+                                rest = &rest[1..];
+                            }
+                            None => continue,
+                        }
+                    }
+                }
+                None => continue,
+            }
+            let modules = &self.targets[target].by_module;
+            let mut taken = 0;
+            for segment in rest {
+                base.push(segment.clone());
+                if !modules.contains_key(&base) {
+                    base.pop();
+                    break;
+                }
+                taken += 1;
+            }
+            if let Some(file) = modules.get(&base) {
+                let entry = (file.clone(), rest[taken..].to_vec());
+                if !found.contains(&entry) {
+                    found.push(entry);
+                }
+            }
+        }
+        if found.is_empty() {
+            found.push((from.to_path_buf(), segments));
+        }
+        found
+    }
+
+    /// Files that hold only test code: integration tests, benches and
+    /// examples, and the modules declared under `#[cfg(test)]`.
+    pub fn test_files(&self, sources: &HashMap<PathBuf, FileFacts>) -> HashSet<PathBuf> {
+        // Module paths declared `#[cfg(test)]`, by target.
+        let mut under: HashMap<usize, Vec<Vec<String>>> = HashMap::new();
+        for (file, owners) in &self.files {
+            let Some(facts) = sources.get(file) else {
+                continue;
+            };
+            for submodule in facts.submodules.iter().filter(|s| s.test) {
+                for (target, module) in owners {
+                    let mut path = module.clone();
+                    path.extend(submodule.inline.iter().cloned());
+                    path.push(submodule.name.clone());
+                    under.entry(*target).or_default().push(path);
+                }
+            }
+        }
+        // A file is test code only if every target it is in says so.
+        let is_test = |target: usize, module: &Vec<String>| match self.targets[target].kind {
+            LayoutKind::Test(_) | LayoutKind::Bench(_) | LayoutKind::Example(_) => true,
+            LayoutKind::Lib | LayoutKind::Bin(_) | LayoutKind::Build => under
+                .get(&target)
+                .is_some_and(|paths| paths.iter().any(|path| module.starts_with(path))),
+        };
+        self.files
+            .iter()
+            .filter(|(_, owners)| {
+                owners
+                    .iter()
+                    .all(|(target, module)| is_test(*target, module))
+            })
+            .map(|(file, _)| file.clone())
+            .collect()
+    }
 }
 
 #[derive(Default, Clone)]
@@ -60,6 +233,13 @@ impl Resolvers {
             python_modules: HashMap::new(),
             go_modules: Vec::new(),
             go_packages: HashMap::new(),
+            rust: RustIndex::build(
+                ws.root,
+                ws.sources
+                    .iter()
+                    .filter(|(_, facts)| facts.family == Family::Rust)
+                    .map(|(path, _)| path),
+            ),
         };
         for (path, facts) in ws.sources {
             match facts.family {
@@ -80,7 +260,7 @@ impl Resolvers {
                         resolvers.go_packages.entry(dir).or_insert(package);
                     }
                 }
-                Family::Js => {}
+                Family::Js | Family::Rust => {}
             }
         }
         for path in ws.paths {
@@ -159,7 +339,7 @@ impl Resolvers {
                 let first = spec.split('.').next().unwrap_or(spec);
                 spec.starts_with('.') || self.python_modules.contains_key(first)
             }
-            Family::Elixir | Family::Go => false,
+            Family::Elixir | Family::Go | Family::Rust => false,
         }
     }
 
@@ -170,6 +350,12 @@ impl Resolvers {
             Family::Js => self.js(ws, from, spec),
             Family::Python => self.python(ws, from, spec),
             Family::Go => self.go_dir(spec).into_iter().collect(),
+            Family::Rust => self
+                .rust
+                .follow(from, spec)
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect(),
         }
     }
 

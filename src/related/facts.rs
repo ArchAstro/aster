@@ -12,6 +12,7 @@ pub enum Family {
     Js,
     Go,
     Python,
+    Rust,
 }
 
 impl Family {
@@ -22,6 +23,7 @@ impl Family {
             "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(Family::Js),
             "go" => Some(Family::Go),
             "py" => Some(Family::Python),
+            "rs" => Some(Family::Rust),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl Family {
             "nodejs" => Some(Family::Js),
             "go" => Some(Family::Go),
             "python" => Some(Family::Python),
+            "rust" => Some(Family::Rust),
             _ => None,
         }
     }
@@ -85,9 +88,33 @@ pub struct Def {
     /// URL-like string literals (`/orgs/\0/members`, with `\0` standing
     /// for an interpolated part): the requests this definition may send.
     pub paths: Vec<String>,
-    /// Lists the modules of an application at run time, so it can reach
-    /// code it never names.
-    pub reflects: bool,
+    /// Reaches code it never names, and how: by listing an application's
+    /// modules at run time, or by running the package's binary.
+    pub reflects: Option<&'static str>,
+    /// Test code in a file that also holds what it tests (a Rust
+    /// `#[cfg(test)]` module): the definition counts as part of a test file
+    /// though the file does not.
+    pub in_test: bool,
+    /// Type names in the definition's signature: what a caller receives
+    /// from it or must hand to it. Only languages that set
+    /// [`FileFacts::static_types`] fill this.
+    pub signature: BTreeSet<String>,
+    /// Type names in what the definition returns, with `Self` written out.
+    /// `None` when the type is not fixed by the declaration (a type
+    /// parameter, `impl Trait`) or the language does not say.
+    pub returns: Option<Vec<String>>,
+    /// Members called on what a call returns, as `(path, through, name)`:
+    /// `name` is called on the result of calling `path`, after the
+    /// methods in `through`, none of which change the type.
+    pub results: Vec<(String, Vec<String>, String)>,
+    /// Some value here has a type the definition does not fix: it has type
+    /// parameters, takes `impl Trait` or `dyn Trait`, or is a trait's own
+    /// method. What it calls on such a value depends on its caller.
+    pub generic: bool,
+    /// The trait this method implements, as a path. One the workspace does
+    /// not declare may call the method without any code naming it: an
+    /// operator, formatting, a conversion, the end of a scope.
+    pub implements: Option<String>,
     /// The type a method belongs to.
     pub owner: Option<String>,
     /// Types this type takes methods from: what it extends or embeds.
@@ -128,7 +155,13 @@ impl Def {
             via: Vec::new(),
             route: None,
             paths: Vec::new(),
-            reflects: false,
+            reflects: None,
+            in_test: false,
+            signature: BTreeSet::new(),
+            returns: None,
+            results: Vec::new(),
+            generic: false,
+            implements: None,
             owner: None,
             supers: Vec::new(),
             concrete: false,
@@ -178,6 +211,16 @@ pub struct ImportLine {
     pub structural: bool,
 }
 
+/// A `mod name;` declaration.
+#[derive(Debug, Clone)]
+pub struct Submodule {
+    /// Inline modules the declaration sits in.
+    pub inline: Vec<String>,
+    pub name: String,
+    /// Declared under `#[cfg(test)]`: the file is test code.
+    pub test: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileFacts {
     pub family: Family,
@@ -212,6 +255,22 @@ pub struct FileFacts {
     /// Loads a file whose name is computed, so what the file brings into a
     /// process cannot be listed.
     pub open_loads: bool,
+    /// The type a member is accessed on is declared in a file this one
+    /// uses, not only in its own unit (Rust, where types are imported).
+    pub types_by_import: bool,
+    /// Types are static: a method runs only where the value's type, or a
+    /// trait it is called through, is known, so a caller's file leads (by
+    /// what it uses, however indirectly) to the file of one or the other.
+    pub static_types: bool,
+    /// A macro is in scope by its bare name wherever it was exported to, so
+    /// its users are found by name rather than through an import.
+    pub macros_by_name: bool,
+    /// Specifiers the file brings into scope without any definition naming
+    /// them (a Rust trait imported for its methods). The file loads them;
+    /// which definitions use them shows in what those definitions call.
+    pub brings: Vec<String>,
+    /// `mod name;` declarations: modules of this file kept in other files.
+    pub submodules: Vec<Submodule>,
     /// Files a test runner's configuration tells it to load before every
     /// test (`setupFiles`), as specifiers relative to this file.
     pub preloads: Vec<String>,
@@ -244,6 +303,11 @@ impl FileFacts {
             loads_by_import: false,
             open_loads: false,
             preloads: Vec::new(),
+            types_by_import: false,
+            static_types: false,
+            macros_by_name: false,
+            brings: Vec::new(),
+            submodules: Vec::new(),
             tests_private: false,
             dynamic: None,
             embeds: Vec::new(),

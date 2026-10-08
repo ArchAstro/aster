@@ -75,6 +75,223 @@ pub(crate) fn select(package_dir: &Path, command: &str, files: &[PathBuf]) -> Fi
     .select(files)
 }
 
+/// What kind of crate target a file is compiled into.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum LayoutKind {
+    Lib,
+    Bin(String),
+    Test(String),
+    Bench(String),
+    Example(String),
+    Build,
+}
+
+/// One crate target: its source files (relative to the package directory)
+/// and the module path of each.
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutTarget {
+    pub kind: LayoutKind,
+    pub files: BTreeMap<PathBuf, Vec<String>>,
+}
+
+/// The targets of the package in `package_dir`, each walked from its root
+/// file through `mod` declarations.
+#[derive(Debug, Clone)]
+pub(crate) struct Layout {
+    pub package: String,
+    pub lib_name: String,
+    pub targets: Vec<LayoutTarget>,
+}
+
+pub(crate) fn layout(package_dir: &Path) -> Option<Layout> {
+    let package = Package::load(package_dir).ok()?;
+    let mut targets = Vec::new();
+    if let Some(lib) = &package.lib {
+        targets.push(LayoutTarget {
+            kind: LayoutKind::Lib,
+            files: lib.files.clone(),
+        });
+    }
+    for target in &package.others {
+        let kind = match &target.owner {
+            Owner::Lib(_) => LayoutKind::Lib,
+            Owner::Bin(name) => LayoutKind::Bin(name.clone()),
+            Owner::Aux(AuxKind::Test, name) => LayoutKind::Test(name.clone()),
+            Owner::Aux(AuxKind::Bench, name) => LayoutKind::Bench(name.clone()),
+            Owner::Aux(AuxKind::Example, name) => LayoutKind::Example(name.clone()),
+            Owner::Build => LayoutKind::Build,
+        };
+        targets.push(LayoutTarget {
+            kind,
+            files: target.files.clone(),
+        });
+    }
+    Some(Layout {
+        package: package.name.clone(),
+        lib_name: package.lib_name.clone(),
+        targets,
+    })
+}
+
+/// Narrow a `cargo test` command to the tests `aster affected --related`
+/// selected. `None` when the command is not one this can narrow, or a
+/// selected file belongs to no crate target, in which case it runs as
+/// written.
+///
+/// A test is run by its full path with `--exact`; a file selected as a
+/// whole, and tests a macro defines, run by their module's path as a
+/// filter. Doctests are not analysed, so they run whenever the original
+/// command would run them.
+pub(crate) fn related(
+    project_dir: &Path,
+    command: &str,
+    tests: &[super::RelatedTest],
+) -> Option<FilesListPlan> {
+    let cargo = CargoTest::parse(command).ok()?;
+    // The package of a file is the nearest directory with a manifest.
+    let mut packages: BTreeMap<PathBuf, Vec<&super::RelatedTest>> = BTreeMap::new();
+    for test in tests {
+        let mut dir = test.file.parent();
+        let package = loop {
+            let candidate = dir?;
+            if project_dir.join(candidate).join("Cargo.toml").is_file() {
+                break candidate.to_path_buf();
+            }
+            dir = candidate.parent();
+        };
+        packages.entry(package).or_default().push(test);
+    }
+    #[derive(Default)]
+    struct Chosen {
+        whole: bool,
+        exact: BTreeSet<String>,
+        filters: BTreeSet<String>,
+    }
+    let mut commands = Vec::new();
+    for (dir, tests) in packages {
+        let layout = layout(&project_dir.join(&dir))?;
+        let in_scope = match &cargo.scope {
+            Scope::Default => dir.as_os_str().is_empty(),
+            Scope::Workspace(excluded) => !excluded.contains(&layout.package),
+            Scope::Packages(names) => names.contains(&layout.package),
+        };
+        if !in_scope {
+            continue;
+        }
+        let package: Vec<String> = match cargo.scope {
+            Scope::Default => Vec::new(),
+            _ => vec!["-p".to_string(), layout.package.clone()],
+        };
+        let mut chosen: BTreeMap<Vec<String>, Chosen> = BTreeMap::new();
+        for test in tests {
+            let file = normalize(test.file.strip_prefix(&dir).unwrap_or(&test.file));
+            let mut owned = false;
+            for target in &layout.targets {
+                let Some(module) = target.files.get(&file) else {
+                    continue;
+                };
+                let flags = match &target.kind {
+                    LayoutKind::Lib => vec!["--lib".to_string()],
+                    LayoutKind::Bin(name) => vec!["--bin".to_string(), name.clone()],
+                    LayoutKind::Test(name) => vec!["--test".to_string(), name.clone()],
+                    LayoutKind::Example(name) => vec!["--example".to_string(), name.clone()],
+                    LayoutKind::Bench(name) if cargo.all_targets => {
+                        vec!["--bench".to_string(), name.clone()]
+                    }
+                    LayoutKind::Bench(_) | LayoutKind::Build => {
+                        owned = true;
+                        continue;
+                    }
+                };
+                owned = true;
+                let entry = chosen.entry(flags).or_default();
+                let prefix = module.join("::");
+                let within = |name: &str| match (prefix.is_empty(), name.is_empty()) {
+                    (true, _) => name.to_string(),
+                    (false, true) => prefix.clone(),
+                    (false, false) => format!("{prefix}::{name}"),
+                };
+                if test.names.is_empty() {
+                    match prefix.is_empty() {
+                        true => entry.whole = true,
+                        false => {
+                            entry.filters.insert(format!("{prefix}::"));
+                        }
+                    }
+                }
+                for name in &test.names {
+                    // A name ending in `::` is a module whose tests a
+                    // macro defines.
+                    match name.strip_suffix("::") {
+                        Some(module) => match within(module) {
+                            path if path.is_empty() => entry.whole = true,
+                            path => {
+                                entry.filters.insert(format!("{path}::"));
+                            }
+                        },
+                        None => {
+                            entry.exact.insert(within(name));
+                        }
+                    }
+                }
+            }
+            if !owned {
+                return None;
+            }
+        }
+        for (flags, mut chosen) in chosen {
+            let mut selection = package.clone();
+            selection.extend(flags);
+            if chosen.exact.len() + chosen.filters.len() > MAX_FILTERS {
+                // Too many names for one command line: run their modules.
+                for name in std::mem::take(&mut chosen.exact) {
+                    match name.rsplit_once("::") {
+                        Some((module, _)) => {
+                            chosen.filters.insert(format!("{module}::"));
+                        }
+                        None => chosen.whole = true,
+                    }
+                }
+            }
+            if chosen.whole || chosen.filters.len() > MAX_FILTERS {
+                commands.push(cargo.render(&selection, &[]));
+                continue;
+            }
+            if !chosen.exact.is_empty() {
+                let mut filters = vec!["--exact".to_string()];
+                filters.extend(chosen.exact);
+                commands.push(cargo.render(&selection, &filters));
+            }
+            if !chosen.filters.is_empty() {
+                let filters: Vec<String> = chosen.filters.into_iter().collect();
+                commands.push(cargo.render(&selection, &filters));
+            }
+        }
+    }
+    if commands.is_empty() {
+        return Some(FilesListPlan::Nothing);
+    }
+    if !cargo.all_targets {
+        let mut selection = match &cargo.scope {
+            Scope::Default => Vec::new(),
+            Scope::Workspace(excluded) => {
+                let mut flags = vec!["--workspace".to_string()];
+                for package in excluded {
+                    flags.extend(["--exclude".to_string(), package.clone()]);
+                }
+                flags
+            }
+            Scope::Packages(names) => names
+                .iter()
+                .flat_map(|name| ["-p".to_string(), name.clone()])
+                .collect(),
+        };
+        selection.push("--doc".to_string());
+        commands.push(cargo.render(&selection, &[]));
+    }
+    Some(FilesListPlan::Commands(commands))
+}
+
 fn full(explanation: Vec<String>) -> FilesListSelection {
     FilesListSelection {
         plan: FilesListPlan::Full,

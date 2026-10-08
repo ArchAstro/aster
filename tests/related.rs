@@ -638,6 +638,181 @@ fn a_change_that_reaches_a_setup_file_runs_every_test() {
     );
 }
 
+const RUST: &[(&str, &str)] = &[
+    (
+        "shop/Cargo.toml",
+        "[package]\nname = \"shop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    ("shop/src/lib.rs", "pub mod cart;\npub mod pricing;\n"),
+    (
+        "shop/src/pricing.rs",
+        "pub fn sum(items: &[u32]) -> u32 {\n    items.iter().sum()\n}\n\npub fn tax(amount: u32) -> u32 {\n    amount / 5\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn sums() {\n        assert_eq!(sum(&[1, 2]), 3);\n    }\n\n    #[test]\n    fn taxes() {\n        assert_eq!(tax(10), 2);\n    }\n}\n",
+    ),
+    (
+        "shop/src/cart.rs",
+        "use crate::pricing;\nuse std::fmt;\n\npub struct Cart {\n    pub items: Vec<u32>,\n}\n\nimpl Cart {\n    pub fn total(&self) -> u32 {\n        pricing::sum(&self.items)\n    }\n\n    pub fn count(&self) -> usize {\n        self.items.len()\n    }\n}\n\nimpl fmt::Display for Cart {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"cart of {}\", self.count())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::Cart;\n\n    #[test]\n    fn totals() {\n        let cart = Cart { items: vec![1, 2] };\n        assert_eq!(cart.total(), 3);\n    }\n\n    #[test]\n    fn counts() {\n        let cart = Cart { items: vec![1] };\n        assert_eq!(cart.count(), 1);\n    }\n}\n",
+    ),
+    (
+        "shop/tests/api.rs",
+        "use shop::cart::Cart;\n\n#[test]\nfn total_of_a_cart() {\n    assert_eq!(Cart { items: vec![4] }.total(), 4);\n}\n\n#[test]\nfn shown() {\n    assert_eq!(Cart { items: vec![] }.to_string(), \"cart of 0\");\n}\n",
+    ),
+];
+
+#[test]
+fn rust_change_selects_the_tests_that_reach_the_function() {
+    let ws = Workspace::new(RUST);
+    ws.edit(
+        "shop/src/pricing.rs",
+        "items.iter().sum()",
+        "items.iter().sum::<u32>() + 0",
+    );
+    let plan = ws.plan("test");
+    // `Cart::total` calls `pricing::sum`; its tests beside it and in the
+    // integration test follow. Doctests are not analysed, so they run.
+    assert_eq!(
+        plan.commands("//shop:test"),
+        [
+            "cargo test --lib -- --exact cart::tests::totals pricing::tests::sums",
+            "cargo test --test api -- --exact total_of_a_cart",
+            "cargo test --doc",
+        ]
+    );
+
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("shop/src/pricing.rs", "amount / 5", "amount / 4");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        [
+            "cargo test --lib -- --exact pricing::tests::taxes",
+            "cargo test --doc"
+        ]
+    );
+}
+
+#[test]
+fn rust_tests_beside_the_code_are_test_code() {
+    let ws = Workspace::new(RUST);
+    // A change to one test runs that test, not the users of the file.
+    ws.edit(
+        "shop/src/cart.rs",
+        "assert_eq!(cart.count(), 1);",
+        "assert_eq!(1, cart.count());",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        [
+            "cargo test --lib -- --exact cart::tests::counts",
+            "cargo test --doc"
+        ]
+    );
+}
+
+#[test]
+fn rust_methods_of_an_outside_trait_reach_the_users_of_the_type() {
+    let ws = Workspace::new(RUST);
+    // Nothing names `fmt`: `to_string()` and `{}` call it.
+    ws.edit("shop/src/cart.rs", "cart of {}", "a cart of {}");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        [
+            "cargo test --lib -- --exact cart::tests::counts cart::tests::totals",
+            "cargo test --test api -- --exact shown total_of_a_cart",
+            "cargo test --doc",
+        ]
+    );
+}
+
+const RUST_KIT: &[(&str, &str)] = &[
+    (
+        "kit/Cargo.toml",
+        "[package]\nname = \"kit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    (
+        "kit/src/lib.rs",
+        "#[macro_use]\nmod macros;\npub mod alpha;\npub mod beta;\npub mod ports;\npub mod wiring;\n",
+    ),
+    (
+        "kit/src/macros.rs",
+        "macro_rules! twice {\n    ($value:expr) => {\n        $value * 2\n    };\n}\n",
+    ),
+    (
+        "kit/src/ports.rs",
+        "pub trait Runner {\n    fn run(&self) -> u32;\n}\n",
+    ),
+    (
+        "kit/src/alpha.rs",
+        "pub struct Alpha {\n    pub run: u32,\n}\n\nimpl Alpha {\n    pub fn new() -> Self {\n        Alpha { run: 1 }\n    }\n\n    pub fn run(&self) -> u32 {\n        self.run\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn alpha_runs() {\n        let alpha = Alpha::new();\n        assert_eq!(alpha.run(), 1);\n    }\n}\n",
+    ),
+    // The trait is declared in one file, implemented in another.
+    (
+        "kit/src/beta.rs",
+        "use crate::ports::Runner;\n\npub struct Beta;\n\nimpl Beta {\n    pub fn new() -> Self {\n        Beta\n    }\n}\n\nimpl Runner for Beta {\n    fn run(&self) -> u32 {\n        twice!(1)\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn beta_runs() {\n        let beta = Beta::new();\n        assert_eq!(beta.run(), 2);\n    }\n}\n",
+    ),
+    (
+        "kit/src/wiring.rs",
+        "use crate::alpha::Alpha;\nuse crate::ports::Runner;\n\npub fn drive(runner: &dyn Runner) -> u32 {\n    runner.run()\n}\n\npub fn read(alpha: &Alpha) -> u32 {\n    alpha.run\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::beta::Beta;\n\n    #[test]\n    fn drives_beta() {\n        assert_eq!(drive(&Beta::new()), 2);\n    }\n\n    #[test]\n    fn reads_the_field() {\n        assert_eq!(read(&Alpha::new()), 1);\n    }\n}\n",
+    ),
+];
+
+#[test]
+fn rust_method_calls_are_told_apart_by_the_type_of_the_value() {
+    let ws = Workspace::new(RUST_KIT);
+    // `Alpha::run` and `Runner::run` share a name. `beta.run()` is called
+    // on what `Beta::new` returns, `runner.run()` on a `dyn Runner`, and
+    // `alpha.run` reads a field: none of them is `Alpha::run`.
+    ws.edit(
+        "kit/src/alpha.rs",
+        "        self.run\n",
+        "        self.run + 0\n",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//kit:test"),
+        [
+            "cargo test --lib -- --exact alpha::tests::alpha_runs",
+            "cargo test --doc"
+        ]
+    );
+}
+
+#[test]
+fn rust_trait_methods_are_reached_through_the_trait() {
+    let ws = Workspace::new(RUST_KIT);
+    // `drive` never names `Beta`; it calls `run` on a `dyn Runner`.
+    ws.edit("kit/src/beta.rs", "twice!(1)", "twice!(1) + 0");
+    assert_eq!(
+        ws.plan("test").commands("//kit:test"),
+        [
+            "cargo test --lib -- --exact beta::tests::beta_runs wiring::tests::drives_beta",
+            "cargo test --doc"
+        ]
+    );
+}
+
+#[test]
+fn rust_macros_are_found_by_name() {
+    let ws = Workspace::new(RUST_KIT);
+    // `#[macro_use]` puts `twice!` in scope with no `use` to follow.
+    ws.edit("kit/src/macros.rs", "$value * 2", "$value + $value");
+    assert_eq!(
+        ws.plan("test").commands("//kit:test"),
+        [
+            "cargo test --lib -- --exact beta::tests::beta_runs wiring::tests::drives_beta",
+            "cargo test --doc"
+        ]
+    );
+}
+
+#[test]
+fn rust_manifest_change_runs_in_full() {
+    let ws = Workspace::new(RUST);
+    ws.edit("shop/Cargo.toml", "0.1.0", "0.2.0");
+    let plan = ws.plan("test");
+    assert!(plan.commands("//shop:test").is_empty());
+    assert!(plan
+        .notes("//shop:test")
+        .contains("shop/Cargo.toml changed; running in full"));
+}
+
 #[test]
 fn python_change_selects_test_files_through_imports() {
     let ws = Workspace::new(&[

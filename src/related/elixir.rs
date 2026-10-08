@@ -342,7 +342,7 @@ impl Walker<'_> {
                     let function = text(right, self.source).to_string();
                     let receiver = text(left, self.source);
                     if lists_modules(receiver, &function, node, self.source) {
-                        self.facts.owner(scope.owner).reflects = true;
+                        self.facts.owner(scope.owner).reflects = Some("lists modules at run time");
                     }
                     if left.kind() == "alias" {
                         // `Module.function(...)`.
