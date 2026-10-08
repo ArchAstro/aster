@@ -1091,6 +1091,119 @@ fn test_only_changes_do_not_run_dependents_in_other_languages() {
         .contains("depends on //shop, which is in another language"));
 }
 
+/// The Elixir fixture plus a project marked as JavaScript whose one test is
+/// an Elixir test of the shop's code, run from the shop's directory.
+fn outside_test() -> Vec<(&'static str, &'static str)> {
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "shop-proof/package.json",
+        r#"{"name":"shop-proof","private":true}"#,
+    ));
+    files.push((
+        "shop-proof/aster.toml",
+        "depends_on = [\"//shop\"]\n\n[targets.test-ci]\ncommand = \"bash -c 'cd ../shop && exec mix test ../shop-proof/proof_test.exs'\"\n",
+    ));
+    files.push(("shop-proof/proof_test.exs", PROOF));
+    files
+}
+
+const PROOF: &str = "defmodule ShopProof.ProofTest do\n  use ExUnit.Case\n\n  test \"tax\" do\n    assert Shop.Pricing.tax(10) == 2.0\n  end\nend\n";
+
+#[test]
+fn a_test_in_another_project_follows_the_code_it_names() {
+    let ws = Workspace::new(&outside_test());
+    // The proof never reaches `sum`: the dependency changed, and the
+    // project that depends on it has nothing to run.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    let plan = ws.plan("test-ci");
+    assert!(!plan.runs().contains(&"//shop-proof:test-ci"), "{plan:#?}");
+
+    // It does reach `tax`, and its command names a file outside the
+    // project it runs in, so it runs as written.
+    ws.git(&["checkout", "-q", "--", "."]);
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    let plan = ws.plan("test-ci");
+    assert!(
+        plan.commands("//shop-proof:test-ci").is_empty(),
+        "{plan:#?}"
+    );
+    let notes = plan.notes("//shop-proof:test-ci");
+    assert!(
+        notes.contains("proof_test.exs: tax (shop/lib/shop/pricing.ex:5)"),
+        "{notes}"
+    );
+    assert!(notes.contains("running as written"), "{notes}");
+}
+
+#[test]
+fn a_dependent_that_may_use_the_dependency_another_way_runs_in_full() {
+    let full = |files: &[(&str, &str)]| {
+        let ws = Workspace::new(files);
+        ws.edit(
+            "shop/lib/shop/pricing.ex",
+            "Enum.sum(items)",
+            "Enum.sum(items) + 0",
+        );
+        let plan = ws.plan("test-ci");
+        assert!(
+            plan.notes("//shop-proof:test-ci")
+                .contains("depends on //shop, which is in another language"),
+            "{plan:#?}"
+        );
+    };
+    // No code in the dependency's language at all.
+    let mut files = outside_test();
+    files.retain(|(path, _)| *path != "shop-proof/proof_test.exs");
+    full(&files);
+    // A test in a second language, which the Elixir graph says nothing
+    // about.
+    let mut files = outside_test();
+    files.push(("shop-proof/src/a.test.ts", "it(\"runs\", () => {});\n"));
+    full(&files);
+    // A path into the dependency: something there is read or launched.
+    let mut files = outside_test();
+    files.push((
+        "shop-proof/launch_test.exs",
+        "defmodule ShopProof.LaunchTest do\n  use ExUnit.Case\n\n  test \"boots\" do\n    assert File.dir?(\"../shop/priv\")\n  end\nend\n",
+    ));
+    full(&files);
+}
+
+#[test]
+fn a_selected_test_in_another_language_keeps_the_project_running() {
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "portal/package.json",
+        r#"{"name":"portal","scripts":{"test":"vitest run"}}"#,
+    ));
+    files.push(("portal/src/a.ts", "export const a = () => 1;\n"));
+    files.push((
+        "portal/src/a.test.ts",
+        "import { a } from \"./a\";\nit(\"runs\", () => { a(); });\n",
+    ));
+    files.push(("portal/src/b.test.ts", "it(\"idles\", () => {});\n"));
+    files.push(("portal/proof_test.exs", PROOF));
+    let ws = Workspace::new(&files);
+    ws.edit("portal/src/a.ts", "=> 1", "=> 2");
+    let plan = ws.plan("test");
+    assert_eq!(plan.commands("//portal:test").len(), 1, "{plan:#?}");
+
+    // The change now also reaches the Elixir test, which `vitest` cannot
+    // be narrowed to: nothing is narrowed on the strength of the rest.
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    let plan = ws.plan("test");
+    assert!(plan.commands("//portal:test").is_empty(), "{plan:#?}");
+    assert!(
+        plan.notes("//portal:test")
+            .contains("a selected test is not in the project's own language"),
+        "{plan:#?}"
+    );
+}
+
 /// A Go gateway and an Elixir platform that depends on it without importing
 /// it: only some of the platform's tests launch or read the gateway. Two
 /// shard projects run the platform's suite, and a JavaScript portal depends

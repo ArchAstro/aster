@@ -554,6 +554,21 @@ impl<'a> RelatedPlanner<'a> {
         requested: &mut Option<Vec<String>>,
     ) -> Result<Option<String>> {
         let target_addr = format!("{project_addr}:{target}");
+        // A selected test the project's runner cannot name is run by some
+        // command here that Aster cannot narrow, so nothing is narrowed or
+        // skipped on the strength of the tests it can.
+        if !outcome.outside.is_empty() {
+            for (file, selection) in &outcome.outside {
+                for reason in &selection.reasons {
+                    plan.note(&target_addr, format!("{}: {reason}", file.display()));
+                }
+            }
+            plan.note(
+                &target_addr,
+                "a selected test is not in the project's own language; running as written",
+            );
+            return Ok(None);
+        }
         let mut requested_is_runner = true;
         // Whether any test command in the closure still runs.
         let mut runs = false;

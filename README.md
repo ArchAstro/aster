@@ -530,6 +530,16 @@ Where the source graph cannot see, Aster runs more:
   cannot follow. A project that says which of its sources
   use such a dependency runs only those and the tests that reach them (see
   below).
+- A dependency in another language is followed by source after all when
+  every test of the dependent is in that language and builds on the
+  dependency's code: an Elixir test kept in a project marked by a
+  `package.json`, say, and run from the dependency's directory. The
+  project then runs only when the change reaches one of its tests. A test
+  in a second language, a `[consumes]` entry, or a path into the dependency
+  means it is also used some other way, and the rule above applies.
+- A project's runner cannot name a test in another language. When one is
+  selected in a project the change's dependents include, the project's
+  targets run as written.
 - A command Aster cannot read as a test runner runs as written: a script
   file, a one-liner whose last command is piped, uses a variable or sits in
   a block, a command that lists test files outside its project, or a
