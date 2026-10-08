@@ -142,15 +142,46 @@ impl AffectedDetector {
     /// is `None`.
     pub fn changes(&self, base: &str, head: Option<&str>) -> Result<Vec<Change>> {
         let base_tree = self.merge_base_tree(base, head.unwrap_or("HEAD"))?;
-        let head_tree = match head {
-            Some(head) => Some(
-                self.repo
-                    .revparse_single(head)
-                    .and_then(|object| object.peel_to_tree())
-                    .with_context(|| format!("Could not get tree for ref '{head}'"))?,
-            ),
-            None => None,
+        let head_tree = head.map(|head| self.tree_of(head)).transpose()?;
+        self.changes_between(base_tree, head_tree)
+    }
+
+    /// The changes a revision expression names, read the way `git diff`
+    /// reads it: nothing is the working tree against `HEAD`, `A` is the
+    /// working tree against `A`, `A..B` is `B` against `A`, and `A...B` is
+    /// `B` against its merge base with `A`. An omitted side is `HEAD`.
+    pub fn changes_in(&self, range: Option<&str>) -> Result<Vec<Change>> {
+        let side = |name: &'_ str| if name.is_empty() { "HEAD" } else { name }.to_string();
+        let Some(range) = range.map(str::trim).filter(|r| !r.is_empty()) else {
+            return self.changes_between(self.tree_of("HEAD")?, None);
         };
+        if let Some((base, head)) = range.split_once("...") {
+            let (base, head) = (side(base), side(head));
+            let base_tree = self.merge_base_tree(&base, &head)?;
+            return self.changes_between(base_tree, Some(self.tree_of(&head)?));
+        }
+        if let Some((base, head)) = range.split_once("..") {
+            let base_tree = self.tree_of(&side(base))?;
+            return self.changes_between(base_tree, Some(self.tree_of(&side(head))?));
+        }
+        self.changes_between(self.tree_of(range)?, None)
+    }
+
+    fn tree_of(&self, name: &str) -> Result<git2::Tree<'_>> {
+        self.repo
+            .revparse_single(name)
+            .with_context(|| format!("Git ref '{name}' not found"))?
+            .peel_to_tree()
+            .with_context(|| format!("Could not get tree for ref '{name}'"))
+    }
+
+    /// The changes from `base_tree` to `head_tree`, or to the working tree
+    /// (untracked files included) when there is none.
+    fn changes_between(
+        &self,
+        base_tree: git2::Tree<'_>,
+        head_tree: Option<git2::Tree<'_>>,
+    ) -> Result<Vec<Change>> {
         let mut opts = DiffOptions::new();
         opts.context_lines(0)
             .include_untracked(true)

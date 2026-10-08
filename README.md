@@ -487,6 +487,28 @@ Where the source graph cannot see, Aster runs more:
   a block, a command that lists test files outside its project, or a
   selection too long for one command line.
 
+#### Seeing the source graph of a change
+
+`aster graph --source` prints what `--related` works from: each definition a
+change touches and, beneath it, the definitions that use it, down to the
+tests.
+
+```console
+aster graph --source                              # uncommitted changes
+aster graph --source --commit origin/main...HEAD  # a branch
+aster graph --source --commit HEAD~3..HEAD        # a range
+aster graph --source --commit HEAD~1              # working tree against a ref
+aster graph --source --dir services/api --ext ts,tsx
+aster --json graph --source --commit main..HEAD   # nodes and edges
+```
+
+`--commit` reads its value as `git diff` does. `--dir` and `--ext` limit which
+changed files are considered. Each definition appears once, under the one it
+was first reached through, so the output is a tree over the graph rather
+than every edge. Projects that run in full for a reason the graph cannot show
+are listed after it. Files the change does not touch are read from the
+working tree, so check out the head of a range for an exact answer.
+
 ### Dependencies that are built or run, not imported
 
 A project can depend on another one it never imports: its tests launch the

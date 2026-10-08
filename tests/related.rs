@@ -252,6 +252,73 @@ fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
 }
 
 #[test]
+fn graph_source_prints_what_a_change_reaches() {
+    let ws = Workspace::new(ELIXIR);
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    let text = |args: &[&str]| {
+        let output = ws.aster(args);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // No range: the working tree.
+    let working = text(&["graph", "--source"]);
+    assert_eq!(
+        working,
+        "Source graph for the working tree: 1 changed, 2 reached, 1 in test files\n\
+         \nsum (shop/lib/shop/pricing.ex:3)  [shop/lib/shop/pricing.ex:3 changed]\n\
+         └─ total (shop/lib/shop/cart.ex:4)\n   \
+         └─ total (shop/test/shop/cart_test.exs:5)  [test]\n"
+    );
+
+    ws.git(&["commit", "-qam", "change"]);
+    assert!(text(&["graph", "--source"]).contains("0 changed, 0 reached"));
+    // A range, a three-dot range and a single ref all name the commit.
+    for range in ["HEAD~1..HEAD", "HEAD~1...HEAD", "HEAD~1"] {
+        let committed = text(&["graph", "--source", "--commit", range]);
+        assert!(
+            committed.contains("└─ total (shop/lib/shop/cart.ex:4)"),
+            "{range}: {committed}"
+        );
+    }
+    // Filters drop changed files before the graph is built.
+    let filtered = text(&[
+        "graph",
+        "--source",
+        "--commit",
+        "HEAD~1..HEAD",
+        "--ext",
+        "ts",
+    ]);
+    assert!(filtered.contains("0 changed"), "{filtered}");
+    let scoped = text(&[
+        "graph",
+        "--source",
+        "--commit",
+        "HEAD~1..HEAD",
+        "--dir",
+        "shop/lib",
+    ]);
+    assert!(scoped.contains("1 changed"), "{scoped}");
+
+    let json: serde_json::Value = serde_json::from_str(&text(&[
+        "--json",
+        "graph",
+        "--source",
+        "--commit",
+        "HEAD~1..HEAD",
+    ]))
+    .unwrap();
+    assert_eq!(json["range"], "HEAD~1..HEAD");
+    assert_eq!(json["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(json["edges"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn removed_function_selects_the_tests_that_still_name_it() {
     let ws = Workspace::new(ELIXIR);
     ws.edit(

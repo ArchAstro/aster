@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use aster::cli::affected_files::{
     apply_warnings_as_errors, plan_affected_commands, related_proxies, AffectedRequest,
 };
+use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
@@ -367,7 +368,31 @@ fn run() -> Result<()> {
             }
             // Quiet mode: no output for list
         }
-        Commands::Graph { target } => {
+        Commands::Graph {
+            source: true,
+            commit,
+            dir,
+            ext,
+            ..
+        } => {
+            let detector = AffectedDetector::new(&workspace_root)
+                .context("Failed to initialize git repository")?;
+            let mut changes = detector
+                .changes_in(commit.as_deref())
+                .context("Failed to read the changed lines")?;
+            source_graph::filter_changes(&mut changes, dir.as_deref(), &ext);
+            changes.sort_by(|a, b| a.path.cmp(&b.path));
+            let graph = build_graph(&projects)?;
+            let analysis = aster::related::analyse(&workspace_root, &projects, &graph, &changes);
+            let range = source_graph::describe_range(commit.as_deref());
+            if output_mode == OutputMode::Json {
+                let value = source_graph::render_json(&analysis, &range);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                print!("{}", source_graph::render_text(&analysis, &range));
+            }
+        }
+        Commands::Graph { target, .. } => {
             // Build the target graph
             let graph = build_target_graph(&projects);
 

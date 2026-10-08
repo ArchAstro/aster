@@ -29,6 +29,8 @@ aster list
 aster list --json
 aster graph
 aster graph //services/api:test
+aster graph --source                              # what the uncommitted changes reach, down to the tests
+aster graph --source --commit origin/main...HEAD  # the same for a branch or range (read as git diff reads it)
 aster why //services/api:test //libs/core:build
 ```
 
