@@ -85,6 +85,9 @@ pub struct Def {
     /// URL-like string literals (`/orgs/\0/members`, with `\0` standing
     /// for an interpolated part): the requests this definition may send.
     pub paths: Vec<String>,
+    /// Lists the modules of an application at run time, so it can reach
+    /// code it never names.
+    pub reflects: bool,
 }
 
 impl Def {
@@ -103,6 +106,7 @@ impl Def {
             via: Vec::new(),
             route: None,
             paths: Vec::new(),
+            reflects: false,
         }
     }
 

@@ -825,7 +825,11 @@ impl<'a> Index<'a> {
                 project.and_then(|p| Family::of_plugin(&self.projects[p].plugin_name));
             match indexed {
                 Some(file) => {
+                    let before = run.affected.len();
                     run.seed(change, file);
+                    if run.affected.len() > before {
+                        self.seed_reflection(&mut run, change, file);
+                    }
                     let family = self.sources[file as usize].facts.family;
                     match project {
                         Some(p) if plugin_family == Some(family) => own_sources.push((change, p)),
@@ -905,6 +909,37 @@ impl<'a> Index<'a> {
     /// Whether a source file only supports tests (`test/support`, fixtures,
     /// `__tests__` helpers): what a project provides to its dependents does
     /// not change with it.
+    /// Mark the definitions that list modules at run time. They reach the
+    /// changed code without naming it, from the project that holds it or
+    /// from any project that depends on that one.
+    fn seed_reflection(&self, run: &mut Run, change: &Change, file: u32) {
+        let changed = &self.sources[file as usize];
+        if changed.facts.is_test_file {
+            return;
+        }
+        let Some(project) = changed.project else {
+            return;
+        };
+        for (other, source) in self.sources.iter().enumerate() {
+            let reaches = source.facts.family == changed.facts.family
+                && source
+                    .project
+                    .is_some_and(|p| self.downstream[project].contains(&p));
+            if !reaches {
+                continue;
+            }
+            let defs = source.facts.defs.iter().enumerate();
+            let top = std::iter::once((TOP as usize, &source.facts.top));
+            for (def, _) in defs.chain(top).filter(|(_, d)| d.reflects) {
+                let why = format!(
+                    "{} changed, and this lists modules at run time",
+                    change.path.display()
+                );
+                run.mark((other as u32, def as u32), Why::Changed(why));
+            }
+        }
+    }
+
     fn test_side(&self, source: &Source) -> bool {
         if source.facts.is_test_file {
             return true;

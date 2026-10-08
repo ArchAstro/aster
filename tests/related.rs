@@ -233,6 +233,25 @@ fn framework_callback_change_selects_users_of_the_module() {
 }
 
 #[test]
+fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
+    let mut files = ELIXIR.to_vec();
+    // Reaches every module's functions without naming one of them.
+    files.push((
+        "shop/test/shop/modules_test.exs",
+        "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"every module answers\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    for module <- modules, do: assert(module.module_info(:module) == module)\n  end\nend\n",
+    ));
+    let ws = Workspace::new(&files);
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/modules_test.exs test/shop/tax_test.exs"]
+    );
+    let notes = plan.notes("//shop:test");
+    assert!(notes.contains("lists modules at run time"), "{notes}");
+}
+
+#[test]
 fn removed_function_selects_the_tests_that_still_name_it() {
     let ws = Workspace::new(ELIXIR);
     ws.edit(

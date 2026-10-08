@@ -110,7 +110,7 @@ impl Walker<'_> {
                     DefKind::Const
                 };
                 let mut specs = Vec::new();
-                self.specs(node, &mut specs);
+                Self::specs(node, &mut specs);
                 let single = specs.len() == 1;
                 for spec in specs {
                     let mut names: Vec<String> = Vec::new();
@@ -137,11 +137,11 @@ impl Walker<'_> {
     }
 
     /// The `*_spec` nodes of a declaration, through parenthesised groups.
-    fn specs<'t>(&self, node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    fn specs<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
         for child in children(node) {
             match child.kind() {
                 "type_spec" | "type_alias" | "const_spec" | "var_spec" => out.push(child),
-                "var_spec_list" | "const_spec_list" | "type_spec_list" => self.specs(child, out),
+                "var_spec_list" | "const_spec_list" | "type_spec_list" => Self::specs(child, out),
                 _ => {}
             }
         }

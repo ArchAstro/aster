@@ -118,6 +118,20 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     facts
 }
 
+/// Whether a remote call lists modules at run time: every module of an
+/// application (`:application.get_key(app, :modules)`,
+/// `Application.spec(app, :modules)`) or every module loaded
+/// (`:code.all_loaded()`).
+fn lists_modules(receiver: &str, function: &str, call: Node, source: &str) -> bool {
+    match (receiver, function) {
+        (":code", "all_loaded" | "all_available") => true,
+        (":application", "get_key") | ("Application", "spec") => arguments(call)
+            .iter()
+            .any(|arg| text(*arg, source) == ":modules"),
+        _ => false,
+    }
+}
+
 fn call_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
     if node.kind() != "call" {
         return None;
@@ -327,6 +341,9 @@ impl Walker<'_> {
                 Some((left, right)) if right.kind() == "identifier" => {
                     let function = text(right, self.source).to_string();
                     let receiver = text(left, self.source);
+                    if lists_modules(receiver, &function, node, self.source) {
+                        self.facts.owner(scope.owner).reflects = true;
+                    }
                     if left.kind() == "alias" {
                         // `Module.function(...)`.
                         let full = self.expand(receiver);
