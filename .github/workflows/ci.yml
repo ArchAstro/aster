@@ -35,6 +35,7 @@ jobs:
             --test config_bug_bash \
             --test dev_tls \
             --test integration \
+            --test related \
             --test watch_tests
           cargo test --locked --test dev_services --all-features -- --test-threads=1
       - if: runner.os != 'macOS'
