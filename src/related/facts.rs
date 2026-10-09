@@ -76,6 +76,9 @@ pub struct Def {
     pub uses: BTreeSet<String>,
     /// String literals that could name a file.
     pub strings: Vec<String>,
+    /// The string literals among them that name code to load: what
+    /// `require`, `import()` and a module mock are given.
+    pub loaded: BTreeSet<String>,
     /// Invoked by a framework or runtime rather than by name.
     pub callback: bool,
     /// Specifiers of files whose users reach this definition without naming
@@ -151,6 +154,7 @@ impl Def {
             atoms: BTreeSet::new(),
             uses: BTreeSet::new(),
             strings: Vec::new(),
+            loaded: BTreeSet::new(),
             callback: false,
             via: Vec::new(),
             route: None,

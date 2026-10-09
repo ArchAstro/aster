@@ -443,6 +443,132 @@ fn typescript_change_follows_package_imports_into_dependent_projects() {
 }
 
 #[test]
+fn a_source_file_read_by_path_selects_the_code_that_reads_it() {
+    let mut files = TYPESCRIPT.to_vec();
+    // Read as text from where the project's tests run, and from beside the
+    // test itself.
+    files.push((
+        "cart/src/bundle.test.ts",
+        "import { readFileSync } from \"node:fs\";\nit(\"ships the formatter\", () => { expect(readFileSync(\"../money/src/format.ts\", \"utf8\")).toContain(\"format\"); });\n",
+    ));
+    files.push((
+        "labels/src/copy.test.ts",
+        "import { copyFileSync } from \"node:fs\";\nimport { resolve } from \"node:path\";\nit(\"copies\", () => { copyFileSync(resolve(import.meta.dirname, \"../../money/src/format.ts\"), \"out.ts\"); });\n",
+    ));
+    // Loaded as code: followed by the names it uses, as any import is.
+    files.push((
+        "labels/src/path.test.ts",
+        "import { add } from \"../../money/src/math.ts\";\nvi.mock(\"../../money/src/format.ts\");\nit(\"adds\", async () => { const math = await import(\"../../money/src/math.ts\"); expect(add(1, 2)).toBe(math.add(1, 2)); });\n",
+    ));
+    let ws = Workspace::new(&files);
+
+    // Not a line of code changes, and the file read is still another file.
+    ws.edit(
+        "money/src/format.ts",
+        "export function format",
+        "// Prints an amount.\nexport function format",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//cart:test"),
+        ["npm test -- src/bundle.test.ts"]
+    );
+    assert_eq!(
+        plan.commands("//labels:test"),
+        ["npm test -- src/copy.test.ts"]
+    );
+    assert!(plan
+        .notes("//cart:test")
+        .contains("money/src/format.ts changed"));
+    assert_eq!(plan.runs(), ["//cart:test", "//labels:test"]);
+
+    // A comment in a file that is only imported changes nothing a test sees.
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "money/src/math.ts",
+        "export function add",
+        "// Adds.\nexport function add",
+    );
+    assert!(ws.plan("test").runs().is_empty());
+}
+
+#[test]
+fn a_directory_named_by_path_selects_on_any_file_beneath_it() {
+    let mut files = TYPESCRIPT.to_vec();
+    files.push(("money/data/prices/eu.json", "{}\n"));
+    files.push(("money/data/fees/eu.json", "{}\n"));
+    files.push((
+        "cart/src/prices.test.ts",
+        "import { readdirSync } from \"node:fs\";\nit(\"has prices\", () => { expect(readdirSync(\"../money/data/prices/\")).not.toEqual([]); });\n",
+    ));
+    // Code that is not a test names paths where it is deployed.
+    files.push((
+        "labels/src/paths.ts",
+        "export const PRICES = \"../money/data/prices\";\n",
+    ));
+    files.push((
+        "labels/src/paths.test.ts",
+        "import { PRICES } from \"./paths\";\nit(\"names prices\", () => { expect(PRICES).toContain(\"prices\"); });\n",
+    ));
+    // A directory that holds a whole project names the project.
+    files.push((
+        "libs/tax/package.json",
+        r#"{"name":"@shop/tax","scripts":{"test":"vitest run"}}"#,
+    ));
+    files.push(("libs/tax/rates/eu.json", "{}\n"));
+    files.push((
+        "libs/tax/src/tax.test.ts",
+        "import { readFileSync } from \"node:fs\";\nit(\"has rates\", () => { expect(readFileSync(\"rates/eu.json\", \"utf8\")).toBe(\"{}\\n\"); });\n",
+    ));
+    files.push((
+        "cart/src/layout.test.ts",
+        "import { existsSync } from \"node:fs\";\nit(\"has the tax project\", () => { expect(existsSync(\"../libs/tax\")).toBe(true); });\n",
+    ));
+    let ws = Workspace::new(&files);
+
+    ws.write("money/data/prices/eu.json", "{\"a\": 1}\n");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//cart:test"),
+        ["npm test -- src/prices.test.ts"]
+    );
+    assert!(plan
+        .notes("//cart:test")
+        .contains("money/data/prices/eu.json changed"));
+    // What the directory's own project does with the file, only its own
+    // code could say.
+    assert!(plan.commands("//money:test").is_empty());
+    assert!(plan
+        .notes("//money:test")
+        .contains("money/data/prices/eu.json is not named by any source file"));
+    assert_eq!(plan.runs(), ["//cart:test", "//money:test"]);
+
+    // A document in the directory is read by the test that names the file.
+    let ws = Workspace::new(&files);
+    ws.write("money/data/prices/NOTES.md", "notes\n");
+    assert!(ws.plan("test").runs().is_empty());
+    ws.write("money/data/prices/golden.txt", "1.00\n");
+    assert_eq!(
+        ws.plan("test").commands("//cart:test"),
+        ["npm test -- src/prices.test.ts"]
+    );
+
+    // A file beside the directory is not beneath it.
+    let ws = Workspace::new(&files);
+    ws.write("money/data/fees/eu.json", "{\"a\": 1}\n");
+    assert_eq!(ws.plan("test").runs(), ["//money:test"]);
+
+    let ws = Workspace::new(&files);
+    ws.write("libs/tax/rates/eu.json", "{\"a\": 1}\n");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//libs/tax:test"),
+        ["npm test -- src/tax.test.ts"]
+    );
+    assert_eq!(plan.runs(), ["//libs/tax:test"]);
+}
+
+#[test]
 fn build_runs_only_where_the_change_is_referenced() {
     let ws = Workspace::new(TYPESCRIPT);
     ws.edit("money/src/format.ts", "`$${n}`", "`USD ${n}`");

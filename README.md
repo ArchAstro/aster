@@ -509,6 +509,18 @@ How a change is followed:
   `__snapshots__` file. Prose (`.md`, `.txt`, …) that nothing names selects
   nothing. A source file read as data by code in another language is found
   the same way.
+- A source file is also data to a test in its own language that names its
+  path without loading it (`readFileSync("../money/src/format.ts")`): any
+  change to the file, a comment included, affects the test. The path is
+  read from the workspace root or the test's project root, or from the
+  test's directory when it is written relative. What `import`, `require`
+  and a module mock name is loaded, and followed by reference as before.
+- A directory a test names by path the same way maps every file beneath it
+  to the test, documents (`.md`, `.rst`, …) excepted, unless the directory
+  holds a whole project. The project that owns such a file still runs in
+  full when none of its own code names the file.
+- Both rules read paths in tests only: a test runs in the workspace, and
+  other code names paths where it is deployed.
 - Tests in projects that never declared a dependency on the changed project
   are found too, when they refer to what changed. Such a project runs only
   those tests.
