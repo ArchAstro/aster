@@ -3379,12 +3379,10 @@ cache = { enabled = false }
     assert_eq!(web_args.trim(), "");
 }
 
+/// web depends on core, and both change in one commit. Returns the file
+/// arguments each `test` target ran with under `--only-affected-files`.
 #[cfg(unix)]
-#[test]
-fn test_only_affected_files_runs_in_full_when_a_dependency_also_changed() {
-    // web depends on core, and both change in the same commit. Without
-    // --dependents, web is still selected for its own file, but that file
-    // list does not describe the core change, so web runs in full.
+fn only_affected_files_with_a_changed_dependency(flags: &[&str]) -> (String, String) {
     let tmp = TempDir::new().unwrap();
     setup_git_repo(&tmp);
     write_recorder(&tmp);
@@ -3408,22 +3406,42 @@ fn test_only_affected_files_runs_in_full_when_a_dependency_also_changed() {
 
     write_fixture(&tmp, "libs/core/index.js", "export const x = 1;\n");
     write_fixture(&tmp, "apps/web/page.js", "export const y = 2;\n");
+    let mut args = vec!["affected", "test", "--base=HEAD", "--only-affected-files"];
+    args.extend(flags);
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())
-        .args(["affected", "test", "--base=HEAD", "--only-affected-files"])
+        .args(&args)
         .output()
         .unwrap();
     assert!(output.status.success(), "aster failed: {output:?}");
-    assert_eq!(
-        fs::read_to_string(tmp.path().join("core.args")).unwrap(),
-        "index.js\n"
-    );
-    assert_eq!(
-        fs::read_to_string(tmp.path().join("web.args"))
+    let ran = |name: &str| {
+        fs::read_to_string(tmp.path().join(format!("{name}.args")))
             .unwrap()
-            .trim(),
-        ""
-    );
+            .trim()
+            .to_string()
+    };
+    (ran("core"), ran("web"))
+}
+
+#[cfg(unix)]
+#[test]
+fn test_only_affected_files_keeps_its_own_files_when_a_dependency_also_changed() {
+    // Without --dependents the run is about each project's own change: a
+    // project that only depends on core is not selected at all, so one that
+    // also has a changed file runs on that file.
+    let (core, web) = only_affected_files_with_a_changed_dependency(&[]);
+    assert_eq!(core, "index.js");
+    assert_eq!(web, "page.js");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_only_affected_files_with_dependents_runs_in_full_when_a_dependency_also_changed() {
+    // Under --dependents web answers for the core change too, which its own
+    // file list does not describe, so it runs in full.
+    let (core, web) = only_affected_files_with_a_changed_dependency(&["--dependents"]);
+    assert_eq!(core, "index.js");
+    assert_eq!(web, "");
 }
 
 #[cfg(unix)]

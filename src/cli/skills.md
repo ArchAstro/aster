@@ -120,8 +120,9 @@ resolve the merge base.
 capability to each project's changed files: the requested target and any
 same-project target it depends on (so a `test-ci` wrapper that depends on
 `//self:test` narrows `test`). A requested target with no relevant files is
-skipped. A project selected only through `--dependents`, or whose dependency
-also changed, runs in full. `--dry-run` shows each chosen command and why.
+skipped. Under `--dependents`, a project selected only as a dependent, or whose
+dependency also changed, runs in full; without it each project runs on its
+own changed files. `--dry-run` shows each chosen command and why.
 
 Rust `cargo test` targets run only related tests: unit tests filtered to the
 modules that transitively import a changed module, integration tests that

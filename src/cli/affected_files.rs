@@ -48,7 +48,8 @@ pub struct AffectedRequest<'a> {
     pub changed_files: &'a [PathBuf],
     /// Addresses of the primary projects.
     pub primary: &'a HashSet<String>,
-    /// Primary projects with a changed dependency.
+    /// Primary projects that answer for a changed dependency: under
+    /// `--dependents`, those with one.
     pub dependency_changed: &'a HashSet<String>,
     pub only_affected_files: bool,
     pub warnings_as_errors: bool,
@@ -163,9 +164,9 @@ pub fn plan_affected_commands(
                 None if project_files.is_empty() => Narrowing::Full(
                     "no changed files of its own (selected as a dependent); running in full".into(),
                 ),
-                None if request.dependency_changed.contains(&project_addr) => {
-                    Narrowing::Full("a project it depends on changed; running in full".into())
-                }
+                None if request.dependency_changed.contains(&project_addr) => Narrowing::Full(
+                    "a project it depends on changed (--dependents); running in full".into(),
+                ),
                 None => Narrowing::OwnFiles,
             };
             match narrowing {

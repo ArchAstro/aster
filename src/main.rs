@@ -862,9 +862,11 @@ fn run() -> Result<()> {
                 // narrowed to its own files.
                 let command_plan = if only_affected_files || related || warnings_as_errors {
                     let registry = PluginRegistry::with_all_plugins();
-                    // A project cannot be narrowed to its own files when a
-                    // project it depends on also changed.
-                    let dependency_changed: HashSet<String> = if only_affected_files || related {
+                    // Under --dependents a project answers for a changed
+                    // project it depends on, which its own files do not
+                    // describe. Without it the run is about each project's
+                    // own change.
+                    let dependency_changed: HashSet<String> = if only_affected_files && dependents {
                         directly_affected_addrs
                             .iter()
                             .flat_map(|addr| {
