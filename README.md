@@ -313,8 +313,10 @@ its `test` prerequisite. A `{files}` placeholder expands to the changed files
   A prerequisite whose plugin declines to narrow it runs in full.
 - A project with no changed files of its own, selected only through
   `--dependents`, runs its targets in full (`{files}` expands to nothing).
-  So does a project whose dependency also changed, with or without
-  `--dependents`. Its own file list does not describe the change.
+  So does a project with changed files whose dependency also changed under
+  `--dependents`: its own file list does not describe that change. Without
+  `--dependents` it runs on its own changed files, like every other project
+  in the run; `--related` runs the tests that reach the dependency's change.
 - `--dry-run` prints the chosen commands and the reasoning under each target;
   `--json` adds them as `commands` and `selection`.
 
