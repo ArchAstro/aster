@@ -963,6 +963,27 @@ fn rust_paths_are_followed_through_a_glob_re_export_of_another_crate() {
             "cargo test --doc"
         ]
     );
+
+    // The same when the module is re-exported by name.
+    let named: Vec<(&str, &str)> = RUST_FACADE
+        .iter()
+        .map(|&(path, source)| match path {
+            "app/src/lib.rs" => (
+                path,
+                "pub mod engine;\npub mod notes;\npub mod wiring;\npub use parts::ports;\n",
+            ),
+            _ => (path, source),
+        })
+        .collect();
+    let ws = Workspace::new(&named);
+    ws.edit("app/src/engine.rs", "        1\n", "        1 + 0\n");
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        [
+            "cargo test --lib -- --exact engine::tests::engine_runs wiring::tests::drives_the_engine",
+            "cargo test --doc"
+        ]
+    );
 }
 
 #[test]
