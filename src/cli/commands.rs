@@ -176,8 +176,12 @@ pub enum Commands {
         dependents: bool,
 
         /// Select a configured named subset of affected primary projects
+        ///
+        /// Repeat the flag with --dry-run to plan several lanes from one
+        /// analysis of the change; the JSON output then has one plan per
+        /// lane under `lanes`.
         #[arg(long)]
-        lane: Option<String>,
+        lane: Vec<String>,
 
         /// Show what would run without executing
         #[arg(long)]
@@ -195,7 +199,7 @@ pub enum Commands {
         /// Run only the tests that reach the change, across projects
         ///
         /// Builds a source-level dependency graph (Elixir, TypeScript and
-        /// JavaScript, Go, Python) and follows the changed functions, types
+        /// JavaScript, Go, Python, Rust) and follows the changed functions, types
         /// and modules to the tests that refer to them. Test commands run
         /// narrowed to those tests; projects no change reaches are skipped.
         /// Implies --dependents, decided per symbol instead of per project.
