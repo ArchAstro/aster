@@ -518,16 +518,20 @@ fn is_runner_config(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+fn is_document(path: &Path) -> bool {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(extension, "md" | "mdx" | "markdown" | "rst" | "adoc")
+}
+
 fn is_prose(path: &Path) -> bool {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    matches!(
-        extension,
-        "md" | "mdx" | "markdown" | "rst" | "adoc" | "txt"
-    ) || matches!(
-        name,
-        "LICENSE" | "NOTICE" | "CODEOWNERS" | "AUTHORS" | "CHANGELOG"
-    )
+    is_document(path)
+        || extension == "txt"
+        || matches!(
+            name,
+            "LICENSE" | "NOTICE" | "CODEOWNERS" | "AUTHORS" | "CHANGELOG"
+        )
 }
 
 /// The plugin whose projects a workspace-level lockfile governs.
@@ -2153,11 +2157,33 @@ impl<'a> Index<'a> {
             })
         };
         let mut by_name: HashMap<&str, Vec<&Change>> = HashMap::new();
+        // Directories inside a project that hold a changed file. A
+        // directory that holds a whole project names the project, not files
+        // to read.
+        let mut beneath: HashMap<&Path, Vec<&Change>> = HashMap::new();
         for change in changes {
             if let Some(name) = change.path.file_name().and_then(|n| n.to_str()) {
                 by_name.entry(name).or_default().push(change);
             }
+            // A document counts where a source names the file itself: a
+            // directory of them is named far more often than it is read.
+            let dirs = change.path.ancestors().skip(1);
+            for dir in dirs.take_while(|_| !is_document(&change.path)) {
+                if dir.as_os_str().is_empty()
+                    || self
+                        .projects
+                        .iter()
+                        .any(|p| p.relative_path.starts_with(dir))
+                {
+                    break;
+                }
+                beneath.entry(dir).or_default().push(change);
+            }
         }
+        let dir_names: HashSet<&str> = beneath
+            .keys()
+            .filter_map(|dir| dir.file_name().and_then(|n| n.to_str()))
+            .collect();
         let mut mentioned = HashSet::new();
         if by_name.is_empty() {
             return mentioned;
@@ -2178,15 +2204,45 @@ impl<'a> Index<'a> {
                     for token in string.split(|c: char| {
                         !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '@' | '+' | '-'))
                     }) {
+                        let token = token.trim_end_matches('/');
                         let name = token.rsplit('/').next().unwrap_or(token);
-                        let Some(candidates) = by_name.get(name) else {
+                        let files = by_name.get(name);
+                        if files.is_none() && !dir_names.contains(name) {
                             continue;
-                        };
+                        }
                         let named: Vec<&str> = token
                             .split('/')
                             .filter(|s| !s.is_empty() && *s != "." && *s != "..")
                             .collect();
-                        for change in candidates {
+                        // A test runs in the workspace, so a path it names
+                        // is a path here; other code names paths where it is
+                        // deployed. What the test loads by the name it uses
+                        // by reference, not as a file to read.
+                        let reads = (source.facts.is_test_file || def.in_test)
+                            && named.len() >= 2
+                            && !token.starts_with('/')
+                            && !def.loaded.contains(string);
+                        let places = if reads {
+                            self.places(source, token, &named)
+                        } else {
+                            Vec::new()
+                        };
+                        // A directory named by path: whatever is read from
+                        // it, a change beneath it may be what is read.
+                        for dir in &places {
+                            for change in beneath.get(dir.as_path()).into_iter().flatten() {
+                                // Only the project's own code says how the
+                                // project itself reads the file.
+                                if source.project == owner(self.projects, &change.path) {
+                                    mentioned.insert(change.path.clone());
+                                }
+                                run.mark(
+                                    id,
+                                    Why::Changed(format!("{} changed", change.path.display())),
+                                );
+                            }
+                        }
+                        for change in files.into_iter().flatten() {
                             let actual: Vec<_> = change
                                 .path
                                 .components()
@@ -2195,9 +2251,19 @@ impl<'a> Index<'a> {
                             // Reading a source file as data takes a path, not
                             // a bare file name.
                             let own_family = native(change);
-                            if own_family == Some(source.facts.family)
-                                || (own_family.is_some() && named.len() < 2)
-                            {
+                            if own_family.is_some() && named.len() < 2 {
+                                continue;
+                            }
+                            // Code of the same language is followed by
+                            // reference; it reads a source file as data only
+                            // where the path it names is that file's.
+                            if own_family == Some(source.facts.family) {
+                                if change.path != source.path && places.contains(&change.path) {
+                                    run.mark(
+                                        id,
+                                        Why::Changed(format!("{} changed", change.path.display())),
+                                    );
+                                }
                                 continue;
                             }
                             // A bare file name only means the file beside
@@ -2291,6 +2357,39 @@ impl<'a> Index<'a> {
             }
         }
         mentioned
+    }
+}
+
+impl Index<'_> {
+    /// The workspace paths `token` can mean in the test file `source`: from
+    /// the workspace root or the project root, where tests run, or from the
+    /// file's own directory when it is written relative (`../data`).
+    fn places(&self, source: &Source, token: &str, named: &[&str]) -> Vec<PathBuf> {
+        let project = source
+            .project
+            .map(|p| self.projects[p].relative_path.as_path())
+            .filter(|root| !root.as_os_str().is_empty());
+        let relative = token.split('/').any(|s| s == "." || s == "..");
+        let mut places: Vec<PathBuf> = Vec::new();
+        if !relative {
+            places.push(named.iter().collect());
+        }
+        let beside = source.path.parent().filter(|_| relative);
+        for base in [project, beside].into_iter().flatten() {
+            let mut path = base.to_path_buf();
+            let mut inside = true;
+            for segment in token.split('/') {
+                match segment {
+                    "" | "." => {}
+                    ".." => inside &= path.pop(),
+                    segment => path.push(segment),
+                }
+            }
+            if inside && !places.contains(&path) {
+                places.push(path);
+            }
+        }
+        places
     }
 }
 

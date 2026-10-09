@@ -152,6 +152,23 @@ fn loaded_spec<'a>(node: Node, source: &'a str) -> Option<&'a str> {
     }
 }
 
+/// The module a test runner is told to replace or load: the first argument
+/// of `vi.mock("x")`, `jest.requireActual("x")` and the like.
+fn mocked_spec<'a>(node: Node, source: &'a str) -> Option<&'a str> {
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    if !matches!(text(object, source), "vi" | "jest") {
+        return None;
+    }
+    string_value(
+        node.child_by_field_name("arguments")?.named_child(0)?,
+        source,
+    )
+}
+
 impl Walker<'_> {
     /// A top-level statement. `whole` is the statement including `export`.
     fn statement(&mut self, node: Node, whole: Node) {
@@ -539,6 +556,7 @@ impl Walker<'_> {
         };
         // An imported asset is found by name when it changes.
         self.facts.top.string(spec);
+        self.facts.top.loaded.insert(spec.to_string());
         let clause = children(node)
             .into_iter()
             .find(|c| c.kind() == "import_clause");
@@ -714,8 +732,12 @@ impl Walker<'_> {
                 return;
             }
             "call_expression" => {
+                if let Some(spec) = mocked_spec(node, self.source) {
+                    self.facts.owner(owner).loaded.insert(spec.to_string());
+                }
                 if let Some(spec) = loaded_spec(node, self.source) {
                     self.facts.owner(owner).uses.insert(spec.to_string());
+                    self.facts.owner(owner).loaded.insert(spec.to_string());
                 } else if node
                     .child_by_field_name("function")
                     .is_some_and(|function| {
