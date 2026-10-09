@@ -701,7 +701,7 @@ fn run() -> Result<()> {
             };
 
             // Expand with dependents if requested
-            let mut affected_addrs = if let Some(analysis) = &related_analysis {
+            let affected_addrs = if let Some(analysis) = &related_analysis {
                 let mut reached: HashSet<String> = analysis
                     .projects
                     .iter()
@@ -723,356 +723,422 @@ fn run() -> Result<()> {
                 directly_affected
             };
 
-            // Lane selection applies only to primary projects, after optional
-            // dependent expansion and before target dependency closure.
-            if let Some(lane_name) = lane.as_deref() {
-                affected_addrs = select_affected_lane(
-                    lane_name,
-                    &workspace_config.affected,
-                    affected_addrs,
-                    &projects,
-                )?;
-                if output_mode == OutputMode::Verbose {
-                    eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
-                }
+            #[derive(serde::Serialize)]
+            struct DryRunTarget {
+                address: String,
+                reason: String,
+                files: Vec<String>,
+                /// Commands replacing the target's own command.
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                commands: Vec<String>,
+                /// How the target's command was chosen.
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                selection: Vec<String>,
             }
-
-            // Primary projects are the affected ones (only these run the requested target)
-            let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
-
-            // Find DiscoveredProject refs for affected addresses
-            let affected_projects: Vec<_> = projects
-                .iter()
-                .filter(|p| {
-                    let addr = format!("//{}", p.relative_path.display());
-                    affected_addrs.contains(&addr)
-                })
-                .filter(|p| lang.is_empty() || p.has_any_language(&lang))
-                .collect();
-
-            if affected_projects.is_empty() {
-                if output_mode == OutputMode::Json {
-                    let output = build_execution_output(&[]);
-                    output_json(&output)?;
-                } else if output_mode != OutputMode::Quiet {
-                    println!("No projects affected");
-                }
-                return Ok(());
+            #[derive(serde::Serialize)]
+            struct DryRunOutput {
+                target: String,
+                base: String,
+                head: Option<String>,
+                targets: Vec<DryRunTarget>,
+                count: usize,
+                /// Requested targets dropped by --only-affected-files.
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                skipped: Vec<String>,
             }
-
-            // Sort by dependency order
-            let ordered = graph.topological_order_subset(&affected_projects);
-
-            if output_mode == OutputMode::Verbose {
-                eprintln!(
-                    "[aster] Running '{}' on {} affected projects",
-                    target,
-                    ordered.len()
-                );
+            // Several lanes are planned from the one analysis above; running
+            // them is one invocation per lane, each on its own runner.
+            let several_lanes = lane.len() > 1;
+            if several_lanes && !dry_run {
+                return Err(anyhow::anyhow!(
+                    "Several lanes can be planned together but not run together: \
+                     add --dry-run, or pass one --lane"
+                ));
             }
-
-            // Machine-readable output must contain JSON only, including dry runs.
-            if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
-                println!(
-                    "Affected projects ({}):",
-                    if lane.is_some() {
-                        "selected by lane"
-                    } else if related {
-                        "reached by the change"
-                    } else if dependents {
-                        "including dependents"
-                    } else {
-                        "directly affected only"
-                    }
-                );
-                for p in &ordered {
-                    println!("  //{}", p.relative_path.display());
-                }
-            }
-
-            // Narrow targets to changed files and apply warnings-as-errors.
-            // Under --dependents, a project whose dependency changed cannot be
-            // narrowed to its own files.
-            let command_plan = if only_affected_files || related || warnings_as_errors {
-                let registry = PluginRegistry::with_all_plugins();
-                // A project cannot be narrowed to its own files when a
-                // project it depends on also changed.
-                let dependency_changed: HashSet<String> = if only_affected_files || related {
-                    directly_affected_addrs
-                        .iter()
-                        .flat_map(|addr| {
-                            let mut reached =
-                                affected_with_dependents(HashSet::from([addr.clone()]), &graph);
-                            reached.remove(addr);
-                            reached
-                        })
-                        .filter(|addr| primary_addrs.contains(addr))
-                        .collect()
-                } else {
-                    HashSet::new()
-                };
-                let mut changed_list: Vec<PathBuf> = changed_files.iter().cloned().collect();
-                changed_list.sort();
-                Some(plan_affected_commands(
-                    &AffectedRequest {
-                        target: &target,
-                        projects: &ordered,
-                        changed_files: &changed_list,
-                        primary: &primary_addrs,
-                        dependency_changed: &dependency_changed,
-                        only_affected_files,
-                        warnings_as_errors,
-                        related: related_analysis.as_ref(),
-                        all_projects: &projects,
-                    },
-                    &registry,
-                )?)
+            let reached = affected_addrs;
+            let lanes: Vec<Option<&str>> = if lane.is_empty() {
+                vec![None]
             } else {
-                None
+                lane.iter().map(|name| Some(name.as_str())).collect()
             };
-            let primary_addrs = command_plan
-                .as_ref()
-                .map(|plan| plan.primary.clone())
-                .unwrap_or(primary_addrs);
-            let no_notes: HashMap<String, Vec<String>> = HashMap::new();
-            let target_notes = command_plan
-                .as_ref()
-                .map(|plan| &plan.notes)
-                .unwrap_or(&no_notes);
+            let mut lane_plans = serde_json::Map::new();
+            for lane in lanes {
+                let lane_label = lane.unwrap_or_default();
+                let mut affected_addrs = reached.clone();
 
-            // Dry run: show the full execution graph with rationale
-            if dry_run {
-                // Build project map from ALL projects (same as executor would)
-                let all_project_map: HashMap<String, &DiscoveredProject> = projects
+                // Lane selection applies only to primary projects, after optional
+                // dependent expansion and before target dependency closure.
+                if let Some(lane_name) = lane {
+                    affected_addrs = select_affected_lane(
+                        lane_name,
+                        &workspace_config.affected,
+                        affected_addrs,
+                        &projects,
+                    )?;
+                    if output_mode == OutputMode::Verbose {
+                        eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
+                    }
+                }
+
+                // Primary projects are the affected ones (only these run the requested target)
+                let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
+
+                // Find DiscoveredProject refs for affected addresses
+                let affected_projects: Vec<_> = projects
                     .iter()
-                    .map(|p| (format!("//{}", p.relative_path.display()), p))
+                    .filter(|p| {
+                        let addr = format!("//{}", p.relative_path.display());
+                        affected_addrs.contains(&addr)
+                    })
+                    .filter(|p| lang.is_empty() || p.has_any_language(&lang))
                     .collect();
 
-                // Compute targets_to_run (same logic as executor)
-                let mut targets_to_run: HashSet<String> = HashSet::new();
-                for addr in &primary_addrs {
-                    let target_addr = format!("{addr}:{target}");
-                    targets_to_run.insert(target_addr.clone());
-                    collect_target_deps(&target_addr, &all_project_map, &mut targets_to_run);
-                }
-
-                // Compute DAG levels for execution order
-                let levels = compute_target_levels(&targets_to_run, &all_project_map);
-
-                // Build map of project -> affected files
-                let mut files_per_project: HashMap<String, Vec<String>> = HashMap::new();
-                for project in &projects {
-                    let project_addr = format!("//{}", project.relative_path.display());
-                    let project_files: Vec<String> = changed_files
-                        .iter()
-                        .filter(|f| f.starts_with(&project.relative_path))
-                        .map(|f| f.to_string_lossy().to_string())
-                        .collect();
-                    if !project_files.is_empty() {
-                        files_per_project.insert(project_addr, project_files);
-                    }
-                }
-
-                // Categorize each target's rationale
-                let rationale_for = |target_addr: &str| -> &'static str {
-                    if let Some((project_addr, target_name)) = parse_target_address(target_addr) {
-                        if target_name == target && primary_addrs.contains(&project_addr) {
-                            // Only lane-selected requested targets are primary work.
-                            if directly_affected_addrs.contains(&project_addr) {
-                                return "affected";
-                            }
-                            return "dependent";
-                        }
-                    }
-                    "target dependency"
-                };
-
-                if output_mode == OutputMode::Json {
-                    #[derive(serde::Serialize)]
-                    struct DryRunTarget {
-                        address: String,
-                        reason: String,
-                        files: Vec<String>,
-                        /// Commands replacing the target's own command.
-                        #[serde(skip_serializing_if = "Vec::is_empty")]
-                        commands: Vec<String>,
-                        /// How the target's command was chosen.
-                        #[serde(skip_serializing_if = "Vec::is_empty")]
-                        selection: Vec<String>,
-                    }
-                    #[derive(serde::Serialize)]
-                    struct DryRunOutput {
-                        target: String,
-                        base: String,
-                        head: Option<String>,
-                        targets: Vec<DryRunTarget>,
-                        count: usize,
-                        /// Requested targets dropped by --only-affected-files.
-                        #[serde(skip_serializing_if = "Vec::is_empty")]
-                        skipped: Vec<String>,
-                    }
-                    let mut all_targets = Vec::new();
-                    for level in &levels {
-                        for target_addr in level {
-                            let reason = rationale_for(target_addr).to_string();
-                            let project_addr = parse_target_address(target_addr)
-                                .map(|(p, _)| p)
-                                .unwrap_or_default();
-                            let files = if reason == "affected" {
-                                files_per_project
-                                    .get(&project_addr)
-                                    .cloned()
-                                    .unwrap_or_default()
-                            } else {
-                                vec![]
+                if affected_projects.is_empty() {
+                    if several_lanes {
+                        if output_mode == OutputMode::Json {
+                            let empty = DryRunOutput {
+                                target: target.clone(),
+                                base: base.clone(),
+                                head: head.clone(),
+                                targets: Vec::new(),
+                                count: 0,
+                                skipped: Vec::new(),
                             };
-                            let commands = match command_plan
-                                .as_ref()
-                                .and_then(|plan| plan.overrides.get(target_addr))
-                            {
-                                Some(CommandOverride::Run(commands)) => commands.clone(),
-                                _ => vec![],
-                            };
-                            all_targets.push(DryRunTarget {
-                                address: target_addr.clone(),
-                                reason,
-                                files,
-                                commands,
-                                selection: target_notes
-                                    .get(target_addr)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            });
-                        }
-                    }
-                    let count = all_targets.len();
-                    let output = DryRunOutput {
-                        target: target.clone(),
-                        base: base.clone(),
-                        head: head.clone(),
-                        targets: all_targets,
-                        count,
-                        skipped: command_plan
-                            .as_ref()
-                            .map(|plan| plan.skipped.clone())
-                            .unwrap_or_default(),
-                    };
-                    output_json(&output)?;
-                } else if output_mode != OutputMode::Quiet {
-                    // Count targets by category
-                    let dep_count = targets_to_run
-                        .iter()
-                        .filter(|t| rationale_for(t) == "target dependency")
-                        .count();
-
-                    if let Some(plan) = &command_plan {
-                        if !plan.skipped.is_empty() {
+                            lane_plans
+                                .insert(lane_label.to_string(), serde_json::to_value(&empty)?);
+                        } else if output_mode != OutputMode::Quiet {
+                            println!("Lane {lane_label}: no projects affected");
                             println!();
-                            if related {
-                                println!("Skipped by --related (no test reaches the change):");
-                            } else {
-                                println!(
+                        }
+                        continue;
+                    }
+                    if output_mode == OutputMode::Json {
+                        let output = build_execution_output(&[]);
+                        output_json(&output)?;
+                    } else if output_mode != OutputMode::Quiet {
+                        println!("No projects affected");
+                    }
+                    return Ok(());
+                }
+
+                // Sort by dependency order
+                let ordered = graph.topological_order_subset(&affected_projects);
+
+                if several_lanes
+                    && output_mode != OutputMode::Quiet
+                    && output_mode != OutputMode::Json
+                {
+                    println!("Lane {lane_label}:");
+                }
+                if output_mode == OutputMode::Verbose {
+                    eprintln!(
+                        "[aster] Running '{}' on {} affected projects",
+                        target,
+                        ordered.len()
+                    );
+                }
+
+                // Machine-readable output must contain JSON only, including dry runs.
+                if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
+                    println!(
+                        "Affected projects ({}):",
+                        if lane.is_some() {
+                            "selected by lane"
+                        } else if related {
+                            "reached by the change"
+                        } else if dependents {
+                            "including dependents"
+                        } else {
+                            "directly affected only"
+                        }
+                    );
+                    for p in &ordered {
+                        println!("  //{}", p.relative_path.display());
+                    }
+                }
+
+                // Narrow targets to changed files and apply warnings-as-errors.
+                // Under --dependents, a project whose dependency changed cannot be
+                // narrowed to its own files.
+                let command_plan = if only_affected_files || related || warnings_as_errors {
+                    let registry = PluginRegistry::with_all_plugins();
+                    // A project cannot be narrowed to its own files when a
+                    // project it depends on also changed.
+                    let dependency_changed: HashSet<String> = if only_affected_files || related {
+                        directly_affected_addrs
+                            .iter()
+                            .flat_map(|addr| {
+                                let mut reached =
+                                    affected_with_dependents(HashSet::from([addr.clone()]), &graph);
+                                reached.remove(addr);
+                                reached
+                            })
+                            .filter(|addr| primary_addrs.contains(addr))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    let mut changed_list: Vec<PathBuf> = changed_files.iter().cloned().collect();
+                    changed_list.sort();
+                    Some(plan_affected_commands(
+                        &AffectedRequest {
+                            target: &target,
+                            projects: &ordered,
+                            changed_files: &changed_list,
+                            primary: &primary_addrs,
+                            dependency_changed: &dependency_changed,
+                            only_affected_files,
+                            warnings_as_errors,
+                            related: related_analysis.as_ref(),
+                            all_projects: &projects,
+                        },
+                        &registry,
+                    )?)
+                } else {
+                    None
+                };
+                let primary_addrs = command_plan
+                    .as_ref()
+                    .map(|plan| plan.primary.clone())
+                    .unwrap_or(primary_addrs);
+                let no_notes: HashMap<String, Vec<String>> = HashMap::new();
+                let target_notes = command_plan
+                    .as_ref()
+                    .map(|plan| &plan.notes)
+                    .unwrap_or(&no_notes);
+
+                // Dry run: show the full execution graph with rationale
+                if dry_run {
+                    // Build project map from ALL projects (same as executor would)
+                    let all_project_map: HashMap<String, &DiscoveredProject> = projects
+                        .iter()
+                        .map(|p| (format!("//{}", p.relative_path.display()), p))
+                        .collect();
+
+                    // Compute targets_to_run (same logic as executor)
+                    let mut targets_to_run: HashSet<String> = HashSet::new();
+                    for addr in &primary_addrs {
+                        let target_addr = format!("{addr}:{target}");
+                        targets_to_run.insert(target_addr.clone());
+                        collect_target_deps(&target_addr, &all_project_map, &mut targets_to_run);
+                    }
+
+                    // Compute DAG levels for execution order
+                    let levels = compute_target_levels(&targets_to_run, &all_project_map);
+
+                    // Build map of project -> affected files
+                    let mut files_per_project: HashMap<String, Vec<String>> = HashMap::new();
+                    for project in &projects {
+                        let project_addr = format!("//{}", project.relative_path.display());
+                        let project_files: Vec<String> = changed_files
+                            .iter()
+                            .filter(|f| f.starts_with(&project.relative_path))
+                            .map(|f| f.to_string_lossy().to_string())
+                            .collect();
+                        if !project_files.is_empty() {
+                            files_per_project.insert(project_addr, project_files);
+                        }
+                    }
+
+                    // Categorize each target's rationale
+                    let rationale_for = |target_addr: &str| -> &'static str {
+                        if let Some((project_addr, target_name)) = parse_target_address(target_addr)
+                        {
+                            if target_name == target && primary_addrs.contains(&project_addr) {
+                                // Only lane-selected requested targets are primary work.
+                                if directly_affected_addrs.contains(&project_addr) {
+                                    return "affected";
+                                }
+                                return "dependent";
+                            }
+                        }
+                        "target dependency"
+                    };
+
+                    if output_mode == OutputMode::Json {
+                        let mut all_targets = Vec::new();
+                        for level in &levels {
+                            for target_addr in level {
+                                let reason = rationale_for(target_addr).to_string();
+                                let project_addr = parse_target_address(target_addr)
+                                    .map(|(p, _)| p)
+                                    .unwrap_or_default();
+                                let files = if reason == "affected" {
+                                    files_per_project
+                                        .get(&project_addr)
+                                        .cloned()
+                                        .unwrap_or_default()
+                                } else {
+                                    vec![]
+                                };
+                                let commands = match command_plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.overrides.get(target_addr))
+                                {
+                                    Some(CommandOverride::Run(commands)) => commands.clone(),
+                                    _ => vec![],
+                                };
+                                all_targets.push(DryRunTarget {
+                                    address: target_addr.clone(),
+                                    reason,
+                                    files,
+                                    commands,
+                                    selection: target_notes
+                                        .get(target_addr)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                });
+                            }
+                        }
+                        let count = all_targets.len();
+                        let output = DryRunOutput {
+                            target: target.clone(),
+                            base: base.clone(),
+                            head: head.clone(),
+                            targets: all_targets,
+                            count,
+                            skipped: command_plan
+                                .as_ref()
+                                .map(|plan| plan.skipped.clone())
+                                .unwrap_or_default(),
+                        };
+                        if several_lanes {
+                            lane_plans
+                                .insert(lane_label.to_string(), serde_json::to_value(&output)?);
+                        } else {
+                            output_json(&output)?;
+                        }
+                    } else if output_mode != OutputMode::Quiet {
+                        // Count targets by category
+                        let dep_count = targets_to_run
+                            .iter()
+                            .filter(|t| rationale_for(t) == "target dependency")
+                            .count();
+
+                        if let Some(plan) = &command_plan {
+                            if !plan.skipped.is_empty() {
+                                println!();
+                                if related {
+                                    println!("Skipped by --related (no test reaches the change):");
+                                } else {
+                                    println!(
                                     "Skipped by --only-affected-files (no relevant changed files):"
                                 );
+                                }
+                                for addr in &plan.skipped {
+                                    println!("  {addr}");
+                                    for line in target_notes.get(addr).into_iter().flatten() {
+                                        println!("    > {line}");
+                                    }
+                                }
                             }
-                            for addr in &plan.skipped {
-                                println!("  {addr}");
-                                for line in target_notes.get(addr).into_iter().flatten() {
+                        }
+
+                        println!();
+                        if dep_count > 0 {
+                            println!(
+                                "Would run '{}' on {} projects (+{} dependency targets):",
+                                target,
+                                primary_addrs.len(),
+                                dep_count
+                            );
+                        } else {
+                            println!(
+                                "Would run '{}' on {} projects:",
+                                target,
+                                primary_addrs.len()
+                            );
+                        }
+                        println!();
+                        for level in &levels {
+                            for target_addr in level {
+                                let reason = rationale_for(target_addr);
+                                println!("  {target_addr}  ({reason})");
+                                if reason == "affected" {
+                                    if let Some((project_addr, _)) =
+                                        parse_target_address(target_addr)
+                                    {
+                                        if let Some(files) = files_per_project.get(&project_addr) {
+                                            for file in files {
+                                                println!("    - {file}");
+                                            }
+                                        }
+                                    }
+                                }
+                                for line in target_notes.get(target_addr).into_iter().flatten() {
                                     println!("    > {line}");
                                 }
                             }
                         }
-                    }
-
-                    println!();
-                    if dep_count > 0 {
-                        println!(
-                            "Would run '{}' on {} projects (+{} dependency targets):",
-                            target,
-                            primary_addrs.len(),
-                            dep_count
-                        );
-                    } else {
-                        println!(
-                            "Would run '{}' on {} projects:",
-                            target,
-                            primary_addrs.len()
-                        );
-                    }
-                    println!();
-                    for level in &levels {
-                        for target_addr in level {
-                            let reason = rationale_for(target_addr);
-                            println!("  {target_addr}  ({reason})");
-                            if reason == "affected" {
-                                if let Some((project_addr, _)) = parse_target_address(target_addr) {
-                                    if let Some(files) = files_per_project.get(&project_addr) {
-                                        for file in files {
-                                            println!("    - {file}");
-                                        }
-                                    }
-                                }
-                            }
-                            for line in target_notes.get(target_addr).into_iter().flatten() {
-                                println!("    > {line}");
-                            }
+                        if several_lanes {
+                            println!();
                         }
                     }
+                    if several_lanes {
+                        continue;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
 
-            // Execute target on projects
-            // Pass ALL projects so executor can resolve target-level dependencies
-            // (e.g., //app:build depends on //lib:build). Only primary (affected)
-            // projects will run the requested target.
-            let executor =
-                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
-            let all_project_refs: Vec<_> = projects.iter().collect();
+                // Execute target on projects
+                // Pass ALL projects so executor can resolve target-level dependencies
+                // (e.g., //app:build depends on //lib:build). Only primary (affected)
+                // projects will run the requested target.
+                let executor = Executor::with_all_options(
+                    &workspace_root,
+                    output_mode,
+                    full_logs,
+                    !cli.no_cache,
+                );
+                let all_project_refs: Vec<_> = projects.iter().collect();
 
-            let results = if let Some(plan) = &command_plan {
-                if output_mode == OutputMode::Verbose {
-                    let mut addresses: Vec<&String> = plan.notes.keys().collect();
-                    addresses.sort();
-                    for addr in addresses {
-                        for line in &plan.notes[addr] {
-                            eprintln!("[aster] {addr}: {line}");
+                let results = if let Some(plan) = &command_plan {
+                    if output_mode == OutputMode::Verbose {
+                        let mut addresses: Vec<&String> = plan.notes.keys().collect();
+                        addresses.sort();
+                        for addr in addresses {
+                            for line in &plan.notes[addr] {
+                                eprintln!("[aster] {addr}: {line}");
+                            }
                         }
-                    }
-                    for addr in &plan.skipped {
-                        eprintln!(
+                        for addr in &plan.skipped {
+                            eprintln!(
                             "[aster] Skipping {addr}: no matching files for --only-affected-files"
                         );
+                        }
+                        if !plan.overrides.is_empty() {
+                            eprintln!(
+                                "[aster] Using modified commands for {} targets",
+                                plan.overrides.len()
+                            );
+                        }
                     }
-                    if !plan.overrides.is_empty() {
-                        eprintln!(
-                            "[aster] Using modified commands for {} targets",
-                            plan.overrides.len()
-                        );
-                    }
+                    executor.execute_with_command_overrides(
+                        &target,
+                        &all_project_refs,
+                        &plan.overrides,
+                        Some(&plan.primary),
+                    )
+                } else {
+                    executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
+                };
+
+                // Output results based on mode
+                if output_mode == OutputMode::Json {
+                    let output = build_execution_output(&results);
+                    output_json(&output)?;
+                } else {
+                    print_summary(&results, &target, output_mode, true);
                 }
-                executor.execute_with_command_overrides(
-                    &target,
-                    &all_project_refs,
-                    &plan.overrides,
-                    Some(&plan.primary),
-                )
-            } else {
-                executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
-            };
 
-            // Output results based on mode
-            if output_mode == OutputMode::Json {
-                let output = build_execution_output(&results);
-                output_json(&output)?;
-            } else {
-                print_summary(&results, &target, output_mode, true);
+                // Return error if any failed (for exit code)
+                let failed = results.iter().filter(|r| !r.success).count();
+                if failed > 0 {
+                    return Err(anyhow::anyhow!("{failed} project(s) failed"));
+                }
             }
-
-            // Return error if any failed (for exit code)
-            let failed = results.iter().filter(|r| !r.success).count();
-            if failed > 0 {
-                return Err(anyhow::anyhow!("{failed} project(s) failed"));
+            if several_lanes && output_mode == OutputMode::Json {
+                output_json(&serde_json::json!({ "lanes": lane_plans }))?;
             }
         }
         Commands::Run {

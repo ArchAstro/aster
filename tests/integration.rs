@@ -1928,6 +1928,43 @@ command = "true"
     let excluded_stdout = String::from_utf8_lossy(&excluded.stdout);
     assert!(excluded_stdout.contains("//src/elixir/core/accounts:build"));
     assert!(!excluded_stdout.contains("//services/platform/gateway:build"));
+
+    // Planned together, each lane gets the plan it gets alone.
+    let together = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD", "--dry-run", "--json"])
+        .args(["--lane", "core", "--lane", "platform"])
+        .output()
+        .unwrap();
+    assert!(together.status.success(), "lanes failed: {together:?}");
+    let together_json: serde_json::Value = serde_json::from_slice(&together.stdout).unwrap();
+    let platform_json: serde_json::Value = serde_json::from_slice(&platform.stdout).unwrap();
+    assert_eq!(together_json["lanes"]["core"], core_json);
+    assert_eq!(together_json["lanes"]["platform"], platform_json);
+    assert_eq!(together_json["lanes"].as_object().unwrap().len(), 2);
+
+    let human = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD", "--dry-run"])
+        .args(["--lane", "core", "--lane", "platform"])
+        .output()
+        .unwrap();
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let core_at = human_stdout.find("Lane core:").unwrap();
+    let platform_at = human_stdout.find("Lane platform:").unwrap();
+    assert!(core_at < platform_at);
+    assert!(human_stdout[..platform_at].contains("//src/elixir/core/accounts:build"));
+    assert!(human_stdout[platform_at..].contains("//services/platform/gateway:build"));
+
+    // Each lane runs on its own; several at once would hide which failed.
+    let run = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "build", "--base=HEAD"])
+        .args(["--lane", "core", "--lane", "platform"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("--dry-run"));
 }
 
 #[test]
@@ -2032,10 +2069,35 @@ fn test_affected_lane_empty_selection_uses_existing_output_contracts() {
     write_aster_toml(
         &tmp,
         "aster.toml",
-        "[affected.lanes.platform]\ninclude = [\"//services/platform/...\"]\n",
+        "[affected.lanes.platform]\ninclude = [\"//services/platform/...\"]\n\n\
+         [affected.lanes.core]\ninclude = [\"//src/elixir/core/...\"]\n",
     );
     git_commit(&tmp, "Initial commit");
     write_fixture(&tmp, "src/elixir/core/accounts/change.js", "changed");
+
+    // A lane with nothing to run still has a plan among several.
+    let together = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["--json", "affected", "test", "--base=HEAD", "--dry-run"])
+        .args(["--lane", "platform", "--lane", "core"])
+        .output()
+        .unwrap();
+    assert!(together.status.success(), "lanes failed: {together:?}");
+    let plans: serde_json::Value = serde_json::from_slice(&together.stdout).unwrap();
+    assert_eq!(plans["lanes"]["platform"]["targets"], serde_json::json!([]));
+    assert_eq!(plans["lanes"]["platform"]["count"], 0);
+    assert!(plans["lanes"]["core"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["address"] == "//src/elixir/core/accounts:test"));
+    let human = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--dry-run"])
+        .args(["--lane", "platform", "--lane", "core"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).contains("Lane platform: no projects affected"));
 
     let human = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(tmp.path())

@@ -372,10 +372,10 @@ aster affected build --base=main --related
 
 `--related` selects at the level of functions, types and modules instead of
 projects, and needs no `files_list` capability, `{files}` placeholder or
-wrapper script. Aster parses every Elixir, TypeScript/JavaScript, Go and
-Python file in the workspace with tree-sitter, maps the diff's hunks onto the
-definitions they touch, and follows references from those definitions to the
-tests that reach them, across project boundaries.
+wrapper script. Aster parses every Elixir, TypeScript/JavaScript, Go, Python
+and Rust file in the workspace with tree-sitter, maps the diff's hunks onto
+the definitions they touch, and follows references from those definitions to
+the tests that reach them, across project boundaries.
 
 - **Test commands run narrowed.** `mix test`, Vitest, Jest, Mocha,
   `bun test`, `node --test`, `go test` and `pytest` are recognised in the
@@ -635,6 +635,31 @@ ignore = [".agents/**", "docs/generated/**"]
 ```
 
 The root-level `ignore` list separately controls project discovery.
+
+### Splitting an affected run into lanes
+
+A lane is a named subset of projects in the root `aster.toml`, for CI that
+gives each group of projects its own job:
+
+```toml
+[affected.lanes.backend]
+include = ["//services/..."]
+exclude = ["//services/web/..."]
+
+[affected.lanes.web]
+include = ["//services/web/..."]
+```
+
+```console
+aster affected test --base=main --dependents --lane backend
+aster --json affected test --base=main --related --dry-run --lane backend --lane web
+```
+
+`--lane` keeps the affected projects the lane matches, after dependents are
+added; the targets they depend on still run. Repeat it with `--dry-run` to
+plan several lanes from one analysis of the change: each lane gets the plan it
+would get alone, and `--json` prints them under `lanes`, keyed by lane name.
+Running takes one lane per invocation.
 
 ## Watch mode
 
