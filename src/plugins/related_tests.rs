@@ -219,6 +219,22 @@ impl Delegated {
         })
     }
 
+    /// The environment assignments written before the test command
+    /// (`A=1 exec mix test` has `A=1`), each followed by a space.
+    pub(crate) fn environment(&self) -> String {
+        let segment = self
+            .head
+            .rsplit("&&")
+            .next()
+            .and_then(|rest| rest.rsplit(';').next())
+            .unwrap_or("");
+        segment
+            .split_whitespace()
+            .filter(|word| is_assignment(word))
+            .map(|word| format!("{word} "))
+            .collect()
+    }
+
     /// The one-liner with its test command replaced.
     pub(crate) fn render(&self, command: &str) -> String {
         let script = format!("{}{command}", self.head);
@@ -321,7 +337,36 @@ pub(super) fn mix(
     if keep.is_empty() {
         return plan(Vec::new());
     }
+    // `--partitions N` deals the files it is given out in turn, and
+    // partition K of fewer than K files gets none: Mix then fails, saying
+    // the paths match nothing.
+    if let Some(partition) = mix_partition(&argv, test) {
+        let given: BTreeSet<&String> = keep.iter().collect();
+        if given.len() < partition {
+            return plan(Vec::new());
+        }
+    }
     plan(vec![argv.render(&listed, &keep)])
+}
+
+/// Which partition a `mix test --partitions N` command runs, when
+/// `MIX_TEST_PARTITION` is written in front of it.
+fn mix_partition(argv: &Argv, test: usize) -> Option<usize> {
+    let arguments = &argv.parts[test + 1..];
+    let total: usize = arguments.iter().enumerate().find_map(|(i, part)| {
+        match part.strip_prefix("--partitions") {
+            Some("") => arguments.get(i + 1)?.parse().ok(),
+            Some(rest) => rest.strip_prefix('=')?.parse().ok(),
+            None => None,
+        }
+    })?;
+    let partition: usize = argv.parts[..argv.program]
+        .iter()
+        .rev()
+        .find_map(|part| part.strip_prefix("MIX_TEST_PARTITION="))?
+        .parse()
+        .ok()?;
+    (total > 1 && (1..=total).contains(&partition)).then_some(partition)
 }
 
 const JS_RUNNERS: &[&str] = &["vitest", "jest", "mocha"];

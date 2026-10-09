@@ -399,7 +399,10 @@ the tests that reach them, across project boundaries.
 
   runs `… exec mix test --partitions 2 test/a_test.exs test/b_test.exs`
   with the tests selected in `//core`, so each shard takes its slice of the
-  selection; `vitest --shard=1/2` works the same way. Everything before the
+  selection; `vitest --shard=1/2` works the same way. A `mix test` shard
+  whose partition gets none of the selected files is skipped: partition 3
+  of two files is empty, and Mix fails on paths that match nothing.
+  Everything before the
   final command is kept, which must be a plain command after an optional
   `cd <dir> &&`. Test targets the requested target depends on in other
   projects are narrowed too, each to its own project's selection, so a
