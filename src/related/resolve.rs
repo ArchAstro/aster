@@ -46,7 +46,12 @@ pub struct RustIndex {
     files: HashMap<PathBuf, Vec<(usize, Vec<String>)>>,
     /// Library targets by crate name.
     libs: HashMap<String, usize>,
+    /// What each file re-exports: the path, and whether all of it (`::*`).
+    reexports: HashMap<PathBuf, Vec<(String, bool)>>,
 }
+
+/// How many re-exports a path is followed through.
+const MAX_REEXPORTS: usize = 8;
 
 impl RustIndex {
     pub fn build<'p>(root: &Path, sources: impl Iterator<Item = &'p PathBuf>) -> Self {
@@ -102,15 +107,29 @@ impl RustIndex {
 
     /// Follow `path` (`crate::a::b::Name`) from `from` as far as modules
     /// go: the file of the innermost module, and the segments left over,
-    /// which name something inside it. A path that leads to no module of
-    /// the workspace stays in `from`, whole.
+    /// which name something inside it. A module may be one that a module on
+    /// the way re-exports (`pub use other::*`). A path that leads to no
+    /// module of the workspace stays in `from`, whole.
     pub fn follow(&self, from: &Path, path: &str) -> Vec<(PathBuf, Vec<String>)> {
         let segments: Vec<String> = path.split("::").map(str::to_string).collect();
+        let mut found = self.modules_of(from, &segments, 0);
+        if found.is_empty() {
+            found.push((from.to_path_buf(), segments));
+        }
+        found
+    }
+
+    fn modules_of(
+        &self,
+        from: &Path,
+        segments: &[String],
+        depth: usize,
+    ) -> Vec<(PathBuf, Vec<String>)> {
         let mut found: Vec<(PathBuf, Vec<String>)> = Vec::new();
         for (target, module) in self.owners(from) {
             let mut target = *target;
             let mut base = module.clone();
-            let mut rest = &segments[..];
+            let mut rest = segments;
             match rest.first().map(String::as_str) {
                 Some("crate") => {
                     base.clear();
@@ -151,15 +170,39 @@ impl RustIndex {
                 }
                 taken += 1;
             }
-            if let Some(file) = modules.get(&base) {
-                let entry = (file.clone(), rest[taken..].to_vec());
+            let Some(file) = modules.get(&base) else {
+                continue;
+            };
+            let left = &rest[taken..];
+            // The next segment is no module of this one. It may be a module
+            // this one re-exports from elsewhere; if so, the path goes on
+            // there and names nothing here.
+            let mut through: Vec<(PathBuf, Vec<String>)> = Vec::new();
+            if left.len() > 1 && depth < MAX_REEXPORTS {
+                for (spec, all) in self.reexports.get(file).into_iter().flatten() {
+                    let mut onward: Vec<String> = spec.split("::").map(str::to_string).collect();
+                    match all {
+                        true => onward.extend_from_slice(left),
+                        false if onward.last() == left.first() => {
+                            onward.extend_from_slice(&left[1..]);
+                        }
+                        false => continue,
+                    }
+                    for entry in self.modules_of(file, &onward, depth + 1) {
+                        if entry.1.len() < left.len() && !through.contains(&entry) {
+                            through.push(entry);
+                        }
+                    }
+                }
+            }
+            if through.is_empty() {
+                through.push((file.clone(), left.to_vec()));
+            }
+            for entry in through {
                 if !found.contains(&entry) {
                     found.push(entry);
                 }
             }
-        }
-        if found.is_empty() {
-            found.push((from.to_path_buf(), segments));
         }
         found
     }
@@ -242,6 +285,14 @@ impl Resolvers {
             ),
         };
         for (path, facts) in ws.sources {
+            if facts.family == Family::Rust && !facts.reexports.is_empty() {
+                let reexports = facts
+                    .reexports
+                    .iter()
+                    .map(|spec| (spec.clone(), facts.uses_all.contains(spec)))
+                    .collect();
+                resolvers.rust.reexports.insert(path.clone(), reexports);
+            }
             match facts.family {
                 Family::Elixir => {
                     for module in &facts.modules {

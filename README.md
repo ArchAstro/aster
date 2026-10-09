@@ -485,6 +485,9 @@ How a change is followed:
     `Drop::drop`, `From::from`) is called by formatting, operators and
     conversions that name nothing. A change to one reaches every
     definition that uses the type's file.
+  - A path is followed through re-exports: with `pub use parts::*` in the
+    crate root, `crate::ports::Runner` is the `Runner` of `parts::ports`.
+    A trait reached that way is one the workspace declares.
   - A `macro_rules!` macro is found by its name wherever it is used.
   - A test that runs the package's binary (`CARGO_BIN_EXE_*`, `assert_cmd`)
     runs for any change to the package's sources.
