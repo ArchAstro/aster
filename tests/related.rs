@@ -914,6 +914,57 @@ fn rust_trait_methods_are_reached_through_the_trait() {
     );
 }
 
+// A crate that re-exports another crate's modules whole, so that its own
+// code names them as `crate::…`.
+const RUST_FACADE: &[(&str, &str)] = &[
+    (
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nparts = { path = \"crates/parts\" }\n",
+    ),
+    (
+        "app/src/lib.rs",
+        "pub mod engine;\npub mod notes;\npub mod wiring;\npub use parts::*;\n",
+    ),
+    (
+        "app/crates/parts/Cargo.toml",
+        "[package]\nname = \"parts\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    ("app/crates/parts/src/lib.rs", "pub mod ports;\n"),
+    (
+        "app/crates/parts/src/ports.rs",
+        "pub trait Runner {\n    fn run(&self) -> u32;\n}\n\npub trait Label {\n    fn text(&self) -> String;\n}\n",
+    ),
+    (
+        "app/src/engine.rs",
+        "use crate::ports::Runner;\n\npub struct Engine;\n\nimpl Runner for Engine {\n    fn run(&self) -> u32 {\n        1\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn engine_runs() {\n        let engine = Engine;\n        assert_eq!(engine.run(), 1);\n    }\n}\n",
+    ),
+    (
+        "app/src/wiring.rs",
+        "use crate::ports::Runner;\n\npub fn drive(runner: &dyn Runner) -> u32 {\n    runner.run()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::engine::Engine;\n\n    #[test]\n    fn drives_the_engine() {\n        assert_eq!(drive(&Engine), 1);\n    }\n}\n",
+    ),
+    // Uses the same re-exported module, and nothing of the engine.
+    (
+        "app/src/notes.rs",
+        "use crate::ports::Label;\n\npub struct Note;\n\nimpl Label for Note {\n    fn text(&self) -> String {\n        String::from(\"note\")\n    }\n}\n\npub fn show(label: &dyn Label) -> String {\n    label.text()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn shows_a_note() {\n        assert_eq!(show(&Note), \"note\");\n    }\n}\n",
+    ),
+];
+
+#[test]
+fn rust_paths_are_followed_through_a_glob_re_export_of_another_crate() {
+    let ws = Workspace::new(RUST_FACADE);
+    // `crate::ports` is `parts::ports`, brought in by `pub use parts::*`.
+    // `Runner` is therefore a trait of the workspace, reached by the code
+    // that calls `run` on one, not by everything that uses the crate.
+    ws.edit("app/src/engine.rs", "        1\n", "        1 + 0\n");
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        [
+            "cargo test --lib -- --exact engine::tests::engine_runs wiring::tests::drives_the_engine",
+            "cargo test --doc"
+        ]
+    );
+}
+
 #[test]
 fn rust_macros_are_found_by_name() {
     let ws = Workspace::new(RUST_KIT);
