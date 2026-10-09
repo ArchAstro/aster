@@ -1161,6 +1161,9 @@ fn shard_projects_run_their_slice_of_the_selected_tests() {
         "Enum.sum(items)",
         "Enum.sum(items) + 0",
     );
+    // Both pricing functions changed, so two test files are selected. Mix
+    // deals them out, one to each partition.
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
     let plan = ws.plan("test-ci");
     for shard in ["1", "2"] {
         let commands = plan.commands(&format!("//shop-shard-{shard}:test-ci"));
@@ -1172,7 +1175,7 @@ fn shard_projects_run_their_slice_of_the_selected_tests() {
                 "-c".to_string(),
                 format!(
                     "cd ../shop && MIX_TEST_PARTITION={shard} exec mix test --warnings-as-errors \
-                     --partitions 2 test/shop/cart_test.exs"
+                     --partitions 2 test/shop/cart_test.exs test/shop/tax_test.exs"
                 ),
             ]
         );
@@ -1181,6 +1184,27 @@ fn shard_projects_run_their_slice_of_the_selected_tests() {
     assert!(
         notes.contains("sum (shop/lib/shop/pricing.ex:3)"),
         "{notes}"
+    );
+}
+
+#[test]
+fn a_shard_whose_partition_gets_no_selected_file_is_skipped() {
+    let ws = Workspace::new(&sharded());
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    // One file is selected. `mix test --partitions 2` gives it to the first
+    // partition; the second would fail, saying its paths match nothing.
+    let plan = ws.plan("test-ci");
+    assert_eq!(
+        plan.commands("//shop-shard-1:test-ci"),
+        ["bash -c 'cd ../shop && MIX_TEST_PARTITION=1 exec mix test --warnings-as-errors --partitions 2 test/shop/cart_test.exs'"]
+    );
+    assert!(
+        !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
+        "{plan:#?}"
     );
 }
 
@@ -1236,8 +1260,12 @@ fn shard_projects_run_in_full_when_their_own_files_change() {
     assert!(plan
         .notes("//shop-shard-1:test-ci")
         .contains("shop-shard-1/aster.toml changed; running in full"));
-    // The other shard still narrows.
-    assert_eq!(plan.commands("//shop-shard-2:test-ci").len(), 1);
+    // The other shard still narrows: to nothing, as the one selected file
+    // is not in its partition.
+    assert!(
+        !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
+        "{plan:#?}"
+    );
 }
 
 #[test]

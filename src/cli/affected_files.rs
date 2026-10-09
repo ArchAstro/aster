@@ -442,8 +442,16 @@ impl<'a> RelatedPlanner<'a> {
             && def.command.contains("{files}")
             && def.capabilities.contains(&TargetCapability::FilesList);
         let plugin = self.registry.find_by_name(&project.plugin_name);
+        // The plugin sees the environment a one-liner sets for the command,
+        // which the one-liner itself keeps.
+        let environment = runner
+            .delegated
+            .as_ref()
+            .map(|delegated| delegated.environment())
+            .unwrap_or_default();
+        let command = format!("{environment}{}", runner.command);
         let attempt = |tests: &[RelatedTest]| {
-            plugin.and_then(|p| p.related_tests(&project.root, &runner.command, tests))
+            plugin.and_then(|p| p.related_tests(&project.root, &command, tests))
         };
         if !placeholder && attempt(&[]).is_none() {
             return Ok(Narrowed::NotRunner);
@@ -480,7 +488,9 @@ impl<'a> RelatedPlanner<'a> {
                 let commands: Vec<String> = commands
                     .iter()
                     .map(|command| match &runner.delegated {
-                        Some(delegated) => delegated.render(command),
+                        Some(delegated) => {
+                            delegated.render(command.strip_prefix(&environment).unwrap_or(command))
+                        }
                         None => command.clone(),
                     })
                     .collect();
