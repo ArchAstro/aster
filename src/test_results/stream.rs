@@ -125,6 +125,7 @@ mod tests {
             skipped: false,
             cached: false,
             output: String::new(),
+            log: Vec::new(),
             duration_ms: 1200,
             exit_code: Some(if success { 0 } else { 2 }),
             tests,
