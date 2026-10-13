@@ -409,7 +409,7 @@ impl LanguagePlugin for PythonPlugin {
                 "setup.py".to_string(),
                 "setup.cfg".to_string(),
             ],
-            env_vars: vec!["PYTHONPATH".to_string(), "CI".to_string()],
+            env_vars: vec!["PYTHONPATH".to_string()],
             ..Default::default()
         };
 

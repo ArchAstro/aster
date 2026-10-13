@@ -39,10 +39,14 @@ pub struct CacheInputs {
     /// or globs. They are hashed with a `ws:` prefix so `Cargo.lock` here
     /// cannot collide with the member's own `Cargo.lock`.
     pub workspace_files: Vec<String>,
-    /// Environment variables to track (e.g., ["NODE_ENV", "CI"])
+    /// Environment variables to track (e.g., ["NODE_ENV", "MIX_ENV"])
     ///
     /// A name ending in `*` is a prefix: every snapshot variable that starts
     /// with the name without that `*` is hashed, sorted by name.
+    ///
+    /// `CI` is not tracked by default. A key computed in GitHub Actions must
+    /// match one computed on a laptop for identical inputs. Users who want
+    /// `CI` in the key opt in with `[targets.<name>.cache] env = ["CI"]`.
     pub env_vars: Vec<String>,
 }
 
@@ -375,3 +379,33 @@ pub use rust::RustPlugin;
 
 // Re-export CacheInputs for use by cache module
 pub use self::CacheInputs as PluginCacheInputs;
+
+#[cfg(test)]
+mod tests {
+    use super::PluginRegistry;
+
+    /// Default target names plugins may return cache inputs for, including
+    /// the implicit clean target and the non-cacheable dev target.
+    const DEFAULT_TARGET_NAMES: &[&str] = &["build", "test", "lint", "deps", "dev", "clean"];
+
+    #[test]
+    fn test_no_plugin_tracks_ci_env_var() {
+        let registry = PluginRegistry::with_all_plugins();
+        assert!(
+            !registry.plugins().is_empty(),
+            "with_all_plugins registered nothing"
+        );
+
+        for plugin in registry.plugins() {
+            for target_name in DEFAULT_TARGET_NAMES {
+                let inputs = plugin.cache_inputs(target_name);
+                assert!(
+                    !inputs.env_vars.iter().any(|var| var == "CI"),
+                    "{} cache_inputs({target_name}) tracks CI: {:?}",
+                    plugin.name(),
+                    inputs.env_vars
+                );
+            }
+        }
+    }
+}

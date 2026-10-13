@@ -560,7 +560,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 "pnpm-lock.yaml".to_string(),
                 "tsconfig.json".to_string(),
             ],
-            env_vars: vec!["NODE_ENV".to_string(), "CI".to_string()],
+            env_vars: vec!["NODE_ENV".to_string()],
             ..Default::default()
         };
 

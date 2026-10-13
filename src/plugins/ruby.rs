@@ -369,7 +369,6 @@ impl LanguagePlugin for RubyPlugin {
                 "BUNDLE_GEMFILE".to_string(),
                 "RAILS_ENV".to_string(),
                 "RACK_ENV".to_string(),
-                "CI".to_string(),
             ],
             ..Default::default()
         }

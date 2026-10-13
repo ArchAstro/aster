@@ -3856,3 +3856,90 @@ fn cargo_workspace_root_lockfile_invalidates_member_cache_keys() {
         "root Cargo.lock must change //crates/two:stamp"
     );
 }
+
+/// Run `//app:build` and return the hash stored for it.
+///
+/// The fixture defines `build` without the implicit `//self:deps` edge, so
+/// `--no-deps` writes a cache entry without running `npm install`. Plugin
+/// cache inputs still come from the nodejs plugin.
+fn cached_build_hash(tmp: &TempDir, ci: Option<&str>) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aster"));
+    cmd.current_dir(tmp.path())
+        .args(["run", "//app:build", "--no-deps"])
+        .env_remove("CI");
+    if let Some(value) = ci {
+        cmd.env("CI", value);
+    }
+    let run = cmd.output().unwrap();
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["cache", "status", "//app:build", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "cache status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("cache status was not an entry ({err}): {stdout}"));
+    entry["hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("cache status has no hash: {stdout}"))
+        .to_string()
+}
+
+#[test]
+fn test_ci_env_var_does_not_change_cache_key() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+"#,
+    );
+
+    let unset = cached_build_hash(&tmp, None);
+    let set = cached_build_hash(&tmp, Some("1"));
+    assert_eq!(
+        unset, set,
+        "CI=1 must not change the cache key of a default plugin target"
+    );
+    assert!(!unset.is_empty());
+}
+
+#[test]
+fn test_ci_env_var_opt_in_changes_cache_key() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+
+[targets.build.cache]
+env = ["CI"]
+"#,
+    );
+
+    let unset = cached_build_hash(&tmp, None);
+    let set = cached_build_hash(&tmp, Some("1"));
+    assert_ne!(
+        unset, set,
+        "opting in with cache.env = [\"CI\"] must change the cache key"
+    );
+}

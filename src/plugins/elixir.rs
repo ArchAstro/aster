@@ -230,7 +230,7 @@ impl LanguagePlugin for ElixirPlugin {
                 "mix.lock".to_string(),
                 "config/*.exs".to_string(),
             ],
-            env_vars: vec!["MIX_ENV".to_string(), "CI".to_string()],
+            env_vars: vec!["MIX_ENV".to_string()],
             ..Default::default()
         };
 

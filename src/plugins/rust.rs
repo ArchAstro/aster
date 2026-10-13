@@ -273,11 +273,7 @@ impl LanguagePlugin for RustPlugin {
                 "rust-toolchain.toml".to_string(),
                 ".cargo/config.toml".to_string(),
             ],
-            env_vars: vec![
-                "RUSTFLAGS".to_string(),
-                "CARGO_TARGET_DIR".to_string(),
-                "CI".to_string(),
-            ],
+            env_vars: vec!["RUSTFLAGS".to_string(), "CARGO_TARGET_DIR".to_string()],
             ..Default::default()
         };
 
