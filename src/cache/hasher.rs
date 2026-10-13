@@ -519,11 +519,12 @@ impl CacheHasher {
             };
 
             if matcher.matches_relative(rel_path) {
-                if let Ok(content) = std::fs::read(entry.path()) {
-                    let digest = Sha256::digest(&content);
-                    let hash = encode_hex(digest.as_ref());
-                    file_hashes.push((normalize_rel(rel_path)?, hash));
-                }
+                let content = std::fs::read(entry.path()).with_context(|| {
+                    format!("Failed to read cache input {}", entry.path().display())
+                })?;
+                let digest = Sha256::digest(&content);
+                let hash = encode_hex(digest.as_ref());
+                file_hashes.push((normalize_rel(rel_path)?, hash));
             }
         }
 
@@ -1848,5 +1849,37 @@ mod tests {
             collected.unwrap(),
             vec![("JAVA_HOME".to_string(), "jdk-21".to_string())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_matched_input_fails_compute_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, "hidden").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let runtime = RuntimeInputCache::new(tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["secret.txt".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let err = hasher
+            .compute_hash(&inputs, None, "build", &[], &HashMap::new(), &runtime)
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&secret.display().to_string()),
+            "error should name the unreadable path, got {message}"
+        );
+
+        // Restore permissions so the temp dir can be removed.
+        let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644));
     }
 }

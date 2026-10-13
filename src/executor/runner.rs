@@ -1464,7 +1464,8 @@ fn check_cache(
         .map(|dep| hashes_guard.get(dep).map(String::as_str))
         .collect::<Option<_>>()?;
 
-    // Compute current hash
+    // Compute current hash. An unreadable matched input is not cacheable
+    // for this run: the target still executes, and nothing is stored.
     let hasher =
         CacheHasher::new(&project.root, workspace_root).with_excluded_dirs(excluded_dirs.to_vec());
     let current_hash = match hasher.compute_hash(
