@@ -1255,18 +1255,18 @@ fn handle_control_connection(
     stop: &AtomicBool,
     shutdown: &AtomicBool,
 ) {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufReader, Read, Write};
 
     // On macOS an accepted socket inherits the listener's non-blocking mode.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut line = String::new();
-    let parsed = BufReader::new(&stream)
-        .take(64 * 1024 + 1)
-        .read_line(&mut line)
-        .ok()
-        .filter(|bytes| *bytes <= 64 * 1024)
-        .and_then(|_| serde_json::from_str::<WireControlRequest>(&line).ok());
+    let mut reader = BufReader::new(&stream).take(64 * 1024 + 1);
+    let parsed = read_control_line(&mut reader).ok().and_then(|line| {
+        if !line.ends_with('\n') || line.len() > 64 * 1024 {
+            return None;
+        }
+        serde_json::from_str::<WireControlRequest>(line.trim_end()).ok()
+    });
     let response = match parsed {
         Some(parsed)
             if is_state_changing_control_command(&parsed.command)
@@ -1319,6 +1319,10 @@ fn handle_control_connection(
 
 fn is_state_changing_control_command(command: &str) -> bool {
     matches!(command, "restart" | "restart_all" | "shutdown")
+}
+
+fn read_control_line(reader: &mut impl std::io::BufRead) -> std::io::Result<String> {
+    super::daemon::read_accepted_line(reader, "control request ended before a newline")
 }
 
 fn create_control_token(port: u16) -> Result<(String, PathBuf)> {

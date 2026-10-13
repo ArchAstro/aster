@@ -183,12 +183,18 @@ mod unix {
             }
         });
         std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(command) = serde_json::from_str(&line) {
-                    if commands.send(command).is_err() {
-                        break;
+            let mut reader = BufReader::new(stream);
+            loop {
+                match read_session_line(&mut reader) {
+                    Ok(line) => {
+                        if let Ok(command) = serde_json::from_str::<SessionCommand>(&line) {
+                            if commands.send(command).is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(_) => break,
                 }
             }
         });
@@ -233,6 +239,10 @@ mod unix {
             stream.flush()?;
             Ok(())
         }
+    }
+
+    fn read_session_line(reader: &mut impl BufRead) -> std::io::Result<String> {
+        crate::dev::daemon::read_accepted_line(reader, "session command ended before a newline")
     }
 }
 
