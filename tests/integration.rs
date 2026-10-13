@@ -2290,6 +2290,64 @@ fn test_cached_targets_are_not_printed() {
 }
 
 #[test]
+fn cache_key_includes_runtime_command_output() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name": "app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+cache = { enabled = true, runtime = ["echo v1"] }
+"#,
+    );
+
+    let first = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "Command failed: {first:?}");
+
+    let cache_path = tmp.path().join(".aster/cache/cache.json");
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
+    let hash_v1 = stored["targets"]["//app:build"]["hash"]
+        .as_str()
+        .expect("cache hash")
+        .to_string();
+
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+cache = { enabled = true, runtime = ["echo v2"] }
+"#,
+    );
+    let second = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "Command failed: {second:?}");
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
+    let hash_v2 = stored["targets"]["//app:build"]["hash"]
+        .as_str()
+        .expect("cache hash")
+        .to_string();
+    assert_ne!(
+        hash_v1, hash_v2,
+        "runtime command output must change the cache key"
+    );
+}
+
+#[test]
 fn test_verbose_shows_primary_project_count() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

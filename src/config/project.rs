@@ -128,6 +128,12 @@ pub struct CacheConfig {
     /// Output paths that must exist before a cached success may be reused.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Commands whose trimmed stdout+stderr is hashed into the cache key.
+    ///
+    /// `None` keeps the plugin's default runtime commands. `Some` replaces
+    /// them, including `Some([])`, which disables runtime inputs.
+    #[serde(default)]
+    pub runtime: Option<Vec<String>>,
 }
 
 /// Rich target configuration with all options
@@ -1005,5 +1011,49 @@ command = "npm run build"
         let build = config.targets.get("build").unwrap();
         assert_eq!(build.command(), "npm run build");
         assert!(!build.invalidates_cache());
+    }
+
+    #[test]
+    fn parses_cache_runtime_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.build]
+command = "npm run build"
+cache = { runtime = ["echo v1", "node --version"] }
+
+[targets.test]
+command = "npm test"
+cache = { runtime = [] }
+
+[targets.lint]
+command = "npm run lint"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+        let build = config.targets.get("build").unwrap().cache().unwrap();
+        assert_eq!(
+            build.runtime.as_deref(),
+            Some(["echo v1".to_string(), "node --version".to_string()].as_slice())
+        );
+        let test = config.targets.get("test").unwrap().cache().unwrap();
+        assert_eq!(test.runtime.as_deref(), Some([].as_slice()));
+        assert!(config.targets.get("lint").unwrap().cache().is_none());
+
+        let unknown = tmp.path().join("unknown.toml");
+        std::fs::write(
+            &unknown,
+            r#"
+[targets.build]
+command = "npm run build"
+cache = { runtime_commands = ["echo v1"] }
+"#,
+        )
+        .unwrap();
+        assert!(parse_aster_toml(&unknown).is_err());
     }
 }

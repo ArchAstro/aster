@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::Utc;
 use console::style;
 
-use crate::cache::{resolve_cache_dir, CacheEntry, CacheHasher, CacheStore};
+use crate::cache::{resolve_cache_dir, CacheEntry, CacheHasher, CacheStore, RuntimeInputCache};
 use crate::cli::OutputMode;
 use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
@@ -451,6 +451,7 @@ impl<'a> Executor<'a> {
         let input_hashes: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
 
         let env_snapshot: HashMap<String, String> = std::env::vars().collect();
+        let runtime_inputs = Arc::new(RuntimeInputCache::new(self.workspace_root));
 
         let mut all_results = Vec::new();
         let mut failed_or_blocked: HashSet<String> = HashSet::new();
@@ -506,6 +507,7 @@ impl<'a> Executor<'a> {
                 &computed_hashes,
                 &input_hashes,
                 &env_snapshot,
+                &runtime_inputs,
             );
             failed_or_blocked.extend(
                 level_results
@@ -544,6 +546,7 @@ impl<'a> Executor<'a> {
         computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
         input_hashes: &Mutex<HashMap<String, String>>,
         env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &Arc<RuntimeInputCache>,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
 
@@ -676,6 +679,7 @@ impl<'a> Executor<'a> {
                     input_hashes,
                     env_snapshot,
                     &excluded_dirs,
+                    runtime_inputs,
                 )
             } else {
                 None
@@ -697,6 +701,7 @@ impl<'a> Executor<'a> {
                     computed_hashes,
                     env_snapshot,
                     &excluded_dirs,
+                    runtime_inputs,
                 ) {
                     if cache_hit {
                         // Cache hit - skip execution
@@ -771,6 +776,7 @@ impl<'a> Executor<'a> {
             let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
             let env_snapshot_clone = env_snapshot.clone();
+            let runtime_inputs_clone = Arc::clone(runtime_inputs);
             let target_deps = project
                 .targets
                 .get(&target_name)
@@ -922,6 +928,7 @@ impl<'a> Executor<'a> {
                                 &command_clone,
                                 &dependency_hashes,
                                 &env_snapshot_clone,
+                                &runtime_inputs_clone,
                             );
                             drop(hashes_guard);
 
@@ -1283,6 +1290,7 @@ fn check_cache(
     computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
     env_snapshot: &HashMap<String, String>,
     excluded_dirs: &[PathBuf],
+    runtime_inputs: &RuntimeInputCache,
 ) -> Option<(bool, String)> {
     // Get user cache config from project's target configuration
     let target = project.targets.get(target_name)?;
@@ -1319,15 +1327,20 @@ fn check_cache(
     // Compute current hash
     let hasher =
         CacheHasher::new(&project.root, workspace_root).with_excluded_dirs(excluded_dirs.to_vec());
-    let current_hash = hasher
-        .compute_hash(
-            &plugin_inputs,
-            user_config,
-            command,
-            &dep_hashes,
-            env_snapshot,
-        )
-        .ok()?;
+    let current_hash = match hasher.compute_hash(
+        &plugin_inputs,
+        user_config,
+        command,
+        &dep_hashes,
+        env_snapshot,
+        runtime_inputs,
+    ) {
+        Ok(hash) => hash,
+        Err(error) => {
+            eprintln!("[aster] Warning: Target {target_addr} is not cacheable: {error:#}");
+            return None;
+        }
+    };
 
     drop(hashes_guard);
 
@@ -1379,6 +1392,7 @@ fn test_input_hash(
     input_hashes: &Mutex<HashMap<String, String>>,
     env_snapshot: &HashMap<String, String>,
     excluded_dirs: &[PathBuf],
+    runtime_inputs: &RuntimeInputCache,
 ) -> Option<String> {
     let target = project.targets.get(target_name)?;
     let elsewhere = tests_run_elsewhere(project, target, command, project_map)?;
@@ -1386,7 +1400,7 @@ fn test_input_hash(
         Some(other) => {
             let other_plugin = plugin_registry.find_by_name(&other.plugin_name)?;
             Some(
-                CacheHasher::new(&other.root, workspace_root)
+                match CacheHasher::new(&other.root, workspace_root)
                     .with_excluded_dirs(nested_project_roots(other, project_map))
                     .compute_hash(
                         &cache_inputs_for(other_plugin, &other.root, workspace_root, "test"),
@@ -1394,8 +1408,11 @@ fn test_input_hash(
                         "",
                         &[],
                         env_snapshot,
-                    )
-                    .ok()?,
+                        runtime_inputs,
+                    ) {
+                    Ok(hash) => hash,
+                    Err(error) => format!("runtime-unavailable:{error:#}"),
+                },
             )
         }
         None => None,
@@ -1408,6 +1425,7 @@ fn test_input_hash(
         (&mut inputs.config_files, test_inputs.config_files),
         (&mut inputs.workspace_files, test_inputs.workspace_files),
         (&mut inputs.env_vars, test_inputs.env_vars),
+        (&mut inputs.runtime_commands, test_inputs.runtime_commands),
     ] {
         for item in more {
             if !all.contains(&item) {
@@ -1423,7 +1441,7 @@ fn test_input_hash(
             .map(|dependency| hashes.get(dependency).map(String::as_str))
             .collect::<Option<_>>()?;
         dependencies.extend(elsewhere_hash.as_deref());
-        CacheHasher::new(&project.root, workspace_root)
+        match CacheHasher::new(&project.root, workspace_root)
             .with_excluded_dirs(excluded_dirs.to_vec())
             .compute_hash(
                 &inputs,
@@ -1431,8 +1449,14 @@ fn test_input_hash(
                 command,
                 &dependencies,
                 env_snapshot,
-            )
-            .ok()?
+                runtime_inputs,
+            ) {
+            Ok(hash) => hash,
+            // A missing toolchain must not drop test tracking. Cache hits
+            // already refuse the target; the test hash records the failure
+            // instead of pretending the target has no inputs.
+            Err(error) => format!("runtime-unavailable:{error:#}"),
+        }
     };
     input_hashes
         .lock()
@@ -2517,6 +2541,7 @@ mod tests {
             &Arc::new(Mutex::new(HashMap::new())),
             &HashMap::new(),
             &[],
+            &RuntimeInputCache::new(tmp.path()),
         );
 
         assert!(
@@ -2718,6 +2743,7 @@ mod tests {
             &computed_hashes,
             &Mutex::new(HashMap::new()),
             &env_snapshot,
+            &Arc::new(RuntimeInputCache::new(&tmp)),
         );
         let total_ms = start.elapsed().as_millis();
 
@@ -2806,6 +2832,7 @@ mod tests {
             &computed_hashes,
             &Mutex::new(HashMap::new()),
             &env_snapshot,
+            &Arc::new(RuntimeInputCache::new(&tmp)),
         );
         let total_ms = start.elapsed().as_millis();
 

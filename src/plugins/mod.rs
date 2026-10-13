@@ -70,6 +70,12 @@ pub struct CacheInputs {
     /// match one computed on a laptop for identical inputs. Users who want
     /// `CI` in the key opt in with `[targets.<name>.cache] env = ["CI"]`.
     pub env_vars: Vec<String>,
+    /// Commands whose trimmed stdout+stderr is hashed into the cache key.
+    ///
+    /// Plugin defaults are toolchain version commands (`rustc -vV`,
+    /// `node --version`). A target's `[targets.<name>.cache] runtime` replaces
+    /// this list; `runtime = []` disables runtime inputs.
+    pub runtime_commands: Vec<String>,
 }
 
 /// Capabilities that a target may support

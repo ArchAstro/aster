@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::cache::matcher::TargetInputMatcher;
+use crate::cache::runtime::RuntimeInputCache;
 use crate::cache::CACHE_SCHEMA_VERSION;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
@@ -124,6 +125,7 @@ impl CacheHasher {
     /// 4. Command string
     /// 5. Dependency cache keys (hash chaining)
     /// 6. Environment variables
+    /// 7. Runtime command outputs (`runtime:<cmd>=<output>`)
     pub fn compute_hash(
         &self,
         plugin_inputs: &CacheInputs,
@@ -131,6 +133,7 @@ impl CacheHasher {
         command: &str,
         dependency_hashes: &[&str],
         env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
     ) -> Result<String> {
         self.compute_hash_with_schema(
             CACHE_SCHEMA_VERSION,
@@ -139,9 +142,11 @@ impl CacheHasher {
             command,
             dependency_hashes,
             env_snapshot,
+            runtime_inputs,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_hash_with_schema(
         &self,
         schema: u32,
@@ -150,6 +155,7 @@ impl CacheHasher {
         command: &str,
         dependency_hashes: &[&str],
         env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
     ) -> Result<String> {
         let mut hasher = Sha256::new();
 
@@ -199,6 +205,33 @@ impl CacheHasher {
                 hasher.update(b"=");
                 hasher.update(value.as_bytes());
                 hasher.update(b";");
+            }
+        }
+
+        hasher.update(b"runtime:");
+        for command in effective_runtime_commands(plugin_inputs, user_config) {
+            match runtime_inputs.output(&command) {
+                Ok(output) => {
+                    hasher.update(b"runtime:");
+                    hasher.update(command.as_bytes());
+                    hasher.update(b"=");
+                    hasher.update(output.as_bytes());
+                    hasher.update(b"\n");
+                }
+                Err(error) => {
+                    // Files are already in the hasher. Record the failure too so
+                    // test tracking still changes when an input file changes,
+                    // then fail the cache hash.
+                    hasher.update(b"runtime-error:");
+                    hasher.update(command.as_bytes());
+                    hasher.update(b"=");
+                    hasher.update(error.as_bytes());
+                    hasher.update(b"\n");
+                    let partial = encode_hex(hasher.finalize().as_ref());
+                    return Err(anyhow::anyhow!(
+                        "runtime input `{command}` failed: {error} (inputs {partial})"
+                    ));
+                }
             }
         }
 
@@ -441,6 +474,16 @@ fn hash_file_contents(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn effective_runtime_commands(
+    plugin_inputs: &CacheInputs,
+    user_config: Option<&CacheConfig>,
+) -> BTreeSet<String> {
+    match user_config.and_then(|config| config.runtime.as_ref()) {
+        Some(commands) => commands.iter().cloned().collect(),
+        None => plugin_inputs.runtime_commands.iter().cloned().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,14 +501,15 @@ mod tests {
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let hash = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
 
         // Hash should be deterministic
         let hash2 = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         assert_eq!(hash, hash2);
     }
@@ -476,9 +520,10 @@ mod tests {
         let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let current = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let bumped = hasher
             .compute_hash_with_schema(
@@ -488,6 +533,7 @@ mod tests {
                 "npm test",
                 &[],
                 &env,
+                &runtime,
             )
             .unwrap();
 
@@ -502,6 +548,7 @@ mod tests {
                     "npm test",
                     &[],
                     &env,
+                    &runtime,
                 )
                 .unwrap()
         );
@@ -512,12 +559,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let hash1 = CacheHasher::with_version(tmp.path(), "0.17.2")
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let hash2 = CacheHasher::with_version(tmp.path(), "0.18.0")
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
 
         assert_ne!(hash1, hash2);
@@ -550,12 +598,13 @@ mod tests {
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let hash1 = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let hash2 = hasher
-            .compute_hash(&inputs, None, "npm run test", &[], &env)
+            .compute_hash(&inputs, None, "npm run test", &[], &env, &runtime)
             .unwrap();
 
         assert_ne!(hash1, hash2);
@@ -568,12 +617,13 @@ mod tests {
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let hash1 = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let hash2 = hasher
-            .compute_hash(&inputs, None, "npm test", &["abc123"], &env)
+            .compute_hash(&inputs, None, "npm test", &["abc123"], &env, &runtime)
             .unwrap();
 
         assert_ne!(hash1, hash2);
@@ -594,12 +644,13 @@ mod tests {
 
         let mut env2 = HashMap::new();
         env2.insert("NODE_ENV".to_string(), "production".to_string());
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let hash1 = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env1)
+            .compute_hash(&inputs, None, "npm test", &[], &env1, &runtime)
             .unwrap();
         let hash2 = hasher
-            .compute_hash(&inputs, None, "npm test", &[], &env2)
+            .compute_hash(&inputs, None, "npm test", &[], &env2, &runtime)
             .unwrap();
 
         assert_ne!(hash1, hash2);
@@ -609,6 +660,7 @@ mod tests {
     fn test_env_prefix_pattern_hashes_matching_vars_in_order() {
         let tmp = TempDir::new().unwrap();
         let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let runtime = RuntimeInputCache::new(tmp.path());
         let inputs = CacheInputs {
             env_vars: vec!["FOO_*".to_string(), "EXACT".to_string()],
             ..Default::default()
@@ -628,20 +680,20 @@ mod tests {
         );
 
         let hash = hasher
-            .compute_hash(&inputs, None, "gradle test", &[], &env)
+            .compute_hash(&inputs, None, "gradle test", &[], &env, &runtime)
             .unwrap();
 
         let mut bar_changed = env.clone();
         bar_changed.insert("BAR".to_string(), "changed".to_string());
         let hash_bar = hasher
-            .compute_hash(&inputs, None, "gradle test", &[], &bar_changed)
+            .compute_hash(&inputs, None, "gradle test", &[], &bar_changed, &runtime)
             .unwrap();
         assert_eq!(hash, hash_bar);
 
         let mut foo_changed = env.clone();
         foo_changed.insert("FOO_A".to_string(), "changed".to_string());
         let hash_foo = hasher
-            .compute_hash(&inputs, None, "gradle test", &[], &foo_changed)
+            .compute_hash(&inputs, None, "gradle test", &[], &foo_changed, &runtime)
             .unwrap();
         assert_ne!(hash, hash_foo);
 
@@ -650,7 +702,7 @@ mod tests {
         swapped.insert("FOO_B".to_string(), "a".to_string());
         swapped.insert("EXACT".to_string(), "yes".to_string());
         let hash_swapped = hasher
-            .compute_hash(&inputs, None, "gradle test", &[], &swapped)
+            .compute_hash(&inputs, None, "gradle test", &[], &swapped, &runtime)
             .unwrap();
         assert_ne!(hash, hash_swapped);
     }
@@ -659,6 +711,7 @@ mod tests {
     fn test_user_env_prefix_pattern() {
         let tmp = TempDir::new().unwrap();
         let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let runtime = RuntimeInputCache::new(tmp.path());
         let inputs = CacheInputs {
             env_vars: vec!["JAVA_HOME".to_string()],
             ..Default::default()
@@ -686,19 +739,33 @@ mod tests {
         );
 
         let hash = hasher
-            .compute_hash(&inputs, Some(&config), "gradle test", &[], &env)
+            .compute_hash(&inputs, Some(&config), "gradle test", &[], &env, &runtime)
             .unwrap();
         let mut changed = env.clone();
         changed.insert("ORG_GRADLE_PROJECT_foo".to_string(), "9".to_string());
         let hash_changed = hasher
-            .compute_hash(&inputs, Some(&config), "gradle test", &[], &changed)
+            .compute_hash(
+                &inputs,
+                Some(&config),
+                "gradle test",
+                &[],
+                &changed,
+                &runtime,
+            )
             .unwrap();
         assert_ne!(hash, hash_changed);
 
         let mut unrelated = env.clone();
         unrelated.insert("UNRELATED".to_string(), "yes".to_string());
         let hash_unrelated = hasher
-            .compute_hash(&inputs, Some(&config), "gradle test", &[], &unrelated)
+            .compute_hash(
+                &inputs,
+                Some(&config),
+                "gradle test",
+                &[],
+                &unrelated,
+                &runtime,
+            )
             .unwrap();
         assert_eq!(hash, hash_unrelated);
     }
@@ -818,13 +885,14 @@ mod tests {
             ..Default::default()
         };
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
         let before = hasher
-            .compute_hash(&inputs, None, "cargo build", &[], &env)
+            .compute_hash(&inputs, None, "cargo build", &[], &env, &runtime)
             .unwrap();
 
         std::fs::write(tmp.path().join("Cargo.lock"), "version = 4\n").unwrap();
         let after = hasher
-            .compute_hash(&inputs, None, "cargo build", &[], &env)
+            .compute_hash(&inputs, None, "cargo build", &[], &env, &runtime)
             .unwrap();
 
         assert_ne!(before, after);
@@ -837,11 +905,25 @@ mod tests {
             ..Default::default()
         };
         let both = hasher
-            .compute_hash(&inputs_with_member_lock, None, "cargo build", &[], &env)
+            .compute_hash(
+                &inputs_with_member_lock,
+                None,
+                "cargo build",
+                &[],
+                &env,
+                &runtime,
+            )
             .unwrap();
         std::fs::write(member.join("Cargo.lock"), "version = 5\n").unwrap();
         let member_changed = hasher
-            .compute_hash(&inputs_with_member_lock, None, "cargo build", &[], &env)
+            .compute_hash(
+                &inputs_with_member_lock,
+                None,
+                "cargo build",
+                &[],
+                &env,
+                &runtime,
+            )
             .unwrap();
         assert_ne!(both, member_changed);
     }
@@ -1047,5 +1129,67 @@ mod tests {
                 "excluding {excluded:?} through an aliased root"
             );
         }
+    }
+
+    #[test]
+    fn runtime_command_output_changes_key() {
+        let tmp = TempDir::new().unwrap();
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            runtime_commands: vec!["echo v1".to_string()],
+            ..Default::default()
+        };
+        let changed = CacheInputs {
+            runtime_commands: vec!["echo v2".to_string()],
+            ..Default::default()
+        };
+        let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
+
+        let hash1 = hasher
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
+            .unwrap();
+        let hash2 = hasher
+            .compute_hash(&changed, None, "npm test", &[], &env, &runtime)
+            .unwrap();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn user_runtime_replaces_plugin_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            runtime_commands: vec!["echo plugin".to_string()],
+            ..Default::default()
+        };
+        let replaced = CacheConfig {
+            runtime: Some(vec!["echo user".to_string()]),
+            ..Default::default()
+        };
+        let disabled = CacheConfig {
+            runtime: Some(vec![]),
+            ..Default::default()
+        };
+        let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
+
+        let plugin_hash = hasher
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
+            .unwrap();
+        let user_hash = hasher
+            .compute_hash(&inputs, Some(&replaced), "npm test", &[], &env, &runtime)
+            .unwrap();
+        let disabled_hash = hasher
+            .compute_hash(&inputs, Some(&disabled), "npm test", &[], &env, &runtime)
+            .unwrap();
+        let empty = CacheInputs::default();
+        let no_runtime = hasher
+            .compute_hash(&empty, None, "npm test", &[], &env, &runtime)
+            .unwrap();
+
+        assert_ne!(plugin_hash, user_hash);
+        assert_ne!(plugin_hash, disabled_hash);
+        assert_eq!(disabled_hash, no_runtime);
     }
 }
