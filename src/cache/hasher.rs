@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::cache::matcher::TargetInputMatcher;
@@ -45,8 +46,11 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 /// Computes cache hashes for targets
 pub struct CacheHasher {
-    project_root: std::path::PathBuf,
-    workspace_root: std::path::PathBuf,
+    project_root: PathBuf,
+    workspace_root: PathBuf,
+    /// Nested project roots whose contents belong to another project and
+    /// must not enter this project's cache key.
+    excluded_dirs: Vec<PathBuf>,
 }
 
 impl CacheHasher {
@@ -57,7 +61,17 @@ impl CacheHasher {
         Self {
             project_root: project_root.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
+            excluded_dirs: Vec::new(),
         }
+    }
+
+    /// Skip these directories while hashing. Each path is a directory under
+    /// `project_root` (absolute, or relative to it) that is itself another
+    /// Aster project. The directory is not descended into, so a glob that
+    /// would otherwise match a nested project's files does not hash them.
+    pub fn with_excluded_dirs(mut self, excluded_dirs: Vec<PathBuf>) -> Self {
+        self.excluded_dirs = excluded_dirs;
+        self
     }
 
     /// Compute the cache key for a target
@@ -132,19 +146,37 @@ impl CacheHasher {
             return Ok(Vec::new());
         }
 
-        // Walk directory once and match files
-        // Disable symlink following to prevent DoS via symlink cycles
-        // and avoid reading files outside the project directory
+        // Walk once. The ignore crate never visits gitignored directories
+        // (node_modules, target, .venv), so a matching glob cannot pull them
+        // into the key. Symlinks are not followed: a cycle or a link outside
+        // the project must not be hashed. Hidden files stay visible because
+        // a glob can name them on purpose. Nested project roots are skipped
+        // by prefix: the walker canonicalizes its root, so an exact compare
+        // against the path discovery stored would miss them.
+        let excluded = self.excluded_prefixes();
         let mut file_hashes = Vec::new();
 
-        for entry in WalkDir::new(&self.project_root)
+        let walker = WalkBuilder::new(&self.project_root)
+            .hidden(false)
             .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(true)
+            .require_git(false)
+            .filter_entry(move |entry| {
+                !excluded
+                    .iter()
+                    .any(|prefix| entry.path().starts_with(prefix))
+            })
+            .build();
+
+        for entry in walker.filter_map(Result::ok).filter(|entry| {
+            entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+        }) {
             let rel_path = match entry.path().strip_prefix(&self.project_root) {
-                Ok(p) => p,
+                Ok(path) => path,
                 Err(_) => continue,
             };
 
@@ -250,6 +282,37 @@ impl CacheHasher {
             }
         }
         Ok(file_hashes)
+    }
+
+    /// Canonical prefixes of the excluded directories.
+    ///
+    /// `ignore` builds entry paths from `canonicalize(project_root)`, so a
+    /// raw project root from discovery (for example `/var/...` on macOS,
+    /// where the walker reports `/private/var/...`) would not compare equal.
+    /// A prefix match also drops the directory itself and everything under
+    /// it, which is what stops the walk from descending.
+    fn excluded_prefixes(&self) -> Vec<PathBuf> {
+        let canonical_root = self.project_root.canonicalize().ok();
+        self.excluded_dirs
+            .iter()
+            .map(|dir| {
+                let path = if dir.is_absolute() {
+                    dir.clone()
+                } else {
+                    self.project_root.join(dir)
+                };
+                path.canonicalize().unwrap_or_else(|_| {
+                    canonical_root
+                        .as_ref()
+                        .and_then(|root| {
+                            path.strip_prefix(&self.project_root)
+                                .ok()
+                                .map(|rel| root.join(rel))
+                        })
+                        .unwrap_or(path)
+                })
+            })
+            .collect()
     }
 
     /// Collect all env vars to track.
@@ -660,5 +723,149 @@ mod tests {
         let hashed = hasher.hash_workspace_files(&inputs, Some(&config)).unwrap();
         let paths: Vec<&str> = hashed.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(paths, vec!["ws:Cargo.lock", "ws:shared/base.json"]);
+    }
+
+    #[test]
+    fn test_hash_files_skips_gitignored_dirs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(tmp.path().join("src/app.js"), "app").unwrap();
+        std::fs::write(tmp.path().join("node_modules/pkg/x.js"), "vendor").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.js".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let before = hasher.hash_files(&inputs, None).unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].0.ends_with("src/app.js") || before[0].0.ends_with("src\\app.js"));
+
+        std::fs::write(tmp.path().join("node_modules/pkg/x.js"), "changed vendor").unwrap();
+        let after = hasher.hash_files(&inputs, None).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_hash_files_honors_ignore_file_and_git_exclude() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "generated/\n").unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "scratch/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("generated")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        std::fs::write(tmp.path().join("src/app.js"), "app").unwrap();
+        std::fs::write(tmp.path().join("generated/out.js"), "generated").unwrap();
+        std::fs::write(tmp.path().join("scratch/note.js"), "scratch").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.js".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let hashes = hasher.hash_files(&inputs, None).unwrap();
+        assert_eq!(
+            hashes.len(),
+            1,
+            "ignored trees must not be hashed: {hashes:?}"
+        );
+        assert!(hashes[0].0.contains("src"));
+    }
+
+    #[test]
+    fn test_hash_files_includes_hidden_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(tmp.path().join("visible.env"), "SECRET=1").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec![],
+            config_files: vec!["**/*.env".to_string(), ".env".to_string()],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let hashes = hasher.hash_files(&inputs, None).unwrap();
+        let paths: Vec<&str> = hashes.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == &".env" || path.ends_with("/.env")),
+            "hidden files must still be hashed when a glob matches: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_hash_files_does_not_follow_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.js"), "outside").unwrap();
+        std::fs::write(tmp.path().join("app.js"), "inside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), tmp.path().join("linked")).unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.js".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let hashes = hasher.hash_files(&inputs, None).unwrap();
+        assert!(
+            hashes.iter().all(|(path, _)| !path.contains("secret.js")),
+            "symlink targets outside the project must not be hashed: {hashes:?}"
+        );
+        assert_eq!(hashes.len(), 1);
+    }
+
+    #[test]
+    fn test_hash_files_skips_excluded_nested_project() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("sub/package.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("sub/a.js"), "nested").unwrap();
+        std::fs::write(tmp.path().join("app.js"), "root").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path())
+            .with_excluded_dirs(vec![tmp.path().join("sub")]);
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.js".to_string(), "sub/*.js".to_string()],
+            config_files: vec!["**/package.json".to_string()],
+            env_vars: vec![],
+            ..Default::default()
+        };
+
+        let unexcluded = CacheHasher::new(tmp.path(), tmp.path())
+            .hash_files(&inputs, None)
+            .unwrap();
+        assert!(
+            unexcluded.iter().any(|(path, _)| path.contains("a.js")),
+            "the glob must match the nested file, or this test proves nothing: {unexcluded:?}"
+        );
+
+        let before = hasher.hash_files(&inputs, None).unwrap();
+        assert!(
+            before.iter().all(|(path, _)| !path.contains("sub")),
+            "nested project files must not be hashed: {before:?}"
+        );
+
+        std::fs::write(tmp.path().join("sub/a.js"), "changed nested").unwrap();
+        let after = hasher.hash_files(&inputs, None).unwrap();
+        assert_eq!(before, after);
     }
 }

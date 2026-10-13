@@ -646,6 +646,7 @@ impl<'a> Executor<'a> {
             };
             // Cache keys and logs see one command per line.
             let command = commands.join("\n");
+            let excluded_dirs = nested_project_roots(project, project_map);
             let input_hash = if self.capture_tests {
                 test_input_hash(
                     target_addr,
@@ -657,6 +658,7 @@ impl<'a> Executor<'a> {
                     plugin_registry,
                     input_hashes,
                     env_snapshot,
+                    &excluded_dirs,
                 )
             } else {
                 None
@@ -677,6 +679,7 @@ impl<'a> Executor<'a> {
                     plugin_registry,
                     computed_hashes,
                     env_snapshot,
+                    &excluded_dirs,
                 ) {
                     if cache_hit {
                         // Cache hit - skip execution
@@ -742,6 +745,7 @@ impl<'a> Executor<'a> {
                     _ => Invocation::plain(command),
                 })
                 .collect();
+            let excluded_dirs_for_rehash = excluded_dirs.clone();
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.cache_dir.clone());
@@ -845,7 +849,8 @@ impl<'a> Executor<'a> {
                                 &workspace_root_path,
                                 &target_name_clone,
                             );
-                            let hasher = CacheHasher::new(&project_root, &workspace_root_path);
+                            let hasher = CacheHasher::new(&project_root, &workspace_root_path)
+                                .with_excluded_dirs(excluded_dirs_for_rehash);
                             let hashes_guard = computed_hashes_clone.lock().unwrap();
                             let dependency_hashes = target_deps
                                 .iter()
@@ -1213,6 +1218,7 @@ fn check_cache(
     plugin_registry: &PluginRegistry,
     computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
     env_snapshot: &HashMap<String, String>,
+    excluded_dirs: &[PathBuf],
 ) -> Option<(bool, String)> {
     // Get user cache config from project's target configuration
     let target = project.targets.get(target_name)?;
@@ -1247,7 +1253,8 @@ fn check_cache(
         .collect::<Option<_>>()?;
 
     // Compute current hash
-    let hasher = CacheHasher::new(&project.root, workspace_root);
+    let hasher =
+        CacheHasher::new(&project.root, workspace_root).with_excluded_dirs(excluded_dirs.to_vec());
     let current_hash = hasher
         .compute_hash(
             &plugin_inputs,
@@ -1307,6 +1314,7 @@ fn test_input_hash(
     plugin_registry: &PluginRegistry,
     input_hashes: &Mutex<HashMap<String, String>>,
     env_snapshot: &HashMap<String, String>,
+    excluded_dirs: &[PathBuf],
 ) -> Option<String> {
     let target = project.targets.get(target_name)?;
     let elsewhere = tests_run_elsewhere(project, target, command, project_map)?;
@@ -1315,6 +1323,7 @@ fn test_input_hash(
             let other_plugin = plugin_registry.find_by_name(&other.plugin_name)?;
             Some(
                 CacheHasher::new(&other.root, workspace_root)
+                    .with_excluded_dirs(nested_project_roots(other, project_map))
                     .compute_hash(
                         &cache_inputs_for(other_plugin, &other.root, workspace_root, "test"),
                         None,
@@ -1351,6 +1360,7 @@ fn test_input_hash(
             .collect::<Option<_>>()?;
         dependencies.extend(elsewhere_hash.as_deref());
         CacheHasher::new(&project.root, workspace_root)
+            .with_excluded_dirs(excluded_dirs.to_vec())
             .compute_hash(
                 &inputs,
                 target.cache.as_ref(),
@@ -1414,6 +1424,29 @@ fn is_default_cacheable_target(target_name: &str) -> bool {
         target_name,
         "deps" | "build" | "test" | "lint" | "format" | "typecheck" | "check"
     )
+}
+
+/// Project roots that live under `project` and must not enter its cache key.
+///
+/// A nested Aster project is hashed on its own. Descending into it from the
+/// parent would put the child's files in both keys, so a child-only change
+/// would miss the parent's cache. The project's own root is not excluded.
+/// Roots are taken from the executor's project map, which under `--no-deps`
+/// contains only the selected projects; an unselected nested project is then
+/// not excluded, which can only cause a cache miss.
+fn nested_project_roots(
+    project: &DiscoveredProject,
+    project_map: &HashMap<String, &DiscoveredProject>,
+) -> Vec<PathBuf> {
+    let parent = project.root.as_path();
+    let mut roots: Vec<PathBuf> = project_map
+        .values()
+        .filter(|other| other.root != parent && other.root.starts_with(parent))
+        .map(|other| other.root.clone())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// One command of a target as it is run.
@@ -2418,12 +2451,46 @@ mod tests {
             &PluginRegistry::with_all_plugins(),
             &Arc::new(Mutex::new(HashMap::new())),
             &HashMap::new(),
+            &[],
         );
 
         assert!(
             result.is_none(),
             "a dependency omitted from the cache key must disable caching"
         );
+    }
+
+    #[test]
+    fn nested_project_roots_lists_only_projects_under_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_root = tmp.path().join("app");
+        let child_root = parent_root.join("packages/ui");
+        let sibling_root = tmp.path().join("other");
+        std::fs::create_dir_all(&child_root).unwrap();
+        std::fs::create_dir_all(&sibling_root).unwrap();
+
+        let mut parent = make_project_with_targets("app", HashMap::new());
+        parent.root = parent_root.clone();
+        parent.relative_path = PathBuf::from("app");
+        let mut child = make_project_with_targets("ui", HashMap::new());
+        child.root = child_root.clone();
+        child.relative_path = PathBuf::from("app/packages/ui");
+        let mut sibling = make_project_with_targets("other", HashMap::new());
+        sibling.root = sibling_root;
+        sibling.relative_path = PathBuf::from("other");
+
+        let projects = [&parent, &child, &sibling];
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|project| (format!("//{}", project.relative_path.display()), *project))
+            .collect();
+
+        assert_eq!(
+            nested_project_roots(&parent, &project_map),
+            vec![child_root]
+        );
+        assert!(nested_project_roots(&child, &project_map).is_empty());
+        assert!(nested_project_roots(&sibling, &project_map).is_empty());
     }
 
     #[test]
