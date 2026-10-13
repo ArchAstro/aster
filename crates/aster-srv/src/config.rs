@@ -1,0 +1,222 @@
+//! Configuration from the environment.
+
+use std::net::SocketAddr;
+
+use anyhow::{bail, Context, Result};
+
+/// GitHub Actions' OIDC token issuer.
+pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// `ASTER_SRV_LISTEN`, default `0.0.0.0:8080`.
+    pub listen: SocketAddr,
+    /// `ASTER_SRV_DATABASE_URL`, a Postgres URL. Required.
+    pub database_url: String,
+    /// `ASTER_SRV_AUDIENCE`: the OIDC audience CI requests tokens for.
+    /// Default `aster-srv`.
+    pub audience: String,
+    /// `ASTER_SRV_ISSUER`, default GitHub Actions.
+    pub issuer: String,
+    /// `ASTER_SRV_REPOSITORIES`: comma-separated `owner/name` or `owner/*`.
+    /// Required; a repository not listed is refused.
+    pub repositories: RepositoryAllowlist,
+    /// `ASTER_SRV_STATIC_TOKENS`: comma-separated `owner/name=token` pairs
+    /// accepted in place of an OIDC token. For local development and tests
+    /// only.
+    pub static_tokens: Vec<StaticToken>,
+    /// `ASTER_SRV_RAW_BUCKET`: a GCS bucket that keeps each upload as sent.
+    /// Unset keeps nothing.
+    pub raw_bucket: Option<String>,
+    /// `ASTER_SRV_RETENTION_DAYS`, default 30.
+    pub retention_days: u32,
+    /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
+    /// or not. Default 64 MiB.
+    pub max_body_bytes: usize,
+}
+
+/// A fixed bearer token standing in for one repository.
+#[derive(Clone)]
+pub struct StaticToken {
+    pub repository: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for StaticToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticToken")
+            .field("repository", &self.repository)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Config {
+    /// Read the configuration through `env`, which looks up one variable.
+    pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let var = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+        let listen = var("ASTER_SRV_LISTEN")
+            .unwrap_or_else(|| "0.0.0.0:8080".to_string())
+            .parse()
+            .context("ASTER_SRV_LISTEN must be host:port")?;
+        let database_url =
+            var("ASTER_SRV_DATABASE_URL").context("ASTER_SRV_DATABASE_URL is required")?;
+        let repositories = RepositoryAllowlist::parse(&var("ASTER_SRV_REPOSITORIES").context(
+            "ASTER_SRV_REPOSITORIES is required: the repositories allowed to upload, \
+                 such as ArchAstro/firstlanding or ArchAstro/*",
+        )?)?;
+        let static_tokens = match var("ASTER_SRV_STATIC_TOKENS") {
+            None => Vec::new(),
+            Some(value) => value
+                .split(',')
+                .map(str::trim)
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (repository, token) = pair
+                        .split_once('=')
+                        .context("ASTER_SRV_STATIC_TOKENS entries are owner/name=token")?;
+                    if token.len() < 16 {
+                        bail!("static tokens must be at least 16 characters");
+                    }
+                    Ok(StaticToken {
+                        repository: repository.trim().to_string(),
+                        token: token.trim().to_string(),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        };
+        let retention_days = match var("ASTER_SRV_RETENTION_DAYS") {
+            Some(days) => days
+                .parse()
+                .ok()
+                .filter(|days| *days > 0)
+                .context("ASTER_SRV_RETENTION_DAYS must be a positive number of days")?,
+            None => 30,
+        };
+        let max_body_bytes = match var("ASTER_SRV_MAX_BODY_BYTES") {
+            Some(bytes) => bytes
+                .parse()
+                .context("ASTER_SRV_MAX_BODY_BYTES must be a number of bytes")?,
+            None => 64 * 1024 * 1024,
+        };
+        Ok(Self {
+            listen,
+            database_url,
+            audience: var("ASTER_SRV_AUDIENCE").unwrap_or_else(|| "aster-srv".to_string()),
+            issuer: var("ASTER_SRV_ISSUER").unwrap_or_else(|| GITHUB_ISSUER.to_string()),
+            repositories,
+            static_tokens,
+            raw_bucket: var("ASTER_SRV_RAW_BUCKET"),
+            retention_days,
+            max_body_bytes,
+        })
+    }
+}
+
+/// Repositories allowed to use the server.
+#[derive(Debug, Clone)]
+pub struct RepositoryAllowlist(Vec<String>);
+
+impl RepositoryAllowlist {
+    pub fn parse(value: &str) -> Result<Self> {
+        let entries: Vec<String> = value
+            .split(',')
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        for entry in &entries {
+            let Some((owner, name)) = entry.split_once('/') else {
+                bail!("repository '{entry}' must be owner/name or owner/*");
+            };
+            if owner.is_empty() || name.is_empty() || owner == "*" || name.contains('/') {
+                bail!("repository '{entry}' must be owner/name or owner/*");
+            }
+        }
+        if entries.is_empty() {
+            bail!("ASTER_SRV_REPOSITORIES lists no repository");
+        }
+        Ok(Self(entries))
+    }
+
+    /// Whether `repository` (`owner/name`, any case) is allowed.
+    pub fn allows(&self, repository: &str) -> bool {
+        let repository = repository.to_ascii_lowercase();
+        let Some((owner, _)) = repository.split_once('/') else {
+            return false;
+        };
+        self.0.iter().any(|entry| {
+            *entry == repository
+                || entry
+                    .strip_suffix("/*")
+                    .is_some_and(|allowed_owner| allowed_owner == owner)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    const REQUIRED: [(&str, &str); 2] = [
+        ("ASTER_SRV_DATABASE_URL", "postgres://localhost/aster"),
+        ("ASTER_SRV_REPOSITORIES", "ArchAstro/*"),
+    ];
+
+    #[test]
+    fn defaults() {
+        let config = Config::from_env(env_of(&REQUIRED)).unwrap();
+        assert_eq!(config.listen.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.audience, "aster-srv");
+        assert_eq!(config.issuer, GITHUB_ISSUER);
+        assert_eq!(config.retention_days, 30);
+        assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
+        assert!(config.static_tokens.is_empty());
+        assert!(config.raw_bucket.is_none());
+    }
+
+    #[test]
+    fn requires_a_database_and_an_allowlist() {
+        let error = Config::from_env(env_of(&REQUIRED[1..])).unwrap_err();
+        assert!(error.to_string().contains("ASTER_SRV_DATABASE_URL"));
+        let error = Config::from_env(env_of(&REQUIRED[..1])).unwrap_err();
+        assert!(error.to_string().contains("ASTER_SRV_REPOSITORIES"));
+    }
+
+    #[test]
+    fn reads_static_tokens_without_printing_them() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push((
+            "ASTER_SRV_STATIC_TOKENS",
+            "ArchAstro/aster=0123456789abcdef0123",
+        ));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(config.static_tokens[0].repository, "ArchAstro/aster");
+        assert!(!format!("{config:?}").contains("0123456789abcdef"));
+
+        pairs.pop();
+        pairs.push(("ASTER_SRV_STATIC_TOKENS", "ArchAstro/aster=short"));
+        assert!(Config::from_env(env_of(&pairs)).is_err());
+    }
+
+    #[test]
+    fn allowlist_matches_names_and_owners_case_insensitively() {
+        let allow = RepositoryAllowlist::parse("ArchAstro/firstlanding, other/*").unwrap();
+        assert!(allow.allows("archastro/FirstLanding"));
+        assert!(allow.allows("Other/anything"));
+        assert!(!allow.allows("ArchAstro/aster"));
+        assert!(!allow.allows("evil/firstlanding"));
+        assert!(!allow.allows("nonsense"));
+        for bad in ["", "*/*", "owner", "a/b/c"] {
+            assert!(RepositoryAllowlist::parse(bad).is_err(), "{bad}");
+        }
+    }
+}

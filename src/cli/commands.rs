@@ -296,6 +296,12 @@ pub enum Commands {
         command: CacheCommands,
     },
 
+    /// Work with recorded test results
+    Results {
+        #[command(subcommand)]
+        command: ResultsCommands,
+    },
+
     /// Watch targets and rerun them when their declared inputs change
     ///
     /// Pass one or more target addresses (//project:target) or bare projects
@@ -454,6 +460,27 @@ pub enum CacheCommands {
     Status {
         /// Specific target to show (e.g., //services/api:test)
         target: Option<String>,
+    },
+}
+
+/// Test results subcommands
+#[derive(Subcommand)]
+pub enum ResultsCommands {
+    /// Send a results file written by `--test-results` to aster-srv
+    ///
+    /// In GitHub Actions the job's OIDC token is used (the job needs
+    /// `permissions: id-token: write`); elsewhere set ASTER_SRV_TOKEN. A
+    /// failed upload is reported but exits 0 unless --strict, so it never
+    /// fails a build.
+    Upload {
+        /// The NDJSON results file
+        path: std::path::PathBuf,
+        /// The aster-srv URL [default: $ASTER_SRV_URL]
+        #[arg(long)]
+        url: Option<String>,
+        /// Exit non-zero when the upload fails
+        #[arg(long)]
+        strict: bool,
     },
 }
 

@@ -17,7 +17,8 @@ use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
     print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
+    ProjectInfo, ResultsCommands, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput,
+    SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -94,6 +95,21 @@ fn run() -> Result<()> {
     // Handle init and daemon lifecycle commands before requiring a workspace.
     if matches!(command, Commands::Init) {
         return handle_init(&cwd, cli.verbose);
+    }
+    if let Commands::Results {
+        command: ResultsCommands::Upload { path, url, strict },
+    } = &command
+    {
+        let url = url.clone().or_else(|| env::var("ASTER_SRV_URL").ok());
+        let Some(url) = url.filter(|u| !u.is_empty()) else {
+            return Err(anyhow::anyhow!("give --url or set ASTER_SRV_URL"));
+        };
+        let uploaded = upload_test_results(&url, path, output_mode);
+        return if uploaded || !strict {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("the test results were not uploaded"))
+        };
     }
     if let Commands::Services {
         command: ServicesCommands::Daemon { command },
@@ -290,6 +306,7 @@ fn run() -> Result<()> {
     let explicit_target = matches!(&command, Commands::RunTarget { .. });
     match command {
         Commands::Init => unreachable!("Init handled above"),
+        Commands::Results { .. } => unreachable!("results handled above"),
         Commands::List { path, lang } => {
             validate_lang_filter(&lang)?;
 
@@ -1635,7 +1652,46 @@ fn write_test_results(
             if tests == 1 { "" } else { "s" },
             path.display()
         ),
-        Err(error) => eprintln!("[aster] Warning: {error:#}"),
+        Err(error) => {
+            eprintln!("[aster] Warning: {error:#}");
+            return;
+        }
+    }
+    if let Some(url) = env::var("ASTER_SRV_URL").ok().filter(|u| !u.is_empty()) {
+        upload_test_results(&url, &path, OutputMode::Normal);
+    }
+}
+
+/// Upload a results file, reporting the outcome on stderr. Returns whether
+/// it was stored.
+fn upload_test_results(url: &str, path: &Path, output_mode: OutputMode) -> bool {
+    use aster::test_results::upload::{upload, Credentials};
+    let Some(credentials) = Credentials::from_env(&|name| env::var(name).ok()) else {
+        eprintln!(
+            "[aster] Warning: test results not uploaded: no credentials. In GitHub Actions \
+             grant `id-token: write`; elsewhere set ASTER_SRV_TOKEN."
+        );
+        return false;
+    };
+    match upload(url, path, &credentials) {
+        Ok(receipt) => {
+            if output_mode != OutputMode::Quiet {
+                eprintln!(
+                    "[aster] Test results uploaded: run {}{}",
+                    receipt.run_id,
+                    if receipt.duplicate {
+                        " (already stored)".to_string()
+                    } else {
+                        format!(" ({} tests)", receipt.tests)
+                    }
+                );
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!("[aster] Warning: test results not uploaded: {error:#}");
+            false
+        }
     }
 }
 

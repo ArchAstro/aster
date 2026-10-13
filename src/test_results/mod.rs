@@ -16,6 +16,7 @@ mod jest;
 mod junit;
 mod libtest;
 mod stream;
+pub mod upload;
 
 pub use context::detect_run;
 pub use stream::{default_path, records, write};

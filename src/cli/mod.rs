@@ -10,8 +10,8 @@ mod skills;
 pub mod source_graph;
 
 pub use commands::{
-    CacheCommands, Cli, Commands, ProjectCommands, ServicesCommands, ServicesDaemonCommands,
-    TlsCommands,
+    CacheCommands, Cli, Commands, ProjectCommands, ResultsCommands, ServicesCommands,
+    ServicesDaemonCommands, TlsCommands,
 };
 pub use output::{
     build_execution_output, output_json, print_summary, ExecutionOutput, ExecutionSummary,

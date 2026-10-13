@@ -43,6 +43,44 @@ jobs:
         run: cargo test --locked --workspace --all-targets --all-features
       - run: scripts/test-dynamic-service-ports
 
+  aster-srv:
+    name: aster-srv
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ASTER_SRV_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - run: cargo test --locked -p aster-srv
+      - name: Image serves health checks
+        run: |
+          set -euo pipefail
+          docker build -f crates/aster-srv/Dockerfile -t aster-srv:ci .
+          docker run -d --name aster-srv --network host \
+            -e ASTER_SRV_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+            -e ASTER_SRV_REPOSITORIES='ArchAstro/*' \
+            -e ASTER_SRV_LISTEN=127.0.0.1:8080 \
+            aster-srv:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/readyz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/readyz
+          curl -fsS http://127.0.0.1:8080/healthz
+          docker logs aster-srv
+
   quality:
     name: Quality
     runs-on: ubuntu-latest
