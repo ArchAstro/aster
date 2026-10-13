@@ -68,6 +68,15 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-go = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "rustls-webpki-roots",
+] }
+base64 = "0.22"
+# Direct so the cache client can pass aws-lc-rs to ureq. ureq's `rustls`
+# feature would also install ring and panic ServerConfig::builder() in
+# src/dev/tls.rs. Keep this on the same rustls major as tokio-rustls.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
