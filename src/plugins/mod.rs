@@ -33,6 +33,9 @@ pub struct CacheInputs {
     /// Specific config/lock files to include (e.g., ["package.json", "package-lock.json"])
     pub config_files: Vec<String>,
     /// Environment variables to track (e.g., ["NODE_ENV", "CI"])
+    ///
+    /// A name ending in `*` is a prefix: every snapshot variable that starts
+    /// with the name without that `*` is hashed, sorted by name.
     pub env_vars: Vec<String>,
 }
 

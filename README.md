@@ -279,6 +279,10 @@ artifacts. The default cacheable target names are `deps`, `build`, `test`,
 `cache.enabled = true`. Set `enabled = false` to opt out.
 
 `include`, `exclude`, and `env` extend a target's detected cache inputs.
+An `env` name ending in `*` matches every variable that starts with the name
+without that `*`, sorted by name. `FOO_*` hashes `FOO_A` and `FOO_B` and
+ignores `BAR`. A name without a trailing `*` is exact. Plugins use the same
+syntax; Gradle tracks `ORG_GRADLE_PROJECT_*`.
 Configured `outputs` must still exist for a cached success to be reused. Clean
 targets invalidate the project's cache after succeeding.
 
