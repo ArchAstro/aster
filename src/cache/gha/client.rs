@@ -72,10 +72,18 @@ impl GhaCacheClient {
 
     /// Build a client from already-read variable values.
     ///
-    /// `None` when either value is missing or empty (including whitespace-only).
+    /// `None` when either value is missing or empty (including whitespace-only),
+    /// or when the results URL is not `https://`: Twirp requests carry the
+    /// runtime token as a bearer header and must not travel in plaintext.
     pub fn from_vars(results_url: Option<&str>, token: Option<&str>) -> Option<Self> {
         let results_url = non_empty(results_url)?;
         let token = non_empty(token)?;
+        if !results_url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            return None;
+        }
         Some(Self::new(results_url, token))
     }
 
@@ -712,6 +720,13 @@ mod tests {
         assert!(GhaCacheClient::from_vars(Some("https://results.local"), None).is_none());
         assert!(GhaCacheClient::from_vars(Some("https://results.local"), Some("")).is_none());
         assert!(GhaCacheClient::from_vars(Some("https://results.local"), Some("token")).is_some());
+        assert!(GhaCacheClient::from_vars(Some("HTTPS://results.local"), Some("token")).is_some());
+    }
+
+    #[test]
+    fn from_vars_rejects_plaintext_results_url() {
+        assert!(GhaCacheClient::from_vars(Some("http://results.local"), Some("token")).is_none());
+        assert!(GhaCacheClient::from_vars(Some("results.local"), Some("token")).is_none());
     }
 
     #[test]
