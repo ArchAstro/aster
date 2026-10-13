@@ -150,6 +150,33 @@ fn http_get(port: u16) -> std::io::Result<String> {
     Ok(response)
 }
 
+/// Static-file HTTP server for service fixtures, listening on 127.0.0.1.
+///
+/// `python3 -m http.server` is not used: `HTTPServer.server_bind` calls
+/// `socket.getfqdn()` after `bind()` and before `listen()`. On macOS CI
+/// runners that reverse lookup can take tens of seconds, so the port refuses
+/// connections long after the service started and readiness waits time out.
+const HTTP_SERVER_FIXTURE: &str = r#"import http.server
+import socketserver
+import sys
+
+
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+Server(("127.0.0.1", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()
+"#;
+
+/// Writes `http_server.py` into `directory`; run it as
+/// `python3 http_server.py {port}` from a target in that directory.
+fn write_http_server_fixture(directory: &Path) {
+    fs::write(directory.join("http_server.py"), HTTP_SERVER_FIXTURE).unwrap();
+}
+
 fn terminate_aster(child: &mut std::process::Child) {
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
@@ -238,6 +265,7 @@ fn dynamic_port_bundles_are_distinct_propagated_and_released() {
     fs::create_dir(root.join("app")).unwrap();
     fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
     fs::write(root.join("service.env"), "DEPENDENT_PORT=wrong\n").unwrap();
+    write_http_server_fixture(&root.join("app"));
     fs::write(
         root.join("aster.toml"),
         format!(
@@ -266,7 +294,7 @@ port_env = {{ DEPENDENT_PORT = "dependent" }}
         root.join("app/aster.toml"),
         r#"
 [targets.dev]
-command = "sh -c 'echo $ASTER_SERVICE_PORT:$DEPENDENT_PORT >> ../events.log; python3 -m http.server {port}'"
+command = "sh -c 'echo $ASTER_SERVICE_PORT:$DEPENDENT_PORT >> ../events.log; python3 http_server.py {port}'"
 stream = true
 "#,
     )
@@ -425,6 +453,7 @@ proxy = {{ target = "//proxy:dev", upstream_port = "platform-upstream", env = {{
         root.join("app/server.py"),
         r#"import http.server
 import os
+import socketserver
 import sys
 
 port = int(sys.argv[1])
@@ -439,7 +468,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # Skip HTTPServer.server_bind: it resolves socket.getfqdn() before
+        # listen(), and that lookup can take tens of seconds on macOS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+server = Server(("127.0.0.1", port), Handler)
 with open("../app-events.log", "a") as events:
     events.write(f"{port}:{os.environ['PORT']}\n")
 server.serve_forever()
@@ -620,6 +657,7 @@ fn ports_reports_static_and_portless_services_from_the_running_instance() {
     fs::create_dir(root.join(".git")).unwrap();
     fs::create_dir(root.join("app")).unwrap();
     fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
     fs::write(
         root.join("aster.toml"),
         format!(
@@ -641,7 +679,7 @@ target = "//app:worker"
         root.join("app/aster.toml"),
         r#"
 [targets.web]
-command = "python3 -m http.server {port}"
+command = "python3 http_server.py {port}"
 stream = true
 
 [targets.worker]
@@ -718,6 +756,7 @@ fn kill_ports_recovers_dynamic_listener_after_supervisor_crash() {
     fs::create_dir(root.join(".git")).unwrap();
     fs::create_dir(root.join("app")).unwrap();
     fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
     fs::write(
         root.join("aster.toml"),
         format!(
@@ -737,7 +776,7 @@ port = "http"
         root.join("app/aster.toml"),
         r#"
 [targets.dev]
-command = "python3 -m http.server {port}"
+command = "python3 http_server.py {port}"
 stream = true
 "#,
     )
@@ -857,6 +896,7 @@ fn dev_supervises_targets_runs_prerequisites_and_restarts_on_dependency_changes(
     fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
     fs::write(root.join("lib/package.json"), r#"{"name":"lib"}"#).unwrap();
     fs::write(root.join("lib/src/input.js"), "first").unwrap();
+    write_http_server_fixture(&root.join("app"));
 
     // Configuration boundary: a service maps to one stream target, and ordinary
     // target dependencies describe both preparation and the watched library.
@@ -892,7 +932,7 @@ command = "sh -c 'count=$(grep -c PREPARE ../events.log 2>/dev/null || true); ec
 depends_on = ["//lib:build"]
 
 [targets.dev]
-command = "sh -c 'echo SERVICE_STDOUT; echo SERVICE_STDERR >&2; if [ -n \"${ASTER_AMBIENT_SECRET:-}\" ]; then echo AMBIENT_SECRET_LEAKED >> ../events.log; fi; echo INHERITED:$ASTER_ALLOWED_VALUE >> ../events.log; echo START:$ASTER_SERVICE_PORT >> ../events.log; python3 -m http.server {port} & server=$!; echo $server > ../child.pid; wait $server'"
+command = "sh -c 'echo SERVICE_STDOUT; echo SERVICE_STDERR >&2; if [ -n \"${ASTER_AMBIENT_SECRET:-}\" ]; then echo AMBIENT_SECRET_LEAKED >> ../events.log; fi; echo INHERITED:$ASTER_ALLOWED_VALUE >> ../events.log; echo START:$ASTER_SERVICE_PORT >> ../events.log; python3 http_server.py {port} & server=$!; echo $server > ../child.pid; wait $server'"
 depends_on = ["//self:prepare"]
 stream = true
 "#,
@@ -1751,6 +1791,7 @@ fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
     fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
     let group_config = group.map_or_else(String::new, |group| {
         format!("[dev.service_groups]\n{group} = {{ services = [\"web\", \"worker\"] }}\n")
     });
@@ -1763,7 +1804,7 @@ fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
     .unwrap();
     fs::write(
         root.join("app/aster.toml"),
-        "[targets.web]\ncommand = \"python3 -m http.server {port}\"\nstream = true\n\n[targets.worker]\ncommand = \"sleep 60\"\nstream = true\n",
+        "[targets.web]\ncommand = \"python3 http_server.py {port}\"\nstream = true\n\n[targets.worker]\ncommand = \"sleep 60\"\nstream = true\n",
     )
     .unwrap();
 }
