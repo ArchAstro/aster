@@ -80,6 +80,9 @@ pub struct AliasTargetConfig {
 }
 
 /// Target configuration - supports simple command string, alias, and rich format
+// Parsed config, not a hot value. `workspace_include` pushed `Rich` over
+// clippy's size threshold; boxing it would touch every match.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TargetConfig {
@@ -108,6 +111,11 @@ pub struct CacheConfig {
     /// Additional files/globs to include in cache key
     #[serde(default)]
     pub include: Vec<String>,
+    /// Additional files/globs, relative to the workspace root, to include
+    /// in the cache key. A root `Cargo.lock` or `tsconfig.base.json` lives
+    /// outside a member project, so `include` cannot name it.
+    #[serde(default)]
+    pub workspace_include: Vec<String>,
     /// Files/globs to exclude from cache key
     #[serde(default)]
     pub exclude: Vec<String>,
@@ -371,7 +379,12 @@ pub(super) fn validate_aster_config(
         }
 
         if let Some(cache) = &target.cache {
-            for pattern in cache.include.iter().chain(&cache.exclude) {
+            for pattern in cache
+                .include
+                .iter()
+                .chain(&cache.exclude)
+                .chain(&cache.workspace_include)
+            {
                 Glob::new(pattern).with_context(|| {
                     format!(
                         "Invalid cache glob '{pattern}' for target '{target_name}' in {}",

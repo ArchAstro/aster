@@ -289,6 +289,7 @@ impl LanguagePlugin for GradlePlugin {
                 "ORG_GRADLE_PROJECT_*".to_string(),
                 "CI".to_string(),
             ],
+            ..Default::default()
         };
         if target_name != "deps" {
             inputs.source_globs = vec![

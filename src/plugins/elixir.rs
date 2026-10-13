@@ -219,6 +219,7 @@ impl LanguagePlugin for ElixirPlugin {
                 source_globs: vec![],
                 config_files: vec!["mix.exs".to_string(), "mix.lock".to_string()],
                 env_vars: vec!["MIX_ENV".to_string()],
+                ..Default::default()
             };
         }
 
@@ -230,6 +231,7 @@ impl LanguagePlugin for ElixirPlugin {
                 "config/*.exs".to_string(),
             ],
             env_vars: vec!["MIX_ENV".to_string(), "CI".to_string()],
+            ..Default::default()
         };
 
         if target_name == "test" {

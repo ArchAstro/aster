@@ -3783,3 +3783,76 @@ fn test_cache_dir_flag_overrides_env() {
     let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
     assert!(parsed["targets"]["//app:build"].is_object());
 }
+
+/// A Cargo workspace member's cache key includes the root Cargo.lock, so
+/// editing that file changes both members' stored hashes.
+#[test]
+fn cargo_workspace_root_lockfile_invalidates_member_cache_keys() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(
+        &tmp,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/one\", \"crates/two\"]\n",
+    );
+    write_fixture(&tmp, "Cargo.lock", "# lock v1\n");
+    for name in ["one", "two"] {
+        write_fixture(
+            &tmp,
+            &format!("crates/{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        write_fixture(
+            &tmp,
+            &format!("crates/{name}/src/lib.rs"),
+            "pub fn ready() {}",
+        );
+        write_fixture(
+            &tmp,
+            &format!("crates/{name}/aster.toml"),
+            "[targets.stamp]\ncommand = \"true\"\ndepends_on = []\ncache.enabled = true\n",
+        );
+    }
+
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "aster {args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    run(&["stamp", "--all"]);
+    let hash = |address: &str| {
+        let output = run(&["--json", "cache", "status", address]);
+        let entry: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cache status json");
+        entry["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing hash for {address}: {entry}"))
+            .to_string()
+    };
+    let one = hash("//crates/one:stamp");
+    let two = hash("//crates/two:stamp");
+
+    write_fixture(&tmp, "Cargo.lock", "# lock v2\n");
+    run(&["stamp", "--all"]);
+    let one_after = hash("//crates/one:stamp");
+    let two_after = hash("//crates/two:stamp");
+
+    assert_ne!(
+        one, one_after,
+        "root Cargo.lock must change //crates/one:stamp"
+    );
+    assert_ne!(
+        two, two_after,
+        "root Cargo.lock must change //crates/two:stamp"
+    );
+}

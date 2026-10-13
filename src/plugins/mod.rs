@@ -32,6 +32,13 @@ pub struct CacheInputs {
     pub source_globs: Vec<String>,
     /// Specific config/lock files to include (e.g., ["package.json", "package-lock.json"])
     pub config_files: Vec<String>,
+    /// Files outside the project, relative to the workspace root.
+    ///
+    /// A Rust member's key includes the workspace `Cargo.lock`; a nested
+    /// Node project includes the root lockfile. Patterns may be literals
+    /// or globs. They are hashed with a `ws:` prefix so `Cargo.lock` here
+    /// cannot collide with the member's own `Cargo.lock`.
+    pub workspace_files: Vec<String>,
     /// Environment variables to track (e.g., ["NODE_ENV", "CI"])
     ///
     /// A name ending in `*` is a prefix: every snapshot variable that starts
@@ -299,6 +306,26 @@ pub trait LanguagePlugin: Send + Sync {
     fn cache_inputs(&self, _target_name: &str) -> CacheInputs {
         // Default: empty inputs (no caching without plugin support)
         CacheInputs::default()
+    }
+
+    /// Workspace-root files that belong in this project's cache key.
+    ///
+    /// `cache_inputs` has no project path, so it cannot tell a workspace
+    /// member from a standalone project. Plugins that share a root lockfile
+    /// or config override this and return workspace-relative patterns.
+    /// The default is none: a project that is its own workspace root must
+    /// not hash `Cargo.lock` a second time under the `ws:` prefix.
+    ///
+    /// - project_root: the project directory
+    /// - workspace_root: the Aster workspace root
+    /// - target_name: name of the target (e.g., "test", "deps")
+    fn workspace_cache_inputs(
+        &self,
+        _project_root: &Path,
+        _workspace_root: &Path,
+        _target_name: &str,
+    ) -> Vec<String> {
+        Vec::new()
     }
 
     /// Plan how to capture per-test results from one of a target's commands.

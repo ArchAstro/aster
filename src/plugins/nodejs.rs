@@ -540,6 +540,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     "pnpm-lock.yaml".to_string(),
                 ],
                 env_vars: vec!["NODE_ENV".to_string()],
+                ..Default::default()
             };
         }
 
@@ -560,6 +561,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 "tsconfig.json".to_string(),
             ],
             env_vars: vec!["NODE_ENV".to_string(), "CI".to_string()],
+            ..Default::default()
         };
 
         // Add test files for test target
@@ -573,6 +575,30 @@ impl LanguagePlugin for NodeJsPlugin {
         }
 
         inputs
+    }
+
+    fn workspace_cache_inputs(
+        &self,
+        project_root: &Path,
+        workspace_root: &Path,
+        target_name: &str,
+    ) -> Vec<String> {
+        if project_root == workspace_root {
+            return Vec::new();
+        }
+        // Only files that exist. A missing lockfile is not an input, and a
+        // package that is merely nested under another tree should not grow
+        // a key entry for a lockfile it does not have.
+        let mut files = Vec::new();
+        for name in ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] {
+            if workspace_root.join(name).is_file() {
+                files.push(name.to_string());
+            }
+        }
+        if target_name != "deps" && workspace_root.join("tsconfig.base.json").is_file() {
+            files.push("tsconfig.base.json".to_string());
+        }
+        files
     }
 
     fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
@@ -2393,5 +2419,34 @@ mod tests {
         std::fs::write(tmp.path().join("app.gemspec"), "s.name = 'app'\n").unwrap();
 
         assert!(NodeJsPlugin.should_skip(&package));
+    }
+
+    #[test]
+    fn nested_project_cache_inputs_include_root_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("tsconfig.base.json"), "{}\n").unwrap();
+        let nested = tmp.path().join("packages/app");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let plugin = NodeJsPlugin;
+        assert_eq!(
+            plugin.workspace_cache_inputs(&nested, tmp.path(), "build"),
+            vec![
+                "pnpm-lock.yaml".to_string(),
+                "tsconfig.base.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            plugin.workspace_cache_inputs(&nested, tmp.path(), "deps"),
+            vec!["pnpm-lock.yaml".to_string()]
+        );
+        assert!(plugin
+            .workspace_cache_inputs(tmp.path(), tmp.path(), "build")
+            .is_empty());
     }
 }

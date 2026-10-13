@@ -260,6 +260,7 @@ impl LanguagePlugin for GoPlugin {
                 source_globs: vec![],
                 config_files: vec!["go.mod".to_string(), "go.sum".to_string()],
                 env_vars: vec!["GOOS".to_string(), "GOARCH".to_string()],
+                ..Default::default()
             };
         }
 
@@ -273,6 +274,7 @@ impl LanguagePlugin for GoPlugin {
                 "CGO_ENABLED".to_string(),
                 "CI".to_string(),
             ],
+            ..Default::default()
         }
     }
 

@@ -283,6 +283,18 @@ An `env` name ending in `*` matches every variable that starts with the name
 without that `*`, sorted by name. `FOO_*` hashes `FOO_A` and `FOO_B` and
 ignores `BAR`. A name without a trailing `*` is exact. Plugins use the same
 syntax; Gradle tracks `ORG_GRADLE_PROJECT_*`.
+
+`workspace_include` extends the inputs with files outside the project, relative to
+the workspace root, so a member can name a root `Cargo.lock` or
+`tsconfig.base.json` that `include` cannot see. Those paths are hashed with a
+`ws:` prefix and do not collide with a file of the same name in the project.
+
+A Cargo workspace member also hashes the workspace-root `Cargo.toml` and
+`Cargo.lock`, plus `rust-toolchain.toml` and `.cargo/config.toml` for targets
+other than `deps`. A nested Node project hashes a root `package-lock.json`,
+`pnpm-lock.yaml`, or `yarn.lock` when that file exists, and `tsconfig.base.json`
+for targets other than `deps`.
+
 Configured `outputs` must still exist for a cached success to be reused. Clean
 targets invalidate the project's cache after succeeding.
 
