@@ -651,10 +651,21 @@ fn serve_http(listener: TcpListener, label: &'static str) -> thread::JoinHandle<
     })
 }
 
+/// A client config builder with the provider named, since a workspace build
+/// can compile rustls with more than one.
+fn client_config_builder(
+) -> tokio_rustls::rustls::ConfigBuilder<ClientConfig, tokio_rustls::rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+}
+
 fn assert_tls_upgrade_echo(port: u16, host: &str, cert: Vec<u8>) {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(cert)).unwrap();
-    let config = ClientConfig::builder()
+    let config = client_config_builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connection = ClientConnection::new(
@@ -694,7 +705,7 @@ fn https_get(port: u16, sni: &str, host: &str, cert: CertificateDer<'static>) ->
 fn assert_tls_handshake_rejected(port: u16, sni: &str, cert: Vec<u8>) {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(cert)).unwrap();
-    let config = ClientConfig::builder()
+    let config = client_config_builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connection = ClientConnection::new(
@@ -721,7 +732,7 @@ fn https_get_with_roots(
     for cert in certs {
         roots.add(cert).unwrap();
     }
-    let config = ClientConfig::builder()
+    let config = client_config_builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connection = ClientConnection::new(

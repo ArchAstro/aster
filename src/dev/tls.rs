@@ -377,9 +377,15 @@ fn load_server_config(
         mkcert: std::env::var_os("ASTER_MKCERT_BIN").unwrap_or_else(|| "mkcert".into()),
         cache: Mutex::new(HashMap::new()),
     };
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+    // Name the provider: a workspace build can compile rustls with more
+    // than one, and then it has no default.
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("cannot configure TLS")?
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }

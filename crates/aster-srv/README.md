@@ -39,7 +39,7 @@ repository can upload only its own results.
 
 | Variable | Default | |
 |---|---|---|
-| `ASTER_SRV_DATABASE_URL` | required | Postgres URL. Connections are plain TCP; in GKE run the Cloud SQL Auth Proxy beside the server. |
+| `ASTER_SRV_DATABASE_URL` | required | Postgres URL. Its `sslmode` decides TLS: `disable`, `prefer` (default) or `require`. As with libpq's `require`, the connection is encrypted but the server certificate is not verified, which suits Cloud SQL's private IP. |
 | `ASTER_SRV_REPOSITORIES` | required | Comma-separated `owner/name` or `owner/*`. |
 | `ASTER_SRV_LISTEN` | `0.0.0.0:8080` | |
 | `ASTER_SRV_AUDIENCE` | `aster-srv` | The OIDC audience. |
@@ -68,4 +68,6 @@ ASTER_SRV_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
   cargo test -p aster-srv
 ```
 
-Without `ASTER_SRV_TEST_DATABASE_URL` the database tests skip.
+Without `ASTER_SRV_TEST_DATABASE_URL` the database tests skip. Set
+`ASTER_SRV_TEST_TLS_DATABASE_URL` to a TLS-enabled Postgres URL with
+`sslmode=require` to also check that connections are encrypted.

@@ -15,6 +15,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
+    // Name the process's TLS provider: rustls is built with more than one.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = Config::from_env(|name| std::env::var(name).ok())?;
     if !config.static_tokens.is_empty() {
         log::warn(
