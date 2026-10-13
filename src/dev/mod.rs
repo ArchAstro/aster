@@ -13,6 +13,8 @@ mod service_report;
 mod session;
 mod tls;
 
+#[doc(hidden)]
+pub use daemon::read_accepted_line;
 pub use daemon::{
     attach_bundle, launch_bundle, list_workspace_bundles, ping_daemon, stop_all_bundles,
     stop_workspace_bundles, BundleDescriptor, BundleState, DaemonError, DaemonErrorCode,

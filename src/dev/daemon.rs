@@ -227,7 +227,7 @@ mod platform {
     use fs2::FileExt;
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions};
-    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::io::{BufReader, Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -819,22 +819,23 @@ mod platform {
             .set_nonblocking(false)
             .map_err(internal("failed to configure daemon connection"))?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let mut line = String::new();
-        if let Err(error) = BufReader::new(
+        let mut reader = BufReader::new(
             stream
                 .try_clone()
                 .map_err(internal("failed to read daemon request"))?,
-        )
-        .read_line(&mut line)
-        {
-            return write_error(
-                &mut stream,
-                daemon_error(
-                    DaemonErrorCode::InvalidRequest,
-                    format!("failed to read request: {error}"),
-                ),
-            );
-        }
+        );
+        let line = match read_request_line(&mut reader) {
+            Ok(line) => line,
+            Err(error) => {
+                return write_error(
+                    &mut stream,
+                    daemon_error(
+                        DaemonErrorCode::InvalidRequest,
+                        format!("failed to read request: {error}"),
+                    ),
+                )
+            }
+        };
         let request: WireRequest = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(error) => {
@@ -1335,6 +1336,34 @@ mod platform {
     }
     fn internal(context: &'static str) -> impl FnOnce(std::io::Error) -> DaemonError {
         move |error| daemon_error(DaemonErrorCode::Internal, format!("{context}: {error}"))
+    }
+}
+
+fn read_request_line(reader: &mut impl std::io::BufRead) -> std::io::Result<String> {
+    read_accepted_line(reader, "daemon request ended before a newline")
+}
+
+/// Reads one line from an accepted socket.
+///
+/// `Interrupted` is a signal during the read and is not a client protocol
+/// error. `WouldBlock` is returned to the caller: on Rust 1.88 a blocking
+/// socket's receive timeout is reported as `WouldBlock`, so retrying it would
+/// pin the daemon thread.
+#[doc(hidden)]
+pub fn read_accepted_line(
+    reader: &mut impl std::io::BufRead,
+    eof: &str,
+) -> std::io::Result<String> {
+    let mut line = String::new();
+    loop {
+        match reader.read_line(&mut line) {
+            Ok(0) if line.is_empty() => {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, eof))
+            }
+            Ok(_) => return Ok(line),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 

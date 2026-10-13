@@ -1429,16 +1429,14 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
                 executable,
                 environment: std::env::vars().collect(),
             })
-            .unwrap()
         })
     };
 
-    std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", &runtime_dir);
-    std::env::set_var("ASTER_PORT_LEASE_DIR", &lease_dir);
+    let _env = DaemonEnvGuard::set(&runtime_dir, &lease_dir);
     let first = launch();
     let second = launch();
-    let first = first.join().unwrap();
-    let second = second.join().unwrap();
+    let first = first.join().unwrap().unwrap();
+    let second = second.join().unwrap().unwrap();
     assert_eq!(first.bundle.supervisor_pid, second.bundle.supervisor_pid);
     assert_eq!(first.bundle.services, vec!["worker"]);
     assert_ne!(first.status, second.status);
@@ -1460,8 +1458,124 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
             && !process_is_running(daemon_pid as i32)
             && !process_is_running(first.bundle.supervisor_pid as i32)
     });
-    std::env::remove_var("ASTER_DAEMON_RUNTIME_DIR");
-    std::env::remove_var("ASTER_PORT_LEASE_DIR");
+
+    let occupied_root = root.join("occupied");
+    let occupied_port = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = occupied_port.local_addr().unwrap().port();
+    write_daemon_workspace(&occupied_root, port, None);
+    let occupied = thread::spawn(move || {
+        aster::dev::launch_bundle(aster::dev::LaunchOptions {
+            workspace: occupied_root,
+            group: None,
+            watch: false,
+            use_cache: true,
+            proxy: false,
+            executable,
+            environment: std::env::vars().collect(),
+        })
+    })
+    .join()
+    .unwrap();
+    let occupied = occupied.expect_err("occupied fixture port must fail the launch");
+    assert_eq!(occupied.code, aster::dev::DaemonErrorCode::StartupFailed);
+    let diagnostics = occupied.diagnostics.as_deref().unwrap_or_default();
+    assert!(
+        diagnostics.contains("already allocated or listening")
+            && diagnostics.contains(&port.to_string()),
+        "{occupied:?}"
+    );
+    assert!(occupied_port.local_addr().is_ok());
+    drop(occupied_port);
+
+    let (mut client, mut accepted) = std::os::unix::net::UnixStream::pair().unwrap();
+    accepted.set_nonblocking(false).unwrap();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        client
+            .write_all(b"{\"version\":1,\"operation\":\"ping\"}\n")
+            .unwrap();
+    });
+    let line = aster::dev::read_accepted_line(
+        &mut BufReader::new(InterruptedAcceptedSocket::new(&mut accepted)),
+        "accepted socket closed",
+    )
+    .unwrap();
+    assert!(line.contains("ping"), "{line}");
+
+    let (mut blocked_client, mut blocked) = std::os::unix::net::UnixStream::pair().unwrap();
+    blocked.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        blocked_client.write_all(b"ping\n").unwrap();
+    });
+    let blocked_read =
+        aster::dev::read_accepted_line(&mut BufReader::new(&mut blocked), "accepted socket closed");
+    assert_eq!(
+        blocked_read.unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        std::env::var_os("ASTER_DAEMON_RUNTIME_DIR").as_deref() == Some(runtime_dir.as_os_str())
+    );
+    assert!(std::env::var_os("ASTER_PORT_LEASE_DIR").as_deref() == Some(lease_dir.as_os_str()));
+}
+
+struct DaemonEnvGuard {
+    runtime: Option<std::ffi::OsString>,
+    lease: Option<std::ffi::OsString>,
+}
+
+impl DaemonEnvGuard {
+    fn set(runtime_dir: &Path, lease_dir: &Path) -> Self {
+        let guard = Self {
+            runtime: std::env::var_os("ASTER_DAEMON_RUNTIME_DIR"),
+            lease: std::env::var_os("ASTER_PORT_LEASE_DIR"),
+        };
+        std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", runtime_dir);
+        std::env::set_var("ASTER_PORT_LEASE_DIR", lease_dir);
+        guard
+    }
+}
+
+impl Drop for DaemonEnvGuard {
+    fn drop(&mut self) {
+        restore_env("ASTER_DAEMON_RUNTIME_DIR", self.runtime.take());
+        restore_env("ASTER_PORT_LEASE_DIR", self.lease.take());
+    }
+}
+
+fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {
+    match previous {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
+}
+
+struct InterruptedAcceptedSocket<'a> {
+    inner: &'a mut std::os::unix::net::UnixStream,
+    interrupted: bool,
+}
+
+impl<'a> InterruptedAcceptedSocket<'a> {
+    fn new(inner: &'a mut std::os::unix::net::UnixStream) -> Self {
+        Self {
+            inner,
+            interrupted: false,
+        }
+    }
+}
+
+impl Read for InterruptedAcceptedSocket<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "accepted socket interrupted",
+            ));
+        }
+        self.inner.read(buffer)
+    }
 }
 
 struct DaemonCliGuard {
