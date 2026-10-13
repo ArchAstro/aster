@@ -69,6 +69,19 @@ fn run() -> Result<()> {
     if cli.skills {
         return print_skills();
     }
+    // `--cache-dir` wins over a pre-existing ASTER_CACHE_DIR. Export it before
+    // any thread or child process starts so daemon children share one source
+    // of truth. A relative flag is made absolute against cwd.
+    if let Some(cache_dir) = cli.cache_dir.as_ref() {
+        let absolute = if cache_dir.is_absolute() {
+            cache_dir.clone()
+        } else {
+            env::current_dir()
+                .context("Failed to get current directory")?
+                .join(cache_dir)
+        };
+        env::set_var(aster::cache::CACHE_DIR_ENV, absolute);
+    }
     let command = cli
         .command
         .take()
@@ -1246,10 +1259,10 @@ fn run() -> Result<()> {
             handle_project_command(command, &workspace_root, &projects, output_mode)?;
         }
         Commands::Cache { command } => {
-            use aster::cache::CacheStore;
+            use aster::cache::{resolve_cache_dir, CacheStore};
             use aster::cli::CacheCommands;
 
-            let cache_store = CacheStore::new(&workspace_root);
+            let cache_store = CacheStore::new(&resolve_cache_dir(&workspace_root));
 
             match command {
                 CacheCommands::Clear { target } => {
@@ -1288,18 +1301,21 @@ fn run() -> Result<()> {
                         // Show all
                         if output_mode == OutputMode::Json {
                             output_json(&state)?;
-                        } else if state.targets.is_empty() {
-                            println!("No cached targets");
                         } else {
-                            println!("Cached targets ({}):", state.targets.len());
-                            let mut addrs: Vec<_> = state.targets.keys().collect();
-                            addrs.sort();
-                            for addr in addrs {
-                                let entry = &state.targets[addr];
-                                let hash_display =
-                                    &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
-                                let time_display = format_relative_time(&entry.timestamp);
-                                println!("  {addr}: {hash_display} ({time_display})");
+                            println!("Cache dir: {}", cache_store.cache_dir().display());
+                            if state.targets.is_empty() {
+                                println!("No cached targets");
+                            } else {
+                                println!("Cached targets ({}):", state.targets.len());
+                                let mut addrs: Vec<_> = state.targets.keys().collect();
+                                addrs.sort();
+                                for addr in addrs {
+                                    let entry = &state.targets[addr];
+                                    let hash_display = &entry.hash
+                                        [..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
+                                    let time_display = format_relative_time(&entry.timestamp);
+                                    println!("  {addr}: {hash_display} ({time_display})");
+                                }
                             }
                         }
                     }

@@ -3647,3 +3647,139 @@ fn test_only_affected_files_runs_rust_tests_related_to_the_change() {
         );
     }
 }
+
+fn cacheable_app(tmp: &TempDir) {
+    setup_workspace(tmp);
+    write_package_json(tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+cache = { enabled = true, include = ["package.json"] }
+"#,
+    );
+}
+
+#[test]
+fn test_aster_cache_dir_env_stores_cache_outside_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    cacheable_app(&tmp);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_CACHE_DIR", outside.path())
+        .args(["build", "//app", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let outside_cache = fs::read_to_string(outside.path().join("cache.json")).unwrap();
+    assert!(
+        outside_cache.contains("//app:build"),
+        "expected cache entry outside the workspace: {outside_cache}"
+    );
+    assert!(
+        !tmp.path().join(".aster/cache/cache.json").exists(),
+        "env override must not write .aster/cache/cache.json"
+    );
+    assert!(
+        !tmp.path().join(".aster/cache.json").exists(),
+        "env override must not write the legacy .aster/cache.json"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_CACHE_DIR", outside.path())
+        .args(["cache", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success(),
+        "cache status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("Cache dir: {}", outside.path().display())),
+        "status should print the resolved dir: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_dir_flag_overrides_env() {
+    let tmp = TempDir::new().unwrap();
+    let from_env = TempDir::new().unwrap();
+    let from_flag = TempDir::new().unwrap();
+    cacheable_app(&tmp);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_CACHE_DIR", from_env.path())
+        .args([
+            "--cache-dir",
+            from_flag.path().to_str().unwrap(),
+            "build",
+            "//app",
+            "--no-deps",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let flag_cache = fs::read_to_string(from_flag.path().join("cache.json")).unwrap();
+    assert!(
+        flag_cache.contains("//app:build"),
+        "flag dir should hold the entry: {flag_cache}"
+    );
+    assert!(
+        !from_env.path().join("cache.json").exists(),
+        "--cache-dir must override ASTER_CACHE_DIR"
+    );
+    assert!(!tmp.path().join(".aster/cache/cache.json").exists());
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--cache-dir",
+            from_flag.path().to_str().unwrap(),
+            "cache",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains(&format!("Cache dir: {}", from_flag.path().display())),
+        "status should print the flag dir: {stdout}"
+    );
+
+    let json_status = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "--cache-dir",
+            from_flag.path().to_str().unwrap(),
+            "cache",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    let json_stdout = String::from_utf8_lossy(&json_status.stdout);
+    assert!(
+        !json_stdout.contains("Cache dir:"),
+        "JSON status must stay unchanged: {json_stdout}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
+    assert!(parsed["targets"]["//app:build"].is_object());
+}
