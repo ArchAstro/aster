@@ -143,14 +143,14 @@
       <span class="pill">aster ≥ 0.18</span>
     </div>
     <h1>Aster Test Tracking</h1>
-    <p class="lede">Aster records every test it runs in CI, one record per test per attempt. It uploads those records to <code>aster-results</code>, a service in this repo deployed on our GKE cluster. The service finds flaky tests, and Aster uses its quarantine list to stop known flakes from failing the build.</p>
+    <p class="lede">Aster records every test it runs in CI, one record per test per attempt. It uploads those records to <code>aster-srv</code>, a service in this repo deployed on our GKE cluster. The service finds flaky tests, and Aster uses its quarantine list to stop known flakes from failing the build.</p>
   </header>
 
   <section>
     <span class="label">Decisions</span>
     <div class="decisions">
       <div><b>CI first</b><span>Built for GitHub Actions runs. Local history is not in scope.</span></div>
-      <div><b>Service lives in aster</b><span>A Cargo workspace member at <code>crates/aster-results</code>. Its image is published to GHCR, and it is deployed from firstlanding's Pulumi.</span></div>
+      <div><b>Service lives in aster</b><span>A Cargo workspace member at <code>crates/aster-srv</code>. Its image is published to GHCR, and it is deployed from firstlanding's Pulumi.</span></div>
       <div><b>Quarantine passes the build</b><span>A target whose only failures are quarantined tests reports <code>passed</code>, with a warning. Quarantined tests still run and still upload.</span></div>
       <div><b>30-day retention</b><span>Run, target and test rows, plus the raw NDJSON in GCS, are dropped after 30 days. Only each test's current state is kept beyond that.</span></div>
     </div>
@@ -168,7 +168,7 @@
 
   <section>
     <span class="label">Architecture</span>
-    <div class="diagram" role="img" aria-label="Aster on a CI runner captures test results, writes NDJSON, and uploads with a GitHub OIDC token to the aster-results service on GKE, which stores data in Postgres and GCS and returns a quarantine list to Aster.">
+    <div class="diagram" role="img" aria-label="Aster on a CI runner captures test results, writes NDJSON, and uploads with a GitHub OIDC token to the aster-srv service on GKE, which stores data in Postgres and GCS and returns a quarantine list to Aster.">
       <svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0L10 5L0 10z"/></marker>
@@ -192,9 +192,9 @@
         <text x="46" y="289" class="title">quarantine applied to exit status</text>
 
         <rect class="zone" x="510" y="10" width="380" height="310" rx="10"/>
-        <text x="526" y="34" class="muted">GKE · aster-results</text>
+        <text x="526" y="34" class="muted">GKE · aster-srv</text>
         <rect class="box" x="530" y="50" width="340" height="76" rx="6"/>
-        <text x="546" y="72" class="title">POST /v1/runs</text>
+        <text x="546" y="72" class="title">POST /v1/test-results/runs</text>
         <text x="546" y="90" class="muted">verify GitHub OIDC, repo allowlist</text>
         <text x="546" y="108" class="muted">gzip NDJSON, idempotent by run_id</text>
         <rect class="box" x="530" y="140" width="160" height="56" rx="6"/>
@@ -301,14 +301,14 @@
       <table>
         <thead><tr><th>Area</th><th>Choice</th></tr></thead>
         <tbody>
-          <tr><td>Code</td><td><code>crates/aster-results</code> in a Cargo workspace. Shared types in <code>crates/aster-results-model</code>, which the CLI also uses. Built on hyper and tokio (already dependencies) plus <code>tokio-postgres</code>.</td></tr>
-          <tr><td>Auth (writes)</td><td>GitHub Actions OIDC token, audience <code>aster-results</code>, verified against GitHub's JWKS, with an allowlist on <code>repository</code>.</td></tr>
-          <tr><td>Auth (reads)</td><td><code>/v1/quarantine</code> uses the same OIDC token. Dashboard and query routes sit behind internal ingress / IAP.</td></tr>
+          <tr><td>Code</td><td><code>crates/aster-srv</code> in a Cargo workspace: one Aster server with test results as its first feature, under <code>/v1/test-results/…</code> and the <code>test_results</code> Postgres schema, so later features such as a shared build cache sit beside it. Shared types in <code>crates/aster-results-model</code>, which the CLI also uses. Built on hyper and tokio (already dependencies) plus <code>tokio-postgres</code>.</td></tr>
+          <tr><td>Auth (writes)</td><td>GitHub Actions OIDC token, audience <code>aster-srv</code>, verified against GitHub's JWKS, with an allowlist on <code>repository</code>.</td></tr>
+          <tr><td>Auth (reads)</td><td><code>/v1/test-results/quarantine</code> uses the same OIDC token. Dashboard and query routes sit behind internal ingress / IAP.</td></tr>
           <tr><td>Tables</td><td><code>runs</code>, <code>target_runs</code>, <code>test_results</code> (each partitioned by day), <code>tests</code> (current state: first/last seen, score, quarantine), <code>failure_clusters</code>.</td></tr>
           <tr><td>Retention</td><td>A daily job drops partitions older than 30 days. A GCS lifecycle rule deletes raw objects at 30 days. <code>tests</code> rows not seen for 30 days are deleted.</td></tr>
-          <tr><td>Deploy</td><td>Image <code>ghcr.io/archastro/aster-results</code> from this repo's release workflow. Pulumi stack in <code>firstlanding/infra/services/aster-results</code>: Deployment, Cloud SQL, bucket, Workload Identity.</td></tr>
+          <tr><td>Deploy</td><td>Image <code>ghcr.io/archastro/aster-srv</code> from this repo's release workflow. Pulumi stack in <code>firstlanding/infra/services/aster-srv</code>: Deployment, Cloud SQL, bucket, Workload Identity.</td></tr>
           <tr><td>Notifications</td><td>Configured webhook endpoints, each with its own subscribed event types: <code>test.quarantined</code>, <code>test.released</code>, <code>test.expired</code>, <code>test.broken</code>. The JSON payload is signed with HMAC-SHA256 (<code>X-Aster-Signature</code>) and retried with backoff. Slack, issue trackers and other receivers live outside the service.</td></tr>
-          <tr><td>Routes</td><td><code>POST /v1/runs</code> · <code>GET /v1/quarantine?repo=</code> · <code>GET /v1/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/tests/:id</code> · <code>GET /v1/runs/:run_id/failures</code> · <code>/healthz</code></td></tr>
+          <tr><td>Routes</td><td><code>POST /v1/test-results/runs</code> · <code>GET /v1/test-results/quarantine?repo=</code> · <code>GET /v1/test-results/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/test-results/tests/:id</code> · <code>GET /v1/test-results/runs/:run_id/failures</code> · <code>/healthz</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -387,27 +387,27 @@
       acc: ["aster --json output includes a per-target test summary", "input_hash present when run with --no-cache", "Leaves LogStore/latest.json behavior unchanged"],
       files: ["src/executor/runner.rs", "src/cli/output.rs", "src/test_results/context.rs"], deps: ["T01", "T02"] },
     { id: "T09", p: "P1", area: "client", title: "aster results upload", sub: "Best effort, GitHub OIDC",
-      obj: "Uploads automatically when ASTER_RESULTS_URL is set, and also as a separate command for an if: always() step. Gzip, 10s timeout, 2 retries. Fetches the OIDC token from ACTIONS_ID_TOKEN_REQUEST_*.",
+      obj: "Uploads automatically when ASTER_SRV_URL is set, and also as a separate command for an if: always() step. Gzip, 10s timeout, 2 retries. Fetches the OIDC token from ACTIONS_ID_TOKEN_REQUEST_*.",
       acc: ["Exit code is 0 on any upload failure unless --strict", "Idempotent: the same run_id uploaded twice causes no duplicates", "Prints a run URL on success"],
       files: ["src/cli/results.rs", "src/test_results/upload.rs"], deps: ["T08", "T10"] },
-    { id: "T10", p: "P1", area: "service", title: "aster-results service skeleton + ingest", sub: "hyper, tokio-postgres, migrations",
-      obj: "POST /v1/runs with OIDC verification (JWKS cache) and the repo allowlist. Streams NDJSON into day-partitioned tables. Raw body to GCS. /healthz.",
+    { id: "T10", p: "P1", area: "service", title: "aster-srv service skeleton + ingest", sub: "hyper, tokio-postgres, migrations",
+      obj: "POST /v1/test-results/runs with OIDC verification (JWKS cache) and the repo allowlist. Streams NDJSON into day-partitioned tables. Raw body to GCS. /healthz.",
       acc: ["Rejects tokens from repos not on the allowlist", "Ingests 50k test records in under 5s", "Integration test against Postgres in CI (service container)"],
-      files: ["crates/aster-results/"], deps: ["T01"] },
+      files: ["crates/aster-srv/"], deps: ["T01"] },
     { id: "T11", p: "P1", area: "service", title: "Retention job", sub: "30 days",
       obj: "Create tomorrow's partitions daily, drop partitions older than 30 days, and delete tests rows not seen for 30 days. Set a GCS lifecycle rule in Pulumi.",
       acc: ["Test proves day-31 data is gone and day-29 data remains", "The job can be re-run safely"],
-      files: ["crates/aster-results/src/retention.rs"], deps: ["T10"] },
-    { id: "T12", p: "P1", area: "infra", title: "Image + release workflow", sub: "ghcr.io/archastro/aster-results",
+      files: ["crates/aster-srv/src/retention.rs"], deps: ["T10"] },
+    { id: "T12", p: "P1", area: "infra", title: "Image + release workflow", sub: "ghcr.io/archastro/aster-srv",
       obj: "Add a container build to this repo's release.yml. Distroless image, versioned with aster.",
       acc: ["The image runs and passes /healthz in CI", "Tag matches the aster release version"],
-      files: [".github/workflows/release.yml", "crates/aster-results/Dockerfile"], deps: ["T10"] },
-    { id: "T13", p: "P1", area: "infra", title: "Pulumi stack on GKE", sub: "firstlanding/infra/services/aster-results (cross-repo)",
+      files: [".github/workflows/release.yml", "crates/aster-srv/Dockerfile"], deps: ["T10"] },
+    { id: "T13", p: "P1", area: "infra", title: "Pulumi stack on GKE", sub: "firstlanding/infra/services/aster-srv (cross-repo)",
       obj: "Deployment, Service, internal ingress plus a public route for /v1/runs and /v1/quarantine, Cloud SQL Postgres, GCS bucket, Workload Identity.",
       acc: ["Health checks green in production", "Only the OIDC routes reachable from GitHub runners"],
-      files: ["firstlanding: infra/services/aster-results/"], deps: ["T12"] },
+      files: ["firstlanding: infra/services/aster-srv/"], deps: ["T12"] },
     { id: "T14", p: "P1", area: "ci", title: "Wire firstlanding test-ci jobs", sub: "Cross-repo",
-      obj: "Set ASTER_RESULTS_URL, add id-token: write, and add an upload step with if: always() to every aster test job.",
+      obj: "Set ASTER_SRV_URL, add id-token: write, and add an upload step with if: always() to every aster test job.",
       acc: ["Every test-ci lane uploads for one week", "No job fails because of an upload"],
       files: ["firstlanding: .github/workflows/ci.yml"], deps: ["T09", "T13"] },
 
@@ -418,11 +418,11 @@
     { id: "T16", p: "P2", area: "service", title: "Classifier", sub: "definite, likely, broken; flake_score",
       obj: "Runs every 5 min on new runs. Applies the classification rules, keeps tests.state and flake_score up to date, and builds failure_clusters.",
       acc: ["A same-hash flip is marked definite", "A run of failures since commit X is marked broken, with X", "Re-running produces the same result"],
-      files: ["crates/aster-results/src/classify.rs"], deps: ["T10"] },
+      files: ["crates/aster-srv/src/classify.rs"], deps: ["T10"] },
     { id: "T17", p: "P2", area: "service", title: "Query API", sub: "tests, history, failures",
-      obj: "GET /v1/tests?state=, /v1/tests/:id (30-day history), /v1/runs/:run_id/failures.",
+      obj: "GET /v1/test-results/tests?state=, /v1/test-results/tests/:id (30-day history), /v1/test-results/runs/:run_id/failures.",
       acc: ["Paginated", "p95 under 300ms on 30 days of data"],
-      files: ["crates/aster-results/src/api.rs"], deps: ["T16"] },
+      files: ["crates/aster-srv/src/api.rs"], deps: ["T16"] },
     { id: "T18", p: "P2", area: "ci", title: "Retire retry_failed_targets.py", sub: "Cross-repo",
       obj: "Switch firstlanding lanes to aster --retry-failed=1 with retry_setup for the Postgres reset. Delete the script and its tests.",
       acc: ["Flaky-on-retry annotations still appear", "The Elixir DB reset still runs before a retry"],
@@ -433,18 +433,18 @@
       acc: ["Works without the service (no known/new labels then)", "One annotation per failing test, with file:line"],
       files: ["src/cli/results.rs"], deps: ["T17"] },
     { id: "T20", p: "P3", area: "ci", title: "Merge-queue report from results", sub: "Cross-repo",
-      obj: "merge_queue_failure_report.py reads /v1/runs/:id/failures instead of scraping job logs.",
+      obj: "merge_queue_failure_report.py reads /v1/test-results/runs/:id/failures instead of scraping job logs.",
       acc: ["Same PR comment content, with flake labels added", "Falls back to log scraping if the run is missing"],
       files: ["firstlanding: scripts/ci/merge_queue_failure_report.py"], deps: ["T17"] },
     { id: "T21", p: "P3", area: "service", title: "Dashboard", sub: "Server-rendered HTML behind IAP",
       obj: "Flaky leaderboard, test history (pass/fail strip by sha), quarantine list, failure clusters.",
       acc: ["Each page loads in under 1s on 30 days of data", "Links from annotations open the test's page"],
-      files: ["crates/aster-results/src/ui/"], deps: ["T17"] },
+      files: ["crates/aster-srv/src/ui/"], deps: ["T17"] },
 
     { id: "T22", p: "P4", area: "service", title: "Quarantine store + feed", sub: "Auto entry and release",
-      obj: "Automatically quarantine at 2 definite events from 2 or more runs in 7 days. Release after 20 consecutive passes, or expire at 30 days. GET /v1/quarantine returns a versioned list.",
+      obj: "Automatically quarantine at 2 definite events from 2 or more runs in 7 days. Release after 20 consecutive passes, or expire at 30 days. GET /v1/test-results/quarantine returns a versioned list.",
       acc: ["Broken tests never quarantined", "Every state change kept in a log table (30 days)"],
-      files: ["crates/aster-results/src/quarantine.rs"], deps: ["T16"] },
+      files: ["crates/aster-srv/src/quarantine.rs"], deps: ["T16"] },
     { id: "T23", p: "P4", area: "client", title: "Quarantine enforcement", sub: "Repo file + server list, the 4 conditions",
       obj: "Fetch at start (cached for 24h in .aster/quarantine.json), merge with aster-quarantine.toml, apply the 4 suppression conditions, and report passed (quarantined: N).",
       acc: ["Partial-confidence results never suppressed", "A crash or compile error never suppressed", "ASTER_QUARANTINE=off disables it", "Dependent targets of a quarantine-passed target run"],
@@ -452,13 +452,13 @@
     { id: "T26", p: "P4", area: "service", title: "Webhook notifications", sub: "Configured endpoints, HMAC-signed",
       obj: "Config sets a list of webhook endpoints, each with a URL, a secret and the event types it receives (test.quarantined, test.released, test.expired, test.broken). Deliveries are queued in Postgres and retried with exponential backoff.",
       acc: ["Payload signed as X-Aster-Signature: sha256=<hmac>", "A failing endpoint never blocks ingest or classification", "Delivery log kept 30 days", "No endpoints configured means nothing is sent"],
-      files: ["crates/aster-results/src/webhooks.rs", "crates/aster-results/src/config.rs"], deps: ["T22"] },
+      files: ["crates/aster-srv/src/webhooks.rs", "crates/aster-srv/src/config.rs"], deps: ["T22"] },
     { id: "T24", p: "P4", area: "client", title: "Duration-based lane balancing", sub: "Uses p50 test durations",
       obj: "--lane and mix --partitions split by recorded duration instead of file count, using the duration data from the service.",
       acc: ["Slowest lane's wall time drops on firstlanding (measured)", "Falls back to the current split when the service is unavailable"],
       files: ["src/git/lane.rs", "src/plugins/elixir.rs"], deps: ["T17"] },
     { id: "T25", p: "P4", area: "docs", title: "Docs", sub: "README, GETTING_STARTED, service runbook",
-      obj: "Document capture per runner, the env vars (ASTER_RESULTS_URL, ASTER_QUARANTINE), the quarantine rules and self-hosting.",
+      obj: "Document capture per runner, the env vars (ASTER_SRV_URL, ASTER_QUARANTINE), the quarantine rules and self-hosting.",
       acc: ["Doc examples run against a fixture workspace"],
       files: ["README.md", "docs/test-tracking.md"], deps: ["T23"] }
   ];

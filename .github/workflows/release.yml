@@ -108,6 +108,27 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  publish-aster-srv-image:
+    name: Publish aster-srv image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and push ghcr.io/archastro/aster-srv
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image=ghcr.io/archastro/aster-srv
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker build -f crates/aster-srv/Dockerfile -t "${image}:${VERSION}" -t "${image}:latest" .
+          docker push "${image}:${VERSION}"
+          docker push "${image}:latest"
+
   release:
     name: Publish release
     needs: [verify, build]

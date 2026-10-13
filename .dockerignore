@@ -1,0 +1,5 @@
+target
+.git
+.aster
+plans
+**/node_modules

@@ -1,0 +1,28 @@
+[package]
+name = "aster-srv"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Aster's server: CI test results now, and other shared Aster services later"
+license = "MIT"
+repository = "https://github.com/ArchAstro/aster"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+aster-results-model = { path = "../aster-results-model" }
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+deadpool-postgres = "0.14"
+flate2 = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+
+[dev-dependencies]
