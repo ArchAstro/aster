@@ -301,12 +301,15 @@ impl OwnedExternalListener {
         let child = Command::new("python3")
             .args([
                 "-c",
-                "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',int(__import__('sys').argv[1]))); s.listen(); time.sleep(60)",
+                // Accept and close every probe so the backlog never fills,
+                // and live until the owner drops it rather than a fixed sleep
+                // that a slow runner can outlast.
+                "import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); print('ready', flush=True)\nwhile True: s.accept()[0].close()",
                 &port.to_string(),
             ])
             .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         assert!(
@@ -314,14 +317,30 @@ impl OwnedExternalListener {
             "external listener {} was not placed in its own process group",
             child.id()
         );
-        Self {
+        let mut listener = Self {
             child,
             released: false,
+        };
+        // Wait for this process to report its own listen() so the occupied
+        // port is known to belong to it, not to a lingering earlier socket.
+        let mut ready = String::new();
+        let stdout = listener.child.stdout.take().unwrap();
+        let _ = BufReader::new(stdout).read_line(&mut ready);
+        if ready.trim() != "ready" {
+            listener.assert_running();
+            panic!("external listener did not report readiness: {ready:?}");
         }
+        listener
     }
 
-    fn id(&self) -> u32 {
-        self.child.id()
+    fn assert_running(&mut self) {
+        if let Some(status) = self.child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            if let Some(pipe) = self.child.stderr.as_mut() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("external listener exited with {status}: {stderr}");
+        }
     }
 
     fn release(&mut self) {
@@ -575,7 +594,6 @@ stream = true
     // Occupied preferred port: an external listener must survive, and the
     // supervisor must take the next collision-free bundle instead.
     let mut external = OwnedExternalListener::spawn(start);
-    let external_pid = external.id();
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_ok()
     });
@@ -585,9 +603,9 @@ stream = true
         occurrences(&events, &format!("{}:{}", start + 1, derived_start + 1)) > before_shift
             && TcpStream::connect(("127.0.0.1", start + 1)).is_ok()
     });
-    assert!(process_is_running(external_pid as i32));
+    external.assert_running();
     occupied_bundle.terminate();
-    assert!(process_is_running(external_pid as i32));
+    external.assert_running();
     assert!(TcpStream::connect(("127.0.0.1", start)).is_ok());
     external.release();
 
