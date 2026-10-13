@@ -584,6 +584,10 @@ mod tests {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // macOS/BSD accepted sockets inherit the listener's
+                    // non-blocking mode; reads would hit WouldBlock and drop
+                    // the request.
+                    stream.set_nonblocking(false).unwrap();
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                     if let Some((method, path, headers, body)) = read_http(&mut stream) {
