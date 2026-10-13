@@ -32,6 +32,7 @@ use aster::git::{
 };
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::PluginRegistry;
+use aster::test_results::detect_run;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1086,12 +1087,17 @@ fn run() -> Result<()> {
                 // Pass ALL projects so executor can resolve target-level dependencies
                 // (e.g., //app:build depends on //lib:build). Only primary (affected)
                 // projects will run the requested target.
+                let test_results = cli.test_results();
+                let run_record = test_results.as_ref().map(|_| {
+                    detect_run(&workspace_root, &target, lane, &|name| env::var(name).ok())
+                });
                 let executor = Executor::with_all_options(
                     &workspace_root,
                     output_mode,
                     full_logs,
                     !cli.no_cache,
-                );
+                )
+                .with_test_capture(test_results.is_some());
                 let all_project_refs: Vec<_> = projects.iter().collect();
 
                 let results = if let Some(plan) = &command_plan {
@@ -1124,6 +1130,7 @@ fn run() -> Result<()> {
                 } else {
                     executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
                 };
+                write_test_results(test_results, run_record, &results);
 
                 // Output results based on mode
                 if output_mode == OutputMode::Json {
@@ -1211,9 +1218,15 @@ fn run() -> Result<()> {
             let primary_targets: std::collections::HashSet<String> =
                 filtered_targets.into_iter().collect();
             let all_project_refs: Vec<_> = projects.iter().collect();
+            let test_results = cli.test_results();
+            let run_record = test_results
+                .as_ref()
+                .map(|_| detect_run(&workspace_root, "run", None, &|name| env::var(name).ok()));
             let executor =
-                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
+                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
+                    .with_test_capture(test_results.is_some());
             let results = executor.execute_targets(&primary_targets, &all_project_refs, no_deps);
+            write_test_results(test_results, run_record, &results);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
@@ -1466,8 +1479,15 @@ fn run() -> Result<()> {
             };
 
             // Execute target on projects
+            let test_results = cli.test_results();
+            let run_record = test_results.as_ref().map(|_| {
+                detect_run(&workspace_root, &run_args.target, None, &|name| {
+                    env::var(name).ok()
+                })
+            });
             let executor =
-                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache);
+                Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
+                    .with_test_capture(test_results.is_some());
 
             // Handle streaming execution (single project only, output to terminal)
             if should_stream {
@@ -1556,6 +1576,7 @@ fn run() -> Result<()> {
                     Some(&primary_projects),
                 )
             };
+            write_test_results(test_results, run_record, &results);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
@@ -1574,6 +1595,32 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Write the run's test results when recording is on. A file that cannot be
+/// written is a warning: recording never fails the build.
+fn write_test_results(
+    destination: Option<Option<PathBuf>>,
+    run: Option<aster_results_model::RunRecord>,
+    results: &[aster::executor::ExecutionResult],
+) {
+    let (Some(destination), Some(run)) = (destination, run) else {
+        return;
+    };
+    let path = destination.unwrap_or_else(|| aster::test_results::default_path(&run.run_id));
+    let records = aster::test_results::records(run, results);
+    let tests = records
+        .iter()
+        .filter(|record| matches!(record, aster_results_model::Record::Test(_)))
+        .count();
+    match aster::test_results::write(&path, &records) {
+        Ok(()) => eprintln!(
+            "[aster] Test results ({tests} test{}) written to {}",
+            if tests == 1 { "" } else { "s" },
+            path.display()
+        ),
+        Err(error) => eprintln!("[aster] Warning: {error:#}"),
+    }
 }
 
 fn print_skills() -> Result<()> {

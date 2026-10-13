@@ -20,7 +20,12 @@ include = [
     "/LICENSE",
 ]
 
+[workspace]
+members = [".", "crates/aster-results-model"]
+resolver = "2"
+
 [dependencies]
+aster-results-model = { path = "crates/aster-results-model" }
 clap = { version = "4.5", features = ["derive"] }
 petgraph = "0.8"
 ignore = "=0.4.31"

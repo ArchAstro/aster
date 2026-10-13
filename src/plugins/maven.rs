@@ -209,6 +209,13 @@ impl LanguagePlugin for MavenPlugin {
             .then(|| format!("{command} -Dmaven.compiler.failOnWarning=true"))
     }
 
+    fn test_report_plan(
+        &self,
+        ctx: &crate::test_results::ReportContext,
+    ) -> Option<crate::test_results::ReportPlan> {
+        super::test_reports::maven(ctx)
+    }
+
     fn cache_inputs(&self, target_name: &str) -> CacheInputs {
         let mut inputs = CacheInputs {
             source_globs: Vec::new(),

@@ -9,6 +9,7 @@ pub mod git;
 pub mod graph;
 pub mod plugins;
 pub mod targets;
+pub mod test_results;
 pub mod ui;
 pub mod watch;
 #[cfg(windows)]

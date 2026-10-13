@@ -18,9 +18,9 @@ install: build-release
 # Validate a release candidate. Tagging and pushing stay explicit human actions.
 release-check:
 	cargo fmt --all -- --check
-	cargo clippy --locked --all-targets --all-features -- -D warnings
-	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
-	cargo test --locked --all-targets --all-features
+	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
+	cargo test --locked --workspace --all-targets --all-features
 	cargo audit
 
 # Run all tests

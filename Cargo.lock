@@ -151,6 +151,7 @@ version = "0.17.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "aster-results-model",
  "bytes",
  "chrono",
  "clap",
@@ -196,6 +197,16 @@ dependencies = [
  "unicode-width",
  "walkdir",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aster-results-model"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

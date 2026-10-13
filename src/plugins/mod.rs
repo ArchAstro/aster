@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::test_results::{ReportContext, ReportPlan};
+
 /// Metadata extracted from a project's native config file
 #[derive(Debug, Clone)]
 pub struct ProjectMetadata {
@@ -296,6 +298,16 @@ pub trait LanguagePlugin: Send + Sync {
         CacheInputs::default()
     }
 
+    /// Plan how to capture per-test results from one of a target's commands.
+    ///
+    /// Called only when test capture is on, after the target's cache key was
+    /// computed from the command as written. Return `None` when `ctx.command`
+    /// is not a test run the plugin can capture; it then runs unchanged. A
+    /// plan must leave the command's console output as it was.
+    fn test_report_plan(&self, _ctx: &ReportContext) -> Option<ReportPlan> {
+        None
+    }
+
     /// Provide the default clean target for this language
     ///
     /// Returns None if the language doesn't have a standard clean operation.
@@ -319,6 +331,7 @@ pub(crate) mod related_tests;
 pub mod ruby;
 pub mod rust;
 pub(crate) mod rust_related;
+mod test_reports;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;

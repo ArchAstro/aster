@@ -33,8 +33,8 @@ jobs:
           test "${version}" = "${package_version}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-targets --all-features
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets --all-features
       # cargo-audit's own dependencies may require a newer compiler than Aster's
       # MSRV. Keep Aster validation on 1.88, then install and run the audit tool
       # with the current stable toolchain.

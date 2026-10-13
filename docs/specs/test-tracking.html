@@ -1,0 +1,565 @@
+<title>Aster Test Tracking</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Instrument+Serif&display=swap">
+<style>
+  /* Layout: single reading column for the spec, widening to a task board at the end. */
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #eef1f5;
+    --fg: #17202c;
+    --muted: #5a6677;
+    --line: #d9dee6;
+    --accent: #2f5bd3;
+    --accent-soft: #e4ebfb;
+    --pass: #1f8a4c;
+    --pass-soft: #e2f3e8;
+    --fail: #c43c3c;
+    --fail-soft: #f8e4e4;
+    --flaky: #b26b00;
+    --flaky-soft: #f8edd9;
+    --code-bg: #eef1f5;
+    --display: "Instrument Serif", Georgia, "Times New Roman", serif;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1218; --panel: #151b24; --panel-2: #1b2330; --fg: #e6ebf2; --muted: #95a1b3;
+      --line: #2a3442; --accent: #8aa8ff; --accent-soft: #1d2a4a; --pass: #5fd08e; --pass-soft: #15301f;
+      --fail: #f08080; --fail-soft: #3a1c1f; --flaky: #f0b45a; --flaky-soft: #3a2a12; --code-bg: #10161f;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1218; --panel: #151b24; --panel-2: #1b2330; --fg: #e6ebf2; --muted: #95a1b3;
+    --line: #2a3442; --accent: #8aa8ff; --accent-soft: #1d2a4a; --pass: #5fd08e; --pass-soft: #15301f;
+    --fail: #f08080; --fail-soft: #3a1c1f; --flaky: #f0b45a; --flaky-soft: #3a2a12; --code-bg: #10161f;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--sans); padding-inline: 16px; }
+  main { max-width: 1040px; margin: 0 auto; padding-block: 40px 96px; display: grid; gap: 40px; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  h1 { font: 400 clamp(40px, 7vw, 68px)/1.02 var(--display); letter-spacing: -.01em; }
+  h2 { font: 400 32px/1.1 var(--display); }
+  h3 { font-size: 15px; font-weight: 600; }
+  p { margin: 0; max-width: 72ch; }
+  code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  ul, ol { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
+  .label { font: 600 11px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  section { display: grid; gap: 16px; }
+  .head { display: grid; gap: 14px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .pill { font: 500 12px/1 var(--mono); padding: 6px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); }
+  .pill.pass { color: var(--pass); background: var(--pass-soft); border-color: transparent; }
+  .pill.fail { color: var(--fail); background: var(--fail-soft); border-color: transparent; }
+  .pill.flaky { color: var(--flaky); background: var(--flaky-soft); border-color: transparent; }
+  .pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 66ch; }
+
+  .decisions { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .decisions > div { background: var(--panel); padding: 16px 18px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+  .decisions b { font-size: 15px; }
+  .decisions span { color: var(--muted); font-size: 14px; }
+
+  .diagram { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 20px; }
+  .diagram svg { display: block; min-width: 760px; width: 100%; height: auto; }
+  .diagram text { font-family: var(--mono); font-size: 12px; fill: var(--fg); }
+  .diagram .muted { fill: var(--muted); }
+  .diagram .box { fill: var(--panel-2); stroke: var(--line); }
+  .diagram .zone { fill: none; stroke: var(--line); stroke-dasharray: 4 4; }
+  .diagram .edge { stroke: var(--accent); stroke-width: 1.5; fill: none; }
+  .diagram .edge-back { stroke: var(--flaky); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+  .diagram .arrow { fill: var(--accent); }
+  .diagram .arrow-back { fill: var(--flaky); }
+  .diagram .title { font-weight: 600; }
+
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 600 11px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); background: var(--panel-2); }
+  tr:last-child td { border-bottom: 0; }
+  td code { white-space: nowrap; }
+
+  .rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .rule { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 16px 18px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .rule ul { color: var(--muted); font-size: 14px; }
+  .rule.def { border-top: 3px solid var(--fail); }
+  .rule.likely { border-top: 3px solid var(--flaky); }
+  .rule.broken { border-top: 3px solid var(--muted); }
+  .callout { border-left: 3px solid var(--flaky); background: var(--flaky-soft); padding: 14px 18px; border-radius: 0 8px 8px 0; display: grid; gap: 8px; }
+
+  /* Task board */
+  .board-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: end; }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font: 500 12px/1 var(--mono); padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  .chip:focus-visible, .status:focus-visible, .task summary:focus-visible, #q:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #q { font: 14px var(--sans); padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); min-width: 0; width: 220px; max-width: 100%; }
+  .progress { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+  .phase-card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 14px; display: grid; gap: 8px; }
+  .phase-card .row { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--pass); width: 0; transition: width .3s; }
+  .phase { display: grid; gap: 10px; }
+  .phase > header { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; padding-top: 8px; }
+  .phase > header p { color: var(--muted); font-size: 14px; }
+  .task { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  .task[data-status="done"] { opacity: .62; }
+  .task summary { list-style: none; cursor: pointer; display: grid; grid-template-columns: 56px 1fr auto; gap: 12px; align-items: center; padding: 12px 14px; }
+  .task summary::-webkit-details-marker { display: none; }
+  .tid { font: 600 12px/1 var(--mono); color: var(--accent); }
+  .ttitle { font-weight: 600; min-width: 0; }
+  .ttitle small { display: block; font-weight: 400; color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .tags { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; justify-content: end; }
+  .status { font: 600 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: pointer; }
+  .status[data-s="doing"] { color: var(--flaky); background: var(--flaky-soft); border-color: transparent; }
+  .status[data-s="done"] { color: var(--pass); background: var(--pass-soft); border-color: transparent; }
+  .tbody { padding: 0 14px 16px 82px; display: grid; gap: 12px; font-size: 14px; }
+  .tbody .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .tbody h4 { margin: 0 0 6px; font: 600 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .tbody > div, .tbody .grid2 > div { min-width: 0; }
+  .empty { color: var(--muted); font-size: 14px; }
+  .qlist { counter-reset: q; display: grid; gap: 10px; padding: 0; list-style: none; }
+  .qlist li { counter-increment: q; display: grid; grid-template-columns: 28px 1fr; gap: 8px; }
+  .qlist li::before { content: counter(q); font: 600 12px/1.6 var(--mono); color: var(--accent); }
+  @media (max-width: 640px) {
+    .task summary { grid-template-columns: 1fr; gap: 6px; }
+    .tags { justify-content: start; }
+    .tbody { padding-left: 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
+</style>
+
+<main>
+  <header class="head">
+    <div class="meta">
+      <span class="pill accent">Spec · proposed</span>
+      <span class="pill">2026-10-13</span>
+      <span class="pill">aster ≥ 0.18</span>
+    </div>
+    <h1>Aster Test Tracking</h1>
+    <p class="lede">Aster records every test it runs in CI, one record per test per attempt. It uploads those records to <code>aster-results</code>, a service in this repo deployed on our GKE cluster. The service finds flaky tests, and Aster uses its quarantine list to stop known flakes from failing the build.</p>
+  </header>
+
+  <section>
+    <span class="label">Decisions</span>
+    <div class="decisions">
+      <div><b>CI first</b><span>Built for GitHub Actions runs. Local history is not in scope.</span></div>
+      <div><b>Service lives in aster</b><span>A Cargo workspace member at <code>crates/aster-results</code>. Its image is published to GHCR, and it is deployed from firstlanding's Pulumi.</span></div>
+      <div><b>Quarantine passes the build</b><span>A target whose only failures are quarantined tests reports <code>passed</code>, with a warning. Quarantined tests still run and still upload.</span></div>
+      <div><b>30-day retention</b><span>Run, target and test rows, plus the raw NDJSON in GCS, are dropped after 30 days. Only each test's current state is kept beyond that.</span></div>
+    </div>
+  </section>
+
+  <section>
+    <span class="label">Why</span>
+    <ul>
+      <li>firstlanding RCA (2026-09-27..30): 271 failed CI jobs, <b>38% flaky</b>. They cluster in Intern Browser, Services Platform (<code>DBConnection.OwnershipError</code>) and Other Elixir canonical-e2e.</li>
+      <li><code>scripts/ci/retry_failed_targets.py</code> retries whole <b>targets</b>, so one flaky ExUnit test reruns all of <code>mix test</code> and the DB reset. It keeps no memory between runs.</li>
+      <li><code>scripts/ci/merge_queue_failure_report.py</code> scrapes failing tests out of job logs. Aster already knows each runner's argv and can capture the results directly.</li>
+      <li>Aster has a <b>content hash</b> of every target's inputs. If two runs have the same hash and different outcomes, the test is proven flaky. Generic tools have to guess this from commit history.</li>
+    </ul>
+  </section>
+
+  <section>
+    <span class="label">Architecture</span>
+    <div class="diagram" role="img" aria-label="Aster on a CI runner captures test results, writes NDJSON, and uploads with a GitHub OIDC token to the aster-results service on GKE, which stores data in Postgres and GCS and returns a quarantine list to Aster.">
+      <svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow-back" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+        <rect class="zone" x="10" y="10" width="380" height="310" rx="10"/>
+        <text x="26" y="34" class="muted">GitHub Actions runner</text>
+        <rect class="box" x="30" y="50" width="340" height="50" rx="6"/>
+        <text x="46" y="72" class="title">aster affected test-ci</text>
+        <text x="46" y="90" class="muted">native runner, reporter flag added</text>
+        <rect class="box" x="30" y="120" width="160" height="56" rx="6"/>
+        <text x="44" y="143" class="title">capture</text>
+        <text x="44" y="162" class="muted">junit · json · stdout</text>
+        <rect class="box" x="210" y="120" width="160" height="56" rx="6"/>
+        <text x="224" y="143" class="title">retry failed</text>
+        <text x="224" y="162" class="muted">per test, native flag</text>
+        <rect class="box" x="30" y="196" width="340" height="50" rx="6"/>
+        <text x="46" y="218" class="title">.aster/results/&lt;run&gt;.ndjson</text>
+        <text x="46" y="236" class="muted">run · target · test records</text>
+        <rect class="box" x="30" y="262" width="340" height="44" rx="6"/>
+        <text x="46" y="289" class="title">quarantine applied to exit status</text>
+
+        <rect class="zone" x="510" y="10" width="380" height="310" rx="10"/>
+        <text x="526" y="34" class="muted">GKE · aster-results</text>
+        <rect class="box" x="530" y="50" width="340" height="76" rx="6"/>
+        <text x="546" y="72" class="title">POST /v1/runs</text>
+        <text x="546" y="90" class="muted">verify GitHub OIDC, repo allowlist</text>
+        <text x="546" y="108" class="muted">gzip NDJSON, idempotent by run_id</text>
+        <rect class="box" x="530" y="140" width="160" height="56" rx="6"/>
+        <text x="544" y="163" class="title">classifier</text>
+        <text x="544" y="182" class="muted">every 5 min</text>
+        <rect class="box" x="710" y="140" width="160" height="56" rx="6"/>
+        <text x="724" y="163" class="title">GET /v1/…</text>
+        <text x="724" y="182" class="muted">tests · quarantine</text>
+        <rect class="box" x="530" y="214" width="160" height="56" rx="6"/>
+        <text x="544" y="237" class="title">Postgres</text>
+        <text x="544" y="256" class="muted">partitioned by day</text>
+        <rect class="box" x="710" y="214" width="160" height="56" rx="6"/>
+        <text x="724" y="237" class="title">GCS raw</text>
+        <text x="724" y="256" class="muted">30-day lifecycle</text>
+
+        <path class="edge" d="M370 221 C 440 221, 440 88, 528 88" marker-end="url(#a)"/>
+        <text x="404" y="150" class="muted">upload</text>
+        <path class="edge" d="M110 100 L110 118" marker-end="url(#a)"/>
+        <path class="edge" d="M190 148 L208 148" marker-end="url(#a)"/>
+        <path class="edge" d="M290 176 L290 194" marker-end="url(#a)"/>
+        <path class="edge" d="M610 196 L610 212" marker-end="url(#a)"/>
+        <path class="edge" d="M700 126 L700 140" marker-end="url(#a)"/>
+        <path class="edge-back" d="M790 196 C 790 300, 460 300, 372 285" marker-end="url(#b)"/>
+        <text x="420" y="314" class="muted">quarantine list at start</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <span class="label">Capture by runner</span>
+    <p>Strategies in order of preference: read report files the tool already writes, add a reporter flag, parse stdout. Aster adds a flag only when its argv parser in <code>src/plugins/related_tests.rs</code> or <code>rust_related.rs</code> understands the command. Report files go under <code>$RUNNER_TEMP</code> (or the system temp dir), never inside the checkout.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Runner</th><th>Strategy</th><th>Change</th><th>Confidence</th><th>Retry</th></tr></thead>
+        <tbody>
+          <tr><td>mix / ExUnit</td><td>Formatter</td><td><code>--formatter AsterFormatter --formatter ExUnit.CLIFormatter</code>, with <code>ERL_LIBS</code> pointing at an embedded <code>.beam</code></td><td><span class="pill pass">complete</span></td><td><code>mix test --failed</code></td></tr>
+          <tr><td>mix (fallback)</td><td>Stdout</td><td>Parse the numbered failure blocks</td><td><span class="pill flaky">partial</span></td><td><code>file:line</code> args</td></tr>
+          <tr><td>go test</td><td>Flag</td><td><code>-json</code>, output written to the console as text again</td><td><span class="pill pass">complete</span></td><td><code>-run '^(A|B)$'</code> per package</td></tr>
+          <tr><td>vitest</td><td>Flag</td><td><code>--reporter=default --reporter=junit --outputFile.junit=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
+          <tr><td>jest</td><td>Flag</td><td><code>--json --outputFile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
+          <tr><td>bun test</td><td>Flag</td><td><code>--reporter=junit --reporter-outfile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
+          <tr><td>pytest</td><td>Flag</td><td><code>--junitxml=…</code></td><td><span class="pill pass">complete</span></td><td>node ids</td></tr>
+          <tr><td>cargo nextest</td><td>Flag</td><td>JUnit profile output</td><td><span class="pill pass">complete</span></td><td><code>--exact</code> names</td></tr>
+          <tr><td>cargo test</td><td>Stdout</td><td>Parse the <code>test x ... ok|FAILED</code> lines</td><td><span class="pill flaky">partial</span></td><td><code>--exact</code> names</td></tr>
+          <tr><td>Gradle / Maven</td><td>Existing files</td><td>Read <code>build/test-results/**.xml</code> and <code>target/surefire-reports/*.xml</code></td><td><span class="pill pass">complete</span></td><td>none in v1</td></tr>
+          <tr><td>rspec</td><td>Flag</td><td><code>--format progress --format json --out …</code></td><td><span class="pill pass">complete</span></td><td><code>--only-failures</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><b>Confidence matters:</b> <span class="pill flaky">partial</span> results are uploaded and classified, but they <b>never</b> qualify a target for quarantine. JUnit XML is parsed with <code>roxmltree</code>, which is already a dependency.</p>
+  </section>
+
+  <section>
+    <span class="label">Wire format</span>
+    <p>One NDJSON file per Aster invocation, gzipped on upload. <code>test_id</code> = <code>sha256(project | file | suite | name)</code>. <code>failure_hash</code> is the failure message with numbers, hex addresses, PIDs and temp paths stripped, then hashed, so similar failures group together.</p>
+<pre><code>{"type":"run","run_id":"gh:ArchAstro/firstlanding:18233412:1:test-ci:services-platform","repo":"ArchAstro/firstlanding",
+ "sha":"9f1c…","branch":"main","pr":null,"workflow":"CI","job":"test-ci","attempt":1,"lane":"services-platform",
+ "runner":"blacksmith-8vcpu-ubuntu-2404","aster_version":"0.18.0","started_at":"2026-10-13T17:02:11Z"}
+{"type":"target","address":"//services/platform:test-ci","input_hash":"sha256:4be2…","status":"failed",
+ "cached":false,"duration_ms":412233,"capture":"exunit-formatter","confidence":"complete","exit_code":2}
+{"type":"test","target":"//services/platform:test-ci","test_id":"c81e…","file":"test/platform/agents_test.exs",
+ "suite":"Platform.AgentsTest","name":"test creates an agent","outcome":"fail","attempt":1,"duration_ms":1840,
+ "failure_hash":"f3a9…","message":"** (DBConnection.OwnershipError) cannot find owner for …"}</code></pre>
+    <ul>
+      <li>Passing tests carry only <code>test_id</code>, <code>outcome</code> and <code>duration_ms</code>.</li>
+      <li><code>message</code> is cut to 4&nbsp;KB, with secrets scrubbed (tokens, <code>Bearer …</code>, URLs containing credentials).</li>
+      <li>A cached target emits a <code>target</code> record with <code>cached:true</code> and no tests.</li>
+      <li><code>input_hash</code> is computed even with <code>--no-cache</code>, because the classifier needs it.</li>
+    </ul>
+  </section>
+
+  <section>
+    <span class="label">Flake classification</span>
+    <div class="rules">
+      <div class="rule def"><h3>Definite flake</h3><ul><li>Same <code>input_hash</code>, both pass and fail, within 30 days.</li><li>Or it fails, then passes on retry, in the same run.</li></ul></div>
+      <div class="rule likely"><h3>Likely flake</h3><ul><li>Fails on <code>main</code> but passes on the next run, with no change to its target.</li><li>Fails on a PR whose diff <code>--related</code> says cannot reach it.</li></ul></div>
+      <div class="rule broken"><h3>Broken</h3><ul><li>Fails on every run since commit X with the same <code>failure_hash</code>.</li><li>Never quarantined. It is reported with X as the likely cause.</li></ul></div>
+    </div>
+    <p><code>flake_score</code> = definite events × 3 + likely events, over a rolling 7 days.</p>
+  </section>
+
+  <section>
+    <span class="label">Quarantine</span>
+    <div class="callout">
+      <b>A failed target reports <code>passed</code> (quarantined: N) only if all of these hold:</b>
+      <ol>
+        <li>Capture confidence is <code>complete</code>.</li>
+        <li>After retries, every failing test is in the quarantine list (server entries plus the repo file).</li>
+        <li>The exit code is the runner's "tests failed" code, not a crash, compile error, timeout or signal. The number of failures parsed matches the runner's own summary.</li>
+        <li><code>ASTER_QUARANTINE</code> is not <code>off</code>.</li>
+      </ol>
+    </div>
+    <div class="rules">
+      <div class="rule"><h3>Entering quarantine</h3><ul><li><b>Automatically:</b> 2 or more definite-flake events in 7 days, from 2 or more different runs.</li><li><b>Manually:</b> an entry in <code>aster-quarantine.toml</code> in the repo (reviewed in a PR, so it is auditable). v1 needs no human auth on the service.</li></ul></div>
+      <div class="rule"><h3>Leaving quarantine</h3><ul><li>Released automatically after 20 consecutive passes while quarantined.</li><li>Expires after 30 days at most (matches retention), then is re-evaluated from scratch.</li><li>Manual entries need a <code>reason</code> and <code>expires</code> date.</li></ul></div>
+      <div class="rule"><h3>Visibility</h3><ul><li>Quarantined tests still run and upload.</li><li>Each suppressed failure gets a GitHub warning annotation and a step-summary row.</li><li>The quarantine snapshot (version and count) is printed at start.</li></ul></div>
+      <div class="rule"><h3>Service outage</h3><ul><li>Use the cached <code>.aster/quarantine.json</code> if it is less than 24 hours old.</li><li>Otherwise only the repo file applies. Nothing extra gets suppressed.</li><li>A failed upload never fails the build.</li></ul></div>
+    </div>
+  </section>
+
+  <section>
+    <span class="label">Service</span>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Area</th><th>Choice</th></tr></thead>
+        <tbody>
+          <tr><td>Code</td><td><code>crates/aster-results</code> in a Cargo workspace. Shared types in <code>crates/aster-results-model</code>, which the CLI also uses. Built on hyper and tokio (already dependencies) plus <code>tokio-postgres</code>.</td></tr>
+          <tr><td>Auth (writes)</td><td>GitHub Actions OIDC token, audience <code>aster-results</code>, verified against GitHub's JWKS, with an allowlist on <code>repository</code>.</td></tr>
+          <tr><td>Auth (reads)</td><td><code>/v1/quarantine</code> uses the same OIDC token. Dashboard and query routes sit behind internal ingress / IAP.</td></tr>
+          <tr><td>Tables</td><td><code>runs</code>, <code>target_runs</code>, <code>test_results</code> (each partitioned by day), <code>tests</code> (current state: first/last seen, score, quarantine), <code>failure_clusters</code>.</td></tr>
+          <tr><td>Retention</td><td>A daily job drops partitions older than 30 days. A GCS lifecycle rule deletes raw objects at 30 days. <code>tests</code> rows not seen for 30 days are deleted.</td></tr>
+          <tr><td>Deploy</td><td>Image <code>ghcr.io/archastro/aster-results</code> from this repo's release workflow. Pulumi stack in <code>firstlanding/infra/services/aster-results</code>: Deployment, Cloud SQL, bucket, Workload Identity.</td></tr>
+          <tr><td>Notifications</td><td>Configured webhook endpoints, each with its own subscribed event types: <code>test.quarantined</code>, <code>test.released</code>, <code>test.expired</code>, <code>test.broken</code>. The JSON payload is signed with HMAC-SHA256 (<code>X-Aster-Signature</code>) and retried with backoff. Slack, issue trackers and other receivers live outside the service.</td></tr>
+          <tr><td>Routes</td><td><code>POST /v1/runs</code> · <code>GET /v1/quarantine?repo=</code> · <code>GET /v1/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/tests/:id</code> · <code>GET /v1/runs/:run_id/failures</code> · <code>/healthz</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tasks">
+    <div class="board-head">
+      <div><span class="label">Tasks</span><h2>Build plan</h2><p class="empty">Status is shared and updated as work lands. Editors can click a status to change it.</p></div>
+      <div class="filters" role="group" aria-label="Filter tasks">
+        <input id="q" type="search" placeholder="Search tasks" aria-label="Search tasks">
+      </div>
+    </div>
+    <div class="filters" id="areaFilters" role="group" aria-label="Filter by area"></div>
+    <div class="progress" id="progress"></div>
+    <div id="board"></div>
+    <p class="empty" id="empty" hidden>No tasks match.</p>
+  </section>
+
+  <section>
+    <span class="label">Risks</span>
+    <ul>
+      <li><b>A reporter flag changes how a user's command behaves.</b> Mitigation: add flags only through the argv parser, and add nothing when the parse is unsure. Each runner gets a golden test that the console output is unchanged.</li>
+      <li><b>The ExUnit <code>.beam</code> doesn't load on a project's OTP version.</b> Mitigation: compile it on the oldest supported OTP, check at load time, and fall back to the stdout parser.</li>
+      <li><b>Quarantine hides a real regression.</b> Mitigation: "broken" tests are never quarantined, entries expire, there are annotations on every suppression, and a kill switch.</li>
+      <li><b>Postgres volume.</b> Example: 40k tests × 300 jobs a day ≈ 12M rows a day, about 360M at 30 days. Mitigation: daily partitions, passing-test rows kept small, ClickHouse only if queries get slow.</li>
+    </ul>
+  </section>
+
+  <section>
+    <span class="label">Open questions</span>
+    <ol class="qlist">
+      <li>Auto-quarantine threshold: should a test enter quarantine after 2 proven flakes from 2 different runs in 7 days (the current proposal), or after a single one? A proven flake means the test passed and failed on identical inputs (the same <code>input_hash</code>). One event is proof enough on its own, but an outage across CI (database down, network blip) would then quarantine every test it touched in a single run.</li>
+    </ol>
+  </section>
+</main>
+
+<script>
+(function () {
+  const PHASES = [
+    { id: "P1", name: "Capture + ingest", note: "Per-test records uploaded from every firstlanding test-ci job." },
+    { id: "P2", name: "Retry + classify", note: "Per-test retry replaces retry_failed_targets.py, and flakes are scored." },
+    { id: "P3", name: "Reporting", note: "PRs and the merge queue say which failures are known flakes and which are new." },
+    { id: "P4", name: "Quarantine + sharding", note: "Known flakes stop failing builds, and lanes are balanced by duration." }
+  ];
+  const T = [
+    { id: "T01", p: "P1", area: "client", title: "Test result model + NDJSON writer", sub: "crates/aster-results-model, shared by the CLI and the service",
+      obj: "Define the Run, Target and Test records, test_id, failure_hash normalization and scrubbing, and serde for NDJSON. Convert the repo to a Cargo workspace.",
+      acc: ["Round-trip serde tests for each record type", "failure_hash is stable when only line numbers, addresses or PIDs differ", "Secret scrubber covers tokens, Bearer headers and URLs with credentials", "cargo test --locked passes at the workspace root"],
+      files: ["Cargo.toml (workspace)", "crates/aster-results-model/"], deps: [] },
+    { id: "T02", p: "P1", area: "client", title: "Report-plan plugin hook", sub: "Mirrors with_files_list",
+      obj: "Add fn test_report_plan(&self, target, command, out_dir) -> Option<ReportPlan { command, env, artifacts, parser, confidence }> to the plugin trait, defaulting to None. It composes with --only-affected-files (CommandOverride::Run).",
+      acc: ["A None plan leaves the command byte-for-byte unchanged", "Report dir is under $RUNNER_TEMP or the temp dir, never the checkout", "Composes with a narrowed (related) command"],
+      files: ["src/plugins/mod.rs", "src/executor/runner.rs"], deps: ["T01"] },
+    { id: "T03", p: "P1", area: "client", title: "JUnit XML parser + Gradle/Maven harvest", sub: "roxmltree",
+      obj: "One JUnit parser for pytest, vitest, bun, nextest and the JVM runners. Gradle and Maven read their existing report dirs after the run.",
+      acc: ["Fixtures from each tool parse to the expected TestCase set", "<skipped>, <error> and <failure> all handled", "Old report files from earlier runs are ignored (compare mtime with target start)"],
+      files: ["src/test_results/junit.rs", "src/plugins/gradle.rs", "src/plugins/maven.rs"], deps: ["T02"] },
+    { id: "T04", p: "P1", area: "client", title: "ExUnit capture", sub: "Embedded formatter, with stdout fallback",
+      obj: "Ship AsterFormatter as a .beam embedded with include_bytes!. Write it to a temp ERL_LIBS dir and add both formatters. The fallback parses CLIFormatter failure blocks (partial).",
+      acc: ["Console output identical to plain mix test (golden test)", "Umbrella and partitioned (--partitions) runs captured", "Falls back cleanly when the beam fails to load"],
+      files: ["src/plugins/elixir.rs", "src/test_results/exunit.rs", "support/exunit_formatter/"], deps: ["T02"] },
+    { id: "T05", p: "P1", area: "client", title: "go test -json capture", sub: "Write output to the console as text again",
+      obj: "Add -json to go test and write the console output back as text, so logs look the same.",
+      acc: ["Subtests become separate test_ids", "Package build failures recorded as target errors, not tests", "Works with the related-tests -run narrowing"],
+      files: ["src/plugins/go.rs", "src/test_results/gojson.rs"], deps: ["T02"] },
+    { id: "T06", p: "P1", area: "client", title: "vitest / jest / bun reporters", sub: "Keep the default reporter",
+      obj: "Add the extra reporter flags from the capture table, through the JS argv parser in related_tests.rs.",
+      acc: ["Commands run through npm/pnpm script wrappers handled, or left untouched", "A user-supplied --reporter is kept"],
+      files: ["src/plugins/nodejs.rs", "src/plugins/related_tests.rs"], deps: ["T03"] },
+    { id: "T07", p: "P1", area: "client", title: "cargo test / nextest capture", sub: "nextest is complete, plain cargo test is partial",
+      obj: "Use the nextest JUnit profile when the command is cargo nextest. Otherwise parse libtest stdout.",
+      acc: ["Doc-tests and multiple test binaries handled", "Plain cargo test results marked confidence=partial"],
+      files: ["src/plugins/rust.rs", "src/plugins/rust_related.rs", "src/test_results/libtest.rs"], deps: ["T03"] },
+    { id: "T08", p: "P1", area: "client", title: "Executor integration + run context", sub: "ExecutionResult.tests, --json, results file",
+      obj: "Attach a TestReport to ExecutionResult and TargetResult. Write .aster/results/<run_id>.ndjson. Build RunContext from the GitHub env (sha, ref, PR, run id, attempt, job) plus --lane. Always compute input_hash.",
+      acc: ["aster --json output includes a per-target test summary", "input_hash present when run with --no-cache", "Leaves LogStore/latest.json behavior unchanged"],
+      files: ["src/executor/runner.rs", "src/cli/output.rs", "src/test_results/context.rs"], deps: ["T01", "T02"] },
+    { id: "T09", p: "P1", area: "client", title: "aster results upload", sub: "Best effort, GitHub OIDC",
+      obj: "Uploads automatically when ASTER_RESULTS_URL is set, and also as a separate command for an if: always() step. Gzip, 10s timeout, 2 retries. Fetches the OIDC token from ACTIONS_ID_TOKEN_REQUEST_*.",
+      acc: ["Exit code is 0 on any upload failure unless --strict", "Idempotent: the same run_id uploaded twice causes no duplicates", "Prints a run URL on success"],
+      files: ["src/cli/results.rs", "src/test_results/upload.rs"], deps: ["T08", "T10"] },
+    { id: "T10", p: "P1", area: "service", title: "aster-results service skeleton + ingest", sub: "hyper, tokio-postgres, migrations",
+      obj: "POST /v1/runs with OIDC verification (JWKS cache) and the repo allowlist. Streams NDJSON into day-partitioned tables. Raw body to GCS. /healthz.",
+      acc: ["Rejects tokens from repos not on the allowlist", "Ingests 50k test records in under 5s", "Integration test against Postgres in CI (service container)"],
+      files: ["crates/aster-results/"], deps: ["T01"] },
+    { id: "T11", p: "P1", area: "service", title: "Retention job", sub: "30 days",
+      obj: "Create tomorrow's partitions daily, drop partitions older than 30 days, and delete tests rows not seen for 30 days. Set a GCS lifecycle rule in Pulumi.",
+      acc: ["Test proves day-31 data is gone and day-29 data remains", "The job can be re-run safely"],
+      files: ["crates/aster-results/src/retention.rs"], deps: ["T10"] },
+    { id: "T12", p: "P1", area: "infra", title: "Image + release workflow", sub: "ghcr.io/archastro/aster-results",
+      obj: "Add a container build to this repo's release.yml. Distroless image, versioned with aster.",
+      acc: ["The image runs and passes /healthz in CI", "Tag matches the aster release version"],
+      files: [".github/workflows/release.yml", "crates/aster-results/Dockerfile"], deps: ["T10"] },
+    { id: "T13", p: "P1", area: "infra", title: "Pulumi stack on GKE", sub: "firstlanding/infra/services/aster-results (cross-repo)",
+      obj: "Deployment, Service, internal ingress plus a public route for /v1/runs and /v1/quarantine, Cloud SQL Postgres, GCS bucket, Workload Identity.",
+      acc: ["Health checks green in production", "Only the OIDC routes reachable from GitHub runners"],
+      files: ["firstlanding: infra/services/aster-results/"], deps: ["T12"] },
+    { id: "T14", p: "P1", area: "ci", title: "Wire firstlanding test-ci jobs", sub: "Cross-repo",
+      obj: "Set ASTER_RESULTS_URL, add id-token: write, and add an upload step with if: always() to every aster test job.",
+      acc: ["Every test-ci lane uploads for one week", "No job fails because of an upload"],
+      files: ["firstlanding: .github/workflows/ci.yml"], deps: ["T09", "T13"] },
+
+    { id: "T15", p: "P2", area: "client", title: "Per-test retry", sub: "--retry-failed=N, retry_setup",
+      obj: "Rerun only the failed test_ids, using each runner's own rerun flag (see table). The target-level retry_setup command replaces CI_RETRY_PRE_RETRY_COMMAND. Each attempt is recorded.",
+      acc: ["mix: only the failing tests rerun (--failed)", "A failing retry_setup skips the retry and keeps the first failure", "attempt numbers appear in the NDJSON"],
+      files: ["src/executor/runner.rs", "src/config/project.rs", "src/plugins/related_tests.rs"], deps: ["T08"] },
+    { id: "T16", p: "P2", area: "service", title: "Classifier", sub: "definite, likely, broken; flake_score",
+      obj: "Runs every 5 min on new runs. Applies the classification rules, keeps tests.state and flake_score up to date, and builds failure_clusters.",
+      acc: ["A same-hash flip is marked definite", "A run of failures since commit X is marked broken, with X", "Re-running produces the same result"],
+      files: ["crates/aster-results/src/classify.rs"], deps: ["T10"] },
+    { id: "T17", p: "P2", area: "service", title: "Query API", sub: "tests, history, failures",
+      obj: "GET /v1/tests?state=, /v1/tests/:id (30-day history), /v1/runs/:run_id/failures.",
+      acc: ["Paginated", "p95 under 300ms on 30 days of data"],
+      files: ["crates/aster-results/src/api.rs"], deps: ["T16"] },
+    { id: "T18", p: "P2", area: "ci", title: "Retire retry_failed_targets.py", sub: "Cross-repo",
+      obj: "Switch firstlanding lanes to aster --retry-failed=1 with retry_setup for the Postgres reset. Delete the script and its tests.",
+      acc: ["Flaky-on-retry annotations still appear", "The Elixir DB reset still runs before a retry"],
+      files: ["firstlanding: scripts/ci/retry_failed_targets.py", "firstlanding: .github/workflows/ci.yml"], deps: ["T15", "T14"] },
+
+    { id: "T19", p: "P3", area: "client", title: "GitHub step summary + annotations", sub: "aster results summary --github",
+      obj: "In-run report: failures grouped by known flake, new and broken, using /v1/tests when the service is reachable.",
+      acc: ["Works without the service (no known/new labels then)", "One annotation per failing test, with file:line"],
+      files: ["src/cli/results.rs"], deps: ["T17"] },
+    { id: "T20", p: "P3", area: "ci", title: "Merge-queue report from results", sub: "Cross-repo",
+      obj: "merge_queue_failure_report.py reads /v1/runs/:id/failures instead of scraping job logs.",
+      acc: ["Same PR comment content, with flake labels added", "Falls back to log scraping if the run is missing"],
+      files: ["firstlanding: scripts/ci/merge_queue_failure_report.py"], deps: ["T17"] },
+    { id: "T21", p: "P3", area: "service", title: "Dashboard", sub: "Server-rendered HTML behind IAP",
+      obj: "Flaky leaderboard, test history (pass/fail strip by sha), quarantine list, failure clusters.",
+      acc: ["Each page loads in under 1s on 30 days of data", "Links from annotations open the test's page"],
+      files: ["crates/aster-results/src/ui/"], deps: ["T17"] },
+
+    { id: "T22", p: "P4", area: "service", title: "Quarantine store + feed", sub: "Auto entry and release",
+      obj: "Automatically quarantine at 2 definite events from 2 or more runs in 7 days. Release after 20 consecutive passes, or expire at 30 days. GET /v1/quarantine returns a versioned list.",
+      acc: ["Broken tests never quarantined", "Every state change kept in a log table (30 days)"],
+      files: ["crates/aster-results/src/quarantine.rs"], deps: ["T16"] },
+    { id: "T23", p: "P4", area: "client", title: "Quarantine enforcement", sub: "Repo file + server list, the 4 conditions",
+      obj: "Fetch at start (cached for 24h in .aster/quarantine.json), merge with aster-quarantine.toml, apply the 4 suppression conditions, and report passed (quarantined: N).",
+      acc: ["Partial-confidence results never suppressed", "A crash or compile error never suppressed", "ASTER_QUARANTINE=off disables it", "Dependent targets of a quarantine-passed target run"],
+      files: ["src/test_results/quarantine.rs", "src/executor/runner.rs", "src/cli/output.rs"], deps: ["T22", "T15"] },
+    { id: "T26", p: "P4", area: "service", title: "Webhook notifications", sub: "Configured endpoints, HMAC-signed",
+      obj: "Config sets a list of webhook endpoints, each with a URL, a secret and the event types it receives (test.quarantined, test.released, test.expired, test.broken). Deliveries are queued in Postgres and retried with exponential backoff.",
+      acc: ["Payload signed as X-Aster-Signature: sha256=<hmac>", "A failing endpoint never blocks ingest or classification", "Delivery log kept 30 days", "No endpoints configured means nothing is sent"],
+      files: ["crates/aster-results/src/webhooks.rs", "crates/aster-results/src/config.rs"], deps: ["T22"] },
+    { id: "T24", p: "P4", area: "client", title: "Duration-based lane balancing", sub: "Uses p50 test durations",
+      obj: "--lane and mix --partitions split by recorded duration instead of file count, using the duration data from the service.",
+      acc: ["Slowest lane's wall time drops on firstlanding (measured)", "Falls back to the current split when the service is unavailable"],
+      files: ["src/git/lane.rs", "src/plugins/elixir.rs"], deps: ["T17"] },
+    { id: "T25", p: "P4", area: "docs", title: "Docs", sub: "README, GETTING_STARTED, service runbook",
+      obj: "Document capture per runner, the env vars (ASTER_RESULTS_URL, ASTER_QUARANTINE), the quarantine rules and self-hosting.",
+      acc: ["Doc examples run against a fixture workspace"],
+      files: ["README.md", "docs/test-tracking.md"], deps: ["T23"] }
+  ];
+
+  // Shared status lives in the artifact db: status/<task id> = {status, note, pr, updated_at}.
+  let status = {}, notes = {}, canEdit = false, store = null;
+  const ORDER = ["todo", "doing", "done"];
+  (async () => {
+    try {
+      store = await window.claude?.use?.("db");
+      const user = await window.claude?.use?.("user");
+      canEdit = !!(user && user.canEdit && await user.canEdit());
+      if (!store) return;
+      store.collection("status").onSnapshot(snap => {
+        status = {}; notes = {};
+        snap.docs.forEach(d => {
+          const v = d.data() || {};
+          if (v.status && v.status !== "todo") status[d.id] = String(v.status);
+          notes[d.id] = { note: v.note ? String(v.note) : "", pr: v.pr ? String(v.pr) : "", at: v.updated_at ? String(v.updated_at) : "" };
+        });
+        render();
+      }, () => {});
+      render();
+    } catch (e) {}
+  })();
+  const save = async id => {
+    if (!store || !canEdit) return;
+    try { await store.doc("status/" + id).set({ status: status[id] || "todo", note: notes[id]?.note || "", pr: notes[id]?.pr || "", updated_at: new Date().toISOString() }); } catch (e) {}
+  };
+  const AREAS = ["all", "client", "service", "infra", "ci", "docs"];
+  let area = "all", q = "";
+
+  const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const fmt = s => esc(s).replace(/(--[\w.=-]+|\/v1\/[\w/:?=|-]+|[\w-]+\.(?:rs|py|toml|yml|md|ndjson|json)\b|ERL_LIBS|ASTER_[A-Z_]+|ACTIONS_ID_TOKEN_REQUEST_\*)/g, "<code>$1</code>");
+
+  const af = document.getElementById("areaFilters");
+  AREAS.forEach(a => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.type = "button"; b.textContent = a; b.id = "area-" + a;
+    b.setAttribute("aria-pressed", a === area ? "true" : "false");
+    b.addEventListener("click", () => { area = a; af.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", c === b ? "true" : "false")); render(); });
+    af.appendChild(b);
+  });
+  document.getElementById("q").addEventListener("input", e => { q = e.target.value.toLowerCase(); render(); });
+
+  function matches(t) {
+    if (area !== "all" && t.area !== area) return false;
+    if (!q) return true;
+    return [t.id, t.title, t.sub, t.obj, ...t.files, ...t.acc].join(" ").toLowerCase().includes(q);
+  }
+
+  function renderProgress() {
+    const el = document.getElementById("progress");
+    el.innerHTML = PHASES.map(ph => {
+      const ts = T.filter(t => t.p === ph.id);
+      const done = ts.filter(t => status[t.id] === "done").length;
+      const doing = ts.filter(t => status[t.id] === "doing").length;
+      const pct = Math.round(done / ts.length * 100);
+      return `<div class="phase-card"><div class="row"><b>${ph.id} · ${esc(ph.name)}</b><span class="mono">${done}/${ts.length}</span></div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        <div class="row" style="color:var(--muted)"><span>${doing} in progress</span><span>${pct}%</span></div></div>`;
+    }).join("");
+  }
+
+  function render() {
+    const board = document.getElementById("board");
+    const open = new Set([...board.querySelectorAll("details[open]")].map(d => d.dataset.id));
+    let shown = 0;
+    board.innerHTML = PHASES.map(ph => {
+      const ts = T.filter(t => t.p === ph.id && matches(t));
+      shown += ts.length;
+      if (!ts.length) return "";
+      return `<div class="phase"><header><span class="pill accent">${ph.id}</span><h3>${esc(ph.name)}</h3><p>${esc(ph.note)}</p></header>` +
+        ts.map(t => {
+          const s = status[t.id] || "todo";
+          return `<details class="task" data-id="${t.id}" data-status="${s}" ${open.has(t.id) ? "open" : ""}>
+            <summary><span class="tid">${t.id}</span><span class="ttitle">${esc(t.title)}<small>${esc(t.sub)}</small></span>
+              <span class="tags"><span class="pill">${t.area}</span><button type="button" class="status" id="status-${t.id}" data-id="${t.id}" data-s="${s}" aria-label="Status of ${t.id}: ${s}. Click to change.">${s}</button></span></summary>
+            <div class="tbody">${notes[t.id]?.note || notes[t.id]?.pr ? `<div class="callout"><b>Progress${notes[t.id].at ? " · " + esc(notes[t.id].at.slice(0, 10)) : ""}</b><p>${fmt(notes[t.id].note || "")}${notes[t.id].pr ? ` <code>${esc(notes[t.id].pr)}</code>` : ""}</p></div>` : ""}<p>${fmt(t.obj)}</p>
+              <div class="grid2"><div><h4>Acceptance</h4><ul>${t.acc.map(a => `<li>${fmt(a)}</li>`).join("")}</ul></div>
+              <div><h4>Files</h4><ul>${t.files.map(f => `<li><code>${esc(f)}</code></li>`).join("")}</ul>
+              <h4 style="margin-top:12px">Depends on</h4><p class="mono">${t.deps.length ? t.deps.join(", ") : "nothing"}</p></div></div>
+            </div></details>`;
+        }).join("") + "</div>";
+    }).join("");
+    document.getElementById("empty").hidden = shown > 0;
+    renderProgress();
+  }
+
+  document.getElementById("board").addEventListener("click", e => {
+    const b = e.target.closest(".status");
+    if (!b) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!canEdit) return;
+    const id = b.dataset.id;
+    const next = ORDER[(ORDER.indexOf(status[id] || "todo") + 1) % ORDER.length];
+    if (next === "todo") delete status[id]; else status[id] = next;
+    save(id); render();
+    const nb = document.getElementById("status-" + id); if (nb) nb.focus();
+  });
+
+  render();
+})();
+</script>

@@ -29,9 +29,9 @@ fn quote_command_argument(value: &str) -> String {
 }
 
 /// A command split into arguments, with the index of its program.
-struct Argv {
-    parts: Vec<String>,
-    program: usize,
+pub(super) struct Argv {
+    pub(super) parts: Vec<String>,
+    pub(super) program: usize,
 }
 
 fn is_assignment(value: &str) -> bool {
@@ -43,7 +43,7 @@ fn is_assignment(value: &str) -> bool {
 }
 
 impl Argv {
-    fn parse(command: &str) -> Option<Self> {
+    pub(super) fn parse(command: &str) -> Option<Self> {
         if command.contains("{files}") || command.contains('`') || command.contains("$(") {
             return None;
         }
@@ -77,6 +77,26 @@ impl Argv {
             .chain(add.iter().map(|a| quote_command_argument(a)))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The command with `add` inserted before the argument at `at` (or
+    /// appended when `at` is past the end).
+    pub(super) fn render_inserting(&self, at: usize, add: &[String]) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(self.parts.len() + add.len());
+        for (i, part) in self.parts.iter().enumerate() {
+            if i == at {
+                parts.extend(add.iter().map(|a| quote_command_argument(a)));
+            }
+            parts.push(if i < self.program {
+                part.clone()
+            } else {
+                quote_command_argument(part)
+            });
+        }
+        if at >= self.parts.len() {
+            parts.extend(add.iter().map(|a| quote_command_argument(a)));
+        }
+        parts.join(" ")
     }
 
     /// Indexes after `from` of arguments that are not options or option

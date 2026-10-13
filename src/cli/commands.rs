@@ -81,6 +81,22 @@ pub struct Cli {
     /// Disable caching, force re-run of all targets
     #[arg(long, global = true)]
     pub no_cache: bool,
+
+    /// Record every test the run executes and write the results as NDJSON
+    ///
+    /// Aster reads each test runner's own report: pytest, Gradle, Maven and
+    /// go test. Give a path with `--test-results=PATH`; without one the file
+    /// goes under $RUNNER_TEMP (or the system temp directory) and its path
+    /// is printed. Setting ASTER_TEST_RESULTS to a path, or to 1, does the
+    /// same.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub test_results: Option<Option<std::path::PathBuf>>,
 }
 
 impl Cli {
@@ -100,6 +116,24 @@ impl Cli {
     /// Check if full logs should be shown for failures
     pub fn full_logs(&self) -> bool {
         self.full_logs
+    }
+
+    /// Where to write test results, from `--test-results` or else
+    /// `ASTER_TEST_RESULTS`. `None` turns recording off; `Some(None)` means
+    /// the default location.
+    pub fn test_results(&self) -> Option<Option<std::path::PathBuf>> {
+        if self.test_results.is_some() {
+            return self.test_results.clone();
+        }
+        test_results_from_env(std::env::var("ASTER_TEST_RESULTS").ok().as_deref())
+    }
+}
+
+fn test_results_from_env(value: Option<&str>) -> Option<Option<std::path::PathBuf>> {
+    match value.map(str::trim) {
+        None | Some("" | "0" | "false" | "off") => None,
+        Some("1" | "true" | "on") => Some(None),
+        Some(path) => Some(Some(std::path::PathBuf::from(path))),
     }
 }
 
@@ -437,6 +471,36 @@ pub enum ProjectCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_results_flag_takes_an_optional_path() {
+        let cli = Cli::try_parse_from(["aster", "affected", "test", "--test-results"]).unwrap();
+        assert_eq!(cli.test_results, Some(None));
+
+        let cli = Cli::try_parse_from(["aster", "--test-results=out/r.ndjson", "list"]).unwrap();
+        assert_eq!(
+            cli.test_results,
+            Some(Some(std::path::PathBuf::from("out/r.ndjson")))
+        );
+
+        // A following word is never taken as the path.
+        let cli = Cli::try_parse_from(["aster", "--test-results", "list"]).unwrap();
+        assert_eq!(cli.test_results, Some(None));
+        assert!(matches!(cli.command, Some(Commands::List { .. })));
+    }
+
+    #[test]
+    fn test_results_env_value() {
+        assert_eq!(test_results_from_env(None), None);
+        for off in ["", "0", "false", "off"] {
+            assert_eq!(test_results_from_env(Some(off)), None, "{off}");
+        }
+        assert_eq!(test_results_from_env(Some("1")), Some(None));
+        assert_eq!(
+            test_results_from_env(Some("/tmp/r.ndjson")),
+            Some(Some(std::path::PathBuf::from("/tmp/r.ndjson")))
+        );
+    }
 
     #[test]
     fn services_up_accepts_zero_or_one_group() {

@@ -252,6 +252,13 @@ impl LanguagePlugin for GoPlugin {
         Some(format!("{}{}", base_command, test_dirs.join(" ")))
     }
 
+    fn test_report_plan(
+        &self,
+        ctx: &crate::test_results::ReportContext,
+    ) -> Option<crate::test_results::ReportPlan> {
+        super::test_reports::go(ctx)
+    }
+
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
         // deps target only cares about dependency specification files,
         // not source code — source changes shouldn't re-download modules

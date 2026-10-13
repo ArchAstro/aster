@@ -104,6 +104,67 @@ pub struct TargetResult {
     /// Output (stdout + stderr)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Per-test results, when the run recorded them
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests: Option<TestSummary>,
+}
+
+/// The tests one target ran, from `--test-results`
+#[derive(Debug, Clone, Serialize)]
+pub struct TestSummary {
+    /// How the results were captured (e.g. "junit", "go-json")
+    pub capture: String,
+    /// "complete", or "partial" when some tests may be missing
+    pub confidence: aster_results_model::Confidence,
+    /// Test attempts reported
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    /// The attempts that failed or errored
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<FailedTest>,
+}
+
+/// One failed test attempt
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedTest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub attempt: u32,
+}
+
+fn test_summary(report: &crate::test_results::TestReport) -> TestSummary {
+    use crate::test_results::TestOutcome;
+    let count = |outcome: TestOutcome| {
+        report
+            .cases
+            .iter()
+            .filter(|case| case.outcome == outcome)
+            .count()
+    };
+    TestSummary {
+        capture: report.capture.clone(),
+        confidence: report.confidence,
+        total: report.cases.len(),
+        passed: count(TestOutcome::Pass),
+        failed: report.failures(),
+        skipped: count(TestOutcome::Skip),
+        failures: report
+            .cases
+            .iter()
+            .filter(|case| case.outcome.is_failure())
+            .map(|case| FailedTest {
+                name: case.name.clone(),
+                suite: case.suite.clone(),
+                file: case.file.clone(),
+                attempt: case.attempt,
+            })
+            .collect(),
+    }
 }
 
 /// Summary of execution results
@@ -219,6 +280,7 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
                 } else {
                     Some(r.output.clone())
                 },
+                tests: r.tests.as_ref().map(test_summary),
             }
         })
         .collect();
@@ -345,6 +407,9 @@ mod tests {
                 cached: false,
                 output: "test output".to_string(),
                 duration_ms: 100,
+                exit_code: None,
+                tests: None,
+                input_hash: None,
             },
             ExecutionResult {
                 address: "//b:test".to_string(),
@@ -353,6 +418,9 @@ mod tests {
                 cached: false,
                 output: "error".to_string(),
                 duration_ms: 50,
+                exit_code: None,
+                tests: None,
+                input_hash: None,
             },
             ExecutionResult {
                 address: "//c:test".to_string(),
@@ -361,6 +429,9 @@ mod tests {
                 cached: false,
                 output: "".to_string(),
                 duration_ms: 0,
+                exit_code: None,
+                tests: None,
+                input_hash: None,
             },
         ];
 
@@ -375,5 +446,52 @@ mod tests {
         assert_eq!(output.results[0].status, "passed");
         assert_eq!(output.results[1].status, "failed");
         assert_eq!(output.results[2].status, "skipped");
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json["results"][0].get("tests").is_none());
+    }
+
+    #[test]
+    fn json_output_summarizes_recorded_tests() {
+        use crate::test_results::{Confidence, TestCase, TestOutcome, TestReport};
+        let case = |name: &str, outcome| TestCase {
+            file: Some("t.py".to_string()),
+            suite: Some("tests.t".to_string()),
+            name: name.to_string(),
+            outcome,
+            attempt: 1,
+            duration_ms: None,
+            message: Some("boom".to_string()),
+        };
+        let result = ExecutionResult {
+            address: "//a:test".to_string(),
+            success: false,
+            skipped: false,
+            cached: false,
+            output: String::new(),
+            duration_ms: 1,
+            exit_code: Some(1),
+            tests: Some(TestReport {
+                capture: "junit".to_string(),
+                confidence: Confidence::Partial,
+                cases: vec![
+                    case("a", TestOutcome::Pass),
+                    case("b", TestOutcome::Fail),
+                    case("c", TestOutcome::Error),
+                    case("d", TestOutcome::Skip),
+                ],
+            }),
+            input_hash: None,
+        };
+        let json = serde_json::to_value(build_execution_output(&[result])).unwrap();
+        let tests = &json["results"][0]["tests"];
+        assert_eq!(tests["capture"], "junit");
+        assert_eq!(tests["confidence"], "partial");
+        assert_eq!(tests["total"], 4);
+        assert_eq!(tests["passed"], 1);
+        assert_eq!(tests["failed"], 2);
+        assert_eq!(tests["skipped"], 1);
+        assert_eq!(tests["failures"][0]["name"], "b");
+        assert_eq!(tests["failures"][1]["suite"], "tests.t");
+        assert!(tests["failures"][0].get("message").is_none());
     }
 }
