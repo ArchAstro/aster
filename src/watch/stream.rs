@@ -307,9 +307,18 @@ mod tests {
         let target = mk_target(script_path.to_str().unwrap());
         sup.spawn("//a:dev", &target, dir.path()).unwrap();
         // Wait until the child confirms that the trap handler is installed.
+        // Only shutdown is timed below, so this wait is generous: on a busy
+        // machine a fresh shell can take seconds to reach its first line,
+        // and a tight deadline here failed the test without any fault in
+        // the supervisor.
         let ready = dir.path().join("ready");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !ready.exists() && std::time::Instant::now() < deadline {
+            let exited = sup.reap();
+            assert!(
+                exited.is_empty(),
+                "child exited before installing its signal handler: {exited:?}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists(), "child never installed its signal handler");
