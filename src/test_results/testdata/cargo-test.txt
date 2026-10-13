@@ -1,0 +1,43 @@
+
+running 3 tests
+test tests::later ... ignored
+test tests::adds ... ok
+test tests::divides ... FAILED
+
+failures:
+
+---- tests::divides stdout ----
+some captured output
+
+thread 'tests::divides' (1) panicked at src/lib.rs:16:9:
+assertion `left == right` failed: division is off
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::divides
+
+test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test adds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test src/lib.rs - add (line 3) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.30s; merged doctests compilation took 0.15s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/lib.rs (target/debug/deps/demo-7cc6f4f0b0b6f6dc)
+error: test failed, to rerun pass `--lib`
+     Running tests/api.rs (target/debug/deps/api-15d9b7efe2ddf411)
+   Doc-tests demo
+error: 1 target failed:
+    `--lib`

@@ -434,7 +434,7 @@ const JS_VALUE_FLAGS: &[&str] = &[
 
 /// Where a JavaScript runner's own arguments start, if `argv` runs one
 /// directly: `vitest run`, `pnpm exec jest`, `bun test`, `node --test`.
-fn js_runner(argv: &Argv) -> Option<usize> {
+pub(super) fn js_runner(argv: &Argv) -> Option<usize> {
     let parts = &argv.parts[argv.program..];
     let name = |part: &str| {
         Path::new(part)
@@ -474,7 +474,7 @@ fn js_runner(argv: &Argv) -> Option<usize> {
 }
 
 /// The package script a command runs: `npm test`, `pnpm run test:unit`.
-fn js_script(argv: &Argv) -> Option<&str> {
+pub(super) fn js_script(argv: &Argv) -> Option<&str> {
     let parts: Vec<&str> = argv.parts[argv.program..]
         .iter()
         .map(String::as_str)

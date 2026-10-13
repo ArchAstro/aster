@@ -616,6 +616,7 @@ impl<'a> Executor<'a> {
                     &target_name,
                     &command,
                     project,
+                    project_map,
                     plugin_registry,
                     input_hashes,
                     env_snapshot,
@@ -1229,16 +1230,42 @@ fn check_cache(
 /// and its dependencies' hashes. A dependency without a hash leaves the
 /// target without one: a hash that missed a changed dependency would make a
 /// real failure look like a flake.
+///
+/// A command that runs in another project's directory, through the
+/// target's `working_dir` or a one-liner such as
+/// `bash -c 'cd ../platform && exec mix test'`, runs that project's tests,
+/// so that project's test inputs are hashed too. When the directory is not
+/// a known project the target gets no hash.
+#[allow(clippy::too_many_arguments)]
 fn test_input_hash(
     target_addr: &str,
     target_name: &str,
     command: &str,
     project: &DiscoveredProject,
+    project_map: &HashMap<String, &DiscoveredProject>,
     plugin_registry: &PluginRegistry,
     input_hashes: &Mutex<HashMap<String, String>>,
     env_snapshot: &HashMap<String, String>,
 ) -> Option<String> {
     let target = project.targets.get(target_name)?;
+    let elsewhere = tests_run_elsewhere(project, target, command, project_map)?;
+    let elsewhere_hash = match elsewhere {
+        Some(other) => {
+            let other_plugin = plugin_registry.find_by_name(&other.plugin_name)?;
+            Some(
+                CacheHasher::new(&other.root)
+                    .compute_hash(
+                        &other_plugin.cache_inputs("test"),
+                        None,
+                        "",
+                        &[],
+                        env_snapshot,
+                    )
+                    .ok()?,
+            )
+        }
+        None => None,
+    };
     let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
     let mut inputs = plugin.cache_inputs(target_name);
     let test_inputs = plugin.cache_inputs("test");
@@ -1255,11 +1282,12 @@ fn test_input_hash(
     }
     let hash = {
         let hashes = input_hashes.lock().ok()?;
-        let dependencies: Vec<&str> = target
+        let mut dependencies: Vec<&str> = target
             .depends_on
             .iter()
             .map(|dependency| hashes.get(dependency).map(String::as_str))
             .collect::<Option<_>>()?;
+        dependencies.extend(elsewhere_hash.as_deref());
         CacheHasher::new(&project.root)
             .compute_hash(
                 &inputs,
@@ -1275,6 +1303,48 @@ fn test_input_hash(
         .ok()?
         .insert(target_addr.to_string(), hash.clone());
     Some(hash)
+}
+
+/// The project whose tests a target's command runs when that is not the
+/// target's own project. `Some(None)`: the command runs in its own project.
+/// `None`: it runs in a directory that is no known project.
+fn tests_run_elsewhere<'p>(
+    project: &DiscoveredProject,
+    target: &crate::plugins::Target,
+    command: &str,
+    project_map: &HashMap<String, &'p DiscoveredProject>,
+) -> Option<Option<&'p DiscoveredProject>> {
+    let mut dir = target
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| project.root.clone());
+    if let Some(cd) = crate::plugins::related_tests::Delegated::parse(command).and_then(|d| d.dir) {
+        dir = dir.join(cd);
+    }
+    let canonical = |path: &Path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| {
+            // Resolve `..` by hand for a path that does not exist.
+            let mut normal = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        normal.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => normal.push(other),
+                }
+            }
+            normal
+        })
+    };
+    let dir = canonical(&dir);
+    if dir == canonical(&project.root) {
+        return Some(None);
+    }
+    project_map
+        .values()
+        .find(|other| canonical(&other.root) == dir)
+        .map(|other| Some(*other))
 }
 
 fn is_default_cacheable_target(target_name: &str) -> bool {
@@ -1314,7 +1384,7 @@ impl Invocation {
             shown: command.to_string(),
             command: plan.command.clone(),
             env: plan.env.clone(),
-            keep_output: plan.files == ReportFiles::Stdout,
+            keep_output: plan.files == ReportFiles::Stdout || plan.format.reads_console(),
             rewrite: plan.rewrite,
         }
     }
@@ -1367,7 +1437,10 @@ fn plan_captures(
                 command,
                 report_dir: &report_dir,
             };
-            match plugin.test_report_plan(&context) {
+            match plugin
+                .test_report_plan(&context)
+                .or_else(|| crate::plugins::test_reports::recognise(&context))
+            {
                 Some(plan) => Some((plan, report_dir)),
                 None => {
                     let _ = std::fs::remove_dir_all(&report_dir);
@@ -1869,6 +1942,40 @@ mod tests {
             build_system: None,
             relative_path: PathBuf::from(relative_path),
         }
+    }
+
+    #[test]
+    fn tests_run_elsewhere_follows_cd_and_working_dir() {
+        // Paths that do not exist compare as written.
+        let shard = make_project_with_targets("services/shard", HashMap::new());
+        let platform = make_project_with_targets("services/platform", HashMap::new());
+        let map: HashMap<String, &DiscoveredProject> = [
+            ("//services/shard".to_string(), &shard),
+            ("//services/platform".to_string(), &platform),
+        ]
+        .into_iter()
+        .collect();
+        let plain = target("mix test", vec![]);
+
+        let own = tests_run_elsewhere(&shard, &plain, "mix test", &map);
+        assert!(matches!(own, Some(None)));
+
+        let cd = "bash -c 'cd ../platform && MIX_TEST_PARTITION=1 exec mix test'";
+        let other = tests_run_elsewhere(&shard, &plain, cd, &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.root, platform.root);
+
+        let mut moved = plain.clone();
+        moved.working_dir = Some(platform.root.clone());
+        let other = tests_run_elsewhere(&shard, &moved, "mix test", &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.root, platform.root);
+
+        // A directory that is no project leaves the target without a hash.
+        let unknown = "bash -c 'cd ../somewhere && exec mix test'";
+        assert!(tests_run_elsewhere(&shard, &plain, unknown, &map).is_none());
     }
 
     #[test]
@@ -2565,6 +2672,7 @@ mod tests {
                 format: crate::test_results::ReportFormat::JUnitXml,
                 confidence: Confidence::Complete,
                 rewrite: None,
+                relative_to: None,
             })
         }
     }
