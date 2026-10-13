@@ -469,7 +469,9 @@ pub enum ResultsCommands {
     /// Send a results file written by `--test-results` to aster-srv
     ///
     /// In GitHub Actions the job's OIDC token is used (the job needs
-    /// `permissions: id-token: write`); elsewhere set ASTER_SRV_TOKEN. A
+    /// `permissions: id-token: write`); elsewhere set ASTER_SRV_TOKEN. Behind
+    /// an identity-aware proxy, ASTER_SRV_PROXY_TOKEN is sent as
+    /// `Proxy-Authorization`. A
     /// failed upload is reported but exits 0 unless --strict, so it never
     /// fails a build.
     Upload {

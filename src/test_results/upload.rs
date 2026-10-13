@@ -4,6 +4,10 @@
 //! audience (the job needs `permissions: id-token: write`). Elsewhere
 //! `ASTER_SRV_TOKEN` supplies a static token. Uploading is best effort for
 //! the build: callers report a failure and carry on.
+//!
+//! When the server sits behind an identity-aware proxy (Google IAP),
+//! `ASTER_SRV_PROXY_TOKEN` carries the proxy's credential in
+//! `Proxy-Authorization`, leaving `Authorization` for the server's own.
 
 use std::io::Write;
 use std::path::Path;
@@ -96,11 +100,17 @@ fn bearer(agent: &ureq::Agent, credentials: &Credentials) -> Result<String> {
     }
 }
 
-/// Upload the NDJSON file at `path` to the server at `server_url`.
+/// Upload the NDJSON file at `path` to the server at `server_url`, with
+/// `proxy_token` (if any) in `Proxy-Authorization`.
 ///
 /// A network error, 429 or 5xx is retried twice, after 1 and 3 seconds.
 /// Any other refusal is returned with the server's reason.
-pub fn upload(server_url: &str, path: &Path, credentials: &Credentials) -> Result<Receipt> {
+pub fn upload(
+    server_url: &str,
+    path: &Path,
+    credentials: &Credentials,
+    proxy_token: Option<&str>,
+) -> Result<Receipt> {
     let ndjson = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&ndjson)?;
@@ -114,12 +124,15 @@ pub fn upload(server_url: &str, path: &Path, credentials: &Credentials) -> Resul
         if wait > 0 {
             std::thread::sleep(Duration::from_secs(wait));
         }
-        let response = agent
+        let mut request = agent
             .post(&url)
             .header("Authorization", &format!("Bearer {token}"))
             .header("Content-Type", "application/x-ndjson")
-            .header("Content-Encoding", "gzip")
-            .send(&body[..]);
+            .header("Content-Encoding", "gzip");
+        if let Some(proxy) = proxy_token {
+            request = request.header("Proxy-Authorization", &format!("Bearer {proxy}"));
+        }
+        let response = request.send(&body[..]);
         match response {
             Ok(mut response) if response.status().is_success() => {
                 return response
@@ -249,6 +262,7 @@ mod tests {
             &url,
             results_file().path(),
             &Credentials::Static("secret".into()),
+            Some("iap-jwt"),
         )
         .unwrap();
         assert_eq!(
@@ -264,6 +278,7 @@ mod tests {
         assert!(head.starts_with("post /v1/test-results/runs"), "{head}");
         assert!(head.contains("authorization: bearer secret"));
         assert!(head.contains("content-encoding: gzip"));
+        assert!(head.contains("proxy-authorization: bearer iap-jwt"));
     }
 
     #[test]
@@ -279,6 +294,7 @@ mod tests {
             &url,
             results_file().path(),
             &Credentials::Static("t".into()),
+            None,
         )
         .unwrap();
         assert!(receipt.duplicate);
@@ -295,6 +311,7 @@ mod tests {
             &url,
             results_file().path(),
             &Credentials::Static("t".into()),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -320,7 +337,7 @@ mod tests {
             request_token: "request".into(),
             audience: "aster-srv".into(),
         };
-        upload(&url, results_file().path(), &credentials).unwrap();
+        upload(&url, results_file().path(), &credentials, None).unwrap();
         let seen = server.join().unwrap();
         let token_request = seen[0].to_ascii_lowercase();
         assert!(
@@ -331,5 +348,9 @@ mod tests {
         assert!(seen[1]
             .to_ascii_lowercase()
             .contains("authorization: bearer oidc-jwt"));
+        assert!(
+            !seen[1].to_ascii_lowercase().contains("proxy-authorization"),
+            "no proxy token, no proxy header"
+        );
     }
 }
