@@ -157,6 +157,210 @@ fn terminate_aster(child: &mut std::process::Child) {
     assert_eq!(status.code(), Some(143));
 }
 
+/// Owns one dynamic-port supervisor and the service group it starts.
+///
+/// Drop terminates that group and removes only this fixture's allocation
+/// manifests, including when an assertion panics. It does not call
+/// `services kill-ports`, which would terminate unrelated listeners.
+struct OwnedBundle {
+    child: std::process::Child,
+    lease_dir: std::path::PathBuf,
+    released: bool,
+}
+
+impl OwnedBundle {
+    fn launch(root: &Path, lease_dir: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .args(["services", "up", "--no-ui", "--no-watch"])
+            .current_dir(root)
+            .env("ASTER_PORT_LEASE_DIR", lease_dir)
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(
+            is_process_group_leader(child.id()),
+            "fixture supervisor {} was not placed in its own process group",
+            child.id()
+        );
+        Self {
+            child,
+            lease_dir: lease_dir.to_path_buf(),
+            released: false,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        self.signal_group(libc::SIGTERM);
+        let status = self.child.wait().unwrap();
+        assert_eq!(status.code(), Some(143));
+        self.finish_group();
+        self.released = true;
+    }
+
+    fn signal_group(&self, signal: i32) {
+        let pid = self.child.id() as i32;
+        // process_group(0) ignores a failed setpgid and still spawns. Never
+        // signal a negative ID unless this child is that group's leader.
+        let target = if is_process_group_leader(self.child.id()) {
+            -pid
+        } else {
+            pid
+        };
+        unsafe {
+            libc::kill(target, signal);
+        }
+    }
+
+    fn finish_group(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && process_group_exists(self.child.id() as i32) {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if process_group_exists(self.child.id() as i32) {
+            self.signal_group(libc::SIGKILL);
+            let force_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < force_deadline && process_group_exists(self.child.id() as i32) {
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+        remove_fixture_manifests(&self.lease_dir, self.child.id());
+    }
+}
+
+impl Drop for OwnedBundle {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.signal_group(libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            self.signal_group(libc::SIGKILL);
+            let _ = self.child.wait();
+        }
+        self.finish_group();
+    }
+}
+
+fn is_process_group_leader(pid: u32) -> bool {
+    let pid = pid as i32;
+    unsafe { libc::getpgid(pid) == pid }
+}
+
+fn process_group_exists(pgid: i32) -> bool {
+    if !is_process_group_leader(pgid as u32) {
+        return false;
+    }
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result == 0 {
+        return true;
+    }
+    // EPERM means some member of the group is still alive.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn remove_fixture_manifests(lease_dir: &Path, supervisor_pid: u32) {
+    let prefix = format!("allocation-{supervisor_pid}-");
+    let Ok(entries) = fs::read_dir(lease_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".json") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+struct OwnedExternalListener {
+    child: std::process::Child,
+    released: bool,
+}
+
+impl OwnedExternalListener {
+    fn spawn(port: u16) -> Self {
+        let child = Command::new("python3")
+            .args([
+                "-c",
+                "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',int(__import__('sys').argv[1]))); s.listen(); time.sleep(60)",
+                &port.to_string(),
+            ])
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            is_process_group_leader(child.id()),
+            "external listener {} was not placed in its own process group",
+            child.id()
+        );
+        Self {
+            child,
+            released: false,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let pid = self.child.id() as i32;
+        let target = if is_process_group_leader(self.child.id()) {
+            -pid
+        } else {
+            pid
+        };
+        unsafe {
+            libc::kill(target, libc::SIGTERM);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for OwnedExternalListener {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn hold_port_lock(lease_dir: &Path, port: u16) -> fs::File {
+    fs::create_dir_all(lease_dir).unwrap();
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lease_dir.join(format!("{port}.lock")))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&file).unwrap();
+    file
+}
+
 #[test]
 fn services_kill_ports_previews_then_clears_configured_listener() {
     let temp = tempfile::tempdir().unwrap();
@@ -271,16 +475,7 @@ stream = true
     )
     .unwrap();
 
-    let launch = || {
-        Command::new(env!("CARGO_BIN_EXE_aster"))
-            .args(["services", "up", "--no-ui", "--no-watch"])
-            .current_dir(root)
-            .env("ASTER_PORT_LEASE_DIR", &lease_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
+    let launch = || OwnedBundle::launch(root, &lease_dir);
 
     let events = root.join("events.log");
     let mut first = launch();
@@ -346,7 +541,7 @@ stream = true
     assert!(human_ports.contains(&start.to_string()));
     assert!(human_ports.contains(&(start + 1).to_string()));
 
-    terminate_aster(&mut first);
+    first.terminate();
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_err()
             && allocation_manifest_count(&lease_dir) == 1
@@ -359,8 +554,8 @@ stream = true
             && TcpStream::connect(("127.0.0.1", start)).is_ok()
     });
 
-    terminate_aster(&mut third);
-    terminate_aster(&mut second);
+    third.terminate();
+    second.terminate();
     wait_until(Duration::from_secs(5), || {
         TcpStream::connect(("127.0.0.1", start)).is_err()
             && TcpStream::connect(("127.0.0.1", start + 1)).is_err()
@@ -376,6 +571,59 @@ stream = true
     assert!(empty_ports.status.success());
     let report: serde_json::Value = serde_json::from_slice(&empty_ports.stdout).unwrap();
     assert!(report["instances"].as_array().unwrap().is_empty());
+
+    // Occupied preferred port: an external listener must survive, and the
+    // supervisor must take the next collision-free bundle instead.
+    let mut external = OwnedExternalListener::spawn(start);
+    let external_pid = external.id();
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", start)).is_ok()
+    });
+    let before_shift = occurrences(&events, &format!("{}:{}", start + 1, derived_start + 1));
+    let mut occupied_bundle = launch();
+    wait_until(Duration::from_secs(20), || {
+        occurrences(&events, &format!("{}:{}", start + 1, derived_start + 1)) > before_shift
+            && TcpStream::connect(("127.0.0.1", start + 1)).is_ok()
+    });
+    assert!(process_is_running(external_pid as i32));
+    occupied_bundle.terminate();
+    assert!(process_is_running(external_pid as i32));
+    assert!(TcpStream::connect(("127.0.0.1", start)).is_ok());
+    external.release();
+
+    // Interruption: dropping the owner before an explicit terminate still
+    // reaps the supervisor group and this fixture's manifests.
+    let interrupted = launch();
+    let interrupted_pid = interrupted.id();
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", start)).is_ok()
+            && allocation_manifest_count(&lease_dir) == 1
+    });
+    drop(interrupted);
+    wait_until(Duration::from_secs(5), || {
+        !process_is_running(interrupted_pid as i32)
+            && !process_group_exists(interrupted_pid as i32)
+            && TcpStream::connect(("127.0.0.1", start)).is_err()
+            && TcpStream::connect(("127.0.0.1", start + 1)).is_err()
+            && allocation_manifest_count(&lease_dir) == 0
+    });
+
+    // WouldBlock: a held exclusive lock is a collision, not a fatal lease error.
+    let held = hold_port_lock(&lease_dir, start);
+    let mut blocked = launch();
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", start + 1)).is_ok()
+            && allocation_manifest_count(&lease_dir) == 1
+    });
+    assert!(blocked.try_wait().unwrap().is_none());
+    assert!(TcpStream::connect(("127.0.0.1", start)).is_err());
+    blocked.terminate();
+    drop(held);
+    let mut after_release = launch();
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", start)).is_ok()
+    });
+    after_release.terminate();
 }
 
 #[test]
