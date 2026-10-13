@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 mod hasher;
 pub mod matcher;
@@ -13,6 +14,31 @@ mod store;
 pub use hasher::CacheHasher;
 pub use matcher::TargetInputMatcher;
 pub use store::CacheStore;
+
+/// Environment variable that overrides the cache directory.
+///
+/// A relative value is joined to the workspace root. An absolute value is
+/// used as-is. `--cache-dir` is exported into this variable before any thread
+/// or child process starts, so it is the single source of truth.
+pub const CACHE_DIR_ENV: &str = "ASTER_CACHE_DIR";
+
+/// Resolve the directory that holds `cache.json` and `cache.lock`.
+///
+/// Order: `ASTER_CACHE_DIR` (relative paths joined to `workspace_root`) >
+/// `<workspace>/.aster/cache`.
+pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
+    match std::env::var_os(CACHE_DIR_ENV) {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        }
+        _ => workspace_root.join(".aster").join("cache"),
+    }
+}
 
 /// Entry in the cache for a single target
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,9 +51,74 @@ pub struct CacheEntry {
     pub success: bool,
 }
 
-/// Complete cache state stored in .aster/cache.json
+/// Complete cache state stored in the resolved cache directory's cache.json.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheState {
     /// Map of target address to cache entry
     pub targets: HashMap<String, CacheEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// `ASTER_CACHE_DIR` is process-global, so resolver tests share one lock.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn resolve_cache_dir_defaults_to_workspace_aster_cache() {
+        let _guard = env_lock();
+        let previous = std::env::var_os(CACHE_DIR_ENV);
+        std::env::remove_var(CACHE_DIR_ENV);
+
+        let workspace = Path::new("/workspace");
+        assert_eq!(
+            resolve_cache_dir(workspace),
+            workspace.join(".aster").join("cache")
+        );
+
+        restore_env(previous);
+    }
+
+    #[test]
+    fn resolve_cache_dir_joins_relative_env_to_workspace_root() {
+        let _guard = env_lock();
+        let previous = std::env::var_os(CACHE_DIR_ENV);
+        std::env::set_var(CACHE_DIR_ENV, "shared/cache");
+
+        let workspace = Path::new("/workspace");
+        assert_eq!(
+            resolve_cache_dir(workspace),
+            workspace.join("shared").join("cache")
+        );
+
+        restore_env(previous);
+    }
+
+    #[test]
+    fn resolve_cache_dir_keeps_absolute_env_path() {
+        let _guard = env_lock();
+        let previous = std::env::var_os(CACHE_DIR_ENV);
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp\aster-cache")
+        } else {
+            PathBuf::from("/tmp/aster-cache")
+        };
+        std::env::set_var(CACHE_DIR_ENV, &absolute);
+
+        assert_eq!(resolve_cache_dir(Path::new("/workspace")), absolute);
+
+        restore_env(previous);
+    }
+
+    fn restore_env(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(CACHE_DIR_ENV, value),
+            None => std::env::remove_var(CACHE_DIR_ENV),
+        }
+    }
 }

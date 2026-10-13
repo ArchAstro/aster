@@ -82,6 +82,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_cache: bool,
 
+    /// Directory for cache.json and cache.lock
+    ///
+    /// Overrides `ASTER_CACHE_DIR`. A relative path is resolved against the
+    /// current working directory. The default is `<workspace>/.aster/cache`.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub cache_dir: Option<std::path::PathBuf>,
+
     /// Record every test the run executes and write the results as NDJSON
     ///
     /// Aster reads each test runner's own report: ExUnit (mix test), go

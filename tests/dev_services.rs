@@ -1461,7 +1461,7 @@ stream = true
     let status = aster.wait().unwrap();
     assert_eq!(status.code(), Some(143));
     assert_eq!(occurrences(&events, "SERVICE_STARTED"), 0);
-    assert!(!fs::read_to_string(root.join(".aster/cache.json"))
+    assert!(!fs::read_to_string(root.join(".aster/cache/cache.json"))
         .unwrap_or_default()
         .contains("//app:prepare"));
 }

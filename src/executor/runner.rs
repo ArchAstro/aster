@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::Utc;
 use console::style;
 
-use crate::cache::{CacheEntry, CacheHasher, CacheStore};
+use crate::cache::{resolve_cache_dir, CacheEntry, CacheHasher, CacheStore};
 use crate::cli::OutputMode;
 use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
@@ -91,6 +91,8 @@ pub struct Executor<'a> {
     full_logs: bool,
     /// Whether to use caching
     use_cache: bool,
+    /// Directory holding `cache.json` and `cache.lock`, resolved once.
+    cache_dir: PathBuf,
     /// Whether child targets should receive a closed stdin.
     ///
     /// Captured execution always uses a closed stdin so tools that prompt on a
@@ -115,6 +117,7 @@ impl<'a> Executor<'a> {
             output_mode: OutputMode::Normal,
             full_logs: false,
             use_cache: true,
+            cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
@@ -128,6 +131,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs: false,
             use_cache: true,
+            cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
@@ -145,6 +149,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache: true,
+            cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
@@ -163,6 +168,7 @@ impl<'a> Executor<'a> {
             output_mode,
             full_logs,
             use_cache,
+            cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
@@ -417,7 +423,7 @@ impl<'a> Executor<'a> {
         progress.set_total(targets_to_run.len());
 
         let cache_store = if self.use_cache {
-            Some(CacheStore::new(self.workspace_root))
+            Some(CacheStore::new(&self.cache_dir))
         } else {
             None
         };
@@ -736,7 +742,7 @@ impl<'a> Executor<'a> {
                 .collect();
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
-            let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
+            let cache_store_path = cache_store.map(|_| self.cache_dir.clone());
             let command_clone = command.clone();
             let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
@@ -814,8 +820,8 @@ impl<'a> Executor<'a> {
                 }
 
                 if !result.success {
-                    if let Some(workspace_root) = cache_store_path.as_ref() {
-                        let store = CacheStore::new(workspace_root);
+                    if let Some(cache_dir) = cache_store_path.as_ref() {
+                        let store = CacheStore::new(cache_dir);
                         if let Err(e) = store.remove(&addr) {
                             eprintln!(
                                 "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
@@ -825,7 +831,7 @@ impl<'a> Executor<'a> {
                 } else {
                     // Update cache only when the preflight cache policy
                     // produced a hash for this target.
-                    if let (Some(workspace_root), Some(preflight_hash)) =
+                    if let (Some(cache_dir), Some(preflight_hash)) =
                         (cache_store_path.as_ref(), cache_hash)
                     {
                         let plugin_registry = PluginRegistry::with_all_plugins();
@@ -854,7 +860,7 @@ impl<'a> Executor<'a> {
                                         let mut hashes = computed_hashes_clone.lock().unwrap();
                                         hashes.insert(addr.clone(), postflight_hash.clone());
                                     }
-                                    let store = CacheStore::new(workspace_root);
+                                    let store = CacheStore::new(cache_dir);
                                     let entry = CacheEntry {
                                         hash: postflight_hash,
                                         timestamp: Utc::now().to_rfc3339(),
@@ -870,7 +876,7 @@ impl<'a> Executor<'a> {
                                     // An unstable or unhashable execution may
                                     // have changed outputs. Do not leave an old
                                     // entry available for a future false hit.
-                                    let store = CacheStore::new(workspace_root);
+                                    let store = CacheStore::new(cache_dir);
                                     if let Err(e) = store.remove(&addr) {
                                         eprintln!(
                                             "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
@@ -884,8 +890,8 @@ impl<'a> Executor<'a> {
 
                 // Invalidate project cache if target has invalidates_cache flag
                 if result.success && invalidates_cache {
-                    if let Some(ref workspace_root) = cache_store_path {
-                        let store = CacheStore::new(workspace_root);
+                    if let Some(ref cache_dir) = cache_store_path {
+                        let store = CacheStore::new(cache_dir);
                         // Extract project address from target address (//project:target -> //project)
                         let project_addr =
                             addr.rsplit_once(':').map(|(proj, _)| proj).unwrap_or(&addr);
@@ -2338,7 +2344,7 @@ mod tests {
         let projects = [&project];
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
         assert!(store.get("//a:deploy").unwrap().is_none());
         store
             .set(
@@ -2380,7 +2386,7 @@ mod tests {
             "build",
             "true",
             &project,
-            &CacheStore::new(tmp.path()),
+            &CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path())),
             &PluginRegistry::with_all_plugins(),
             &Arc::new(Mutex::new(HashMap::new())),
             &HashMap::new(),
@@ -2409,7 +2415,7 @@ mod tests {
         let projects = [&project];
         let requested = HashSet::from(["//a:build".to_string()]);
         let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
         store
             .set(
                 "//a:build",
@@ -2440,7 +2446,7 @@ mod tests {
         let mut project = make_project_with_targets("a", targets);
         project.root = tmp.path().to_path_buf();
         project.plugin_name = "nodejs".to_string();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
         store
             .set(
                 "//a:build",

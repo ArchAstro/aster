@@ -9,23 +9,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{CacheEntry, CacheState};
 
-/// Manages the cache file at .aster/cache.json
+/// Manages `cache.json` and `cache.lock` inside a resolved cache directory.
 pub struct CacheStore {
     cache_path: PathBuf,
     lock_path: PathBuf,
 }
 
 impl CacheStore {
-    pub fn new(workspace_root: &Path) -> Self {
-        let aster_dir = workspace_root.join(".aster");
+    /// `cache_dir` is the directory that holds `cache.json` and `cache.lock`.
+    /// Callers resolve it with [`super::resolve_cache_dir`].
+    pub fn new(cache_dir: &Path) -> Self {
         Self {
-            cache_path: aster_dir.join("cache.json"),
-            lock_path: aster_dir.join("cache.lock"),
+            cache_path: cache_dir.join("cache.json"),
+            lock_path: cache_dir.join("cache.lock"),
         }
     }
 
     /// Directory that holds `cache.json` and `cache.lock`.
-    fn cache_dir(&self) -> &Path {
+    pub fn cache_dir(&self) -> &Path {
         self.cache_path
             .parent()
             .expect("cache.json always has a parent directory")
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn test_load_empty() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let state = store.load().unwrap();
         assert!(state.targets.is_empty());
@@ -216,7 +217,7 @@ mod tests {
     #[test]
     fn test_save_and_load() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let entry = CacheEntry {
             hash: "abc123".to_string(),
@@ -234,7 +235,7 @@ mod tests {
     #[test]
     fn test_get_missing() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let result = store.get("//nonexistent:target").unwrap();
         assert!(result.is_none());
@@ -243,7 +244,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let entry = CacheEntry {
             hash: "abc123".to_string(),
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn test_clear_matching_exact() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let entry = CacheEntry {
             hash: "abc123".to_string(),
@@ -285,7 +286,7 @@ mod tests {
     #[test]
     fn test_clear_matching_project() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         let entry = CacheEntry {
             hash: "abc123".to_string(),
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn test_invalidate_project_clears_all_project_targets() {
         let tmp = TempDir::new().unwrap();
-        let store = CacheStore::new(tmp.path());
+        let store = CacheStore::new(&super::super::resolve_cache_dir(tmp.path()));
 
         // Set up cache entries for multiple projects
         let entry = CacheEntry {
@@ -363,7 +364,7 @@ mod tests {
             thread.join().expect("writer thread");
         }
 
-        let raw = fs::read_to_string(root.join(".aster/cache.json")).unwrap();
+        let raw = fs::read_to_string(root.join("cache.json")).unwrap();
         let state: CacheState = serde_json::from_str(&raw).expect("index stays parseable");
         assert_eq!(state.targets.len(), 8);
         for i in 0..8 {
@@ -371,7 +372,7 @@ mod tests {
             assert!(entry.hash.starts_with(&format!("hash-{i}-")));
         }
 
-        let leftovers: Vec<_> = fs::read_dir(root.join(".aster"))
+        let leftovers: Vec<_> = fs::read_dir(&root)
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.file_name())
@@ -391,8 +392,7 @@ mod tests {
     fn test_corrupt_index_loads_as_empty() {
         let tmp = TempDir::new().unwrap();
         let store = CacheStore::new(tmp.path());
-        fs::create_dir_all(tmp.path().join(".aster")).unwrap();
-        fs::write(tmp.path().join(".aster/cache.json"), "{not json").unwrap();
+        fs::write(tmp.path().join("cache.json"), "{not json").unwrap();
 
         let state = store.load().unwrap();
         assert!(state.targets.is_empty());
