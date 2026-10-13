@@ -1605,8 +1605,13 @@ fn daemon_launch_neither_waits_out_nor_replaces_a_daemon_that_holds_the_instance
         "{error:?}"
     );
 
-    // Once the holder is gone, the next launch treats the socket as stale,
-    // starts a daemon, and that daemon exits after its bundle stops.
+    // Once the holder is gone, as after a crash that left its socket and PID
+    // file behind, the next launch treats both as stale, starts a daemon, and
+    // that daemon exits after its bundle stops.
+    let mut exited = Command::new("true").spawn().unwrap();
+    let dead_pid = exited.id();
+    exited.wait().unwrap();
+    fs::write(runtime_dir.join("daemon.pid"), format!("{dead_pid}\n")).unwrap();
     let launched = await_launch(spawn_launch(root), &runtime_dir, "launch after release").unwrap();
     assert_eq!(launched.status, aster::dev::LaunchStatus::Started);
     assert_eq!(launched.bundle.services, vec!["worker"]);

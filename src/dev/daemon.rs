@@ -618,7 +618,7 @@ mod platform {
         // bind. A held lock means a daemon is about to answer, or is answering
         // slowly, so its socket must stay and no second daemon is spawned.
         let instance_lock = open_regular(&paths.instance_lock, true)?;
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut deadline = Instant::now() + CONNECT_TIMEOUT;
         let mut spawned = false;
         loop {
             if !spawned && try_lock(&instance_lock)? {
@@ -632,10 +632,22 @@ mod platform {
                     }
                     remove_verified_socket(&paths.socket)?;
                 }
+                // A PID file left by a daemon that did not exit cleanly would
+                // read as this daemon dying during startup.
+                match fs::remove_file(&paths.pid) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(internal("failed to remove stale daemon PID file")(error))
+                    }
+                }
                 spawn_daemon(paths, daemon_executable)?;
                 FileExt::unlock(&instance_lock)
                     .map_err(internal("failed to release daemon instance lock"))?;
                 spawned = true;
+                // The lock holder may have exited late in the wait; give the
+                // daemon spawned here the full startup bound.
+                deadline = Instant::now() + CONNECT_TIMEOUT;
             }
             match ping_existing(&paths.socket) {
                 Ok(_) => return Ok(()),
