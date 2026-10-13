@@ -1,13 +1,15 @@
 #![cfg(unix)]
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use fs2::FileExt;
 
 use rcgen::{
     generate_simple_self_signed, BasicConstraints, CertificateParams, DnType, IsCa, Issuer,
@@ -33,12 +35,47 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     assert!(condition(), "condition not met within {timeout:?}");
 }
 
-#[test]
-fn configured_tls_routes_replace_upstream_localhost_open_urls_in_public_plan() {
-    // Setup: three ordinary services expose named internal ports; the selected
-    // TLS edge publishes two of them and leaves one intentionally private.
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+struct OwnedTlsFixturePorts {
+    https: u16,
+    frontend: u16,
+    gateway: u16,
+    worker: u16,
+    listeners: Vec<TcpListener>,
+}
+
+fn reserve_distinct_ports(count: usize) -> Vec<(TcpListener, u16)> {
+    let mut reserved = Vec::with_capacity(count);
+    while reserved.len() < count {
+        let (listener, port) = reserve_port();
+        if reserved.iter().any(|(_, held)| *held == port) {
+            continue;
+        }
+        reserved.push((listener, port));
+    }
+    reserved
+}
+
+fn owned_tls_fixture_ports() -> OwnedTlsFixturePorts {
+    let mut reserved = reserve_distinct_ports(4);
+    let (https_listener, https) = reserved.pop().unwrap();
+    let (frontend_listener, frontend) = reserved.pop().unwrap();
+    let (gateway_listener, gateway) = reserved.pop().unwrap();
+    let (worker_listener, worker) = reserved.pop().unwrap();
+    OwnedTlsFixturePorts {
+        https,
+        frontend,
+        gateway,
+        worker,
+        listeners: vec![
+            https_listener,
+            frontend_listener,
+            gateway_listener,
+            worker_listener,
+        ],
+    }
+}
+
+fn write_tls_open_url_workspace(root: &std::path::Path, ports: &OwnedTlsFixturePorts) {
     fs::create_dir(root.join(".git")).unwrap();
     for project in ["frontend", "gateway", "worker"] {
         fs::create_dir(root.join(project)).unwrap();
@@ -55,12 +92,13 @@ fn configured_tls_routes_replace_upstream_localhost_open_urls_in_public_plan() {
     }
     fs::write(
         root.join("aster.toml"),
-        r#"
+        format!(
+            r#"
 [dev.ports]
-https = 8443
-frontend = 3100
-gateway = 3800
-worker = 3900
+https = {https}
+frontend = {frontend}
+gateway = {gateway}
+worker = {worker}
 
 [dev.service_groups]
 web = ["frontend", "gateway", "worker", "edge"]
@@ -80,16 +118,73 @@ port = "worker"
 
 [dev.services.edge]
 port = "https"
-tls_proxy = { certificate_hosts = ["app.example.test"], open_host = "app.example.test", routes = [{ host = "app.example.test", upstream_port = "frontend" }, { host_suffix = ".example.test", open_host = "demo.team.example.test", upstream_port = "gateway" }] }
+tls_proxy = {{ certificate_hosts = ["app.example.test"], open_host = "app.example.test", routes = [{{ host = "app.example.test", upstream_port = "frontend" }}, {{ host_suffix = ".example.test", open_host = "demo.team.example.test", upstream_port = "gateway" }}] }}
 "#,
+            https = ports.https,
+            frontend = ports.frontend,
+            gateway = ports.gateway,
+            worker = ports.worker,
+        ),
     )
     .unwrap();
+}
+
+fn allocation_manifests(lease_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fs::read_dir(lease_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("allocation-") && name.ends_with(".json"))
+        })
+        .collect()
+}
+
+fn port_lock_is_held_by_another_process(path: &std::path::Path) -> bool {
+    let probe = Command::new("python3")
+        .args([
+            "-c",
+            "import fcntl,sys\ntry:\n    f=open(sys.argv[1],'a+')\n    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:\n    sys.exit(1)",
+            path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    !probe.success()
+}
+
+fn hold_port_lease(lease_dir: &std::path::Path, port: u16) -> File {
+    fs::create_dir_all(lease_dir).unwrap();
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lease_dir.join(format!("{port}.lock")))
+        .unwrap();
+    file.try_lock_exclusive().unwrap();
+    file
+}
+
+#[test]
+fn configured_tls_routes_replace_upstream_localhost_open_urls_in_public_plan() {
+    // Setup: three ordinary services expose test-owned internal ports; the
+    // selected TLS edge publishes two of them and leaves one intentionally
+    // private. Listeners stay bound only until dry-run needs the ports.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = temp.path().join("port-leases");
+    let mut ports = owned_tls_fixture_ports();
+    write_tls_open_url_workspace(root, &ports);
 
     // Public boundary: the same resolved plan feeds the dashboard [open]
     // action; dry-run renders those concrete URLs without launching services.
+    ports.listeners.clear();
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["services", "up", "web", "--dry-run"])
         .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -98,18 +193,107 @@ tls_proxy = { certificate_hosts = ["app.example.test"], open_host = "app.example
     // Observable result: routed services open through trusted HTTPS, including
     // their own path, while an unpublished service retains localhost fallback.
     assert!(
-        plan.contains(
-            "frontend :3100 -> //frontend:dev [open https://app.example.test:8443/login]"
-        ),
+        plan.contains(&format!(
+            "frontend :{} -> //frontend:dev [open https://app.example.test:{}/login]",
+            ports.frontend, ports.https
+        )),
         "{plan}"
     );
     assert!(
-        plan.contains("gateway :3800 -> //gateway:dev [open https://demo.team.example.test:8443]"),
+        plan.contains(&format!(
+            "gateway :{} -> //gateway:dev [open https://demo.team.example.test:{}]",
+            ports.gateway, ports.https
+        )),
         "{plan}"
     );
     assert!(
-        plan.contains("worker :3900 -> //worker:dev [open http://localhost:3900]"),
+        plan.contains(&format!(
+            "worker :{} -> //worker:dev [open http://localhost:{}]",
+            ports.worker, ports.worker
+        )),
         "{plan}"
+    );
+    assert!(
+        allocation_manifests(&lease_dir).is_empty(),
+        "successful dry-run left a port allocation manifest"
+    );
+
+    // Occupied-port failure: the fixture keeps its own listener. Dry-run must
+    // name that port and must not kill the unrelated holder.
+    let occupied = TcpListener::bind(("127.0.0.1", ports.frontend)).unwrap();
+    let occupied_failure = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "web", "--dry-run"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(!occupied_failure.status.success(), "{occupied_failure:?}");
+    let occupied_error = String::from_utf8_lossy(&occupied_failure.stderr);
+    assert!(
+        occupied_error.contains(&format!("frontend={}", ports.frontend)),
+        "{occupied_error}"
+    );
+    assert!(
+        occupied_error.contains("already allocated or listening"),
+        "{occupied_error}"
+    );
+    assert!(
+        occupied.local_addr().unwrap().port() == ports.frontend,
+        "occupied fixture listener was closed"
+    );
+    assert!(
+        allocation_manifests(&lease_dir).is_empty(),
+        "occupied-port failure left a port allocation manifest"
+    );
+    drop(occupied);
+
+    // Interruption: stop the fixture-owned dry-run before wait. The signal
+    // targets only that child. Its lease directory is test-owned and must not
+    // keep an allocation manifest after the child is gone.
+    let mut interrupted = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "web", "--dry-run"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    unsafe {
+        libc::kill(interrupted.id() as i32, libc::SIGTERM);
+    }
+    let _ = interrupted.wait();
+    assert!(
+        allocation_manifests(&lease_dir).is_empty(),
+        "interrupted dry-run left a port allocation manifest"
+    );
+
+    // WouldBlock: another owner holds the same port lock file PortAllocator
+    // uses. Dry-run fails closed and leaves that lock held.
+    let held_lock = hold_port_lease(&lease_dir, ports.https);
+    let blocked = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["services", "up", "web", "--dry-run"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success(), "{blocked:?}");
+    let blocked_error = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_error.contains(&format!("https={}", ports.https)),
+        "{blocked_error}"
+    );
+    assert!(
+        blocked_error.contains("already allocated or listening"),
+        "{blocked_error}"
+    );
+    assert!(
+        port_lock_is_held_by_another_process(&lease_dir.join(format!("{}.lock", ports.https))),
+        "WouldBlock fixture released the port lock"
+    );
+    drop(held_lock);
+    assert!(
+        allocation_manifests(&lease_dir).is_empty(),
+        "WouldBlock failure left a port allocation manifest"
     );
 }
 
