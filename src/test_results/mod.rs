@@ -10,8 +10,11 @@
 //! command, so capturing results never changes what is cached.
 
 mod context;
+pub(crate) mod exunit;
 mod gojson;
+mod jest;
 mod junit;
+mod libtest;
 mod stream;
 
 pub use context::detect_run;
@@ -70,6 +73,13 @@ pub enum ReportFormat {
     JUnitXml,
     /// `go test -json` events.
     GoTestJson,
+    /// JSON lines from Aster's ExUnit formatter, checked against ExUnit's
+    /// console summary. With no report, the console's failure blocks.
+    ExUnit,
+    /// Jest's `--json` results.
+    JestJson,
+    /// `cargo test` console output.
+    LibtestText,
 }
 
 impl ReportFormat {
@@ -78,7 +88,15 @@ impl ReportFormat {
         match self {
             ReportFormat::JUnitXml => "junit",
             ReportFormat::GoTestJson => "go-json",
+            ReportFormat::ExUnit => "exunit",
+            ReportFormat::JestJson => "jest-json",
+            ReportFormat::LibtestText => "libtest",
         }
+    }
+
+    /// Whether reading the report also needs the command's console output.
+    pub fn reads_console(self) -> bool {
+        matches!(self, ReportFormat::ExUnit)
     }
 }
 
@@ -125,6 +143,9 @@ pub struct ReportPlan {
     /// Set when the planned command's console output is the report, so the
     /// log shows a rendering of it instead.
     pub rewrite: Option<OutputRewrite>,
+    /// Test files the report names under this directory are recorded
+    /// relative to it (Jest names them by absolute path).
+    pub relative_to: Option<PathBuf>,
 }
 
 /// What a plugin is told when asked for a [`ReportPlan`].
@@ -182,15 +203,42 @@ pub struct Collected {
 /// earlier run is never read as this run's. An error means the results
 /// could not be read; no report file at all is an empty result.
 pub fn collect(plan: &ReportPlan, started: SystemTime, stdout: Option<&str>) -> Result<Collected> {
+    let mut collected = collect_raw(plan, started, stdout)?;
+    if let Some(base) = &plan.relative_to {
+        for case in &mut collected.cases {
+            if let Some(file) = &case.file {
+                if let Ok(relative) = Path::new(file).strip_prefix(base) {
+                    case.file = Some(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    Ok(collected)
+}
+
+fn collect_raw(plan: &ReportPlan, started: SystemTime, stdout: Option<&str>) -> Result<Collected> {
+    if plan.format == ReportFormat::ExUnit {
+        let report = match report_files(&plan.files, started)?.first() {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read test report {}", path.display()))?,
+            ),
+            None => None,
+        };
+        return Ok(exunit::collect(report.as_deref(), stdout));
+    }
     if plan.files == ReportFiles::Stdout {
         let output = stdout.unwrap_or("");
         return parse(plan.format, output).context("cannot parse the test output");
     }
+    let files = report_files(&plan.files, started)?;
+    // A runner that wrote no report ran nothing Aster can vouch for, such
+    // as a Gradle test task that was up to date.
     let mut collected = Collected {
         cases: Vec::new(),
-        complete: true,
+        complete: !files.is_empty(),
     };
-    for path in report_files(&plan.files, started)? {
+    for path in files {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read test report {}", path.display()))?;
         let parsed = parse(plan.format, &content)
@@ -214,6 +262,9 @@ fn parse(format: ReportFormat, content: &str) -> Result<Collected> {
                 complete: parsed.complete,
             }
         }
+        ReportFormat::ExUnit => exunit::collect(Some(content), None),
+        ReportFormat::JestJson => jest::parse(content)?,
+        ReportFormat::LibtestText => libtest::parse(content),
     })
 }
 
@@ -276,6 +327,7 @@ mod tests {
             format: ReportFormat::JUnitXml,
             confidence: Confidence::Complete,
             rewrite: None,
+            relative_to: None,
         }
     }
 
@@ -335,9 +387,9 @@ mod tests {
             SystemTime::now(),
             None,
         )
-        .unwrap()
-        .cases;
-        assert!(cases.is_empty());
+        .unwrap();
+        assert!(cases.cases.is_empty());
+        assert!(!cases.complete, "no report is no proof that nothing failed");
     }
 
     #[test]

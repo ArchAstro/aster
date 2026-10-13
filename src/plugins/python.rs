@@ -377,13 +377,6 @@ impl LanguagePlugin for PythonPlugin {
         }
     }
 
-    fn test_report_plan(
-        &self,
-        ctx: &crate::test_results::ReportContext,
-    ) -> Option<crate::test_results::ReportPlan> {
-        super::test_reports::pytest(ctx)
-    }
-
     fn cache_inputs(&self, target_name: &str) -> super::CacheInputs {
         // deps target only cares about dependency specification files,
         // not source code — source changes shouldn't re-install dependencies

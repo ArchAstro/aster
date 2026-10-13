@@ -331,7 +331,7 @@ pub(crate) mod related_tests;
 pub mod ruby;
 pub mod rust;
 pub(crate) mod rust_related;
-mod test_reports;
+pub(crate) mod test_reports;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;

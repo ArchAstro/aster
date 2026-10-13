@@ -230,8 +230,8 @@
       <table>
         <thead><tr><th>Runner</th><th>Strategy</th><th>Change</th><th>Confidence</th><th>Retry</th></tr></thead>
         <tbody>
-          <tr><td>mix / ExUnit</td><td>Formatter</td><td><code>--formatter AsterFormatter --formatter ExUnit.CLIFormatter</code>, with <code>ERL_LIBS</code> pointing at an embedded <code>.beam</code></td><td><span class="pill pass">complete</span></td><td><code>mix test --failed</code></td></tr>
-          <tr><td>mix (fallback)</td><td>Stdout</td><td>Parse the numbered failure blocks</td><td><span class="pill flaky">partial</span></td><td><code>file:line</code> args</td></tr>
+          <tr><td>mix / ExUnit</td><td>Formatter</td><td><code>elixir -r &lt;formatter.exs&gt; -S mix test --formatter AsterTestResults.ExUnitFormatter --formatter ExUnit.CLIFormatter</code>. Complete only when the counts match ExUnit's summary line.</td><td><span class="pill pass">complete</span></td><td><code>mix test --failed</code></td></tr>
+          <tr><td>mix (project sets formatters)</td><td>Stdout</td><td>Command left alone: <code>--formatter</code> would drop the project's own formatters. The numbered failure blocks are parsed.</td><td><span class="pill flaky">partial</span></td><td><code>file:line</code> args</td></tr>
           <tr><td>go test</td><td>Flag</td><td><code>-json</code>, output written to the console as text again</td><td><span class="pill pass">complete</span></td><td><code>-run '^(A|B)$'</code> per package</td></tr>
           <tr><td>vitest</td><td>Flag</td><td><code>--reporter=default --reporter=junit --outputFile.junit=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
           <tr><td>jest</td><td>Flag</td><td><code>--json --outputFile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
@@ -367,9 +367,9 @@
       acc: ["Fixtures from each tool parse to the expected TestCase set", "<skipped>, <error> and <failure> all handled", "Old report files from earlier runs are ignored (compare mtime with target start)"],
       files: ["src/test_results/junit.rs", "src/plugins/gradle.rs", "src/plugins/maven.rs"], deps: ["T02"] },
     { id: "T04", p: "P1", area: "client", title: "ExUnit capture", sub: "Embedded formatter, with stdout fallback",
-      obj: "Ship AsterFormatter as a .beam embedded with include_bytes!. Write it to a temp ERL_LIBS dir and add both formatters. The fallback parses CLIFormatter failure blocks (partial).",
-      acc: ["Console output identical to plain mix test (golden test)", "Umbrella and partitioned (--partitions) runs captured", "Falls back cleanly when the beam fails to load"],
-      files: ["src/plugins/elixir.rs", "src/test_results/exunit.rs", "support/exunit_formatter/"], deps: ["T02"] },
+      obj: "Load AsterTestResults.ExUnitFormatter from source with elixir -r and add it next to ExUnit.CLIFormatter. Projects that configure formatters keep their command, and console failure blocks are parsed (partial). Shell one-liners that cd into the project are handled too.",
+      acc: ["Console output identical to plain mix test", "Umbrella and partitioned (--partitions) runs captured", "Falls back to console failures when the formatter is not loaded"],
+      files: ["src/plugins/test_reports.rs", "src/test_results/exunit.rs", "src/test_results/exunit_formatter.exs"], deps: ["T02"] },
     { id: "T05", p: "P1", area: "client", title: "go test -json capture", sub: "Write output to the console as text again",
       obj: "Add -json to go test and write the console output back as text, so logs look the same.",
       acc: ["Subtests become separate test_ids", "Package build failures recorded as target errors, not tests", "Works with the related-tests -run narrowing"],
