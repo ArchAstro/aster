@@ -1,14 +1,30 @@
 //! Hash computation for cache keys
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Component, Path};
 use walkdir::WalkDir;
 
 use crate::cache::matcher::TargetInputMatcher;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
+
+/// Relative path as hashed into a cache key: `Normal` components joined with
+/// `/`, so Windows and Unix produce the same key. A non-UTF-8 component fails
+/// the hash instead of becoming a lossy string.
+fn normalize_rel(rel: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        if let Component::Normal(part) = component {
+            let part = part.to_str().with_context(|| {
+                format!("cache input path is not valid UTF-8: {}", rel.display())
+            })?;
+            parts.push(part);
+        }
+    }
+    Ok(parts.join("/"))
+}
 
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -121,7 +137,7 @@ impl CacheHasher {
                 if let Ok(content) = std::fs::read(entry.path()) {
                     let digest = Sha256::digest(&content);
                     let hash = encode_hex(digest.as_ref());
-                    file_hashes.push((rel_path.to_string_lossy().to_string(), hash));
+                    file_hashes.push((normalize_rel(rel_path)?, hash));
                 }
             }
         }
@@ -351,6 +367,50 @@ mod tests {
             .compute_hash(&inputs, Some(&config), "gradle test", &[], &unrelated)
             .unwrap();
         assert_eq!(hash, hash_unrelated);
+    }
+
+    #[test]
+    fn normalize_rel_uses_forward_slashes() {
+        let rel = Path::new("a").join("b").join("c.rs");
+        assert_eq!(normalize_rel(&rel).unwrap(), "a/b/c.rs");
+    }
+
+    #[test]
+    fn hash_files_reports_nested_paths_with_forward_slashes() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("c.rs"), "fn main() {}").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.rs".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+        };
+
+        let file_hashes = hasher.hash_files(&inputs, None).unwrap();
+        let paths: Vec<_> = file_hashes.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            paths.contains(&"a/b/c.rs"),
+            "sorted list should contain a/b/c.rs, got {paths:?}"
+        );
+        assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_rel_rejects_non_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let rel = Path::new(OsStr::from_bytes(b"a/\xff/c.rs"));
+        let err = normalize_rel(rel).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not valid UTF-8"),
+            "error should reject the non-UTF-8 component, got {message}"
+        );
     }
 
     #[test]
