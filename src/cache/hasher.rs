@@ -150,10 +150,12 @@ impl CacheHasher {
         // (node_modules, target, .venv), so a matching glob cannot pull them
         // into the key. Symlinks are not followed: a cycle or a link outside
         // the project must not be hashed. Hidden files stay visible because
-        // a glob can name them on purpose. Nested project roots are skipped
-        // by prefix: the walker canonicalizes its root, so an exact compare
-        // against the path discovery stored would miss them.
-        let excluded = self.excluded_prefixes();
+        // a glob can name them on purpose. Nested project roots are pruned by
+        // their path relative to the root: the walker joins entry names onto
+        // the root exactly as given, so comparing relative paths works whether
+        // the root is canonical, a symlink, or a platform alias like /var.
+        let excluded = self.excluded_relative_dirs();
+        let root = self.project_root.clone();
         let mut file_hashes = Vec::new();
 
         let walker = WalkBuilder::new(&self.project_root)
@@ -164,9 +166,10 @@ impl CacheHasher {
             .git_exclude(true)
             .require_git(false)
             .filter_entry(move |entry| {
-                !excluded
-                    .iter()
-                    .any(|prefix| entry.path().starts_with(prefix))
+                let Ok(rel) = entry.path().strip_prefix(&root) else {
+                    return true;
+                };
+                !excluded.iter().any(|dir| rel.starts_with(dir))
             })
             .build();
 
@@ -284,34 +287,31 @@ impl CacheHasher {
         Ok(file_hashes)
     }
 
-    /// Canonical prefixes of the excluded directories.
+    /// Excluded directories as non-empty paths relative to `project_root`.
     ///
-    /// `ignore` builds entry paths from `canonicalize(project_root)`, so a
-    /// raw project root from discovery (for example `/var/...` on macOS,
-    /// where the walker reports `/private/var/...`) would not compare equal.
-    /// A prefix match also drops the directory itself and everything under
-    /// it, which is what stops the walk from descending.
-    fn excluded_prefixes(&self) -> Vec<PathBuf> {
+    /// Each directory may be given relative to the root, or absolute in the
+    /// root's own spelling or in canonical form (for example `/private/var`
+    /// on macOS when the root is spelled `/var`). Directories that are not
+    /// under the root are dropped.
+    fn excluded_relative_dirs(&self) -> Vec<PathBuf> {
         let canonical_root = self.project_root.canonicalize().ok();
         self.excluded_dirs
             .iter()
-            .map(|dir| {
-                let path = if dir.is_absolute() {
-                    dir.clone()
-                } else {
-                    self.project_root.join(dir)
-                };
-                path.canonicalize().unwrap_or_else(|_| {
-                    canonical_root
-                        .as_ref()
-                        .and_then(|root| {
-                            path.strip_prefix(&self.project_root)
-                                .ok()
-                                .map(|rel| root.join(rel))
-                        })
-                        .unwrap_or(path)
-                })
+            .filter_map(|dir| {
+                if dir.is_relative() {
+                    return Some(dir.clone());
+                }
+                if let Ok(rel) = dir.strip_prefix(&self.project_root) {
+                    return Some(rel.to_path_buf());
+                }
+                let canonical_root = canonical_root.as_ref()?;
+                let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                canonical_dir
+                    .strip_prefix(canonical_root)
+                    .ok()
+                    .map(Path::to_path_buf)
             })
+            .filter(|rel| !rel.as_os_str().is_empty())
             .collect()
     }
 
@@ -867,5 +867,41 @@ mod tests {
         std::fs::write(tmp.path().join("sub/a.js"), "changed nested").unwrap();
         let after = hasher.hash_files(&inputs, None).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_files_skips_excluded_nested_project_through_aliased_root() {
+        // macOS temp dirs live under /var, a symlink to /private/var. Reach
+        // the project through a symlink so this runs the same way everywhere,
+        // and name the excluded dir in both the alias and canonical forms.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::write(real.join("app.js"), "root").unwrap();
+        std::fs::write(real.join("sub/a.js"), "nested").unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let inputs = CacheInputs {
+            source_globs: vec!["**/*.js".to_string()],
+            config_files: vec![],
+            env_vars: vec![],
+            ..Default::default()
+        };
+        for excluded in [alias.join("sub"), real.canonicalize().unwrap().join("sub")] {
+            let hashes = CacheHasher::new(&alias, &alias)
+                .with_excluded_dirs(vec![excluded.clone()])
+                .hash_files(&inputs, None)
+                .unwrap();
+            assert_eq!(
+                hashes
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["app.js"],
+                "excluding {excluded:?} through an aliased root"
+            );
+        }
     }
 }
