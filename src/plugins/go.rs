@@ -277,7 +277,6 @@ impl LanguagePlugin for GoPlugin {
                 "GOOS".to_string(),
                 "GOARCH".to_string(),
                 "CGO_ENABLED".to_string(),
-                "CI".to_string(),
             ],
             ..Default::default()
         }

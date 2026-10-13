@@ -288,7 +288,6 @@ impl LanguagePlugin for GradlePlugin {
                 "JAVA_HOME".to_string(),
                 "GRADLE_OPTS".to_string(),
                 "ORG_GRADLE_PROJECT_*".to_string(),
-                "CI".to_string(),
             ],
             ..Default::default()
         };

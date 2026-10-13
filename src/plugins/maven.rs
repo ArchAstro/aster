@@ -230,7 +230,6 @@ impl LanguagePlugin for MavenPlugin {
                 "JAVA_HOME".to_string(),
                 "MAVEN_OPTS".to_string(),
                 "MAVEN_ARGS".to_string(),
-                "CI".to_string(),
             ],
             ..Default::default()
         };
