@@ -111,7 +111,10 @@ pub struct CacheConfig {
     /// Files/globs to exclude from cache key
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Additional environment variables to track
+    /// Additional environment variables to track.
+    ///
+    /// A name ending in `*` matches every variable that starts with the name
+    /// without that `*`.
     #[serde(default)]
     pub env: Vec<String>,
     /// Output paths that must exist before a cached success may be reused.
