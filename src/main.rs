@@ -1673,7 +1673,10 @@ fn upload_test_results(url: &str, path: &Path, output_mode: OutputMode) -> bool 
         );
         return false;
     };
-    match upload(url, path, &credentials) {
+    let proxy_token = env::var("ASTER_SRV_PROXY_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    match upload(url, path, &credentials, proxy_token.as_deref()) {
         Ok(receipt) => {
             if output_mode != OutputMode::Quiet {
                 eprintln!(

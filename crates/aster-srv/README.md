@@ -35,6 +35,20 @@ A token is accepted when GitHub signed it, it is unexpired, its audience is
 `ASTER_SRV_AUDIENCE`, and its repository is on `ASTER_SRV_REPOSITORIES`. A
 repository can upload only its own results.
 
+### Behind Google IAP
+
+To keep the server off the open internet, put it behind Identity-Aware Proxy
+and let CI pass IAP with Workload Identity Federation:
+
+1. CI exchanges its GitHub OIDC token for a Google service account
+   (`google-github-actions/auth`) that holds `roles/iap.httpsResourceAccessor`
+   on the server's host only.
+2. That account signs a short-lived JWT with the IAM Credentials API
+   (`aud: https://<host>/*`), which IAP accepts.
+3. `aster results upload` sends it in `Proxy-Authorization` from
+   `ASTER_SRV_PROXY_TOKEN`; `Authorization` keeps the GitHub OIDC token, so
+   the server still knows which repository is uploading.
+
 ## Configuration
 
 | Variable | Default | |
