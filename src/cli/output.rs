@@ -266,7 +266,7 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
             let exit_code = if r.skipped || r.cached {
                 None
             } else {
-                Some(if r.success { 0 } else { 1 })
+                r.exit_code
             };
 
             TargetResult {
@@ -406,8 +406,9 @@ mod tests {
                 skipped: false,
                 cached: false,
                 output: "test output".to_string(),
+                log: b"test output".to_vec(),
                 duration_ms: 100,
-                exit_code: None,
+                exit_code: Some(0),
                 tests: None,
                 input_hash: None,
             },
@@ -417,8 +418,9 @@ mod tests {
                 skipped: false,
                 cached: false,
                 output: "error".to_string(),
+                log: b"error".to_vec(),
                 duration_ms: 50,
-                exit_code: None,
+                exit_code: Some(3),
                 tests: None,
                 input_hash: None,
             },
@@ -428,6 +430,7 @@ mod tests {
                 skipped: true,
                 cached: false,
                 output: "".to_string(),
+                log: Vec::new(),
                 duration_ms: 0,
                 exit_code: None,
                 tests: None,
@@ -444,8 +447,11 @@ mod tests {
         assert_eq!(output.summary.duration_ms, 150);
 
         assert_eq!(output.results[0].status, "passed");
+        assert_eq!(output.results[0].exit_code, Some(0));
         assert_eq!(output.results[1].status, "failed");
+        assert_eq!(output.results[1].exit_code, Some(3));
         assert_eq!(output.results[2].status, "skipped");
+        assert_eq!(output.results[2].exit_code, None);
         let json = serde_json::to_value(&output).unwrap();
         assert!(json["results"][0].get("tests").is_none());
     }
@@ -468,6 +474,7 @@ mod tests {
             skipped: false,
             cached: false,
             output: String::new(),
+            log: Vec::new(),
             duration_ms: 1,
             exit_code: Some(1),
             tests: Some(TestReport {
