@@ -1,0 +1,15 @@
+[package]
+name = "aster-results-model"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Test result records shared by the Aster CLI and the aster-results service"
+license = "MIT"
+repository = "https://github.com/ArchAstro/aster"
+publish = false
+
+[dependencies]
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"

@@ -9,13 +9,13 @@
 //! Each level executes in parallel, waiting for completion before the next level.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use console::style;
@@ -26,7 +26,10 @@ use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::logs::{LogStore, RunLog, TargetLog};
 use crate::graph::ProjectGraph;
-use crate::plugins::PluginRegistry;
+use crate::plugins::{LanguagePlugin, PluginRegistry};
+use crate::test_results::{
+    self, Confidence, OutputRewrite, ReportContext, ReportFiles, ReportPlan, TestReport,
+};
 use crate::ui::ProgressDisplay;
 
 use super::command::parse_command;
@@ -60,6 +63,15 @@ pub struct ExecutionResult {
     pub output: String,
     /// Execution duration in milliseconds
     pub duration_ms: u128,
+    /// Exit code of the last command run, when it exited normally
+    pub exit_code: Option<i32>,
+    /// Per-test results, when test capture was on and the plugin could
+    /// capture this target's runner
+    pub tests: Option<TestReport>,
+    /// Hash of everything the target's tests depend on, computed when test
+    /// capture is on. Two runs with the same hash ran the same tests on the
+    /// same inputs.
+    pub input_hash: Option<String>,
 }
 
 /// Executor for running target commands on projects
@@ -78,6 +90,9 @@ pub struct Executor<'a> {
     /// TTY fail instead of hanging behind Aster's progress UI. Streaming
     /// targets inherit the caller's terminal separately.
     null_stdin: bool,
+    /// Whether to capture per-test results from targets whose runner the
+    /// plugin knows how to report on.
+    capture_tests: bool,
 }
 
 impl<'a> Executor<'a> {
@@ -89,6 +104,7 @@ impl<'a> Executor<'a> {
             full_logs: false,
             use_cache: true,
             null_stdin: true,
+            capture_tests: false,
         }
     }
 
@@ -100,6 +116,7 @@ impl<'a> Executor<'a> {
             full_logs: false,
             use_cache: true,
             null_stdin: true,
+            capture_tests: false,
         }
     }
 
@@ -115,6 +132,7 @@ impl<'a> Executor<'a> {
             full_logs,
             use_cache: true,
             null_stdin: true,
+            capture_tests: false,
         }
     }
 
@@ -131,6 +149,7 @@ impl<'a> Executor<'a> {
             full_logs,
             use_cache,
             null_stdin: true,
+            capture_tests: false,
         }
     }
 
@@ -141,6 +160,16 @@ impl<'a> Executor<'a> {
     /// the dashboard's terminal.
     pub fn with_null_stdin(mut self) -> Self {
         self.null_stdin = true;
+        self
+    }
+
+    /// Capture per-test results into [`ExecutionResult::tests`].
+    ///
+    /// A target's command is rewritten (for example to add a reporter flag)
+    /// only after its cache key is computed, so capture never changes what
+    /// is cached.
+    pub fn with_test_capture(mut self, capture_tests: bool) -> Self {
+        self.capture_tests = capture_tests;
         self
     }
 
@@ -370,6 +399,7 @@ impl<'a> Executor<'a> {
 
         let computed_hashes: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let input_hashes: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
 
         let env_snapshot: HashMap<String, String> = std::env::vars().collect();
 
@@ -409,6 +439,9 @@ impl<'a> Executor<'a> {
                         failed_dependencies.join(", ")
                     ),
                     duration_ms: 0,
+                    exit_code: None,
+                    tests: None,
+                    input_hash: None,
                 });
             }
 
@@ -421,6 +454,7 @@ impl<'a> Executor<'a> {
                 cache_store.as_ref(),
                 &plugin_registry,
                 &computed_hashes,
+                &input_hashes,
                 &env_snapshot,
             );
             failed_or_blocked.extend(
@@ -458,6 +492,7 @@ impl<'a> Executor<'a> {
         cache_store: Option<&CacheStore>,
         plugin_registry: &PluginRegistry,
         computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
+        input_hashes: &Mutex<HashMap<String, String>>,
         env_snapshot: &HashMap<String, String>,
     ) -> Vec<ExecutionResult> {
         let (tx, rx) = mpsc::channel();
@@ -514,6 +549,9 @@ impl<'a> Executor<'a> {
                                 cached: false,
                                 output: format!("Skipped: {reason}"),
                                 duration_ms: 0,
+                                exit_code: None,
+                                tests: None,
+                                input_hash: None,
                             };
                             if show_progress {
                                 progress.mark_skipped(target_addr);
@@ -534,6 +572,9 @@ impl<'a> Executor<'a> {
                                 cached: false,
                                 output: format!("Skipped: no '{target_name}' target defined"),
                                 duration_ms: 0,
+                                exit_code: None,
+                                tests: None,
+                                input_hash: None,
                             };
                             if show_progress {
                                 progress.mark_skipped(target_addr);
@@ -555,6 +596,9 @@ impl<'a> Executor<'a> {
                             cached: false,
                             output: format!("Skipped: no '{target_name}' target defined"),
                             duration_ms: 0,
+                            exit_code: None,
+                            tests: None,
+                            input_hash: None,
                         };
                         if show_progress {
                             progress.mark_skipped(target_addr);
@@ -566,6 +610,19 @@ impl<'a> Executor<'a> {
             };
             // Cache keys and logs see one command per line.
             let command = commands.join("\n");
+            let input_hash = if self.capture_tests {
+                test_input_hash(
+                    target_addr,
+                    &target_name,
+                    &command,
+                    project,
+                    plugin_registry,
+                    input_hashes,
+                    env_snapshot,
+                )
+            } else {
+                None
+            };
 
             // Check cache if enabled. A miss carries the exact hash that may
             // be stored after successful execution; `None` means this target
@@ -591,6 +648,9 @@ impl<'a> Executor<'a> {
                             cached: true,
                             output: String::new(),
                             duration_ms: 0,
+                            exit_code: None,
+                            tests: None,
+                            input_hash: input_hash.clone(),
                         };
                         if show_progress {
                             progress.mark_cached(target_addr);
@@ -622,11 +682,30 @@ impl<'a> Executor<'a> {
                 .get(&target_name)
                 .and_then(|t| t.working_dir.clone())
                 .unwrap_or_else(|| project_root.clone());
+            // Test capture rewrites the commands only now, after the cache
+            // key was computed from the commands as written.
+            let captures = if self.capture_tests {
+                plugin_registry
+                    .find_by_name(&project.plugin_name)
+                    .map(|plugin| {
+                        plan_captures(plugin, &project_root, &working_dir, &target_name, &commands)
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let invocations: Vec<Invocation> = commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| match captures.get(index) {
+                    Some(Some((plan, _))) => Invocation::planned(command, plan),
+                    _ => Invocation::plain(command),
+                })
+                .collect();
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.workspace_root.to_path_buf());
             let command_clone = command.clone();
-            let commands_clone = commands.clone();
             let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
             let env_snapshot_clone = env_snapshot.clone();
@@ -676,11 +755,20 @@ impl<'a> Executor<'a> {
                         cached: false,
                         output: "Cancelled: shutdown requested".to_string(),
                         duration_ms: 0,
+                        exit_code: None,
+                        tests: None,
+                        input_hash: None,
                     };
                     let _ = tx_clone.send(result.clone());
                     return result;
                 }
-                let mut result = run_commands(&addr, &commands_clone, &working_dir, null_stdin);
+                let started = SystemTime::now();
+                let (mut result, raw_outputs) =
+                    run_invocations(&addr, &invocations, &working_dir, null_stdin);
+                if !captures.is_empty() {
+                    result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
+                }
+                result.input_hash = input_hash;
                 if shutdown_requested() {
                     result.success = false;
                     result.skipped = true;
@@ -1133,6 +1221,62 @@ fn check_cache(
     Some((false, current_hash))
 }
 
+/// Hash a target's inputs for test tracking, whatever its cache policy.
+///
+/// The inputs are the plugin's cache inputs for the target joined with its
+/// inputs for `test`, so a custom test target such as `test-ci` still covers
+/// the test files, plus the target's configured cache inputs, its command
+/// and its dependencies' hashes. A dependency without a hash leaves the
+/// target without one: a hash that missed a changed dependency would make a
+/// real failure look like a flake.
+fn test_input_hash(
+    target_addr: &str,
+    target_name: &str,
+    command: &str,
+    project: &DiscoveredProject,
+    plugin_registry: &PluginRegistry,
+    input_hashes: &Mutex<HashMap<String, String>>,
+    env_snapshot: &HashMap<String, String>,
+) -> Option<String> {
+    let target = project.targets.get(target_name)?;
+    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
+    let mut inputs = plugin.cache_inputs(target_name);
+    let test_inputs = plugin.cache_inputs("test");
+    for (all, more) in [
+        (&mut inputs.source_globs, test_inputs.source_globs),
+        (&mut inputs.config_files, test_inputs.config_files),
+        (&mut inputs.env_vars, test_inputs.env_vars),
+    ] {
+        for item in more {
+            if !all.contains(&item) {
+                all.push(item);
+            }
+        }
+    }
+    let hash = {
+        let hashes = input_hashes.lock().ok()?;
+        let dependencies: Vec<&str> = target
+            .depends_on
+            .iter()
+            .map(|dependency| hashes.get(dependency).map(String::as_str))
+            .collect::<Option<_>>()?;
+        CacheHasher::new(&project.root)
+            .compute_hash(
+                &inputs,
+                target.cache.as_ref(),
+                command,
+                &dependencies,
+                env_snapshot,
+            )
+            .ok()?
+    };
+    input_hashes
+        .lock()
+        .ok()?
+        .insert(target_addr.to_string(), hash.clone());
+    Some(hash)
+}
+
 fn is_default_cacheable_target(target_name: &str) -> bool {
     matches!(
         target_name,
@@ -1140,18 +1284,167 @@ fn is_default_cacheable_target(target_name: &str) -> bool {
     )
 }
 
-/// Run commands in order, stopping at the first failure.
+/// One command of a target as it is run.
+struct Invocation {
+    /// The command as written, shown in logs.
+    shown: String,
+    /// The command actually run: `shown`, or its test-capture rewrite.
+    command: String,
+    /// Environment added for this command.
+    env: Vec<(String, String)>,
+    /// Keep the raw console output: it is the command's test report.
+    keep_output: bool,
+    /// How to render the raw console output for the log.
+    rewrite: Option<OutputRewrite>,
+}
+
+impl Invocation {
+    fn plain(command: &str) -> Self {
+        Self {
+            shown: command.to_string(),
+            command: command.to_string(),
+            env: Vec::new(),
+            keep_output: false,
+            rewrite: None,
+        }
+    }
+
+    fn planned(command: &str, plan: &ReportPlan) -> Self {
+        Self {
+            shown: command.to_string(),
+            command: plan.command.clone(),
+            env: plan.env.clone(),
+            keep_output: plan.files == ReportFiles::Stdout,
+            rewrite: plan.rewrite,
+        }
+    }
+
+    /// Run the command. Returns its result, with the console output
+    /// rendered for the log, and the raw output when it is kept.
+    fn run(
+        &self,
+        address: &str,
+        working_dir: &Path,
+        null_stdin: bool,
+    ) -> (ExecutionResult, Option<String>) {
+        let mut result = run_command(address, &self.command, &self.env, working_dir, null_stdin);
+        let raw = self.rewrite.map(|rewrite| {
+            let rendered = test_results::rewrite_output(rewrite, &result.output);
+            std::mem::replace(&mut result.output, rendered)
+        });
+        let raw = if self.keep_output {
+            raw.or_else(|| Some(result.output.clone()))
+        } else {
+            None
+        };
+        (result, raw)
+    }
+}
+
+/// Ask the plugin how to capture test results from each command. Each
+/// planned command gets its own empty report directory.
+fn plan_captures(
+    plugin: &dyn LanguagePlugin,
+    project_dir: &Path,
+    working_dir: &Path,
+    target_name: &str,
+    commands: &[String],
+) -> Vec<Option<(ReportPlan, PathBuf)>> {
+    commands
+        .iter()
+        .map(|command| {
+            let report_dir = match test_results::new_report_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    eprintln!("[aster] Warning: test results will not be captured: {error:#}");
+                    return None;
+                }
+            };
+            let context = ReportContext {
+                project_dir,
+                working_dir,
+                target_name,
+                command,
+                report_dir: &report_dir,
+            };
+            match plugin.test_report_plan(&context) {
+                Some(plan) => Some((plan, report_dir)),
+                None => {
+                    let _ = std::fs::remove_dir_all(&report_dir);
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Read the reports of the commands that ran and remove every report
+/// directory. `raw_outputs` has one entry per command that ran: its raw
+/// console output when that is its report. `None` when no command was
+/// planned for capture.
+///
+/// The result is [`Confidence::Complete`] only when every command ran, was
+/// planned, its plan was complete and its report was read in full.
+fn read_test_report(
+    address: &str,
+    captures: &[Option<(ReportPlan, PathBuf)>],
+    raw_outputs: &[Option<String>],
+    started: SystemTime,
+) -> Option<TestReport> {
+    if captures.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut complete = raw_outputs.len() == captures.len();
+    let mut cases = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    for (capture, raw) in captures.iter().zip(raw_outputs) {
+        let Some((plan, _)) = capture else {
+            complete = false;
+            continue;
+        };
+        match test_results::collect(plan, started, raw.as_deref()) {
+            Ok(found) => {
+                complete &= found.complete && plan.confidence == Confidence::Complete;
+                cases.extend(found.cases);
+                if !names.contains(&plan.format.capture_name()) {
+                    names.push(plan.format.capture_name());
+                }
+            }
+            Err(error) => {
+                eprintln!("[aster] Warning: test results for {address} are incomplete: {error:#}");
+                complete = false;
+            }
+        }
+    }
+    for (_, dir) in captures.iter().flatten() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Some(TestReport {
+        capture: names.join("+"),
+        confidence: if complete {
+            Confidence::Complete
+        } else {
+            Confidence::Partial
+        },
+        cases,
+    })
+}
+
+/// Run commands in order, stopping at the first failure. Returns the
+/// combined result and, for each command that ran, its raw console output
+/// when the command keeps it.
 ///
 /// A target has one command; several come only from a
 /// [`CommandOverride::Run`] that splits the target into narrower invocations.
-fn run_commands(
+fn run_invocations(
     address: &str,
-    commands: &[String],
+    invocations: &[Invocation],
     working_dir: &Path,
     null_stdin: bool,
-) -> ExecutionResult {
-    if let [command] = commands {
-        return run_command(address, command, working_dir, null_stdin);
+) -> (ExecutionResult, Vec<Option<String>>) {
+    if let [invocation] = invocations {
+        let (result, raw) = invocation.run(address, working_dir, null_stdin);
+        return (result, vec![raw]);
     }
     let mut combined = ExecutionResult {
         address: address.to_string(),
@@ -1160,30 +1453,39 @@ fn run_commands(
         cached: false,
         output: String::new(),
         duration_ms: 0,
+        exit_code: None,
+        tests: None,
+        input_hash: None,
     };
-    for command in commands {
+    let mut raw_outputs = Vec::new();
+    for invocation in invocations {
         if shutdown_requested() {
             break;
         }
-        let result = run_command(address, command, working_dir, null_stdin);
+        let (result, raw) = invocation.run(address, working_dir, null_stdin);
+        raw_outputs.push(raw);
         if !combined.output.is_empty() && !combined.output.ends_with('\n') {
             combined.output.push('\n');
         }
-        combined.output.push_str(&format!("$ {command}\n"));
+        combined
+            .output
+            .push_str(&format!("$ {}\n", invocation.shown));
         combined.output.push_str(&result.output);
         combined.duration_ms += result.duration_ms;
+        combined.exit_code = result.exit_code;
         if !result.success {
             combined.success = false;
             break;
         }
     }
-    combined
+    (combined, raw_outputs)
 }
 
 /// Run a command in a directory and capture output
 fn run_command(
     address: &str,
     command: &str,
+    extra_env: &[(String, String)],
     working_dir: &Path,
     null_stdin: bool,
 ) -> ExecutionResult {
@@ -1199,6 +1501,9 @@ fn run_command(
                 cached: false,
                 output: error.to_string(),
                 duration_ms: 0,
+                exit_code: None,
+                tests: None,
+                input_hash: None,
             };
         }
     };
@@ -1211,6 +1516,9 @@ fn run_command(
             cached: false,
             output: "Empty command".to_string(),
             duration_ms: 0,
+            exit_code: None,
+            tests: None,
+            input_hash: None,
         };
     }
 
@@ -1228,6 +1536,9 @@ fn run_command(
 
     // Set environment variables
     for (name, value) in parsed.env {
+        cmd.env(name, value);
+    }
+    for (name, value) in extra_env {
         cmd.env(name, value);
     }
 
@@ -1287,6 +1598,9 @@ fn run_command(
                 cached: false,
                 output: combined,
                 duration_ms,
+                exit_code: output.status.code(),
+                tests: None,
+                input_hash: None,
             }
         }
         Err(e) => ExecutionResult {
@@ -1296,6 +1610,9 @@ fn run_command(
             cached: false,
             output: format!("Failed to execute command: {e}"),
             duration_ms,
+            exit_code: None,
+            tests: None,
+            input_hash: None,
         },
     }
 }
@@ -1974,6 +2291,7 @@ mod tests {
             None,
             &plugin_registry,
             &computed_hashes,
+            &Mutex::new(HashMap::new()),
             &env_snapshot,
         );
         let total_ms = start.elapsed().as_millis();
@@ -2061,6 +2379,7 @@ mod tests {
             None,
             &plugin_registry,
             &computed_hashes,
+            &Mutex::new(HashMap::new()),
             &env_snapshot,
         );
         let total_ms = start.elapsed().as_millis();
@@ -2087,6 +2406,9 @@ mod tests {
             cached: false,
             output: "test output".to_string(),
             duration_ms: 100,
+            exit_code: None,
+            tests: None,
+            input_hash: None,
         };
 
         assert_eq!(result.address, "//test:build");
@@ -2127,6 +2449,7 @@ mod tests {
         let result = run_command(
             "//a:prompt",
             "sh -c 'if [ -t 0 ]; then echo tty; else echo not-a-tty; fi'",
+            &[],
             tmp.path(),
             true,
         );
@@ -2142,15 +2465,181 @@ mod tests {
     #[test]
     fn override_commands_run_in_order_and_stop_at_the_first_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let commands = vec![
-            "sh -c 'echo first'".to_string(),
-            "sh -c 'echo second; exit 3'".to_string(),
-            "sh -c 'echo third'".to_string(),
-        ];
-        let result = run_commands("//a:test", &commands, tmp.path(), true);
+        let invocations: Vec<Invocation> = [
+            "sh -c 'echo first'",
+            "sh -c 'echo second; exit 3'",
+            "sh -c 'echo third'",
+        ]
+        .into_iter()
+        .map(Invocation::plain)
+        .collect();
+        let (result, raw) = run_invocations("//a:test", &invocations, tmp.path(), true);
         assert!(!result.success);
+        assert_eq!(raw.len(), 2, "the third command never ran");
+        assert_eq!(result.exit_code, Some(3));
         assert!(result.output.contains("$ sh -c 'echo first'\nfirst"));
         assert!(result.output.contains("second"));
         assert!(!result.output.contains("third"), "{}", result.output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invocation_runs_its_rewrite_with_its_env_and_logs_the_original() {
+        let tmp = tempfile::tempdir().unwrap();
+        let invocations = vec![
+            Invocation::plain("sh -c 'echo plain'"),
+            Invocation {
+                shown: "make test".to_string(),
+                command: "sh -c 'echo \"report=$ASTER_TEST_REPORT\"'".to_string(),
+                env: vec![("ASTER_TEST_REPORT".to_string(), "on".to_string())],
+                keep_output: true,
+                rewrite: None,
+            },
+        ];
+        let (result, raw) = run_invocations("//a:test", &invocations, tmp.path(), true);
+        assert!(result.success, "{}", result.output);
+        assert_eq!(raw, vec![None, Some("report=on\n".to_string())]);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            result.output.contains("$ make test\nreport=on"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_json_output_is_rendered_for_the_log_and_kept_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event = r#"{"Action":"output","Package":"p","Output":"ok  \tp\t0.01s\n"}"#;
+        let invocation = Invocation {
+            shown: "go test ./...".to_string(),
+            command: format!("printf '%s\\n' '{event}'"),
+            env: Vec::new(),
+            keep_output: true,
+            rewrite: Some(OutputRewrite::GoTestJson { verbose: false }),
+        };
+        let (result, raw) = run_invocations("//a:test", &[invocation], tmp.path(), true);
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.output, "ok  \tp\t0.01s\n");
+        assert_eq!(raw, vec![Some(format!("{event}\n"))]);
+    }
+
+    struct JunitPlugin;
+
+    impl LanguagePlugin for JunitPlugin {
+        fn name(&self) -> &str {
+            "junit-fixture"
+        }
+        fn marker_files(&self) -> &[&str] {
+            &[]
+        }
+        fn parse_project(
+            &self,
+            _root: &Path,
+            _config_path: &Path,
+        ) -> anyhow::Result<crate::plugins::ProjectMetadata> {
+            unreachable!()
+        }
+        fn parse_dependencies(
+            &self,
+            _config_path: &Path,
+        ) -> anyhow::Result<Vec<crate::plugins::LocalDependency>> {
+            unreachable!()
+        }
+        fn detect_targets(
+            &self,
+            _ctx: &crate::plugins::TargetContext,
+        ) -> anyhow::Result<HashMap<String, Target>> {
+            unreachable!()
+        }
+        /// Plans only commands starting with `report`; they write a JUnit
+        /// file into the report directory named by `$REPORT`.
+        fn test_report_plan(&self, ctx: &ReportContext) -> Option<ReportPlan> {
+            let rest = ctx.command.strip_prefix("report ")?;
+            let file = ctx.report_dir.join("junit.xml");
+            Some(ReportPlan {
+                command: rest.to_string(),
+                env: vec![("REPORT".to_string(), file.display().to_string())],
+                files: crate::test_results::ReportFiles::Paths(vec![file]),
+                format: crate::test_results::ReportFormat::JUnitXml,
+                confidence: Confidence::Complete,
+                rewrite: None,
+            })
+        }
+    }
+
+    const WRITE_REPORT: &str = r#"report sh -c 'printf "%s" "<testsuite><testcase classname=\"A\" name=\"ok\"/><testcase classname=\"A\" name=\"bad\"><failure message=\"boom\"/></testcase></testsuite>" > "$REPORT"; exit 1'"#;
+
+    fn capture_and_run(
+        tmp: &Path,
+        commands: &[String],
+    ) -> (ExecutionResult, Vec<Option<(ReportPlan, PathBuf)>>) {
+        let captures = plan_captures(&JunitPlugin, tmp, tmp, "test", commands);
+        let invocations: Vec<Invocation> = commands
+            .iter()
+            .zip(&captures)
+            .map(|(command, capture)| match capture {
+                Some((plan, _)) => Invocation::planned(command, plan),
+                None => Invocation::plain(command),
+            })
+            .collect();
+        let started = SystemTime::now();
+        let (mut result, raw) = run_invocations("//a:test", &invocations, tmp, true);
+        result.tests = read_test_report("//a:test", &captures, &raw, started);
+        (result, captures)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_report_is_read_and_its_directory_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (result, captures) = capture_and_run(tmp.path(), &[WRITE_REPORT.to_string()]);
+        assert!(!result.success);
+        let report = result.tests.expect("a report");
+        assert_eq!(report.capture, "junit");
+        assert_eq!(report.confidence, Confidence::Complete);
+        assert_eq!(report.cases.len(), 2);
+        assert_eq!(report.failures(), 1);
+        let (_, dir) = captures[0].as_ref().unwrap();
+        assert!(!dir.exists(), "report directory is cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unplanned_or_unrun_commands_make_the_report_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The first command fails, so the second never runs.
+        let (result, _) = capture_and_run(
+            tmp.path(),
+            &[WRITE_REPORT.to_string(), "report sh -c 'true'".to_string()],
+        );
+        assert_eq!(result.tests.unwrap().confidence, Confidence::Partial);
+
+        // One command the plugin cannot capture.
+        let (result, _) = capture_and_run(
+            tmp.path(),
+            &[
+                "sh -c 'true'".to_string(),
+                "report sh -c 'true'".to_string(),
+            ],
+        );
+        let report = result.tests.unwrap();
+        assert_eq!(report.confidence, Confidence::Partial);
+        assert!(report.cases.is_empty());
+    }
+
+    #[test]
+    fn no_plan_means_no_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let captures = plan_captures(
+            &JunitPlugin,
+            tmp.path(),
+            tmp.path(),
+            "test",
+            &["true".to_string()],
+        );
+        assert!(captures.iter().all(Option::is_none));
+        assert!(read_test_report("//a:test", &captures, &[None], SystemTime::now()).is_none());
     }
 }
