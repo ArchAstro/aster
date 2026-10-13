@@ -1540,7 +1540,7 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
 }
 
 #[test]
-fn daemon_launch_does_not_wait_out_a_daemon_that_holds_the_instance_lock() {
+fn daemon_launch_neither_waits_out_nor_replaces_a_daemon_that_holds_the_instance_lock() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let runtime_dir = root.join("daemon-runtime");
@@ -1560,11 +1560,12 @@ fn daemon_launch_does_not_wait_out_a_daemon_that_holds_the_instance_lock() {
     .unwrap();
     let _env = DaemonEnvGuard::set(&runtime_dir, &lease_dir);
 
-    // Setup: stand in for a daemon that has taken `daemon.lock` but has not
-    // bound its socket yet. A real daemon keeps that lock until it exits, so a
-    // client that waits on it can wait for the daemon's whole lifetime. This
-    // is the interleaving that hung the concurrent-launch test: the second
-    // client's ping arrived before the first client's daemon bound its socket.
+    // Setup: stand in for a daemon that holds `daemon.lock` and owns
+    // `daemon.sock` but does not answer pings, as a daemon does between taking
+    // the lock and listening, or while it is slow. A real daemon keeps the lock
+    // until it exits. The concurrent-launch test hung when a client waited on
+    // it: the second client's ping arrived before the first client's daemon
+    // was listening, and the daemon then held the lock for its whole life.
     fs::create_dir(&runtime_dir).unwrap();
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let instance_lock = fs::OpenOptions::new()
@@ -1576,29 +1577,37 @@ fn daemon_launch_does_not_wait_out_a_daemon_that_holds_the_instance_lock() {
         .open(runtime_dir.join("daemon.lock"))
         .unwrap();
     fs2::FileExt::lock_exclusive(&instance_lock).unwrap();
+    let socket = runtime_dir.join("daemon.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
 
-    // Action: a client launches a bundle while the lock is held. It must go on
-    // to spawn its own daemon rather than queue behind the lock holder.
+    // Action: a client launches a bundle while the lock is held.
     let launch = spawn_launch(root);
-    let daemon_log = runtime_dir.join("daemon.log");
-    let spawned = condition_met(Duration::from_secs(10), || {
-        fs::read_to_string(&daemon_log)
-            .unwrap_or_default()
-            .contains("starting Aster daemon")
-    });
-    // Release before asserting so a failure does not strand the client.
+    let result = await_launch(launch, &runtime_dir, "launch behind a held instance lock");
     fs2::FileExt::unlock(&instance_lock).unwrap();
+
+    // Outcome: the client gives up within its own startup bound instead of
+    // waiting for the lock holder to exit, and it leaves the holder alone: the
+    // socket stays and no second daemon is spawned to queue behind the lock.
     assert!(
-        spawned,
-        "client did not spawn a daemon while another process held daemon.lock; \
-         it is waiting on a lock a daemon holds for its lifetime\n{}",
+        socket.exists(),
+        "client removed the lock holder's socket\n{}",
         daemon_runtime_diagnostics(&runtime_dir)
     );
+    assert!(
+        !runtime_dir.join("daemon.log").exists(),
+        "client spawned a second daemon while daemon.lock was held\n{}",
+        daemon_runtime_diagnostics(&runtime_dir)
+    );
+    let error = result.expect_err("no daemon answered, so the launch must fail");
+    assert_eq!(error.code, aster::dev::DaemonErrorCode::DaemonUnavailable);
+    assert!(
+        error.message.contains("holds the runtime lock"),
+        "{error:?}"
+    );
 
-    // Outcome: once the stand-in releases the lock, the spawned daemon serves
-    // the launch, and stopping the bundle lets that daemon exit.
-    let launched =
-        await_launch(launch, &runtime_dir, "launch behind a held instance lock").unwrap();
+    // Once the holder is gone, the next launch treats the socket as stale,
+    // starts a daemon, and that daemon exits after its bundle stops.
+    let launched = await_launch(spawn_launch(root), &runtime_dir, "launch after release").unwrap();
     assert_eq!(launched.status, aster::dev::LaunchStatus::Started);
     assert_eq!(launched.bundle.services, vec!["worker"]);
     let daemon_pid = aster::dev::ping_daemon().unwrap();
@@ -1609,7 +1618,7 @@ fn daemon_launch_does_not_wait_out_a_daemon_that_holds_the_instance_lock() {
         1
     );
     wait_until(Duration::from_secs(10), || {
-        !runtime_dir.join("daemon.sock").exists()
+        !socket.exists()
             && !process_is_running(daemon_pid as i32)
             && !process_is_running(launched.bundle.supervisor_pid as i32)
     });

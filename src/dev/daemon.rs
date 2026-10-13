@@ -237,7 +237,7 @@ mod platform {
 
     const SOCKET_NAME: &str = "daemon.sock";
     /// Held by the serving daemon for its whole lifetime, so at most one
-    /// daemon serves a runtime directory. Clients never wait on it.
+    /// daemon serves a runtime directory. Clients probe it but never wait on it.
     const INSTANCE_LOCK_NAME: &str = "daemon.lock";
     /// Held by a client while it spawns a daemon and waits for it to answer,
     /// so concurrent clients start one daemon between them.
@@ -598,11 +598,9 @@ mod platform {
         if ping_existing(&paths.socket).is_ok() {
             return Ok(());
         }
-        // A daemon takes the instance lock before it binds its socket and keeps
-        // it until it exits, so waiting on that lock here would block for the
-        // daemon's whole life whenever a ping lands before the bind. Clients
-        // serialize on a separate startup lock that only other clients hold,
-        // and only for the bounded spawn-and-ping below.
+        // Clients serialize daemon startup on a startup lock that only clients
+        // take, and hold it until the daemon answers, so a client queued behind
+        // it reaches that daemon instead of spawning another.
         let startup_lock = open_regular(&paths.startup_lock, true)?;
         startup_lock
             .lock_exclusive()
@@ -614,38 +612,66 @@ mod platform {
             }
             Err(_) => {}
         }
-        if let Some(is_socket) = endpoint_kind(&paths.socket)? {
-            if !is_socket {
-                return Err(daemon_error(
-                    DaemonErrorCode::EndpointCollision,
-                    format!("daemon endpoint {} is not a socket", paths.socket.display()),
-                ));
-            }
-            remove_verified_socket(&paths.socket)?;
-        }
-        spawn_daemon(paths, daemon_executable)?;
-        // Keep the startup lock until the daemon answers: a client queued
-        // behind it then reaches the new daemon instead of spawning another.
+        // A daemon takes the instance lock before it binds its socket and holds
+        // it until it exits. Clients only probe it, never wait on it: waiting
+        // would last the daemon's whole life whenever a ping lands before the
+        // bind. A held lock means a daemon is about to answer, or is answering
+        // slowly, so its socket must stay and no second daemon is spawned.
+        let instance_lock = open_regular(&paths.instance_lock, true)?;
         let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut spawned = false;
         loop {
+            if !spawned && try_lock(&instance_lock)? {
+                // No daemon is alive, so a socket left behind is stale.
+                if let Some(is_socket) = endpoint_kind(&paths.socket)? {
+                    if !is_socket {
+                        return Err(daemon_error(
+                            DaemonErrorCode::EndpointCollision,
+                            format!("daemon endpoint {} is not a socket", paths.socket.display()),
+                        ));
+                    }
+                    remove_verified_socket(&paths.socket)?;
+                }
+                spawn_daemon(paths, daemon_executable)?;
+                FileExt::unlock(&instance_lock)
+                    .map_err(internal("failed to release daemon instance lock"))?;
+                spawned = true;
+            }
             match ping_existing(&paths.socket) {
                 Ok(_) => return Ok(()),
                 Err(_error) if Instant::now() < deadline => {
-                    if let Ok(Some(status)) = daemon_pid_status(&paths.pid) {
-                        return Err(daemon_error(
-                            DaemonErrorCode::DaemonUnavailable,
-                            format!("daemon exited during startup: {status}"),
-                        ));
+                    if spawned {
+                        if let Ok(Some(status)) = daemon_pid_status(&paths.pid) {
+                            return Err(daemon_error(
+                                DaemonErrorCode::DaemonUnavailable,
+                                format!("daemon exited during startup: {status}"),
+                            ));
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 Err(error) => {
+                    let holder = if spawned {
+                        ""
+                    } else {
+                        "; another Aster daemon holds the runtime lock but is not answering"
+                    };
                     return Err(daemon_error(
                         DaemonErrorCode::DaemonUnavailable,
-                        format!("daemon did not become ready: {error}"),
-                    ))
+                        format!("daemon did not become ready: {error}{holder}"),
+                    ));
                 }
             }
+        }
+    }
+
+    /// Takes `file`'s exclusive lock without waiting; `false` means another
+    /// open file description holds it.
+    fn try_lock(file: &File) -> DaemonResult<bool> {
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(false),
+            Err(error) => Err(internal("failed to probe daemon instance lock")(error)),
         }
     }
 
