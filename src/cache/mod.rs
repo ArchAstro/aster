@@ -41,6 +41,14 @@ pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
     }
 }
 
+/// Version mixed into every cache key by [`CacheHasher`].
+///
+/// Bump when the hashed material, its order, or the meaning of a key changes
+/// so old entries cannot be restored under an incompatible layout. A crate
+/// version change already salts keys; this constant covers layout changes
+/// that ship without a version bump.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Entry in the cache for a single target
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {

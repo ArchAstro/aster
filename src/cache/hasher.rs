@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::cache::matcher::TargetInputMatcher;
+use crate::cache::CACHE_SCHEMA_VERSION;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
 
@@ -51,6 +52,7 @@ pub struct CacheHasher {
     /// Nested project roots whose contents belong to another project and
     /// must not enter this project's cache key.
     excluded_dirs: Vec<PathBuf>,
+    aster_version: String,
 }
 
 impl CacheHasher {
@@ -62,6 +64,17 @@ impl CacheHasher {
             project_root: project_root.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
             excluded_dirs: Vec::new(),
+            aster_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Hasher whose version salt is injected instead of the crate version.
+    /// The project is its own workspace.
+    #[cfg(test)]
+    fn with_version(project_root: &Path, version: &str) -> Self {
+        Self {
+            aster_version: version.to_string(),
+            ..Self::new(project_root, project_root)
         }
     }
 
@@ -77,11 +90,12 @@ impl CacheHasher {
     /// Compute the cache key for a target
     ///
     /// The cache key is a SHA256 hash of:
-    /// 1. Source files (matched by globs)
-    /// 2. Config files
-    /// 3. Command string
-    /// 4. Dependency cache keys (hash chaining)
-    /// 5. Environment variables
+    /// 1. Cache schema (`aster-cache-v<SCHEMA>`) and Aster version
+    /// 2. Source files (matched by globs)
+    /// 3. Config files
+    /// 4. Command string
+    /// 5. Dependency cache keys (hash chaining)
+    /// 6. Environment variables
     pub fn compute_hash(
         &self,
         plugin_inputs: &CacheInputs,
@@ -90,7 +104,32 @@ impl CacheHasher {
         dependency_hashes: &[&str],
         env_snapshot: &HashMap<String, String>,
     ) -> Result<String> {
+        self.compute_hash_with_schema(
+            CACHE_SCHEMA_VERSION,
+            plugin_inputs,
+            user_config,
+            command,
+            dependency_hashes,
+            env_snapshot,
+        )
+    }
+
+    fn compute_hash_with_schema(
+        &self,
+        schema: u32,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+        command: &str,
+        dependency_hashes: &[&str],
+        env_snapshot: &HashMap<String, String>,
+    ) -> Result<String> {
         let mut hasher = Sha256::new();
+
+        // Schema and Aster version come first so incompatible keys never collide.
+        hasher.update(format!("aster-cache-v{schema}").as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.aster_version.as_bytes());
+        hasher.update(b"\n");
 
         // 1. Hash source files, then workspace-root files. The `ws:` prefix
         // keeps a root Cargo.lock distinct from the member's own.
@@ -397,6 +436,59 @@ mod tests {
             .compute_hash(&inputs, None, "npm test", &[], &env)
             .unwrap();
         assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn test_compute_hash_schema_version_changes_key() {
+        let tmp = TempDir::new().unwrap();
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs::default();
+        let env = HashMap::new();
+
+        let current = hasher
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+        let bumped = hasher
+            .compute_hash_with_schema(
+                CACHE_SCHEMA_VERSION + 1,
+                &inputs,
+                None,
+                "npm test",
+                &[],
+                &env,
+            )
+            .unwrap();
+
+        assert_ne!(current, bumped);
+        assert_eq!(
+            current,
+            hasher
+                .compute_hash_with_schema(
+                    CACHE_SCHEMA_VERSION,
+                    &inputs,
+                    None,
+                    "npm test",
+                    &[],
+                    &env,
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_compute_hash_aster_version_changes_key() {
+        let tmp = TempDir::new().unwrap();
+        let inputs = CacheInputs::default();
+        let env = HashMap::new();
+
+        let hash1 = CacheHasher::with_version(tmp.path(), "0.17.2")
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+        let hash2 = CacheHasher::with_version(tmp.path(), "0.18.0")
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+
+        assert_ne!(hash1, hash2);
     }
 
     #[test]
