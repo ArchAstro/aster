@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 use super::{
-    FilesListPlan, FilesListSelection, LanguagePlugin, LocalDependency, ProjectMetadata, Target,
-    TargetCapability, TargetContext,
+    FilesListPlan, FilesListSelection, LanguagePlugin, LocalDependency, NativeCache,
+    ProjectMetadata, Target, TargetCapability, TargetContext,
 };
 
 /// Rust plugin for discovering and parsing Cargo projects
@@ -319,6 +319,39 @@ impl LanguagePlugin for RustPlugin {
         }
         files
     }
+
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        let cargo_root = cargo_workspace_root(ctx.project_dir, ctx.workspace_root);
+        let lock_file = workspace_relative(&cargo_root.join("Cargo.lock"), ctx.workspace_root);
+        let target_dir = workspace_relative(&cargo_root.join("target"), ctx.workspace_root);
+        let root_rel = workspace_relative(&cargo_root, ctx.workspace_root);
+        let target_id = if root_rel.is_empty() {
+            "cargo-target".to_string()
+        } else {
+            format!("cargo-target:{root_rel}")
+        };
+
+        vec![
+            NativeCache {
+                id: "cargo-registry".to_string(),
+                paths: vec![
+                    "~/.cargo/registry/index".to_string(),
+                    "~/.cargo/registry/cache".to_string(),
+                    "~/.cargo/git/db".to_string(),
+                ],
+                key_files: vec![lock_file.clone()],
+                key_runtime: None,
+                shared: true,
+            },
+            NativeCache {
+                id: target_id,
+                paths: vec![target_dir],
+                key_files: vec![lock_file],
+                key_runtime: Some("rustc -vV".to_string()),
+                shared: false,
+            },
+        ]
+    }
 }
 
 /// Resolve LocalDependency paths to project addresses
@@ -425,6 +458,47 @@ fn cargo_member_matches(relative: &str, pattern: &str) -> bool {
         .iter()
         .zip(pattern_parts.iter())
         .all(|(path_part, pattern_part)| *pattern_part == "*" || path_part == pattern_part)
+}
+
+/// Nearest ancestor of `project_dir`, bounded by `workspace_root`, whose
+/// Cargo.toml has a `[workspace]` table. A crate with no such ancestor uses
+/// its own directory, which is where Cargo writes `target/`.
+fn cargo_workspace_root(project_dir: &Path, workspace_root: &Path) -> PathBuf {
+    let mut current = project_dir.to_path_buf();
+    loop {
+        if cargo_toml_is_workspace(&current.join("Cargo.toml")) {
+            return current;
+        }
+        if current == workspace_root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent.starts_with(workspace_root) => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    project_dir.to_path_buf()
+}
+
+fn cargo_toml_is_workspace(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<Value>(&content) else {
+        return false;
+    };
+    value.get("workspace").is_some()
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+/// `~` paths are not passed here. A path equal to the workspace root is `""`.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -750,5 +824,98 @@ version = "0.1.0"
         assert!(plugin
             .workspace_cache_inputs(tmp.path(), tmp.path(), "build")
             .is_empty());
+    }
+
+    fn registry_paths() -> Vec<String> {
+        vec![
+            "~/.cargo/registry/index".to_string(),
+            "~/.cargo/registry/cache".to_string(),
+            "~/.cargo/git/db".to_string(),
+        ]
+    }
+
+    #[test]
+    fn test_native_caches_default_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("go.mod");
+        std::fs::write(&config, "module example.com/app\n\ngo 1.22\n").unwrap();
+        let ctx = make_context(&config, tmp.path(), &[]);
+
+        let caches = super::super::GoPlugin.native_caches(&ctx);
+
+        assert!(caches.is_empty());
+    }
+
+    #[test]
+    fn test_native_caches_standalone_crate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo_toml = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo_toml,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let plugin = RustPlugin;
+        let ctx = make_context(&cargo_toml, tmp.path(), &[]);
+
+        let caches = plugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "cargo-registry");
+        assert_eq!(caches[0].paths, registry_paths());
+        assert_eq!(caches[0].key_files, vec!["Cargo.lock".to_string()]);
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
+
+        assert_eq!(caches[1].id, "cargo-target");
+        assert_eq!(caches[1].paths, vec!["target".to_string()]);
+        assert_eq!(caches[1].key_files, vec!["Cargo.lock".to_string()]);
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("rustc -vV"));
+        assert!(!caches[1].shared);
+    }
+
+    #[test]
+    fn test_native_caches_workspace_member_uses_workspace_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aster_root = tmp.path();
+        // Cargo workspace is nested under the Aster workspace, so the restored
+        // target dir is relative to the checkout, not the member.
+        let cargo_root = aster_root.join("services/api");
+        std::fs::create_dir_all(&cargo_root).unwrap();
+        std::fs::write(
+            cargo_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n",
+        )
+        .unwrap();
+        let member = cargo_root.join("crates/app");
+        std::fs::create_dir_all(&member).unwrap();
+        let cargo_toml = member.join("Cargo.toml");
+        std::fs::write(
+            &cargo_toml,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let plugin = RustPlugin;
+        let ctx = make_context(&cargo_toml, aster_root, &[]);
+
+        let caches = plugin.native_caches(&ctx);
+
+        assert_eq!(caches[0].id, "cargo-registry");
+        assert_eq!(caches[0].paths, registry_paths());
+        assert_eq!(
+            caches[0].key_files,
+            vec!["services/api/Cargo.lock".to_string()]
+        );
+        assert!(caches[0].shared);
+        assert_eq!(caches[0].key_runtime, None);
+
+        assert_eq!(caches[1].id, "cargo-target:services/api");
+        assert_eq!(caches[1].paths, vec!["services/api/target".to_string()]);
+        assert_eq!(
+            caches[1].key_files,
+            vec!["services/api/Cargo.lock".to_string()]
+        );
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("rustc -vV"));
+        assert!(!caches[1].shared);
     }
 }

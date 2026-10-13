@@ -22,6 +22,28 @@ pub struct LocalDependency {
     pub path: PathBuf,
 }
 
+/// A warm-start directory for a native tool, restored by actions/cache.
+///
+/// These caches are not content-addressed and are distinct from Aster's
+/// artifact cache. `shared` marks a machine-global directory (for example
+/// `~/.cargo/registry`) so a later layer can dedupe it across projects.
+/// Paths and key files that do not start with `~` are relative to the Aster
+/// workspace root, because actions/cache runs from the repo checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCache {
+    /// Stable id. Per-workspace caches include the cargo root, for example
+    /// `cargo-target:crates/app`.
+    pub id: String,
+    /// Directories to save and restore. `~` is the user home directory.
+    pub paths: Vec<String>,
+    /// Files hashed into the actions/cache key, relative to the workspace root.
+    pub key_files: Vec<String>,
+    /// Command whose output is hashed into the key, when the toolchain matters.
+    pub key_runtime: Option<String>,
+    /// Machine-global cache, deduped across projects.
+    pub shared: bool,
+}
+
 /// Cache inputs provided by a language plugin
 ///
 /// Defines the files and environment variables that should be included
@@ -329,6 +351,15 @@ pub trait LanguagePlugin: Send + Sync {
         _workspace_root: &Path,
         _target_name: &str,
     ) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Warm-start directories for this language's native tools.
+    ///
+    /// Default is empty: a plugin opts in by describing the directories
+    /// actions/cache should restore before a run. This does not change
+    /// what a run executes.
+    fn native_caches(&self, _ctx: &TargetContext) -> Vec<NativeCache> {
         Vec::new()
     }
 
