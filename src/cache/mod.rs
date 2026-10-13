@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod artifact;
 pub mod gha;
 mod hasher;
 pub mod matcher;
 mod store;
 
+pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
 pub use hasher::CacheHasher;
 pub use matcher::TargetInputMatcher;
 pub use store::CacheStore;
