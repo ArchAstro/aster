@@ -221,6 +221,7 @@ impl LanguagePlugin for ElixirPlugin {
                 source_globs: vec![],
                 config_files: vec!["mix.exs".to_string(), "mix.lock".to_string()],
                 env_vars: vec!["MIX_ENV".to_string()],
+                runtime_commands: vec!["elixir --version".to_string()],
                 ..Default::default()
             };
         }
@@ -233,6 +234,7 @@ impl LanguagePlugin for ElixirPlugin {
                 "config/*.exs".to_string(),
             ],
             env_vars: vec!["MIX_ENV".to_string()],
+            runtime_commands: vec!["elixir --version".to_string()],
             ..Default::default()
         };
 
@@ -1371,6 +1373,10 @@ end
         let clean = targets.get("clean").unwrap();
         assert_eq!(clean.command, "mix clean");
         assert!(clean.depends_on.is_empty());
+        assert_eq!(
+            plugin.cache_inputs("build").runtime_commands,
+            vec!["elixir --version".to_string()]
+        );
         assert!(clean.invalidates_cache);
     }
 

@@ -268,6 +268,7 @@ impl LanguagePlugin for RustPlugin {
                 source_globs: vec![],
                 config_files: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
                 env_vars: vec![],
+                runtime_commands: vec!["rustc -vV".to_string()],
                 ..Default::default()
             };
         }
@@ -281,6 +282,7 @@ impl LanguagePlugin for RustPlugin {
                 ".cargo/config.toml".to_string(),
             ],
             env_vars: vec!["RUSTFLAGS".to_string(), "CARGO_TARGET_DIR".to_string()],
+            runtime_commands: vec!["rustc -vV".to_string()],
             ..Default::default()
         };
 
@@ -729,6 +731,7 @@ version = "0.1.0"
         assert!(inputs.config_files.contains(&"Cargo.toml".to_string()));
         assert!(inputs.config_files.contains(&"Cargo.lock".to_string()));
         assert!(inputs.env_vars.contains(&"RUSTFLAGS".to_string()));
+        assert_eq!(inputs.runtime_commands, vec!["rustc -vV".to_string()]);
     }
 
     #[test]

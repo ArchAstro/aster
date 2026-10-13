@@ -605,6 +605,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     "pnpm-lock.yaml".to_string(),
                 ],
                 env_vars: vec!["NODE_ENV".to_string()],
+                runtime_commands: vec!["node --version".to_string()],
                 ..Default::default()
             };
         }
@@ -626,6 +627,7 @@ impl LanguagePlugin for NodeJsPlugin {
                 "tsconfig.json".to_string(),
             ],
             env_vars: vec!["NODE_ENV".to_string()],
+            runtime_commands: vec!["node --version".to_string()],
             ..Default::default()
         };
 
@@ -1285,6 +1287,10 @@ mod tests {
         assert_eq!(
             targets.get("deps").map(|t| &t.command),
             Some(&"npm install".to_string())
+        );
+        assert_eq!(
+            plugin.cache_inputs("build").runtime_commands,
+            vec!["node --version".to_string()]
         );
 
         // Check dependencies (//self:deps)

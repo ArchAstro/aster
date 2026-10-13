@@ -266,6 +266,7 @@ impl LanguagePlugin for GoPlugin {
                 source_globs: vec![],
                 config_files: vec!["go.mod".to_string(), "go.sum".to_string()],
                 env_vars: vec!["GOOS".to_string(), "GOARCH".to_string()],
+                runtime_commands: vec!["go version".to_string()],
                 ..Default::default()
             };
         }
@@ -279,6 +280,7 @@ impl LanguagePlugin for GoPlugin {
                 "GOARCH".to_string(),
                 "CGO_ENABLED".to_string(),
             ],
+            runtime_commands: vec!["go version".to_string()],
             ..Default::default()
         }
     }
@@ -573,6 +575,10 @@ go 1.21
             vec!["//self:deps"]
         );
         assert_eq!(targets.get("test").unwrap().depends_on, vec!["//self:deps"]);
+        assert_eq!(
+            plugin.cache_inputs("build").runtime_commands,
+            vec!["go version".to_string()]
+        );
     }
 
     #[test]

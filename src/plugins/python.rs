@@ -401,6 +401,7 @@ impl LanguagePlugin for PythonPlugin {
                     ".venv/pyvenv.cfg".to_string(),
                 ],
                 env_vars: vec!["PYTHONPATH".to_string()],
+                runtime_commands: vec!["python --version".to_string()],
                 ..Default::default()
             };
         }
@@ -416,6 +417,7 @@ impl LanguagePlugin for PythonPlugin {
                 "setup.cfg".to_string(),
             ],
             env_vars: vec!["PYTHONPATH".to_string()],
+            runtime_commands: vec!["python --version".to_string()],
             ..Default::default()
         };
 
@@ -1382,6 +1384,10 @@ name = "mypackage"
                 .config_files
                 .contains(&".venv/pyvenv.cfg".to_string()),
             "deps cache_inputs should include .venv/pyvenv.cfg"
+        );
+        assert_eq!(
+            inputs.runtime_commands,
+            vec!["python --version".to_string()]
         );
 
         // deps should NOT include source globs (source changes don't require reinstall)

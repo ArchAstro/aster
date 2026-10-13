@@ -231,6 +231,7 @@ impl LanguagePlugin for MavenPlugin {
                 "MAVEN_OPTS".to_string(),
                 "MAVEN_ARGS".to_string(),
             ],
+            runtime_commands: vec!["java -version".to_string()],
             ..Default::default()
         };
         if target_name != "deps" {
@@ -534,6 +535,10 @@ mod tests {
     #[test]
     fn dependency_cache_excludes_sources() {
         assert!(MavenPlugin.cache_inputs("deps").source_globs.is_empty());
+        assert_eq!(
+            MavenPlugin.cache_inputs("test").runtime_commands,
+            vec!["java -version".to_string()]
+        );
         assert!(MavenPlugin
             .cache_inputs("test")
             .source_globs

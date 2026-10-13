@@ -292,6 +292,7 @@ impl LanguagePlugin for GradlePlugin {
                 "GRADLE_OPTS".to_string(),
                 "ORG_GRADLE_PROJECT_*".to_string(),
             ],
+            runtime_commands: vec!["java -version".to_string()],
             ..Default::default()
         };
         if target_name != "deps" {
@@ -667,6 +668,10 @@ dependencies {
 
         assert_eq!(targets["format"].command, "gradle spotlessApply");
         assert!(GradlePlugin.cache_inputs("deps").source_globs.is_empty());
+        assert_eq!(
+            GradlePlugin.cache_inputs("test").runtime_commands,
+            vec!["java -version".to_string()]
+        );
         assert!(GradlePlugin
             .cache_inputs("test")
             .source_globs

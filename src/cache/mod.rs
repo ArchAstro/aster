@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 pub mod gha;
 mod hasher;
 pub mod matcher;
+mod runtime;
 mod store;
 
 pub use hasher::CacheHasher;
 pub use matcher::TargetInputMatcher;
+pub use runtime::RuntimeInputCache;
 pub use store::CacheStore;
 
 /// Environment variable that overrides the cache directory.

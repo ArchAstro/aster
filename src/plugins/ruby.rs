@@ -340,6 +340,7 @@ impl LanguagePlugin for RubyPlugin {
                     "BUNDLE_WITH".to_string(),
                     "BUNDLE_WITHOUT".to_string(),
                 ],
+                runtime_commands: vec!["ruby --version".to_string()],
                 ..Default::default()
             };
         }
@@ -370,6 +371,7 @@ impl LanguagePlugin for RubyPlugin {
                 "RAILS_ENV".to_string(),
                 "RACK_ENV".to_string(),
             ],
+            runtime_commands: vec!["ruby --version".to_string()],
             ..Default::default()
         }
     }
@@ -694,6 +696,10 @@ mod tests {
             Some("bundle exec gem build sample.gemspec --strict".to_string())
         );
         assert!(RubyPlugin.cache_inputs("deps").source_globs.is_empty());
+        assert_eq!(
+            RubyPlugin.cache_inputs("test").runtime_commands,
+            vec!["ruby --version".to_string()]
+        );
         assert!(RubyPlugin
             .cache_inputs("test")
             .source_globs
