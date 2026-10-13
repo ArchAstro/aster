@@ -652,6 +652,7 @@ impl<'a> Executor<'a> {
                     &target_name,
                     &command,
                     project,
+                    self.workspace_root,
                     project_map,
                     plugin_registry,
                     input_hashes,
@@ -671,6 +672,7 @@ impl<'a> Executor<'a> {
                     &target_name,
                     &command,
                     project,
+                    self.workspace_root,
                     store,
                     plugin_registry,
                     computed_hashes,
@@ -743,6 +745,7 @@ impl<'a> Executor<'a> {
             let tx_clone = tx.clone();
             let computed_hashes_clone = Arc::clone(computed_hashes);
             let cache_store_path = cache_store.map(|_| self.cache_dir.clone());
+            let workspace_root_path = self.workspace_root.to_path_buf();
             let command_clone = command.clone();
             let target_name_clone = target_name.clone();
             let plugin_name = project.plugin_name.clone();
@@ -836,8 +839,13 @@ impl<'a> Executor<'a> {
                     {
                         let plugin_registry = PluginRegistry::with_all_plugins();
                         if let Some(plugin) = plugin_registry.find_by_name(&plugin_name) {
-                            let plugin_inputs = plugin.cache_inputs(&target_name_clone);
-                            let hasher = CacheHasher::new(&project_root);
+                            let plugin_inputs = cache_inputs_for(
+                                plugin,
+                                &project_root,
+                                &workspace_root_path,
+                                &target_name_clone,
+                            );
+                            let hasher = CacheHasher::new(&project_root, &workspace_root_path);
                             let hashes_guard = computed_hashes_clone.lock().unwrap();
                             let dependency_hashes = target_deps
                                 .iter()
@@ -1175,6 +1183,21 @@ pub fn compute_target_levels(
     levels
 }
 
+/// Plugin cache inputs plus the workspace-root files that plugin names
+/// for this project. A root project gets an empty workspace list, so its
+/// own `Cargo.lock` is not hashed a second time.
+fn cache_inputs_for(
+    plugin: &dyn LanguagePlugin,
+    project_root: &Path,
+    workspace_root: &Path,
+    target_name: &str,
+) -> crate::plugins::CacheInputs {
+    let mut inputs = plugin.cache_inputs(target_name);
+    inputs.workspace_files =
+        plugin.workspace_cache_inputs(project_root, workspace_root, target_name);
+    inputs
+}
+
 /// Check if a target is cached and return (cache_hit, current_hash)
 ///
 /// Returns Some((true, hash)) if cache hit, Some((false, hash)) if cache miss,
@@ -1185,6 +1208,7 @@ fn check_cache(
     target_name: &str,
     command: &str,
     project: &DiscoveredProject,
+    workspace_root: &Path,
     cache_store: &CacheStore,
     plugin_registry: &PluginRegistry,
     computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
@@ -1204,9 +1228,10 @@ fn check_cache(
     // cacheable by explicit opt-in; their command, dependencies, configured
     // inputs, and environment still form the cache key.
     let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
-    let plugin_inputs = plugin.cache_inputs(target_name);
+    let plugin_inputs = cache_inputs_for(plugin, &project.root, workspace_root, target_name);
     if plugin_inputs.source_globs.is_empty()
         && plugin_inputs.config_files.is_empty()
+        && plugin_inputs.workspace_files.is_empty()
         && plugin_inputs.env_vars.is_empty()
         && explicitly_enabled != Some(true)
     {
@@ -1222,7 +1247,7 @@ fn check_cache(
         .collect::<Option<_>>()?;
 
     // Compute current hash
-    let hasher = CacheHasher::new(&project.root);
+    let hasher = CacheHasher::new(&project.root, workspace_root);
     let current_hash = hasher
         .compute_hash(
             &plugin_inputs,
@@ -1277,6 +1302,7 @@ fn test_input_hash(
     target_name: &str,
     command: &str,
     project: &DiscoveredProject,
+    workspace_root: &Path,
     project_map: &HashMap<String, &DiscoveredProject>,
     plugin_registry: &PluginRegistry,
     input_hashes: &Mutex<HashMap<String, String>>,
@@ -1288,9 +1314,9 @@ fn test_input_hash(
         Some(other) => {
             let other_plugin = plugin_registry.find_by_name(&other.plugin_name)?;
             Some(
-                CacheHasher::new(&other.root)
+                CacheHasher::new(&other.root, workspace_root)
                     .compute_hash(
-                        &other_plugin.cache_inputs("test"),
+                        &cache_inputs_for(other_plugin, &other.root, workspace_root, "test"),
                         None,
                         "",
                         &[],
@@ -1302,11 +1328,12 @@ fn test_input_hash(
         None => None,
     };
     let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
-    let mut inputs = plugin.cache_inputs(target_name);
-    let test_inputs = plugin.cache_inputs("test");
+    let mut inputs = cache_inputs_for(plugin, &project.root, workspace_root, target_name);
+    let test_inputs = cache_inputs_for(plugin, &project.root, workspace_root, "test");
     for (all, more) in [
         (&mut inputs.source_globs, test_inputs.source_globs),
         (&mut inputs.config_files, test_inputs.config_files),
+        (&mut inputs.workspace_files, test_inputs.workspace_files),
         (&mut inputs.env_vars, test_inputs.env_vars),
     ] {
         for item in more {
@@ -1323,7 +1350,7 @@ fn test_input_hash(
             .map(|dependency| hashes.get(dependency).map(String::as_str))
             .collect::<Option<_>>()?;
         dependencies.extend(elsewhere_hash.as_deref());
-        CacheHasher::new(&project.root)
+        CacheHasher::new(&project.root, workspace_root)
             .compute_hash(
                 &inputs,
                 target.cache.as_ref(),
@@ -2386,6 +2413,7 @@ mod tests {
             "build",
             "true",
             &project,
+            tmp.path(),
             &CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path())),
             &PluginRegistry::with_all_plugins(),
             &Arc::new(Mutex::new(HashMap::new())),

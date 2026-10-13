@@ -22,6 +22,18 @@ impl LanguagePlugin for RustPlugin {
         &["Cargo.toml"]
     }
 
+    fn should_skip(&self, config_path: &Path) -> bool {
+        // A virtual workspace manifest has `[workspace]` and no `[package]`.
+        // It is not a buildable project; its members are. Leaving it for
+        // `parse_project` aborts discovery of the whole workspace.
+        // A member that also declares `[workspace]` has a `[package]` and
+        // is not skipped.
+        match std::fs::read_to_string(config_path) {
+            Ok(content) => is_virtual_workspace_manifest(&content),
+            Err(_) => false,
+        }
+    }
+
     fn parse_project(&self, _root: &Path, config_path: &Path) -> Result<ProjectMetadata> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
@@ -249,6 +261,7 @@ impl LanguagePlugin for RustPlugin {
                 source_globs: vec![],
                 config_files: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
                 env_vars: vec![],
+                ..Default::default()
             };
         }
 
@@ -265,6 +278,7 @@ impl LanguagePlugin for RustPlugin {
                 "CARGO_TARGET_DIR".to_string(),
                 "CI".to_string(),
             ],
+            ..Default::default()
         };
 
         // Add test files for test target
@@ -274,6 +288,29 @@ impl LanguagePlugin for RustPlugin {
         }
 
         inputs
+    }
+
+    fn workspace_cache_inputs(
+        &self,
+        project_root: &Path,
+        workspace_root: &Path,
+        target_name: &str,
+    ) -> Vec<String> {
+        if project_root == workspace_root {
+            return Vec::new();
+        }
+        if !is_cargo_workspace_member(project_root, workspace_root) {
+            return Vec::new();
+        }
+        // Cargo reads the workspace Cargo.toml and Cargo.lock from the
+        // workspace root, not from the member. Toolchain and cargo config
+        // change what a build produces, but not what `cargo fetch` resolves.
+        let mut files = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+        if target_name != "deps" {
+            files.push("rust-toolchain.toml".to_string());
+            files.push(".cargo/config.toml".to_string());
+        }
+        files
     }
 }
 
@@ -296,6 +333,91 @@ fn resolve_dependency_addresses(ctx: &TargetContext) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// True when `content` is a virtual workspace manifest: `[workspace]` and
+/// no `[package]`. A real crate that also declares `[workspace]` is a project.
+fn is_virtual_workspace_manifest(content: &str) -> bool {
+    let Ok(value) = toml::from_str::<Value>(content) else {
+        return false;
+    };
+    value.get("workspace").is_some() && value.get("package").is_none()
+}
+
+/// True when `project_root` is a member of the Cargo workspace at
+/// `workspace_root`.
+///
+/// Membership is the root `[workspace]` table: `members` matches the
+/// crate's path, `exclude` does not, and the crate has no `[workspace]`
+/// of its own. A nested workspace is its own root, so its lockfile is the
+/// one Cargo uses.
+fn is_cargo_workspace_member(project_root: &Path, workspace_root: &Path) -> bool {
+    let Ok(relative) = project_root.strip_prefix(workspace_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let Ok(root_manifest) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(root) = toml::from_str::<Value>(&root_manifest) else {
+        return false;
+    };
+    let Some(workspace) = root.get("workspace").and_then(|value| value.as_table()) else {
+        return false;
+    };
+    let Some(members) = workspace.get("members").and_then(|value| value.as_array()) else {
+        return false;
+    };
+    let excluded = workspace
+        .get("exclude")
+        .and_then(|value| value.as_array())
+        .is_some_and(|exclude| {
+            exclude
+                .iter()
+                .filter_map(|value| value.as_str())
+                .any(|pattern| cargo_member_matches(&relative, pattern))
+        });
+    if excluded {
+        return false;
+    }
+    if !members
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|pattern| cargo_member_matches(&relative, pattern))
+    {
+        return false;
+    }
+    let Ok(member_manifest) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(member) = toml::from_str::<Value>(&member_manifest) else {
+        return false;
+    };
+    member.get("workspace").is_none()
+}
+
+/// Cargo `members`/`exclude` patterns: `*` matches one path segment, and
+/// a pattern without a glob is an exact path.
+fn cargo_member_matches(relative: &str, pattern: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    if !pattern.contains('*') {
+        return relative == pattern;
+    }
+    let relative_parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let pattern_parts: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    if relative_parts.len() != pattern_parts.len() {
+        return false;
+    }
+    relative_parts
+        .iter()
+        .zip(pattern_parts.iter())
+        .all(|(path_part, pattern_part)| *pattern_part == "*" || path_part == pattern_part)
 }
 
 #[cfg(test)]
@@ -562,5 +684,64 @@ version = "0.1.0"
         let clean = targets.get("clean").unwrap();
         assert_eq!(clean.command, "cargo clean");
         assert!(clean.invalidates_cache);
+    }
+
+    #[test]
+    fn workspace_member_cache_inputs_include_root_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skip\"]\n",
+        )
+        .unwrap();
+        let member = tmp.path().join("crates/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let excluded = tmp.path().join("crates/skip");
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::write(
+            excluded.join("Cargo.toml"),
+            "[package]\nname = \"skip\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let nested = tmp.path().join("crates/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[package]\nname = \"nested\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let plugin = RustPlugin;
+        assert!(plugin.should_skip(&tmp.path().join("Cargo.toml")));
+        assert!(!plugin.should_skip(&member.join("Cargo.toml")));
+
+        let build = plugin.workspace_cache_inputs(&member, tmp.path(), "build");
+        assert_eq!(
+            build,
+            vec![
+                "Cargo.toml".to_string(),
+                "Cargo.lock".to_string(),
+                "rust-toolchain.toml".to_string(),
+                ".cargo/config.toml".to_string(),
+            ]
+        );
+        assert_eq!(
+            plugin.workspace_cache_inputs(&member, tmp.path(), "deps"),
+            vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()]
+        );
+        assert!(plugin
+            .workspace_cache_inputs(&excluded, tmp.path(), "build")
+            .is_empty());
+        assert!(plugin
+            .workspace_cache_inputs(&nested, tmp.path(), "build")
+            .is_empty());
+        assert!(plugin
+            .workspace_cache_inputs(tmp.path(), tmp.path(), "build")
+            .is_empty());
     }
 }

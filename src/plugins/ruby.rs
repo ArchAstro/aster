@@ -340,6 +340,7 @@ impl LanguagePlugin for RubyPlugin {
                     "BUNDLE_WITH".to_string(),
                     "BUNDLE_WITHOUT".to_string(),
                 ],
+                ..Default::default()
             };
         }
 
@@ -370,6 +371,7 @@ impl LanguagePlugin for RubyPlugin {
                 "RACK_ENV".to_string(),
                 "CI".to_string(),
             ],
+            ..Default::default()
         }
     }
 

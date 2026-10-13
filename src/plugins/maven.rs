@@ -231,6 +231,7 @@ impl LanguagePlugin for MavenPlugin {
                 "MAVEN_ARGS".to_string(),
                 "CI".to_string(),
             ],
+            ..Default::default()
         };
         if target_name != "deps" {
             inputs.source_globs = vec![

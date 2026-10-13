@@ -395,6 +395,7 @@ impl LanguagePlugin for PythonPlugin {
                     ".venv/pyvenv.cfg".to_string(),
                 ],
                 env_vars: vec!["PYTHONPATH".to_string()],
+                ..Default::default()
             };
         }
 
@@ -409,6 +410,7 @@ impl LanguagePlugin for PythonPlugin {
                 "setup.cfg".to_string(),
             ],
             env_vars: vec!["PYTHONPATH".to_string(), "CI".to_string()],
+            ..Default::default()
         };
 
         if target_name == "test" {

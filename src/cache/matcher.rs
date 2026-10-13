@@ -119,6 +119,7 @@ mod tests {
             source_globs: source.iter().map(|s| s.to_string()).collect(),
             config_files: config.iter().map(|s| s.to_string()).collect(),
             env_vars: vec![],
+            ..Default::default()
         }
     }
 
@@ -152,6 +153,7 @@ mod tests {
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
             outputs: vec![],
+            ..Default::default()
         };
         let m =
             TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))
@@ -168,6 +170,7 @@ mod tests {
             exclude: vec![],
             env: vec![],
             outputs: vec![],
+            ..Default::default()
         };
         let m =
             TargetInputMatcher::build(Path::new("/p"), &inputs(&["src/**/*.ts"], &[]), Some(&user))

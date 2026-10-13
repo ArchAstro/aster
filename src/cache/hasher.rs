@@ -1,6 +1,7 @@
 //! Hash computation for cache keys
 
 use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path};
@@ -26,6 +27,12 @@ fn normalize_rel(rel: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// Prefix for a workspace-relative path in a cache key.
+///
+/// A member project and the workspace root can both contain `Cargo.lock`.
+/// Without a prefix those two paths hash as the same input.
+const WORKSPACE_PATH_PREFIX: &str = "ws:";
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -39,12 +46,17 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// Computes cache hashes for targets
 pub struct CacheHasher {
     project_root: std::path::PathBuf,
+    workspace_root: std::path::PathBuf,
 }
 
 impl CacheHasher {
-    pub fn new(project_root: &Path) -> Self {
+    /// `workspace_root` is where `workspace_files` and `workspace_include`
+    /// are resolved. Pass the project root again for a project that is its
+    /// own workspace.
+    pub fn new(project_root: &Path, workspace_root: &Path) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            workspace_root: workspace_root.to_path_buf(),
         }
     }
 
@@ -66,8 +78,11 @@ impl CacheHasher {
     ) -> Result<String> {
         let mut hasher = Sha256::new();
 
-        // 1. Hash source files
-        let file_hashes = self.hash_files(plugin_inputs, user_config)?;
+        // 1. Hash source files, then workspace-root files. The `ws:` prefix
+        // keeps a root Cargo.lock distinct from the member's own.
+        let mut file_hashes = self.hash_files(plugin_inputs, user_config)?;
+        file_hashes.extend(self.hash_workspace_files(plugin_inputs, user_config)?);
+        file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
         for (path, hash) in &file_hashes {
             hasher.update(path.as_bytes());
             hasher.update(b":");
@@ -147,6 +162,96 @@ impl CacheHasher {
         Ok(file_hashes)
     }
 
+    /// Hash workspace-root inputs.
+    ///
+    /// A pattern with no glob metacharacter is one file: read it directly so
+    /// a root lockfile does not require walking the workspace. Anything else
+    /// is a glob, matched by one walk. Missing files are omitted, matching
+    /// how a missing project-relative config file is omitted.
+    fn hash_workspace_files(
+        &self,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut literals = Vec::new();
+        let mut glob_builder = GlobSetBuilder::new();
+        let mut has_globs = false;
+
+        let mut add = |pattern: &str| -> Result<()> {
+            if is_literal_path(pattern) {
+                literals.push(pattern.to_string());
+                return Ok(());
+            }
+            let glob = Glob::new(pattern)
+                .with_context(|| format!("Invalid workspace cache glob: {pattern}"))?;
+            glob_builder.add(glob);
+            has_globs = true;
+            Ok(())
+        };
+
+        for pattern in &plugin_inputs.workspace_files {
+            add(pattern)?;
+        }
+        if let Some(config) = user_config {
+            for pattern in &config.workspace_include {
+                add(pattern)?;
+            }
+        }
+
+        let mut file_hashes = Vec::new();
+        let mut seen = BTreeSet::new();
+        for pattern in literals {
+            let rel = Path::new(&pattern);
+            if !seen.insert(pattern.clone()) {
+                continue;
+            }
+            if let Some(hash) = hash_file_contents(&self.workspace_root.join(rel))? {
+                file_hashes.push((format!("{WORKSPACE_PATH_PREFIX}{pattern}"), hash));
+            }
+        }
+
+        if has_globs {
+            let globs = glob_builder
+                .build()
+                .context("Failed to build workspace cache globset")?;
+            file_hashes.extend(self.walk_workspace_globs(&globs, &mut seen)?);
+        }
+
+        file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(file_hashes)
+    }
+
+    /// One walk of the workspace for every workspace glob.
+    fn walk_workspace_globs(
+        &self,
+        globs: &GlobSet,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut file_hashes = Vec::new();
+        for entry in WalkDir::new(&self.workspace_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let rel_path = match entry.path().strip_prefix(&self.workspace_root) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !globs.is_match(rel_path) {
+                continue;
+            }
+            let rel = normalize_rel(rel_path)?;
+            if !seen.insert(rel.clone()) {
+                continue;
+            }
+            if let Some(hash) = hash_file_contents(entry.path())? {
+                file_hashes.push((format!("{WORKSPACE_PATH_PREFIX}{rel}"), hash));
+            }
+        }
+        Ok(file_hashes)
+    }
+
     /// Collect all env vars to track.
     ///
     /// A name ending in `*` is a prefix: every snapshot key that starts with
@@ -180,6 +285,28 @@ impl CacheHasher {
     }
 }
 
+/// A workspace pattern with no glob metacharacter names one file.
+fn is_literal_path(pattern: &str) -> bool {
+    !pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | '{'))
+}
+
+/// Content hash of one file. `Ok(None)` when the file is absent, so a
+/// toolchain file that only some workspaces have does not fail the key.
+/// A present file that cannot be read is an error: skipping it would let
+/// a permission failure look like "this input does not exist".
+fn hash_file_contents(path: &Path) -> Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(content) => {
+            let digest = Sha256::digest(&content);
+            Ok(Some(encode_hex(digest.as_ref())))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +320,7 @@ mod tests {
     #[test]
     fn test_compute_hash_empty_inputs() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
@@ -212,7 +339,7 @@ mod tests {
     #[test]
     fn test_compute_hash_different_commands() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
@@ -230,7 +357,7 @@ mod tests {
     #[test]
     fn test_compute_hash_with_deps() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
 
         let inputs = CacheInputs::default();
         let env = HashMap::new();
@@ -248,7 +375,7 @@ mod tests {
     #[test]
     fn test_compute_hash_with_env() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
 
         let inputs = CacheInputs {
             env_vars: vec!["NODE_ENV".to_string()],
@@ -274,7 +401,7 @@ mod tests {
     #[test]
     fn test_env_prefix_pattern_hashes_matching_vars_in_order() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs {
             env_vars: vec!["FOO_*".to_string(), "EXACT".to_string()],
             ..Default::default()
@@ -324,7 +451,7 @@ mod tests {
     #[test]
     fn test_user_env_prefix_pattern() {
         let tmp = TempDir::new().unwrap();
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs {
             env_vars: vec!["JAVA_HOME".to_string()],
             ..Default::default()
@@ -382,11 +509,12 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("c.rs"), "fn main() {}").unwrap();
 
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs {
             source_globs: vec!["**/*.rs".to_string()],
             config_files: vec![],
             env_vars: vec![],
+            ..Default::default()
         };
 
         let file_hashes = hasher.hash_files(&inputs, None).unwrap();
@@ -422,11 +550,12 @@ mod tests {
         std::fs::write(tmp.path().join("src/main.ts"), "console.log('hello')").unwrap();
         std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
 
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs {
             source_globs: vec!["src/**/*.ts".to_string()],
             config_files: vec!["package.json".to_string()],
             env_vars: vec![],
+            ..Default::default()
         };
 
         let file_hashes = hasher.hash_files(&inputs, None).unwrap();
@@ -445,11 +574,12 @@ mod tests {
         std::fs::write(tmp.path().join("src/main.ts"), "code").unwrap();
         std::fs::write(tmp.path().join("src/main.test.ts"), "test").unwrap();
 
-        let hasher = CacheHasher::new(tmp.path());
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
         let inputs = CacheInputs {
             source_globs: vec!["src/**/*.ts".to_string()],
             config_files: vec![],
             env_vars: vec![],
+            ..Default::default()
         };
         let config = CacheConfig {
             enabled: None,
@@ -457,11 +587,78 @@ mod tests {
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
             outputs: vec![],
+            ..Default::default()
         };
 
         let file_hashes = hasher.hash_files(&inputs, Some(&config)).unwrap();
         assert_eq!(file_hashes.len(), 1);
         assert!(file_hashes[0].0.contains("main.ts"));
         assert!(!file_hashes[0].0.contains("test"));
+    }
+
+    #[test]
+    fn workspace_file_change_changes_member_key() {
+        let tmp = TempDir::new().unwrap();
+        let member = tmp.path().join("crates/app");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(member.join("src/lib.rs"), "fn app() {}").unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), "version = 3\n").unwrap();
+
+        let hasher = CacheHasher::new(&member, tmp.path());
+        let inputs = CacheInputs {
+            source_globs: vec!["src/**/*.rs".to_string()],
+            workspace_files: vec!["Cargo.lock".to_string()],
+            ..Default::default()
+        };
+        let env = HashMap::new();
+        let before = hasher
+            .compute_hash(&inputs, None, "cargo build", &[], &env)
+            .unwrap();
+
+        std::fs::write(tmp.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let after = hasher
+            .compute_hash(&inputs, None, "cargo build", &[], &env)
+            .unwrap();
+
+        assert_ne!(before, after);
+
+        // The member's own Cargo.lock is a different input from the root one.
+        std::fs::write(member.join("Cargo.lock"), "version = 4\n").unwrap();
+        let inputs_with_member_lock = CacheInputs {
+            config_files: vec!["Cargo.lock".to_string()],
+            workspace_files: vec!["Cargo.lock".to_string()],
+            ..Default::default()
+        };
+        let both = hasher
+            .compute_hash(&inputs_with_member_lock, None, "cargo build", &[], &env)
+            .unwrap();
+        std::fs::write(member.join("Cargo.lock"), "version = 5\n").unwrap();
+        let member_changed = hasher
+            .compute_hash(&inputs_with_member_lock, None, "cargo build", &[], &env)
+            .unwrap();
+        assert_ne!(both, member_changed);
+    }
+
+    #[test]
+    fn workspace_files_use_ws_prefix_and_user_globs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shared")).unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), "lock\n").unwrap();
+        std::fs::write(tmp.path().join("shared/base.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("shared/notes.md"), "skip\n").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            workspace_files: vec!["Cargo.lock".to_string(), "missing.toml".to_string()],
+            ..Default::default()
+        };
+        let config = CacheConfig {
+            workspace_include: vec!["shared/*.json".to_string()],
+            ..Default::default()
+        };
+
+        let hashed = hasher.hash_workspace_files(&inputs, Some(&config)).unwrap();
+        let paths: Vec<&str> = hashed.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, vec!["ws:Cargo.lock", "ws:shared/base.json"]);
     }
 }
