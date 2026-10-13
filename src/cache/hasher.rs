@@ -36,7 +36,7 @@ fn normalize_rel(rel: &Path) -> Result<String> {
 /// Without a prefix those two paths hash as the same input.
 const WORKSPACE_PATH_PREFIX: &str = "ws:";
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(super) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
