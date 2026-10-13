@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -1415,28 +1416,14 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
     )
     .unwrap();
 
-    let executable = Path::new(env!("CARGO_BIN_EXE_aster")).to_path_buf();
-    let launch = || {
-        let root = root.to_path_buf();
-        let executable = executable.clone();
-        thread::spawn(move || {
-            aster::dev::launch_bundle(aster::dev::LaunchOptions {
-                workspace: root,
-                group: None,
-                watch: false,
-                use_cache: true,
-                proxy: false,
-                executable,
-                environment: std::env::vars().collect(),
-            })
-        })
-    };
-
     let _env = DaemonEnvGuard::set(&runtime_dir, &lease_dir);
-    let first = launch();
-    let second = launch();
-    let first = first.join().unwrap().unwrap();
-    let second = second.join().unwrap().unwrap();
+    // Two clients race to start the daemon. Each launch runs on its own
+    // thread under a hang guard, so a client blocked on a wait the product
+    // never bounds fails this test with diagnostics instead of stalling it.
+    let first = spawn_launch(root);
+    let second = spawn_launch(root);
+    let first = await_launch(first, &runtime_dir, "first concurrent launch").unwrap();
+    let second = await_launch(second, &runtime_dir, "second concurrent launch").unwrap();
     assert_eq!(first.bundle.supervisor_pid, second.bundle.supervisor_pid);
     assert_eq!(first.bundle.services, vec!["worker"]);
     assert_ne!(first.status, second.status);
@@ -1463,19 +1450,11 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
     let occupied_port = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = occupied_port.local_addr().unwrap().port();
     write_daemon_workspace(&occupied_root, port, None);
-    let occupied = thread::spawn(move || {
-        aster::dev::launch_bundle(aster::dev::LaunchOptions {
-            workspace: occupied_root,
-            group: None,
-            watch: false,
-            use_cache: true,
-            proxy: false,
-            executable,
-            environment: std::env::vars().collect(),
-        })
-    })
-    .join()
-    .unwrap();
+    let occupied = await_launch(
+        spawn_launch(&occupied_root),
+        &runtime_dir,
+        "launch with an occupied port",
+    );
     let occupied = occupied.expect_err("occupied fixture port must fail the launch");
     assert_eq!(occupied.code, aster::dev::DaemonErrorCode::StartupFailed);
     let diagnostics = occupied.diagnostics.as_deref().unwrap_or_default();
@@ -1520,16 +1499,178 @@ fn daemon_runtime_is_single_instance_and_exits_after_last_bundle() {
     assert!(std::env::var_os("ASTER_PORT_LEASE_DIR").as_deref() == Some(lease_dir.as_os_str()));
 }
 
+#[test]
+fn daemon_launch_does_not_wait_out_a_daemon_that_holds_the_instance_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let runtime_dir = root.join("daemon-runtime");
+    let lease_dir = root.join("leases");
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev.services.worker]\ntarget = \"//app:worker\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.worker]\ncommand = \"sleep 30\"\nstream = true\n",
+    )
+    .unwrap();
+    let _env = DaemonEnvGuard::set(&runtime_dir, &lease_dir);
+
+    // Setup: stand in for a daemon that has taken `daemon.lock` but has not
+    // bound its socket yet. A real daemon keeps that lock until it exits, so a
+    // client that waits on it can wait for the daemon's whole lifetime. This
+    // is the interleaving that hung the concurrent-launch test: the second
+    // client's ping arrived before the first client's daemon bound its socket.
+    fs::create_dir(&runtime_dir).unwrap();
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let instance_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(runtime_dir.join("daemon.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&instance_lock).unwrap();
+
+    // Action: a client launches a bundle while the lock is held. It must go on
+    // to spawn its own daemon rather than queue behind the lock holder.
+    let launch = spawn_launch(root);
+    let daemon_log = runtime_dir.join("daemon.log");
+    let spawned = condition_met(Duration::from_secs(10), || {
+        fs::read_to_string(&daemon_log)
+            .unwrap_or_default()
+            .contains("starting Aster daemon")
+    });
+    // Release before asserting so a failure does not strand the client.
+    fs2::FileExt::unlock(&instance_lock).unwrap();
+    assert!(
+        spawned,
+        "client did not spawn a daemon while another process held daemon.lock; \
+         it is waiting on a lock a daemon holds for its lifetime\n{}",
+        daemon_runtime_diagnostics(&runtime_dir)
+    );
+
+    // Outcome: once the stand-in releases the lock, the spawned daemon serves
+    // the launch, and stopping the bundle lets that daemon exit.
+    let launched =
+        await_launch(launch, &runtime_dir, "launch behind a held instance lock").unwrap();
+    assert_eq!(launched.status, aster::dev::LaunchStatus::Started);
+    assert_eq!(launched.bundle.services, vec!["worker"]);
+    let daemon_pid = aster::dev::ping_daemon().unwrap();
+    assert_eq!(
+        aster::dev::stop_workspace_bundles(root, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    wait_until(Duration::from_secs(10), || {
+        !runtime_dir.join("daemon.sock").exists()
+            && !process_is_running(daemon_pid as i32)
+            && !process_is_running(launched.bundle.supervisor_pid as i32)
+    });
+}
+
+/// Upper bound for one in-process daemon launch. The client bounds each of
+/// its own waits (10 s for a spawned daemon to answer a ping, 30 s for the
+/// launch response, 20 s inside the daemon for supervisor readiness), so a
+/// launch still running after this is blocked on a wait with no bound.
+const LAUNCH_HANG_GUARD: Duration = Duration::from_secs(60);
+
+type LaunchReceiver = std::sync::mpsc::Receiver<aster::dev::DaemonResult<aster::dev::LaunchResult>>;
+
+/// Starts `launch_bundle` for `workspace` on its own thread and reports the
+/// result through a channel, so the caller can wait with a deadline. A thread
+/// left blocked after a failed guard ends with the test process.
+fn spawn_launch(workspace: &Path) -> LaunchReceiver {
+    let options = aster::dev::LaunchOptions {
+        workspace: workspace.to_path_buf(),
+        group: None,
+        watch: false,
+        use_cache: true,
+        proxy: false,
+        executable: Path::new(env!("CARGO_BIN_EXE_aster")).to_path_buf(),
+        environment: std::env::vars().collect(),
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(aster::dev::launch_bundle(options));
+    });
+    receiver
+}
+
+fn await_launch(
+    receiver: LaunchReceiver,
+    runtime_dir: &Path,
+    label: &str,
+) -> aster::dev::DaemonResult<aster::dev::LaunchResult> {
+    match receiver.recv_timeout(LAUNCH_HANG_GUARD) {
+        Ok(result) => result,
+        Err(error) => panic!(
+            "{label} did not return within {LAUNCH_HANG_GUARD:?} ({error}); \
+             the client is blocked on a wait with no bound\n{}",
+            daemon_runtime_diagnostics(runtime_dir)
+        ),
+    }
+}
+
+/// Describes a daemon runtime directory for a failure message: its entries,
+/// whether the recorded daemon process is alive, and the daemon and
+/// supervisor startup logs.
+fn daemon_runtime_diagnostics(runtime_dir: &Path) -> String {
+    let mut report = format!("daemon runtime {}:\n", runtime_dir.display());
+    let mut entries: Vec<_> = fs::read_dir(runtime_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in &entries {
+        report.push_str(&format!("  {}\n", path.display()));
+    }
+    let pid = fs::read_to_string(runtime_dir.join("daemon.pid")).unwrap_or_default();
+    if let Ok(pid) = pid.trim().parse::<i32>() {
+        report.push_str(&format!(
+            "daemon.pid {pid} running: {}\n",
+            process_is_running(pid)
+        ));
+    }
+    for path in entries
+        .iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+    {
+        report.push_str(&format!(
+            "--- {} ---\n{}\n",
+            path.display(),
+            fs::read_to_string(path).unwrap_or_default()
+        ));
+    }
+    report
+}
+
+/// Points the in-process daemon client at test-owned directories. These are
+/// process-wide variables, so tests that set them run one at a time.
 struct DaemonEnvGuard {
     runtime: Option<std::ffi::OsString>,
     lease: Option<std::ffi::OsString>,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl DaemonEnvGuard {
     fn set(runtime_dir: &Path, lease_dir: &Path) -> Self {
+        static DAEMON_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let serial = DAEMON_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let guard = Self {
             runtime: std::env::var_os("ASTER_DAEMON_RUNTIME_DIR"),
             lease: std::env::var_os("ASTER_PORT_LEASE_DIR"),
+            _serial: serial,
         };
         std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", runtime_dir);
         std::env::set_var("ASTER_PORT_LEASE_DIR", lease_dir);

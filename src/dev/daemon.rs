@@ -236,7 +236,12 @@ mod platform {
     use std::time::{Duration, Instant};
 
     const SOCKET_NAME: &str = "daemon.sock";
-    const LOCK_NAME: &str = "daemon.lock";
+    /// Held by the serving daemon for its whole lifetime, so at most one
+    /// daemon serves a runtime directory. Clients never wait on it.
+    const INSTANCE_LOCK_NAME: &str = "daemon.lock";
+    /// Held by a client while it spawns a daemon and waits for it to answer,
+    /// so concurrent clients start one daemon between them.
+    const STARTUP_LOCK_NAME: &str = "startup.lock";
     const PID_NAME: &str = "daemon.pid";
     const LOG_NAME: &str = "daemon.log";
     const READY_NAME: &str = "ready.sock";
@@ -280,8 +285,9 @@ mod platform {
     pub(super) fn serve_from_environment() -> DaemonResult<()> {
         std::env::remove_var(SERVE_ENV);
         let paths = RuntimePaths::secure()?;
-        let lock = open_regular(&paths.lock, true)?;
-        lock.lock_exclusive()
+        let instance_lock = open_regular(&paths.instance_lock, true)?;
+        instance_lock
+            .lock_exclusive()
             .map_err(internal("failed to acquire daemon lock"))?;
         if endpoint_kind(&paths.socket)?.is_some() {
             if ping_existing(&paths.socket).is_ok() {
@@ -454,7 +460,8 @@ mod platform {
     pub(super) struct RuntimePaths {
         directory: PathBuf,
         socket: PathBuf,
-        lock: PathBuf,
+        instance_lock: PathBuf,
+        startup_lock: PathBuf,
         pid: PathBuf,
         log: PathBuf,
         ready: PathBuf,
@@ -511,7 +518,8 @@ mod platform {
             ensure_secure_directory(&attach_directory)?;
             Ok(Self {
                 socket: directory.join(SOCKET_NAME),
-                lock: directory.join(LOCK_NAME),
+                instance_lock: directory.join(INSTANCE_LOCK_NAME),
+                startup_lock: directory.join(STARTUP_LOCK_NAME),
                 pid: directory.join(PID_NAME),
                 log: directory.join(LOG_NAME),
                 ready: directory.join(READY_NAME),
@@ -590,8 +598,14 @@ mod platform {
         if ping_existing(&paths.socket).is_ok() {
             return Ok(());
         }
-        let lock = open_regular(&paths.lock, true)?;
-        lock.lock_exclusive()
+        // A daemon takes the instance lock before it binds its socket and keeps
+        // it until it exits, so waiting on that lock here would block for the
+        // daemon's whole life whenever a ping lands before the bind. Clients
+        // serialize on a separate startup lock that only other clients hold,
+        // and only for the bounded spawn-and-ping below.
+        let startup_lock = open_regular(&paths.startup_lock, true)?;
+        startup_lock
+            .lock_exclusive()
             .map_err(internal("failed to acquire daemon startup lock"))?;
         match ping_existing(&paths.socket) {
             Ok(_) => return Ok(()),
@@ -610,7 +624,8 @@ mod platform {
             remove_verified_socket(&paths.socket)?;
         }
         spawn_daemon(paths, daemon_executable)?;
-        FileExt::unlock(&lock).map_err(internal("failed to release daemon startup lock"))?;
+        // Keep the startup lock until the daemon answers: a client queued
+        // behind it then reaches the new daemon instead of spawning another.
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
             match ping_existing(&paths.socket) {
