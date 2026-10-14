@@ -92,8 +92,8 @@ pub struct Cli {
     /// Record every test the run executes and write the results as NDJSON
     ///
     /// Aster reads each test runner's own report: ExUnit (mix test), go
-    /// test, pytest, Vitest, Jest, bun test, cargo test and nextest, Gradle
-    /// and Maven. Give a path with `--test-results=PATH`; without one the file
+    /// test, pytest, Vitest, Jest, bun test, node --test, cargo test and
+    /// nextest, Gradle and Maven. Give a path with `--test-results=PATH`; without one the file
     /// goes under $RUNNER_TEMP (or the system temp directory) and its path
     /// is printed. Setting ASTER_TEST_RESULTS to a path, or to 1, does the
     /// same.

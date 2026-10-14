@@ -236,6 +236,7 @@
           <tr><td>vitest</td><td>Flag</td><td><code>--reporter=default --reporter=junit --outputFile.junit=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
           <tr><td>jest</td><td>Flag</td><td><code>--json --outputFile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
           <tr><td>bun test</td><td>Flag</td><td><code>--reporter=junit --reporter-outfile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
+          <tr><td>node --test (tsx --test)</td><td>Reporter</td><td>Command left alone. <code>NODE_OPTIONS</code> adds <code>--test-reporter=spec</code> to stdout and Aster's reporter, which appends one JSON line per test, so a package script chaining several runs is captured. Planned only when the command, or the package script it runs, mentions <code>--test</code> and picks no reporter.</td><td><span class="pill flaky">partial</span></td><td>none in v1</td></tr>
           <tr><td>pytest</td><td>Flag</td><td><code>--junitxml=…</code></td><td><span class="pill pass">complete</span></td><td>node ids</td></tr>
           <tr><td>cargo nextest</td><td>Flag</td><td>JUnit profile output</td><td><span class="pill pass">complete</span></td><td><code>--exact</code> names</td></tr>
           <tr><td>cargo test</td><td>Stdout</td><td>Parse the <code>test x ... ok|FAILED</code> lines</td><td><span class="pill flaky">partial</span></td><td><code>--exact</code> names</td></tr>

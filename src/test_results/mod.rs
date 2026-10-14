@@ -15,6 +15,7 @@ mod gojson;
 mod jest;
 mod junit;
 mod libtest;
+pub(crate) mod nodetest;
 mod stream;
 pub mod upload;
 
@@ -81,6 +82,8 @@ pub enum ReportFormat {
     JestJson,
     /// `cargo test` console output.
     LibtestText,
+    /// JSON lines from Aster's reporter for Node's built-in test runner.
+    NodeTest,
 }
 
 impl ReportFormat {
@@ -92,6 +95,7 @@ impl ReportFormat {
             ReportFormat::ExUnit => "exunit",
             ReportFormat::JestJson => "jest-json",
             ReportFormat::LibtestText => "libtest",
+            ReportFormat::NodeTest => "node-test",
         }
     }
 
@@ -266,6 +270,7 @@ fn parse(format: ReportFormat, content: &str) -> Result<Collected> {
         ReportFormat::ExUnit => exunit::collect(Some(content), None),
         ReportFormat::JestJson => jest::parse(content)?,
         ReportFormat::LibtestText => libtest::parse(content),
+        ReportFormat::NodeTest => nodetest::parse(content)?,
     })
 }
 
