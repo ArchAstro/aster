@@ -107,6 +107,11 @@ impl rustls::client::danger::ServerCertVerifier for EncryptOnly {
 }
 
 const MIGRATION_LOCK: i64 = 0x6173_7465_722d_7372; // "aster-sr"
+/// How long a migration waits for a table lock before it gives up and
+/// tries again.
+const MIGRATION_LOCK_TIMEOUT: &str = "5s";
+/// Attempts at a migration that keeps meeting a deadlock or a lock timeout.
+const MIGRATION_ATTEMPTS: u32 = 12;
 
 /// Apply every migration not yet applied.
 pub async fn migrate(pool: &Pool, migrations: &[&Migration]) -> Result<()> {
@@ -136,23 +141,7 @@ pub async fn migrate(pool: &Pool, migrations: &[&Migration]) -> Result<()> {
             if applied {
                 continue;
             }
-            let transaction = client.transaction().await?;
-            transaction
-                .batch_execute(migration.sql)
-                .await
-                .with_context(|| {
-                    format!(
-                        "migration {} {} failed",
-                        migration.feature, migration.version
-                    )
-                })?;
-            transaction
-                .execute(
-                    "INSERT INTO aster_srv_migrations (feature, version) VALUES ($1, $2)",
-                    &[&migration.feature, &migration.version],
-                )
-                .await?;
-            transaction.commit().await?;
+            apply(&mut client, migration).await?;
             crate::log::info(
                 "applied migration",
                 serde_json::json!({"feature": migration.feature, "version": migration.version}),
@@ -165,4 +154,58 @@ pub async fn migrate(pool: &Pool, migrations: &[&Migration]) -> Result<()> {
         .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK])
         .await?;
     result
+}
+
+/// Apply one migration in its own transaction.
+///
+/// During a rolling deploy the previous release keeps writing to the tables
+/// a migration alters, so the migration can deadlock with it or wait behind
+/// it. Such a migration rolls back and is tried again after a pause rather
+/// than failing the server's start.
+async fn apply(client: &mut deadpool_postgres::Client, migration: &Migration) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        let transaction = client.transaction().await?;
+        let applied = async {
+            transaction
+                .batch_execute(&format!(
+                    "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
+                ))
+                .await?;
+            transaction.batch_execute(migration.sql).await?;
+            transaction
+                .execute(
+                    "INSERT INTO aster_srv_migrations (feature, version) VALUES ($1, $2)",
+                    &[&migration.feature, &migration.version],
+                )
+                .await?;
+            transaction.commit().await
+        }
+        .await;
+        let error = match applied {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let contended = error.code().is_some_and(|code| {
+            *code == tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+                || *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
+        });
+        if !contended || attempt >= MIGRATION_ATTEMPTS {
+            return Err(anyhow::Error::new(error).context(format!(
+                "migration {} {} failed",
+                migration.feature, migration.version
+            )));
+        }
+        crate::log::warn(
+            "migration waiting for table locks",
+            serde_json::json!({
+                "feature": migration.feature,
+                "version": migration.version,
+                "attempt": attempt,
+                "error": error.to_string(),
+            }),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt.min(5)))).await;
+        attempt += 1;
+    }
 }
