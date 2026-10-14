@@ -88,16 +88,11 @@ mod tests {
             "#!/bin/sh\ncount=0\nif [ -f runs ]; then count=$(cat runs); fi\ncount=$((count + 1))\necho \"$count\" > runs\necho v$count\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
 
+        // Run through `sh` rather than exec'ing the freshly written file:
+        // exec can fail with ETXTBSY while parallel tests fork.
         let cache = RuntimeInputCache::new(tmp.path());
-        let command = script.display().to_string();
+        let command = format!("sh {}", script.display());
         let first = cache.output(&command).unwrap();
         let second = cache.output(&command).unwrap();
 
