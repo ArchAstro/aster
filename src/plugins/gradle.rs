@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::jvm;
-use super::{CacheInputs, LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetContext};
+use super::{
+    CacheInputs, LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target,
+    TargetContext,
+};
 
 static ROOT_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\brootProject\.name\s*=\s*["']([^"']+)["']"#)
@@ -311,6 +314,33 @@ impl LanguagePlugin for GradlePlugin {
         }
         inputs
     }
+
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        let gradle_root = find_gradle_root(ctx.project_dir);
+        let root_rel = workspace_relative(&gradle_root, ctx.workspace_root);
+        // `*.gradle*` matches Groovy and Kotlin DSL scripts at the Gradle
+        // root. The wrapper properties pin the distribution those caches hold.
+        let key_files = vec![
+            join_workspace_relative(&root_rel, "*.gradle*"),
+            join_workspace_relative(&root_rel, "gradle/wrapper/gradle-wrapper.properties"),
+        ];
+        vec![
+            NativeCache {
+                id: "gradle-caches".to_string(),
+                paths: vec!["~/.gradle/caches".to_string()],
+                key_files: key_files.clone(),
+                key_runtime: None,
+                shared: true,
+            },
+            NativeCache {
+                id: "gradle-wrapper".to_string(),
+                paths: vec!["~/.gradle/wrapper".to_string()],
+                key_files,
+                key_runtime: None,
+                shared: true,
+            },
+        ]
+    }
 }
 
 fn is_settings_file(filename: &str) -> bool {
@@ -342,6 +372,24 @@ fn find_gradle_root(project_dir: &Path) -> PathBuf {
         .find(|directory| has_settings_file(directory))
         .unwrap_or(project_dir)
         .to_path_buf()
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
 }
 
 fn read_settings(build_root: &Path) -> String {
@@ -633,5 +681,39 @@ dependencies {
         std::fs::write(&build, "").unwrap();
         std::fs::write(temp.path().join("pom.xml"), "<project/>").unwrap();
         assert!(GradlePlugin.should_skip(&build));
+    }
+
+    #[test]
+    fn test_native_caches_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("settings.gradle.kts"),
+            "rootProject.name = \"app\"\n",
+        )
+        .unwrap();
+        let module = root.join("services/api");
+        std::fs::create_dir_all(&module).unwrap();
+        let build = module.join("build.gradle.kts");
+        std::fs::write(&build, "plugins { java }\n").unwrap();
+        let ctx = context(&build, root, &[]);
+
+        let caches = GradlePlugin.native_caches(&ctx);
+
+        let key_files = vec![
+            "*.gradle*".to_string(),
+            "gradle/wrapper/gradle-wrapper.properties".to_string(),
+        ];
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "gradle-caches");
+        assert_eq!(caches[0].paths, vec!["~/.gradle/caches".to_string()]);
+        assert_eq!(caches[0].key_files, key_files);
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
+
+        assert_eq!(caches[1].id, "gradle-wrapper");
+        assert_eq!(caches[1].paths, vec!["~/.gradle/wrapper".to_string()]);
+        assert_eq!(caches[1].key_files, caches[0].key_files);
+        assert!(caches[1].shared);
     }
 }

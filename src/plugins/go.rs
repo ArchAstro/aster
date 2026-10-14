@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::{
-    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+    LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
+    TargetContext,
 };
 
 /// Regex to extract module path from go.mod: `module github.com/user/project`
@@ -283,6 +284,32 @@ impl LanguagePlugin for GoPlugin {
         }
     }
 
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        // Go modules share one download cache. The build cache path is
+        // whatever `go env GOCACHE` prints; cache-plan runs that command.
+        // The plugin does not, so the path stays a command substitution.
+        let sum = join_workspace_relative(
+            &workspace_relative(ctx.project_dir, ctx.workspace_root),
+            "go.sum",
+        );
+        vec![
+            NativeCache {
+                id: "go-mod".to_string(),
+                paths: vec!["~/go/pkg/mod".to_string()],
+                key_files: vec![sum],
+                key_runtime: None,
+                shared: true,
+            },
+            NativeCache {
+                id: "go-build".to_string(),
+                paths: vec!["$(go env GOCACHE)".to_string()],
+                key_files: vec![],
+                key_runtime: Some("go version".to_string()),
+                shared: true,
+            },
+        ]
+    }
+
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
         Some(Target {
             command: "go clean".to_string(),
@@ -318,6 +345,24 @@ fn resolve_dependency_addresses(ctx: &TargetContext) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
 }
 
 #[cfg(test)]
@@ -732,5 +777,31 @@ go 1.21
         let clean = targets.get("clean").unwrap();
         assert_eq!(clean.command, "go clean");
         assert!(clean.invalidates_cache);
+    }
+
+    #[test]
+    fn test_native_caches_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("services/api");
+        std::fs::create_dir_all(&module).unwrap();
+        let go_mod = module.join("go.mod");
+        std::fs::write(&go_mod, "module example.com/api\n\ngo 1.22\n").unwrap();
+        std::fs::write(module.join("go.sum"), "").unwrap();
+        let ctx = make_context(&go_mod, tmp.path(), &[]);
+
+        let caches = GoPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "go-mod");
+        assert_eq!(caches[0].paths, vec!["~/go/pkg/mod".to_string()]);
+        assert_eq!(caches[0].key_files, vec!["services/api/go.sum".to_string()]);
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
+
+        assert_eq!(caches[1].id, "go-build");
+        assert_eq!(caches[1].paths, vec!["$(go env GOCACHE)".to_string()]);
+        assert!(caches[1].key_files.is_empty());
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("go version"));
+        assert!(caches[1].shared);
     }
 }

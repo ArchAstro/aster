@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::{
-    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+    LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
+    TargetContext,
 };
 
 /// Regex to extract app name from `app: :name` in mix.exs project definition
@@ -242,6 +243,35 @@ impl LanguagePlugin for ElixirPlugin {
         inputs
     }
 
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        // Umbrella children compile into the umbrella's deps and _build.
+        let mix_root =
+            find_umbrella_root(ctx.project_dir).unwrap_or_else(|| ctx.project_dir.to_path_buf());
+        let root_rel = workspace_relative(&mix_root, ctx.workspace_root);
+        let suffix = if root_rel.is_empty() {
+            String::new()
+        } else {
+            format!(":{root_rel}")
+        };
+        let lock = join_workspace_relative(&root_rel, "mix.lock");
+        vec![
+            NativeCache {
+                id: format!("elixir-deps{suffix}"),
+                paths: vec![join_workspace_relative(&root_rel, "deps")],
+                key_files: vec![lock.clone()],
+                key_runtime: Some("elixir --version".to_string()),
+                shared: false,
+            },
+            NativeCache {
+                id: format!("elixir-build{suffix}"),
+                paths: vec![join_workspace_relative(&root_rel, "_build")],
+                key_files: vec![lock],
+                key_runtime: Some("elixir --version".to_string()),
+                shared: false,
+            },
+        ]
+    }
+
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
         Some(Target {
             command: "mix clean".to_string(),
@@ -294,6 +324,24 @@ fn find_umbrella_root(project_dir: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
 }
 
 /// Detect targets for umbrella child apps
@@ -1486,5 +1534,65 @@ end
             !build_deps.iter().any(|d| d.contains("shared")),
             "Should not contain Elixir umbrella dep 'shared'"
         );
+    }
+
+    #[test]
+    fn test_native_caches_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(&mix_exs, "defmodule App.MixProject do\nend\n").unwrap();
+        std::fs::write(tmp.path().join("mix.lock"), "%{}\n").unwrap();
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+
+        let caches = ElixirPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "elixir-deps");
+        assert_eq!(caches[0].paths, vec!["deps".to_string()]);
+        assert_eq!(caches[0].key_files, vec!["mix.lock".to_string()]);
+        assert_eq!(caches[0].key_runtime.as_deref(), Some("elixir --version"));
+        assert!(!caches[0].shared);
+
+        assert_eq!(caches[1].id, "elixir-build");
+        assert_eq!(caches[1].paths, vec!["_build".to_string()]);
+        assert_eq!(caches[1].key_files, vec!["mix.lock".to_string()]);
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("elixir --version"));
+        assert!(!caches[1].shared);
+    }
+
+    #[test]
+    fn test_native_caches_umbrella_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let umbrella = tmp.path().join("services/api");
+        std::fs::write(
+            {
+                std::fs::create_dir_all(&umbrella).unwrap();
+                umbrella.join("mix.exs")
+            },
+            "defmodule Api.MixProject do\n  def project, do: [apps_path: \"apps\"]\nend\n",
+        )
+        .unwrap();
+        let app = umbrella.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        let mix_exs = app.join("mix.exs");
+        std::fs::write(&mix_exs, "defmodule Web.MixProject do\nend\n").unwrap();
+        let ctx = make_context(&mix_exs, tmp.path(), &[]);
+
+        let caches = ElixirPlugin.native_caches(&ctx);
+
+        assert_eq!(caches[0].id, "elixir-deps:services/api");
+        assert_eq!(caches[0].paths, vec!["services/api/deps".to_string()]);
+        assert_eq!(
+            caches[0].key_files,
+            vec!["services/api/mix.lock".to_string()]
+        );
+        assert_eq!(caches[1].id, "elixir-build:services/api");
+        assert_eq!(caches[1].paths, vec!["services/api/_build".to_string()]);
+        assert_eq!(
+            caches[1].key_files,
+            vec!["services/api/mix.lock".to_string()]
+        );
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("elixir --version"));
+        assert!(!caches[1].shared);
     }
 }

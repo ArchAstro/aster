@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::{
-    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+    LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
+    TargetContext,
 };
 
 /// Regex to extract path from PEP 621 format: `pkg @ file:../path`
@@ -427,6 +428,41 @@ impl LanguagePlugin for PythonPlugin {
         inputs
     }
 
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        let project_rel = workspace_relative(ctx.project_dir, ctx.workspace_root);
+        let venv_id = if project_rel.is_empty() {
+            "python-venv".to_string()
+        } else {
+            format!("python-venv:{project_rel}")
+        };
+        // pip's download cache is shared. The project venv is not: its
+        // interpreter is pinned by `python --version`.
+        let mut key_files = vec![
+            join_workspace_relative(&project_rel, "pyproject.toml"),
+            join_workspace_relative(&project_rel, "requirements.txt"),
+        ];
+        if let Some(lock) = python_lock_file(ctx.project_dir, ctx.workspace_root) {
+            key_files.push(lock);
+        }
+
+        vec![
+            NativeCache {
+                id: "pip-cache".to_string(),
+                paths: vec!["~/.cache/pip".to_string()],
+                key_files: vec![],
+                key_runtime: None,
+                shared: true,
+            },
+            NativeCache {
+                id: venv_id,
+                paths: vec![join_workspace_relative(&project_rel, ".venv")],
+                key_files,
+                key_runtime: Some("python --version".to_string()),
+                shared: false,
+            },
+        ]
+    }
+
     fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
         let mut dirs_to_clean = vec![
             PathBuf::from(".pytest_cache"),
@@ -510,6 +546,47 @@ fn has_uv_lock_in_ancestry(project_dir: &Path, workspace_root: &Path) -> bool {
             Some(parent) => parent,
             None => return false,
         };
+    }
+}
+
+/// Lockfile hashed into the venv cache key, if one exists.
+///
+/// Walks from the project to the Aster workspace root. uv and Poetry keep
+/// the lock at the workspace root; a project-local `requirements.lock` wins
+/// when it is closer.
+fn python_lock_file(project_dir: &Path, workspace_root: &Path) -> Option<String> {
+    let mut dir = project_dir;
+    loop {
+        for name in ["uv.lock", "poetry.lock", "requirements.lock"] {
+            if dir.join(name).is_file() {
+                return Some(join_workspace_relative(
+                    &workspace_relative(dir, workspace_root),
+                    name,
+                ));
+            }
+        }
+        if dir == workspace_root {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
     }
 }
 
@@ -1427,5 +1504,39 @@ line-length = 100
         std::fs::remove_file(root.join("uv.lock")).unwrap();
         std::fs::write(root.join("a/uv.lock"), "").unwrap();
         assert!(has_uv_lock_in_ancestry(&child, root));
+    }
+
+    #[test]
+    fn test_native_caches_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("services/api");
+        std::fs::create_dir_all(&project).unwrap();
+        let pyproject = project.join("pyproject.toml");
+        std::fs::write(&pyproject, "[project]\nname = \"api\"\n").unwrap();
+        std::fs::write(project.join("requirements.txt"), "requests\n").unwrap();
+        std::fs::write(project.join("uv.lock"), "").unwrap();
+        let ctx = make_context(&pyproject, tmp.path(), &[]);
+
+        let caches = PythonPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "pip-cache");
+        assert_eq!(caches[0].paths, vec!["~/.cache/pip".to_string()]);
+        assert!(caches[0].key_files.is_empty());
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
+
+        assert_eq!(caches[1].id, "python-venv:services/api");
+        assert_eq!(caches[1].paths, vec!["services/api/.venv".to_string()]);
+        assert_eq!(
+            caches[1].key_files,
+            vec![
+                "services/api/pyproject.toml".to_string(),
+                "services/api/requirements.txt".to_string(),
+                "services/api/uv.lock".to_string(),
+            ]
+        );
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("python --version"));
+        assert!(!caches[1].shared);
     }
 }
