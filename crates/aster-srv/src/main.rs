@@ -27,6 +27,7 @@ async fn run() -> anyhow::Result<()> {
     let listen = config.listen;
     let app = App::start(config).await?;
     aster_srv::test_results::retention::spawn(app.clone());
+    aster_srv::test_results::classifier::spawn(app.clone());
     let listener = tokio::net::TcpListener::bind(listen).await?;
     log::info(
         "aster-srv listening",

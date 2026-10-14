@@ -421,6 +421,7 @@ async fn retention_drops_days_past_the_period_and_keeps_the_rest() {
         report.dropped,
         vec![
             aster_srv::test_results::partition_name("target_runs", old),
+            aster_srv::test_results::partition_name("test_flake_events", old),
             aster_srv::test_results::partition_name("test_results", old),
         ]
     );

@@ -5,19 +5,24 @@
 //! and keyed by `run_id`, which makes an upload idempotent. `target_runs`
 //! and `test_results` are large and partitioned by the UTC day they were
 //! received, so retention drops whole days. `tests` holds each test's
-//! identity and when it was first and last seen.
+//! identity, when it was first and last seen, and what the classifier
+//! concluded about it. `test_flake_events` (also day-partitioned) is the
+//! classifier's evidence.
 
+pub mod classifier;
 pub mod ingest;
+pub mod query;
 pub mod retention;
 
 use chrono::NaiveDate;
 
 use crate::db::Migration;
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    feature: "test_results",
-    version: 1,
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        feature: "test_results",
+        version: 1,
+        sql: r#"
 CREATE SCHEMA IF NOT EXISTS test_results;
 
 CREATE TABLE test_results.runs (
@@ -81,10 +86,67 @@ CREATE TABLE test_results.tests (
 );
 CREATE INDEX tests_last_seen ON test_results.tests (last_seen);
 "#,
-}];
+    },
+    Migration {
+        feature: "test_results",
+        version: 2,
+        // Additive only. The new `tests` columns have constant defaults (no
+        // rewrite) and the new indexes are on small tables: `tests` (one row
+        // per test) and `runs`. The big partitioned tables are untouched and
+        // the events table starts with no partitions.
+        sql: r#"
+ALTER TABLE test_results.tests
+    ADD COLUMN state text NOT NULL DEFAULT 'healthy'
+        CHECK (state IN ('healthy', 'flaky', 'broken')),
+    ADD COLUMN flake_score integer NOT NULL DEFAULT 0,
+    ADD COLUMN last_flake_at timestamptz,
+    ADD COLUMN broken_since_sha text,
+    ADD COLUMN broken_failure_hash text;
+CREATE INDEX tests_by_score ON test_results.tests (repo, flake_score DESC, test_id);
+CREATE INDEX tests_by_state_score ON test_results.tests (repo, state, flake_score DESC, test_id);
+CREATE INDEX runs_received ON test_results.runs (received_at);
+
+CREATE TABLE test_results.classifier_state (
+    id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    watermark timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE test_results.test_flake_events (
+    observed_on date NOT NULL,
+    repo text NOT NULL,
+    test_id text NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('definite', 'likely')),
+    reason text NOT NULL,
+    run_id text NOT NULL,
+    prev_run_id text,
+    target text NOT NULL,
+    input_hash text,
+    observed_at timestamptz NOT NULL
+) PARTITION BY RANGE (observed_on);
+CREATE UNIQUE INDEX test_flake_events_key
+    ON test_results.test_flake_events (repo, test_id, kind, run_id, observed_on);
+CREATE INDEX test_flake_events_test
+    ON test_results.test_flake_events (repo, test_id, observed_at);
+
+CREATE VIEW test_results.failure_clusters AS
+SELECT repo,
+       failure_hash,
+       count(*) AS failures,
+       count(DISTINCT test_id) AS tests,
+       min(received_on) AS first_seen,
+       max(received_on) AS last_seen,
+       (array_agg(message ORDER BY received_on DESC))[1] AS example_message,
+       (array_agg(test_id ORDER BY received_on DESC))[1] AS example_test_id
+FROM test_results.test_results
+WHERE outcome IN ('fail', 'error') AND failure_hash IS NOT NULL
+GROUP BY repo, failure_hash;
+"#,
+    },
+];
 
 /// The day-partitioned tables.
-pub const PARTITIONED: [&str; 2] = ["target_runs", "test_results"];
+pub const PARTITIONED: [&str; 3] = ["target_runs", "test_results", "test_flake_events"];
 
 /// The partition of `table` holding `day`, e.g. `test_results_p20261013`.
 pub fn partition_name(table: &str, day: NaiveDate) -> String {
@@ -103,20 +165,30 @@ pub async fn ensure_partitions(
     client: &deadpool_postgres::Client,
     day: NaiveDate,
 ) -> anyhow::Result<()> {
-    let next = day.succ_opt().expect("a day after");
     for table in PARTITIONED {
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS test_results.{} PARTITION OF test_results.{table} \
-             FOR VALUES FROM ('{day}') TO ('{next}')",
-            partition_name(table, day),
-        );
-        if let Err(error) = client.batch_execute(&sql).await {
-            let raced = error
-                .code()
-                .is_some_and(|code| *code == tokio_postgres::error::SqlState::DUPLICATE_TABLE);
-            if !raced {
-                return Err(error.into());
-            }
+        ensure_partition(client, table, day).await?;
+    }
+    Ok(())
+}
+
+/// [`ensure_partitions`] for one table.
+pub async fn ensure_partition(
+    client: &deadpool_postgres::Client,
+    table: &str,
+    day: NaiveDate,
+) -> anyhow::Result<()> {
+    let next = day.succ_opt().expect("a day after");
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS test_results.{} PARTITION OF test_results.{table} \
+         FOR VALUES FROM ('{day}') TO ('{next}')",
+        partition_name(table, day),
+    );
+    if let Err(error) = client.batch_execute(&sql).await {
+        let raced = error
+            .code()
+            .is_some_and(|code| *code == tokio_postgres::error::SqlState::DUPLICATE_TABLE);
+        if !raced {
+            return Err(error.into());
         }
     }
     Ok(())

@@ -17,8 +17,9 @@ use hyper_util::server::graceful::GracefulShutdown;
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use crate::auth::AuthError;
+use crate::auth::{AuthError, Identity};
 use crate::test_results::ingest::{self, Upload};
+use crate::test_results::query;
 use crate::App;
 
 /// A response before it is sent.
@@ -93,13 +94,9 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             Err(error) => Reply::error(503, format!("the database is unavailable: {error}")),
         },
         (&Method::POST, "/v1/test-results/runs") => {
-            let authorization = header(&request, AUTHORIZATION);
-            let identity = match app.verifier.verify(authorization.as_deref()).await {
+            let identity = match authenticate(app, &request).await {
                 Ok(identity) => identity,
-                Err(error @ AuthError::Forbidden(_)) => {
-                    return Reply::error(403, error.to_string())
-                }
-                Err(error) => return Reply::error(401, error.to_string()),
+                Err(reply) => return reply,
             };
             let gzip =
                 header(&request, CONTENT_ENCODING).is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
@@ -109,10 +106,29 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             ingest::handle(app, &identity, Upload { body, gzip }).await
         }
+        (&Method::GET, path) if query::parse_route(path).is_some() => {
+            let identity = match authenticate(app, &request).await {
+                Ok(identity) => identity,
+                Err(reply) => return reply,
+            };
+            let route = query::parse_route(path).expect("checked above");
+            query::handle(app, &identity, route, request.uri().query()).await
+        }
         (_, "/healthz" | "/readyz" | "/v1/test-results/runs") => {
             Reply::error(405, "method not allowed")
         }
+        (_, path) if query::parse_route(path).is_some() => Reply::error(405, "method not allowed"),
         _ => Reply::error(404, "not found"),
+    }
+}
+
+/// Who is calling, from the bearer token; the error is the reply to send.
+async fn authenticate(app: &App, request: &Request<Incoming>) -> Result<Identity, Reply> {
+    let authorization = header(request, AUTHORIZATION);
+    match app.verifier.verify(authorization.as_deref()).await {
+        Ok(identity) => Ok(identity),
+        Err(error @ AuthError::Forbidden(_)) => Err(Reply::error(403, error.to_string())),
+        Err(error) => Err(Reply::error(401, error.to_string())),
     }
 }
 

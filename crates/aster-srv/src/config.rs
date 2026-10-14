@@ -30,6 +30,13 @@ pub struct Config {
     pub raw_bucket: Option<String>,
     /// `ASTER_SRV_RETENTION_DAYS`, default 30.
     pub retention_days: u32,
+    /// `ASTER_SRV_DEFAULT_BRANCH`: the branch whose runs decide "broken" and
+    /// "likely flaky". Default `main`.
+    pub default_branch: String,
+    /// `ASTER_SRV_BROKEN_RUNS`: how many consecutive default-branch runs must
+    /// fail with the same failure hash before a test is broken. At least 3;
+    /// default 3.
+    pub broken_runs: u32,
     /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
@@ -93,6 +100,14 @@ impl Config {
                 .context("ASTER_SRV_RETENTION_DAYS must be a positive number of days")?,
             None => 30,
         };
+        let broken_runs = match var("ASTER_SRV_BROKEN_RUNS") {
+            Some(runs) => runs
+                .parse()
+                .ok()
+                .filter(|runs| *runs >= 3)
+                .context("ASTER_SRV_BROKEN_RUNS must be a number of runs, at least 3")?,
+            None => 3,
+        };
         let max_body_bytes = match var("ASTER_SRV_MAX_BODY_BYTES") {
             Some(bytes) => bytes
                 .parse()
@@ -108,6 +123,8 @@ impl Config {
             static_tokens,
             raw_bucket: var("ASTER_SRV_RAW_BUCKET"),
             retention_days,
+            default_branch: var("ASTER_SRV_DEFAULT_BRANCH").unwrap_or_else(|| "main".to_string()),
+            broken_runs,
             max_body_bytes,
         })
     }
@@ -178,9 +195,26 @@ mod tests {
         assert_eq!(config.audience, "aster-srv");
         assert_eq!(config.issuer, GITHUB_ISSUER);
         assert_eq!(config.retention_days, 30);
+        assert_eq!(config.default_branch, "main");
+        assert_eq!(config.broken_runs, 3);
         assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
         assert!(config.static_tokens.is_empty());
         assert!(config.raw_bucket.is_none());
+    }
+
+    #[test]
+    fn reads_the_classifier_settings() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_DEFAULT_BRANCH", "trunk"));
+        pairs.push(("ASTER_SRV_BROKEN_RUNS", "5"));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(config.default_branch, "trunk");
+        assert_eq!(config.broken_runs, 5);
+        for bad in ["2", "0", "many"] {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push(("ASTER_SRV_BROKEN_RUNS", bad));
+            assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
     }
 
     #[test]
