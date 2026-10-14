@@ -45,6 +45,19 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Host OS and CPU architecture mixed into every cache key.
+///
+/// `std::env::consts` values, joined as `platform:<os>-<arch>` (for example
+/// `platform:linux-x86_64`). A binary built on one host must not restore an
+/// artifact produced on another.
+fn host_platform() -> String {
+    format!(
+        "platform:{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
 /// Computes cache hashes for targets
 pub struct CacheHasher {
     project_root: PathBuf,
@@ -53,6 +66,9 @@ pub struct CacheHasher {
     /// must not enter this project's cache key.
     excluded_dirs: Vec<PathBuf>,
     aster_version: String,
+    /// `platform:<os>-<arch>`. Injectable so tests can prove a different
+    /// host changes the key without running on that host.
+    platform: String,
 }
 
 impl CacheHasher {
@@ -65,6 +81,7 @@ impl CacheHasher {
             workspace_root: workspace_root.to_path_buf(),
             excluded_dirs: Vec::new(),
             aster_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: host_platform(),
         }
     }
 
@@ -74,6 +91,16 @@ impl CacheHasher {
     fn with_version(project_root: &Path, version: &str) -> Self {
         Self {
             aster_version: version.to_string(),
+            ..Self::new(project_root, project_root)
+        }
+    }
+
+    /// Hasher whose platform string is injected instead of the host OS and
+    /// architecture. The project is its own workspace.
+    #[cfg(test)]
+    fn with_platform(project_root: &Path, platform: &str) -> Self {
+        Self {
+            platform: platform.to_string(),
             ..Self::new(project_root, project_root)
         }
     }
@@ -90,7 +117,8 @@ impl CacheHasher {
     /// Compute the cache key for a target
     ///
     /// The cache key is a SHA256 hash of:
-    /// 1. Cache schema (`aster-cache-v<SCHEMA>`) and Aster version
+    /// 1. Cache schema (`aster-cache-v<SCHEMA>`), Aster version, and
+    ///    `platform:<os>-<arch>`
     /// 2. Source files (matched by globs)
     /// 3. Config files
     /// 4. Command string
@@ -125,10 +153,14 @@ impl CacheHasher {
     ) -> Result<String> {
         let mut hasher = Sha256::new();
 
-        // Schema and Aster version come first so incompatible keys never collide.
+        // Schema, Aster version, and host platform come first so incompatible
+        // keys never collide. Platform is hashed immediately after the version
+        // salt: a linux-x86_64 artifact must not restore on macOS-arm64.
         hasher.update(format!("aster-cache-v{schema}").as_bytes());
         hasher.update(b"\n");
         hasher.update(self.aster_version.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.platform.as_bytes());
         hasher.update(b"\n");
 
         // 1. Hash source files, then workspace-root files. The `ws:` prefix
@@ -489,6 +521,26 @@ mod tests {
             .unwrap();
 
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_hash_platform_changes_key() {
+        let tmp = TempDir::new().unwrap();
+        let inputs = CacheInputs::default();
+        let env = HashMap::new();
+
+        let linux = CacheHasher::with_platform(tmp.path(), "platform:linux-x86_64")
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+        let macos = CacheHasher::with_platform(tmp.path(), "platform:macos-aarch64")
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+        let same = CacheHasher::with_platform(tmp.path(), "platform:linux-x86_64")
+            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .unwrap();
+
+        assert_ne!(linux, macos);
+        assert_eq!(linux, same);
     }
 
     #[test]

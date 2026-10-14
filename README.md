@@ -278,6 +278,8 @@ artifacts. The default cacheable target names are `deps`, `build`, `test`,
 `lint`, `format`, `typecheck`, and `check`. Other targets must opt in with
 `cache.enabled = true`. Set `enabled = false` to opt out.
 
+Every cache key includes `platform:<os>-<arch>` (for example `platform:linux-x86_64`), so an artifact built on one OS and CPU architecture is never restored on another.
+
 `include`, `exclude`, and `env` extend a target's detected cache inputs.
 An `env` name ending in `*` matches every variable that starts with the name
 without that `*`, sorted by name. `FOO_*` hashes `FOO_A` and `FOO_B` and
