@@ -380,8 +380,13 @@ fn js(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Option<Vec<S
     let body = manifest.get("scripts")?.get(script)?.as_str()?;
     let script_argv = Argv::parse(body)?;
     let start = js_runner(&script_argv)?;
-    // A script that already names paths would run them as well.
-    if !script_argv.positionals(start, JS_VALUE_FLAGS).is_empty() {
+    // A script that already names paths would run them as well. Other
+    // positionals, such as `vitest run`'s subcommand, select nothing.
+    if script_argv
+        .positionals(start, JS_VALUE_FLAGS)
+        .into_iter()
+        .any(|i| working_dir.join(&script_argv.parts[i]).exists())
+    {
         return None;
     }
     let launcher = Path::new(&argv.parts[argv.program])
@@ -878,6 +883,10 @@ mod tests {
         assert_eq!(
             one(tmp.path(), "npm run test", &failures),
             "npm run test -- a.test.ts -t 'suite case$'"
+        );
+        assert_eq!(
+            one(tmp.path(), "npm test", &failures),
+            "npm test -- a.test.ts -t 'suite case$'"
         );
         assert_eq!(build(tmp.path(), "pnpm ci", &failures), None);
     }
