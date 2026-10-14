@@ -216,7 +216,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Rerun only the failing tests of a failed test target, up to `retries`
-    /// times. See [`retry`].
+    /// times, with `retry_setup` run before each retry.
     pub fn with_retry_failed(mut self, retries: u32) -> Self {
         self.retry_failed = retries;
         self
