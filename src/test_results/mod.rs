@@ -57,6 +57,16 @@ pub struct TestReport {
     pub cases: Vec<TestCase>,
 }
 
+/// A test that failed in one attempt and passed in a later one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlakyTest {
+    pub file: Option<String>,
+    pub suite: Option<String>,
+    pub name: String,
+    /// The attempt that passed.
+    pub passed_on_attempt: u32,
+}
+
 impl TestReport {
     /// Number of attempts that failed or errored.
     pub fn failures(&self) -> usize {
@@ -65,6 +75,41 @@ impl TestReport {
             .filter(|case| case.outcome.is_failure())
             .count()
     }
+
+    /// The tests that failed and then passed on a later attempt, in the
+    /// order they first passed after failing.
+    pub fn flaky(&self) -> Vec<FlakyTest> {
+        let mut flaky: Vec<FlakyTest> = Vec::new();
+        for pass in self
+            .cases
+            .iter()
+            .filter(|case| case.outcome == TestOutcome::Pass)
+        {
+            let failed_earlier = self.cases.iter().any(|case| {
+                case.outcome.is_failure() && case.attempt < pass.attempt && same_test(case, pass)
+            });
+            let listed = flaky.iter().any(|known| {
+                known.name == pass.name && known.suite == pass.suite && known.file == pass.file
+            });
+            if failed_earlier && !listed {
+                flaky.push(FlakyTest {
+                    file: pass.file.clone(),
+                    suite: pass.suite.clone(),
+                    name: pass.name.clone(),
+                    passed_on_attempt: pass.attempt,
+                });
+            }
+        }
+        flaky
+    }
+}
+
+/// Whether two attempts are of the same test. A runner that names the file
+/// in one report and not another still matches on suite and name.
+pub fn same_test(a: &TestCase, b: &TestCase) -> bool {
+    a.name == b.name
+        && a.suite == b.suite
+        && (a.file == b.file || a.file.is_none() || b.file.is_none())
 }
 
 /// A report format Aster can read.

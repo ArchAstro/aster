@@ -202,6 +202,7 @@ impl LanguagePlugin for GradlePlugin {
                 invalidates_cache,
                 working_dir: working_dir.clone(),
                 exclusive_resources: vec![resource.clone()],
+                retry_setup: None,
             };
 
         let mut targets = HashMap::new();

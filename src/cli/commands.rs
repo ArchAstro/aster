@@ -105,6 +105,29 @@ pub struct Cli {
         require_equals = true
     )]
     pub test_results: Option<Option<std::path::PathBuf>>,
+
+    /// Rerun only the failing tests of a failed test target, up to N times
+    ///
+    /// When a target fails and its captured results name the failing tests,
+    /// Aster reruns just those tests with the runner's own selection flags
+    /// (go test -run, pytest node ids, vitest/jest -t, ...), recording every
+    /// attempt. A target whose failing tests all pass on a retry reports
+    /// PASS marked flaky, and is not cached. Runners that cannot select
+    /// single tests (Gradle, Maven) and failures that are not tests (crashes,
+    /// compile errors, signals) are not retried. A target's `retry_setup`
+    /// command runs before each retry. Bare `--retry-failed` means 1;
+    /// ASTER_RETRY_FAILED=N does the same. Results are captured for the
+    /// retries even without --test-results, which alone decides whether a
+    /// results file is written.
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1"
+    )]
+    pub retry_failed: Option<u32>,
 }
 
 impl Cli {
@@ -134,6 +157,21 @@ impl Cli {
             return self.test_results.clone();
         }
         test_results_from_env(std::env::var("ASTER_TEST_RESULTS").ok().as_deref())
+    }
+
+    /// How many times to rerun a failed target's failing tests, from
+    /// `--retry-failed` or else `ASTER_RETRY_FAILED`. 0 turns retries off.
+    pub fn retry_failed(&self) -> u32 {
+        self.retry_failed
+            .unwrap_or_else(|| retry_from_env(std::env::var("ASTER_RETRY_FAILED").ok().as_deref()))
+    }
+}
+
+fn retry_from_env(value: Option<&str>) -> u32 {
+    match value.map(str::trim) {
+        Some("true" | "on") => 1,
+        Some(count) => count.parse().unwrap_or(0),
+        None => 0,
     }
 }
 
@@ -524,6 +562,28 @@ mod tests {
         let cli = Cli::try_parse_from(["aster", "--test-results", "list"]).unwrap();
         assert_eq!(cli.test_results, Some(None));
         assert!(matches!(cli.command, Some(Commands::List { .. })));
+    }
+
+    #[test]
+    fn retry_failed_flag_defaults_to_one_when_bare() {
+        let cli = Cli::try_parse_from(["aster", "--retry-failed", "list"]).unwrap();
+        assert_eq!(cli.retry_failed, Some(1));
+        let cli = Cli::try_parse_from(["aster", "--retry-failed=3", "list"]).unwrap();
+        assert_eq!(cli.retry_failed, Some(3));
+        let cli = Cli::try_parse_from(["aster", "list"]).unwrap();
+        assert_eq!(cli.retry_failed, None);
+        assert!(Cli::try_parse_from(["aster", "--retry-failed=x", "list"]).is_err());
+    }
+
+    #[test]
+    fn retry_failed_env_value() {
+        assert_eq!(retry_from_env(None), 0);
+        assert_eq!(retry_from_env(Some("")), 0);
+        assert_eq!(retry_from_env(Some("0")), 0);
+        assert_eq!(retry_from_env(Some("2")), 2);
+        assert_eq!(retry_from_env(Some(" 3 ")), 3);
+        assert_eq!(retry_from_env(Some("true")), 1);
+        assert_eq!(retry_from_env(Some("nonsense")), 0);
     }
 
     #[test]

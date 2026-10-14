@@ -230,16 +230,16 @@
       <table>
         <thead><tr><th>Runner</th><th>Strategy</th><th>Change</th><th>Confidence</th><th>Retry</th></tr></thead>
         <tbody>
-          <tr><td>mix / ExUnit</td><td>Formatter</td><td><code>elixir -r &lt;formatter.exs&gt; -S mix test --formatter AsterTestResults.ExUnitFormatter --formatter ExUnit.CLIFormatter</code>. Complete only when the counts match ExUnit's summary line.</td><td><span class="pill pass">complete</span></td><td><code>mix test --failed</code></td></tr>
-          <tr><td>mix (project sets formatters)</td><td>Stdout</td><td>Command left alone: <code>--formatter</code> would drop the project's own formatters. The numbered failure blocks are parsed.</td><td><span class="pill flaky">partial</span></td><td><code>file:line</code> args</td></tr>
+          <tr><td>mix / ExUnit</td><td>Formatter</td><td><code>elixir -r &lt;formatter.exs&gt; -S mix test --formatter AsterTestResults.ExUnitFormatter --formatter ExUnit.CLIFormatter</code>. Complete only when the counts match ExUnit's summary line.</td><td><span class="pill pass">complete</span></td><td>failing files (the formatter records no line), no <code>--partitions</code></td></tr>
+          <tr><td>mix (project sets formatters)</td><td>Stdout</td><td>Command left alone: <code>--formatter</code> would drop the project's own formatters. The numbered failure blocks are parsed.</td><td><span class="pill flaky">partial</span></td><td>failing files</td></tr>
           <tr><td>go test</td><td>Flag</td><td><code>-json</code>, output written to the console as text again</td><td><span class="pill pass">complete</span></td><td><code>-run '^(A|B)$'</code> per package</td></tr>
           <tr><td>vitest</td><td>Flag</td><td><code>--reporter=default --reporter=junit --outputFile.junit=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
           <tr><td>jest</td><td>Flag</td><td><code>--json --outputFile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
           <tr><td>bun test</td><td>Flag</td><td><code>--reporter=junit --reporter-outfile=…</code></td><td><span class="pill pass">complete</span></td><td>file + <code>-t</code></td></tr>
-          <tr><td>node --test (tsx --test)</td><td>Reporter</td><td>Command left alone. <code>NODE_OPTIONS</code> adds <code>--test-reporter=spec</code> to stdout and Aster's reporter, which appends one JSON line per test, so a package script chaining several runs is captured. Planned only when the command, or the package script it runs, mentions <code>--test</code> and picks no reporter.</td><td><span class="pill flaky">partial</span></td><td>none in v1</td></tr>
+          <tr><td>node --test (tsx --test)</td><td>Reporter</td><td>Command left alone. <code>NODE_OPTIONS</code> adds <code>--test-reporter=spec</code> to stdout and Aster's reporter, which appends one JSON line per test, so a package script chaining several runs is captured. Planned only when the command, or the package script it runs, mentions <code>--test</code> and picks no reporter.</td><td><span class="pill flaky">partial</span></td><td><code>--test-name-pattern</code> + files, direct <code>node --test</code> only</td></tr>
           <tr><td>pytest</td><td>Flag</td><td><code>--junitxml=…</code></td><td><span class="pill pass">complete</span></td><td>node ids</td></tr>
-          <tr><td>cargo nextest</td><td>Flag</td><td>JUnit profile output</td><td><span class="pill pass">complete</span></td><td><code>--exact</code> names</td></tr>
-          <tr><td>cargo test</td><td>Stdout</td><td>Parse the <code>test x ... ok|FAILED</code> lines</td><td><span class="pill flaky">partial</span></td><td><code>--exact</code> names</td></tr>
+          <tr><td>cargo nextest</td><td>Flag</td><td>JUnit profile output</td><td><span class="pill pass">complete</span></td><td><code>-E 'test(=name)'</code>, needs <code>--no-fail-fast</code></td></tr>
+          <tr><td>cargo test</td><td>Stdout</td><td>Parse the <code>test x ... ok|FAILED</code> lines</td><td><span class="pill flaky">partial</span></td><td><code>--exact</code> names, needs <code>--no-fail-fast</code></td></tr>
           <tr><td>Gradle / Maven</td><td>Existing files</td><td>Read <code>build/test-results/**.xml</code> and <code>target/surefire-reports/*.xml</code></td><td><span class="pill pass">complete</span></td><td>none in v1</td></tr>
           <tr><td>rspec</td><td>Flag</td><td><code>--format progress --format json --out …</code></td><td><span class="pill pass">complete</span></td><td><code>--only-failures</code></td></tr>
         </tbody>
@@ -414,7 +414,7 @@
 
     { id: "T15", p: "P2", area: "client", title: "Per-test retry", sub: "--retry-failed=N, retry_setup",
       obj: "Rerun only the failed test_ids, using each runner's own rerun flag (see table). The target-level retry_setup command replaces CI_RETRY_PRE_RETRY_COMMAND. Each attempt is recorded.",
-      acc: ["mix: only the failing tests rerun (--failed)", "A failing retry_setup skips the retry and keeps the first failure", "attempt numbers appear in the NDJSON"],
+      acc: ["mix: only the failing test files rerun, without --partitions", "A failing retry_setup skips the retry and keeps the first failure", "attempt numbers appear in the NDJSON"],
       files: ["src/executor/runner.rs", "src/config/project.rs", "src/plugins/related_tests.rs"], deps: ["T08"] },
     { id: "T16", p: "P2", area: "service", title: "Classifier", sub: "definite, likely, broken; flake_score",
       obj: "Runs every 5 min on new runs. Applies the classification rules, keeps tests.state and flake_score up to date, and builds failure_clusters.",

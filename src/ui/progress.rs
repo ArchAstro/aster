@@ -43,6 +43,8 @@ pub struct ProgressDisplay {
     skipped: Arc<AtomicUsize>,
     cached: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
+    /// Targets that passed only on a retry, by address: how many tests
+    flaky: HashMap<String, usize>,
 }
 
 impl ProgressDisplay {
@@ -84,6 +86,7 @@ impl ProgressDisplay {
             skipped: Arc::new(AtomicUsize::new(0)),
             cached: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
+            flaky: HashMap::new(),
         }
     }
 
@@ -234,6 +237,12 @@ impl ProgressDisplay {
         self.refresh_status();
     }
 
+    /// Note that a target passed with `tests` tests that failed first, so
+    /// its completion line says so. Call before [`Self::mark_complete`].
+    pub fn mark_flaky(&mut self, address: &str, tests: usize) {
+        self.flaky.insert(address.to_string(), tests);
+    }
+
     /// Mark a target as complete
     ///
     /// Updates counts and removes spinner. Behavior differs by mode:
@@ -261,12 +270,23 @@ impl ProgressDisplay {
             self.failed.fetch_add(1, Ordering::SeqCst);
         }
 
+        let flaky = self.flaky.remove(address).filter(|_| success);
+        let flaky_note = flaky
+            .map(|tests| {
+                format!(
+                    " {} flaky: {tests} test{} passed on retry",
+                    style("\u{2014}").dim(),
+                    if tests == 1 { "" } else { "s" }
+                )
+            })
+            .unwrap_or_default();
+
         // CI mode: print PASS/FAIL with timestamp and duration
         if self.ci_mode {
             let duration_str = format_duration(duration_ms);
             if success {
                 eprintln!(
-                    "{} {} {} ({})",
+                    "{} {} {} ({}){flaky_note}",
                     style(format_timestamp()).dim(),
                     style("PASS").green(),
                     address,
@@ -291,7 +311,7 @@ impl ProgressDisplay {
                 let duration_str = format_duration(duration_ms);
                 if success {
                     pb.finish_with_message(format!(
-                        "{} {} ({})",
+                        "{} {} ({}){flaky_note}",
                         style("PASS").green(),
                         address,
                         style(duration_str).dim()
@@ -308,6 +328,12 @@ impl ProgressDisplay {
                 // Concise mode: clear passes, show failures briefly
                 if !success {
                     pb.finish_with_message(format!("{} {}", style("✗").red(), address));
+                } else if flaky.is_some() {
+                    pb.finish_with_message(format!(
+                        "{} {}{flaky_note}",
+                        style("PASS").green(),
+                        address
+                    ));
                 } else {
                     pb.finish_and_clear();
                 }

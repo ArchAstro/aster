@@ -33,6 +33,8 @@ use crate::test_results::{
 };
 use crate::ui::ProgressDisplay;
 
+mod retry;
+
 use super::command::parse_command;
 use super::shutdown_requested;
 #[cfg(any(unix, windows))]
@@ -102,6 +104,10 @@ pub struct Executor<'a> {
     /// Whether to capture per-test results from targets whose runner the
     /// plugin knows how to report on.
     capture_tests: bool,
+    /// How many times to rerun a failed target's failing tests. Test
+    /// capture is planned for every target when this is above 0, whether or
+    /// not results are recorded.
+    retry_failed: u32,
     /// Maximum combined stdout+stderr bytes retained for one command.
     log_cap: usize,
 }
@@ -120,6 +126,7 @@ impl<'a> Executor<'a> {
             cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
+            retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
         }
     }
@@ -134,6 +141,7 @@ impl<'a> Executor<'a> {
             cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
+            retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
         }
     }
@@ -152,6 +160,7 @@ impl<'a> Executor<'a> {
             cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
+            retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
         }
     }
@@ -171,6 +180,7 @@ impl<'a> Executor<'a> {
             cache_dir: resolve_cache_dir(workspace_root),
             null_stdin: true,
             capture_tests: false,
+            retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
         }
     }
@@ -202,6 +212,13 @@ impl<'a> Executor<'a> {
     /// is cached.
     pub fn with_test_capture(mut self, capture_tests: bool) -> Self {
         self.capture_tests = capture_tests;
+        self
+    }
+
+    /// Rerun only the failing tests of a failed test target, up to `retries`
+    /// times. See [`retry`].
+    pub fn with_retry_failed(mut self, retries: u32) -> Self {
+        self.retry_failed = retries;
         self
     }
 
@@ -724,7 +741,7 @@ impl<'a> Executor<'a> {
                 .unwrap_or_else(|| project_root.clone());
             // Test capture rewrites the commands only now, after the cache
             // key was computed from the commands as written.
-            let captures = if self.capture_tests {
+            let captures = if self.capture_tests || self.retry_failed > 0 {
                 plugin_registry
                     .find_by_name(&project.plugin_name)
                     .map(|plugin| {
@@ -767,6 +784,15 @@ impl<'a> Executor<'a> {
                 .unwrap_or(false);
             let null_stdin = self.null_stdin;
             let log_cap = self.log_cap;
+            // Retrying reruns one command, so a target that runs several
+            // (a split `--only-affected-files` run) is not retried.
+            let retry_command =
+                (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
+            let retry_failed = self.retry_failed;
+            let retry_setup = project
+                .targets
+                .get(&target_name)
+                .and_then(|target| target.retry_setup.clone());
             // Collect per-resource mutexes this target needs to acquire
             let target_resource_locks: Vec<Arc<Mutex<()>>> = {
                 let mut res_names: Vec<&String> = project
@@ -811,6 +837,36 @@ impl<'a> Executor<'a> {
                 if !captures.is_empty() {
                     result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
                 }
+                let mut retried = false;
+                if let (Some(command), false) = (&retry_command, shutdown_requested()) {
+                    let registry = PluginRegistry::with_all_plugins();
+                    if let Some(plugin) = registry.find_by_name(&plugin_name) {
+                        retried = retry::rerun_failures(
+                            &retry::RetryJob {
+                                address: &addr,
+                                plugin,
+                                project_dir: &project_root,
+                                working_dir: &working_dir,
+                                target_name: &target_name_clone,
+                                command,
+                                setup: retry_setup.as_deref(),
+                                max_retries: retry_failed,
+                                null_stdin,
+                                log_cap,
+                            },
+                            &mut result,
+                        );
+                    }
+                }
+                if let Some(report) = &result.tests {
+                    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                        for line in
+                            retry::flaky_annotations(report, &working_dir, &workspace_root_path)
+                        {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
                 result.input_hash = input_hash;
                 if shutdown_requested() {
                     result.success = false;
@@ -822,7 +878,9 @@ impl<'a> Executor<'a> {
                     };
                 }
 
-                if !result.success {
+                // A pass that needed a retry is not a clean pass to replay
+                // from the cache: the next run should see the flake again.
+                if !result.success || retried {
                     if let Some(cache_dir) = cache_store_path.as_ref() {
                         let store = CacheStore::new(cache_dir);
                         if let Err(e) = store.remove(&addr) {
@@ -925,6 +983,12 @@ impl<'a> Executor<'a> {
         let mut results = Vec::new();
         for result in rx.iter() {
             if show_progress && !result.cached {
+                if result.success {
+                    let flaky = result.tests.as_ref().map_or(0, |t| t.flaky().len());
+                    if flaky > 0 {
+                        progress.mark_flaky(&result.address, flaky);
+                    }
+                }
                 progress.mark_complete(
                     &result.address,
                     result.success,
@@ -2105,6 +2169,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            retry_setup: None,
         }
     }
 
@@ -2507,6 +2572,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: resources.into_iter().map(|s| s.to_string()).collect(),
+            retry_setup: None,
         }
     }
 

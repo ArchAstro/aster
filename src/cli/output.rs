@@ -124,6 +124,21 @@ pub struct TestSummary {
     /// The attempts that failed or errored
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<FailedTest>,
+    /// The tests that failed and then passed on a retry
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flaky: Vec<FlakyTestSummary>,
+}
+
+/// One test that passed only on a retry
+#[derive(Debug, Clone, Serialize)]
+pub struct FlakyTestSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// The attempt that passed (2 for the first retry)
+    pub passed_on_attempt: u32,
 }
 
 /// One failed test attempt
@@ -162,6 +177,16 @@ fn test_summary(report: &crate::test_results::TestReport) -> TestSummary {
                 suite: case.suite.clone(),
                 file: case.file.clone(),
                 attempt: case.attempt,
+            })
+            .collect(),
+        flaky: report
+            .flaky()
+            .into_iter()
+            .map(|test| FlakyTestSummary {
+                name: test.name,
+                suite: test.suite,
+                file: test.file,
+                passed_on_attempt: test.passed_on_attempt,
             })
             .collect(),
     }

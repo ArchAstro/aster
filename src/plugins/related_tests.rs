@@ -60,7 +60,7 @@ impl Argv {
     }
 
     /// The command with the arguments at `drop` removed and `add` appended.
-    fn render(&self, drop: &[usize], add: &[String]) -> String {
+    pub(super) fn render(&self, drop: &[usize], add: &[String]) -> String {
         self.parts
             .iter()
             .enumerate()
@@ -101,7 +101,7 @@ impl Argv {
 
     /// Indexes after `from` of arguments that are not options or option
     /// values. `value_flags` take the next argument as their value.
-    fn positionals(&self, from: usize, value_flags: &[&str]) -> Vec<usize> {
+    pub(super) fn positionals(&self, from: usize, value_flags: &[&str]) -> Vec<usize> {
         let mut out = Vec::new();
         let mut i = from;
         while i < self.parts.len() {
@@ -255,6 +255,22 @@ impl Delegated {
             .collect()
     }
 
+    /// The same one-liner without the environment assignments of `name`
+    /// written before the test command.
+    pub(crate) fn without_assignment(&self, name: &str) -> Self {
+        let prefix = format!("{name}=");
+        let head = self
+            .head
+            .split(' ')
+            .filter(|word| !word.starts_with(&prefix))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self {
+            head,
+            ..self.clone()
+        }
+    }
+
     /// The one-liner with its test command replaced.
     pub(crate) fn render(&self, command: &str) -> String {
         let script = format!("{}{command}", self.head);
@@ -403,7 +419,7 @@ const JS_LAUNCHERS: &[&str] = &[
     "dlx",
     "cross-env",
 ];
-const JS_VALUE_FLAGS: &[&str] = &[
+pub(super) const JS_VALUE_FLAGS: &[&str] = &[
     "--config",
     "-c",
     "--project",
@@ -529,7 +545,7 @@ pub(super) fn node(
     plan(vec![argv.render(&[], &add)])
 }
 
-const GO_VALUE_FLAGS: &[&str] = &[
+pub(super) const GO_VALUE_FLAGS: &[&str] = &[
     "-tags",
     "-timeout",
     "-count",
@@ -644,7 +660,7 @@ pub(super) fn go(command: &str, tests: &[RelatedTest]) -> Option<FilesListPlan> 
     plan(commands)
 }
 
-const PYTEST_VALUE_FLAGS: &[&str] = &[
+pub(super) const PYTEST_VALUE_FLAGS: &[&str] = &[
     "-k",
     "-m",
     "-p",

@@ -113,6 +113,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -140,6 +141,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -156,6 +158,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -172,6 +175,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -188,6 +192,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -204,6 +209,7 @@ impl LanguagePlugin for RustPlugin {
                 invalidates_cache: false,
                 working_dir: None,
                 exclusive_resources: vec![],
+                retry_setup: None,
             },
         );
 
@@ -250,6 +256,7 @@ impl LanguagePlugin for RustPlugin {
             invalidates_cache: true,
             working_dir: None,
             exclusive_resources: vec![],
+            retry_setup: None,
         })
     }
 

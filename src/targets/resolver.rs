@@ -51,6 +51,7 @@ impl TargetResolver {
                     invalidates_cache: target.invalidates_cache,
                     working_dir: target.working_dir.clone(),
                     exclusive_resources: target.exclusive_resources.clone(),
+                    retry_setup: target.retry_setup.clone(),
                 },
             );
         }
@@ -74,6 +75,7 @@ impl TargetResolver {
                                 invalidates_cache: existing.invalidates_cache,
                                 working_dir: existing.working_dir.clone(),
                                 exclusive_resources: existing.exclusive_resources.clone(),
+                                retry_setup: existing.retry_setup.clone(),
                             },
                         );
                     } else {
@@ -90,6 +92,7 @@ impl TargetResolver {
                                 invalidates_cache: false,
                                 working_dir: None,
                                 exclusive_resources: vec![],
+                                retry_setup: None,
                             },
                         );
                     }
@@ -150,6 +153,10 @@ impl TargetResolver {
                             invalidates_cache,
                             working_dir,
                             exclusive_resources,
+                            retry_setup: rich
+                                .retry_setup
+                                .clone()
+                                .or_else(|| existing.and_then(|e| e.retry_setup.clone())),
                         },
                     );
                 }
@@ -198,6 +205,7 @@ impl TargetResolver {
                         invalidates_cache: source_target.invalidates_cache,
                         working_dir: source_target.working_dir,
                         exclusive_resources: source_target.exclusive_resources,
+                        retry_setup: source_target.retry_setup,
                     },
                 );
                 false
@@ -258,6 +266,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            retry_setup: None,
         }
     }
 
@@ -280,6 +289,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec![],
+            retry_setup: None,
         })
     }
 
@@ -680,6 +690,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec!["custom_resource".to_string()],
+            retry_setup: None,
         };
         custom.insert("deps".to_string(), TargetConfig::Rich(rich_config));
 
@@ -711,6 +722,36 @@ mod tests {
 
         let deps = targets.get("deps").unwrap();
         assert_eq!(deps.exclusive_resources, vec!["hex_registry".to_string()]);
+    }
+
+    #[test]
+    fn test_retry_setup_comes_from_rich_config_and_survives_a_simple_override() {
+        let mut detected = HashMap::new();
+        detected.insert("test".to_string(), target("mix test", vec![]));
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "test".to_string(),
+            TargetConfig::Rich(RichTargetConfig {
+                command: "mix test".to_string(),
+                retry_setup: Some("mix ecto.reset".to_string()),
+                ..Default::default()
+            }),
+        );
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+        assert_eq!(
+            targets["test"].retry_setup.as_deref(),
+            Some("mix ecto.reset")
+        );
+
+        // A detected setup is kept when a simple override changes the command.
+        let mut detected = HashMap::new();
+        let mut test = target("mix test", vec![]);
+        test.retry_setup = Some("reset".to_string());
+        detected.insert("test".to_string(), test);
+        let custom = HashMap::from([("test".to_string(), simple("mix test --trace"))]);
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+        assert_eq!(targets["test"].retry_setup.as_deref(), Some("reset"));
     }
 
     #[test]
