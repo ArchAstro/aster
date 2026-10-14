@@ -178,7 +178,9 @@ fn gzip(text: &str) -> Vec<u8> {
 }
 
 async fn upload(server: &Server, bearer: Option<&str>, body: Vec<u8>) -> (u16, serde_json::Value) {
-    let mut request = reqwest::Client::new()
+    let mut request = aster_srv::http_client()
+        .build()
+        .unwrap()
         .post(format!("{}/v1/test-results/runs", server.url))
         .header("Content-Type", "application/x-ndjson")
         .header("Content-Encoding", "gzip")

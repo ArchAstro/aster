@@ -14,6 +14,14 @@ pub mod log;
 pub mod raw_store;
 pub mod test_results;
 
+/// An HTTP client builder on aws-lc-rs, the workspace's one TLS provider.
+/// reqwest is built without its own (it would bring ring, and two
+/// providers leave rustls with no default).
+pub fn http_client() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    reqwest::Client::builder()
+}
+
 use std::sync::Arc;
 
 use anyhow::Result;

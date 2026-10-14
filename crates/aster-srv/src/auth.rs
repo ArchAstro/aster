@@ -77,7 +77,7 @@ impl Verifier {
             )),
             keys: RwLock::new(HashMap::new()),
             last_fetch: Mutex::new(None),
-            client: reqwest::Client::builder()
+            client: crate::http_client()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP client builds"),

@@ -33,7 +33,7 @@ impl RawStore {
             None => RawStore::Disabled,
             Some(bucket) => RawStore::Gcs {
                 bucket,
-                client: reqwest::Client::builder()
+                client: crate::http_client()
                     .timeout(Duration::from_secs(30))
                     .build()
                     .expect("HTTP client builds"),
