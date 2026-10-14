@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::jvm;
 use super::{
-    CacheInputs, LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability,
-    TargetContext,
+    CacheInputs, LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target,
+    TargetCapability, TargetContext,
 };
 
 /// Plugin for Maven JVM builds.
@@ -250,6 +250,21 @@ impl LanguagePlugin for MavenPlugin {
         }
         inputs
     }
+
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        // A reactor module resolves against the root pom. A standalone
+        // project uses its own.
+        let reactor = find_maven_reactor_root(ctx.project_dir);
+        let pom =
+            join_workspace_relative(&workspace_relative(&reactor, ctx.workspace_root), "pom.xml");
+        vec![NativeCache {
+            id: "maven-repository".to_string(),
+            paths: vec!["~/.m2/repository".to_string()],
+            key_files: vec![pom],
+            key_runtime: None,
+            shared: true,
+        }]
+    }
 }
 
 fn child<'a>(node: Node<'a, 'a>, name: &str) -> Option<Node<'a, 'a>> {
@@ -321,6 +336,24 @@ fn find_maven_reactor_root(project_dir: &Path) -> PathBuf {
         }
     }
     reactor_root
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
 }
 
 fn maven_runner(reactor_root: &Path) -> String {
@@ -505,5 +538,30 @@ mod tests {
             .cache_inputs("test")
             .source_globs
             .contains(&"src/test/**/*".to_string()));
+    }
+
+    #[test]
+    fn test_native_caches_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><artifactId>root</artifactId><modules><module>services/api</module></modules></project>",
+        )
+        .unwrap();
+        let module = root.join("services/api");
+        std::fs::create_dir_all(&module).unwrap();
+        let pom = module.join("pom.xml");
+        std::fs::write(&pom, "<project><artifactId>api</artifactId></project>").unwrap();
+        let ctx = context(&pom, root, &[]);
+
+        let caches = MavenPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].id, "maven-repository");
+        assert_eq!(caches[0].paths, vec!["~/.m2/repository".to_string()]);
+        assert_eq!(caches[0].key_files, vec!["pom.xml".to_string()]);
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
     }
 }

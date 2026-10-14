@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::{
-    CacheInputs, LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability,
-    TargetContext,
+    CacheInputs, LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target,
+    TargetCapability, TargetContext,
 };
 
 static GEM_NAME: LazyLock<Regex> = LazyLock::new(|| {
@@ -374,6 +374,27 @@ impl LanguagePlugin for RubyPlugin {
         }
     }
 
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        // Bundler installs into the project that owns the Gemfile. A gem
+        // without one still names vendor/bundle under its own directory.
+        let bundle_root = nearest_gemfile(ctx.project_dir, ctx.workspace_root)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| ctx.project_dir.to_path_buf());
+        let root_rel = workspace_relative(&bundle_root, ctx.workspace_root);
+        let id = if root_rel.is_empty() {
+            "bundle".to_string()
+        } else {
+            format!("bundle:{root_rel}")
+        };
+        vec![NativeCache {
+            id,
+            paths: vec![join_workspace_relative(&root_rel, "vendor/bundle")],
+            key_files: vec![join_workspace_relative(&root_rel, "Gemfile.lock")],
+            key_runtime: Some("ruby --version".to_string()),
+            shared: false,
+        }]
+    }
+
     fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
         let rakefile = std::fs::read_to_string(ctx.project_dir.join("Rakefile")).ok()?;
         let task_name = if rake_has_task(&rakefile, "clobber") {
@@ -461,6 +482,24 @@ fn nearest_gemfile(project_dir: &Path, workspace_root: &Path) -> Option<PathBuf>
             return None;
         }
         directory = directory.parent()?;
+    }
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
     }
 }
 
@@ -698,5 +737,31 @@ mod tests {
         assert_eq!(targets["build"].command, "gem build standalone.gemspec");
         assert_eq!(targets["test"].command, "rake test");
         assert!(targets["build"].depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_native_caches_gemfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("services/web");
+        std::fs::create_dir_all(&app).unwrap();
+        let gemfile = app.join("Gemfile");
+        std::fs::write(&gemfile, "source 'https://rubygems.org'\n").unwrap();
+        std::fs::write(app.join("Gemfile.lock"), "GEM\n").unwrap();
+        let ctx = context(&gemfile, tmp.path());
+
+        let caches = RubyPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].id, "bundle:services/web");
+        assert_eq!(
+            caches[0].paths,
+            vec!["services/web/vendor/bundle".to_string()]
+        );
+        assert_eq!(
+            caches[0].key_files,
+            vec!["services/web/Gemfile.lock".to_string()]
+        );
+        assert_eq!(caches[0].key_runtime.as_deref(), Some("ruby --version"));
+        assert!(!caches[0].shared);
     }
 }

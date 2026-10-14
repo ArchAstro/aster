@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::{
-    LanguagePlugin, LocalDependency, ProjectMetadata, Target, TargetCapability, TargetContext,
+    LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
+    TargetContext,
 };
 
 /// Internal representation of package.json for serde deserialization
@@ -130,6 +131,63 @@ fn detect_package_manager(project_dir: &Path, workspace_root: &Path) -> PackageM
     }
 
     PackageManager::Npm
+}
+
+/// Directory whose lockfile this project installs from.
+///
+/// Walks from the project up to the Aster workspace root and stops at the
+/// first `pnpm-lock.yaml`, `package-lock.json`, or `yarn.lock`. A project
+/// with no lockfile uses its own directory.
+fn node_lock_root(project_dir: &Path, workspace_root: &Path) -> PathBuf {
+    let mut dir = project_dir;
+    loop {
+        if ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"]
+            .iter()
+            .any(|name| dir.join(name).is_file())
+        {
+            return dir.to_path_buf();
+        }
+        if dir == workspace_root {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    project_dir.to_path_buf()
+}
+
+/// Workspace-relative lockfile hashed into the actions/cache key.
+///
+/// Prefers the lockfile that exists. A fixture with none still names
+/// `package-lock.json`, which is npm's default.
+fn node_lock_file(lock_root: &Path, workspace_root: &Path) -> String {
+    let name = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"]
+        .iter()
+        .find(|name| lock_root.join(name).is_file())
+        .copied()
+        .unwrap_or("package-lock.json");
+    join_workspace_relative(&workspace_relative(lock_root, workspace_root), name)
+}
+
+/// Path relative to the Aster workspace root, with `/` separators.
+/// A path equal to the workspace root is `""`.
+fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn join_workspace_relative(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
 }
 
 /// npm workspaces can be either an array of glob patterns or an object with a `packages` field
@@ -606,6 +664,40 @@ impl LanguagePlugin for NodeJsPlugin {
             files.push("tsconfig.base.json".to_string());
         }
         files
+    }
+
+    fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
+        let pm = detect_package_manager(ctx.project_dir, ctx.workspace_root);
+        let (store_id, store_path) = match pm {
+            PackageManager::Pnpm => ("pnpm-store", "~/.local/share/pnpm/store"),
+            PackageManager::Npm => ("npm-cache", "~/.npm"),
+        };
+        let lock_root = node_lock_root(ctx.project_dir, ctx.workspace_root);
+        let lock_file = node_lock_file(&lock_root, ctx.workspace_root);
+        let project_rel = workspace_relative(ctx.project_dir, ctx.workspace_root);
+        let modules_id = if project_rel.is_empty() {
+            "node-modules".to_string()
+        } else {
+            format!("node-modules:{project_rel}")
+        };
+        let modules_path = join_workspace_relative(&project_rel, "node_modules");
+
+        vec![
+            NativeCache {
+                id: store_id.to_string(),
+                paths: vec![store_path.to_string()],
+                key_files: vec![lock_file.clone()],
+                key_runtime: None,
+                shared: true,
+            },
+            NativeCache {
+                id: modules_id,
+                paths: vec![modules_path],
+                key_files: vec![lock_file],
+                key_runtime: Some("node --version".to_string()),
+                shared: false,
+            },
+        ]
     }
 
     fn clean_target(&self, ctx: &TargetContext) -> Option<Target> {
@@ -2456,5 +2548,64 @@ mod tests {
         assert!(plugin
             .workspace_cache_inputs(tmp.path(), tmp.path(), "build")
             .is_empty());
+    }
+
+    #[test]
+    fn test_native_caches_npm_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package.json");
+        std::fs::write(&pkg, r#"{"name":"app"}"#).unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        let ctx = make_context(&pkg, tmp.path(), &[]);
+
+        let caches = NodeJsPlugin.native_caches(&ctx);
+
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].id, "npm-cache");
+        assert_eq!(caches[0].paths, vec!["~/.npm".to_string()]);
+        assert_eq!(caches[0].key_files, vec!["package-lock.json".to_string()]);
+        assert_eq!(caches[0].key_runtime, None);
+        assert!(caches[0].shared);
+
+        assert_eq!(caches[1].id, "node-modules");
+        assert_eq!(caches[1].paths, vec!["node_modules".to_string()]);
+        assert_eq!(caches[1].key_files, vec!["package-lock.json".to_string()]);
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("node --version"));
+        assert!(!caches[1].shared);
+    }
+
+    #[test]
+    fn test_native_caches_pnpm_workspace_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        let member = tmp.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        let pkg = member.join("package.json");
+        std::fs::write(&pkg, r#"{"name":"app"}"#).unwrap();
+        let ctx = make_context(&pkg, tmp.path(), &[]);
+
+        let caches = NodeJsPlugin.native_caches(&ctx);
+
+        assert_eq!(caches[0].id, "pnpm-store");
+        assert_eq!(
+            caches[0].paths,
+            vec!["~/.local/share/pnpm/store".to_string()]
+        );
+        assert_eq!(caches[0].key_files, vec!["pnpm-lock.yaml".to_string()]);
+        assert!(caches[0].shared);
+        assert_eq!(caches[0].key_runtime, None);
+
+        assert_eq!(caches[1].id, "node-modules:packages/app");
+        assert_eq!(
+            caches[1].paths,
+            vec!["packages/app/node_modules".to_string()]
+        );
+        assert_eq!(caches[1].key_files, vec!["pnpm-lock.yaml".to_string()]);
+        assert_eq!(caches[1].key_runtime.as_deref(), Some("node --version"));
+        assert!(!caches[1].shared);
     }
 }

@@ -831,18 +831,6 @@ version = "0.1.0"
     }
 
     #[test]
-    fn test_native_caches_default_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("go.mod");
-        std::fs::write(&config, "module example.com/app\n\ngo 1.22\n").unwrap();
-        let ctx = make_context(&config, tmp.path(), &[]);
-
-        let caches = super::super::GoPlugin.native_caches(&ctx);
-
-        assert!(caches.is_empty());
-    }
-
-    #[test]
     fn test_native_caches_standalone_crate() {
         let tmp = tempfile::tempdir().unwrap();
         let cargo_toml = tmp.path().join("Cargo.toml");
