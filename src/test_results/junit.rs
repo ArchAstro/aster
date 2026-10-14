@@ -6,6 +6,8 @@
 //! children and disagree on where the file and suite names go, so the file
 //! comes from the test case or its nearest suite that names one, and the
 //! suite from the test case's `classname` or else its suite's `name`.
+//! Vitest names no file; its `classname` is the file's path, so a
+//! `classname` with a JS or TS extension is taken as the file instead.
 //!
 //! Surefire's rerun elements become extra attempts: `<flakyFailure>` and
 //! `<flakyError>` are failed attempts before a pass, `<rerunFailure>` and
@@ -27,6 +29,16 @@ pub(super) fn parse(content: &str) -> Result<Vec<TestCase>> {
     Ok(cases)
 }
 
+/// Whether a classname is a source file path (`src/math.test.ts`) rather
+/// than a module or class name (`tests.test_math`, `com.example.Test`).
+fn is_source_path(name: &str) -> bool {
+    const EXTENSIONS: [&str; 8] = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTENSIONS.contains(&e))
+}
+
 fn read_case(node: Node, cases: &mut Vec<TestCase>) {
     let Some(name) = node.attribute("name") else {
         return;
@@ -36,15 +48,19 @@ fn read_case(node: Node, cases: &mut Vec<TestCase>) {
             .skip(1)
             .filter(|n| n.is_element() && n.tag_name().name() == "testsuite")
     };
-    let file = node
+    let mut file = node
         .attribute("file")
         .or_else(|| suites().find_map(|s| s.attribute("file")))
         .map(normalize_file);
-    let suite = node
+    let mut suite = node
         .attribute("classname")
         .filter(|c| !c.is_empty())
         .or_else(|| suites().find_map(|s| s.attribute("name")))
         .map(str::to_string);
+    // Vitest names no file, but its classname is the test file's path.
+    if file.is_none() && suite.as_deref().is_some_and(is_source_path) {
+        file = suite.take().map(|path| normalize_file(&path));
+    }
     let duration_ms = node.attribute("time").and_then(parse_seconds);
 
     let children: Vec<Node> = node.children().filter(|c| c.is_element()).collect();
@@ -247,7 +263,8 @@ AssertionError: expected 1 to be 2 // Object.is equality
         let cases = parse(xml).unwrap();
         assert_eq!(cases[0].name, "math > adds");
         assert_eq!(cases[1].outcome, TestOutcome::Fail);
-        assert_eq!(cases[1].suite.as_deref(), Some("src/math.test.ts"));
+        assert_eq!(cases[1].file.as_deref(), Some("src/math.test.ts"));
+        assert_eq!(cases[1].suite, None);
         assert!(cases[1]
             .message
             .as_deref()

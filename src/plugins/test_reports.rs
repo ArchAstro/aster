@@ -193,7 +193,12 @@ pub(super) fn js(ctx: &ReportContext) -> Option<ReportPlan> {
         });
     }
 
-    let script = js_script(&argv)?;
+    // `pnpm test` or `npm run test`, possibly with arguments for the
+    // runner after it, as a retry's narrowed command has.
+    let (script, passed) = js_script(&argv)
+        .map(|script| (script.to_string(), Vec::new()))
+        .or_else(|| js_script_with_args(&argv))?;
+    let script = script.as_str();
     let launcher = std::path::Path::new(&argv.parts[argv.program])
         .file_name()?
         .to_str()?
@@ -208,7 +213,7 @@ pub(super) fn js(ctx: &ReportContext) -> Option<ReportPlan> {
     // npm passes a script its arguments only after `--`; pnpm, yarn and
     // bun pass them as they are, and would hand a `--` to the runner.
     let mut add = Vec::new();
-    if launcher == "npm" {
+    if launcher == "npm" && !passed.iter().any(|a| a == "--") {
         add.push("--".to_string());
     }
     add.extend(flags);
@@ -216,6 +221,26 @@ pub(super) fn js(ctx: &ReportContext) -> Option<ReportPlan> {
         command: argv.render_inserting(usize::MAX, &add),
         ..plan
     })
+}
+
+/// [`js_script`] for a script call followed by arguments:
+/// `npm test -- a.test.ts -t name`, `pnpm run test a.test.ts`. Returns the
+/// script name and the arguments.
+fn js_script_with_args(argv: &Argv) -> Option<(String, Vec<String>)> {
+    let parts = &argv.parts[argv.program..];
+    let launcher = std::path::Path::new(parts.first()?).file_name()?.to_str()?;
+    let (script, rest) = match parts.get(1)?.as_str() {
+        "run" if matches!(launcher, "npm" | "pnpm" | "yarn" | "bun") => {
+            (parts.get(2)?, &parts[3..])
+        }
+        "test" if matches!(launcher, "npm" | "pnpm" | "yarn") => (&parts[1], &parts[2..]),
+        _ => return None,
+    };
+    // npm reads arguments before `--` as its own options.
+    if launcher == "npm" && rest.first().is_some_and(|a| a != "--") {
+        return None;
+    }
+    Some((script.clone(), rest.to_vec()))
 }
 
 pub(super) fn js_runner_kind(argv: &Argv, start: usize) -> Option<JsRunner> {
@@ -937,6 +962,21 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             "{}",
             plan.command
         );
+        // A retry's narrowed script call keeps its arguments, and npm's `--`
+        // is not repeated.
+        let plan = js(&context(&f, "test", "npm test -- a.test.ts -t 'x$'")).unwrap();
+        assert!(
+            plan.command
+                .starts_with("npm test -- a.test.ts -t 'x$' --reporter=default"),
+            "{}",
+            plan.command
+        );
+        let plan = js(&context(&f, "test", "pnpm run test-ci a.test.ts")).unwrap();
+        assert_eq!(
+            plan.command,
+            "pnpm run test-ci a.test.ts --json --outputFile=/tmp/aster-reports/1/jest.json"
+        );
+        assert_eq!(js(&context(&f, "test", "npm test a.test.ts")), None);
         let plan = js(&context(&f, "test", "pnpm run test-ci")).unwrap();
         assert_eq!(
             plan.command,
