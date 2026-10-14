@@ -29,8 +29,12 @@ struct MetadataToken {
     expires_in: u64,
 }
 
+/// The metadata server's token endpoint. It serves only plain HTTP, on a
+/// link-local address that never leaves the node; GKE's metadata server
+/// answers it for the pod's Workload Identity. The address, not the
+/// `metadata.google.internal` name, so DNS cannot redirect the request.
 const METADATA_TOKEN: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token";
 
 impl RawStore {
     pub fn new(bucket: Option<String>) -> Self {
@@ -40,6 +44,7 @@ impl RawStore {
                 bucket,
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .expect("HTTP client builds"),
                 token: Mutex::new(None),
@@ -65,14 +70,20 @@ impl RawStore {
                     match cached.as_ref() {
                         Some((value, until)) if Instant::now() < *until => value.clone(),
                         _ => {
-                            let fresh: MetadataToken = client
+                            let response = client
                                 .get(METADATA_TOKEN)
                                 .header("Metadata-Flavor", "Google")
                                 .send()
                                 .await?
-                                .error_for_status()?
-                                .json()
-                                .await?;
+                                .error_for_status()?;
+                            // The real metadata server echoes the header;
+                            // anything else answering there is not it.
+                            if response.headers().get("Metadata-Flavor")
+                                != Some(&reqwest::header::HeaderValue::from_static("Google"))
+                            {
+                                anyhow::bail!("the metadata server did not identify itself");
+                            }
+                            let fresh: MetadataToken = response.json().await?;
                             let until = Instant::now()
                                 + Duration::from_secs(fresh.expires_in.saturating_sub(60));
                             *cached = Some((fresh.access_token.clone(), until));
