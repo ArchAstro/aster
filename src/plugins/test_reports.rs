@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::related_tests::{js_runner, js_script, Argv, Delegated};
-use crate::test_results::exunit;
+use crate::test_results::{exunit, nodetest};
 use crate::test_results::{
     Confidence, OutputRewrite, ReportContext, ReportFiles, ReportFormat, ReportPlan,
 };
@@ -25,6 +25,94 @@ pub(crate) fn recognise(ctx: &ReportContext) -> Option<ReportPlan> {
         .or_else(|| delegating(ctx, pytest))
         .or_else(|| delegating(ctx, js))
         .or_else(|| delegating(ctx, cargo))
+        .or_else(|| node_test(ctx))
+}
+
+/// Node's built-in test runner, for a Node project's test command that no
+/// other runner claims, such as a package script that chains several
+/// `node --test` (or `tsx --test`) runs.
+///
+/// The command runs as written. `NODE_OPTIONS` adds Aster's reporter next
+/// to `spec`, Node's console reporter since Node 23, so every `node --test`
+/// the command starts appends its tests to one report, and other Node
+/// processes ignore the flags. Aster cannot tell whether the command runs
+/// tests some other way too, so the results are partial. Only a command
+/// that mentions `--test`, or runs a package script that does, is planned,
+/// and one that picks its own test reporter is left alone.
+pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
+    let manifest = std::fs::read_to_string(ctx.working_dir.join("package.json")).ok()?;
+    let mentions_test = |text: &str| {
+        text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .any(|word| word == "--test")
+    };
+    let script = package_script(ctx.command, &manifest);
+    let script = script.as_deref().unwrap_or("");
+    if !mentions_test(ctx.command) && !mentions_test(script) {
+        return None;
+    }
+    if script.contains("--test-reporter") {
+        return None;
+    }
+    let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    if [ctx.command, existing.as_str()]
+        .iter()
+        .any(|text| text.contains("--test-reporter"))
+        || ctx.command.contains("NODE_OPTIONS")
+    {
+        return None;
+    }
+    let reporter = ctx.report_dir.join("aster_node_test_reporter.mjs");
+    std::fs::write(&reporter, nodetest::REPORTER_SOURCE).ok()?;
+    let report = ctx.report_dir.join("node-test.ndjson");
+    let quoted = reporter
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let added = format!(
+        "--test-reporter=spec --test-reporter-destination=stdout \
+         --test-reporter=\"{quoted}\" --test-reporter-destination=stderr"
+    );
+    let node_options = if existing.trim().is_empty() {
+        added
+    } else {
+        format!("{existing} {added}")
+    };
+    Some(ReportPlan {
+        command: ctx.command.to_string(),
+        env: vec![
+            ("NODE_OPTIONS".to_string(), node_options),
+            (
+                nodetest::REPORT_ENV.to_string(),
+                report.display().to_string(),
+            ),
+        ],
+        files: ReportFiles::Paths(vec![report]),
+        format: ReportFormat::NodeTest,
+        confidence: Confidence::Partial,
+        rewrite: None,
+        // Node names test files by their resolved path.
+        relative_to: Some(
+            std::fs::canonicalize(ctx.working_dir)
+                .unwrap_or_else(|_| ctx.working_dir.to_path_buf()),
+        ),
+    })
+}
+
+/// The body of the package script a command runs: `pnpm test-ci`,
+/// `npm run test-ci`, `yarn test`.
+fn package_script(command: &str, manifest: &str) -> Option<String> {
+    let argv = Argv::parse(command)?;
+    let mut parts = argv.parts[argv.program..].iter().map(String::as_str);
+    if !matches!(parts.next()?, "npm" | "pnpm" | "yarn" | "bun") {
+        return None;
+    }
+    let name = match parts.next()? {
+        "run" | "run-script" => parts.next()?,
+        name => name,
+    };
+    let manifest: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    Some(manifest.get("scripts")?.get(name)?.as_str()?.to_string())
 }
 
 /// `cargo test` and `cargo nextest run`.
@@ -484,6 +572,7 @@ pub(super) fn maven(ctx: &ReportContext) -> Option<ReportPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_results::TestOutcome;
     use std::path::PathBuf;
 
     struct Fixture {
@@ -506,6 +595,147 @@ mod tests {
             command,
             report_dir: &f.report_dir,
         }
+    }
+
+    fn node_project(manifest: &str) -> (tempfile::TempDir, Fixture) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), manifest).unwrap();
+        let f = Fixture {
+            project: tmp.path().to_path_buf(),
+            report_dir: tmp.path().join("reports dir"),
+        };
+        std::fs::create_dir_all(&f.report_dir).unwrap();
+        (tmp, f)
+    }
+
+    #[test]
+    fn node_test_adds_aster_reporter_through_node_options() {
+        let (_tmp, f) = node_project(
+            r#"{"scripts": {"test-ci": "pnpm lint && tsx --test --test-force-exit tests/a.test.ts"}}"#,
+        );
+        let plan = node_test(&context(&f, "test-ci", "pnpm test-ci")).unwrap();
+        assert_eq!(plan.command, "pnpm test-ci");
+        assert_eq!(plan.format, ReportFormat::NodeTest);
+        assert_eq!(plan.confidence, Confidence::Partial);
+        let reporter = f.report_dir.join("aster_node_test_reporter.mjs");
+        assert_eq!(
+            std::fs::read_to_string(&reporter).unwrap(),
+            nodetest::REPORTER_SOURCE
+        );
+        let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
+        let options = &env["NODE_OPTIONS"];
+        assert!(
+            options.ends_with(&format!(
+                "--test-reporter=spec --test-reporter-destination=stdout \
+                 --test-reporter=\"{}\" --test-reporter-destination=stderr",
+                reporter.display()
+            )),
+            "{options}"
+        );
+        let report = f.report_dir.join("node-test.ndjson");
+        assert_eq!(env[nodetest::REPORT_ENV], report.display().to_string());
+        assert_eq!(plan.files, ReportFiles::Paths(vec![report]));
+    }
+
+    #[test]
+    fn node_test_leaves_commands_without_node_tests_or_with_their_own_reporter() {
+        let (_tmp, f) = node_project(
+            r#"{"scripts": {"test": "eslint . && tsc --noEmit", "unit": "node --test"}}"#,
+        );
+        assert_eq!(node_test(&context(&f, "test", "pnpm test")), None);
+        assert_eq!(node_test(&context(&f, "deps", "pnpm install")), None);
+        assert!(node_test(&context(&f, "unit", "npm run unit")).is_some());
+        assert!(node_test(&context(&f, "test", "node --test")).is_some());
+        assert_eq!(
+            node_test(&context(&f, "test", "node --test --test-reporter=tap")),
+            None
+        );
+        assert_eq!(
+            node_test(&context(&f, "test", "NODE_OPTIONS=--inspect node --test")),
+            None
+        );
+        let (_tmp, f) =
+            node_project(r#"{"scripts": {"test": "node --test --test-reporter=junit"}}"#);
+        assert_eq!(node_test(&context(&f, "test", "pnpm test")), None);
+        let none = Fixture {
+            project: PathBuf::from("/nonexistent"),
+            report_dir: PathBuf::from("/nonexistent/r"),
+        };
+        assert_eq!(node_test(&context(&none, "test", "node --test")), None);
+    }
+
+    /// Runs real `node --test` processes with the planned environment, as
+    /// a package script chaining two of them would, and reads the report.
+    #[test]
+    fn node_test_report_records_every_test_of_every_run() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: node is not installed");
+            return;
+        }
+        let (_tmp, f) = node_project(r#"{"scripts": {"test": "node --test"}}"#);
+        std::fs::write(
+            f.project.join("a.test.mjs"),
+            r#"import test, { describe, it } from "node:test";
+import assert from "node:assert";
+describe("outer", () => {
+  it("passes", () => {});
+  it("fails", () => assert.equal(1, 2));
+  it.skip("skipped", () => {});
+});
+test("parent", async (t) => { await t.test("child", () => {}); });
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.project.join("b.test.mjs"),
+            "throw new Error(\"broken\");\n",
+        )
+        .unwrap();
+        let plan = node_test(&context(&f, "test", "pnpm test")).unwrap();
+        let started = std::time::SystemTime::now();
+        for file in ["a.test.mjs", "b.test.mjs"] {
+            let output = std::process::Command::new("node")
+                .args(["--test", file])
+                .current_dir(&f.project)
+                .envs(plan.env.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("tests "), "spec still prints: {stdout}");
+        }
+        let collected = crate::test_results::collect(&plan, started, None).unwrap();
+        let mut seen: Vec<_> = collected
+            .cases
+            .iter()
+            .map(|c| (c.file.clone().unwrap(), c.name.clone(), c.outcome))
+            .collect();
+        seen.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+        let a = |name: &str, outcome| ("a.test.mjs".to_string(), name.to_string(), outcome);
+        assert_eq!(
+            seen,
+            vec![
+                a("outer > fails", TestOutcome::Fail),
+                a("outer > passes", TestOutcome::Pass),
+                a("outer > skipped", TestOutcome::Skip),
+                a("parent > child", TestOutcome::Pass),
+                (
+                    "b.test.mjs".to_string(),
+                    "b.test.mjs".to_string(),
+                    TestOutcome::Error
+                ),
+            ]
+        );
+        let failed = collected
+            .cases
+            .iter()
+            .find(|c| c.name == "outer > fails")
+            .unwrap();
+        assert!(failed.message.as_deref().unwrap().contains("1 == 2"));
     }
 
     #[test]
