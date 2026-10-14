@@ -130,6 +130,10 @@ pub struct Target {
     /// Targets sharing a resource are serialized via per-resource mutexes
     /// while non-contending targets still run in parallel.
     pub exclusive_resources: Vec<String>,
+    /// Shell command run in the target's working directory before each
+    /// `--retry-failed` rerun, such as a database reset. A failing setup
+    /// skips that retry.
+    pub retry_setup: Option<String>,
 }
 
 /// Context passed to plugins for target detection
@@ -362,6 +366,7 @@ pub mod ruby;
 pub mod rust;
 pub(crate) mod rust_related;
 pub(crate) mod test_reports;
+pub(crate) mod test_retry;
 
 pub use elixir::ElixirPlugin;
 pub use go::GoPlugin;

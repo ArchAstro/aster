@@ -298,6 +298,57 @@ for targets other than `deps`.
 Configured `outputs` must still exist for a cached success to be reused. Clean
 targets invalidate the project's cache after succeeding.
 
+A target that passed only on a retry (see below) is not cached, so the next run
+sees the flake again.
+
+### Retrying failed tests
+
+```console
+aster --retry-failed test //api          # one retry
+aster --retry-failed=2 --test-results=results.ndjson test //api
+ASTER_RETRY_FAILED=1 aster test //api
+```
+
+When a test target fails and its captured results name the failing tests,
+`--retry-failed[=N]` (default 1; `ASTER_RETRY_FAILED=N`) reruns only those
+tests, up to N times, with the runner's own selection flags, and records every
+attempt (`attempt` 1 is the original run, 2 the first retry). The target passes
+when every failing test passes on a retry, nothing else fails and the retry
+commands exit 0; it then reports `PASS //api:test (12.3s) — flaky: 2 tests
+passed on retry`, `--json` lists them under `tests.flaky`, and GitHub Actions
+gets a `::warning` annotation per flaky test. Otherwise the target fails with
+the last attempt's failures.
+
+Retries capture results even without `--test-results`; that flag alone decides
+whether a results file is written.
+
+`retry_setup` is a shell command run in the target's working directory before
+each retry, such as a database reset. If it fails the retry is skipped and the
+original failure stands.
+
+```toml
+[targets.test]
+command = "mix test"
+retry_setup = "mix ecto.reset"
+```
+
+| Runner | Retry selects |
+| --- | --- |
+| `mix test` | the failing test files (the report has no line), without `--partitions` or `MIX_TEST_PARTITION` |
+| `go test` | `-run` per failing package, subtests anchored level by level (`^TestA$/^sub$`) |
+| Vitest, Jest, `bun test` | the failing files and an escaped `-t` pattern |
+| `pytest` | node ids, `file::Class::test` |
+| `cargo test` | `-- --exact name`; needs `--no-fail-fast` in the command |
+| `cargo nextest run` | `-E 'test(=name)'`; needs `--no-fail-fast`, plain Rust names |
+| `node --test` | `--test-name-pattern` per test and the failing files, for a direct `node --test` or `tsx --test` command only |
+| Gradle, Maven | not retried |
+
+Nothing is retried when the report has no failing test (a crash, a compile
+error), when the command was killed by a signal, when the command stops at its
+first failure (`pytest -x`, `--bail`, `mix test --max-failures`, `go test
+-failfast`), when a target runs several commands, or when the runner cannot
+select single tests.
+
 ## Affected projects
 
 ```console

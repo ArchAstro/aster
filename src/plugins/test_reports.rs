@@ -164,7 +164,7 @@ pub(super) fn cargo(ctx: &ReportContext) -> Option<ReportPlan> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsRunner {
+pub(super) enum JsRunner {
     Vitest,
     Jest,
     Bun,
@@ -218,7 +218,7 @@ pub(super) fn js(ctx: &ReportContext) -> Option<ReportPlan> {
     })
 }
 
-fn js_runner_kind(argv: &Argv, start: usize) -> Option<JsRunner> {
+pub(super) fn js_runner_kind(argv: &Argv, start: usize) -> Option<JsRunner> {
     argv.parts[argv.program..start].iter().find_map(|part| {
         match std::path::Path::new(part).file_name()?.to_str()? {
             "vitest" => Some(JsRunner::Vitest),

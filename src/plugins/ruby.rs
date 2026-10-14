@@ -421,6 +421,7 @@ fn target(
         invalidates_cache: false,
         working_dir,
         exclusive_resources,
+        retry_setup: None,
     }
 }
 

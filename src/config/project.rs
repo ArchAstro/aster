@@ -164,6 +164,11 @@ pub struct RichTargetConfig {
     /// Named resources requiring exclusive access within a DAG level
     #[serde(default)]
     pub exclusive_resources: Vec<String>,
+
+    /// Shell command run in the target's working directory before each
+    /// `--retry-failed` rerun of failing tests (e.g. a database reset). If
+    /// it fails, that retry is skipped and the original failure stands.
+    pub retry_setup: Option<String>,
 }
 
 impl TargetConfig {
@@ -928,6 +933,31 @@ command = "mix compile"
 
         let build = config.targets.get("build").unwrap();
         assert!(build.exclusive_resources().is_empty());
+    }
+
+    #[test]
+    fn test_parse_retry_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.test]
+command = "mix test"
+retry_setup = "mix ecto.reset && echo done"
+"#,
+        )
+        .unwrap();
+
+        let config = parse_aster_toml(&toml_path).unwrap();
+
+        match config.targets.get("test").unwrap() {
+            TargetConfig::Rich(rich) => assert_eq!(
+                rich.retry_setup.as_deref(),
+                Some("mix ecto.reset && echo done")
+            ),
+            other => panic!("expected a rich target, got {other:?}"),
+        }
     }
 
     #[test]

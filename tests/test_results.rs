@@ -51,6 +51,7 @@ fn aster(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env_remove("ASTER_TEST_RESULTS")
         .env_remove("GITHUB_RUN_ID")
+        .env_remove("ASTER_RETRY_FAILED")
         .env("RUNNER_TEMP", root.join("runner-temp"))
         .args(args)
         .output()
@@ -203,4 +204,227 @@ fn without_the_flag_nothing_is_recorded() {
         .all(|r| r.get("tests").is_none()));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Test results"));
     assert!(!tmp.path().join("runner-temp/aster-results").exists());
+}
+
+// --retry-failed, end to end with a real `go test`.
+
+fn go_available() -> bool {
+    Command::new("go").arg("version").output().is_ok()
+}
+
+/// A Go module whose `TestFlaky` fails until `../marker` exists (it creates
+/// the file as it fails) and whose `TestStable` logs each run to
+/// `../stable.log`, so the log shows what was rerun.
+fn flaky_go_workspace(test_target: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "app/go.mod",
+        "module example.com/app\n\ngo 1.21\n",
+    );
+    write(
+        tmp.path(),
+        "app/app_test.go",
+        r#"package app
+
+import (
+	"fmt"
+	"os"
+	"testing"
+)
+
+func TestStable(t *testing.T) {
+	f, _ := os.OpenFile("../stable.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, "ran")
+	f.Close()
+}
+
+func TestFlaky(t *testing.T) {
+	if _, err := os.Stat("../marker"); err != nil {
+		os.WriteFile("../marker", []byte("x"), 0o644)
+		t.Fatal("fails on the first run")
+	}
+}
+"#,
+    );
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        &format!("[targets.deps]\ncommand = \"true\"\n\n[targets.test]\n{test_target}\n"),
+    );
+    tmp
+}
+
+fn tests_of(records: &[Record]) -> Vec<(String, TestOutcome, u32)> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            Record::Test(test) => Some((test.name.clone(), test.outcome, test.attempt)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn target_status(records: &[Record], address: &str) -> TargetStatus {
+    records
+        .iter()
+        .find_map(|r| match r {
+            Record::Target(t) if t.address == address => Some(t.status),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn retry_failed_reruns_only_the_failing_test_and_marks_the_pass_flaky() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace(
+        "command = \"go test ./...\"\nretry_setup = \"echo reset >> ../setup.log\"",
+    );
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            "--retry-failed=1",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the retry passes: {stderr}");
+    assert!(
+        stderr.contains("PASS //app:test") && stderr.contains("flaky: 1 test passed on retry"),
+        "{stderr}"
+    );
+
+    let records = read_records(&results);
+    assert_eq!(target_status(&records, "//app:test"), TargetStatus::Passed);
+    let tests = tests_of(&records);
+    for expected in [
+        ("TestFlaky", TestOutcome::Fail, 1),
+        ("TestFlaky", TestOutcome::Pass, 2),
+        ("TestStable", TestOutcome::Pass, 1),
+    ] {
+        assert!(
+            tests.contains(&(expected.0.into(), expected.1, expected.2)),
+            "{expected:?} in {tests:?}"
+        );
+    }
+    assert_eq!(tests.len(), 3, "{tests:?}");
+
+    // TestStable ran once: the retry selected only TestFlaky.
+    let stable = fs::read_to_string(tmp.path().join("stable.log")).unwrap();
+    assert_eq!(stable.lines().count(), 1, "{stable}");
+    // The setup ran once, before the retry.
+    let setup = fs::read_to_string(tmp.path().join("setup.log")).unwrap();
+    assert_eq!(setup.lines().count(), 1, "{setup}");
+}
+
+#[test]
+fn retry_failed_lists_the_flaky_tests_in_json_without_a_results_file() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace("command = \"go test ./...\"");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("GITHUB_RUN_ID")
+        .env("ASTER_RETRY_FAILED", "2")
+        .env("GITHUB_ACTIONS", "true")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .args(["--json", "--no-cache", "test", "//app"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("::warning file=app/app_test.go::TestFlaky failed then passed on retry")
+            || stderr.contains("::warning::TestFlaky failed then passed on retry"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Test results"),
+        "no results file was asked for: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let test = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "//app:test")
+        .unwrap();
+    assert_eq!(test["status"], "passed");
+    assert_eq!(test["tests"]["flaky"][0]["name"], "TestFlaky");
+    assert_eq!(test["tests"]["flaky"][0]["passed_on_attempt"], 2);
+}
+
+#[test]
+fn a_failing_retry_setup_skips_the_retry_and_keeps_the_failure() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace("command = \"go test ./...\"\nretry_setup = \"exit 3\"");
+    let results = tmp.path().join("results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            "--retry-failed",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    assert!(!output.status.success());
+    let records = read_records(&results);
+    let tests = tests_of(&records);
+    assert!(
+        tests.contains(&("TestFlaky".into(), TestOutcome::Fail, 1)),
+        "{tests:?}"
+    );
+    assert!(
+        tests.iter().all(|(_, _, attempt)| *attempt == 1),
+        "{tests:?}"
+    );
+    assert_eq!(target_status(&records, "//app:test"), TargetStatus::Failed);
+}
+
+#[test]
+fn a_pass_that_needed_a_retry_is_not_cached() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace("command = \"go test ./...\"");
+    let run = || aster(tmp.path(), &["--retry-failed", "test", "//app"]);
+    let first = run();
+    assert!(first.status.success());
+    assert!(String::from_utf8_lossy(&first.stderr).contains("flaky: 1 test passed on retry"));
+    // The flake comes back, and the target runs again instead of replaying a
+    // cached pass.
+    fs::remove_file(tmp.path().join("marker")).unwrap();
+    let second = run();
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    assert!(stderr.contains("flaky: 1 test passed on retry"), "{stderr}");
+}
+
+#[test]
+fn without_retry_failed_a_failing_test_fails_the_target() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace("command = \"go test ./...\"");
+    let output = aster(tmp.path(), &["--no-cache", "test", "//app"]);
+    assert!(!output.status.success());
 }

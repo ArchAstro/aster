@@ -1041,6 +1041,7 @@ mod file_command_tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            retry_setup: None,
         }
     }
 

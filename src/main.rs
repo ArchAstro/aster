@@ -1127,7 +1127,8 @@ fn run() -> Result<()> {
                     full_logs,
                     !cli.no_cache,
                 )
-                .with_test_capture(test_results.is_some());
+                .with_test_capture(test_results.is_some())
+                .with_retry_failed(cli.retry_failed());
                 let all_project_refs: Vec<_> = projects.iter().collect();
 
                 let results = if let Some(plan) = &command_plan {
@@ -1254,7 +1255,8 @@ fn run() -> Result<()> {
                 .map(|_| detect_run(&workspace_root, "run", None, &|name| env::var(name).ok()));
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
-                    .with_test_capture(test_results.is_some());
+                    .with_test_capture(test_results.is_some())
+                    .with_retry_failed(cli.retry_failed());
             let results = executor.execute_targets(&primary_targets, &all_project_refs, no_deps);
             write_test_results(test_results, run_record, &results);
 
@@ -1520,7 +1522,8 @@ fn run() -> Result<()> {
             });
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
-                    .with_test_capture(test_results.is_some());
+                    .with_test_capture(test_results.is_some())
+                    .with_retry_failed(cli.retry_failed());
 
             // Handle streaming execution (single project only, output to terminal)
             if should_stream {
