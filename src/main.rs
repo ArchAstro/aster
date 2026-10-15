@@ -16,9 +16,9 @@ use aster::cli::affected_files::{
 use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
-    print_summary, select_projects, Cli, Commands, GraphOutput, OutputMode, ProjectCommands,
-    ProjectInfo, ResultsCommands, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput,
-    SKILLS_MARKDOWN,
+    print_summary, select_projects, CiCommands, Cli, Commands, GraphOutput, OutputMode,
+    ProjectCommands, ProjectInfo, ResultsCommands, ServicesCommands, ServicesDaemonCommands,
+    TlsCommands, WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -1276,6 +1276,42 @@ fn run() -> Result<()> {
         }
         Commands::Project { command } => {
             handle_project_command(command, &workspace_root, &projects, output_mode)?;
+        }
+        Commands::Ci { command } => {
+            let CiCommands::CachePlan {
+                projects: addresses,
+                all,
+                github_output,
+            } = command;
+            let mut included = Vec::new();
+            let mut exclusions = Vec::new();
+            for address in &addresses {
+                if let Some(excluded) = address.strip_prefix('-') {
+                    exclusions.push(excluded.to_string());
+                } else {
+                    included.push(address.clone());
+                }
+            }
+            // No addresses means every discovered project. `aster run`
+            // instead falls back to the project containing cwd.
+            let select_all = all || included.is_empty();
+            let graph = build_graph(&projects)?;
+            let args = aster::cli::RunArgs {
+                all: select_all,
+                projects: if select_all { Vec::new() } else { included },
+                exclusions,
+                ..aster::cli::RunArgs::default()
+            };
+            let selected = select_projects(&args, &graph, &projects, &cwd, &workspace_root)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let runtime = aster::cache::RuntimeInputCache::new(&workspace_root);
+            let plan = aster::cli::cache_plan::plan_native_caches(
+                &selected,
+                &registry,
+                &workspace_root,
+                &runtime,
+            )?;
+            aster::cli::cache_plan::render_cache_plan(&plan, output_mode, github_output)?;
         }
         Commands::Cache { command } => {
             use aster::cache::{resolve_cache_dir, CacheStore};
