@@ -262,15 +262,17 @@ impl<'a> Run<'a> {
 pub async fn seed(server: &Server, run: &Run<'_>) {
     let client = server.client().await;
     let day = run.at.date_naive();
+    // A CI job's runner, named after its lane.
+    let runner = run.lane.map(|lane| format!("runner-{lane}"));
     aster_srv::test_results::ensure_partitions(&client, day)
         .await
         .unwrap();
     client
         .execute(
             "INSERT INTO test_results.runs \
-             (run_id, repo, sha, branch, job, lane, attempt, aster_version, started_at, \
-              received_at) \
-             VALUES ($1, $2, $3, $4, $6, $7, $8, '0', $5, $5)",
+             (run_id, repo, sha, branch, job, lane, attempt, runner, aster_version, \
+              started_at, received_at) \
+             VALUES ($1, $2, $3, $4, $6, $7, $8, $9, '0', $5, $5)",
             &[
                 &run.run_id,
                 &run.repo,
@@ -280,6 +282,7 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
                 &run.job,
                 &run.lane,
                 &run.attempt,
+                &runner,
             ],
         )
         .await

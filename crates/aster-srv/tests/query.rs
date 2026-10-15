@@ -520,6 +520,7 @@ async fn reports_the_failures_of_a_github_run() {
     );
     assert_eq!(runs[1]["lane"], "web");
     assert_eq!(runs[1]["job"], "test-ci");
+    assert_eq!(runs[1]["runner"], "runner-web");
     assert_eq!(runs[1]["attempt"], 1);
     assert_eq!(runs[1]["branch"], "main");
     for key in ["sha", "pr", "received_at"] {
@@ -533,6 +534,7 @@ async fn reports_the_failures_of_a_github_run() {
     assert_eq!(failures[0]["message"], "boom in dead");
     assert_eq!(failures[1]["passed_on_retry"], true);
     assert_eq!(failures[2]["lane"], "web");
+    assert_eq!(failures[2]["runner"], "runner-web");
     assert_eq!(failures[2]["state"], "new");
     assert_eq!(report["next_cursor"], Value::Null);
 
