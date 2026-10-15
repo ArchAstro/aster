@@ -120,14 +120,18 @@ pub(super) async fn update(
         )
         .await?);
 
-    // 3. A run of passes since entering releases.
-    let since_entry = window.finals(
-        &format!(
-            "tr.repo = q.repo AND tr.test_id = q.test_id \
-             AND tr.received_on >= (q.entered_at AT TIME ZONE 'UTC')::date \
-             AND r.received_at > q.entered_at AND r.received_at <= {to}"
-        ),
-        false,
+    // 3. A run of passes since entering releases. Each run's final attempt
+    // counts. Cached targets record no tests, so unlike the classifier this
+    // needs no `target_runs`.
+    let since_entry = format!(
+        "SELECT DISTINCT ON (tr.run_id) tr.run_id, r.received_at, \
+                tr.outcome IN ('fail', 'error') AS is_fail \
+         FROM test_results.test_results tr \
+         JOIN test_results.runs r ON r.run_id = tr.run_id \
+         WHERE tr.repo = q.repo AND tr.test_id = q.test_id AND tr.outcome <> 'skip' \
+           AND tr.received_on >= (q.entered_at AT TIME ZONE 'UTC')::date \
+           AND r.received_at > q.entered_at AND r.received_at <= {to} \
+         ORDER BY tr.run_id, tr.attempt DESC"
     );
     let released = log(transaction
         .query(
