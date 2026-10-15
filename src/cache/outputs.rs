@@ -1,14 +1,21 @@
-//! Pack declared target outputs into the content-addressed store.
+//! Pack declared target outputs into the content-addressed store, and restore
+//! them onto disk from that store.
 //!
 //! Declarations are project-relative paths or globs from
 //! `[targets.<t>.cache] outputs`. Files become blobs. Directories are walked
 //! without following symlinks. A missing declaration or a symlink that leaves
 //! the project is a warning and is not stored.
+//!
+//! [`restore`] materializes a packed entry list. It validates every path
+//! before deleting anything, replaces each declared output root, and removes
+//! those roots again if a blob is missing or corrupt.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::fs::{self, File};
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 use super::artifact::{Digest, OutputEntry, OutputKind};
@@ -81,6 +88,250 @@ pub fn pack(
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(Some(entries))
+}
+
+/// Replace declared outputs under `project_root` with the packed tree.
+///
+/// Every entry is checked before the first delete. A path that is absolute,
+/// contains `..`, or otherwise leaves `project_root` is refused and nothing
+/// is removed. Each declared path is removed (a directory root takes its
+/// children with it), then files, directories, and symlinks are written.
+/// File bytes come from `store` and land via a same-directory temp rename.
+///
+/// A missing or corrupt blob, or any write error after a delete, removes the
+/// declared paths again and returns `Err`. The caller treats that as a miss.
+pub fn restore(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
+    let entries = validate_restore_entries(project_root, entries)?;
+    let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+    remove_outputs(project_root, &paths)?;
+    if let Err(error) = write_outputs(project_root, &entries, store) {
+        let _ = remove_outputs(project_root, &paths);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Checked entries, parents before children, so a directory exists before its files.
+fn validate_restore_entries(
+    project_root: &Path,
+    entries: &[OutputEntry],
+) -> Result<Vec<OutputEntry>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut checked = Vec::with_capacity(entries.len());
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        if !is_restore_path(&entry.path) {
+            bail!(
+                "cache restore path `{}` escapes the project root",
+                entry.path
+            );
+        }
+        if path_inside(project_root, &project_root.join(&entry.path)).is_none() {
+            bail!(
+                "cache restore path `{}` escapes the project root",
+                entry.path
+            );
+        }
+        match entry.kind {
+            OutputKind::File if entry.digest.is_none() => {
+                bail!("cache restore file `{}` is missing a digest", entry.path);
+            }
+            OutputKind::Symlink => match entry.target.as_deref() {
+                Some(target) if symlink_target_stays_inside(&entry.path, target) => {}
+                _ => bail!(
+                    "cache restore symlink `{}` has a target that escapes the project root",
+                    entry.path
+                ),
+            },
+            _ => {}
+        }
+        if !seen.insert(entry.path.clone()) {
+            bail!("cache restore path `{}` is declared twice", entry.path);
+        }
+        checked.push(entry.clone());
+    }
+    checked.sort_by(|left, right| {
+        left.path
+            .matches('/')
+            .count()
+            .cmp(&right.path.matches('/').count())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(checked)
+}
+
+fn remove_outputs(project_root: &Path, paths: &[String]) -> Result<()> {
+    let mut deepest_first = paths.to_vec();
+    deepest_first.sort_by(|left, right| {
+        right
+            .matches('/')
+            .count()
+            .cmp(&left.matches('/').count())
+            .then_with(|| right.cmp(left))
+    });
+    for rel in deepest_first {
+        let path = project_root.join(&rel);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to stat cache output {rel}"));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove cache output {rel}"))?;
+        } else {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("Failed to remove cache output {rel}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
+    for entry in entries {
+        let path = project_root.join(&entry.path);
+        match entry.kind {
+            OutputKind::Dir => write_dir(&path, entry.mode)
+                .with_context(|| format!("Failed to restore directory {}", entry.path))?,
+            OutputKind::File => {
+                let digest = entry.digest.as_ref().expect("validated");
+                write_file_atomic(&path, digest, entry.mode, store)
+                    .with_context(|| format!("Failed to restore file {} from blob", entry.path))?;
+            }
+            OutputKind::Symlink => {
+                let target = entry.target.as_deref().expect("validated");
+                write_symlink(&path, target)
+                    .with_context(|| format!("Failed to restore symlink {}", entry.path))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_dir(path: &Path, mode: u32) -> Result<()> {
+    fs::create_dir_all(path)?;
+    set_mode(path, mode)
+}
+
+/// Write blob bytes to a sibling temp file, then rename over `path`.
+fn write_file_atomic(path: &Path, digest: &Digest, mode: u32, store: &LocalStore) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = restore_temp_path(path);
+    let write_result = (|| {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        store.get_blob(digest, &mut file)?;
+        file.sync_all()?;
+        set_mode(&tmp, mode)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+fn write_symlink(path: &Path, target: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, path)?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, path)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!("symlinks are not supported on this platform");
+    }
+    Ok(())
+}
+
+fn restore_temp_path(final_path: &Path) -> PathBuf {
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    final_path.with_file_name(format!(
+        ".{name}.aster-restore.{}.{seq}",
+        std::process::id()
+    ))
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::symlink_metadata(path)?.permissions();
+        perms.set_mode(mode & 0o777);
+        fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+/// Same shape [`super::artifact::Manifest::validate`] accepts, checked here so
+/// a hand-built entry list cannot delete outside the project.
+fn is_restore_path(path: &str) -> bool {
+    if path.is_empty() || path.contains('\\') || path.contains(':') || path.starts_with('/') {
+        return false;
+    }
+    let mut components = Path::new(path).components();
+    match components.next() {
+        Some(Component::Normal(_)) => {
+            components.all(|component| matches!(component, Component::Normal(_)))
+        }
+        _ => false,
+    }
+}
+
+/// A packed symlink target is either a project-relative path or the original
+/// relative link text. Both must stay inside the project when resolved from
+/// the link's parent. Absolute targets and `..` that climb out are refused.
+fn symlink_target_stays_inside(link_rel: &str, target: &str) -> bool {
+    if !is_restore_path(link_rel) {
+        return false;
+    }
+    if target.is_empty() || target.contains('\\') || target.contains(':') || target.starts_with('/')
+    {
+        return false;
+    }
+    let link = Path::new(link_rel);
+    let parent = link.parent().unwrap_or(Path::new(""));
+    let mut parts: Vec<String> = parent
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    for component in Path::new(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 /// Pack `path` and, when it is a directory, its children. Symlinks are not followed.
@@ -181,11 +432,11 @@ fn pack_symlink(
     Ok(true)
 }
 
-/// Project-relative symlink target, or `None` when the link leaves the project.
+/// Project-relative check, then the text restore should write.
 ///
-/// A relative link that stays inside the project is collapsed to that
-/// project-relative path, so `../app.js` from `dist/links` becomes
-/// `dist/app.js`. An absolute link inside the project is stored the same way.
+/// A relative link that stays inside the project is stored as that link text,
+/// so `../app.js` from `dist/links` stays `../app.js`. An absolute link inside
+/// the project is stored as the project-relative path it names.
 fn symlink_target(project_root: &Path, link_path: &Path, link: &Path) -> Option<String> {
     let resolved = if link.is_absolute() {
         link.to_path_buf()
@@ -196,10 +447,11 @@ fn symlink_target(project_root: &Path, link_path: &Path, link: &Path) -> Option<
     if link.is_absolute() {
         return Some(rel);
     }
-    if !is_safe_declaration(link) {
-        return Some(rel);
+    let text = link.to_str()?;
+    if text.is_empty() || text.contains('\\') || text.contains(':') {
+        return None;
     }
-    normalize_rel(link).ok()
+    Some(text.replace('\\', "/"))
 }
 
 /// Walk the project once and return glob matches that are not under another match.
@@ -456,7 +708,7 @@ mod tests {
             .iter()
             .find(|entry| entry.path == "dist/links/current")
             .unwrap();
-        assert_eq!(link.target.as_deref(), Some("dist/app.js"));
+        assert_eq!(link.target.as_deref(), Some("../app.js"));
     }
 
     #[test]
@@ -484,5 +736,205 @@ mod tests {
         let rejected = pack(project.path(), &["leak".to_string()], &store).unwrap();
         assert!(rejected.is_none());
         assert!(!store.has_blob(&Digest::of_bytes(b"nope")));
+    }
+
+    fn snapshot(project: &Path, root_rel: &str) -> Vec<(String, String, u32)> {
+        let root = project.join(root_rel);
+        let mut rows = Vec::new();
+        for entry in WalkDir::new(&root).follow_links(false).sort_by_file_name() {
+            let entry = entry.unwrap();
+            if entry.depth() == 0 {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            let kind = if meta.file_type().is_symlink() {
+                let link = fs::read_link(entry.path()).unwrap();
+                let resolved = if link.is_absolute() {
+                    link.clone()
+                } else {
+                    entry.path().parent().unwrap_or(project).join(&link)
+                };
+                let inside =
+                    path_inside(project, &resolved).unwrap_or_else(|| link.display().to_string());
+                format!("link:{inside}")
+            } else if meta.file_type().is_dir() {
+                "dir".to_string()
+            } else {
+                format!("file:{}", fs::read_to_string(entry.path()).unwrap())
+            };
+            rows.push((rel, kind, mode_of(&meta)));
+        }
+        rows
+    }
+
+    #[test]
+    fn restore_round_trip_matches_packed_tree_including_modes() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/nested/app.js"), b"app");
+        let script = project.path().join("dist/run.sh");
+        write_file(&script, b"#!/bin/sh\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+            std::os::unix::fs::symlink("../app.js", project.path().join("dist/nested/current"))
+                .unwrap();
+        }
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("../app.js", project.path().join("dist/nested/current"))
+            .unwrap();
+
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        let packed = snapshot(project.path(), "dist");
+
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        write_file(&project.path().join("dist/stale.txt"), b"stale");
+        write_file(&project.path().join("keep.txt"), b"keep");
+
+        restore(project.path(), &entries, &store).unwrap();
+
+        assert_eq!(snapshot(project.path(), "dist"), packed);
+        assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
+        assert!(!project.path().join("dist/stale.txt").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(project.path().join("dist/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+            assert_eq!(
+                fs::read_link(project.path().join("dist/nested/current")).unwrap(),
+                Path::new("../app.js")
+            );
+        }
+    }
+
+    #[test]
+    fn restore_aborts_on_corrupt_blob_and_leaves_no_partial_output() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.txt"), b"aaa");
+        write_file(&project.path().join("dist/b.txt"), b"bbb");
+        write_file(&project.path().join("keep.txt"), b"keep");
+
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+        let b = entries
+            .iter()
+            .find(|entry| entry.path == "dist/b.txt")
+            .unwrap();
+        let digest = b.digest.as_ref().unwrap();
+        let blob = store.blob_path(digest).unwrap();
+        fs::write(&blob, b"not-a-zstd-frame").unwrap();
+
+        let error = restore(project.path(), &entries, &store).unwrap_err();
+        assert!(error.to_string().contains("dist"), "{error}");
+        assert!(
+            !project.path().join("dist").exists(),
+            "partial restore left dist behind"
+        );
+        assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn restore_refuses_path_that_escapes_project_root() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("keep.txt"), b"keep");
+        let store = LocalStore::new(cache.path().to_path_buf());
+
+        for path in ["../outside.txt", "/etc/passwd", "dist/../../etc/passwd", ""] {
+            let entries = vec![OutputEntry {
+                path: path.to_string(),
+                kind: OutputKind::File,
+                digest: Some(Digest::of_bytes(b"x")),
+                mode: 0o644,
+                target: None,
+            }];
+            let error = restore(project.path(), &entries, &store).unwrap_err();
+            assert!(
+                error.to_string().contains("escapes"),
+                "path {path:?} produced {error}"
+            );
+        }
+        assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
+
+        let link = vec![OutputEntry {
+            path: "dist/leak".into(),
+            kind: OutputKind::Symlink,
+            digest: None,
+            mode: 0o777,
+            target: Some("../../outside".into()),
+        }];
+        assert!(restore(project.path(), &link, &store).is_err());
+        assert!(!project.path().join("dist").exists());
+    }
+
+    #[test]
+    fn restore_same_directory_symlink_stays_inside_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/app.js"), b"app");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("app.js", project.path().join("dist/current")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("app.js", project.path().join("dist/current")).unwrap();
+
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        restore(project.path(), &entries, &store).unwrap();
+
+        let link = fs::read_link(project.path().join("dist/current")).unwrap();
+        assert_eq!(link, Path::new("app.js"));
+        let resolved = project.path().join("dist").join(link);
+        assert!(path_inside(project.path(), &resolved).is_some());
+    }
+
+    #[test]
+    fn restore_removes_a_directory_symlink_without_following_it() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_file(&outside.path().join("secret"), b"keep-me");
+        write_file(&project.path().join("dist/app.js"), b"app");
+
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist/app.js".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        fs::remove_file(project.path().join("dist/app.js")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), project.path().join("dist/app.js")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), project.path().join("dist/app.js"))
+            .unwrap();
+
+        restore(project.path(), &entries, &store).unwrap();
+        assert_eq!(
+            fs::read(project.path().join("dist/app.js")).unwrap(),
+            b"app"
+        );
+        assert_eq!(fs::read(outside.path().join("secret")).unwrap(), b"keep-me");
     }
 }
