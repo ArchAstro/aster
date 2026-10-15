@@ -309,7 +309,7 @@
           <tr><td>Retention</td><td>A daily job drops partitions older than 30 days. A GCS lifecycle rule deletes raw objects at 30 days. <code>tests</code> rows not seen for 30 days are deleted.</td></tr>
           <tr><td>Deploy</td><td>Image <code>ghcr.io/archastro/aster-srv</code> from this repo's release workflow. Pulumi stack in <code>firstlanding/infra/services/aster-srv</code>: Deployment, Cloud SQL, bucket, Workload Identity.</td></tr>
           <tr><td>Notifications</td><td>Configured webhook endpoints, each with its own subscribed event types: <code>test.quarantined</code>, <code>test.released</code>, <code>test.expired</code>, <code>test.broken</code>. The JSON payload is signed with HMAC-SHA256 (<code>X-Aster-Signature</code>) and retried with backoff. Slack, issue trackers and other receivers live outside the service.</td></tr>
-          <tr><td>Routes</td><td><code>POST /v1/test-results/runs</code> · <code>GET /v1/test-results/quarantine?repo=</code> · <code>GET /v1/test-results/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/test-results/tests/:id</code> · <code>GET /v1/test-results/runs/:run_id/failures</code> · <code>/healthz</code></td></tr>
+          <tr><td>Routes</td><td><code>POST /v1/test-results/runs</code> · <code>GET /v1/test-results/quarantine?repo=</code> · <code>GET /v1/test-results/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/test-results/tests/:id</code> · <code>GET /v1/test-results/runs/:run_id/failures</code> · <code>GET /v1/test-results/durations?target=&amp;day=</code> · <code>/healthz</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -352,7 +352,7 @@
     { id: "P1", name: "Capture + ingest", note: "Per-test records uploaded from every firstlanding test-ci job." },
     { id: "P2", name: "Retry + classify", note: "Per-test retry replaces retry_failed_targets.py, and flakes are scored." },
     { id: "P3", name: "Reporting", note: "PR runs say which failures are known flakes and which are new, and a dashboard shows the history." },
-    { id: "P4", name: "Quarantine + sharding", note: "Known flakes stop failing builds, and lanes are balanced by duration." }
+    { id: "P4", name: "Quarantine + sharding", note: "Known flakes stop failing builds, and partitioned suites are split by duration." }
   ];
   const T = [
     { id: "T01", p: "P1", area: "client", title: "Test result model + NDJSON writer", sub: "crates/aster-results-model, shared by the CLI and the service",
@@ -454,10 +454,10 @@
       obj: "Config sets a list of webhook endpoints, each with a URL, a secret and the event types it receives (test.quarantined, test.released, test.expired, test.broken). Deliveries are queued in Postgres and retried with exponential backoff.",
       acc: ["Payload signed as X-Aster-Signature: sha256=<hmac>", "A failing endpoint never blocks ingest or classification", "Delivery log kept 30 days", "No endpoints configured means nothing is sent"],
       files: ["crates/aster-srv/src/webhooks.rs", "crates/aster-srv/src/config.rs"], deps: ["T22"] },
-    { id: "T24", p: "P4", area: "client", title: "Duration-based lane balancing", sub: "Uses p50 test durations",
-      obj: "--lane and mix --partitions split by recorded duration instead of file count, using the duration data from the service.",
-      acc: ["Slowest lane's wall time drops on firstlanding (measured)", "Falls back to the current split when the service is unavailable"],
-      files: ["src/git/lane.rs", "src/plugins/elixir.rs"], deps: ["T17"] },
+    { id: "T24", p: "P4", area: "client", title: "Duration-balanced mix partitions", sub: "p50 file durations, longest first",
+      obj: "A MIX_TEST_PARTITION=K mix test --partitions N target (the firstlanding shard projects) runs an explicit file list: Mix's file set, split longest-first by each file's median duration from GET /v1/test-results/durations, as of the commit's UTC day so every shard gets the same answer. Lanes stay configured selectors. Shard tests are recorded under the project that owns them (the cd ../platform target), so a test keeps its id on any shard.",
+      acc: ["Every shard of one commit gets the same split: no file runs on no shard or on two", "Falls back to Mix's own split, unchanged, with no ASTER_SRV_URL, no history, an error, or ASTER_BALANCE_PARTITIONS=off", "Retry and result capture work on the rewritten command", "Slowest partition's time drops on firstlanding (measured after rollout; logs show up to ~20% headroom)"],
+      files: ["src/plugins/mix_partitions.rs", "src/test_results/balance.rs", "src/executor/runner/partitions.rs", "crates/aster-srv/src/test_results/durations.rs"], deps: ["T17"] },
     { id: "T25", p: "P4", area: "docs", title: "Docs", sub: "README, GETTING_STARTED, service runbook",
       obj: "Document capture per runner, the env vars (ASTER_SRV_URL, ASTER_QUARANTINE), the quarantine rules and self-hosting.",
       acc: ["Doc examples run against a fixture workspace"],

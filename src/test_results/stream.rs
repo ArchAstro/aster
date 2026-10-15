@@ -35,10 +35,12 @@ pub fn records(run: RunRecord, results: &[ExecutionResult]) -> Vec<Record> {
         let Some(report) = &result.tests else {
             continue;
         };
-        let project = result
-            .address
-            .rsplit_once(':')
-            .map_or(result.address.as_str(), |(project, _)| project);
+        let project = report.project.as_deref().unwrap_or_else(|| {
+            result
+                .address
+                .rsplit_once(':')
+                .map_or(result.address.as_str(), |(project, _)| project)
+        });
         for case in &report.cases {
             let identity = TestIdentity::new(
                 project,
@@ -148,6 +150,7 @@ mod tests {
     #[test]
     fn writes_run_then_targets_then_their_tests() {
         let report = TestReport {
+            project: None,
             capture: "junit".into(),
             confidence: Confidence::Complete,
             cases: vec![
@@ -198,6 +201,34 @@ mod tests {
 
         assert!(matches!(&records[4], Record::Target(t) if t.capture.is_none()));
         assert_eq!(records.len(), 5);
+    }
+
+    #[test]
+    fn a_shards_tests_are_named_for_the_project_that_owns_them() {
+        let report = |shard: &str| {
+            let report = TestReport {
+                project: Some("//services/platform".into()),
+                capture: "exunit-formatter".into(),
+                confidence: Confidence::Complete,
+                cases: vec![case("fails", TestOutcome::Fail, Some("boom"))],
+            };
+            records(run(), &[result(shard, false, Some(report))])
+        };
+        let ids: Vec<String> = [
+            "//services/platform-test-shard-1:test-ci",
+            "//services/platform-test-shard-3:test-ci",
+        ]
+        .into_iter()
+        .map(|shard| match &report(shard)[2] {
+            Record::Test(test) => {
+                assert_eq!(test.target, shard);
+                test.test_id.clone()
+            }
+            _ => panic!("expected test"),
+        })
+        .collect();
+        let owned = TestIdentity::new("//services/platform", "test/a_test.exs", "AppTest", "fails");
+        assert_eq!(ids, [owned.test_id(), owned.test_id()]);
     }
 
     #[test]

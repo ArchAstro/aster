@@ -27,7 +27,17 @@ impl Server {
         credentials: &Credentials,
         proxy_token: Option<String>,
     ) -> Result<Self> {
-        let agent = agent(Duration::from_secs(20));
+        Self::connect_with_timeout(url, credentials, proxy_token, Duration::from_secs(20))
+    }
+
+    /// [`Server::connect`] whose requests give up after `timeout`.
+    pub fn connect_with_timeout(
+        url: &str,
+        credentials: &Credentials,
+        proxy_token: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let agent = agent(timeout);
         let token = bearer(&agent, credentials)?;
         Ok(Self {
             agent,

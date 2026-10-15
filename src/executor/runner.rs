@@ -36,6 +36,7 @@ use crate::test_results::{
 };
 use crate::ui::ProgressDisplay;
 
+mod partitions;
 mod retry;
 
 use super::command::parse_command;
@@ -792,6 +793,26 @@ impl<'a> Executor<'a> {
                 .get(&target_name)
                 .and_then(|t| t.working_dir.clone())
                 .unwrap_or_else(|| project_root.clone());
+            // A partition of a suite runs the share recorded durations give
+            // it. Like test capture, this rewrites the commands only after
+            // the cache key and input hash were computed from them as
+            // written.
+            let commands = match partitions::balance(
+                target_addr,
+                &commands,
+                &working_dir,
+                self.workspace_root,
+                project_map,
+                &|name| std::env::var(name).ok(),
+            ) {
+                Some(balanced) => vec![balanced],
+                None => commands,
+            };
+            // From the command as configured, so an override that narrows
+            // it never changes whose tests these are.
+            let test_project = project.targets.get(&target_name).and_then(|target| {
+                partitions::test_owner(project, target, &target.command, project_map)
+            });
             // Test capture rewrites the commands only now, after the cache
             // key was computed from the commands as written.
             let captures = if self.capture_tests || self.retry_failed > 0 {
@@ -912,6 +933,9 @@ impl<'a> Executor<'a> {
                             &mut result,
                         );
                     }
+                }
+                if let Some(report) = &mut result.tests {
+                    report.project = test_project;
                 }
                 if let Some(report) = &result.tests {
                     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
@@ -1733,6 +1757,7 @@ fn read_test_report(
         let _ = std::fs::remove_dir_all(dir);
     }
     Some(TestReport {
+        project: None,
         capture: names.join("+"),
         confidence: if complete {
             Confidence::Complete
