@@ -17,7 +17,7 @@ mod runtime;
 mod store;
 
 pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
-pub use hasher::CacheHasher;
+pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial, RuntimeInput};
 pub use local::{LocalStore, PruneStats};
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};

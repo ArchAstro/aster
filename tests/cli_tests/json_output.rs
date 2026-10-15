@@ -580,3 +580,111 @@ fn cache_plan_github_output_writes_combined_entry() {
     assert!(written.contains("~/.cargo/registry/index\n"));
     assert!(written.contains("apps/web/node_modules\n"));
 }
+
+/// `cache status --inputs --json` lists every key component, hashes env
+/// values, and prints the same key execution stored.
+#[test]
+fn cache_status_inputs_json_matches_executor_hash() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "p/package.json", "{\"name\":\"p\"}\n");
+    write_file(
+        &tmp,
+        "p/aster.toml",
+        "[targets.build]\ncommand = \"true\"\n\n[targets.build.cache]\nenabled = true\ninclude = [\"package.json\"]\nenv = [\"APP_SECRET\", \"UNSET_CACHE_INPUT\"]\nruntime = [\"echo toolchain-1\"]\n",
+    );
+
+    let run = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .env("APP_SECRET", "s3cret-value")
+        .env_remove("UNSET_CACHE_INPUT")
+        .args(["run", "//p:build", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stored = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["--json", "cache", "status", "//p:build"])
+        .output()
+        .unwrap();
+    assert!(stored.status.success(), "{stored:?}");
+    let entry: Value = serde_json::from_slice(&stored.stdout).expect("cache status json");
+    let stored_hash = entry["hash"].as_str().expect("stored hash").to_string();
+
+    let status = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .env("APP_SECRET", "s3cret-value")
+        .env_remove("UNSET_CACHE_INPUT")
+        .args(["--json", "cache", "status", "//p:build", "--inputs"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success(),
+        "cache status --inputs failed: {} {stdout}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        !stdout.contains("s3cret-value"),
+        "env values must not be printed raw: {stdout}"
+    );
+
+    let parsed: Value = serde_json::from_str(&stdout).expect("inputs json");
+    assert_eq!(parsed["key"].as_str(), Some(stored_hash.as_str()));
+    assert!(
+        parsed["salt"]
+            .as_str()
+            .is_some_and(|salt| salt.starts_with("aster-cache-v")),
+        "salt: {}",
+        parsed["salt"]
+    );
+    assert!(
+        parsed["platform"]
+            .as_str()
+            .is_some_and(|platform| platform.starts_with("platform:")),
+        "platform: {}",
+        parsed["platform"]
+    );
+    let files = parsed["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|file| {
+            file["path"] == "package.json" && file["digest"].as_str().is_some_and(|d| !d.is_empty())
+        }),
+        "files: {files:?}"
+    );
+    assert_eq!(parsed["command"], "true");
+    assert!(parsed["deps"].is_array(), "deps: {}", parsed["deps"]);
+
+    let env = parsed["env"].as_array().expect("env");
+    let secret = env
+        .iter()
+        .find(|var| var["name"] == "APP_SECRET")
+        .expect("APP_SECRET");
+    let value_hash = secret["value_hash"].as_str().expect("value_hash");
+    assert_eq!(value_hash.len(), 64);
+    assert_ne!(value_hash, "s3cret-value");
+    let unset = env
+        .iter()
+        .find(|var| var["name"] == "UNSET_CACHE_INPUT")
+        .expect("UNSET_CACHE_INPUT");
+    assert!(unset["value_hash"].is_null(), "unset: {unset}");
+
+    let runtime = parsed["runtime"].as_array().expect("runtime");
+    assert_eq!(runtime.len(), 1, "{runtime:?}");
+    assert_eq!(runtime[0]["cmd"], "echo toolchain-1");
+    let output_hash = runtime[0]["output_hash"].as_str().expect("output_hash");
+    assert_eq!(output_hash.len(), 64);
+    assert_ne!(output_hash, "toolchain-1");
+    assert!(runtime[0].get("output").is_none());
+    assert!(runtime[0].get("error").is_none());
+    for field in [
+        "key", "salt", "platform", "files", "command", "deps", "env", "runtime",
+    ] {
+        assert!(parsed.get(field).is_some(), "missing {field}");
+    }
+}
