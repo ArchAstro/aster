@@ -183,9 +183,8 @@ merged JSON.
 `GET /v1/test-results/durations?target=<address>&target=…&day=<YYYY-MM-DD>`
 returns each test file's median duration over the targets' recent runs, for
 splitting a partitioned suite (`MIX_TEST_PARTITION=K mix test --partitions N`)
-by time. Every partition of one commit asks with the same targets and the
-commit's UTC `day`, and must get the same answer, so the answer depends on
-nothing else: it covers runs received in the 7 days before `day` began (less
+by time. The answer for a set of targets and a UTC `day` depends on nothing
+else: it covers runs received in the 7 days before `day` began (less
 15 minutes for uploads still committing), and a `day` that has not begun is
 `409`. Per file, the first-attempt durations of its tests are summed in each
 of the latest 20 uncached, completely captured runs of each target, and the
@@ -201,9 +200,35 @@ empty without history.
 }
 ```
 
-Aster asks when a target runs a partition of a suite and `ASTER_SRV_URL` is
-set, then runs the files that partition gets from a longest-first split
-(`ASTER_BALANCE_PARTITIONS=off` keeps Mix's own split; so does any error).
+Partitions never ask the server while they run: one shard that could not
+reach it would split differently from the rest, and a file would run on two
+shards or none. Instead `aster results durations` asks for every partitioned
+suite in the workspace and writes `aster-durations.json` at its root, to be
+committed. A target that runs a partition of a suite reads its suite there
+and runs the files it gets from a longest-first split, so every shard of a
+commit splits the same way. Without the file or the suite in it, or with
+`ASTER_BALANCE_PARTITIONS=off`, Mix splits as usual. Files new since the
+refresh count as the suite's median. Refresh it on a schedule, for example:
+
+```yaml
+on:
+  schedule: [{ cron: "0 6 * * 1" }]
+permissions: { id-token: write, contents: write, pull-requests: write }
+jobs:
+  durations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: aster results durations
+        env: { ASTER_SRV_URL: https://aster-srv.example.com }
+      - run: |
+          git diff --quiet aster-durations.json && exit 0
+          git switch -c aster-durations-$(date +%F)
+          git commit -am "chore: refresh aster-durations.json"
+          git push -u origin HEAD && gh pr create --fill
+        env: { GH_TOKEN: "${{ github.token }}" }
+```
+
 The shards' tests are recorded under the project whose suite it is (the
 directory the command `cd`s to), so a test's id does not depend on the shard
 that ran it.

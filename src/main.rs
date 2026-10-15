@@ -1733,6 +1733,42 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
             println!("{report}");
             Ok(())
         }
+        ResultsCommands::Durations { url } => {
+            use aster::test_results::balance;
+            let url = srv_url(url.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("give --url or set ASTER_SRV_URL"))?;
+            let cwd = env::current_dir().context("Failed to get current directory")?;
+            let workspace_root = find_workspace_root(&cwd)
+                .ok_or_else(|| anyhow::anyhow!("not in an aster workspace"))?;
+            let registry = PluginRegistry::with_all_plugins();
+            let projects = discover_projects(&workspace_root, &registry)
+                .context("Failed to discover projects")?;
+            let project_map: HashMap<String, &DiscoveredProject> = projects
+                .iter()
+                .map(|project| (project_address(project), project))
+                .collect();
+            let suites = aster::executor::runner::partitioned_suites(&workspace_root, &project_map);
+            if suites.is_empty() {
+                anyhow::bail!("no partitioned `mix test --partitions` suites in this workspace");
+            }
+            let day = chrono::Utc::now().date_naive();
+            let file = balance::fetch_all(&url, &suites, day, &|name| env::var(name).ok())?;
+            balance::write(&workspace_root, &file)?;
+            if output_mode != OutputMode::Quiet {
+                for (dir, suite) in &file.suites {
+                    eprintln!(
+                        "[aster] {dir}: {} files timed from {} partitions",
+                        suite.files.len(),
+                        suite.targets.len()
+                    );
+                }
+                eprintln!(
+                    "[aster] Wrote {}",
+                    workspace_root.join(balance::FILE).display()
+                );
+            }
+            Ok(())
+        }
     }
 }
 
