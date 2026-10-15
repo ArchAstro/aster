@@ -1363,6 +1363,26 @@ fn run() -> Result<()> {
                         }
                     }
                 }
+                CacheCommands::Prune { max_size, max_age } => {
+                    use aster::cache::{prune_cache, PruneLimits};
+                    use aster::config::WorkspaceConfig;
+
+                    let workspace = WorkspaceConfig::load(&workspace_root)?;
+                    let limits = PruneLimits::from_config(
+                        workspace.cache.max_size.as_deref(),
+                        workspace.cache.max_age.as_deref(),
+                    )?
+                    .with_flags(max_size.as_deref(), max_age.as_deref())?;
+                    let stats = prune_cache(&workspace_root, limits)?;
+                    if output_mode == OutputMode::Json {
+                        output_json(&stats)?;
+                    } else if output_mode != OutputMode::Quiet {
+                        println!(
+                            "Pruned {} manifests and {} blobs ({} bytes remaining)",
+                            stats.manifests_removed, stats.blobs_removed, stats.bytes_remaining
+                        );
+                    }
+                }
             }
         }
         Commands::Watch {

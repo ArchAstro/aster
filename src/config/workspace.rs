@@ -25,6 +25,10 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub dev: DevWorkspaceConfig,
 
+    /// Local artifact-cache retention. Both fields are optional.
+    #[serde(default)]
+    pub cache: CacheRetentionConfig,
+
     /// Project settings are accepted because a project at the repository root
     /// may share this file with workspace configuration.
     pub name: Option<String>,
@@ -34,6 +38,18 @@ pub struct WorkspaceConfig {
     pub targets: HashMap<String, TargetConfig>,
     #[serde(default)]
     pub consumes: std::collections::BTreeMap<String, ConsumesConfig>,
+}
+
+/// `[cache]` retention for the local artifact store.
+///
+/// `max_size` accepts bytes or a `KB`/`MB`/`GB` suffix (powers of 1024).
+/// `max_age` accepts `s`/`m`/`h`/`d`. Absent fields use the prune defaults
+/// (10 GB and 14 days). `"0"` disables that limit.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheRetentionConfig {
+    pub max_size: Option<String>,
+    pub max_age: Option<String>,
 }
 
 /// Configuration for `aster services up`.
@@ -1077,5 +1093,23 @@ test = "cargo test"
         // For this test, we just verify the function runs without panic
         // and returns Some or None based on what exists above temp
         assert!(result.is_none() || result.is_some());
+    }
+
+    #[test]
+    fn workspace_cache_section_parses_max_size_and_max_age() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("aster.toml"),
+            "[cache]\nmax_size = \"10GB\"\nmax_age = \"14d\"\n",
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig::load(temp.path()).unwrap();
+        assert_eq!(config.cache.max_size.as_deref(), Some("10GB"));
+        assert_eq!(config.cache.max_age.as_deref(), Some("14d"));
+
+        fs::write(temp.path().join("aster.toml"), "").unwrap();
+        let absent = WorkspaceConfig::load(temp.path()).unwrap();
+        assert_eq!(absent.cache, CacheRetentionConfig::default());
     }
 }
