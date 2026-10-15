@@ -29,3 +29,4 @@ tokio-postgres-rustls = "0.14"
 gcp_auth = { version = "0.12.7", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
+aws-lc-rs = "1"

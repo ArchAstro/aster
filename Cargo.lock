@@ -226,6 +226,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aster-results-model",
+ "aws-lc-rs",
  "bytes",
  "chrono",
  "deadpool-postgres",

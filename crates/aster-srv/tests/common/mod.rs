@@ -17,11 +17,25 @@ use serde_json::{json, Value};
 
 const PRIVATE: &[u8] = include_bytes!("../fixtures/test-oidc-key.pem");
 const PUBLIC: &[u8] = include_bytes!("../fixtures/test-oidc-key.pub.pem");
-const IAP_PRIVATE: &[u8] = include_bytes!("../fixtures/test-iap-key.pem");
-const IAP_PUBLIC: &[u8] = include_bytes!("../fixtures/test-iap-key.pub.pem");
 /// The audience dashboard tests configure and sign for.
 pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
 pub const REPO: &str = "ArchAstro/firstlanding";
+
+/// A P-256 key pair made for this test process, so no private key is
+/// checked in: `(signing key as PKCS#8, public key as an uncompressed point)`.
+fn iap_key_pair() -> &'static (Vec<u8>, Vec<u8>) {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    static PAIR: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+                .expect("a P-256 key is generated");
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .expect("the generated key loads");
+        (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
+    })
+}
 
 pub struct Server {
     pub app: Arc<App>,
@@ -109,7 +123,7 @@ pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
     let verifier =
         Verifier::new(&config).with_key("test", DecodingKey::from_rsa_pem(PUBLIC).unwrap());
     let iap =
-        IapVerifier::new(&config).with_key("iap", DecodingKey::from_ec_pem(IAP_PUBLIC).unwrap());
+        IapVerifier::new(&config).with_key("iap", DecodingKey::from_ec_der(&iap_key_pair().1));
     let app = App::start_with_iap(
         config,
         verifier,
@@ -172,7 +186,7 @@ pub fn iap_assertion_for(email: &str, audience: &str) -> String {
             "exp": Utc::now().timestamp() + 300,
             "email": email,
         }),
-        &EncodingKey::from_ec_pem(IAP_PRIVATE).unwrap(),
+        &EncodingKey::from_ec_der(&iap_key_pair().0),
     )
     .unwrap()
 }

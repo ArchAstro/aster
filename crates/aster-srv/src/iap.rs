@@ -216,9 +216,25 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
 
-    const PRIVATE: &[u8] = include_bytes!("../tests/fixtures/test-iap-key.pem");
-    const PUBLIC: &[u8] = include_bytes!("../tests/fixtures/test-iap-key.pub.pem");
     const AUDIENCE: &str = "/projects/123456/global/backendServices/";
+
+    /// A P-256 key pair made for this test process, so no private key is
+    /// checked in: `(signing key as PKCS#8, public key as an uncompressed point)`.
+    fn iap_key_pair() -> &'static (Vec<u8>, Vec<u8>) {
+        use aws_lc_rs::rand::SystemRandom;
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        static PAIR: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        PAIR.get_or_init(|| {
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &SystemRandom::new(),
+            )
+            .expect("a P-256 key is generated");
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+                .expect("the generated key loads");
+            (pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec())
+        })
+    }
 
     fn config(extra: &[(&'static str, &'static str)]) -> Config {
         let extra = extra.to_vec();
@@ -234,7 +250,7 @@ mod tests {
     }
 
     fn verifier(extra: &[(&'static str, &'static str)]) -> IapVerifier {
-        IapVerifier::new(&config(extra)).with_key("k1", DecodingKey::from_ec_pem(PUBLIC).unwrap())
+        IapVerifier::new(&config(extra)).with_key("k1", DecodingKey::from_ec_der(&iap_key_pair().1))
     }
 
     fn token(claims: serde_json::Value, kid: &str) -> String {
@@ -243,7 +259,7 @@ mod tests {
         encode(
             &header,
             &claims,
-            &EncodingKey::from_ec_pem(PRIVATE).unwrap(),
+            &EncodingKey::from_ec_der(&iap_key_pair().0),
         )
         .unwrap()
     }
