@@ -509,3 +509,26 @@ async fn unsubscribed_or_unconfigured_events_record_nothing() {
     assert!(deliveries(&server).await.is_empty());
     server.stop().await;
 }
+
+#[tokio::test]
+async fn a_pass_behind_the_committed_watermark_changes_and_announces_nothing() {
+    let hook = receiver(204).await;
+    let config = webhooks_env(&hook.url, r#""test.broken""#);
+    let Some(server) = start(&[("ASTER_SRV_WEBHOOKS", config.as_str())]).await else {
+        return;
+    };
+    let now = Utc::now();
+    break_on_main(&server, "gone", now, 30).await;
+    assert_eq!(classify(&server, now).await.deliveries, 1);
+    // A replica whose clock is behind: as of 29 minutes ago the test was
+    // not broken yet. Re-deriving that would undo the state and announce
+    // the break a second time on the next pass.
+    assert_eq!(classify(&server, ago(now, 29)).await, Default::default());
+    let next = classify(&server, now + Duration::minutes(5)).await;
+    assert_eq!((next.tests_updated, next.deliveries), (0, 0));
+    assert_eq!(
+        deliveries(&server).await,
+        vec![("test.broken".into(), 0, false, false)]
+    );
+    server.stop().await;
+}

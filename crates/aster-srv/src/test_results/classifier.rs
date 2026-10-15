@@ -268,6 +268,19 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
     if !locked {
         return Ok(None);
     }
+    // Under the lock, a pass whose clock is behind what another replica
+    // committed would re-derive state, quarantine and notifications as of an
+    // earlier time: a broken test could turn healthy and be announced as
+    // breaking again. That replica covered this window: skip it, and go on
+    // from its watermark if `now` is later still.
+    let committed: Option<DateTime<Utc>> = transaction
+        .query_opt("SELECT watermark FROM test_results.classifier_state", &[])
+        .await?
+        .map(|row| row.get(0));
+    if let Some(committed) = committed.filter(|committed| *committed > window.to) {
+        transaction.rollback().await?;
+        return Ok(Some((Report::default(), committed >= now)));
+    }
     let report = classify(&transaction, &window).await?;
     transaction
         .execute(
