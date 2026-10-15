@@ -340,6 +340,7 @@ refers to a supervised long-lived service.
 ```console
 aster cache status
 aster cache status //services/api:test
+aster cache status //services/api:test --inputs
 aster cache clear //services/api:test
 aster cache clear
 aster cache prune --max-size 10GB --max-age 14d
@@ -355,6 +356,12 @@ A run prunes automatically when the local blob store is over that cap.
 
 The cache memoizes successful execution. It does not restore deleted artifacts.
 Declared outputs must still exist for a cached result to be reusable.
+
+`aster cache status <target> --inputs` prints every component of that target's
+cache key: salt, platform, hashed files, command, dependency hashes, tracked
+environment variables, and runtime inputs, then the key execution stores.
+Environment values and runtime command output are shown as SHA256 hashes, never
+raw. `--json` emits `{key, salt, platform, files, command, deps, env, path_env, runtime}`.
 
 ## Configure custom projects and targets
 

@@ -1321,46 +1321,24 @@ fn run() -> Result<()> {
                         }
                     }
                 }
-                CacheCommands::Status { target } => {
-                    let state = cache_store.load()?;
-
-                    if let Some(addr) = target {
-                        // Show specific target
-                        if let Some(entry) = state.targets.get(&addr) {
-                            if output_mode == OutputMode::Json {
-                                output_json(&entry)?;
-                            } else {
-                                let hash_display =
-                                    &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
-                                let time_display = format_relative_time(&entry.timestamp);
-                                println!("{addr}: {hash_display} ({time_display})");
-                            }
-                        } else if output_mode == OutputMode::Json {
-                            println!("null");
-                        } else {
-                            println!("{addr}: not cached");
-                        }
+                CacheCommands::Status { target, inputs } => {
+                    if inputs {
+                        let addr = target.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "cache status --inputs requires a target address, for example //app:build"
+                            )
+                        })?;
+                        print_cache_inputs(
+                            &addr,
+                            &workspace_root,
+                            &projects,
+                            &registry,
+                            &cache_store,
+                            output_mode,
+                        )?;
                     } else {
-                        // Show all
-                        if output_mode == OutputMode::Json {
-                            output_json(&state)?;
-                        } else {
-                            println!("Cache dir: {}", cache_store.cache_dir().display());
-                            if state.targets.is_empty() {
-                                println!("No cached targets");
-                            } else {
-                                println!("Cached targets ({}):", state.targets.len());
-                                let mut addrs: Vec<_> = state.targets.keys().collect();
-                                addrs.sort();
-                                for addr in addrs {
-                                    let entry = &state.targets[addr];
-                                    let hash_display = &entry.hash
-                                        [..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
-                                    let time_display = format_relative_time(&entry.timestamp);
-                                    println!("  {addr}: {hash_display} ({time_display})");
-                                }
-                            }
-                        }
+                        let state = cache_store.load()?;
+                        print_cache_status(&cache_store, &state, target.as_deref(), output_mode)?;
                     }
                 }
                 CacheCommands::Prune { max_size, max_age } => {
@@ -2397,4 +2375,197 @@ fn format_relative_time(timestamp: &str) -> String {
         }
         Err(_) => timestamp.to_string(),
     }
+}
+
+fn print_cache_status(
+    cache_store: &aster::cache::CacheStore,
+    state: &aster::cache::CacheState,
+    target: Option<&str>,
+    output_mode: OutputMode,
+) -> Result<()> {
+    if let Some(addr) = target {
+        if let Some(entry) = state.targets.get(addr) {
+            if output_mode == OutputMode::Json {
+                output_json(&entry)?;
+            } else {
+                let hash_display = &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
+                let time_display = format_relative_time(&entry.timestamp);
+                println!("{addr}: {hash_display} ({time_display})");
+            }
+        } else if output_mode == OutputMode::Json {
+            println!("null");
+        } else {
+            println!("{addr}: not cached");
+        }
+        return Ok(());
+    }
+
+    if output_mode == OutputMode::Json {
+        output_json(&state)?;
+    } else {
+        println!("Cache dir: {}", cache_store.cache_dir().display());
+        if state.targets.is_empty() {
+            println!("No cached targets");
+        } else {
+            println!("Cached targets ({}):", state.targets.len());
+            let mut addrs: Vec<_> = state.targets.keys().collect();
+            addrs.sort();
+            for addr in addrs {
+                let entry = &state.targets[addr];
+                let hash_display = &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
+                let time_display = format_relative_time(&entry.timestamp);
+                println!("  {addr}: {hash_display} ({time_display})");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print every component of `addr`'s cache key, using the same hasher the
+/// executor uses. Dependency hashes come from the stored cache when present.
+fn print_cache_inputs(
+    addr: &str,
+    workspace_root: &Path,
+    projects: &[DiscoveredProject],
+    registry: &aster::plugins::PluginRegistry,
+    cache_store: &aster::cache::CacheStore,
+    output_mode: OutputMode,
+) -> Result<()> {
+    use aster::cache::{CacheHasher, DependencyHash, RuntimeInputCache};
+
+    let (project_addr, target_name) = parse_target_address(addr)
+        .ok_or_else(|| anyhow::anyhow!("invalid target address '{addr}'"))?;
+    let project = projects
+        .iter()
+        .find(|project| project_address(project) == project_addr)
+        .ok_or_else(|| anyhow::anyhow!("project '{project_addr}' not found"))?;
+    let target = project
+        .targets
+        .get(&target_name)
+        .ok_or_else(|| anyhow::anyhow!("target '{target_name}' not found in {project_addr}"))?;
+    let plugin = registry
+        .find_by_name(&project.plugin_name)
+        .ok_or_else(|| anyhow::anyhow!("plugin '{}' not found", project.plugin_name))?;
+
+    let mut inputs = plugin.cache_inputs(&target_name);
+    inputs.workspace_files =
+        plugin.workspace_cache_inputs(&project.root, workspace_root, &target_name);
+
+    let state = cache_store.load()?;
+    let deps: Vec<DependencyHash> = target
+        .depends_on
+        .iter()
+        .map(|dep| DependencyHash {
+            hash: state.targets.get(dep).map(|entry| entry.hash.clone()),
+            address: dep.clone(),
+        })
+        .collect();
+
+    let excluded = nested_project_roots(project, projects);
+    let hasher = CacheHasher::new(&project.root, workspace_root).with_excluded_dirs(excluded);
+    let env_snapshot: HashMap<String, String> = std::env::vars().collect();
+    let runtime = RuntimeInputCache::new(workspace_root);
+    let (material, key) = hasher.explain(
+        &inputs,
+        target.cache.as_ref(),
+        &target.command,
+        &deps,
+        &env_snapshot,
+        &runtime,
+    );
+
+    if output_mode == OutputMode::Json {
+        let value = serde_json::to_value(&material)?;
+        let key_value = key.as_ref().cloned().unwrap_or_default();
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("key".to_string(), serde_json::Value::String(key_value));
+        if let Some(object) = value.as_object() {
+            for (field, field_value) in object {
+                ordered.insert(field.clone(), field_value.clone());
+            }
+        }
+        output_json(&ordered)?;
+    } else {
+        println!("salt: {}", material.salt.replace('\n', " "));
+        println!("platform: {}", material.platform);
+        if material.files.is_empty() {
+            println!("files: (none)");
+        } else {
+            println!("files:");
+            for file in &material.files {
+                println!("  {} {}", file.digest, file.path);
+            }
+        }
+        println!("command: {}", material.command);
+        if material.deps.is_empty() {
+            println!("deps: (none)");
+        } else {
+            println!("deps:");
+            for dep in &material.deps {
+                match &dep.hash {
+                    Some(hash) => println!("  {} {hash}", dep.address),
+                    None => println!("  {} (not cached)", dep.address),
+                }
+            }
+        }
+        if material.env.is_empty() {
+            println!("env: (none)");
+        } else {
+            println!("env:");
+            for var in &material.env {
+                match &var.value_hash {
+                    Some(hash) => println!("  {} set {hash}", var.name),
+                    None => println!("  {} unset", var.name),
+                }
+            }
+        }
+        if !material.path_env.is_empty() {
+            println!("path-env:");
+            for var in &material.path_env {
+                if let Some(hash) = &var.value_hash {
+                    println!("  {} set {hash}", var.name);
+                }
+            }
+        }
+        if material.runtime.is_empty() {
+            println!("runtime: (none)");
+        } else {
+            println!("runtime:");
+            for input in &material.runtime {
+                match &input.output_hash {
+                    Some(hash) => println!("  {} {hash}", input.cmd),
+                    None => println!(
+                        "  {} failed: {}",
+                        input.cmd,
+                        input.error.as_deref().unwrap_or("unknown error")
+                    ),
+                }
+            }
+        }
+        match &key {
+            Ok(key) => println!("key: {key}"),
+            Err(_) => println!("key: (unavailable)"),
+        }
+    }
+
+    key.map(|_| ())
+}
+
+fn project_address(project: &DiscoveredProject) -> String {
+    format!("//{}", project.relative_path.display())
+}
+
+fn nested_project_roots(
+    project: &DiscoveredProject,
+    projects: &[DiscoveredProject],
+) -> Vec<PathBuf> {
+    let parent = project.root.as_path();
+    let mut roots: Vec<PathBuf> = projects
+        .iter()
+        .filter(|other| other.root != parent && other.root.starts_with(parent))
+        .map(|other| other.root.clone())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
 }

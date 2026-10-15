@@ -533,6 +533,15 @@ pub enum CacheCommands {
     Status {
         /// Specific target to show (e.g., //services/api:test)
         target: Option<String>,
+
+        /// Print every component of the target's cache key
+        ///
+        /// Lists the salt, platform, each hashed file and its digest, the
+        /// command, dependency hashes, tracked environment variables (names
+        /// and whether set; values are SHA256-hashed), and runtime inputs,
+        /// then the key execution stores. Requires a target address.
+        #[arg(long)]
+        inputs: bool,
     },
 
     /// Evict old and least-recently-used artifact cache entries

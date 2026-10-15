@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +14,90 @@ use crate::cache::runtime::RuntimeInputCache;
 use crate::cache::CACHE_SCHEMA_VERSION;
 use crate::config::CacheConfig;
 use crate::plugins::CacheInputs;
+
+/// One file mixed into a cache key, in the order it is hashed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HashedFile {
+    /// Path as written into the key (`ws:` prefixes a workspace-root file).
+    pub path: String,
+    /// SHA256 of the file contents.
+    pub digest: String,
+}
+
+/// A dependency hash chained into this target's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DependencyHash {
+    /// Target address, when the caller supplied one. Hash-only callers leave
+    /// this empty; the key still mixes only `hash`.
+    pub address: String,
+    /// That target's cache key. `None` when it has not been computed, so it
+    /// is omitted from this key the same way a cold cache omits it.
+    pub hash: Option<String>,
+}
+
+/// An environment variable named by the cache inputs.
+///
+/// `value_hash` is the SHA256 of the raw value. The raw value is never stored
+/// here: status output must not print secrets. The cache key itself still
+/// mixes the raw value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnvInput {
+    pub name: String,
+    /// SHA256 of the value when the variable is set. `None` when unset.
+    pub value_hash: Option<String>,
+    /// Raw value, used only while hashing the key. Never serialized.
+    #[serde(skip)]
+    value: Option<String>,
+}
+
+/// One runtime command mixed into the key.
+///
+/// `output_hash` is the SHA256 of the trimmed stdout+stderr, for display.
+/// The cache key mixes the raw output, kept here and never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeInput {
+    /// Command string, serialized as `cmd` to match status JSON.
+    #[serde(rename = "cmd")]
+    pub cmd: String,
+    /// SHA256 of the trimmed stdout+stderr. `None` when the command failed;
+    /// the key then records the error and hashing fails.
+    pub output_hash: Option<String>,
+    /// Failure text when the command did not produce output. Text status
+    /// prints it; JSON status does not, so the documented shape stays stable.
+    #[serde(skip)]
+    pub error: Option<String>,
+    /// Trimmed stdout+stderr. Hashed into the key; never printed.
+    #[serde(skip)]
+    output: Option<String>,
+}
+
+/// Every component of a target cache key, in hash order.
+///
+/// Built once and reused by [`CacheHasher::compute_hash`] and
+/// `aster cache status --inputs`, so the printed key is the key execution
+/// stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KeyMaterial {
+    /// `aster-cache-v<schema>` plus the Aster version, the first two lines
+    /// hashed into the key.
+    pub salt: String,
+    /// `platform:<os>-<arch>`.
+    pub platform: String,
+    /// Project files, then workspace files, sorted by path.
+    pub files: Vec<HashedFile>,
+    /// The target command string.
+    pub command: String,
+    /// Dependency keys. Only entries with a hash are mixed in, sorted by hash.
+    pub deps: Vec<DependencyHash>,
+    /// Tracked environment variables, sorted by name.
+    pub env: Vec<EnvInput>,
+    /// Path-valued environment variables, sorted by name. The hashed value is
+    /// the portable form (workspace-relative path or final component), so a
+    /// machine-absolute path never reaches the key.
+    pub path_env: Vec<EnvInput>,
+    /// Toolchain commands, in sorted command order.
+    pub runtime: Vec<RuntimeInput>,
+}
 
 /// Relative path as hashed into a cache key: `Normal` components joined with
 /// `/`, so Windows and Unix produce the same key. A non-UTF-8 component fails
@@ -115,17 +200,11 @@ impl CacheHasher {
         self
     }
 
-    /// Compute the cache key for a target
+    /// Compute the cache key for a target.
     ///
-    /// The cache key is a SHA256 hash of:
-    /// 1. Cache schema (`aster-cache-v<SCHEMA>`), Aster version, and
-    ///    `platform:<os>-<arch>`
-    /// 2. Source files (matched by globs)
-    /// 3. Config files
-    /// 4. Command string
-    /// 5. Dependency cache keys (hash chaining)
-    /// 6. Environment variables
-    /// 7. Runtime command outputs (`runtime:<cmd>=<output>`)
+    /// Dependency hashes are mixed without addresses. Use
+    /// [`Self::compute_hash_with_deps`] when status output needs each
+    /// dependency's address next to its hash; both produce the same key.
     pub fn compute_hash(
         &self,
         plugin_inputs: &CacheInputs,
@@ -135,7 +214,36 @@ impl CacheHasher {
         env_snapshot: &HashMap<String, String>,
         runtime_inputs: &RuntimeInputCache,
     ) -> Result<String> {
-        self.compute_hash_with_schema(
+        let deps: Vec<DependencyHash> = dependency_hashes
+            .iter()
+            .map(|hash| DependencyHash {
+                address: String::new(),
+                hash: Some((*hash).to_string()),
+            })
+            .collect();
+        self.compute_hash_with_deps(
+            plugin_inputs,
+            user_config,
+            command,
+            &deps,
+            env_snapshot,
+            runtime_inputs,
+        )
+    }
+
+    /// Compute the cache key, keeping each dependency address for display.
+    ///
+    /// A dependency with `hash: None` is listed but not mixed into the key.
+    pub fn compute_hash_with_deps(
+        &self,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+        command: &str,
+        dependency_hashes: &[DependencyHash],
+        env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
+    ) -> Result<String> {
+        self.material_and_hash(
             CACHE_SCHEMA_VERSION,
             plugin_inputs,
             user_config,
@@ -144,8 +252,68 @@ impl CacheHasher {
             env_snapshot,
             runtime_inputs,
         )
+        .map(|(_material, key)| key)
+        .map_err(cache_hash_error)
     }
 
+    /// The components status prints, plus the key execution stores.
+    ///
+    /// A failed runtime command is still present on the material (with
+    /// `output_hash: None` and `error` set). The error is returned after the
+    /// material so status can show the failure and the partial key.
+    pub fn explain(
+        &self,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+        command: &str,
+        dependency_hashes: &[DependencyHash],
+        env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
+    ) -> (KeyMaterial, Result<String>) {
+        match self.material_and_hash(
+            CACHE_SCHEMA_VERSION,
+            plugin_inputs,
+            user_config,
+            command,
+            dependency_hashes,
+            env_snapshot,
+            runtime_inputs,
+        ) {
+            Ok((material, key)) => (material, Ok(key)),
+            Err(CacheHashError::Runtime {
+                material,
+                partial,
+                command,
+                error,
+            }) => (
+                *material,
+                Err(anyhow::anyhow!(
+                    "runtime input `{command}` failed: {error} (inputs {partial})"
+                )),
+            ),
+            Err(CacheHashError::Other(error)) => {
+                let salt = format!(
+                    "aster-cache-v{}\n{}",
+                    CACHE_SCHEMA_VERSION, self.aster_version
+                );
+                (
+                    KeyMaterial {
+                        salt,
+                        platform: self.platform.clone(),
+                        files: Vec::new(),
+                        command: command.to_string(),
+                        deps: dependency_hashes.to_vec(),
+                        env: Vec::new(),
+                        path_env: Vec::new(),
+                        runtime: Vec::new(),
+                    },
+                    Err(error),
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn compute_hash_with_schema(
         &self,
@@ -157,94 +325,123 @@ impl CacheHasher {
         env_snapshot: &HashMap<String, String>,
         runtime_inputs: &RuntimeInputCache,
     ) -> Result<String> {
-        let mut hasher = Sha256::new();
+        let deps: Vec<DependencyHash> = dependency_hashes
+            .iter()
+            .map(|hash| DependencyHash {
+                address: String::new(),
+                hash: Some((*hash).to_string()),
+            })
+            .collect();
+        self.material_and_hash(
+            schema,
+            plugin_inputs,
+            user_config,
+            command,
+            &deps,
+            env_snapshot,
+            runtime_inputs,
+        )
+        .map(|(_material, key)| key)
+        .map_err(cache_hash_error)
+    }
 
-        // Schema, Aster version, and host platform come first so incompatible
-        // keys never collide. Platform is hashed immediately after the version
-        // salt: a linux-x86_64 artifact must not restore on macOS-arm64.
-        hasher.update(format!("aster-cache-v{schema}").as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.aster_version.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(self.platform.as_bytes());
-        hasher.update(b"\n");
+    #[allow(clippy::too_many_arguments)]
+    fn material_and_hash(
+        &self,
+        schema: u32,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+        command: &str,
+        dependency_hashes: &[DependencyHash],
+        env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
+    ) -> std::result::Result<(KeyMaterial, String), CacheHashError> {
+        let material = self.collect_key_material(
+            schema,
+            plugin_inputs,
+            user_config,
+            command,
+            dependency_hashes,
+            env_snapshot,
+            runtime_inputs,
+        )?;
+        hash_key_material(&material)
+    }
 
-        // 1. Hash source files, then workspace-root files. The `ws:` prefix
-        // keeps a root Cargo.lock distinct from the member's own.
-        let mut file_hashes = self.hash_files(plugin_inputs, user_config)?;
-        file_hashes.extend(self.hash_workspace_files(plugin_inputs, user_config)?);
-        file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
-        for (path, hash) in &file_hashes {
-            hasher.update(path.as_bytes());
-            hasher.update(b":");
-            hasher.update(hash.as_bytes());
-            hasher.update(b"\n");
-        }
+    #[allow(clippy::too_many_arguments)]
+    fn collect_key_material(
+        &self,
+        schema: u32,
+        plugin_inputs: &CacheInputs,
+        user_config: Option<&CacheConfig>,
+        command: &str,
+        dependency_hashes: &[DependencyHash],
+        env_snapshot: &HashMap<String, String>,
+        runtime_inputs: &RuntimeInputCache,
+    ) -> std::result::Result<KeyMaterial, CacheHashError> {
+        let mut files = self
+            .hash_files(plugin_inputs, user_config)
+            .map_err(CacheHashError::Other)?;
+        files.extend(
+            self.hash_workspace_files(plugin_inputs, user_config)
+                .map_err(CacheHashError::Other)?,
+        );
+        files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // 2. Hash command string
-        hasher.update(b"command:");
-        hasher.update(command.as_bytes());
-        hasher.update(b"\n");
+        let env = self
+            .collect_env_vars(plugin_inputs, user_config, env_snapshot)
+            .into_iter()
+            .map(|name| {
+                let value = env_snapshot.get(&name).cloned();
+                EnvInput {
+                    value_hash: value.as_deref().map(hash_text),
+                    value,
+                    name,
+                }
+            })
+            .collect();
 
-        // 3. Hash dependency cache keys (sorted for determinism)
-        hasher.update(b"deps:");
-        let mut sorted_deps: Vec<_> = dependency_hashes.iter().collect();
-        sorted_deps.sort();
-        for dep_hash in sorted_deps {
-            hasher.update(dep_hash.as_bytes());
-            hasher.update(b",");
-        }
-        hasher.update(b"\n");
+        let path_env = self
+            .collect_path_env_vars(plugin_inputs, env_snapshot)?
+            .into_iter()
+            .map(|(name, value)| EnvInput {
+                value_hash: Some(hash_text(&value)),
+                value: Some(value),
+                name,
+            })
+            .collect();
 
-        // 4. Hash environment variables. Path-valued names are a separate
-        // section so a machine-absolute path cannot leak into the key.
-        hasher.update(b"env:");
-        let env_vars = self.collect_env_vars(plugin_inputs, user_config, env_snapshot);
-        for var in &env_vars {
-            if let Some(value) = env_snapshot.get(var) {
-                hasher.update(var.as_bytes());
-                hasher.update(b"=");
-                hasher.update(value.as_bytes());
-                hasher.update(b";");
-            }
-        }
-        hasher.update(b"path-env:");
-        for (name, value) in self.collect_path_env_vars(plugin_inputs, env_snapshot)? {
-            hasher.update(name.as_bytes());
-            hasher.update(b"=");
-            hasher.update(value.as_bytes());
-            hasher.update(b";");
-        }
-
-        hasher.update(b"runtime:");
+        let mut runtime = Vec::new();
         for command in effective_runtime_commands(plugin_inputs, user_config) {
             match runtime_inputs.output(&command) {
-                Ok(output) => {
-                    hasher.update(b"runtime:");
-                    hasher.update(command.as_bytes());
-                    hasher.update(b"=");
-                    hasher.update(output.as_bytes());
-                    hasher.update(b"\n");
-                }
-                Err(error) => {
-                    // Files are already in the hasher. Record the failure too so
-                    // test tracking still changes when an input file changes,
-                    // then fail the cache hash.
-                    hasher.update(b"runtime-error:");
-                    hasher.update(command.as_bytes());
-                    hasher.update(b"=");
-                    hasher.update(error.as_bytes());
-                    hasher.update(b"\n");
-                    let partial = encode_hex(hasher.finalize().as_ref());
-                    return Err(anyhow::anyhow!(
-                        "runtime input `{command}` failed: {error} (inputs {partial})"
-                    ));
-                }
+                Ok(output) => runtime.push(RuntimeInput {
+                    cmd: command,
+                    output_hash: Some(hash_text(&output)),
+                    error: None,
+                    output: Some(output),
+                }),
+                Err(error) => runtime.push(RuntimeInput {
+                    cmd: command,
+                    output_hash: None,
+                    error: Some(error),
+                    output: None,
+                }),
             }
         }
 
-        let result = hasher.finalize();
-        Ok(encode_hex(result.as_ref()))
+        Ok(KeyMaterial {
+            salt: format!("aster-cache-v{schema}\n{}", self.aster_version),
+            platform: self.platform.clone(),
+            files: files
+                .into_iter()
+                .map(|(path, digest)| HashedFile { path, digest })
+                .collect(),
+            command: command.to_string(),
+            deps: dependency_hashes.to_vec(),
+            env,
+            path_env,
+            runtime,
+        })
     }
 
     /// Hash all files matching the globs
@@ -570,6 +767,139 @@ fn effective_runtime_commands(
     }
 }
 
+/// SHA256 of text, used for displayed env values and runtime outputs.
+fn hash_text(text: &str) -> String {
+    encode_hex(Sha256::digest(text.as_bytes()).as_ref())
+}
+
+fn cache_hash_error(error: CacheHashError) -> anyhow::Error {
+    match error {
+        CacheHashError::Runtime {
+            partial,
+            command,
+            error,
+            ..
+        } => anyhow::anyhow!("runtime input `{command}` failed: {error} (inputs {partial})"),
+        CacheHashError::Other(error) => error,
+    }
+}
+
+/// A cache hash that failed after the inputs were collected, or before.
+enum CacheHashError {
+    /// A runtime command failed. `material` still lists every component,
+    /// including the error, and `partial` is the key of what was hashed
+    /// through that failure.
+    Runtime {
+        material: Box<KeyMaterial>,
+        partial: String,
+        command: String,
+        error: String,
+    },
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for CacheHashError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// SHA256 of `material`, using the same byte layout `compute_hash` always has.
+///
+/// Schema and version are the two lines of `salt`. Platform follows. Files,
+/// command, sorted dependency hashes, set env values, portable path-env
+/// values, and runtime outputs
+/// follow in that order. A runtime error is mixed as `runtime-error:` and
+/// then returned with the partial digest, matching the previous hasher.
+fn hash_key_material(
+    material: &KeyMaterial,
+) -> std::result::Result<(KeyMaterial, String), CacheHashError> {
+    let mut hasher = Sha256::new();
+
+    // Schema, Aster version, and host platform come first so incompatible
+    // keys never collide. Platform is hashed immediately after the version
+    // salt: a linux-x86_64 artifact must not restore on macOS-arm64.
+    hasher.update(material.salt.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(material.platform.as_bytes());
+    hasher.update(b"\n");
+
+    for file in &material.files {
+        hasher.update(file.path.as_bytes());
+        hasher.update(b":");
+        hasher.update(file.digest.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    hasher.update(b"command:");
+    hasher.update(material.command.as_bytes());
+    hasher.update(b"\n");
+
+    hasher.update(b"deps:");
+    let mut sorted_deps: Vec<&str> = material
+        .deps
+        .iter()
+        .filter_map(|dep| dep.hash.as_deref())
+        .collect();
+    sorted_deps.sort_unstable();
+    for dep_hash in sorted_deps {
+        hasher.update(dep_hash.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(b"\n");
+
+    hasher.update(b"env:");
+    for var in &material.env {
+        if let Some(value) = &var.value {
+            hasher.update(var.name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b";");
+        }
+    }
+    hasher.update(b"path-env:");
+    for var in &material.path_env {
+        if let Some(value) = &var.value {
+            hasher.update(var.name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b";");
+        }
+    }
+
+    hasher.update(b"runtime:");
+    for input in &material.runtime {
+        if let Some(output) = &input.output {
+            hasher.update(b"runtime:");
+            hasher.update(input.cmd.as_bytes());
+            hasher.update(b"=");
+            hasher.update(output.as_bytes());
+            hasher.update(b"\n");
+            continue;
+        }
+        let error = input
+            .error
+            .clone()
+            .unwrap_or_else(|| "runtime input failed".to_string());
+        // Files are already in the hasher. Record the failure too so test
+        // tracking still changes when an input file changes, then fail.
+        hasher.update(b"runtime-error:");
+        hasher.update(input.cmd.as_bytes());
+        hasher.update(b"=");
+        hasher.update(error.as_bytes());
+        hasher.update(b"\n");
+        let partial = encode_hex(hasher.finalize().as_ref());
+        return Err(CacheHashError::Runtime {
+            material: Box::new(material.clone()),
+            partial,
+            command: input.cmd.clone(),
+            error,
+        });
+    }
+
+    Ok((material.clone(), encode_hex(hasher.finalize().as_ref())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +908,74 @@ mod tests {
     #[test]
     fn encode_hex_preserves_leading_zeroes_and_lowercase() {
         assert_eq!(encode_hex(&[0x00, 0x09, 0xaf, 0xff]), "0009afff");
+    }
+
+    #[test]
+    fn key_material_hash_matches_compute_hash() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();
+        std::fs::write(tmp.path().join("src.txt"), "source\n").unwrap();
+        let script = tmp.path().join("ver.sh");
+        std::fs::write(&script, "#!/bin/sh\necho toolchain\n").unwrap();
+
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let mut inputs = CacheInputs::default();
+        inputs.config_files.push("package.json".to_string());
+        inputs.source_globs.push("src.txt".to_string());
+        inputs.env_vars.push("APP_SECRET".to_string());
+        inputs.env_vars.push("UNSET_VAR".to_string());
+        inputs
+            .runtime_commands
+            .push(format!("sh {}", script.display()));
+        let mut env = HashMap::new();
+        env.insert("APP_SECRET".to_string(), "s3cret".to_string());
+        let runtime = RuntimeInputCache::new(tmp.path());
+        let deps = [
+            DependencyHash {
+                address: "//libs/core:build".to_string(),
+                hash: Some("abc".to_string()),
+            },
+            DependencyHash {
+                address: "//libs/missing:build".to_string(),
+                hash: None,
+            },
+        ];
+
+        let key = hasher
+            .compute_hash(&inputs, None, "npm test", &["abc"], &env, &runtime)
+            .unwrap();
+        let (material, explained) =
+            hasher.explain(&inputs, None, "npm test", &deps, &env, &runtime);
+        assert_eq!(explained.unwrap(), key);
+        assert!(material.salt.starts_with("aster-cache-v"));
+        assert!(material.platform.starts_with("platform:"));
+        assert!(material
+            .files
+            .iter()
+            .any(|file| file.path == "package.json"));
+        assert_eq!(material.command, "npm test");
+        assert_eq!(material.deps[0].address, "//libs/core:build");
+        assert!(material.deps[1].hash.is_none());
+        let secret = material
+            .env
+            .iter()
+            .find(|var| var.name == "APP_SECRET")
+            .unwrap();
+        assert_eq!(
+            secret.value_hash.as_deref(),
+            Some(hash_text("s3cret").as_str())
+        );
+        assert!(material
+            .env
+            .iter()
+            .any(|var| var.name == "UNSET_VAR" && var.value_hash.is_none()));
+        assert!(material.runtime[0].output_hash.is_some());
+
+        let json = serde_json::to_value(&material).unwrap();
+        let rendered = json.to_string();
+        assert!(!rendered.contains("s3cret"));
+        assert!(!rendered.contains("toolchain"));
+        assert!(json.get("value").is_none());
     }
 
     #[test]
