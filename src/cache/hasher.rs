@@ -196,7 +196,8 @@ impl CacheHasher {
         }
         hasher.update(b"\n");
 
-        // 4. Hash environment variables
+        // 4. Hash environment variables. Path-valued names are a separate
+        // section so a machine-absolute path cannot leak into the key.
         hasher.update(b"env:");
         let env_vars = self.collect_env_vars(plugin_inputs, user_config, env_snapshot);
         for var in &env_vars {
@@ -206,6 +207,13 @@ impl CacheHasher {
                 hasher.update(value.as_bytes());
                 hasher.update(b";");
             }
+        }
+        hasher.update(b"path-env:");
+        for (name, value) in self.collect_path_env_vars(plugin_inputs, env_snapshot)? {
+            hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b";");
         }
 
         hasher.update(b"runtime:");
@@ -450,6 +458,84 @@ impl CacheHasher {
         }
         vars
     }
+
+    /// Path-valued env vars, sorted by name, with a portable value.
+    ///
+    /// A value under the workspace root is the workspace-relative path.
+    /// A value outside it is the final path component. An empty value stays
+    /// empty. A missing variable is omitted, matching `env:`.
+    fn collect_path_env_vars(
+        &self,
+        plugin_inputs: &CacheInputs,
+        env_snapshot: &HashMap<String, String>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut names: Vec<&str> = plugin_inputs
+            .path_env_vars
+            .iter()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+
+        let mut vars = Vec::new();
+        for name in names {
+            let Some(value) = env_snapshot.get(name) else {
+                continue;
+            };
+            vars.push((
+                name.to_string(),
+                portable_path_env(value, &self.workspace_root)?,
+            ));
+        }
+        Ok(vars)
+    }
+}
+
+/// Portable form of a path-valued env var.
+///
+/// `PYTHONPATH` is a list, so each entry is made portable and rejoined with
+/// the platform separator. A single path (`JAVA_HOME`, `CARGO_TARGET_DIR`)
+/// is one entry. Under `workspace_root`, an entry is the workspace-relative
+/// path with `/` separators. Otherwise it is the final path component, so
+/// two installs of `jdk-21` at different absolute paths share a key. The
+/// toolchain version is a runtime input, not this path.
+fn portable_path_env(value: &str, workspace_root: &Path) -> Result<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let mut entries = Vec::new();
+    for entry in std::env::split_paths(Path::new(value)) {
+        entries.push(portable_path_entry(&entry, workspace_root)?);
+    }
+    Ok(entries.join(separator()))
+}
+
+fn separator() -> &'static str {
+    if cfg!(windows) {
+        ";"
+    } else {
+        ":"
+    }
+}
+
+fn portable_path_entry(path: &Path, workspace_root: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Ok(String::new());
+    }
+    if let Ok(rel) = path.strip_prefix(workspace_root) {
+        if rel.as_os_str().is_empty() {
+            return Ok(String::new());
+        }
+        return normalize_rel(rel);
+    }
+    path.file_name()
+        .map(|name| {
+            name.to_str()
+                .map(str::to_string)
+                .with_context(|| format!("path env value is not valid UTF-8: {}", path.display()))
+        })
+        .transpose()?
+        .with_context(|| format!("path env value has no final component: {}", path.display()))
 }
 
 /// A workspace pattern with no glob metacharacter names one file.
@@ -577,14 +663,15 @@ mod tests {
         let inputs = CacheInputs::default();
         let env = HashMap::new();
 
+        let runtime = RuntimeInputCache::new(tmp.path());
         let linux = CacheHasher::with_platform(tmp.path(), "platform:linux-x86_64")
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let macos = CacheHasher::with_platform(tmp.path(), "platform:macos-aarch64")
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
         let same = CacheHasher::with_platform(tmp.path(), "platform:linux-x86_64")
-            .compute_hash(&inputs, None, "npm test", &[], &env)
+            .compute_hash(&inputs, None, "npm test", &[], &env, &runtime)
             .unwrap();
 
         assert_ne!(linux, macos);
@@ -1191,5 +1278,124 @@ mod tests {
         assert_ne!(plugin_hash, user_hash);
         assert_ne!(plugin_hash, disabled_hash);
         assert_eq!(disabled_hash, no_runtime);
+    }
+
+    fn hash_path_env(workspace: &Path, value: &str) -> String {
+        let hasher = CacheHasher::new(workspace, workspace);
+        let inputs = CacheInputs {
+            path_env_vars: vec!["JAVA_HOME".to_string()],
+            ..Default::default()
+        };
+        let mut env = HashMap::new();
+        env.insert("JAVA_HOME".to_string(), value.to_string());
+        hasher
+            .compute_hash(
+                &inputs,
+                None,
+                "build",
+                &[],
+                &env,
+                &RuntimeInputCache::new(workspace),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn path_env_under_workspace_is_hashed_relative() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let first_value = first.path().join("target").join("debug");
+        let second_value = second.path().join("target").join("debug");
+        std::fs::create_dir_all(&first_value).unwrap();
+        std::fs::create_dir_all(&second_value).unwrap();
+
+        let same = hash_path_env(first.path(), &first_value.to_string_lossy());
+        let also_same = hash_path_env(second.path(), &second_value.to_string_lossy());
+        assert_eq!(
+            same, also_same,
+            "the same relative path in two checkouts must share a key"
+        );
+
+        let other = first.path().join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let different = hash_path_env(first.path(), &other.to_string_lossy());
+        assert_ne!(same, different);
+
+        let collected = CacheHasher::new(first.path(), first.path()).collect_path_env_vars(
+            &CacheInputs {
+                path_env_vars: vec!["JAVA_HOME".to_string()],
+                ..Default::default()
+            },
+            &HashMap::from([(
+                "JAVA_HOME".to_string(),
+                first_value.to_string_lossy().into_owned(),
+            )]),
+        );
+        assert_eq!(
+            collected.unwrap(),
+            vec![("JAVA_HOME".to_string(), "target/debug".to_string())]
+        );
+
+        let listed = format!(
+            "{}{}{}",
+            first_value.display(),
+            if cfg!(windows) { ";" } else { ":" },
+            other.display()
+        );
+        let collected = CacheHasher::new(first.path(), first.path()).collect_path_env_vars(
+            &CacheInputs {
+                path_env_vars: vec!["PYTHONPATH".to_string()],
+                ..Default::default()
+            },
+            &HashMap::from([("PYTHONPATH".to_string(), listed)]),
+        );
+        assert_eq!(
+            collected.unwrap(),
+            vec![(
+                "PYTHONPATH".to_string(),
+                format!(
+                    "target/debug{}elsewhere",
+                    if cfg!(windows) { ";" } else { ":" }
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn path_env_outside_workspace_is_hashed_as_basename() {
+        let parent = TempDir::new().unwrap();
+        let first = parent.path().join("checkout-a");
+        let second = parent.path().join("checkout-b");
+        let jdk_a = parent.path().join("opt").join("jdk-21");
+        let jdk_b = parent.path().join("usr").join("lib").join("jdk-21");
+        let jdk_17 = parent.path().join("opt").join("jdk-17");
+        for dir in [&first, &second, &jdk_a, &jdk_b, &jdk_17] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let from_first = hash_path_env(&first, &jdk_a.to_string_lossy());
+        let from_second = hash_path_env(&second, &jdk_b.to_string_lossy());
+        assert_eq!(
+            from_first, from_second,
+            "same-version JDKs at different absolute paths must share a key"
+        );
+
+        let different = hash_path_env(&second, &jdk_17.to_string_lossy());
+        assert_ne!(from_first, different);
+
+        let collected = CacheHasher::new(&second, &second).collect_path_env_vars(
+            &CacheInputs {
+                path_env_vars: vec!["JAVA_HOME".to_string()],
+                ..Default::default()
+            },
+            &HashMap::from([(
+                "JAVA_HOME".to_string(),
+                jdk_a.to_string_lossy().into_owned(),
+            )]),
+        );
+        assert_eq!(
+            collected.unwrap(),
+            vec![("JAVA_HOME".to_string(), "jdk-21".to_string())]
+        );
     }
 }

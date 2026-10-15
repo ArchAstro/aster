@@ -1311,6 +1311,7 @@ fn check_cache(
         && plugin_inputs.config_files.is_empty()
         && plugin_inputs.workspace_files.is_empty()
         && plugin_inputs.env_vars.is_empty()
+        && plugin_inputs.path_env_vars.is_empty()
         && explicitly_enabled != Some(true)
     {
         return None;
@@ -1425,6 +1426,7 @@ fn test_input_hash(
         (&mut inputs.config_files, test_inputs.config_files),
         (&mut inputs.workspace_files, test_inputs.workspace_files),
         (&mut inputs.env_vars, test_inputs.env_vars),
+        (&mut inputs.path_env_vars, test_inputs.path_env_vars),
         (&mut inputs.runtime_commands, test_inputs.runtime_commands),
     ] {
         for item in more {

@@ -400,7 +400,8 @@ impl LanguagePlugin for PythonPlugin {
                     // deleted, recreated, or rebuilt with a different Python version.
                     ".venv/pyvenv.cfg".to_string(),
                 ],
-                env_vars: vec!["PYTHONPATH".to_string()],
+                env_vars: vec![],
+                path_env_vars: vec!["PYTHONPATH".to_string()],
                 runtime_commands: vec!["python --version".to_string()],
                 ..Default::default()
             };
@@ -416,7 +417,8 @@ impl LanguagePlugin for PythonPlugin {
                 "setup.py".to_string(),
                 "setup.cfg".to_string(),
             ],
-            env_vars: vec!["PYTHONPATH".to_string()],
+            env_vars: vec![],
+            path_env_vars: vec!["PYTHONPATH".to_string()],
             runtime_commands: vec!["python --version".to_string()],
             ..Default::default()
         };

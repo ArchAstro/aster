@@ -226,11 +226,8 @@ impl LanguagePlugin for MavenPlugin {
                 "mvnw".to_string(),
                 "mvnw.cmd".to_string(),
             ],
-            env_vars: vec![
-                "JAVA_HOME".to_string(),
-                "MAVEN_OPTS".to_string(),
-                "MAVEN_ARGS".to_string(),
-            ],
+            env_vars: vec!["MAVEN_OPTS".to_string(), "MAVEN_ARGS".to_string()],
+            path_env_vars: vec!["JAVA_HOME".to_string()],
             runtime_commands: vec!["java -version".to_string()],
             ..Default::default()
         };

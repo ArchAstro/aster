@@ -70,6 +70,15 @@ pub struct CacheInputs {
     /// match one computed on a laptop for identical inputs. Users who want
     /// `CI` in the key opt in with `[targets.<name>.cache] env = ["CI"]`.
     pub env_vars: Vec<String>,
+    /// Environment variables whose value is a filesystem path.
+    ///
+    /// Exact names only; prefix patterns stay on `env_vars`. A list value
+    /// (`PYTHONPATH`) is split on the platform path separator. Each entry
+    /// under the workspace root is hashed workspace-relative; an entry
+    /// outside it (for example `JAVA_HOME`) is hashed as its final path
+    /// component, so two machines with the same install name share a key.
+    /// The toolchain version stays in `runtime_commands`.
+    pub path_env_vars: Vec<String>,
     /// Commands whose trimmed stdout+stderr is hashed into the cache key.
     ///
     /// Plugin defaults are toolchain version commands (`rustc -vV`,
