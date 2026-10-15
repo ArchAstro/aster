@@ -125,6 +125,14 @@ pub struct TestRecord {
     /// [`crate::scrub_message`] of the failure message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Set on a test's last attempt when it failed but the test is
+    /// quarantined and Aster let its target pass.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quarantined: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[cfg(test)]
@@ -190,11 +198,20 @@ mod tests {
             duration_ms: Some(1840),
             failure_hash: Some("f3a9".into()),
             message: Some("** (DBConnection.OwnershipError) cannot find owner".into()),
+            quarantined: true,
         });
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["type"], "test");
         assert_eq!(json["outcome"], "fail");
+        assert_eq!(json["quarantined"], true);
         assert_eq!(round_trip(&record), record);
+        // Only a quarantined failure says so; older readers ignore it.
+        let Record::Test(mut plain) = record else {
+            unreachable!()
+        };
+        plain.quarantined = false;
+        let json = serde_json::to_value(Record::Test(plain)).unwrap();
+        assert!(json.get("quarantined").is_none());
     }
 
     #[test]

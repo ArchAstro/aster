@@ -1116,7 +1116,11 @@ fn run() -> Result<()> {
                     !cli.no_cache,
                 )
                 .with_test_capture(test_results.is_some())
-                .with_retry_failed(cli.retry_failed());
+                .with_retry_failed(cli.retry_failed())
+                .with_quarantine(quarantine_for(
+                    &workspace_root,
+                    test_results.is_some() || cli.retry_failed() > 0,
+                )?);
                 let all_project_refs: Vec<_> = projects.iter().collect();
 
                 let results = if let Some(plan) = &command_plan {
@@ -1244,7 +1248,11 @@ fn run() -> Result<()> {
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
-                    .with_retry_failed(cli.retry_failed());
+                    .with_retry_failed(cli.retry_failed())
+                    .with_quarantine(quarantine_for(
+                        &workspace_root,
+                        test_results.is_some() || cli.retry_failed() > 0,
+                    )?);
             let results = executor.execute_targets(&primary_targets, &all_project_refs, no_deps);
             write_test_results(test_results, run_record, &results);
 
@@ -1544,7 +1552,11 @@ fn run() -> Result<()> {
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
-                    .with_retry_failed(cli.retry_failed());
+                    .with_retry_failed(cli.retry_failed())
+                    .with_quarantine(quarantine_for(
+                        &workspace_root,
+                        test_results.is_some() || cli.retry_failed() > 0,
+                    )?);
 
             // Handle streaming execution (single project only, output to terminal)
             if should_stream {
@@ -1770,6 +1782,28 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
             Ok(())
         }
     }
+}
+
+/// The quarantine for a run, loaded once per invocation (a run over
+/// several lanes executes several times). Only a run that captures test
+/// results can use one.
+fn quarantine_for(
+    workspace_root: &Path,
+    capturing: bool,
+) -> Result<Option<aster::test_results::quarantine::Quarantine>> {
+    static LOADED: std::sync::OnceLock<
+        std::result::Result<Option<aster::test_results::quarantine::Quarantine>, String>,
+    > = std::sync::OnceLock::new();
+    if !capturing {
+        return Ok(None);
+    }
+    LOADED
+        .get_or_init(|| {
+            aster::test_results::quarantine::load(workspace_root, &|name| env::var(name).ok())
+                .map_err(|error| format!("{error:#}"))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 /// The server URL from `--url`, else `ASTER_SRV_URL`.

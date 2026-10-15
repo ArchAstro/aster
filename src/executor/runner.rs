@@ -31,6 +31,7 @@ use crate::discovery::DiscoveredProject;
 use crate::executor::logs::{LogStore, RunLog, TargetLog};
 use crate::graph::ProjectGraph;
 use crate::plugins::{LanguagePlugin, PluginRegistry};
+use crate::test_results::quarantine::{Quarantine, Verdict};
 use crate::test_results::{
     self, Confidence, OutputRewrite, ReportContext, ReportFiles, ReportPlan, TestReport,
 };
@@ -153,6 +154,8 @@ pub struct Executor<'a> {
     retry_failed: u32,
     /// Maximum combined stdout+stderr bytes retained for one command.
     log_cap: usize,
+    /// The tests whose failures may not fail their target.
+    quarantine: Option<Arc<Quarantine>>,
 }
 
 /// Default cap on one command's combined log: 16 MiB.
@@ -171,6 +174,7 @@ impl<'a> Executor<'a> {
             capture_tests: false,
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
+            quarantine: None,
         }
     }
 
@@ -186,6 +190,7 @@ impl<'a> Executor<'a> {
             capture_tests: false,
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
+            quarantine: None,
         }
     }
 
@@ -205,6 +210,7 @@ impl<'a> Executor<'a> {
             capture_tests: false,
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
+            quarantine: None,
         }
     }
 
@@ -225,6 +231,7 @@ impl<'a> Executor<'a> {
             capture_tests: false,
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
+            quarantine: None,
         }
     }
 
@@ -262,6 +269,14 @@ impl<'a> Executor<'a> {
     /// times, with `retry_setup` run before each retry.
     pub fn with_retry_failed(mut self, retries: u32) -> Self {
         self.retry_failed = retries;
+        self
+    }
+
+    /// Let a failed test target pass when, after retries, its only
+    /// failures are quarantined tests (see [`crate::test_results::quarantine`]).
+    /// Applies only to targets whose results are captured.
+    pub fn with_quarantine(mut self, quarantine: Option<Quarantine>) -> Self {
+        self.quarantine = quarantine.map(Arc::new);
         self
     }
 
@@ -865,6 +880,12 @@ impl<'a> Executor<'a> {
             let retry_command =
                 (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
             let retry_failed = self.retry_failed;
+            // Quarantine judges one command's results, like a retry.
+            let quarantine = self
+                .quarantine
+                .clone()
+                .filter(|_| !captures.is_empty() && commands.len() == 1);
+            let quarantine_command = commands.first().cloned();
             let retry_setup = project
                 .targets
                 .get(&target_name)
@@ -946,6 +967,50 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+                let mut let_through = false;
+                if let (Some(quarantine), Some(command), Some(report), false) = (
+                    &quarantine,
+                    &quarantine_command,
+                    result.tests.as_ref(),
+                    result.success || result.skipped || shutdown_requested(),
+                ) {
+                    match quarantine.judge(&addr, &plugin_name, command, result.exit_code, report) {
+                        Verdict::Pass(tests) => {
+                            let mut note = format!(
+                                "[aster] Quarantine: every failing test is quarantined, so {addr} passes\n"
+                            );
+                            for test in &tests {
+                                note.push_str(&format!(
+                                    "[aster]   {} ({})\n",
+                                    test.name, test.source
+                                ));
+                            }
+                            retry::append_log(&mut result, &note, &[]);
+                            if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                                for line in retry::quarantine_annotations(
+                                    &tests,
+                                    &working_dir,
+                                    &workspace_root_path,
+                                ) {
+                                    eprintln!("{line}");
+                                }
+                            }
+                            if let Some(report) = result.tests.as_mut() {
+                                report.quarantined = tests;
+                            }
+                            result.success = true;
+                            let_through = true;
+                        }
+                        Verdict::Fail(why) => {
+                            retry::append_log(
+                                &mut result,
+                                &format!("[aster] Quarantine: {why}\n"),
+                                &[],
+                            );
+                        }
+                        Verdict::Untouched => {}
+                    }
+                }
                 result.input_hash = input_hash;
                 if shutdown_requested() {
                     result.success = false;
@@ -957,9 +1022,10 @@ impl<'a> Executor<'a> {
                     };
                 }
 
-                // A pass that needed a retry is not a clean pass to replay
-                // from the cache: the next run should see the flake again.
-                if !result.success || retried {
+                // A pass that needed a retry or the quarantine is not a
+                // clean pass to replay from the cache: the next run should
+                // see the flake again.
+                if !result.success || retried || let_through {
                     if let Some(cache_dir) = cache_store_path.as_ref() {
                         let store = CacheStore::new(cache_dir);
                         if let Err(e) = store.remove(&addr) {
@@ -1068,6 +1134,10 @@ impl<'a> Executor<'a> {
                     let flaky = result.tests.as_ref().map_or(0, |t| t.flaky().len());
                     if flaky > 0 {
                         progress.mark_flaky(&result.address, flaky);
+                    }
+                    let quarantined = result.tests.as_ref().map_or(0, |t| t.quarantined.len());
+                    if quarantined > 0 {
+                        progress.mark_quarantined(&result.address, quarantined);
                     }
                 }
                 progress.mark_complete(
@@ -1836,6 +1906,7 @@ fn read_test_report(
             Confidence::Partial
         },
         cases,
+        quarantined: Vec::new(),
     })
 }
 

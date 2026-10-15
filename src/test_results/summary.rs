@@ -10,6 +10,9 @@
 //! - `new`: the server calls it healthy, or has never seen it
 //! - `failed`: no label, because the server could not be asked
 //!
+//! A failing test that Aster let through because it is quarantined is
+//! listed as `quarantined` and not looked up.
+//!
 //! The report never fails the build: a lookup problem only costs labels.
 
 use std::collections::HashMap;
@@ -43,6 +46,8 @@ pub enum Label {
         since_sha: Option<String>,
     },
     KnownFlake,
+    /// Failed, but quarantined: its target passed anyway.
+    Quarantined,
     /// Failed, then passed on retry.
     FlakyOnRetry,
 }
@@ -55,20 +60,28 @@ impl Label {
             Label::New => "new",
             Label::Broken { .. } => "broken",
             Label::KnownFlake => "known flake",
+            Label::Quarantined => "quarantined",
             Label::FlakyOnRetry => "flaky on retry",
         }
     }
 
-    /// Position in the report: new first, then broken, known flakes, and
-    /// the tests that passed on retry last.
+    /// Position in the report: new first, then broken, known flakes,
+    /// quarantined tests, and the tests that passed on retry last.
     fn rank(&self) -> u8 {
         match self {
             Label::New => 0,
             Label::Failed => 1,
             Label::Broken { .. } => 2,
             Label::KnownFlake => 3,
-            Label::FlakyOnRetry => 4,
+            Label::Quarantined => 4,
+            Label::FlakyOnRetry => 5,
         }
+    }
+
+    /// Whether the test failed its target. Quarantined and flaky-on-retry
+    /// tests did not.
+    fn fails(&self) -> bool {
+        !matches!(self, Label::Quarantined | Label::FlakyOnRetry)
     }
 }
 
@@ -105,9 +118,7 @@ impl Report {
     }
 
     fn failing(&self) -> impl Iterator<Item = &Entry> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.label != Label::FlakyOnRetry)
+        self.entries.iter().filter(|entry| entry.label.fails())
     }
 }
 
@@ -149,7 +160,9 @@ pub fn collect(records: &[Record]) -> Report {
             .iter()
             .max_by_key(|test| test.attempt)
             .expect("a test has an attempt");
-        let label = if last.outcome.is_failure() {
+        let label = if last.outcome.is_failure() && last.quarantined {
+            Label::Quarantined
+        } else if last.outcome.is_failure() {
             Label::Failed
         } else if last.outcome == aster_results_model::TestOutcome::Pass
             && tests.iter().any(|test| test.outcome.is_failure())
@@ -308,15 +321,16 @@ fn truncate(text: &str, chars: usize) -> String {
 }
 
 /// The workflow commands for the report: an error per failing test and, when
-/// `flaky` is set, a warning per flaky-on-retry test.
+/// `flaky` is set, a warning per flaky-on-retry or quarantined test.
 pub fn annotations(report: &Report, flaky: bool) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in &report.entries {
         let flaky_on_retry = entry.label == Label::FlakyOnRetry;
-        if flaky_on_retry && !flaky {
+        let warned = !entry.label.fails();
+        if warned && !flaky {
             continue;
         }
-        let level = if flaky_on_retry { "warning" } else { "error" };
+        let level = if warned { "warning" } else { "error" };
         let mut properties = Vec::new();
         if let Some(path) = annotation_path(entry) {
             properties.push(format!("file={}", escape_property(&path)));
@@ -345,6 +359,7 @@ pub fn annotations(report: &Report, flaky: bool) -> Vec<String> {
                 Label::Broken {
                     since_sha: Some(sha),
                 } => format!("broken since {sha}\n{text}"),
+                Label::Quarantined => format!("quarantined, so its target passed\n{text}"),
                 _ => text,
             }
         };
@@ -386,6 +401,7 @@ fn code(text: &str) -> String {
 pub fn markdown(report: &Report, url: Option<&str>, problem: Option<&str>) -> String {
     let failing = report.failing().count();
     let flaky = report.count(Label::FlakyOnRetry.rank());
+    let quarantined = report.count(Label::Quarantined.rank());
     let mut out = String::from("## Aster test results\n\n");
     if report.is_empty() {
         out.push_str("No failing tests.\n");
@@ -404,6 +420,11 @@ pub fn markdown(report: &Report, url: Option<&str>, problem: Option<&str>) -> St
     let unlabelled = report.count(Label::Failed.rank());
     if unlabelled > 0 && unlabelled < failing {
         counts.push(format!("{unlabelled} unlabelled"));
+    }
+    if quarantined > 0 {
+        counts.push(format!(
+            "{quarantined} quarantined (did not fail the build)"
+        ));
     }
     if flaky > 0 {
         counts.push(format!("{flaky} flaky on retry"));
@@ -561,7 +582,42 @@ mod tests {
             duration_ms: None,
             failure_hash: None,
             message: message.map(str::to_string),
+            quarantined: false,
         })
+    }
+
+    #[test]
+    fn quarantined_failures_are_listed_but_not_failures() {
+        let Record::Test(mut held) = test("held", TestOutcome::Fail, 1, Some("boom")) else {
+            unreachable!()
+        };
+        held.quarantined = true;
+        let mut report = collect(&[
+            run_record(),
+            Record::Test(held),
+            test("real", TestOutcome::Fail, 1, Some("bad")),
+        ]);
+        assert_eq!(report.entries[0].label, Label::Quarantined);
+        // Only the real failure is looked up.
+        let mut asked = Vec::new();
+        label(&mut report, &mut |id| {
+            asked.push(id.to_string());
+            Ok(None)
+        });
+        assert_eq!(asked, ["real"]);
+        sort(&mut report);
+        let text = markdown(&report, None, None);
+        assert!(text.contains("**1 failing test**"), "{text}");
+        assert!(
+            text.contains("1 quarantined (did not fail the build)"),
+            "{text}"
+        );
+        assert!(text.contains("| quarantined | test held"), "{text}");
+        let errors = annotations(&report, false);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("::error"));
+        let all = annotations(&report, true);
+        assert!(all[1].starts_with("::warning") && all[1].contains("quarantined"));
     }
 
     fn sample() -> Vec<Record> {

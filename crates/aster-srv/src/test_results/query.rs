@@ -258,7 +258,7 @@ fn test_json(row: &Row) -> Value {
 /// next two parameters (score, test id); the limit is last. Sorted along
 /// `tests_by_score` / `tests_by_state_score`. The state `quarantined` is
 /// not a column but membership of the quarantine list, so its `$2` is
-/// matched by [`quarantine_filter`] instead.
+/// matched by an `EXISTS` on `quarantine` instead.
 pub fn list_sql(with_state: bool, with_cursor: bool) -> String {
     let mut next = 2;
     let mut filters = String::new();
