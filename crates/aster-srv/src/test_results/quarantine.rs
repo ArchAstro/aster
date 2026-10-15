@@ -10,6 +10,7 @@
 //! 2. An entry older than `ASTER_SRV_QUARANTINE_DAYS` expires.
 //! 3. A test whose final results since it entered end in
 //!    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` consecutive passes is released.
+//!    Skips and cached targets' replayed results do not count.
 //! 4. A test that is not broken enters when definite flake events from
 //!    `ASTER_SRV_QUARANTINE_RUNS` different runs fall in the last 7 days.
 //!    Only events after the test last left count, so a released or expired
@@ -123,17 +124,15 @@ pub(super) async fn update(
         .await?);
 
     // 3. A run of passes since entering releases. Each run's final attempt
-    // counts. Cached targets record no tests, so unlike the classifier this
-    // needs no `target_runs`.
-    let since_entry = format!(
-        "SELECT DISTINCT ON (tr.run_id) tr.run_id, r.received_at, \
-                tr.outcome IN ('fail', 'error') AS is_fail \
-         FROM test_results.test_results tr \
-         JOIN test_results.runs r ON r.run_id = tr.run_id \
-         WHERE tr.repo = q.repo AND tr.test_id = q.test_id AND tr.outcome <> 'skip' \
-           AND tr.received_on >= (q.entered_at AT TIME ZONE 'UTC')::date \
-           AND r.received_at > q.entered_at AND r.received_at <= {to} \
-         ORDER BY tr.run_id, tr.attempt DESC"
+    // counts, with the classifier's rules: cached targets store the results
+    // they replay, and a replayed pass proves nothing.
+    let since_entry = window.finals(
+        &format!(
+            "tr.repo = q.repo AND tr.test_id = q.test_id \
+             AND tr.received_on >= (q.entered_at AT TIME ZONE 'UTC')::date \
+             AND r.received_at > q.entered_at AND r.received_at <= {to}"
+        ),
+        false,
     );
     let released = log(transaction
         .query(

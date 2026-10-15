@@ -270,6 +270,36 @@ async fn consecutive_passes_release_and_a_release_starts_afresh() {
 }
 
 #[tokio::test]
+async fn replayed_passes_from_cached_targets_do_not_release() {
+    let Some(server) = start(&[("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "2")]).await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&server, &retried("r1", "t", ago(now, 100))).await;
+    seed(&server, &retried("r2", "t", ago(now, 90))).await;
+    classify(&server, ago(now, 80)).await;
+    assert_eq!(quarantined(&feed(&server).await), vec!["t"]);
+
+    for (run, minutes) in [("c1", 70), ("c2", 65)] {
+        let mut replayed = Run::new(run, "pr-9", ago(now, minutes)).result("t", "pass", None);
+        replayed.cached = true;
+        seed(&server, &replayed).await;
+    }
+    assert_eq!(classify(&server, ago(now, 60)).await.quarantine.released, 0);
+    assert_eq!(quarantined(&feed(&server).await), vec!["t"]);
+
+    for (run, minutes) in [("p1", 55), ("p2", 50)] {
+        seed(
+            &server,
+            &Run::new(run, "pr-9", ago(now, minutes)).result("t", "pass", None),
+        )
+        .await;
+    }
+    assert_eq!(classify(&server, ago(now, 45)).await.quarantine.released, 1);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn entries_expire() {
     let Some(server) = start(&[("ASTER_SRV_QUARANTINE_DAYS", "1")]).await else {
         return;
