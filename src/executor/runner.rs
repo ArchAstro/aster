@@ -2655,6 +2655,11 @@ mod tests {
             &store.manifest_path(new_key).unwrap(),
             SystemTime::UNIX_EPOCH + Duration::from_secs(20),
         );
+        // Past prune's grace window for unreferenced blobs.
+        set_manifest_mtime(
+            &store.blob_path(&old).unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        );
         assert!(store.has_blob(&old));
 
         auto_prune_cache(tmp.path(), crate::cli::output::OutputMode::Quiet);

@@ -220,6 +220,11 @@ mod tests {
         let new_path = store.manifest_path(new_key).unwrap();
         set_mtime(&old_path, SystemTime::UNIX_EPOCH + Duration::from_secs(10));
         set_mtime(&new_path, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
+        // Past prune's grace window for unreferenced blobs.
+        set_mtime(
+            &store.blob_path(&old).unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        );
         let new_bytes = std::fs::metadata(store.blob_path(&new).unwrap())
             .unwrap()
             .len();
