@@ -117,7 +117,7 @@ impl Manifest {
                     anyhow::bail!("file output missing digest: {}", output.path);
                 }
                 OutputKind::Symlink => match &output.target {
-                    Some(target) if is_safe_relative_path(target) => {}
+                    Some(target) if symlink_target_stays_in_project(&output.path, target) => {}
                     _ => anyhow::bail!("unsafe symlink target for {}", output.path),
                 },
                 _ => {}
@@ -153,6 +153,44 @@ fn is_safe_relative_path(path: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// A symlink target may be the original relative link text, including `..`,
+/// as long as resolving it from the link's parent stays inside the project.
+fn symlink_target_stays_in_project(link_rel: &str, target: &str) -> bool {
+    if !is_safe_relative_path(link_rel) {
+        return false;
+    }
+    if target.is_empty() || target.contains('\\') || target.contains(':') || target.starts_with('/')
+    {
+        return false;
+    }
+    let parent = Path::new(link_rel).parent().unwrap_or(Path::new(""));
+    let mut parts: Vec<&str> = parent
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    for component in Path::new(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return false;
+                };
+                parts.push(part);
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -254,6 +292,19 @@ mod tests {
             target: None,
         });
         assert!(Manifest::decode(&missing.encode()).is_none());
+    }
+
+    #[test]
+    fn decode_accepts_parent_relative_symlink_that_stays_inside() {
+        let mut manifest = sample();
+        manifest.outputs.push(OutputEntry {
+            path: "dist/links/current".into(),
+            kind: OutputKind::Symlink,
+            digest: None,
+            mode: 0o777,
+            target: Some("../app.js".into()),
+        });
+        assert!(Manifest::decode(&manifest.encode()).is_some());
     }
 
     #[test]
