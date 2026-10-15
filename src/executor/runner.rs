@@ -1343,6 +1343,97 @@ fn cache_inputs_for(
     inputs
 }
 
+/// The plugin cache inputs for a target, or `None` when its cache policy
+/// leaves it uncacheable.
+///
+/// Targets with no detected inputs are only cacheable by explicit opt-in;
+/// their command, dependencies, configured inputs, and environment still
+/// form the cache key.
+fn cacheable_inputs(
+    target_name: &str,
+    project: &DiscoveredProject,
+    workspace_root: &Path,
+    plugin_registry: &PluginRegistry,
+) -> Option<crate::plugins::CacheInputs> {
+    let target = project.targets.get(target_name)?;
+    let explicitly_enabled = target.cache.as_ref().and_then(|config| config.enabled);
+    if explicitly_enabled == Some(false)
+        || (explicitly_enabled != Some(true) && !is_default_cacheable_target(target_name))
+    {
+        return None;
+    }
+    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
+    let plugin_inputs = cache_inputs_for(plugin, &project.root, workspace_root, target_name);
+    if plugin_inputs.source_globs.is_empty()
+        && plugin_inputs.config_files.is_empty()
+        && plugin_inputs.workspace_files.is_empty()
+        && plugin_inputs.env_vars.is_empty()
+        && plugin_inputs.path_env_vars.is_empty()
+        && explicitly_enabled != Some(true)
+    {
+        return None;
+    }
+    Some(plugin_inputs)
+}
+
+/// The cache key a fresh run would compute for `target_addr` with its
+/// default command, recomputing every dependency's key from current inputs.
+///
+/// Returns `None` when the target, or any dependency, is not cacheable or
+/// its key cannot be computed; execution then caches nothing for it either.
+/// `keys` memoizes results by address.
+pub fn fresh_cache_key(
+    target_addr: &str,
+    project_map: &HashMap<String, &DiscoveredProject>,
+    workspace_root: &Path,
+    plugin_registry: &PluginRegistry,
+    env_snapshot: &HashMap<String, String>,
+    runtime_inputs: &RuntimeInputCache,
+    keys: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(key) = keys.get(target_addr) {
+        return key.clone();
+    }
+    // Guards a dependency cycle; resolution rejects cycles before this.
+    keys.insert(target_addr.to_string(), None);
+    let key = (|| {
+        let (project_addr, target_name) = parse_target_address(target_addr)?;
+        let project = *project_map.get(&project_addr)?;
+        let target = project.targets.get(&target_name)?;
+        let plugin_inputs =
+            cacheable_inputs(&target_name, project, workspace_root, plugin_registry)?;
+        let dep_hashes = target
+            .depends_on
+            .iter()
+            .map(|dep| {
+                fresh_cache_key(
+                    dep,
+                    project_map,
+                    workspace_root,
+                    plugin_registry,
+                    env_snapshot,
+                    runtime_inputs,
+                    keys,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let dep_hashes: Vec<&str> = dep_hashes.iter().map(String::as_str).collect();
+        CacheHasher::new(&project.root, workspace_root)
+            .with_excluded_dirs(nested_project_roots(project, project_map))
+            .compute_hash(
+                &plugin_inputs,
+                target.cache.as_ref(),
+                &target.command,
+                &dep_hashes,
+                env_snapshot,
+                runtime_inputs,
+            )
+            .ok()
+    })();
+    keys.insert(target_addr.to_string(), key.clone());
+    key
+}
+
 /// Check if a target is cached and return (cache_hit, current_hash)
 ///
 /// Returns Some((true, hash)) if cache hit, Some((false, hash)) if cache miss,
@@ -1361,30 +1452,9 @@ fn check_cache(
     excluded_dirs: &[PathBuf],
     runtime_inputs: &RuntimeInputCache,
 ) -> Option<(bool, String)> {
-    // Get user cache config from project's target configuration
     let target = project.targets.get(target_name)?;
     let user_config: Option<&CacheConfig> = target.cache.as_ref();
-    let explicitly_enabled = user_config.and_then(|config| config.enabled);
-    if explicitly_enabled == Some(false)
-        || (explicitly_enabled != Some(true) && !is_default_cacheable_target(target_name))
-    {
-        return None;
-    }
-
-    // Get plugin for cache inputs. Targets with no detected inputs are only
-    // cacheable by explicit opt-in; their command, dependencies, configured
-    // inputs, and environment still form the cache key.
-    let plugin = plugin_registry.find_by_name(&project.plugin_name)?;
-    let plugin_inputs = cache_inputs_for(plugin, &project.root, workspace_root, target_name);
-    if plugin_inputs.source_globs.is_empty()
-        && plugin_inputs.config_files.is_empty()
-        && plugin_inputs.workspace_files.is_empty()
-        && plugin_inputs.env_vars.is_empty()
-        && plugin_inputs.path_env_vars.is_empty()
-        && explicitly_enabled != Some(true)
-    {
-        return None;
-    }
+    let plugin_inputs = cacheable_inputs(target_name, project, workspace_root, plugin_registry)?;
 
     // Get dependency hashes from previously computed targets
     let hashes_guard = computed_hashes.lock().ok()?;
