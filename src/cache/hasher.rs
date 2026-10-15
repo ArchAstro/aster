@@ -17,7 +17,7 @@ use crate::plugins::CacheInputs;
 /// Relative path as hashed into a cache key: `Normal` components joined with
 /// `/`, so Windows and Unix produce the same key. A non-UTF-8 component fails
 /// the hash instead of becoming a lossy string.
-fn normalize_rel(rel: &Path) -> Result<String> {
+pub(super) fn normalize_rel(rel: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in rel.components() {
         if let Component::Normal(part) = component {

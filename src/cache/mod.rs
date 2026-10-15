@@ -11,6 +11,7 @@ mod artifact;
 mod hasher;
 mod local;
 pub mod matcher;
+mod outputs;
 mod prune;
 mod runtime;
 mod store;
@@ -19,6 +20,7 @@ pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VE
 pub use hasher::CacheHasher;
 pub use local::{LocalStore, PruneStats};
 pub use matcher::TargetInputMatcher;
+pub use outputs::pack;
 pub use prune::{prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE, DEFAULT_MAX_SIZE};
 pub use runtime::RuntimeInputCache;
 pub use store::CacheStore;
