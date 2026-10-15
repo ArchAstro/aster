@@ -157,14 +157,16 @@ A malformed file stops the run with an error naming the entry.
 
 A target that runs one partition of a Mix suite
 (`MIX_TEST_PARTITION=K mix test --partitions N`) runs an explicit file list
-when `ASTER_SRV_URL` is set: the suite's files split longest-first by their
-median duration on the server, as of the commit's UTC day, so every shard
-gets the same split. With no history, an error or
-`ASTER_BALANCE_PARTITIONS=off`, the shard keeps Mix's own split. A shard's
-tests are recorded under the project whose suite it runs (the directory the
-command `cd`s to), so a test has one id, and one quarantine entry, whichever
-shard ran it. See
-[Durations](../crates/aster-srv/README.md#durations).
+when `aster-durations.json` at the workspace root times its suite: the
+suite's files split longest-first by median duration. The file comes from
+the checkout, so every shard of a commit splits the same way; nothing is
+fetched while the suite runs. `aster results durations` writes it from the
+server; commit it and refresh it on a schedule (see
+[Durations](../crates/aster-srv/README.md#durations)). Without the file, the
+suite in it, or with `ASTER_BALANCE_PARTITIONS=off`, every shard keeps Mix's
+own split. A shard's tests are recorded under the project whose suite it
+runs (the directory the command `cd`s to), so a test has one id, and one
+quarantine entry, whichever shard ran it.
 
 ## 7. Notifications
 
