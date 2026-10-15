@@ -4,7 +4,7 @@
 //! - `/ui`: the flaky leaderboard and broken tests
 //! - `/ui/tests/:test_id`: one test's state and history
 //! - `/ui/clusters`: failures grouped by failure hash
-//! - `/ui/quarantine`: the quarantine list (not built yet)
+//! - `/ui/quarantine`: the quarantine list and its recent changes
 //!
 //! `?repo=owner/name` picks the repository; without it the one with the
 //! newest run is shown. Any repository on the allowlist can be viewed. The
@@ -170,7 +170,7 @@ async fn render(
             Route::Test(_) => ("Test", Section::Other),
         };
         let body = if route == Route::Quarantine {
-            pages::quarantine()
+            pages::quarantine(None, app.config.quarantine, &[], &[])
         } else {
             pages::no_runs()
         };
@@ -195,7 +195,14 @@ async fn render(
                 &pages::clusters(repo_name, &clusters),
             )
         }
-        Route::Quarantine => make("Quarantine", Section::Quarantine, &pages::quarantine()),
+        Route::Quarantine => {
+            let (entries, changes) = data::quarantine(&client, repo_name).await?;
+            make(
+                "Quarantine",
+                Section::Quarantine,
+                &pages::quarantine(Some(repo_name), app.config.quarantine, &entries, &changes),
+            )
+        }
         Route::Test(test_id) => {
             let Some(test) = data::test(&client, repo_name, &test_id).await? else {
                 let body = "<p class=\"empty\">No such test in this repository.</p>";

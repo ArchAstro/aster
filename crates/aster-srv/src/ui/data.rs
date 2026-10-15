@@ -11,6 +11,8 @@ pub const FLAKY_LIMIT: i64 = 200;
 pub const SCORED_LIMIT: i64 = 100;
 pub const BROKEN_LIMIT: i64 = 100;
 pub const CLUSTER_LIMIT: i64 = 50;
+pub const QUARANTINE_LIMIT: i64 = 500;
+pub const QUARANTINE_LOG_LIMIT: i64 = 50;
 /// The most results one test's page reads: the strip shows all of them, the
 /// table the newest [`TABLE_ROWS`].
 pub const HISTORY_LIMIT: i64 = 300;
@@ -221,4 +223,69 @@ pub async fn clusters(client: &Client, repo: &str, since: NaiveDate) -> Result<V
             example_message: row.get("message"),
         })
         .collect())
+}
+
+/// A quarantined test.
+pub struct Quarantined {
+    pub test_id: String,
+    /// `None` when the test's row has aged out.
+    pub name: Option<String>,
+    pub target: Option<String>,
+    pub file: Option<String>,
+    pub since: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub runs: i32,
+}
+
+/// One change to the quarantine list.
+pub struct QuarantineChange {
+    pub test_id: String,
+    pub name: Option<String>,
+    pub action: String,
+    pub at: DateTime<Utc>,
+}
+
+/// The quarantine list, oldest entry first, and its newest changes.
+pub async fn quarantine(
+    client: &Client,
+    repo: &str,
+) -> Result<(Vec<Quarantined>, Vec<QuarantineChange>)> {
+    let entries = client
+        .query(
+            "SELECT q.test_id, q.entered_at, q.expires_at, q.runs, t.name, t.target, t.file \
+             FROM test_results.quarantine q \
+             LEFT JOIN test_results.tests t ON t.repo = q.repo AND t.test_id = q.test_id \
+             WHERE q.repo = $1 ORDER BY q.entered_at, q.test_id LIMIT $2",
+            &[&repo, &QUARANTINE_LIMIT],
+        )
+        .await?
+        .iter()
+        .map(|row| Quarantined {
+            test_id: row.get("test_id"),
+            name: row.get("name"),
+            target: row.get("target"),
+            file: row.get("file"),
+            since: row.get("entered_at"),
+            expires_at: row.get("expires_at"),
+            runs: row.get("runs"),
+        })
+        .collect();
+    let changes = client
+        .query(
+            "SELECT l.test_id, l.action, l.at, t.name \
+             FROM test_results.quarantine_log l \
+             LEFT JOIN test_results.tests t ON t.repo = l.repo AND t.test_id = l.test_id \
+             WHERE l.repo = $1 ORDER BY l.id DESC LIMIT $2",
+            &[&repo, &QUARANTINE_LOG_LIMIT],
+        )
+        .await?
+        .iter()
+        .map(|row| QuarantineChange {
+            test_id: row.get("test_id"),
+            name: row.get("name"),
+            action: row.get("action"),
+            at: row.get("at"),
+        })
+        .collect();
+    Ok((entries, changes))
 }

@@ -4,10 +4,12 @@
 use std::fmt::Write;
 
 use super::data::{
-    Attempt, Cluster, Leaderboard, TestRow, BROKEN_LIMIT, CLUSTER_DAYS, CLUSTER_LIMIT, FLAKY_LIMIT,
-    HISTORY_LIMIT, SCORED_LIMIT, TABLE_ROWS,
+    Attempt, Cluster, Leaderboard, QuarantineChange, Quarantined, TestRow, BROKEN_LIMIT,
+    CLUSTER_DAYS, CLUSTER_LIMIT, FLAKY_LIMIT, HISTORY_LIMIT, QUARANTINE_LIMIT, SCORED_LIMIT,
+    TABLE_ROWS,
 };
 use super::html::{escape, short_sha, test_link, when, when_opt};
+use crate::config::QuarantineRules;
 
 /// Shown on every page when no repository has runs.
 pub fn no_runs() -> String {
@@ -275,12 +277,96 @@ pub fn clusters(repo: &str, clusters: &[Cluster]) -> String {
     out
 }
 
-/// Quarantine is not built yet (task T22 fills `#quarantine`).
-pub fn quarantine() -> String {
-    "<section id=\"quarantine\">\
-     <p class=\"empty\">Quarantine is not enabled yet. When it is, tests that are held out of \
-     the required checks will be listed here.</p></section>"
-        .to_string()
+/// How tests enter and leave quarantine, in one paragraph.
+fn rules_note(rules: QuarantineRules) -> String {
+    let entry = if rules.runs == 0 {
+        "Automatic quarantine is off.".to_string()
+    } else {
+        format!(
+            "A test enters after definite flakes in {} different run{} within 7 days, unless it \
+             is broken.",
+            rules.runs,
+            if rules.runs == 1 { "" } else { "s" }
+        )
+    };
+    format!(
+        "<p class=\"muted\">Quarantined tests still run and upload, but their failures do not \
+         fail the build. {entry} It leaves after {} consecutive passes, when it breaks, or after \
+         {} days. Entries in a repository's <code>aster-quarantine.toml</code> also apply and are \
+         not listed here.</p>",
+        rules.release_passes, rules.days
+    )
+}
+
+/// The quarantine list (`#quarantine`) and its recent changes.
+pub fn quarantine(
+    repo: Option<&str>,
+    rules: QuarantineRules,
+    entries: &[Quarantined],
+    changes: &[QuarantineChange],
+) -> String {
+    let mut out = String::from("<section id=\"quarantine\">");
+    out.push_str(&rules_note(rules));
+    let name_cell = |test_id: &str, name: Option<&str>| match repo {
+        Some(repo) => format!(
+            "<td class=\"id\"><a href=\"{}\">{}</a><br><span class=\"muted\">{}</span></td>",
+            escape(&test_link(test_id, repo)),
+            escape(name.unwrap_or(test_id)),
+            escape(test_id),
+        ),
+        None => format!("<td class=\"id\">{}</td>", escape(test_id)),
+    };
+    if entries.is_empty() {
+        out.push_str("<p class=\"empty\">No tests are quarantined.</p>");
+    } else {
+        out.push_str(
+            "<div class=\"scroll\"><table><thead><tr><th>Test</th><th>Since</th><th>Expires</th>\
+             <th>Runs</th><th>Target / file</th></tr></thead><tbody>",
+        );
+        for entry in entries {
+            let file = entry
+                .file
+                .as_deref()
+                .map(|f| format!("<br>{}", escape(f)))
+                .unwrap_or_default();
+            let _ = write!(
+                out,
+                "<tr>{}<td>{}</td><td>{}</td><td class=\"num\">{}</td>\
+                 <td class=\"id\"><code>{}</code>{}</td></tr>",
+                name_cell(&entry.test_id, entry.name.as_deref()),
+                escape(&when(entry.since)),
+                escape(&when(entry.expires_at)),
+                entry.runs,
+                escape(entry.target.as_deref().unwrap_or("-")),
+                file,
+            );
+        }
+        out.push_str("</tbody></table></div>");
+        out.push_str(&capped(entries.len(), QUARANTINE_LIMIT));
+    }
+    if !changes.is_empty() {
+        out.push_str(
+            "<h2>Recent changes</h2><div class=\"scroll\"><table><thead><tr><th>When</th>\
+             <th>Change</th><th>Test</th></tr></thead><tbody>",
+        );
+        for change in changes {
+            let class = match change.action.as_str() {
+                "quarantined" => "flaky",
+                "broken" => "broken",
+                _ => "healthy",
+            };
+            let _ = write!(
+                out,
+                "<tr><td>{}</td><td><span class=\"tag {class}\">{}</span></td>{}</tr>",
+                escape(&when(change.at)),
+                escape(&change.action),
+                name_cell(&change.test_id, change.name.as_deref()),
+            );
+        }
+        out.push_str("</tbody></table></div>");
+    }
+    out.push_str("</section>");
+    out
 }
 
 #[cfg(test)]
@@ -330,9 +416,45 @@ mod tests {
         assert!(message(None).contains("muted"));
     }
 
+    const RULES: QuarantineRules = QuarantineRules {
+        runs: 2,
+        release_passes: 20,
+        days: 30,
+    };
+
     #[test]
-    fn quarantine_page_has_an_empty_state() {
-        let html = quarantine();
-        assert!(html.contains("not enabled yet") && html.contains("id=\"quarantine\""));
+    fn quarantine_page_has_an_empty_state_and_states_the_rules() {
+        let html = quarantine(Some("o/r"), RULES, &[], &[]);
+        assert!(html.contains("No tests are quarantined") && html.contains("id=\"quarantine\""));
+        assert!(html.contains("2 different runs") && html.contains("20 consecutive passes"));
+        let off = quarantine(None, QuarantineRules { runs: 0, ..RULES }, &[], &[]);
+        assert!(off.contains("Automatic quarantine is off"));
+    }
+
+    #[test]
+    fn quarantine_page_escapes_and_links_tests() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 13, 14, 3, 0).unwrap();
+        let html = quarantine(
+            Some("o/r"),
+            RULES,
+            &[Quarantined {
+                test_id: "<id>".into(),
+                name: Some("n<b>".into()),
+                target: Some("//a:t".into()),
+                file: None,
+                since: at,
+                expires_at: at,
+                runs: 3,
+            }],
+            &[QuarantineChange {
+                test_id: "gone".into(),
+                name: None,
+                action: "released".into(),
+                at,
+            }],
+        );
+        assert!(!html.contains("<b>") && !html.contains("<id>"));
+        assert!(html.contains("/ui/tests/%3Cid%3E?repo=o%2Fr"));
+        assert!(html.contains("Recent changes") && html.contains("released"));
     }
 }

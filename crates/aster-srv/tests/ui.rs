@@ -183,13 +183,44 @@ async fn clusters_group_recent_failures_by_hash() {
 }
 
 #[tokio::test]
-async fn the_quarantine_page_says_it_is_not_enabled() {
+async fn the_quarantine_page_lists_quarantined_tests() {
     let Some(server) = seeded().await else {
         return;
     };
-    let (status, body) = page(&server, "/ui/quarantine?repo=ArchAstro%2Ffirstlanding").await;
+    let path = "/ui/quarantine?repo=ArchAstro%2Ffirstlanding";
+    let (status, body) = page(&server, path).await;
     assert_eq!(status, 200);
-    assert!(body.contains("Quarantine is not enabled yet"));
+    assert!(body.contains("No tests are quarantined"));
+
+    let flaky: String = server
+        .client()
+        .await
+        .query_one(
+            "SELECT test_id FROM test_results.tests WHERE state = 'flaky' LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    server
+        .client()
+        .await
+        .batch_execute(&format!(
+            "INSERT INTO test_results.quarantine (repo, test_id, entered_at, expires_at, runs) \
+             VALUES ('{REPO}', '{flaky}', now(), now() + interval '30 days', 2); \
+             INSERT INTO test_results.quarantine_log (repo, test_id, action, at, detail) \
+             VALUES ('{REPO}', '{flaky}', 'quarantined', now(), '{{}}')"
+        ))
+        .await
+        .unwrap();
+    let (status, body) = page(&server, path).await;
+    assert_eq!(status, 200);
+    assert!(!body.contains("No tests are quarantined"));
+    assert!(
+        body.contains("/ui/tests/flaky%20%3Ctest%3E?repo="),
+        "{body}"
+    );
+    assert!(body.contains("Recent changes"));
     server.stop().await;
 }
 
