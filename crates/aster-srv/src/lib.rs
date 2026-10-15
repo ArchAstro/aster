@@ -38,6 +38,8 @@ pub struct App {
     pub verifier: auth::Verifier,
     pub iap: iap::IapVerifier,
     pub raw_store: raw_store::RawStore,
+    /// Test durations already answered (they cannot change).
+    pub durations: test_results::durations::Answers,
 }
 
 /// Every feature's migrations, in order.
@@ -79,6 +81,7 @@ impl App {
             verifier,
             iap,
             raw_store,
+            durations: Default::default(),
         }))
     }
 }

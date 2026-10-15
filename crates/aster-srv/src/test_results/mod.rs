@@ -10,6 +10,7 @@
 //! classifier's evidence.
 
 pub mod classifier;
+pub mod durations;
 pub mod ingest;
 pub mod query;
 pub mod retention;

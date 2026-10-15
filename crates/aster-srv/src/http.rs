@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{AuthError, Identity};
 use crate::test_results::ingest::{self, Upload};
-use crate::test_results::query;
+use crate::test_results::{durations, query};
 use crate::App;
 
 /// A response before it is sent.
@@ -135,6 +135,13 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             ingest::handle(app, &identity, Upload { body, gzip }).await
         }
+        (&Method::GET, "/v1/test-results/durations") => {
+            let identity = match authenticate(app, &request).await {
+                Ok(identity) => identity,
+                Err(reply) => return reply,
+            };
+            durations::handle(app, &identity, request.uri().query()).await
+        }
         (&Method::GET, path) if query::parse_route(path).is_some() => {
             let identity = match authenticate(app, &request).await {
                 Ok(identity) => identity,
@@ -151,7 +158,7 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
                 .map(str::to_string);
             crate::ui::handle(app, method, path, request.uri().query(), assertion).await
         }
-        (_, "/healthz" | "/readyz" | "/v1/test-results/runs") => {
+        (_, "/healthz" | "/readyz" | "/v1/test-results/runs" | "/v1/test-results/durations") => {
             Reply::error(405, "method not allowed")
         }
         (_, path) if query::parse_route(path).is_some() => Reply::error(405, "method not allowed"),
