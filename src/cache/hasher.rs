@@ -662,6 +662,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inputs = CacheInputs::default();
         let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
 
         let runtime = RuntimeInputCache::new(tmp.path());
         let linux = CacheHasher::with_platform(tmp.path(), "platform:linux-x86_64")
