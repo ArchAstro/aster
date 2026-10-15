@@ -390,6 +390,23 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_configuration_works() {
+        let readme = include_str!("../README.md");
+        let example = readme
+            .split("```json\n")
+            .skip(1)
+            .filter_map(|block| block.split("```").next())
+            .find(|block| block.contains("\"secret\""))
+            .expect("the README shows ASTER_SRV_WEBHOOKS");
+        let endpoints = Endpoint::parse_all(example).unwrap();
+        assert!(endpoints[0].wants("test.quarantined"));
+        // Every event the README's table names is one the server sends.
+        for event in EVENTS {
+            assert!(readme.contains(&format!("| `{event}` |")), "{event}");
+        }
+    }
+
+    #[test]
     fn plain_http_is_only_for_this_machine() {
         assert!(allowed_url("http://localhost:9000/hook"));
         assert!(allowed_url("http://127.0.0.1/hook"));

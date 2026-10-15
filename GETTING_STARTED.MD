@@ -299,7 +299,10 @@ For a real repository:
    dependency edges, caching inputs or outputs, aliases, or file capabilities.
 4. Start with a narrow command such as `aster test //path/to/project`, then
    expand to `--all` or `aster affected` after the graph looks correct.
-5. Add the verified command to CI.
+5. Add the verified command to CI. With `--retry-failed --test-results`,
+   Aster retries only failing tests and records every result; see
+   [Test tracking](docs/test-tracking.md) to send them to aster-srv for flake
+   detection and quarantine.
 
 From there, see the main [README](README.md) for supported languages, richer
 project configuration, affected-path exclusions, watch settings, and the

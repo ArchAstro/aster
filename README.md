@@ -355,6 +355,28 @@ first failure (`pytest -x`, `--bail`, `mix test --max-failures`, `go test
 -failfast`), when a target runs several commands, or when the runner cannot
 select single tests.
 
+### Quarantining flaky tests
+
+With test results captured (`--test-results` or `--retry-failed`), a failed
+target reports `passed (quarantined: N)` when, after retries, its only
+failures are quarantined tests, its results are complete and it exited with
+its runner's "tests failed" code. Its dependents run, and each such failure
+gets a `::warning` annotation. The list comes from aster-srv (tests proven
+flaky in 2 runs within 7 days) and from `aster-quarantine.toml` at the
+workspace root, whose entries need a reason and an expiry date:
+
+```toml
+[[test]]
+name = "test creates an agent"
+file = "test/platform/agents_test.exs"
+reason = "DBConnection.OwnershipError under load; tracked in #4812"
+expires = 2026-11-30
+```
+
+`ASTER_QUARANTINE=off` turns it off. [Test tracking](docs/test-tracking.md)
+covers capture per runner, uploading to aster-srv, the labels in the step
+summary, and the quarantine rules in full.
+
 ## Affected projects
 
 ```console

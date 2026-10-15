@@ -843,6 +843,53 @@ expires = 2026-10-14
         assert!(matches!(cached, Some((_, ServerSource::Cached(_)))));
     }
 
+    /// The ```toml blocks of a Markdown file that hold `[[test]]` entries.
+    fn toml_examples(markdown: &str) -> Vec<String> {
+        markdown
+            .split("```toml\n")
+            .skip(1)
+            .filter_map(|block| block.split("```").next())
+            .filter(|block| block.contains("[[test]]"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_documented_quarantine_files_work() {
+        let docs = [
+            include_str!("../../docs/test-tracking.md"),
+            include_str!("../../README.md"),
+        ];
+        let examples: Vec<String> = docs.iter().flat_map(|d| toml_examples(d)).collect();
+        assert_eq!(examples.len(), 2, "both documents show an example");
+        let agents = TestCase {
+            file: Some("test/platform/agents_test.exs".into()),
+            suite: Some("Platform.AgentsTest".into()),
+            name: "test creates an agent".into(),
+            outcome: TestOutcome::Fail,
+            attempt: 1,
+            duration_ms: None,
+            message: None,
+        };
+        for example in examples {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(REPO_FILE), &example).unwrap();
+            let (entries, warnings) = read_repo_file(dir.path(), today()).unwrap();
+            assert!(warnings.is_empty(), "{example}");
+            let q = Quarantine::new(None, entries);
+            assert!(
+                q.source_of("//services/platform:test-ci", None, &agents)
+                    .is_some(),
+                "{example}"
+            );
+            if example.contains("target =") {
+                assert!(q
+                    .source_of("//services/other:test-ci", None, &agents)
+                    .is_none());
+            }
+        }
+    }
+
     #[test]
     fn off_switch_and_no_lists_load_nothing() {
         let dir = tempfile::tempdir().unwrap();
