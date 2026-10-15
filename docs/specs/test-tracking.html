@@ -161,7 +161,7 @@
     <ul>
       <li>firstlanding RCA (2026-09-27..30): 271 failed CI jobs, <b>38% flaky</b>. They cluster in Intern Browser, Services Platform (<code>DBConnection.OwnershipError</code>) and Other Elixir canonical-e2e.</li>
       <li><code>scripts/ci/retry_failed_targets.py</code> retries whole <b>targets</b>, so one flaky ExUnit test reruns all of <code>mix test</code> and the DB reset. It keeps no memory between runs.</li>
-      <li><code>scripts/ci/merge_queue_failure_report.py</code> scrapes failing tests out of job logs. Aster already knows each runner's argv and can capture the results directly.</li>
+      <li>CI failure reports scrape failing tests out of job logs. Aster already knows each runner's argv and can capture the results directly.</li>
       <li>Aster has a <b>content hash</b> of every target's inputs. If two runs have the same hash and different outcomes, the test is proven flaky. Generic tools have to guess this from commit history.</li>
     </ul>
   </section>
@@ -351,7 +351,7 @@
   const PHASES = [
     { id: "P1", name: "Capture + ingest", note: "Per-test records uploaded from every firstlanding test-ci job." },
     { id: "P2", name: "Retry + classify", note: "Per-test retry replaces retry_failed_targets.py, and flakes are scored." },
-    { id: "P3", name: "Reporting", note: "PRs and the merge queue say which failures are known flakes and which are new." },
+    { id: "P3", name: "Reporting", note: "PR runs say which failures are known flakes and which are new, and a dashboard shows the history." },
     { id: "P4", name: "Quarantine + sharding", note: "Known flakes stop failing builds, and lanes are balanced by duration." }
   ];
   const T = [
@@ -430,13 +430,13 @@
       files: ["firstlanding: scripts/ci/retry_failed_targets.py", "firstlanding: .github/workflows/ci.yml"], deps: ["T15", "T14"] },
 
     { id: "T19", p: "P3", area: "client", title: "GitHub step summary + annotations", sub: "aster results summary --github",
-      obj: "In-run report: failures grouped by known flake, new and broken, using /v1/tests when the service is reachable.",
-      acc: ["Works without the service (no known/new labels then)", "One annotation per failing test, with file:line"],
-      files: ["src/cli/results.rs"], deps: ["T17"] },
-    { id: "T20", p: "P3", area: "ci", title: "Merge-queue report from results", sub: "Cross-repo",
-      obj: "merge_queue_failure_report.py reads /v1/test-results/runs/:id/failures instead of scraping job logs.",
-      acc: ["Same PR comment content, with flake labels added", "Falls back to log scraping if the run is missing"],
-      files: ["firstlanding: scripts/ci/merge_queue_failure_report.py"], deps: ["T17"] },
+      obj: "In-run report: failures grouped by known flake, new and broken, using /v1/tests when the service is reachable. Runs automatically in GitHub Actions after results are written (ASTER_GITHUB_SUMMARY=0 turns it off). Also: aster results failures --github-run and GET /v1/test-results/failures?github_run= list a whole workflow run's failures, with each run's runner name to match GitHub's jobs.",
+      acc: ["Works without the service (no known/new labels then)", "One annotation per failing test, with file:line", "Each row links to the test's dashboard page"],
+      files: ["src/test_results/summary.rs", "src/test_results/client.rs", "crates/aster-srv/src/test_results/query.rs"], deps: ["T17"] },
+    { id: "T20", p: "P3", area: "ci", title: "Merge-queue report from results (dropped)", sub: "firstlanding does not use a merge queue",
+      obj: "Dropped 2026-10-15: firstlanding does not use a merge queue, so merge_queue_failure_report.py never runs. PR runs get their labelled failures from T19's step summary and annotations. The lookup by GitHub run built for this stays in aster-srv for any later report.",
+      acc: ["Nothing to build"],
+      files: [], deps: ["T17"] },
     { id: "T21", p: "P3", area: "service", title: "Dashboard", sub: "Server-rendered HTML behind IAP",
       obj: "Flaky leaderboard, test history (pass/fail strip by sha), quarantine list, failure clusters.",
       acc: ["Each page loads in under 1s on 30 days of data", "Links from annotations open the test's page"],
