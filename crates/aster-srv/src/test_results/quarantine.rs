@@ -80,6 +80,8 @@ pub(super) async fn update(
     rules: QuarantineRules,
 ) -> Result<(Changes, Vec<Notification>)> {
     let to = window.to_literal();
+    // Days here are 24 hours. `interval 'N days'` is calendar arithmetic in
+    // the session's time zone and gains or loses an hour across a DST change.
     let mut ids: Vec<i64> = Vec::new();
     let mut log = |rows: Vec<tokio_postgres::Row>| {
         ids.extend(rows.iter().map(|row| row.get::<_, i64>(0)));
@@ -175,7 +177,7 @@ pub(super) async fn update(
                          FROM test_results.test_flake_events e \
                          LEFT JOIN left_at l ON l.repo = e.repo AND l.test_id = e.test_id \
                          WHERE e.kind = 'definite' AND e.observed_on >= '{from_day}'::date \
-                           AND e.observed_at > {to} - interval '{ENTRY_DAYS} days' \
+                           AND e.observed_at > {to} - {ENTRY_DAYS} * interval '24 hours' \
                            AND e.observed_at <= {to} \
                            AND (l.at IS NULL OR e.observed_at > l.at) \
                          GROUP BY e.repo, e.test_id \
@@ -183,7 +185,7 @@ pub(super) async fn update(
                      entered AS ( \
                          INSERT INTO test_results.quarantine \
                              (repo, test_id, entered_at, expires_at, runs) \
-                         SELECT p.repo, p.test_id, {to}, {to} + interval '{days} days', p.runs \
+                         SELECT p.repo, p.test_id, {to}, {to} + {days} * interval '24 hours', p.runs \
                          FROM proven p \
                          JOIN test_results.tests t \
                               ON t.repo = p.repo AND t.test_id = p.test_id \
