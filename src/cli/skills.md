@@ -342,8 +342,16 @@ aster cache status
 aster cache status //services/api:test
 aster cache clear //services/api:test
 aster cache clear
+aster cache prune --max-size 10GB --max-age 14d
 aster test //services/api --no-cache
 ```
+
+`aster cache prune` drops action-cache manifests by age and then by least
+recent access (file mtime), and deletes blobs no surviving manifest still
+references. Sizes accept bytes or `KB`/`MB`/`GB` (powers of 1024); ages accept
+`s`/`m`/`h`/`d`. `0` disables that limit. The same limits live in the root
+`aster.toml` as `[cache] max_size` and `max_age` (defaults `10GB` and `14d`).
+A run prunes automatically when the local blob store is over that cap.
 
 The cache memoizes successful execution. It does not restore deleted artifacts.
 Declared outputs must still exist for a cached result to be reusable.

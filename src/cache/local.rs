@@ -6,17 +6,23 @@
 //! and rename into place.
 
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use sha2::{Digest as Sha256Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::artifact::{Digest, Manifest};
 use super::hasher::encode_hex;
 
 const SHARD_LEN: usize = 2;
+
+/// How many times `put_blob` restarts when a concurrent prune unlinks the
+/// destination between the exists check and the rename.
+const PUT_BLOB_ATTEMPTS: u32 = 2;
 
 /// Local CAS and action-cache tier under a resolved cache directory.
 pub struct LocalStore {
@@ -33,8 +39,28 @@ impl LocalStore {
     /// Compress `reader` and store it under `digest`.
     ///
     /// The digest must be the sha256 of the uncompressed bytes. An existing
-    /// blob with the same digest is left in place.
-    pub fn put_blob(&self, digest: &Digest, reader: impl Read) -> Result<()> {
+    /// blob with the same digest is left in place. A missing destination
+    /// after a failed rename is retried: a concurrent prune may have unlinked
+    /// the blob between the exists check and the rename.
+    pub fn put_blob(&self, digest: &Digest, mut reader: impl Read) -> Result<()> {
+        let mut buffered = Vec::new();
+        reader
+            .read_to_end(&mut buffered)
+            .context("Failed to read blob")?;
+        let mut last_error = None;
+        for _ in 0..PUT_BLOB_ATTEMPTS {
+            match self.put_blob_once(digest, &buffered) {
+                Ok(()) => return Ok(()),
+                Err(error) if missing_after_race(&error, digest, self) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("blob put failed")))
+    }
+
+    fn put_blob_once(&self, digest: &Digest, bytes: &[u8]) -> Result<()> {
         let path = self.blob_path(digest)?;
         if path.is_file() {
             return Ok(());
@@ -51,7 +77,7 @@ impl LocalStore {
                 .write(true)
                 .open(&tmp)
                 .with_context(|| format!("Failed to open {}", tmp.display()))?;
-            let (written, encoder) = hash_and_compress(reader, file)?;
+            let (written, encoder) = hash_and_compress(bytes, file)?;
             encoder.finish().context("Failed to finish zstd encoder")?;
             if written.as_str() != digest.as_str() {
                 bail!(
@@ -127,6 +153,217 @@ impl LocalStore {
         write_atomic(&path, &bytes)
     }
 
+    /// Drop old and least-recently-used manifests, then delete blobs no
+    /// surviving manifest references.
+    ///
+    /// Manifest mtime is the access time (`get_manifest` touches it). Age is
+    /// applied first. Size is the sum of on-disk `cas/**/*.zst` lengths;
+    /// oldest manifests are removed until that sum is at or under `max_size`.
+    /// `None` disables that limit. An exclusive `cache.lock` is held for the
+    /// whole scan, manifest delete, and blob sweep so a blob is unlinked only
+    /// after every surviving manifest has been decoded.
+    pub fn prune(&self, max_size: Option<u64>, max_age: Option<Duration>) -> Result<PruneStats> {
+        let _lock = self.acquire_exclusive_lock()?;
+        self.prune_locked(max_size, max_age)
+    }
+
+    fn prune_locked(&self, max_size: Option<u64>, max_age: Option<Duration>) -> Result<PruneStats> {
+        let now = SystemTime::now();
+        let mut manifests = self.scan_manifests()?;
+        manifests.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        let mut referenced = HashSet::new();
+        let mut survivors: Vec<&ManifestFile> = Vec::new();
+        for entry in &mut manifests {
+            let bytes = match fs::read(&entry.path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read {}", entry.path.display()))
+                }
+            };
+            // An undecodable manifest is not a survivor: it cannot protect
+            // blobs, and leaving it would keep a miss that still occupies a key.
+            let Some(manifest) = Manifest::decode(&bytes) else {
+                continue;
+            };
+            entry.refs = manifest.blob_refs();
+            let mut keep = true;
+            if let Some(max_age) = max_age {
+                if age_of(entry.modified, now) > max_age {
+                    keep = false;
+                }
+            }
+            if keep {
+                referenced.extend(entry.refs.iter().cloned());
+                survivors.push(entry);
+            }
+        }
+
+        if let Some(max_size) = max_size {
+            // Survivors are oldest-first. Drop from the front until the
+            // on-disk bytes that would remain after the sweep fit. Orphans
+            // are not in that total: the sweep deletes them. A blob shared
+            // with a newer manifest stays referenced, so it is never deleted.
+            let blob_sizes = self.blob_sizes()?;
+            let mut index = 0;
+            while index < survivors.len() && remaining_bytes(&blob_sizes, &referenced) > max_size {
+                index += 1;
+                referenced.clear();
+                for entry in &survivors[index..] {
+                    referenced.extend(entry.refs.iter().cloned());
+                }
+            }
+            survivors = survivors[index..].to_vec();
+        }
+
+        let survivor_paths: HashSet<PathBuf> =
+            survivors.iter().map(|entry| entry.path.clone()).collect();
+        drop(survivors);
+        let mut manifests_removed = 0u64;
+        for entry in &manifests {
+            if survivor_paths.contains(&entry.path) {
+                continue;
+            }
+            match fs::remove_file(&entry.path) {
+                Ok(()) => manifests_removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to remove manifest {}", entry.path.display())
+                    })
+                }
+            }
+        }
+
+        let blobs_removed = self.sweep_unreferenced_blobs(&referenced)?;
+        Ok(PruneStats {
+            manifests_removed,
+            blobs_removed,
+            bytes_remaining: self.cas_bytes()?,
+        })
+    }
+
+    /// On-disk size of every `cas/**/*.zst` blob.
+    pub fn cas_bytes(&self) -> Result<u64> {
+        Ok(self.blob_sizes()?.into_values().sum())
+    }
+
+    fn blob_sizes(&self) -> Result<HashMap<Digest, u64>> {
+        let mut sizes = HashMap::new();
+        for path in self.blob_files()? {
+            let Some(digest) = digest_from_blob_path(&path) else {
+                continue;
+            };
+            let len = fs::metadata(&path)
+                .with_context(|| format!("Failed to stat {}", path.display()))?
+                .len();
+            sizes.insert(digest, len);
+        }
+        Ok(sizes)
+    }
+
+    fn sweep_unreferenced_blobs(&self, referenced: &HashSet<Digest>) -> Result<u64> {
+        let mut removed = 0u64;
+        for path in self.blob_files()? {
+            let Some(digest) = digest_from_blob_path(&path) else {
+                continue;
+            };
+            if referenced.contains(&digest) {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to remove blob {}", path.display()))
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    fn scan_manifests(&self) -> Result<Vec<ManifestFile>> {
+        let root = self.cache_dir.join("ac");
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for shard in read_dir_files(&root)? {
+            if !shard.path.is_dir() {
+                continue;
+            }
+            for entry in read_dir_files(&shard.path)? {
+                if !entry.path.is_file() {
+                    continue;
+                }
+                let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with(".json") || name.contains(".tmp.") {
+                    continue;
+                }
+                let modified = entry
+                    .modified
+                    .with_context(|| format!("Failed to read mtime of {}", entry.path.display()))?;
+                found.push(ManifestFile {
+                    path: entry.path,
+                    modified,
+                    refs: Vec::new(),
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    fn blob_files(&self) -> Result<Vec<PathBuf>> {
+        let root = self.cache_dir.join("cas");
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut found = Vec::new();
+        for shard in read_dir_files(&root)? {
+            if !shard.path.is_dir() {
+                continue;
+            }
+            for entry in read_dir_files(&shard.path)? {
+                if !entry.path.is_file() {
+                    continue;
+                }
+                let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.ends_with(".zst") && !name.contains(".tmp.") {
+                    found.push(entry.path);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn acquire_exclusive_lock(&self) -> Result<File> {
+        let lock_path = self.cache_dir.join("cache.lock");
+        fs::create_dir_all(&self.cache_dir)
+            .with_context(|| format!("Failed to create {}", self.cache_dir.display()))?;
+        // truncate(false): the lock lives on this inode. Replacing it would
+        // leave holders of the old inode unlocked against new openers.
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
+        FileExt::lock_exclusive(&lock_file).with_context(|| "Failed to acquire cache lock")?;
+        Ok(lock_file)
+    }
+
     /// Load the manifest for `key`.
     ///
     /// `None` is a cache miss: the file is absent, or [`Manifest::decode`]
@@ -149,7 +386,7 @@ impl LocalStore {
         }
     }
 
-    fn blob_path(&self, digest: &Digest) -> Result<PathBuf> {
+    pub(crate) fn blob_path(&self, digest: &Digest) -> Result<PathBuf> {
         let hex = digest.as_str();
         let shard = shard(hex).context("blob digest is not a hex sha256")?;
         Ok(self
@@ -159,7 +396,7 @@ impl LocalStore {
             .join(format!("{hex}.zst")))
     }
 
-    fn manifest_path(&self, key: &str) -> Result<PathBuf> {
+    pub(crate) fn manifest_path(&self, key: &str) -> Result<PathBuf> {
         let shard = shard(key).context("manifest key is not a hex cache hash")?;
         Ok(self
             .cache_dir
@@ -167,6 +404,70 @@ impl LocalStore {
             .join(shard)
             .join(format!("{key}.json")))
     }
+}
+
+/// Counts from one prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PruneStats {
+    /// Manifest files removed, including undecodable ones.
+    pub manifests_removed: u64,
+    /// Blob files removed because no surviving manifest referenced them.
+    pub blobs_removed: u64,
+    /// On-disk size of remaining `cas/**/*.zst` files.
+    pub bytes_remaining: u64,
+}
+
+struct ManifestFile {
+    path: PathBuf,
+    modified: SystemTime,
+    /// Blobs named by a decoded manifest. Empty when the file did not decode.
+    refs: Vec<Digest>,
+}
+
+struct DirEntry {
+    path: PathBuf,
+    modified: io::Result<SystemTime>,
+}
+
+fn read_dir_files(dir: &Path) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    let read = fs::read_dir(dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+    for entry in read {
+        let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+        entries.push(DirEntry {
+            modified: entry.metadata().and_then(|meta| meta.modified()),
+            path: entry.path(),
+        });
+    }
+    Ok(entries)
+}
+
+fn age_of(modified: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(modified).unwrap_or(Duration::ZERO)
+}
+
+/// Bytes that remain after the sweep: every on-disk blob a survivor names.
+/// Orphans are not included; the sweep deletes them.
+fn remaining_bytes(blob_sizes: &HashMap<Digest, u64>, referenced: &HashSet<Digest>) -> u64 {
+    referenced
+        .iter()
+        .filter_map(|digest| blob_sizes.get(digest))
+        .sum()
+}
+
+fn digest_from_blob_path(path: &Path) -> Option<Digest> {
+    let name = path.file_name()?.to_str()?;
+    let hex = name.strip_suffix(".zst")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Digest::from_hex(hex.to_ascii_lowercase()))
+}
+
+/// True when a put lost the race to a prune that unlinked the destination.
+fn missing_after_race(error: &anyhow::Error, digest: &Digest, store: &LocalStore) -> bool {
+    let message = format!("{error:#}");
+    message.contains("Failed to rename") && !store.has_blob(digest)
 }
 
 /// First two hex characters, after rejecting anything that is not a safe key.
@@ -523,5 +824,165 @@ mod tests {
     fn filetime_set(path: &Path, time: SystemTime) {
         let file = OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    #[test]
+    fn prune_keeps_newest_manifests_and_referenced_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let old_blob = Digest::of_bytes(b"old-artifact-bytes");
+        let new_blob = Digest::of_bytes(b"new-artifact-bytes");
+        let shared = Digest::of_bytes(b"shared-by-both");
+        store
+            .put_blob(&old_blob, &b"old-artifact-bytes"[..])
+            .unwrap();
+        store
+            .put_blob(&new_blob, &b"new-artifact-bytes"[..])
+            .unwrap();
+        store.put_blob(&shared, &b"shared-by-both"[..]).unwrap();
+
+        let old_key = "aa0123456789abcdef";
+        let new_key = "bb0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(
+                old_key,
+                &[old_blob.clone(), shared.clone()],
+            ))
+            .unwrap();
+        store
+            .put_manifest(&sample_manifest(
+                new_key,
+                &[new_blob.clone(), shared.clone()],
+            ))
+            .unwrap();
+
+        let old_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let new_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
+        filetime_set(&store.manifest_path(old_key).unwrap(), old_time);
+        filetime_set(&store.manifest_path(new_key).unwrap(), new_time);
+
+        let before = store.cas_bytes().unwrap();
+        let new_only = fs::metadata(store.blob_path(&new_blob).unwrap())
+            .unwrap()
+            .len()
+            + fs::metadata(store.blob_path(&shared).unwrap())
+                .unwrap()
+                .len();
+        assert!(before > new_only, "fixture must exceed the survivor size");
+
+        let stats = store.prune(Some(new_only), None).unwrap();
+        assert_eq!(stats.manifests_removed, 1);
+        assert!(store.get_manifest(old_key).unwrap().is_none());
+        assert_eq!(
+            store
+                .get_manifest(new_key)
+                .unwrap()
+                .expect("newest survives")
+                .key,
+            new_key
+        );
+        assert!(
+            !store.has_blob(&old_blob),
+            "unreferenced blob must be deleted"
+        );
+        assert!(store.has_blob(&new_blob));
+        assert!(
+            store.has_blob(&shared),
+            "blob referenced by a surviving manifest must remain"
+        );
+        assert!(stats.bytes_remaining <= new_only);
+        assert_eq!(stats.blobs_removed, 1);
+    }
+
+    #[test]
+    fn prune_sweeps_orphans_without_dropping_fitting_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let orphan_bytes: Vec<u8> = (0..4096).map(|index| (index * 17) as u8).collect();
+        let orphan = Digest::of_bytes(&orphan_bytes);
+        let old_blob = Digest::of_bytes(b"old-still-referenced");
+        let new_blob = Digest::of_bytes(b"new-still-referenced");
+        store.put_blob(&orphan, orphan_bytes.as_slice()).unwrap();
+        store
+            .put_blob(&old_blob, &b"old-still-referenced"[..])
+            .unwrap();
+        store
+            .put_blob(&new_blob, &b"new-still-referenced"[..])
+            .unwrap();
+
+        let old_key = "cc0123456789abcdef";
+        let new_key = "dd0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(old_key, std::slice::from_ref(&old_blob)))
+            .unwrap();
+        store
+            .put_manifest(&sample_manifest(new_key, std::slice::from_ref(&new_blob)))
+            .unwrap();
+        filetime_set(
+            &store.manifest_path(old_key).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+        filetime_set(
+            &store.manifest_path(new_key).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000),
+        );
+
+        // The orphan is unreferenced, so a sweep alone would bring the store
+        // under this cap. Prune must not also drop a manifest.
+        let orphan_len = fs::metadata(store.blob_path(&orphan).unwrap())
+            .unwrap()
+            .len();
+        let referenced = store.cas_bytes().unwrap() - orphan_len;
+        assert!(orphan_len > referenced);
+        let stats = store.prune(Some(referenced), None).unwrap();
+        assert_eq!(stats.manifests_removed, 0);
+        assert!(store.get_manifest(old_key).unwrap().is_some());
+        assert!(store.get_manifest(new_key).unwrap().is_some());
+        assert!(!store.has_blob(&orphan));
+        assert!(store.has_blob(&old_blob));
+        assert!(store.has_blob(&new_blob));
+        assert!(stats.bytes_remaining <= referenced);
+    }
+
+    #[test]
+    fn prune_drops_oldest_when_survivors_still_exceed_cap_after_orphan_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let orphan_bytes: Vec<u8> = (0..2048).map(|index| (index * 17) as u8).collect();
+        let old_bytes: Vec<u8> = (0..2048).map(|index| (index * 31) as u8).collect();
+        let orphan = Digest::of_bytes(&orphan_bytes);
+        let old_blob = Digest::of_bytes(&old_bytes);
+        let new_blob = Digest::of_bytes(b"tiny-survivor");
+        store.put_blob(&orphan, orphan_bytes.as_slice()).unwrap();
+        store.put_blob(&old_blob, old_bytes.as_slice()).unwrap();
+        store.put_blob(&new_blob, &b"tiny-survivor"[..]).unwrap();
+
+        let old_key = "ee0123456789abcdef";
+        let new_key = "ff0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(old_key, std::slice::from_ref(&old_blob)))
+            .unwrap();
+        store
+            .put_manifest(&sample_manifest(new_key, std::slice::from_ref(&new_blob)))
+            .unwrap();
+        filetime_set(
+            &store.manifest_path(old_key).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+        filetime_set(
+            &store.manifest_path(new_key).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000),
+        );
+
+        let survivor = fs::metadata(store.blob_path(&new_blob).unwrap())
+            .unwrap()
+            .len();
+        let stats = store.prune(Some(survivor), None).unwrap();
+        assert!(store.get_manifest(old_key).unwrap().is_none());
+        assert!(store.get_manifest(new_key).unwrap().is_some());
+        assert!(!store.has_blob(&orphan));
+        assert!(!store.has_blob(&old_blob));
+        assert!(store.has_blob(&new_blob));
+        assert!(stats.bytes_remaining <= survivor);
     }
 }

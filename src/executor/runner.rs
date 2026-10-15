@@ -21,7 +21,10 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::Utc;
 use console::style;
 
-use crate::cache::{resolve_cache_dir, CacheEntry, CacheHasher, CacheStore, RuntimeInputCache};
+use crate::cache::{
+    prune_if_over_cap, resolve_cache_dir, CacheEntry, CacheHasher, CacheStore, PruneLimits,
+    RuntimeInputCache,
+};
 use crate::cli::OutputMode;
 use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
@@ -39,6 +42,44 @@ use super::command::parse_command;
 use super::shutdown_requested;
 #[cfg(any(unix, windows))]
 use super::{register_supervised_child, unregister_supervised_child};
+
+/// Evict old entries when the local artifact store is over its cap.
+///
+/// Called at the end of a cached run. A lock or IO failure is a warning:
+/// eviction must not fail the build. Limits come from `[cache]` in the root
+/// aster.toml, defaulting to 10 GB and 14 days. Size eviction runs only when
+/// the store is already over the cap; that pass also applies the age limit.
+fn auto_prune_cache(workspace_root: &Path, output_mode: OutputMode) {
+    let loaded = match crate::config::WorkspaceConfig::load(workspace_root) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("[aster] Warning: cache prune skipped, workspace config: {error:#}");
+            return;
+        }
+    };
+    let limits = match PruneLimits::from_config(
+        loaded.cache.max_size.as_deref(),
+        loaded.cache.max_age.as_deref(),
+    ) {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("[aster] Warning: cache prune skipped, invalid [cache]: {error:#}");
+            return;
+        }
+    };
+    match prune_if_over_cap(workspace_root, limits) {
+        Ok(Some(stats)) if output_mode != OutputMode::Quiet => {
+            eprintln!(
+                "[aster] Pruned {} manifests and {} blobs ({} bytes remaining)",
+                stats.manifests_removed, stats.blobs_removed, stats.bytes_remaining
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[aster] Warning: cache prune failed: {error:#}");
+        }
+    }
+}
 
 /// Replacement for a target's command, used by `aster affected
 /// --only-affected-files` and `--warnings-as-errors`.
@@ -527,6 +568,10 @@ impl<'a> Executor<'a> {
 
         if show_output {
             self.print_failure_details(&all_results, &progress);
+        }
+
+        if self.use_cache {
+            auto_prune_cache(self.workspace_root, self.output_mode);
         }
 
         all_results
@@ -2550,6 +2595,79 @@ mod tests {
             result.is_none(),
             "a dependency omitted from the cache key must disable caching"
         );
+    }
+
+    #[test]
+    fn auto_prune_after_run_drops_old_manifests_over_cap() {
+        use crate::cache::{
+            Digest, LocalStore, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(crate::cache::resolve_cache_dir(tmp.path()));
+        let old_bytes: Vec<u8> = (0..8 * 1024).map(|index| (index * 17) as u8).collect();
+        let old = Digest::of_bytes(&old_bytes);
+        let new = Digest::of_bytes(b"new-auto-prune-blob");
+        store.put_blob(&old, old_bytes.as_slice()).unwrap();
+        store.put_blob(&new, &b"new-auto-prune-blob"[..]).unwrap();
+        let old_on_disk = std::fs::metadata(store.blob_path(&old).unwrap())
+            .unwrap()
+            .len();
+        let new_on_disk = std::fs::metadata(store.blob_path(&new).unwrap())
+            .unwrap()
+            .len();
+        assert!(
+            old_on_disk > new_on_disk,
+            "old blob must be larger on disk than the survivor"
+        );
+        std::fs::write(
+            tmp.path().join("aster.toml"),
+            format!("[cache]\nmax_size = \"{new_on_disk}\"\nmax_age = \"0\"\n"),
+        )
+        .unwrap();
+
+        let old_key = "aa3333333333333333";
+        let new_key = "bb4444444444444444";
+        let manifest = |key: &str, digest: &Digest| Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            key: key.into(),
+            target: "//a:build".into(),
+            exit_code: 0,
+            duration_ms: 1,
+            created_at: "2026-10-13T00:00:00Z".into(),
+            outputs: vec![OutputEntry {
+                path: "dist/out.bin".into(),
+                kind: OutputKind::File,
+                digest: Some(digest.clone()),
+                mode: 0o644,
+                target: None,
+            }],
+            log: None,
+            aster_version: "0.17.2".into(),
+        };
+        store.put_manifest(&manifest(old_key, &old)).unwrap();
+        store.put_manifest(&manifest(new_key, &new)).unwrap();
+        set_manifest_mtime(
+            &store.manifest_path(old_key).unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        );
+        set_manifest_mtime(
+            &store.manifest_path(new_key).unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+        );
+        assert!(store.has_blob(&old));
+
+        auto_prune_cache(tmp.path(), crate::cli::output::OutputMode::Quiet);
+
+        assert!(store.get_manifest(old_key).unwrap().is_none());
+        assert!(store.get_manifest(new_key).unwrap().is_some());
+        assert!(!store.has_blob(&old));
+        assert!(store.has_blob(&new));
+    }
+
+    fn set_manifest_mtime(path: &Path, time: SystemTime) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(time).unwrap();
     }
 
     #[test]

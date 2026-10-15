@@ -534,6 +534,25 @@ pub enum CacheCommands {
         /// Specific target to show (e.g., //services/api:test)
         target: Option<String>,
     },
+
+    /// Evict old and least-recently-used artifact cache entries
+    ///
+    /// Manifests older than --max-age are removed first. Remaining manifests
+    /// are removed oldest-first until the on-disk blob store is at or under
+    /// --max-size. Blobs still referenced by a surviving manifest are kept.
+    ///
+    /// Sizes accept bytes or a KB/MB/GB suffix (powers of 1024). Ages accept
+    /// s/m/h/d. `0` disables that limit. Flags override `[cache]` in the root
+    /// aster.toml. Absent flags and config use 10GB and 14d.
+    Prune {
+        /// Maximum on-disk blob size to keep (bytes or KB/MB/GB)
+        #[arg(long, value_name = "SIZE")]
+        max_size: Option<String>,
+
+        /// Maximum age of a manifest, using mtime as last access (s/m/h/d)
+        #[arg(long, value_name = "AGE")]
+        max_age: Option<String>,
+    },
 }
 
 /// Test results subcommands
