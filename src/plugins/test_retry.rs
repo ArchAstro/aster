@@ -726,6 +726,23 @@ mod tests {
     }
 
     #[test]
+    fn mix_retries_a_balanced_partition_with_only_its_failing_files() {
+        let dir = Path::new("/w/shard");
+        let original =
+            "bash -c 'cd ../core && MIX_TEST_PARTITION=2 exec mix test --seed 0 --partitions 4'";
+        let balanced = crate::plugins::mix_partitions::parse(dir, original)
+            .unwrap()
+            .render(&["test/a_test.exs".into(), "test/b_test.exs".into()]);
+        let failures = [failure(Some("test/b_test.exs"), None, "test one")];
+        let found = one(dir, &balanced, &failures);
+        let script = shell_words::split(&found).unwrap().pop().unwrap();
+        assert_eq!(
+            script,
+            "cd ../core && exec mix test --seed 0 test/b_test.exs"
+        );
+    }
+
+    #[test]
     fn go_selects_tests_per_package() {
         let dir = Path::new("/w");
         let failures = [

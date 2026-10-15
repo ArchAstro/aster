@@ -21,6 +21,7 @@ from this server's state, looked up with the same credentials.
 | `GET /v1/test-results/tests/:test_id` | One test's state and history. |
 | `GET /v1/test-results/runs/:run_id/failures` | The failing tests of a run, with their state. |
 | `GET /v1/test-results/failures?github_run=` | The failing tests of every Aster run in one GitHub Actions run. |
+| `GET /v1/test-results/durations?target=&day=` | Each test file's median duration, for splitting a partitioned suite. |
 | `GET /healthz` | The process is up. |
 | `GET /readyz` | The database answers. |
 
@@ -176,6 +177,36 @@ name.
 
 `aster results failures --github-run <id>` fetches every page and prints the
 merged JSON.
+
+### Durations
+
+`GET /v1/test-results/durations?target=<address>&target=…&day=<YYYY-MM-DD>`
+returns each test file's median duration over the targets' recent runs, for
+splitting a partitioned suite (`MIX_TEST_PARTITION=K mix test --partitions N`)
+by time. Every partition of one commit asks with the same targets and the
+commit's UTC `day`, and must get the same answer, so the answer depends on
+nothing else: it covers runs received in the 7 days before `day` began (less
+15 minutes for uploads still committing), and a `day` that has not begun is
+`409`. Per file, the first-attempt durations of its tests are summed in each
+of the latest 20 uncached, completely captured runs of each target, and the
+median of those sums is `p50_ms`. 1 to 32 targets; `files` is sorted and
+empty without history.
+
+```json
+{
+  "repo": "ArchAstro/firstlanding",
+  "targets": ["//services/platform-test-shard-1:test-ci", "…"],
+  "day": "2026-10-15",
+  "files": [ { "file": "test/platform/agents_test.exs", "p50_ms": 18234, "runs": 60 } ]
+}
+```
+
+Aster asks when a target runs a partition of a suite and `ASTER_SRV_URL` is
+set, then runs the files that partition gets from a longest-first split
+(`ASTER_BALANCE_PARTITIONS=off` keeps Mix's own split; so does any error).
+The shards' tests are recorded under the project whose suite it is (the
+directory the command `cd`s to), so a test's id does not depend on the shard
+that ran it.
 
 ## Authentication
 

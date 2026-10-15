@@ -893,6 +893,43 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         assert_eq!(plan.files, ReportFiles::Stdout);
     }
 
+    #[test]
+    fn a_balanced_partition_is_captured_like_the_partition_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = tmp.path().join("platform-test-shard-2");
+        let platform = tmp.path().join("platform");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::create_dir_all(platform.join("test")).unwrap();
+        std::fs::write(platform.join("test/test_helper.exs"), "ExUnit.start()\n").unwrap();
+        let report_dir = tmp.path().join("reports");
+        std::fs::create_dir_all(&report_dir).unwrap();
+        let original =
+            "bash -c 'cd ../platform && MIX_TEST_PARTITION=2 exec mix test --partitions 4'";
+        let command = crate::plugins::mix_partitions::parse(&shard, original)
+            .unwrap()
+            .render(&["test/a_test.exs".into(), "test/b_test.exs".into()]);
+        let ctx = ReportContext {
+            project_dir: &shard,
+            working_dir: &shard,
+            target_name: "test-ci",
+            command: &command,
+            report_dir: &report_dir,
+        };
+        let plan = delegating(&ctx, mix).unwrap();
+        let script = shell_words::split(&plan.command).unwrap().pop().unwrap();
+        assert!(
+            script.starts_with("cd ../platform && MIX_TEST_PARTITION=2 exec elixir -r "),
+            "{script}"
+        );
+        assert!(
+            script.ends_with(
+                "-S mix test --formatter AsterTestResults.ExUnitFormatter --formatter ExUnit.CLIFormatter test/a_test.exs test/b_test.exs"
+            ),
+            "{script}"
+        );
+        assert_eq!(plan.confidence, Confidence::Complete);
+    }
+
     fn js_fixture(manifest: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, Fixture) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("package.json"), manifest).unwrap();

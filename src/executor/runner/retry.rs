@@ -149,6 +149,7 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
 
     if ran_any {
         result.tests = Some(TestReport {
+            project: report.project,
             capture: report.capture,
             confidence,
             cases,
@@ -315,6 +316,7 @@ mod tests {
             duration_ms: 10,
             exit_code,
             tests: Some(TestReport {
+                project: None,
                 capture: "go-json".into(),
                 confidence: Confidence::Complete,
                 cases,
@@ -427,6 +429,7 @@ mod tests {
     #[test]
     fn annotations_name_the_file_and_escape_the_message() {
         let report = TestReport {
+            project: None,
             capture: "go-json".into(),
             confidence: Confidence::Complete,
             cases: vec![

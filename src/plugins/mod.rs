@@ -408,6 +408,7 @@ pub mod go;
 pub mod gradle;
 mod jvm;
 pub mod maven;
+pub(crate) mod mix_partitions;
 pub mod nodejs;
 pub mod python;
 pub mod registry;

@@ -9,6 +9,7 @@
 //! The plan is applied after the cache key is computed from the original
 //! command, so capturing results never changes what is cached.
 
+pub mod balance;
 pub mod client;
 mod context;
 pub(crate) mod exunit;
@@ -57,6 +58,11 @@ pub struct TestReport {
     pub capture: String,
     pub confidence: Confidence,
     pub cases: Vec<TestCase>,
+    /// The project whose tests these are, when it is not the target's own:
+    /// a shard project that runs another project's suite
+    /// (`cd ../platform && mix test`). Test identities use it, so a test
+    /// keeps its id whichever shard runs it.
+    pub project: Option<String>,
 }
 
 /// A test that failed in one attempt and passed in a later one.
@@ -473,6 +479,7 @@ mod tests {
     #[test]
     fn counts_failures() {
         let report = TestReport {
+            project: None,
             capture: "junit".into(),
             confidence: Confidence::Complete,
             cases: vec![

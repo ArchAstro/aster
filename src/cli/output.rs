@@ -503,6 +503,7 @@ mod tests {
             duration_ms: 1,
             exit_code: Some(1),
             tests: Some(TestReport {
+                project: None,
                 capture: "junit".to_string(),
                 confidence: Confidence::Partial,
                 cases: vec![
