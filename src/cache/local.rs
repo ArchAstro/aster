@@ -24,6 +24,10 @@ const SHARD_LEN: usize = 2;
 /// destination between the exists check and the rename.
 const PUT_BLOB_ATTEMPTS: u32 = 2;
 
+/// Prune keeps a blob that no manifest names when it is younger than this.
+/// A writer stores blobs before their manifest; this window covers that gap.
+const UNREFERENCED_BLOB_GRACE: Duration = Duration::from_secs(60 * 60);
+
 /// Local CAS and action-cache tier under a resolved cache directory.
 pub struct LocalStore {
     cache_dir: PathBuf,
@@ -47,6 +51,9 @@ impl LocalStore {
         reader
             .read_to_end(&mut buffered)
             .context("Failed to read blob")?;
+        // Shared with other writers, exclusive against prune: a sweep never
+        // runs while this blob is between temp file and rename.
+        let _lock = self.acquire_lock(LockMode::Shared)?;
         let mut last_error = None;
         for _ in 0..PUT_BLOB_ATTEMPTS {
             match self.put_blob_once(digest, &buffered) {
@@ -63,6 +70,9 @@ impl LocalStore {
     fn put_blob_once(&self, digest: &Digest, bytes: &[u8]) -> Result<()> {
         let path = self.blob_path(digest)?;
         if path.is_file() {
+            // Refresh mtime so prune's grace window covers this writer until
+            // it stores the manifest that names the blob.
+            touch_mtime(&path)?;
             return Ok(());
         }
         if let Some(parent) = path.parent() {
@@ -138,7 +148,11 @@ impl LocalStore {
     }
 
     /// Write `manifest` only when every referenced blob is present.
+    ///
+    /// The blob check and the write run under a shared `cache.lock`, so a
+    /// prune cannot delete a checked blob before the manifest lands.
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<()> {
+        let _lock = self.acquire_lock(LockMode::Shared)?;
         for digest in manifest.blob_refs() {
             if !self.has_blob(&digest) {
                 bail!("manifest references missing blob {}", digest.as_str());
@@ -161,9 +175,12 @@ impl LocalStore {
     /// oldest manifests are removed until that sum is at or under `max_size`.
     /// `None` disables that limit. An exclusive `cache.lock` is held for the
     /// whole scan, manifest delete, and blob sweep so a blob is unlinked only
-    /// after every surviving manifest has been decoded.
+    /// after every surviving manifest has been decoded. Writers hold the same
+    /// lock shared. A blob no manifest names is kept while it is younger than
+    /// [`UNREFERENCED_BLOB_GRACE`]: its writer may not have stored the
+    /// manifest yet.
     pub fn prune(&self, max_size: Option<u64>, max_age: Option<Duration>) -> Result<PruneStats> {
-        let _lock = self.acquire_exclusive_lock()?;
+        let _lock = self.acquire_lock(LockMode::Exclusive)?;
         self.prune_locked(max_size, max_age)
     }
 
@@ -177,6 +194,9 @@ impl LocalStore {
         });
 
         let mut referenced = HashSet::new();
+        // Every blob a decoded manifest names, survivor or not. A blob
+        // outside this set may belong to a write still in flight.
+        let mut named = HashSet::new();
         let mut survivors: Vec<&ManifestFile> = Vec::new();
         for entry in &mut manifests {
             let bytes = match fs::read(&entry.path) {
@@ -193,6 +213,7 @@ impl LocalStore {
                 continue;
             };
             entry.refs = manifest.blob_refs();
+            named.extend(entry.refs.iter().cloned());
             let mut keep = true;
             if let Some(max_age) = max_age {
                 if age_of(entry.modified, now) > max_age {
@@ -241,7 +262,8 @@ impl LocalStore {
             }
         }
 
-        let blobs_removed = self.sweep_unreferenced_blobs(&referenced)?;
+        let grace_cutoff = now.checked_sub(UNREFERENCED_BLOB_GRACE);
+        let blobs_removed = self.sweep_unreferenced_blobs(&referenced, &named, grace_cutoff)?;
         Ok(PruneStats {
             manifests_removed,
             blobs_removed,
@@ -268,13 +290,21 @@ impl LocalStore {
         Ok(sizes)
     }
 
-    fn sweep_unreferenced_blobs(&self, referenced: &HashSet<Digest>) -> Result<u64> {
+    fn sweep_unreferenced_blobs(
+        &self,
+        referenced: &HashSet<Digest>,
+        named: &HashSet<Digest>,
+        grace_cutoff: Option<SystemTime>,
+    ) -> Result<u64> {
         let mut removed = 0u64;
         for path in self.blob_files()? {
             let Some(digest) = digest_from_blob_path(&path) else {
                 continue;
             };
             if referenced.contains(&digest) {
+                continue;
+            }
+            if !named.contains(&digest) && written_after(&path, grace_cutoff) {
                 continue;
             }
             match fs::remove_file(&path) {
@@ -347,7 +377,7 @@ impl LocalStore {
         Ok(found)
     }
 
-    fn acquire_exclusive_lock(&self) -> Result<File> {
+    fn acquire_lock(&self, mode: LockMode) -> Result<File> {
         let lock_path = self.cache_dir.join("cache.lock");
         fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("Failed to create {}", self.cache_dir.display()))?;
@@ -360,7 +390,13 @@ impl LocalStore {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("Failed to open lock file {}", lock_path.display()))?;
-        FileExt::lock_exclusive(&lock_file).with_context(|| "Failed to acquire cache lock")?;
+        // UFCS: std::fs::File locking is 1.89; this crate's MSRV is 1.88.
+        match mode {
+            LockMode::Shared => FileExt::lock_shared(&lock_file)
+                .with_context(|| "Failed to acquire shared cache lock")?,
+            LockMode::Exclusive => FileExt::lock_exclusive(&lock_file)
+                .with_context(|| "Failed to acquire cache lock")?,
+        }
         Ok(lock_file)
     }
 
@@ -422,6 +458,24 @@ struct ManifestFile {
     modified: SystemTime,
     /// Blobs named by a decoded manifest. Empty when the file did not decode.
     refs: Vec<Digest>,
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// Whether `path` was modified after `cutoff`. An unreadable mtime counts as
+/// recent so the blob is kept.
+fn written_after(path: &Path, cutoff: Option<SystemTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    match fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified > cutoff,
+        Err(_) => true,
+    }
 }
 
 struct DirEntry {
@@ -903,6 +957,10 @@ mod tests {
         let old_blob = Digest::of_bytes(b"old-still-referenced");
         let new_blob = Digest::of_bytes(b"new-still-referenced");
         store.put_blob(&orphan, orphan_bytes.as_slice()).unwrap();
+        filetime_set(
+            &store.blob_path(&orphan).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
         store
             .put_blob(&old_blob, &b"old-still-referenced"[..])
             .unwrap();
@@ -954,6 +1012,10 @@ mod tests {
         let old_blob = Digest::of_bytes(&old_bytes);
         let new_blob = Digest::of_bytes(b"tiny-survivor");
         store.put_blob(&orphan, orphan_bytes.as_slice()).unwrap();
+        filetime_set(
+            &store.blob_path(&orphan).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
         store.put_blob(&old_blob, old_bytes.as_slice()).unwrap();
         store.put_blob(&new_blob, &b"tiny-survivor"[..]).unwrap();
 
@@ -984,5 +1046,53 @@ mod tests {
         assert!(!store.has_blob(&old_blob));
         assert!(store.has_blob(&new_blob));
         assert!(stats.bytes_remaining <= survivor);
+    }
+
+    #[test]
+    fn prune_keeps_fresh_unreferenced_blob_for_inflight_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        // A writer has stored its blob but not yet its manifest.
+        let pending = Digest::of_bytes(b"pending-manifest-blob");
+        store
+            .put_blob(&pending, &b"pending-manifest-blob"[..])
+            .unwrap();
+        let stale = Digest::of_bytes(b"stale-orphan-blob");
+        store.put_blob(&stale, &b"stale-orphan-blob"[..]).unwrap();
+        filetime_set(
+            &store.blob_path(&stale).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+
+        let stats = store.prune(Some(0), None).unwrap();
+        assert!(store.has_blob(&pending), "in-flight blob must survive");
+        assert!(!store.has_blob(&stale), "stale orphan must be swept");
+        assert_eq!(stats.blobs_removed, 1);
+
+        // The writer can now publish the manifest that names the blob.
+        let key = "ab0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(key, std::slice::from_ref(&pending)))
+            .unwrap();
+        assert!(store.get_manifest(key).unwrap().is_some());
+    }
+
+    #[test]
+    fn put_blob_refreshes_mtime_of_existing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let digest = Digest::of_bytes(b"reused-blob");
+        store.put_blob(&digest, &b"reused-blob"[..]).unwrap();
+        let path = store.blob_path(&digest).unwrap();
+        filetime_set(
+            &path,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+        store.put_blob(&digest, &b"reused-blob"[..]).unwrap();
+        store.prune(Some(0), None).unwrap();
+        assert!(
+            store.has_blob(&digest),
+            "re-put blob is in the grace window"
+        );
     }
 }
