@@ -1,4 +1,5 @@
-//! Sending a results file to aster-srv.
+//! Talking to aster-srv: sending a results file, and the credentials that
+//! the read calls in [`super::client`] share.
 //!
 //! In GitHub Actions the credential is an OIDC token for the `aster-srv`
 //! audience (the job needs `permissions: id-token: write`). Elsewhere
@@ -15,6 +16,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+
+/// `ASTER_SRV_PROXY_TOKEN`, when set.
+pub fn proxy_token_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    env("ASTER_SRV_PROXY_TOKEN").filter(|token| !token.is_empty())
+}
 
 /// What the server said it stored.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -53,20 +59,21 @@ impl Credentials {
     }
 }
 
-fn agent() -> ureq::Agent {
+/// An HTTP agent whose requests give up after `timeout`.
+pub(super) fn agent(timeout: Duration) -> ureq::Agent {
     // ureq is built without its own crypto provider; use the aws-lc-rs one
     // the rest of Aster uses. Installing twice is harmless.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_global(Some(timeout))
         .user_agent(concat!("aster/", env!("CARGO_PKG_VERSION")))
         .http_status_as_error(false)
         .build()
         .into()
 }
 
-fn bearer(agent: &ureq::Agent, credentials: &Credentials) -> Result<String> {
+pub(super) fn bearer(agent: &ureq::Agent, credentials: &Credentials) -> Result<String> {
     match credentials {
         Credentials::Static(token) => Ok(token.clone()),
         Credentials::GitHubOidc {
@@ -116,7 +123,7 @@ pub fn upload(
     encoder.write_all(&ndjson)?;
     let body = encoder.finish()?;
 
-    let agent = agent();
+    let agent = agent(Duration::from_secs(60));
     let token = bearer(&agent, credentials)?;
     let url = format!("{}/v1/test-results/runs", server_url.trim_end_matches('/'));
     let mut last_error = None;

@@ -428,3 +428,136 @@ fn without_retry_failed_a_failing_test_fails_the_target() {
     let output = aster(tmp.path(), &["--no-cache", "test", "//app"]);
     assert!(!output.status.success());
 }
+
+fn aster_in_github(root: &Path, summary: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(root)
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("ASTER_RETRY_FAILED")
+        .env_remove("ASTER_SRV_URL")
+        .env_remove("ASTER_SRV_TOKEN")
+        .env_remove("ASTER_GITHUB_SUMMARY")
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_STEP_SUMMARY", summary)
+        .env("RUNNER_TEMP", root.join("runner-temp"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_github_run_summarizes_and_annotates_its_failures() {
+    let tmp = workspace();
+    let results = tmp.path().join("out/results.ndjson");
+    let step = tmp.path().join("step-summary.md");
+    let output = aster_in_github(
+        tmp.path(),
+        &step,
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("::error title=failed%3A divides()::"),
+        "{stderr}"
+    );
+    let summary = fs::read_to_string(&step).unwrap();
+    assert!(summary.contains("## Aster test results"), "{summary}");
+    assert!(summary.contains("**1 failing test**"), "{summary}");
+    assert!(summary.contains("divides()"), "{summary}");
+
+    // ASTER_GITHUB_SUMMARY=0 turns it off.
+    fs::remove_file(&step).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_STEP_SUMMARY", &step)
+        .env("ASTER_GITHUB_SUMMARY", "0")
+        .env_remove("ASTER_SRV_URL")
+        .args([
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!step.exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("::error"));
+}
+
+#[test]
+fn results_summary_prints_markdown_or_github_commands() {
+    let tmp = workspace();
+    let results = tmp.path().join("out/results.ndjson");
+    let run = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    assert!(!run.status.success());
+    let results = results.display().to_string();
+
+    let output = aster(tmp.path(), &["results", "summary", &results]);
+    assert!(output.status.success());
+    let markdown = String::from_utf8_lossy(&output.stdout);
+    assert!(markdown.contains("| failed | divides() |"), "{markdown}");
+
+    let step = tmp.path().join("step.md");
+    let output = aster_in_github(
+        tmp.path(),
+        &step,
+        &["results", "summary", &results, "--github"],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("::error "), "{stdout}");
+    assert!(stdout.contains("title=failed%3A divides()"), "{stdout}");
+    assert!(fs::read_to_string(&step).unwrap().contains("divides()"));
+}
+
+#[test]
+fn results_failures_exits_nonzero_when_it_cannot_ask() {
+    let tmp = workspace();
+    let run = |url: Option<&str>, token: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command
+            .current_dir(tmp.path())
+            .env_remove("ASTER_SRV_URL")
+            .env_remove("ASTER_SRV_TOKEN")
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .args(["results", "failures", "--github-run", "123"]);
+        if let Some(url) = url {
+            command.args(["--url", url]);
+        }
+        if let Some(token) = token {
+            command.env("ASTER_SRV_TOKEN", token);
+        }
+        command.output().unwrap()
+    };
+    let unreachable = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    for (url, token, message) in [
+        (None, None, "give --url or set ASTER_SRV_URL"),
+        (Some("http://127.0.0.1:1"), None, "no credentials"),
+        (Some(unreachable.as_str()), Some("t"), "cannot reach"),
+    ] {
+        let output = run(url, token);
+        assert_eq!(output.status.code(), Some(1), "{message}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{stderr}");
+    }
+}

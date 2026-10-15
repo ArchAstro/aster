@@ -8,7 +8,11 @@ cache, live beside it under their own routes and Postgres schema.
 
 `aster --test-results` records every test a run executes. With
 `ASTER_SRV_URL` set, Aster uploads the results after the run; `aster results
-upload <file>` sends a file by hand.
+upload <file>` sends a file by hand. In GitHub Actions, Aster then adds the
+run's failures to the job's step summary and annotates them (set
+`ASTER_GITHUB_SUMMARY=0` to skip); `aster results summary <file> [--github]`
+does the same by hand. Failures are labelled `new`, `broken` or `known flake`
+from this server's state, looked up with the same credentials.
 
 | Route | |
 |---|---|
