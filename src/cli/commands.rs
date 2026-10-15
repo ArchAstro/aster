@@ -334,6 +334,12 @@ pub enum Commands {
         command: CacheCommands,
     },
 
+    /// CI helpers
+    Ci {
+        #[command(subcommand)]
+        command: CiCommands,
+    },
+
     /// Work with recorded test results
     Results {
         #[command(subcommand)]
@@ -481,6 +487,35 @@ pub enum TlsCommands {
     Serve {
         /// Name from `[dev.services.<name>]`
         edge: String,
+    },
+}
+
+/// CI subcommands
+#[derive(Subcommand)]
+pub enum CiCommands {
+    /// Print actions/cache entries for native tool caches
+    ///
+    /// Resolves every selected project's native caches into concrete
+    /// entries. Shared caches with the same id and paths are emitted once.
+    /// With no addresses, every discovered project is included.
+    CachePlan {
+        /// Project addresses (`//path`, `//prefix/...`, `./...`, `-//excl`)
+        ///
+        /// The same selectors as `aster run`. Omit them to include every
+        /// discovered project.
+        projects: Vec<String>,
+
+        /// Include every discovered project (the default when no addresses
+        /// are given)
+        #[arg(long)]
+        all: bool,
+
+        /// Write the combined entry to $GITHUB_OUTPUT
+        ///
+        /// Emits `paths` (newline-joined, heredoc syntax), `key`, and
+        /// `restore-keys` so one actions/cache step can consume them.
+        #[arg(long)]
+        github_output: bool,
     },
 }
 

@@ -311,3 +311,272 @@ fn test_pnpm_workspace_protocol_build_edge() {
         "expected a dependency path consumer:build -> dep:build; got {why_json}"
     );
 }
+
+fn setup_rust_and_node_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+
+    write_file(
+        &tmp,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+    );
+    write_file(&tmp, "Cargo.lock", "# lock v1\n");
+    write_file(
+        &tmp,
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(
+        &tmp,
+        "crates/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write_package_json(&tmp, "apps/web/package.json", "{\"name\": \"web\"}");
+    write_file(
+        &tmp,
+        "apps/web/package-lock.json",
+        "{\"lockfileVersion\": 3}\n",
+    );
+
+    tmp
+}
+
+fn cache_plan_json(tmp: &TempDir, extra: &[&str]) -> Value {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "ci", "cache-plan"])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cache-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cache-plan --json should be an object")
+}
+
+fn entry<'a>(plan: &'a Value, id: &str) -> &'a Value {
+    plan["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("missing entry {id}: {plan}"))
+}
+
+fn assert_key_prefix(key: &str, id: &str) {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let prefix = format!("aster-l0-{id}-{os}-{arch}-");
+    assert!(key.starts_with(&prefix), "{key} should start with {prefix}");
+    let digest = &key[prefix.len()..];
+    assert_eq!(digest.len(), 64, "sha256 hex digest: {key}");
+    assert!(digest.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[test]
+fn cache_plan_json_dedupes_shared_rust_caches_and_keeps_node() {
+    let tmp = setup_rust_and_node_workspace();
+    let plan = cache_plan_json(&tmp, &[]);
+
+    let ids: Vec<&str> = plan["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "cargo-registry",
+            "cargo-target",
+            "node-modules:apps/web",
+            "npm-cache"
+        ]
+    );
+
+    let registry = entry(&plan, "cargo-registry");
+    assert_eq!(
+        registry["paths"],
+        serde_json::json!([
+            "~/.cargo/registry/index",
+            "~/.cargo/registry/cache",
+            "~/.cargo/git/db"
+        ])
+    );
+    assert_eq!(
+        registry["projects"],
+        serde_json::json!(["//crates/a", "//crates/b"])
+    );
+    assert_key_prefix(registry["key"].as_str().unwrap(), "cargo-registry");
+    assert_eq!(
+        registry["restore_keys"],
+        serde_json::json!([format!(
+            "aster-l0-cargo-registry-{}-{}-",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )])
+    );
+
+    let target = entry(&plan, "cargo-target");
+    assert_eq!(target["paths"], serde_json::json!(["target"]));
+    assert_eq!(
+        target["projects"],
+        serde_json::json!(["//crates/a", "//crates/b"])
+    );
+    assert_key_prefix(target["key"].as_str().unwrap(), "cargo-target");
+
+    let modules = entry(&plan, "node-modules:apps/web");
+    assert_eq!(
+        modules["paths"],
+        serde_json::json!(["apps/web/node_modules"])
+    );
+    assert_eq!(modules["projects"], serde_json::json!(["//apps/web"]));
+    assert_key_prefix(modules["key"].as_str().unwrap(), "node-modules:apps/web");
+
+    let npm = entry(&plan, "npm-cache");
+    assert_eq!(npm["paths"], serde_json::json!(["~/.npm"]));
+    assert_eq!(npm["projects"], serde_json::json!(["//apps/web"]));
+
+    let combined_paths = plan["combined"]["paths"].as_array().unwrap();
+    assert_eq!(combined_paths.len(), 6);
+    assert!(combined_paths.contains(&serde_json::json!("~/.npm")));
+    assert!(combined_paths.contains(&serde_json::json!("target")));
+    assert_key_prefix(plan["combined"]["key"].as_str().unwrap(), "all");
+    assert_eq!(
+        plan["combined"]["restore_keys"],
+        serde_json::json!([format!(
+            "aster-l0-all-{}-{}-",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )])
+    );
+}
+
+#[test]
+fn cache_plan_lockfile_edit_changes_only_rust_keys() {
+    let tmp = setup_rust_and_node_workspace();
+    let before = cache_plan_json(&tmp, &[]);
+
+    write_file(&tmp, "Cargo.lock", "# lock v2\n");
+    let after = cache_plan_json(&tmp, &[]);
+
+    for id in ["cargo-registry", "cargo-target"] {
+        assert_ne!(
+            entry(&before, id)["key"],
+            entry(&after, id)["key"],
+            "{id} key should change when Cargo.lock changes"
+        );
+    }
+    for id in ["npm-cache", "node-modules:apps/web"] {
+        assert_eq!(
+            entry(&before, id)["key"],
+            entry(&after, id)["key"],
+            "{id} key should not change when Cargo.lock changes"
+        );
+    }
+    assert_ne!(before["combined"]["key"], after["combined"]["key"]);
+}
+
+#[test]
+fn cache_plan_selects_one_project() {
+    let tmp = setup_rust_and_node_workspace();
+    let plan = cache_plan_json(&tmp, &["//apps/web"]);
+    let ids: Vec<&str> = plan["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["node-modules:apps/web", "npm-cache"]);
+}
+
+#[test]
+fn cache_plan_keeps_independent_shared_caches_separate() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    // Two reactors share the Maven repository path but hash different poms.
+    // Merging them would make one pom miss the cache for the other.
+    write_file(
+        &tmp,
+        "services/a/pom.xml",
+        "<project><artifactId>a</artifactId></project>\n",
+    );
+    write_file(
+        &tmp,
+        "services/b/pom.xml",
+        "<project><artifactId>b</artifactId></project>\n",
+    );
+
+    let plan = cache_plan_json(&tmp, &[]);
+    let repos: Vec<&Value> = plan["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["id"] == "maven-repository")
+        .collect();
+    assert_eq!(repos.len(), 2, "each reactor keeps its own pom key: {plan}");
+    assert_ne!(repos[0]["key"], repos[1]["key"]);
+    assert_eq!(repos[0]["paths"], serde_json::json!(["~/.m2/repository"]));
+    assert_eq!(repos[1]["paths"], serde_json::json!(["~/.m2/repository"]));
+
+    write_file(
+        &tmp,
+        "services/b/pom.xml",
+        "<project><artifactId>b2</artifactId></project>\n",
+    );
+    let after = cache_plan_json(&tmp, &[]);
+    let after_repos: Vec<&Value> = after["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["id"] == "maven-repository")
+        .collect();
+    let before_a = repos
+        .iter()
+        .find(|entry| entry["projects"] == serde_json::json!(["//services/a"]))
+        .unwrap();
+    let after_a = after_repos
+        .iter()
+        .find(|entry| entry["projects"] == serde_json::json!(["//services/a"]))
+        .unwrap();
+    let after_b = after_repos
+        .iter()
+        .find(|entry| entry["projects"] == serde_json::json!(["//services/b"]))
+        .unwrap();
+    assert_eq!(after_a["key"], before_a["key"]);
+    assert_ne!(after_b["key"], before_a["key"]);
+}
+
+#[test]
+fn cache_plan_github_output_writes_combined_entry() {
+    let tmp = setup_rust_and_node_workspace();
+    let output_path = tmp.path().join("github-output.txt");
+
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
+    let output = cmd
+        .current_dir(tmp.path())
+        .env("GITHUB_OUTPUT", &output_path)
+        .args(["ci", "cache-plan", "--github-output"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cache-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = std::fs::read_to_string(&output_path).unwrap();
+    let plan = cache_plan_json(&tmp, &[]);
+    let key = plan["combined"]["key"].as_str().unwrap();
+    let restore = plan["combined"]["restore_keys"][0].as_str().unwrap();
+    assert!(written.starts_with("paths<<ASTER_CACHE_PATHS\n"));
+    assert!(written.contains("\nASTER_CACHE_PATHS\n"));
+    assert!(written.contains(&format!("key={key}\n")));
+    assert!(written.contains(&format!("restore-keys={restore}\n")));
+    assert!(written.contains("~/.cargo/registry/index\n"));
+    assert!(written.contains("apps/web/node_modules\n"));
+}
