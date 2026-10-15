@@ -18,7 +18,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{Config, EmailDomains};
+use crate::config::{Config, EmailDomains, IapAudience};
 
 pub const IAP_ISSUER: &str = "https://cloud.google.com/iap";
 pub const IAP_JWKS_URL: &str = "https://www.gstatic.com/iap/verify/public_key-jwk";
@@ -200,13 +200,18 @@ impl IapVerifier {
     }
 }
 
-/// `configured` is exact, or a prefix when it ends in `/` (and then the
-/// audience must continue past it).
+/// `configured` names one backend service, matched exactly, or (ending in
+/// `/`) a project, matching any of its backend services. Both sides must
+/// have the full IAP audience shape, whatever configuration validation let
+/// through.
 fn audience_matches(configured: &str, audience: &str) -> bool {
-    if configured.ends_with('/') {
-        audience.len() > configured.len() && audience.starts_with(configured)
-    } else {
-        audience == configured
+    let (Some(want), Some(got)) = (IapAudience::parse(configured), IapAudience::parse(audience))
+    else {
+        return false;
+    };
+    match want.backend_service {
+        Some(_) => want == got,
+        None => want.project == got.project && got.backend_service.is_some(),
     }
 }
 
@@ -376,9 +381,30 @@ mod tests {
 
     #[test]
     fn audience_prefixes_need_a_trailing_slash() {
-        assert!(audience_matches("/p/1/b/", "/p/1/b/2"));
-        assert!(!audience_matches("/p/1/b/", "/p/1/b/"));
-        assert!(!audience_matches("/p/1/b", "/p/1/b2"));
-        assert!(audience_matches("/p/1/b/2", "/p/1/b/2"));
+        let p = "/projects/1/global/backendServices/";
+        assert!(audience_matches(p, "/projects/1/global/backendServices/2"));
+        assert!(!audience_matches(p, p));
+        assert!(!audience_matches(
+            p,
+            "/projects/12/global/backendServices/2"
+        ));
+        assert!(!audience_matches(
+            p,
+            "/projects/1/global/backendServices/2/x"
+        ));
+        let exact = "/projects/1/global/backendServices/2";
+        assert!(audience_matches(exact, exact));
+        assert!(!audience_matches(
+            exact,
+            "/projects/1/global/backendServices/23"
+        ));
+    }
+
+    #[test]
+    fn malformed_configured_audiences_match_nothing() {
+        let aud = "/projects/1/global/backendServices/2";
+        for configured in ["/", "", "/projects/", "/projects/1/", "/projects/1/global/"] {
+            assert!(!audience_matches(configured, aud), "{configured:?}");
+        }
     }
 }
