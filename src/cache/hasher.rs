@@ -40,7 +40,7 @@ pub struct DependencyHash {
 /// `value_hash` is the SHA256 of the raw value. The raw value is never stored
 /// here: status output must not print secrets. The cache key itself still
 /// mixes the raw value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct EnvInput {
     pub name: String,
     /// SHA256 of the value when the variable is set. `None` when unset.
@@ -54,7 +54,7 @@ pub struct EnvInput {
 ///
 /// `output_hash` is the SHA256 of the trimmed stdout+stderr, for display.
 /// The cache key mixes the raw output, kept here and never serialized.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeInput {
     /// Command string, serialized as `cmd` to match status JSON.
     #[serde(rename = "cmd")]
@@ -69,6 +69,27 @@ pub struct RuntimeInput {
     /// Trimmed stdout+stderr. Hashed into the key; never printed.
     #[serde(skip)]
     output: Option<String>,
+}
+
+// `Debug` is written by hand so the raw env value and runtime output never
+// reach logs or panic messages; only their hashes are shown.
+impl std::fmt::Debug for EnvInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvInput")
+            .field("name", &self.name)
+            .field("value_hash", &self.value_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RuntimeInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeInput")
+            .field("cmd", &self.cmd)
+            .field("output_hash", &self.output_hash)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Every component of a target cache key, in hash order.
@@ -976,6 +997,11 @@ mod tests {
         assert!(!rendered.contains("s3cret"));
         assert!(!rendered.contains("toolchain"));
         assert!(json.get("value").is_none());
+
+        let debug = format!("{material:?}");
+        assert!(!debug.contains("s3cret"));
+        assert!(!debug.contains("toolchain"));
+        assert!(debug.contains("APP_SECRET"));
     }
 
     #[test]
