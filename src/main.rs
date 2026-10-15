@@ -1333,7 +1333,6 @@ fn run() -> Result<()> {
                             &workspace_root,
                             &projects,
                             &registry,
-                            &cache_store,
                             output_mode,
                         )?;
                     } else {
@@ -2422,13 +2421,12 @@ fn print_cache_status(
 }
 
 /// Print every component of `addr`'s cache key, using the same hasher the
-/// executor uses. Dependency hashes come from the stored cache when present.
+/// executor uses. Dependency keys are recomputed from current inputs.
 fn print_cache_inputs(
     addr: &str,
     workspace_root: &Path,
     projects: &[DiscoveredProject],
     registry: &aster::plugins::PluginRegistry,
-    cache_store: &aster::cache::CacheStore,
     output_mode: OutputMode,
 ) -> Result<()> {
     use aster::cache::{CacheHasher, DependencyHash, RuntimeInputCache};
@@ -2451,20 +2449,34 @@ fn print_cache_inputs(
     inputs.workspace_files =
         plugin.workspace_cache_inputs(&project.root, workspace_root, &target_name);
 
-    let state = cache_store.load()?;
+    // Dependency keys are recomputed from current inputs, as a fresh run
+    // would, so a stale stored entry cannot change the displayed key.
+    let env_snapshot: HashMap<String, String> = std::env::vars().collect();
+    let runtime = RuntimeInputCache::new(workspace_root);
+    let project_map: HashMap<String, &DiscoveredProject> = projects
+        .iter()
+        .map(|project| (project_address(project), project))
+        .collect();
+    let mut fresh_keys = HashMap::new();
     let deps: Vec<DependencyHash> = target
         .depends_on
         .iter()
         .map(|dep| DependencyHash {
-            hash: state.targets.get(dep).map(|entry| entry.hash.clone()),
+            hash: aster::executor::fresh_cache_key(
+                dep,
+                &project_map,
+                workspace_root,
+                registry,
+                &env_snapshot,
+                &runtime,
+                &mut fresh_keys,
+            ),
             address: dep.clone(),
         })
         .collect();
 
     let excluded = nested_project_roots(project, projects);
     let hasher = CacheHasher::new(&project.root, workspace_root).with_excluded_dirs(excluded);
-    let env_snapshot: HashMap<String, String> = std::env::vars().collect();
-    let runtime = RuntimeInputCache::new(workspace_root);
     let (material, key) = hasher.explain(
         &inputs,
         target.cache.as_ref(),
@@ -2504,7 +2516,7 @@ fn print_cache_inputs(
             for dep in &material.deps {
                 match &dep.hash {
                     Some(hash) => println!("  {} {hash}", dep.address),
-                    None => println!("  {} (not cached)", dep.address),
+                    None => println!("  {} (no key)", dep.address),
                 }
             }
         }

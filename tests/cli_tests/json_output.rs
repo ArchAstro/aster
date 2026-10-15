@@ -688,3 +688,73 @@ fn cache_status_inputs_json_matches_executor_hash() {
         assert!(parsed.get(field).is_some(), "missing {field}");
     }
 }
+
+/// `cache status --inputs` recomputes dependency keys from current inputs, so
+/// a stale stored dependency entry cannot change the displayed key.
+#[test]
+fn cache_status_inputs_recomputes_stale_dependency_keys() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "lib/package.json", "{\"name\":\"lib\"}\n");
+    write_file(
+        &tmp,
+        "lib/aster.toml",
+        "[targets.build]\ncommand = \"true\"\n\n[targets.build.cache]\nenabled = true\ninclude = [\"package.json\"]\n",
+    );
+    write_package_json(&tmp, "app/package.json", "{\"name\":\"app\"}\n");
+    write_file(
+        &tmp,
+        "app/aster.toml",
+        "[targets.build]\ncommand = \"true\"\ndepends_on = [\"//lib:build\"]\n\n[targets.build.cache]\nenabled = true\ninclude = [\"package.json\"]\n",
+    );
+
+    let inputs_key = || {
+        let status = assert_cmd::cargo::cargo_bin_cmd!("aster")
+            .current_dir(tmp.path())
+            .args(["--json", "cache", "status", "//app:build", "--inputs"])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let parsed: Value = serde_json::from_slice(&status.stdout).expect("inputs json");
+        (
+            parsed["key"].as_str().expect("key").to_string(),
+            parsed["deps"][0]["hash"].as_str().map(str::to_string),
+        )
+    };
+    let stored_key = |addr: &str| {
+        let stored = assert_cmd::cargo::cargo_bin_cmd!("aster")
+            .current_dir(tmp.path())
+            .args(["--json", "cache", "status", addr])
+            .output()
+            .unwrap();
+        let entry: Value = serde_json::from_slice(&stored.stdout).expect("status json");
+        entry["hash"].as_str().expect("stored hash").to_string()
+    };
+    let run = || {
+        let run = assert_cmd::cargo::cargo_bin_cmd!("aster")
+            .current_dir(tmp.path())
+            .args(["run", "//app:build"])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "run failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    };
+
+    run();
+    let (key, dep) = inputs_key();
+    assert_eq!(key, stored_key("//app:build"));
+    assert_eq!(dep.as_deref(), Some(stored_key("//lib:build").as_str()));
+
+    // Make the stored `//lib:build` entry stale; its fresh key changes.
+    write_package_json(&tmp, "lib/package.json", "{\"name\":\"lib\",\"v\":2}\n");
+    let stale_lib = stored_key("//lib:build");
+    let (key, dep) = inputs_key();
+    assert_ne!(dep.as_deref(), Some(stale_lib.as_str()));
+
+    run();
+    assert_eq!(key, stored_key("//app:build"));
+    assert_eq!(dep.as_deref(), Some(stored_key("//lib:build").as_str()));
+}

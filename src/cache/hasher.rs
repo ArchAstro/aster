@@ -441,12 +441,17 @@ impl CacheHasher {
                     error: None,
                     output: Some(output),
                 }),
-                Err(error) => runtime.push(RuntimeInput {
-                    cmd: command,
-                    output_hash: None,
-                    error: Some(error),
-                    output: None,
-                }),
+                Err(error) => {
+                    // Hashing fails at the first failed command, so later
+                    // configured commands are not run.
+                    runtime.push(RuntimeInput {
+                        cmd: command,
+                        output_hash: None,
+                        error: Some(error),
+                        output: None,
+                    });
+                    break;
+                }
             }
         }
 
@@ -1002,6 +1007,28 @@ mod tests {
         assert!(!debug.contains("s3cret"));
         assert!(!debug.contains("toolchain"));
         assert!(debug.contains("APP_SECRET"));
+    }
+
+    #[test]
+    fn explain_stops_running_runtime_commands_after_a_failure() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("ran-after-failure");
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let mut inputs = CacheInputs::default();
+        inputs.runtime_commands.push("sh -c 'exit 3'".to_string());
+        inputs
+            .runtime_commands
+            .push(format!("touch {}", marker.display()));
+        let runtime = RuntimeInputCache::new(tmp.path());
+
+        let (material, key) = hasher.explain(&inputs, None, "true", &[], &HashMap::new(), &runtime);
+        assert!(key.is_err());
+        assert_eq!(material.runtime.len(), 1, "{:?}", material.runtime);
+        assert!(material.runtime[0].error.is_some());
+        assert!(
+            !marker.exists(),
+            "a runtime command after the failure must not run"
+        );
     }
 
     #[test]
