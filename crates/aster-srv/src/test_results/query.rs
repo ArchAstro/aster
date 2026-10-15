@@ -605,7 +605,7 @@ async fn github_failures(app: &App, identity: &Identity, query: Option<&str>) ->
     let client = app.pool.get().await?;
     let runs = client
         .query(
-            "SELECT run_id, job, lane, sha, branch, pr, attempt, received_at, \
+            "SELECT run_id, job, lane, runner, sha, branch, pr, attempt, received_at, \
                     (received_at AT TIME ZONE 'UTC')::date AS received_on \
              FROM test_results.runs \
              WHERE repo = $1 AND received_at >= $2 AND run_id ILIKE $3 ESCAPE '\\' \
@@ -645,6 +645,7 @@ async fn github_failures(app: &App, identity: &Identity, query: Option<&str>) ->
             failure["run_id"] = json!(run_id);
             failure["job"] = json!(run.and_then(|run| run.get::<_, Option<String>>("job")));
             failure["lane"] = json!(run.and_then(|run| run.get::<_, Option<String>>("lane")));
+            failure["runner"] = json!(run.and_then(|run| run.get::<_, Option<String>>("runner")));
             failure
         })
         .collect();
@@ -663,6 +664,7 @@ async fn github_failures(app: &App, identity: &Identity, query: Option<&str>) ->
                 "run_id": run.get::<_, String>("run_id"),
                 "job": run.get::<_, Option<String>>("job"),
                 "lane": run.get::<_, Option<String>>("lane"),
+                "runner": run.get::<_, Option<String>>("runner"),
                 "sha": run.get::<_, String>("sha"),
                 "branch": run.get::<_, Option<String>>("branch"),
                 "pr": run.get::<_, Option<i64>>("pr"),

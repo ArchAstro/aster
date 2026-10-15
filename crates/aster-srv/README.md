@@ -155,17 +155,21 @@ answers the same question for a caller that knows only the GitHub Actions run
 id (one run holds an Aster run per job or lane). It covers the caller's
 repository's runs within the retention period whose `run_id` starts
 `gh:<repo>:<github run>:` (and `<attempt>:`), and is `404` when none match.
-`failures` are the objects above plus `run_id`, `job` and `lane`, ordered by
-`run_id` then `test_id`:
+`failures` are the objects above plus `run_id`, `job`, `lane` and `runner`,
+ordered by `run_id` then `test_id`. `runner` is the runner's name
+(`RUNNER_NAME`), which is how to match a run to a job from GitHub's jobs API
+(its `runner_name`): `job` is the workflow's job key, not the job's display
+name.
 
 ```json
 {
   "github_run": "18233412",
   "runs": [
-    { "run_id": "…", "job": "test-ci", "lane": "platform", "sha": "…",
+    { "run_id": "…", "job": "test-ci", "lane": "platform",
+      "runner": "blacksmith-1", "sha": "…",
       "branch": "main", "pr": 16161, "attempt": 1, "received_at": "…" }
   ],
-  "failures": [ { "run_id": "…", "job": "test-ci", "lane": "platform", "test_id": "…", "…": "as above" } ],
+  "failures": [ { "run_id": "…", "job": "test-ci", "lane": "platform", "runner": "blacksmith-1", "test_id": "…", "…": "as above" } ],
   "next_cursor": null
 }
 ```
