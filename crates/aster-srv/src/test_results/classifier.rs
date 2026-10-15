@@ -47,6 +47,10 @@
 //! the last 7 days; `state` is `broken`, else `flaky` when the score is
 //! positive, else `healthy`.
 //!
+//! Then the pass updates quarantine (see [`super::quarantine`]) and records
+//! webhook notifications for what changed: a test entering, leaving or
+//! expiring from quarantine, and a test becoming broken.
+//!
 //! # Idempotence
 //!
 //! Events are keyed by (repo, test, kind, run) and inserted with
@@ -61,7 +65,9 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde_json::json;
 
-use super::ensure_partition;
+use super::{ensure_partition, quarantine};
+use crate::config::QuarantineRules;
+use crate::webhooks::{self, Notification};
 use crate::App;
 
 const CLASSIFIER_LOCK: i64 = 0x6173_7465_722d_636c; // "aster-cl"
@@ -88,6 +94,10 @@ pub struct Report {
     pub events: u64,
     /// `tests` rows whose state changed.
     pub tests_updated: u64,
+    /// Quarantine entries and exits.
+    pub quarantine: quarantine::Changes,
+    /// Webhook deliveries recorded.
+    pub deliveries: u64,
 }
 
 /// One pass as of `now`: classify every run received up to `now` that an
@@ -101,6 +111,11 @@ pub async fn run_once(app: &App, now: DateTime<Utc>) -> Result<Option<Report>> {
         report.results += chunk.results;
         report.events += chunk.events;
         report.tests_updated += chunk.tests_updated;
+        report.quarantine.quarantined += chunk.quarantine.quarantined;
+        report.quarantine.released += chunk.quarantine.released;
+        report.quarantine.expired += chunk.quarantine.expired;
+        report.quarantine.broken += chunk.quarantine.broken;
+        report.deliveries += chunk.deliveries;
         if done {
             return Ok(Some(report));
         }
@@ -118,6 +133,11 @@ pub fn spawn(app: std::sync::Arc<App>) {
                         "results": report.results,
                         "events": report.events,
                         "tests_updated": report.tests_updated,
+                        "quarantined": report.quarantine.quarantined,
+                        "released": report.quarantine.released,
+                        "expired": report.quarantine.expired,
+                        "broken_in_quarantine": report.quarantine.broken,
+                        "deliveries": report.deliveries,
                     }),
                 ),
                 Ok(None) => {}
@@ -150,18 +170,26 @@ fn text(value: &str) -> String {
 }
 
 /// What one transaction fixes: the window, the clock and the settings.
-struct Window {
-    /// Runs received in `(from, to]` are classified.
+pub(super) struct Window {
+    /// Runs received in `(from, to]` are classified; `to` is the pass's
+    /// clock.
     from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    pub(super) to: DateTime<Utc>,
     /// The oldest day whose results count as history.
     history_from: NaiveDate,
     /// The branch names that mean the default branch.
     on_default: String,
     broken_runs: u32,
+    quarantine: QuarantineRules,
+    webhooks: Vec<webhooks::Endpoint>,
 }
 
 impl Window {
+    /// `to` as a SQL literal.
+    pub(super) fn to_literal(&self) -> String {
+        at(self.to)
+    }
+
     fn branch_is_default(&self, branch: &str) -> String {
         format!(
             "{branch} IN ({0}, {1})",
@@ -172,7 +200,7 @@ impl Window {
 
     /// Each run's final result of one test: `filter` picks the test and
     /// bounds the runs. `strict` leaves out `partial` targets.
-    fn finals(&self, filter: &str, strict: bool) -> String {
+    pub(super) fn finals(&self, filter: &str, strict: bool) -> String {
         format!(
             "SELECT DISTINCT ON (tr.run_id) tr.run_id, r.sha, r.received_at, \
                     tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash \
@@ -220,6 +248,8 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
         history_from: now.date_naive() - chrono::Days::new(u64::from(app.config.retention_days)),
         on_default: app.config.default_branch.clone(),
         broken_runs: app.config.broken_runs,
+        quarantine: app.config.quarantine,
+        webhooks: app.config.webhooks.clone(),
     };
 
     // Event partitions for the days being classified. Another replica may
@@ -405,7 +435,7 @@ async fn classify(
         true,
     );
     let tests_updated = transaction
-        .execute(
+        .query(
             &format!(
                 "WITH affected AS ( \
                      SELECT repo, test_id FROM cls_win \
@@ -445,8 +475,9 @@ async fn classify(
                  derived AS ( \
                      SELECT s.repo, s.test_id, s.score, s.last_flake_at, \
                             COALESCE(k.length, 0) >= {k} AS broken, \
-                            k.since_sha, k.failure_hash \
-                     FROM scores s LEFT JOIN streaks k USING (repo, test_id)) \
+                            k.since_sha, k.failure_hash, o.state AS old_state \
+                     FROM scores s LEFT JOIN streaks k USING (repo, test_id) \
+                     JOIN test_results.tests o USING (repo, test_id)) \
                  UPDATE test_results.tests t SET \
                      state = CASE WHEN d.broken THEN 'broken' \
                                   WHEN d.score > 0 THEN 'flaky' ELSE 'healthy' END, \
@@ -463,18 +494,47 @@ async fn classify(
                              WHEN d.score > 0 THEN 'flaky' ELSE 'healthy' END, \
                         d.score, d.last_flake_at, \
                         CASE WHEN d.broken THEN d.since_sha END, \
-                        CASE WHEN d.broken THEN d.failure_hash END)",
+                        CASE WHEN d.broken THEN d.failure_hash END) \
+                 RETURNING t.repo, t.test_id, t.target, t.file, t.suite, t.name, t.state, \
+                           d.old_state, t.broken_since_sha, t.broken_failure_hash",
                 to = at(window.to),
                 k = window.broken_runs,
             ),
             &[],
         )
         .await?;
+    let mut notifications: Vec<Notification> = tests_updated
+        .iter()
+        .filter(|row| {
+            row.get::<_, String>("state") == "broken"
+                && row.get::<_, String>("old_state") != "broken"
+        })
+        .map(|row| {
+            quarantine::notification(
+                "test.broken",
+                &row.get::<_, String>("repo"),
+                window.to,
+                quarantine::test_json(row),
+                json!({
+                    "since_sha": row.get::<_, Option<String>>("broken_since_sha"),
+                    "failure_hash": row.get::<_, Option<String>>("broken_failure_hash"),
+                }),
+            )
+        })
+        .collect();
+
+    let (quarantine, mut changed) =
+        quarantine::update(transaction, window, window.quarantine).await?;
+    notifications.append(&mut changed);
+    let deliveries =
+        webhooks::enqueue(transaction, &window.webhooks, &notifications, window.to).await?;
 
     Ok(Report {
         results,
         events,
-        tests_updated,
+        tests_updated: tests_updated.len() as u64,
+        quarantine,
+        deliveries,
     })
 }
 

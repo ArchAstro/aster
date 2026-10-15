@@ -1,5 +1,6 @@
 //! Keeping the retention period: whole day partitions older than it are
-//! dropped, and runs and tests not seen within it are deleted.
+//! dropped, and runs and tests not seen within it are deleted, as are older
+//! quarantine log rows and webhook deliveries.
 
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ pub struct Report {
     pub dropped: Vec<String>,
     pub runs_deleted: u64,
     pub tests_deleted: u64,
+    /// Quarantine log rows and webhook deliveries.
+    pub log_deleted: u64,
 }
 
 /// One pass as of `today`: create the coming days' partitions, then remove
@@ -72,6 +75,18 @@ pub async fn run_once(app: &App, today: NaiveDate) -> Result<Option<Report>> {
             &[&cutoff_at],
         )
         .await?;
+    report.log_deleted = transaction
+        .execute(
+            "DELETE FROM test_results.quarantine_log WHERE at < $1",
+            &[&cutoff_at],
+        )
+        .await?
+        + transaction
+            .execute(
+                "DELETE FROM webhooks.deliveries WHERE created_at < $1",
+                &[&cutoff_at],
+            )
+            .await?;
     transaction.commit().await?;
     Ok(Some(report))
 }
@@ -87,6 +102,7 @@ pub fn spawn(app: std::sync::Arc<App>) {
                         "dropped": report.dropped,
                         "runs_deleted": report.runs_deleted,
                         "tests_deleted": report.tests_deleted,
+                        "log_deleted": report.log_deleted,
                     }),
                 ),
                 Ok(None) => {}

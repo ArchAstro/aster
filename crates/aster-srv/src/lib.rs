@@ -15,6 +15,7 @@ pub mod log;
 pub mod raw_store;
 pub mod test_results;
 mod ui;
+pub mod webhooks;
 
 /// An HTTP client builder on aws-lc-rs, the workspace's one TLS provider.
 /// reqwest is built without its own (it would bring ring, and two
@@ -44,7 +45,10 @@ pub struct App {
 
 /// Every feature's migrations, in order.
 pub fn migrations() -> Vec<&'static db::Migration> {
-    test_results::MIGRATIONS.iter().collect()
+    test_results::MIGRATIONS
+        .iter()
+        .chain(webhooks::MIGRATIONS)
+        .collect()
 }
 
 impl App {

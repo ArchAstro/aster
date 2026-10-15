@@ -1,7 +1,8 @@
 //! The read API over test state: `GET /v1/test-results/tests`,
-//! `.../tests/:test_id`, `.../runs/:run_id/failures` and
+//! `.../tests/:test_id`, `.../runs/:run_id/failures`,
 //! `.../failures?github_run=` (the failures of every Aster run in one GitHub
-//! Actions run).
+//! Actions run) and `.../quarantine` (the tests Aster keeps from failing
+//! builds).
 //!
 //! A caller reads only its own repository's data. Lists page with an opaque
 //! keyset cursor (hex of the last row's sort key), so a page costs the same
@@ -20,6 +21,9 @@ const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
 /// The most failures one run's report lists in a page.
 const MAX_FAILURES: i64 = 1000;
+/// The most tests the quarantine list returns; past it the list is cut
+/// (and says so), which only lets more tests fail.
+const MAX_QUARANTINED: i64 = 10_000;
 
 /// A read route.
 #[derive(Debug, PartialEq, Eq)]
@@ -28,6 +32,7 @@ pub enum Route {
     Test(String),
     RunFailures(String),
     GithubFailures,
+    Quarantine,
 }
 
 /// The route for a request path, with ids percent-decoded (a run id holds
@@ -38,6 +43,7 @@ pub fn parse_route(path: &str) -> Option<Route> {
     match segments.as_slice() {
         ["tests"] => Some(Route::Tests),
         ["failures"] => Some(Route::GithubFailures),
+        ["quarantine"] => Some(Route::Quarantine),
         ["tests", id] if !id.is_empty() => Some(Route::Test(percent_decode(id)?)),
         ["runs", id, "failures"] if !id.is_empty() => Some(Route::RunFailures(percent_decode(id)?)),
         _ => None,
@@ -156,8 +162,11 @@ fn params(
                 )
             }
             "state" => {
-                if !["flaky", "broken", "healthy"].contains(&value.as_str()) {
-                    return Err(Reply::error(400, "state must be flaky, broken or healthy"));
+                if !["flaky", "broken", "healthy", "quarantined"].contains(&value.as_str()) {
+                    return Err(Reply::error(
+                        400,
+                        "state must be flaky, broken, healthy or quarantined",
+                    ));
                 }
                 found.state = Some(value);
             }
@@ -191,6 +200,7 @@ pub async fn handle(app: &App, identity: &Identity, route: Route, query: Option<
         Route::Test(test_id) => test_detail(app, identity, &test_id, query).await,
         Route::RunFailures(run_id) => run_failures(app, identity, &run_id, query).await,
         Route::GithubFailures => github_failures(app, identity, query).await,
+        Route::Quarantine => quarantine_list(app, identity, query).await,
     };
     match result {
         Ok(reply) | Err(Failure::Reply(reply)) => reply,
@@ -246,12 +256,17 @@ fn test_json(row: &Row) -> Value {
 
 /// The list query: `repo` is `$1`; a state filter is `$2`; a cursor is the
 /// next two parameters (score, test id); the limit is last. Sorted along
-/// `tests_by_score` / `tests_by_state_score`.
+/// `tests_by_score` / `tests_by_state_score`. The state `quarantined` is
+/// not a column but membership of the quarantine list, so its `$2` is
+/// matched by [`quarantine_filter`] instead.
 pub fn list_sql(with_state: bool, with_cursor: bool) -> String {
     let mut next = 2;
     let mut filters = String::new();
     if with_state {
-        filters.push_str(&format!(" AND state = ${next}"));
+        filters.push_str(&format!(
+            " AND (CASE WHEN ${next} = 'quarantined' THEN {} ELSE state = ${next} END)",
+            quarantine_filter()
+        ));
         next += 1;
     }
     if with_cursor {
@@ -265,6 +280,67 @@ pub fn list_sql(with_state: bool, with_cursor: bool) -> String {
         "SELECT {TEST_COLUMNS} FROM test_results.tests WHERE repo = $1{filters} \
          ORDER BY flake_score DESC, test_id LIMIT ${next}"
     )
+}
+
+/// Whether the `tests` row is on the quarantine list.
+fn quarantine_filter() -> &'static str {
+    "EXISTS (SELECT 1 FROM test_results.quarantine q \
+             WHERE q.repo = tests.repo AND q.test_id = tests.test_id)"
+}
+
+/// `GET /v1/test-results/quarantine`: every quarantined test of the
+/// caller's repository, and the list's version (its newest change).
+async fn quarantine_list(app: &App, identity: &Identity, query: Option<&str>) -> Handled {
+    let params = params(identity, query, 1, 1, false)?;
+    if params.state.is_some() || params.cursor.is_some() || query.unwrap_or("").contains("limit") {
+        return Err(Reply::error(400, "this route takes only repo").into());
+    }
+    let client = app.pool.get().await?;
+    let version: i64 = client
+        .query_one(
+            "SELECT COALESCE(max(id), 0) FROM test_results.quarantine_log WHERE repo = $1",
+            &[&params.repo],
+        )
+        .await?
+        .get(0);
+    let fetch = MAX_QUARANTINED + 1;
+    let rows = client
+        .query(
+            "SELECT q.test_id, q.entered_at, q.expires_at, q.runs, \
+                    t.target, t.file, t.suite, t.name \
+             FROM test_results.quarantine q \
+             LEFT JOIN test_results.tests t ON t.repo = q.repo AND t.test_id = q.test_id \
+             WHERE q.repo = $1 ORDER BY q.test_id LIMIT $2",
+            &[&params.repo, &fetch],
+        )
+        .await?;
+    let truncated = rows.len() as i64 > MAX_QUARANTINED;
+    let tests: Vec<Value> = rows
+        .iter()
+        .take(MAX_QUARANTINED as usize)
+        .map(|row| {
+            json!({
+                "test_id": row.get::<_, String>("test_id"),
+                "target": row.get::<_, Option<String>>("target"),
+                "file": row.get::<_, Option<String>>("file"),
+                "suite": row.get::<_, Option<String>>("suite"),
+                "name": row.get::<_, Option<String>>("name"),
+                "since": time(row.get("entered_at")),
+                "expires_at": time(row.get("expires_at")),
+                "runs": row.get::<_, i32>("runs"),
+            })
+        })
+        .collect();
+    Ok(Reply::json(
+        200,
+        json!({
+            "repo": params.repo,
+            "version": version,
+            "generated_at": time(Utc::now()),
+            "tests": tests,
+            "truncated": truncated,
+        }),
+    ))
 }
 
 async fn list_tests(app: &App, identity: &Identity, query: Option<&str>) -> Handled {

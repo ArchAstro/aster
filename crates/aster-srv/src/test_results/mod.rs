@@ -7,11 +7,13 @@
 //! received, so retention drops whole days. `tests` holds each test's
 //! identity, when it was first and last seen, and what the classifier
 //! concluded about it. `test_flake_events` (also day-partitioned) is the
-//! classifier's evidence.
+//! classifier's evidence. `quarantine` lists the tests held out of failing
+//! builds, and `quarantine_log` how that list changed.
 
 pub mod classifier;
 pub mod durations;
 pub mod ingest;
+pub mod quarantine;
 pub mod query;
 pub mod retention;
 
@@ -160,6 +162,12 @@ GROUP BY repo, failure_hash;
 CREATE INDEX test_results_failures ON test_results.test_results (repo, received_on)
     WHERE outcome IN ('fail', 'error') AND failure_hash IS NOT NULL;
 "#,
+    },
+    Migration {
+        feature: "test_results",
+        version: 4,
+        // New tables only.
+        sql: quarantine::MIGRATION_SQL,
     },
 ];
 

@@ -84,6 +84,26 @@ pub struct Config {
     /// `ASTER_SRV_UI_DEV_EMAIL`: the viewer the dashboard assumes when no IAP
     /// audience is configured. For local development only.
     pub ui_dev_email: Option<String>,
+    /// When tests enter and leave quarantine.
+    pub quarantine: QuarantineRules,
+    /// `ASTER_SRV_WEBHOOKS`: where state changes are sent. Empty sends
+    /// nothing.
+    pub webhooks: Vec<crate::webhooks::Endpoint>,
+}
+
+/// When tests enter and leave quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineRules {
+    /// `ASTER_SRV_QUARANTINE_RUNS`: a test enters quarantine once this many
+    /// different runs in the last 7 days hold a definite flake of it. 0
+    /// turns automatic quarantine off. Default 2.
+    pub runs: u32,
+    /// `ASTER_SRV_QUARANTINE_RELEASE_PASSES`: consecutive passes, while
+    /// quarantined, that release a test. Default 20.
+    pub release_passes: u32,
+    /// `ASTER_SRV_QUARANTINE_DAYS`: the longest a test stays quarantined,
+    /// at most the retention period. Default 30.
+    pub days: u32,
 }
 
 /// A fixed bearer token standing in for one repository.
@@ -173,6 +193,31 @@ impl Config {
                  (or end in / to match any backend service of a project)"
             );
         }
+        let number = |name: &str, default: u32, min: u32, max: u32| -> Result<u32> {
+            match var(name) {
+                None => Ok(default),
+                Some(value) => value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|n| (min..=max).contains(n))
+                    .with_context(|| format!("{name} must be a number from {min} to {max}")),
+            }
+        };
+        let quarantine = QuarantineRules {
+            runs: number("ASTER_SRV_QUARANTINE_RUNS", 2, 0, 1000)?,
+            release_passes: number("ASTER_SRV_QUARANTINE_RELEASE_PASSES", 20, 1, 10_000)?,
+            days: number(
+                "ASTER_SRV_QUARANTINE_DAYS",
+                30.min(retention_days),
+                1,
+                retention_days,
+            )?,
+        };
+        let webhooks = match var("ASTER_SRV_WEBHOOKS") {
+            Some(value) => crate::webhooks::Endpoint::parse_all(&value)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             listen,
             database_url,
@@ -188,6 +233,8 @@ impl Config {
             iap_audience,
             ui_email_domains,
             ui_dev_email: var("ASTER_SRV_UI_DEV_EMAIL").map(|email| email.trim().to_string()),
+            quarantine,
+            webhooks,
         })
     }
 }
@@ -306,6 +353,50 @@ mod tests {
         assert!(config.iap_audience.is_none());
         assert!(config.ui_email_domains.is_none());
         assert!(config.ui_dev_email.is_none());
+        assert_eq!(
+            config.quarantine,
+            QuarantineRules {
+                runs: 2,
+                release_passes: 20,
+                days: 30
+            }
+        );
+        assert!(config.webhooks.is_empty());
+    }
+
+    #[test]
+    fn reads_the_quarantine_rules() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_QUARANTINE_RUNS", "0"));
+        pairs.push(("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "5"));
+        pairs.push(("ASTER_SRV_QUARANTINE_DAYS", "14"));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(
+            config.quarantine,
+            QuarantineRules {
+                runs: 0,
+                release_passes: 5,
+                days: 14
+            }
+        );
+        // Quarantine never outlives the results that justify it.
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_RETENTION_DAYS", "10"));
+        assert_eq!(
+            Config::from_env(env_of(&pairs)).unwrap().quarantine.days,
+            10
+        );
+        pairs.push(("ASTER_SRV_QUARANTINE_DAYS", "11"));
+        assert!(Config::from_env(env_of(&pairs)).is_err());
+        for (name, bad) in [
+            ("ASTER_SRV_QUARANTINE_RUNS", "-1"),
+            ("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "0"),
+            ("ASTER_SRV_QUARANTINE_DAYS", "0"),
+        ] {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push((name, bad));
+            assert!(Config::from_env(env_of(&pairs)).is_err(), "{name}={bad}");
+        }
     }
 
     #[test]
