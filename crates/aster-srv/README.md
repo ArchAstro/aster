@@ -21,12 +21,14 @@ from this server's state, looked up with the same credentials.
 | `GET /v1/test-results/tests/:test_id` | One test's state and history. |
 | `GET /v1/test-results/runs/:run_id/failures` | The failing tests of a run, with their state. |
 | `GET /v1/test-results/failures?github_run=` | The failing tests of every Aster run in one GitHub Actions run. |
+| `GET /v1/test-results/quarantine` | The caller's quarantine list and its version. See [Quarantine](#quarantine). |
 | `GET /v1/test-results/durations?target=&day=` | Each test file's median duration, for splitting a partitioned suite. |
 | `GET /healthz` | The process is up. |
 | `GET /readyz` | The database answers. |
 
 Rows are kept for the retention period (30 days by default). Day partitions
-past it are dropped every six hours.
+past it are dropped every six hours, with the older quarantine log rows and
+webhook deliveries.
 
 ## Flaky and broken tests
 
@@ -71,6 +73,84 @@ branch matches it as `main` or `refs/heads/main`.
 (repo, `failure_hash`) the `failures` and distinct `tests` counts, `first_seen`
 and `last_seen` days, and an example message and test.
 
+## Quarantine
+
+At the end of each pass, in the same transaction and as of the same clock,
+the classifier updates `test_results.quarantine`, in this order:
+
+1. A quarantined test that is now **broken** leaves: broken tests are never
+   quarantined.
+2. An entry older than `ASTER_SRV_QUARANTINE_DAYS` (default 30, at most the
+   retention period) **expires**.
+3. A test whose final results since it entered end in
+   `ASTER_SRV_QUARANTINE_RELEASE_PASSES` (default 20) consecutive passes is
+   **released**. Any failure resets the count.
+4. A test that is not broken **enters** once definite flake events from
+   `ASTER_SRV_QUARANTINE_RUNS` (default 2) different runs fall within the last
+   7 days. Only events after it last left count, so a released or expired
+   test is judged afresh. `0` turns automatic quarantine off.
+
+Every change is a row in `test_results.quarantine_log` (`quarantined`,
+`released`, `expired` or `broken`, with details), kept for the retention
+period. A repository's newest log id is its list's `version`.
+
+`GET /v1/test-results/quarantine` (the upload token; `repo=` must match it)
+returns:
+
+```json
+{"repo": "ArchAstro/firstlanding", "version": 312, "generated_at": "…",
+ "truncated": false,
+ "tests": [{"test_id": "c81e…", "target": "//services/platform:test-ci",
+            "file": "test/platform/agents_test.exs", "suite": "Platform.AgentsTest",
+            "name": "test creates an agent", "since": "…", "expires_at": "…",
+            "runs": 2}]}
+```
+
+It lists at most 10,000 tests (`truncated` says when there were more), which
+only lets more tests fail. `GET /v1/test-results/tests?state=quarantined`
+filters the test list the same way. How Aster applies the list, and the
+repository's own `aster-quarantine.toml`, are in
+[docs/test-tracking.md](../../docs/test-tracking.md#5-quarantine).
+
+## Webhooks
+
+`ASTER_SRV_WEBHOOKS` is a JSON array of endpoints, each with the events it
+wants:
+
+```json
+[{"name": "flake-bot", "url": "https://hooks.example.com/aster",
+  "secret": "at-least-16-characters", "events": ["test.quarantined", "test.released"]}]
+```
+
+| Event | When |
+|---|---|
+| `test.quarantined` | A test entered quarantine. `detail`: `runs`, `events`, `expires_at`. |
+| `test.released` | It passed enough times in a row. `detail`: `entered_at`, `passes`. |
+| `test.expired` | Its entry reached the longest stay. `detail`: `entered_at`. |
+| `test.broken` | A test became broken, quarantined or not. `detail`: `since_sha`, `failure_hash`. |
+
+Each delivery is a `POST` of
+
+```json
+{"event": "test.quarantined", "occurred_at": "…", "repo": "ArchAstro/firstlanding",
+ "test": {"test_id": "…", "target": "…", "file": "…", "suite": "…", "name": "…"},
+ "detail": {…}}
+```
+
+with `X-Aster-Event`, `X-Aster-Delivery` (the same on every retry, so a
+receiver can drop repeats) and `X-Aster-Signature: sha256=<hex HMAC-SHA256 of
+the body, keyed by the secret>`. Check the signature over the raw body before
+parsing it.
+
+The classifier records deliveries in `webhooks.deliveries` in the transaction
+that makes the change, so nothing is announced that did not happen and
+nothing that happened is lost. A sender on every replica claims due rows
+every 15 seconds (`FOR UPDATE SKIP LOCKED`) and posts them with a 10-second
+timeout. A 2xx delivers; anything else is retried after 30 seconds, doubling
+up to 6 hours, and abandoned after 12 attempts (about 14.5 hours). A slow or
+failing endpoint holds up only its own deliveries. Endpoints must be `https://`
+(`http://` only for localhost). Unsubscribed events, and all events with no
+endpoints configured, record nothing. Rows are kept for the retention period.
 ## Reading results
 
 These routes take the same bearer token as uploads, and a token reads only its
@@ -83,7 +163,7 @@ last classifier pass, up to five minutes old.
 Lists are paged with `limit` and an opaque `cursor`; pass the previous page's
 `next_cursor` until it is `null`.
 
-`GET /v1/test-results/tests?state=flaky|broken|healthy&limit=100&cursor=`
+`GET /v1/test-results/tests?state=flaky|broken|healthy|quarantined&limit=100&cursor=`
 (`limit` 1 to 500, default 100), sorted by `flake_score` descending, then
 `test_id`:
 
@@ -273,7 +353,7 @@ needs no JavaScript.
 | `/ui` | Flaky leaderboard (flake score, last flake) and broken tests |
 | `/ui/tests/:test_id?repo=owner/name` | One test: state, a pass/fail strip (oldest to newest) and recent results with failure messages |
 | `/ui/clusters` | Failures of the last 7 days grouped by failure hash |
-| `/ui/quarantine` | The quarantine list; empty until quarantine exists |
+| `/ui/quarantine` | The quarantine list, its rules and its recent changes |
 
 `?repo=owner/name` picks the repository; without it the one with the newest
 run is shown. Any repository on `ASTER_SRV_REPOSITORIES` can be viewed.
@@ -319,9 +399,24 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts, exact or a prefix ending in `/`. Unset turns the dashboard off. See [Dashboard](#dashboard). |
 | `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
 | `ASTER_SRV_UI_DEV_EMAIL` | unset | The viewer to trust when no IAP audience is set. Development only. |
+| `ASTER_SRV_QUARANTINE_RUNS` | `2` | Different runs with a definite flake in 7 days that quarantine a test; `0` turns automatic quarantine off. |
+| `ASTER_SRV_QUARANTINE_RELEASE_PASSES` | `20` | Consecutive passes that release a quarantined test. |
+| `ASTER_SRV_QUARANTINE_DAYS` | `30` | The longest a test stays quarantined; at most `ASTER_SRV_RETENTION_DAYS`. |
+| `ASTER_SRV_WEBHOOKS` | unset | Webhook endpoints, as JSON. See [Webhooks](#webhooks). |
 | `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. |
 
 Logs are one JSON object per line, with `severity` and `message`.
+
+## Runbook
+
+| Symptom | Check | Do |
+|---|---|---|
+| Uploads fail | `/readyz`; logs with `"severity":"ERROR"` | Uploads never fail CI, so results are only missing. Fix the database or the allowlist (`403`). |
+| Classification stalls | `SELECT watermark FROM test_results.classifier_state` should be minutes old; `classifier pass failed` in the logs | A pass is safe to rerun; restarting a pod starts one at once. |
+| A real regression is being let through | `/ui/quarantine`, the test's page | In CI set `ASTER_QUARANTINE=off` for the job to fail it at once. On the server, delete its row: `DELETE FROM test_results.quarantine WHERE repo = '…' AND test_id = '…'` (it can re-enter on new flakes after now). Set `ASTER_SRV_QUARANTINE_RUNS=0` to stop new entries. |
+| Too many or too few tests quarantined | `SELECT action, count(*) FROM test_results.quarantine_log WHERE at > now() - interval '1 day' GROUP BY 1` | Tune `ASTER_SRV_QUARANTINE_RUNS` and `ASTER_SRV_QUARANTINE_RELEASE_PASSES`; they apply from the next pass. |
+| Webhooks not arriving | `SELECT endpoint, event, attempts, last_status, last_error FROM webhooks.deliveries WHERE delivered_at IS NULL ORDER BY id DESC LIMIT 20` | Abandoned rows have `abandoned_at`; to resend, `UPDATE webhooks.deliveries SET abandoned_at = NULL, attempts = 0, next_attempt_at = now() WHERE id = …`. |
+| A deploy waits at startup | `migration waiting for table locks` in the logs | Expected while the old release writes; it retries for about a minute. |
 
 ## Image
 

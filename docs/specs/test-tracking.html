@@ -309,7 +309,7 @@
           <tr><td>Retention</td><td>A daily job drops partitions older than 30 days. A GCS lifecycle rule deletes raw objects at 30 days. <code>tests</code> rows not seen for 30 days are deleted.</td></tr>
           <tr><td>Deploy</td><td>Image <code>ghcr.io/archastro/aster-srv</code> from this repo's release workflow. Pulumi stack in <code>firstlanding/infra/services/aster-srv</code>: Deployment, Cloud SQL, bucket, Workload Identity.</td></tr>
           <tr><td>Notifications</td><td>Configured webhook endpoints, each with its own subscribed event types: <code>test.quarantined</code>, <code>test.released</code>, <code>test.expired</code>, <code>test.broken</code>. The JSON payload is signed with HMAC-SHA256 (<code>X-Aster-Signature</code>) and retried with backoff. Slack, issue trackers and other receivers live outside the service.</td></tr>
-          <tr><td>Routes</td><td><code>POST /v1/test-results/runs</code> · <code>GET /v1/test-results/quarantine?repo=</code> · <code>GET /v1/test-results/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/test-results/tests/:id</code> · <code>GET /v1/test-results/runs/:run_id/failures</code> · <code>GET /v1/test-results/durations?target=&amp;day=</code> · <code>/healthz</code></td></tr>
+          <tr><td>Routes</td><td><code>POST /v1/test-results/runs</code> · <code>GET /v1/test-results/quarantine</code> · <code>GET /v1/test-results/tests?state=flaky|broken|quarantined</code> · <code>GET /v1/test-results/tests/:id</code> · <code>GET /v1/test-results/runs/:run_id/failures</code> · <code>GET /v1/test-results/durations?target=&amp;day=</code> · <code>/healthz</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -341,7 +341,7 @@
   <section>
     <span class="label">Open questions</span>
     <ol class="qlist">
-      <li>Auto-quarantine threshold: should a test enter quarantine after 2 proven flakes from 2 different runs in 7 days (the current proposal), or after a single one? A proven flake means the test passed and failed on identical inputs (the same <code>input_hash</code>). One event is proof enough on its own, but an outage across CI (database down, network blip) would then quarantine every test it touched in a single run.</li>
+      <li>Auto-quarantine threshold (built as the proposal, and configurable: <code>ASTER_SRV_QUARANTINE_RUNS</code>, default 2; 1 means a single proven flake): should a test enter quarantine after 2 proven flakes from 2 different runs in 7 days, or after a single one? A proven flake means the test passed and failed on identical inputs (the same <code>input_hash</code>). One event is proof enough on its own, but an outage across CI (database down, network blip) would then quarantine every test it touched in a single run.</li>
     </ol>
   </section>
 </main>
@@ -443,15 +443,15 @@
       files: ["crates/aster-srv/src/ui/"], deps: ["T17"] },
 
     { id: "T22", p: "P4", area: "service", title: "Quarantine store + feed", sub: "Auto entry and release",
-      obj: "Automatically quarantine at 2 definite events from 2 or more runs in 7 days. Release after 20 consecutive passes, or expire at 30 days. GET /v1/test-results/quarantine returns a versioned list.",
+      obj: "At the end of each classifier pass: quarantine a test that is not broken once definite flakes from 2 different runs fall in 7 days (ASTER_SRV_QUARANTINE_RUNS; 0 turns it off). Release after 20 consecutive passes (ASTER_SRV_QUARANTINE_RELEASE_PASSES), when it breaks, or at 30 days (ASTER_SRV_QUARANTINE_DAYS); a released test is judged only on later events. GET /v1/test-results/quarantine returns the list, versioned by its newest log id; tests?state=quarantined filters by it; /ui/quarantine shows it with recent changes.",
       acc: ["Broken tests never quarantined", "Every state change kept in a log table (30 days)"],
-      files: ["crates/aster-srv/src/quarantine.rs"], deps: ["T16"] },
+      files: ["crates/aster-srv/src/test_results/quarantine.rs", "crates/aster-srv/src/test_results/classifier.rs", "crates/aster-srv/src/ui/"], deps: ["T16"] },
     { id: "T23", p: "P4", area: "client", title: "Quarantine enforcement", sub: "Repo file + server list, the 4 conditions",
-      obj: "Fetch at start (cached for 24h in .aster/quarantine.json), merge with aster-quarantine.toml, apply the 4 suppression conditions, and report passed (quarantined: N).",
+      obj: "With capture on, fetch the server list at start (cached in .aster/quarantine.json; a cache under 24h stands in when the server is down), merge with aster-quarantine.toml ([[test]] by id or name/file/suite/target, each with reason and expires), apply the 4 conditions after retries, and report passed (quarantined: N). Tests-failed exit codes: ExUnit 2, nextest 100, pytest/go/jest/vitest/bun/node 1; never Gradle, Maven or cargo test. Suppressed failures get a warning annotation, a step-summary row and quarantined: true in the results file; the pass is not cached.",
       acc: ["Partial-confidence results never suppressed", "A crash or compile error never suppressed", "ASTER_QUARANTINE=off disables it", "Dependent targets of a quarantine-passed target run"],
-      files: ["src/test_results/quarantine.rs", "src/executor/runner.rs", "src/cli/output.rs"], deps: ["T22", "T15"] },
+      files: ["src/test_results/quarantine.rs", "src/executor/runner.rs", "src/cli/output.rs", "src/test_results/summary.rs"], deps: ["T22", "T15"] },
     { id: "T26", p: "P4", area: "service", title: "Webhook notifications", sub: "Configured endpoints, HMAC-signed",
-      obj: "Config sets a list of webhook endpoints, each with a URL, a secret and the event types it receives (test.quarantined, test.released, test.expired, test.broken). Deliveries are queued in Postgres and retried with exponential backoff.",
+      obj: "ASTER_SRV_WEBHOOKS (JSON) lists endpoints, each with a name, URL, secret and the event types it receives (test.quarantined, test.released, test.expired, test.broken). The classifier records deliveries in its own transaction (outbox); a sender posts them every 15s and retries from 30s, doubling to 6h, abandoning after 12 attempts.",
       acc: ["Payload signed as X-Aster-Signature: sha256=<hmac>", "A failing endpoint never blocks ingest or classification", "Delivery log kept 30 days", "No endpoints configured means nothing is sent"],
       files: ["crates/aster-srv/src/webhooks.rs", "crates/aster-srv/src/config.rs"], deps: ["T22"] },
     { id: "T24", p: "P4", area: "client", title: "Duration-balanced mix partitions", sub: "p50 file durations, longest first",
@@ -459,9 +459,9 @@
       acc: ["Every shard of one commit gets the same split: no file runs on no shard or on two", "Falls back to Mix's own split, unchanged, on every shard alike: no aster-durations.json, the suite missing from it, a malformed file, or ASTER_BALANCE_PARTITIONS=off", "Retry and result capture work on the rewritten command", "Slowest partition's time drops on firstlanding (measured after rollout; logs show up to ~20% headroom)"],
       files: ["src/plugins/mix_partitions.rs", "src/test_results/balance.rs", "src/executor/runner/partitions.rs", "crates/aster-srv/src/test_results/durations.rs"], deps: ["T17"] },
     { id: "T25", p: "P4", area: "docs", title: "Docs", sub: "README, GETTING_STARTED, service runbook",
-      obj: "Document capture per runner, the env vars (ASTER_SRV_URL, ASTER_QUARANTINE), the quarantine rules and self-hosting.",
+      obj: "Document capture per runner, the env vars (ASTER_SRV_URL, ASTER_QUARANTINE), the quarantine rules, webhooks, self-hosting and a service runbook.",
       acc: ["Doc examples run against a fixture workspace"],
-      files: ["README.md", "docs/test-tracking.md"], deps: ["T23"] }
+      files: ["README.md", "GETTING_STARTED.md", "docs/test-tracking.md", "crates/aster-srv/README.md"], deps: ["T23"] }
   ];
 
   // Shared status lives in the artifact db: status/<task id> = {status, note, pr, updated_at}.
