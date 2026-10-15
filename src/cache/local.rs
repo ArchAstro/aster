@@ -176,9 +176,11 @@ impl LocalStore {
     /// `None` disables that limit. An exclusive `cache.lock` is held for the
     /// whole scan, manifest delete, and blob sweep so a blob is unlinked only
     /// after every surviving manifest has been decoded. Writers hold the same
-    /// lock shared. A blob no manifest names is kept while it is younger than
-    /// [`UNREFERENCED_BLOB_GRACE`]: its writer may not have stored the
-    /// manifest yet.
+    /// lock shared. An unreferenced blob is kept while its mtime is younger
+    /// than `UNREFERENCED_BLOB_GRACE` (one hour), even when only an evicted
+    /// manifest named it: a writer may have just stored or refreshed it for
+    /// a manifest it has not written yet. A manifest that does not decode is
+    /// a cache miss; it is removed and protects no blobs.
     pub fn prune(&self, max_size: Option<u64>, max_age: Option<Duration>) -> Result<PruneStats> {
         let _lock = self.acquire_lock(LockMode::Exclusive)?;
         self.prune_locked(max_size, max_age)
@@ -194,9 +196,6 @@ impl LocalStore {
         });
 
         let mut referenced = HashSet::new();
-        // Every blob a decoded manifest names, survivor or not. A blob
-        // outside this set may belong to a write still in flight.
-        let mut named = HashSet::new();
         let mut survivors: Vec<&ManifestFile> = Vec::new();
         for entry in &mut manifests {
             let bytes = match fs::read(&entry.path) {
@@ -213,7 +212,6 @@ impl LocalStore {
                 continue;
             };
             entry.refs = manifest.blob_refs();
-            named.extend(entry.refs.iter().cloned());
             let mut keep = true;
             if let Some(max_age) = max_age {
                 if age_of(entry.modified, now) > max_age {
@@ -263,7 +261,7 @@ impl LocalStore {
         }
 
         let grace_cutoff = now.checked_sub(UNREFERENCED_BLOB_GRACE);
-        let blobs_removed = self.sweep_unreferenced_blobs(&referenced, &named, grace_cutoff)?;
+        let blobs_removed = self.sweep_unreferenced_blobs(&referenced, grace_cutoff)?;
         Ok(PruneStats {
             manifests_removed,
             blobs_removed,
@@ -293,7 +291,6 @@ impl LocalStore {
     fn sweep_unreferenced_blobs(
         &self,
         referenced: &HashSet<Digest>,
-        named: &HashSet<Digest>,
         grace_cutoff: Option<SystemTime>,
     ) -> Result<u64> {
         let mut removed = 0u64;
@@ -304,7 +301,9 @@ impl LocalStore {
             if referenced.contains(&digest) {
                 continue;
             }
-            if !named.contains(&digest) && written_after(&path, grace_cutoff) {
+            // Grace covers blobs an evicted manifest named too: put_blob
+            // refreshes mtime on reuse, so a writer's fresh blob survives.
+            if written_after(&path, grace_cutoff) {
                 continue;
             }
             match fs::remove_file(&path) {
@@ -914,6 +913,8 @@ mod tests {
         let new_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
         filetime_set(&store.manifest_path(old_key).unwrap(), old_time);
         filetime_set(&store.manifest_path(new_key).unwrap(), new_time);
+        // Past the grace window, so eviction of its manifest frees it.
+        filetime_set(&store.blob_path(&old_blob).unwrap(), old_time);
 
         let before = store.cas_bytes().unwrap();
         let new_only = fs::metadata(store.blob_path(&new_blob).unwrap())
@@ -1017,6 +1018,10 @@ mod tests {
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
         );
         store.put_blob(&old_blob, old_bytes.as_slice()).unwrap();
+        filetime_set(
+            &store.blob_path(&old_blob).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
         store.put_blob(&new_blob, &b"tiny-survivor"[..]).unwrap();
 
         let old_key = "ee0123456789abcdef";
@@ -1075,6 +1080,39 @@ mod tests {
             .put_manifest(&sample_manifest(key, std::slice::from_ref(&pending)))
             .unwrap();
         assert!(store.get_manifest(key).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_keeps_fresh_blob_of_evicted_manifest_for_reusing_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let reused = Digest::of_bytes(b"reused-by-new-writer");
+        store
+            .put_blob(&reused, &b"reused-by-new-writer"[..])
+            .unwrap();
+        let old_key = "ac0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(old_key, std::slice::from_ref(&reused)))
+            .unwrap();
+        filetime_set(
+            &store.manifest_path(old_key).unwrap(),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+        // A writer re-puts the blob for a manifest it has not stored yet.
+        store
+            .put_blob(&reused, &b"reused-by-new-writer"[..])
+            .unwrap();
+
+        let stats = store
+            .prune(None, Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        assert_eq!(stats.manifests_removed, 1);
+        assert!(store.get_manifest(old_key).unwrap().is_none());
+        assert!(store.has_blob(&reused), "fresh blob must survive eviction");
+        let new_key = "ad0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(new_key, std::slice::from_ref(&reused)))
+            .unwrap();
     }
 
     #[test]
