@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::plugins::test_retry;
+use crate::test_results::quarantine::Quarantined;
 use crate::test_results::same_test;
 use crate::test_results::{TestCase, TestOutcome};
 
@@ -153,6 +154,7 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
             capture: report.capture,
             confidence,
             cases,
+            quarantined: Vec::new(),
         });
     }
     ran_any
@@ -225,7 +227,7 @@ fn remove_report_dirs(captures: &[Vec<Option<(ReportPlan, PathBuf)>>]) {
 }
 
 /// Add a note and a command's log to the result's log.
-fn append_log(result: &mut ExecutionResult, note: &str, log: &[u8]) {
+pub(super) fn append_log(result: &mut ExecutionResult, note: &str, log: &[u8]) {
     if !result.log.is_empty() && !result.log.ends_with(b"\n") {
         result.log.push(b'\n');
     }
@@ -262,21 +264,55 @@ pub(super) fn flaky_annotations(
         .flaky()
         .iter()
         .map(|test| {
-            let message = escape_data(&format!("{} failed then passed on retry", test.name));
-            match &test.file {
-                Some(file) => {
-                    let absolute = working_dir.join(file);
-                    let path = absolute
-                        .strip_prefix(workspace_root)
-                        .unwrap_or(Path::new(file))
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    format!("::warning file={}::{message}", escape_property(&path))
-                }
-                None => format!("::warning::{message}"),
-            }
+            warning(
+                test.file.as_deref(),
+                &format!("{} failed then passed on retry", test.name),
+                working_dir,
+                workspace_root,
+            )
         })
         .collect()
+}
+
+/// The GitHub Actions annotations for failures the quarantine let through:
+/// one warning per test, on its file when known.
+pub(super) fn quarantine_annotations(
+    tests: &[Quarantined],
+    working_dir: &Path,
+    workspace_root: &Path,
+) -> Vec<String> {
+    tests
+        .iter()
+        .map(|test| {
+            warning(
+                test.file.as_deref(),
+                &format!(
+                    "{} failed but is quarantined ({}); its target passed",
+                    test.name, test.source
+                ),
+                working_dir,
+                workspace_root,
+            )
+        })
+        .collect()
+}
+
+/// A `::warning` annotation, on `file` (relative to `working_dir`) when
+/// known.
+fn warning(file: Option<&str>, message: &str, working_dir: &Path, workspace_root: &Path) -> String {
+    let message = escape_data(message);
+    match file {
+        Some(file) => {
+            let absolute = working_dir.join(file);
+            let path = absolute
+                .strip_prefix(workspace_root)
+                .unwrap_or(Path::new(file))
+                .to_string_lossy()
+                .replace('\\', "/");
+            format!("::warning file={}::{message}", escape_property(&path))
+        }
+        None => format!("::warning::{message}"),
+    }
 }
 
 fn escape_data(text: &str) -> String {
@@ -320,6 +356,7 @@ mod tests {
                 capture: "go-json".into(),
                 confidence: Confidence::Complete,
                 cases,
+                quarantined: Vec::new(),
             }),
             input_hash: None,
         }
@@ -436,6 +473,7 @@ mod tests {
                 case("TestA 100%", TestOutcome::Fail, 1),
                 case("TestA 100%", TestOutcome::Pass, 2),
             ],
+            quarantined: Vec::new(),
         };
         let lines = flaky_annotations(&report, Path::new("/ws/app"), Path::new("/ws"));
         assert_eq!(

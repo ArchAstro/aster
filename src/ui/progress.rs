@@ -45,6 +45,7 @@ pub struct ProgressDisplay {
     running: Arc<AtomicUsize>,
     /// Targets that passed only on a retry, by address: how many tests
     flaky: HashMap<String, usize>,
+    quarantined: HashMap<String, usize>,
 }
 
 impl ProgressDisplay {
@@ -87,6 +88,7 @@ impl ProgressDisplay {
             cached: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
             flaky: HashMap::new(),
+            quarantined: HashMap::new(),
         }
     }
 
@@ -243,6 +245,12 @@ impl ProgressDisplay {
         self.flaky.insert(address.to_string(), tests);
     }
 
+    /// Note that a target passed only because `tests` failing tests are
+    /// quarantined. Call before [`Self::mark_complete`].
+    pub fn mark_quarantined(&mut self, address: &str, tests: usize) {
+        self.quarantined.insert(address.to_string(), tests);
+    }
+
     /// Mark a target as complete
     ///
     /// Updates counts and removes spinner. Behavior differs by mode:
@@ -271,7 +279,8 @@ impl ProgressDisplay {
         }
 
         let flaky = self.flaky.remove(address).filter(|_| success);
-        let flaky_note = flaky
+        let quarantined = self.quarantined.remove(address).filter(|_| success);
+        let mut flaky_note = flaky
             .map(|tests| {
                 format!(
                     " {} flaky: {tests} test{} passed on retry",
@@ -280,6 +289,13 @@ impl ProgressDisplay {
                 )
             })
             .unwrap_or_default();
+        if let Some(tests) = quarantined {
+            flaky_note.push_str(&format!(
+                " {} (quarantined: {tests})",
+                style("\u{2014}").dim()
+            ));
+        }
+        let flaky = flaky.or(quarantined);
 
         // CI mode: print PASS/FAIL with timestamp and duration
         if self.ci_mode {

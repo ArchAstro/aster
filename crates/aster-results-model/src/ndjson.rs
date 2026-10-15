@@ -80,6 +80,7 @@ mod tests {
                 duration_ms: Some(3),
                 failure_hash: None,
                 message: None,
+                quarantined: false,
             }),
         ]
     }

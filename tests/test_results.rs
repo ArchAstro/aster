@@ -702,3 +702,170 @@ fn shards_split_by_the_committed_durations_file_without_a_server() {
         "test test/b_test.exs test/c_test.exs test/d_test.exs\n"
     );
 }
+
+// Quarantine, end to end with a real `go test`.
+
+/// A Go module with a test that always fails (`TestQuarantined`), one that
+/// passes, and, when `also_failing`, a second failing test. `after` depends
+/// on `test` and records that it ran.
+fn quarantine_go_workspace(also_failing: bool, quarantine_file: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "app/go.mod",
+        "module example.com/app\n\ngo 1.21\n",
+    );
+    let other = if also_failing {
+        "\nfunc TestReal(t *testing.T) { t.Fatal(\"a real failure\") }\n"
+    } else {
+        ""
+    };
+    write(
+        tmp.path(),
+        "app/app_test.go",
+        &format!(
+            "package app\n\nimport \"testing\"\n\n\
+             func TestFine(t *testing.T) {{}}\n\n\
+             func TestQuarantined(t *testing.T) {{ t.Fatal(\"flaky on CI\") }}\n{other}"
+        ),
+    );
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"go test ./...\"\n\n\
+         [targets.after]\ncommand = \"touch ../after.ran\"\ndepends_on = [\"//self:test\"]\n",
+    );
+    if !quarantine_file.is_empty() {
+        write(tmp.path(), "aster-quarantine.toml", quarantine_file);
+    }
+    tmp
+}
+
+const QUARANTINE_FILE: &str = r#"
+[[test]]
+name = "TestQuarantined"
+target = "//app"
+reason = "flaky on CI, see #1"
+expires = 2999-01-01
+"#;
+
+#[test]
+fn a_target_whose_only_failures_are_quarantined_passes_and_says_so() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = quarantine_go_workspace(false, QUARANTINE_FILE);
+    let results = tmp.path().join("out/results.ndjson");
+    let step = tmp.path().join("step-summary.md");
+    let output = aster_in_github(
+        tmp.path(),
+        &step,
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "run",
+            "//app:after",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stderr}\n{stdout}");
+    assert!(
+        stderr.contains("[aster] Quarantine: 1 from aster-quarantine.toml"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    // Go names a test's package, not its file.
+    assert!(
+        stderr.contains("::warning::TestQuarantined failed but is quarantined"),
+        "{stderr}"
+    );
+    // The dependent target ran.
+    assert!(tmp.path().join("after.ran").exists());
+
+    let records = read_records(&results);
+    assert_eq!(target_status(&records, "//app:test"), TargetStatus::Passed);
+    let quarantined: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Test(t) if t.quarantined => Some(t.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(quarantined, ["TestQuarantined"]);
+    let summary = fs::read_to_string(&step).unwrap();
+    assert!(summary.contains("1 quarantined"), "{summary}");
+    assert!(
+        summary.contains("| quarantined | TestQuarantined"),
+        "{summary}"
+    );
+    // The run already warned; the summary adds no error for it.
+    assert!(!stderr.contains("::error"), "{stderr}");
+}
+
+#[test]
+fn any_other_failure_still_fails_the_target() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = quarantine_go_workspace(true, QUARANTINE_FILE);
+    let output = aster(
+        tmp.path(),
+        &["--no-cache", "--test-results=out/r.ndjson", "test", "//app"],
+    );
+    assert!(!output.status.success());
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        all.contains("1 of 2 failing tests are quarantined; the others still fail"),
+        "{all}"
+    );
+}
+
+#[test]
+fn quarantine_can_be_turned_off_and_needs_captured_results() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = quarantine_go_workspace(false, QUARANTINE_FILE);
+    let off = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_QUARANTINE", "off")
+        .env_remove("ASTER_SRV_URL")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .args(["--no-cache", "--test-results=out/r.ndjson", "test", "//app"])
+        .output()
+        .unwrap();
+    assert!(!off.status.success());
+    assert!(String::from_utf8_lossy(&off.stderr).contains("Quarantine: off"));
+    // Without --test-results or --retry-failed nothing is captured, so
+    // nothing is let through.
+    let plain = aster(tmp.path(), &["--no-cache", "test", "//app"]);
+    assert!(!plain.status.success());
+}
+
+#[test]
+fn a_bad_quarantine_file_is_an_error() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = quarantine_go_workspace(false, "[[test]]\nname = \"TestQuarantined\"\n");
+    let output = aster(
+        tmp.path(),
+        &["--no-cache", "--test-results=out/r.ndjson", "test", "//app"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("aster-quarantine.toml"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

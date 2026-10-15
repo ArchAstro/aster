@@ -127,6 +127,10 @@ pub struct TestSummary {
     /// The tests that failed and then passed on a retry
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flaky: Vec<FlakyTestSummary>,
+    /// Failing tests the quarantine let through: the target passed
+    /// because of them
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quarantined: Vec<crate::test_results::quarantine::Quarantined>,
 }
 
 /// One test that passed only on a retry
@@ -189,6 +193,7 @@ fn test_summary(report: &crate::test_results::TestReport) -> TestSummary {
                 passed_on_attempt: test.passed_on_attempt,
             })
             .collect(),
+        quarantined: report.quarantined.clone(),
     }
 }
 
@@ -264,6 +269,23 @@ pub fn print_summary(
         );
     }
     println!("Total time: {total_duration}ms");
+
+    let quarantined: Vec<_> = results
+        .iter()
+        .filter_map(|r| {
+            let tests = &r.tests.as_ref()?.quarantined;
+            (r.success && !tests.is_empty()).then_some((r, tests))
+        })
+        .collect();
+    if !quarantined.is_empty() {
+        println!("\nPassed with quarantined failures:");
+        for (result, tests) in quarantined {
+            println!("  - {} (quarantined: {})", result.address, tests.len());
+            for test in tests {
+                println!("      {} ({})", test.name, test.source);
+            }
+        }
+    }
 
     if failed > 0 {
         println!("\nFailed projects:");
@@ -512,6 +534,7 @@ mod tests {
                     case("c", TestOutcome::Error),
                     case("d", TestOutcome::Skip),
                 ],
+                quarantined: Vec::new(),
             }),
             input_hash: None,
         };

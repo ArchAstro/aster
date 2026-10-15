@@ -166,6 +166,7 @@ fn stream(run_id: &str, repo: &str, tests: usize) -> Vec<Record> {
             duration_ms: Some(5),
             failure_hash: failed.then(|| "f3a9".into()),
             message: failed.then(|| "** (DBConnection.OwnershipError) boom".into()),
+            quarantined: false,
         }));
     }
     records

@@ -18,7 +18,8 @@ mod jest;
 mod junit;
 mod libtest;
 pub(crate) mod nodetest;
-mod stream;
+pub mod quarantine;
+pub(crate) mod stream;
 pub mod summary;
 pub mod upload;
 
@@ -63,6 +64,9 @@ pub struct TestReport {
     /// (`cd ../platform && mix test`). Test identities use it, so a test
     /// keeps its id whichever shard runs it.
     pub project: Option<String>,
+    /// Failing tests the quarantine let through, when it let the target
+    /// pass.
+    pub quarantined: Vec<quarantine::Quarantined>,
 }
 
 /// A test that failed in one attempt and passed in a later one.
@@ -502,6 +506,7 @@ mod tests {
                     message: None,
                 },
             ],
+            quarantined: Vec::new(),
         };
         assert_eq!(report.failures(), 1);
     }
