@@ -37,6 +37,7 @@ use crate::test_results::{
 use crate::ui::ProgressDisplay;
 
 mod partitions;
+pub use partitions::partitioned_suites;
 mod retry;
 
 use super::command::parse_command;
@@ -802,7 +803,6 @@ impl<'a> Executor<'a> {
                 &commands,
                 &working_dir,
                 self.workspace_root,
-                project_map,
                 &|name| std::env::var(name).ok(),
             ) {
                 Some(balanced) => vec![balanced],

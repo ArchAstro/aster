@@ -2,17 +2,18 @@
 //!
 //! Each partition of a suite runs on its own runner and works out its own
 //! share, so every partition must reach the same split from the same
-//! inputs: the file list (from the checkout), and each file's median
-//! duration as aster-srv reported it for the UTC day of the commit (which
-//! the server answers the same way however often it is asked). The split
-//! is greedy longest-processing-time: the longest file first, each to the
-//! partition with the least time so far.
+//! inputs: the file list and the durations in [`FILE`], both from the
+//! checkout. Nothing is fetched while the suite runs, so no partition can
+//! see different durations from another. `aster results durations` writes
+//! the file from aster-srv's medians, to be committed like any change. The
+//! split is greedy longest-processing-time: the longest file first, each to
+//! the partition with the least time so far.
 //!
-//! Durations are a hint. Without them (no server, no history, an error)
-//! the command runs as written, and Mix deals the files out itself.
+//! Without the file, or without the suite in it, the command runs as
+//! written and Mix deals the files out itself, on every partition alike.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -80,93 +81,114 @@ pub fn expected_ms(files: &[String], all: &[String], durations: &Durations) -> u
         .sum()
 }
 
-/// The UTC day of `HEAD`'s commit, the same on every runner of that commit.
-pub fn commit_day(workspace_root: &Path) -> Option<NaiveDate> {
-    let output = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%cI", "HEAD"])
-        .current_dir(workspace_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// The durations file, at the workspace root.
+pub const FILE: &str = "aster-durations.json";
+/// The [`DurationsFile::version`] this Aster writes and reads.
+const VERSION: u32 = 1;
+
+/// [`FILE`]: each partitioned suite's file durations.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DurationsFile {
+    pub version: u32,
+    /// The UTC day the medians were computed as of, `YYYY-MM-DD`.
+    pub day: String,
+    /// By the suite's directory, relative to the workspace root.
+    pub suites: BTreeMap<String, Suite>,
+}
+
+/// One partitioned suite in [`FILE`].
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Suite {
+    /// The partition targets whose runs the medians come from.
+    pub targets: Vec<String>,
+    /// Each test file's median duration in milliseconds.
+    pub files: BTreeMap<String, u64>,
+}
+
+/// The durations [`FILE`] records for the suite in `suite` (relative to
+/// the workspace root). `Ok(None)`: no file, or the suite is not in it.
+pub fn read(workspace_root: &Path, suite: &str) -> Result<Option<Durations>> {
+    let path = workspace_root.join(FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {FILE}")),
+    };
+    let file: DurationsFile =
+        serde_json::from_slice(&bytes).with_context(|| format!("cannot parse {FILE}"))?;
+    if file.version != VERSION {
+        bail!(
+            "{FILE} is version {}, this Aster reads {VERSION}",
+            file.version
+        );
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let at = chrono::DateTime::parse_from_rfc3339(text.trim()).ok()?;
-    Some(at.with_timezone(&chrono::Utc).date_naive())
+    Ok(file
+        .suites
+        .get(suite)
+        .map(|suite| suite.files.iter().map(|(f, ms)| (f.clone(), *ms)).collect()))
 }
 
-#[derive(Serialize, Deserialize)]
-struct Cached {
-    targets: Vec<String>,
-    /// `YYYY-MM-DD`.
-    day: String,
-    files: Vec<CachedFile>,
+/// Write `file` as [`FILE`], sorted and pretty, so a refresh diffs cleanly.
+pub fn write(workspace_root: &Path, file: &DurationsFile) -> Result<()> {
+    let mut text = serde_json::to_string_pretty(file)?;
+    text.push('\n');
+    std::fs::write(workspace_root.join(FILE), text).with_context(|| format!("cannot write {FILE}"))
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedFile {
-    file: String,
-    p50_ms: u64,
-}
-
-fn cache_path(workspace_root: &Path, targets: &[String], day: NaiveDate) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for target in targets {
-        hasher.update(target.as_bytes());
-        hasher.update([0]);
-    }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    workspace_root
-        .join(".aster")
-        .join("durations")
-        .join(format!("{day}-{}.json", &digest[..16]))
-}
-
-/// The durations of the files `targets` ran, as of `day`. `Ok(None)`: no
-/// server is configured. Answers are kept under `.aster/durations/`, since
-/// the server's answer for a day does not change.
-pub fn fetch(
-    workspace_root: &Path,
-    targets: &[String],
+/// A [`DurationsFile`] for `suites` (each a directory and its partition
+/// targets), with aster-srv's medians as of `day`.
+pub fn fetch_all(
+    url: &str,
+    suites: &[(String, Vec<String>)],
     day: NaiveDate,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<Durations>> {
-    let Some(url) = env("ASTER_SRV_URL").filter(|url| !url.is_empty()) else {
-        return Ok(None);
-    };
-    let mut targets = targets.to_vec();
-    targets.sort();
-    targets.dedup();
-    let cache = cache_path(workspace_root, &targets, day);
-    if let Some(found) = std::fs::read(&cache)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Cached>(&bytes).ok())
-        .filter(|cached| cached.targets == targets && cached.day == day.to_string())
-    {
-        return Ok(Some(
-            found
-                .files
-                .into_iter()
-                .map(|f| (f.file, f.p50_ms))
-                .collect(),
-        ));
-    }
+) -> Result<DurationsFile> {
     let Some(credentials) = Credentials::from_env(env) else {
-        bail!("no credentials for {url}");
+        bail!("no credentials for {url}: in GitHub Actions grant `id-token: write`; elsewhere set ASTER_SRV_TOKEN");
     };
+    let mut file = DurationsFile {
+        version: VERSION,
+        day: day.to_string(),
+        suites: BTreeMap::new(),
+    };
+    for (dir, targets) in suites {
+        let mut targets = targets.clone();
+        targets.sort();
+        targets.dedup();
+        if targets.len() > MAX_TARGETS {
+            bail!(
+                "{dir} has {} partition targets; aster-srv takes at most {MAX_TARGETS}",
+                targets.len()
+            );
+        }
+        let files = fetch(url, &credentials, env, &targets, day)
+            .with_context(|| format!("durations of {dir}"))?;
+        file.suites.insert(dir.clone(), Suite { targets, files });
+    }
+    Ok(file)
+}
+
+/// The medians aster-srv reports for the files `targets` ran, as of `day`.
+fn fetch(
+    url: &str,
+    credentials: &Credentials,
+    env: &dyn Fn(&str) -> Option<String>,
+    targets: &[String],
+    day: NaiveDate,
+) -> Result<BTreeMap<String, u64>> {
+    #[derive(Deserialize)]
+    struct File {
+        file: String,
+        p50_ms: u64,
+    }
     let mut path = format!("/v1/test-results/durations?day={day}");
-    for target in &targets {
+    for target in targets {
         path.push_str(&format!("&target={}", percent_encode(target)));
     }
     let mut attempt = 1;
     let body = loop {
         let result =
-            Server::connect_with_timeout(&url, &credentials, proxy_token_from_env(env), TIMEOUT)
+            Server::connect_with_timeout(url, credentials, proxy_token_from_env(env), TIMEOUT)
                 .and_then(|server| server.get_json(&path));
         match result {
             Ok(Some(body)) => break body,
@@ -178,27 +200,9 @@ pub fn fetch(
             }
         }
     };
-    let files: Vec<CachedFile> = serde_json::from_value(body["files"].clone())
+    let files: Vec<File> = serde_json::from_value(body["files"].clone())
         .context("cannot read the server's durations")?;
-    let cached = Cached {
-        targets,
-        day: day.to_string(),
-        files,
-    };
-    if let Some(parent) = cache.parent() {
-        if std::fs::create_dir_all(parent).is_ok() {
-            if let Ok(bytes) = serde_json::to_vec(&cached) {
-                let _ = std::fs::write(&cache, bytes);
-            }
-        }
-    }
-    Ok(Some(
-        cached
-            .files
-            .into_iter()
-            .map(|f| (f.file, f.p50_ms))
-            .collect(),
-    ))
+    Ok(files.into_iter().map(|f| (f.file, f.p50_ms)).collect())
 }
 
 #[cfg(test)]
@@ -260,39 +264,49 @@ mod tests {
     }
 
     #[test]
-    fn no_server_means_no_durations() {
+    fn the_file_round_trips_and_names_suites_by_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let day = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
-        let found = fetch(dir.path(), &names(&["//a:test"]), day, &|_| None).unwrap();
-        assert!(found.is_none());
+        assert_eq!(read(dir.path(), "services/platform").unwrap(), None);
+        let file = DurationsFile {
+            version: VERSION,
+            day: "2026-10-15".into(),
+            suites: [(
+                "services/platform".to_string(),
+                Suite {
+                    targets: names(&["//services/platform-test-shard-1:test-ci"]),
+                    files: [("test/a_test.exs".to_string(), 42)].into_iter().collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        write(dir.path(), &file).unwrap();
+        let found = read(dir.path(), "services/platform").unwrap().unwrap();
+        assert_eq!(found["test/a_test.exs"], 42);
+        assert_eq!(read(dir.path(), "services/other").unwrap(), None);
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.ends_with("}\n"), "{text}");
     }
 
     #[test]
-    fn a_cached_answer_is_used_without_the_server() {
+    fn a_broken_or_newer_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let day = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
-        let targets = names(&["//b:test", "//a:test"]);
-        let mut sorted = targets.clone();
-        sorted.sort();
-        let path = cache_path(dir.path(), &sorted, day);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(dir.path().join(FILE), "{").unwrap();
+        assert!(read(dir.path(), "a").is_err());
         std::fs::write(
-            &path,
-            serde_json::to_vec(&Cached {
-                targets: sorted,
-                day: day.to_string(),
-                files: vec![CachedFile {
-                    file: "test/a_test.exs".into(),
-                    p50_ms: 42,
-                }],
-            })
-            .unwrap(),
+            dir.path().join(FILE),
+            r#"{"version":2,"day":"x","suites":{}}"#,
         )
         .unwrap();
-        // The URL is unreachable and there are no credentials: only the
-        // cache can answer.
-        let env = |name: &str| (name == "ASTER_SRV_URL").then(|| "http://127.0.0.1:9".to_string());
-        let found = fetch(dir.path(), &targets, day, &env).unwrap().unwrap();
-        assert_eq!(found["test/a_test.exs"], 42);
+        let error = read(dir.path(), "a").unwrap_err().to_string();
+        assert!(error.contains("version 2"), "{error}");
+    }
+
+    #[test]
+    fn fetching_needs_credentials() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 15).unwrap();
+        let suites = vec![("app".to_string(), names(&["//a:test"]))];
+        let error = fetch_all("http://127.0.0.1:9", &suites, day, &|_| None).unwrap_err();
+        assert!(error.to_string().contains("no credentials"), "{error}");
     }
 }

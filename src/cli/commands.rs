@@ -626,6 +626,20 @@ pub enum ResultsCommands {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Write aster-durations.json from aster-srv, for balanced partitions
+    ///
+    /// Finds every `MIX_TEST_PARTITION=K mix test --partitions N` suite in
+    /// the workspace and writes each test file's median duration, from the
+    /// partitions' recent runs, to aster-durations.json at the workspace
+    /// root. Commit it: each partition then splits the suite by those
+    /// durations, from the checkout, so all partitions of a commit agree.
+    /// Uses the credentials `upload` uses. Leaves the file unchanged and
+    /// exits 1 when any suite cannot be fetched.
+    Durations {
+        /// The aster-srv URL [default: $ASTER_SRV_URL]
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 /// Project-level subcommands

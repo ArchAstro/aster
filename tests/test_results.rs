@@ -561,3 +561,144 @@ fn results_failures_exits_nonzero_when_it_cannot_ask() {
         assert!(stderr.contains(message), "{stderr}");
     }
 }
+
+/// Answers one request with `body` and hands back the request line.
+fn serve_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        request_line
+    });
+    (url, handle)
+}
+
+/// Two shard projects that each run a partition of `app`'s suite, and a
+/// `mix` on PATH that writes what it was asked to run to
+/// `app/ran-<partition>.txt`.
+#[cfg(unix)]
+fn partitioned_workspace() -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "app/mix.exs", "[app: :app]\n");
+    for file in ["a", "b", "c", "d"] {
+        write(tmp.path(), &format!("app/test/{file}_test.exs"), "");
+    }
+    for k in [1, 2] {
+        write(
+            tmp.path(),
+            &format!("shard-{k}/package.json"),
+            &format!(r#"{{"name":"shard-{k}","private":true}}"#),
+        );
+        write(
+            tmp.path(),
+            &format!("shard-{k}/aster.toml"),
+            &format!(
+                "[targets.test-ci]\ncommand = \"bash -c 'cd ../app && MIX_TEST_PARTITION={k} exec mix test --partitions 2'\"\n"
+            ),
+        );
+    }
+    write(
+        tmp.path(),
+        "bin/mix",
+        "#!/bin/sh\necho \"$*\" > \"ran-$MIX_TEST_PARTITION.txt\"\n",
+    );
+    let mix = tmp.path().join("bin/mix");
+    fs::set_permissions(&mix, fs::Permissions::from_mode(0o755)).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+fn aster_with_mix(root: &Path, args: &[&str]) -> Output {
+    let path = format!(
+        "{}:{}",
+        root.join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(root)
+        .env("PATH", path)
+        .env_remove("ASTER_SRV_URL")
+        .env_remove("ASTER_BALANCE_PARTITIONS")
+        .env("ASTER_SRV_TOKEN", "t")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[cfg(unix)]
+fn shards_split_by_the_committed_durations_file_without_a_server() {
+    let ws = partitioned_workspace();
+    let root = ws.path();
+    // Without the file, Mix deals the files out.
+    let output = aster_with_mix(root, &["run", "//shard-1:test-ci", "--no-cache"]);
+    let log = String::from_utf8_lossy(&output.stderr).to_string()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{log}");
+    let ran = |k: u32| fs::read_to_string(root.join(format!("app/ran-{k}.txt"))).unwrap();
+    assert_eq!(ran(1), "test --partitions 2\n");
+    assert!(
+        log.contains("split by Mix (no durations for app in aster-durations.json)"),
+        "{log}"
+    );
+
+    // `aster results durations` writes the file from the server.
+    let (url, server) = serve_once(
+        r#"{"files":[{"file":"test/a_test.exs","p50_ms":100,"runs":3},{"file":"test/b_test.exs","p50_ms":10,"runs":3},{"file":"test/c_test.exs","p50_ms":10,"runs":3},{"file":"test/d_test.exs","p50_ms":80,"runs":3}]}"#,
+    );
+    let output = aster_with_mix(root, &["results", "durations", "--url", &url]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = server.join().unwrap();
+    assert!(
+        request.contains("target=%2F%2Fshard-1%3Atest-ci&target=%2F%2Fshard-2%3Atest-ci"),
+        "{request}"
+    );
+    let file: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("aster-durations.json")).unwrap())
+            .unwrap();
+    assert_eq!(file["suites"]["app"]["files"]["test/a_test.exs"], 100);
+
+    // Each shard now runs its share by name, with no server configured.
+    let run = |shard: &str| {
+        let output = aster_with_mix(root, &["run", &format!("//{shard}:test-ci"), "--no-cache"]);
+        let log = String::from_utf8_lossy(&output.stderr).to_string()
+            + &String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{log}");
+        log
+    };
+    let first = run("shard-1");
+    assert!(
+        first.contains("balanced by duration: 1 of 4 files"),
+        "{first}"
+    );
+    assert_eq!(ran(1), "test test/a_test.exs\n");
+    run("shard-2");
+    assert_eq!(
+        ran(2),
+        "test test/b_test.exs test/c_test.exs test/d_test.exs\n"
+    );
+}
