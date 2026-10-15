@@ -143,6 +143,23 @@ WHERE outcome IN ('fail', 'error') AND failure_hash IS NOT NULL
 GROUP BY repo, failure_hash;
 "#,
     },
+    Migration {
+        feature: "test_results",
+        version: 3,
+        // The dashboard's failure clusters read one repository's failures
+        // from the last days. Without this, that scans every result of those
+        // days (about 0.4M a day, 4x slower on a seeded 12M-row copy); with
+        // it, only the failing rows. The index is partial, so it stays a
+        // few percent of the table. Creating it on the partitioned parent
+        // takes a SHARE lock on each partition until the migration commits,
+        // which holds back uploads for about the build time (about a second
+        // for 30 days of data) and waits behind or is retried after
+        // in-flight ones, within the migration lock timeout.
+        sql: r#"
+CREATE INDEX test_results_failures ON test_results.test_results (repo, received_on)
+    WHERE outcome IN ('fail', 'error') AND failure_hash IS NOT NULL;
+"#,
+    },
 ];
 
 /// The day-partitioned tables.

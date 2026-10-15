@@ -40,6 +40,19 @@ pub struct Config {
     /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
+    /// `ASTER_SRV_IAP_AUDIENCE`: the Google IAP audience the dashboard (`/ui`)
+    /// accepts, `/projects/NUMBER/global/backendServices/ID` (or, for GKE
+    /// ingress, which assigns the ID, a prefix ending in `/` such as
+    /// `/projects/NUMBER/global/backendServices/`). Unset disables the
+    /// dashboard unless `ASTER_SRV_UI_DEV_EMAIL` is set.
+    pub iap_audience: Option<String>,
+    /// `ASTER_SRV_UI_EMAIL_DOMAINS`: comma-separated domains (`example.com`,
+    /// or `*.example.com` for subdomains) whose emails may view the
+    /// dashboard. Unset lets every identity that passes IAP in.
+    pub ui_email_domains: Option<EmailDomains>,
+    /// `ASTER_SRV_UI_DEV_EMAIL`: the viewer the dashboard assumes when no IAP
+    /// audience is configured. For local development only.
+    pub ui_dev_email: Option<String>,
 }
 
 /// A fixed bearer token standing in for one repository.
@@ -114,6 +127,18 @@ impl Config {
                 .context("ASTER_SRV_MAX_BODY_BYTES must be a number of bytes")?,
             None => 64 * 1024 * 1024,
         };
+        let ui_email_domains = match var("ASTER_SRV_UI_EMAIL_DOMAINS") {
+            Some(domains) => Some(EmailDomains::parse(&domains)?),
+            None => None,
+        };
+        let iap_audience =
+            var("ASTER_SRV_IAP_AUDIENCE").map(|audience| audience.trim().to_string());
+        if iap_audience.as_deref().is_some_and(|a| !a.starts_with('/')) {
+            bail!(
+                "ASTER_SRV_IAP_AUDIENCE must look like /projects/NUMBER/global/backendServices/ID \
+                 (or end in / to match any backend service of a project)"
+            );
+        }
         Ok(Self {
             listen,
             database_url,
@@ -126,6 +151,9 @@ impl Config {
             default_branch: var("ASTER_SRV_DEFAULT_BRANCH").unwrap_or_else(|| "main".to_string()),
             broken_runs,
             max_body_bytes,
+            iap_audience,
+            ui_email_domains,
+            ui_dev_email: var("ASTER_SRV_UI_DEV_EMAIL").map(|email| email.trim().to_string()),
         })
     }
 }
@@ -170,6 +198,47 @@ impl RepositoryAllowlist {
     }
 }
 
+/// Email domains allowed to view the dashboard.
+#[derive(Debug, Clone)]
+pub struct EmailDomains(Vec<String>);
+
+impl EmailDomains {
+    /// `example.com` matches that domain; `*.example.com` matches its
+    /// subdomains (not `example.com` itself).
+    pub fn parse(value: &str) -> Result<Self> {
+        let entries: Vec<String> = value
+            .split(',')
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        for entry in &entries {
+            let domain = entry.strip_prefix("*.").unwrap_or(entry);
+            if domain.is_empty() || domain.contains(['@', '*', '/']) {
+                bail!("email domain '{entry}' must be example.com or *.example.com");
+            }
+        }
+        if entries.is_empty() {
+            bail!("ASTER_SRV_UI_EMAIL_DOMAINS lists no domain");
+        }
+        Ok(Self(entries))
+    }
+
+    /// Whether `email` (any case) is at an allowed domain.
+    pub fn allows(&self, email: &str) -> bool {
+        let email = email.to_ascii_lowercase();
+        let Some((local, domain)) = email.rsplit_once('@') else {
+            return false;
+        };
+        !local.is_empty()
+            && self.0.iter().any(|entry| match entry.strip_prefix("*.") {
+                Some(suffix) => domain
+                    .strip_suffix(suffix)
+                    .is_some_and(|rest| rest.ends_with('.') && rest.len() > 1),
+                None => *entry == domain,
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +269,52 @@ mod tests {
         assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
         assert!(config.static_tokens.is_empty());
         assert!(config.raw_bucket.is_none());
+        assert!(config.iap_audience.is_none());
+        assert!(config.ui_email_domains.is_none());
+        assert!(config.ui_dev_email.is_none());
+    }
+
+    #[test]
+    fn reads_the_dashboard_settings() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push((
+            "ASTER_SRV_IAP_AUDIENCE",
+            "/projects/123456/global/backendServices/",
+        ));
+        pairs.push(("ASTER_SRV_UI_EMAIL_DOMAINS", "Example.com, *.corp.example"));
+        pairs.push(("ASTER_SRV_UI_DEV_EMAIL", "me@example.com"));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(
+            config.iap_audience.as_deref(),
+            Some("/projects/123456/global/backendServices/")
+        );
+        let domains = config.ui_email_domains.unwrap();
+        assert!(domains.allows("a@example.com"));
+        assert_eq!(config.ui_dev_email.as_deref(), Some("me@example.com"));
+
+        for (name, bad) in [
+            ("ASTER_SRV_IAP_AUDIENCE", "no-slash"),
+            ("ASTER_SRV_UI_EMAIL_DOMAINS", "a@b.com"),
+            ("ASTER_SRV_UI_EMAIL_DOMAINS", "*."),
+        ] {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push((name, bad));
+            assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn email_domains_match_exactly_or_by_wildcard() {
+        let domains = EmailDomains::parse("example.com, *.gserviceaccount.com").unwrap();
+        assert!(domains.allows("Ann@Example.com"));
+        assert!(domains.allows("ci@proj.iam.gserviceaccount.com"));
+        assert!(!domains.allows("ci@gserviceaccount.com"));
+        assert!(!domains.allows("ci@evilgserviceaccount.com"));
+        assert!(!domains.allows("a@sub.example.com"));
+        assert!(!domains.allows("a@example.com.evil.io"));
+        assert!(!domains.allows("example.com"));
+        assert!(!domains.allows("@example.com"));
+        assert!(EmailDomains::parse(" , ").is_err());
     }
 
     #[test]

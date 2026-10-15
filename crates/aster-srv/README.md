@@ -203,6 +203,45 @@ and let CI pass IAP with Workload Identity Federation:
    `ASTER_SRV_PROXY_TOKEN`; `Authorization` keeps the GitHub OIDC token, so
    the server still knows which repository is uploading.
 
+## Dashboard
+
+`/ui` is a server-rendered, read-only HTML dashboard for people, not CI. It
+needs no JavaScript.
+
+| Path | Shows |
+|---|---|
+| `/ui` | Flaky leaderboard (flake score, last flake) and broken tests |
+| `/ui/tests/:test_id?repo=owner/name` | One test: state, a pass/fail strip (oldest to newest) and recent results with failure messages |
+| `/ui/clusters` | Failures of the last 7 days grouped by failure hash |
+| `/ui/quarantine` | The quarantine list; empty until quarantine exists |
+
+`?repo=owner/name` picks the repository; without it the one with the newest
+run is shown. Any repository on `ASTER_SRV_REPOSITORIES` can be viewed.
+
+Viewers are identified by the Google IAP assertion
+(`x-goog-iap-jwt-assertion`): ES256, signed by Google's published IAP keys,
+unexpired, issued by `https://cloud.google.com/iap`, addressed to
+`ASTER_SRV_IAP_AUDIENCE`. The viewer is the assertion's `email`. The pod must
+accept traffic only through IAP, since the header is trusted once verified.
+
+`ASTER_SRV_IAP_AUDIENCE` is `/projects/PROJECT_NUMBER/global/backendServices/ID`.
+GKE ingress assigns the backend service ID, so a value ending in `/`, such as
+`/projects/123456/global/backendServices/`, matches any backend service of
+that project. Without it the dashboard is off (`/ui` is a 404).
+
+`ASTER_SRV_UI_EMAIL_DOMAINS` limits who may view: `example.com` for that
+domain, `*.example.com` for its subdomains. Unset, anyone who passes IAP may
+view, including service accounts such as the CI uploader; set it to keep
+those out (list `*.gserviceaccount.com` to let them in).
+
+For local development, `ASTER_SRV_UI_DEV_EMAIL=you@example.com` with no IAP
+audience makes the dashboard trust that viewer without any sign-in. Never set
+it where the server is reachable by others; the server logs a warning at
+startup.
+
+Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
+`Referrer-Policy: same-origin` and `X-Frame-Options: DENY`.
+
 ## Configuration
 
 | Variable | Default | |
@@ -217,6 +256,9 @@ and let CI pass IAP with Workload Identity Federation:
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
 | `ASTER_SRV_RAW_BUCKET` | unset | A GCS bucket that keeps each upload as sent, using the pod's Workload Identity. Give the bucket a lifecycle rule that deletes objects after the retention period. |
+| `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts, exact or a prefix ending in `/`. Unset turns the dashboard off. See [Dashboard](#dashboard). |
+| `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
+| `ASTER_SRV_UI_DEV_EMAIL` | unset | The viewer to trust when no IAP audience is set. Development only. |
 | `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. |
 
 Logs are one JSON object per line, with `severity` and `message`.

@@ -44,7 +44,7 @@ pub fn parse_route(path: &str) -> Option<Route> {
     }
 }
 
-fn percent_decode(text: &str) -> Option<String> {
+pub(crate) fn percent_decode(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -68,7 +68,7 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn parse_query(query: Option<&str>) -> Option<Vec<(String, String)>> {
+pub(crate) fn parse_query(query: Option<&str>) -> Option<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
