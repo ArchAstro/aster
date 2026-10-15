@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use aster_srv::auth::Verifier;
+use aster_srv::iap::IapVerifier;
 use aster_srv::raw_store::RawStore;
 use aster_srv::{App, Config};
 use chrono::{DateTime, Utc};
@@ -16,6 +17,10 @@ use serde_json::{json, Value};
 
 const PRIVATE: &[u8] = include_bytes!("../fixtures/test-oidc-key.pem");
 const PUBLIC: &[u8] = include_bytes!("../fixtures/test-oidc-key.pub.pem");
+const IAP_PRIVATE: &[u8] = include_bytes!("../fixtures/test-iap-key.pem");
+const IAP_PUBLIC: &[u8] = include_bytes!("../fixtures/test-iap-key.pub.pem");
+/// The audience dashboard tests configure and sign for.
+pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
 pub const REPO: &str = "ArchAstro/firstlanding";
 
 pub struct Server {
@@ -103,9 +108,16 @@ pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
     .unwrap();
     let verifier =
         Verifier::new(&config).with_key("test", DecodingKey::from_rsa_pem(PUBLIC).unwrap());
-    let app = App::start_with(config, verifier, Some(RawStore::Memory(Default::default())))
-        .await
-        .unwrap();
+    let iap =
+        IapVerifier::new(&config).with_key("iap", DecodingKey::from_ec_pem(IAP_PUBLIC).unwrap());
+    let app = App::start_with_iap(
+        config,
+        verifier,
+        iap,
+        Some(RawStore::Memory(Default::default())),
+    )
+    .await
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -119,6 +131,50 @@ pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
         database,
         shutdown: Some(shutdown),
     })
+}
+
+impl Server {
+    /// `GET path` as a browser behind IAP: the status, the headers and the
+    /// page. `assertion` is the `x-goog-iap-jwt-assertion` value, if any.
+    pub async fn get_page(
+        &self,
+        path: &str,
+        assertion: Option<&str>,
+    ) -> (u16, reqwest::header::HeaderMap, String) {
+        let mut request = aster_srv::http_client()
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.url));
+        if let Some(assertion) = assertion {
+            request = request.header("x-goog-iap-jwt-assertion", assertion);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        (status, headers, response.text().await.unwrap())
+    }
+}
+
+/// An IAP assertion for `email`, signed with the fixture key.
+pub fn iap_assertion(email: &str) -> String {
+    iap_assertion_for(email, &format!("{IAP_AUDIENCE}4242"))
+}
+
+/// [`iap_assertion`] addressed to `audience`.
+pub fn iap_assertion_for(email: &str, audience: &str) -> String {
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some("iap".into());
+    encode(
+        &header,
+        &json!({
+            "iss": "https://cloud.google.com/iap",
+            "aud": audience,
+            "exp": Utc::now().timestamp() + 300,
+            "email": email,
+        }),
+        &EncodingKey::from_ec_pem(IAP_PRIVATE).unwrap(),
+    )
+    .unwrap()
 }
 
 pub fn token(repository: &str) -> String {

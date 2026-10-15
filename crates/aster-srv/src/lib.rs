@@ -10,9 +10,11 @@ pub mod auth;
 pub mod config;
 pub mod db;
 mod http;
+pub mod iap;
 pub mod log;
 pub mod raw_store;
 pub mod test_results;
+mod ui;
 
 /// An HTTP client builder on aws-lc-rs, the workspace's one TLS provider.
 /// reqwest is built without its own (it would bring ring, and two
@@ -27,13 +29,14 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use config::Config;
-pub use http::{serve, Reply};
+pub use http::{serve, Body, Reply};
 
 /// Everything a request handler needs.
 pub struct App {
     pub config: Config,
     pub pool: deadpool_postgres::Pool,
     pub verifier: auth::Verifier,
+    pub iap: iap::IapVerifier,
     pub raw_store: raw_store::RawStore,
 }
 
@@ -55,6 +58,17 @@ impl App {
         verifier: auth::Verifier,
         raw_store: Option<raw_store::RawStore>,
     ) -> Result<Arc<Self>> {
+        let iap = iap::IapVerifier::new(&config);
+        Self::start_with_iap(config, verifier, iap, raw_store).await
+    }
+
+    /// [`Self::start_with`] with a chosen dashboard verifier. For tests.
+    pub async fn start_with_iap(
+        config: Config,
+        verifier: auth::Verifier,
+        iap: iap::IapVerifier,
+        raw_store: Option<raw_store::RawStore>,
+    ) -> Result<Arc<Self>> {
         let pool = db::pool(&config.database_url)?;
         db::migrate(&pool, &migrations()).await?;
         let raw_store =
@@ -63,6 +77,7 @@ impl App {
             config,
             pool,
             verifier,
+            iap,
             raw_store,
         }))
     }

@@ -26,12 +26,30 @@ use crate::App;
 #[derive(Debug)]
 pub struct Reply {
     pub status: u16,
-    pub body: serde_json::Value,
+    pub body: Body,
+}
+
+/// What a reply carries.
+#[derive(Debug)]
+pub enum Body {
+    Json(serde_json::Value),
+    /// A page for a browser, sent with the dashboard's security headers.
+    Html(String),
 }
 
 impl Reply {
     pub fn json(status: u16, body: serde_json::Value) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body: Body::Json(body),
+        }
+    }
+
+    pub fn html(status: u16, page: String) -> Self {
+        Self {
+            status,
+            body: Body::Html(page),
+        }
     }
 
     pub fn error(status: u16, message: impl Into<String>) -> Self {
@@ -39,12 +57,23 @@ impl Reply {
     }
 
     fn into_response(self) -> Response<Full<Bytes>> {
-        let mut response = Response::new(Full::new(Bytes::from(self.body.to_string())));
+        let (content_type, body, is_html) = match self.body {
+            Body::Json(body) => ("application/json", body.to_string(), false),
+            Body::Html(page) => ("text/html; charset=utf-8", page, true),
+        };
+        let mut response = Response::new(Full::new(Bytes::from(body)));
         *response.status_mut() =
             StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let headers = response.headers_mut();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        if is_html {
+            for (name, value) in crate::ui::SECURITY_HEADERS {
+                headers.insert(
+                    hyper::header::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+        }
         response
     }
 }
@@ -113,6 +142,14 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             let route = query::parse_route(path).expect("checked above");
             query::handle(app, &identity, route, request.uri().query()).await
+        }
+        (method, path) if crate::ui::is_ui_path(path) => {
+            let assertion = request
+                .headers()
+                .get(crate::iap::IAP_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            crate::ui::handle(app, method, path, request.uri().query(), assertion).await
         }
         (_, "/healthz" | "/readyz" | "/v1/test-results/runs") => {
             Reply::error(405, "method not allowed")

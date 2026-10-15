@@ -24,6 +24,19 @@ async fn run() -> anyhow::Result<()> {
             json!({"repositories": config.static_tokens.iter().map(|t| &t.repository).collect::<Vec<_>>()}),
         );
     }
+    if config.iap_audience.is_none() {
+        if let Some(email) = &config.ui_dev_email {
+            log::warn(
+                "the dashboard trusts ASTER_SRV_UI_DEV_EMAIL without IAP; use it only for development",
+                json!({"viewer": email}),
+            );
+        }
+    } else if config.ui_dev_email.is_some() {
+        log::warn(
+            "ASTER_SRV_UI_DEV_EMAIL is ignored because ASTER_SRV_IAP_AUDIENCE is set",
+            json!({}),
+        );
+    }
     let listen = config.listen;
     let app = App::start(config).await?;
     aster_srv::test_results::retention::spawn(app.clone());
