@@ -185,7 +185,7 @@ pub struct Lookups {
 }
 
 /// Label the failing entries with `lookup` (a test id to the server's JSON
-/// for it, `None` for 404). At most [`MAX_LOOKUPS`] are made, and none after
+/// for it, `None` for 404). At most 50 are made, and none after
 /// the first error: the rest stay `failed`.
 pub fn label(
     report: &mut Report,
