@@ -43,6 +43,11 @@ impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wrap an already-computed lowercase hex digest.
+    pub(super) fn from_hex(hex: String) -> Self {
+        Self(hex)
+    }
 }
 
 /// What an output path is.

@@ -8,14 +8,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod artifact;
-pub mod gha;
 mod hasher;
+mod local;
 pub mod matcher;
 mod runtime;
 mod store;
 
 pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
 pub use hasher::CacheHasher;
+pub use local::LocalStore;
 pub use matcher::TargetInputMatcher;
 pub use runtime::RuntimeInputCache;
 pub use store::CacheStore;
