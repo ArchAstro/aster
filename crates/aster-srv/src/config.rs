@@ -7,6 +7,37 @@ use anyhow::{bail, Context, Result};
 /// GitHub Actions' OIDC token issuer.
 pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
+/// A Google IAP audience, `/projects/NUMBER/global/backendServices/ID`, or
+/// with the ID left off (a trailing `/`) to stand for any backend service of
+/// the project. Both NUMBER and ID are nonempty runs of digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IapAudience<'a> {
+    pub project: &'a str,
+    /// `None` for the project-wide prefix form.
+    pub backend_service: Option<&'a str>,
+}
+
+impl<'a> IapAudience<'a> {
+    pub fn parse(audience: &'a str) -> Option<Self> {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let rest = audience.strip_prefix("/projects/")?;
+        let (project, rest) = rest.split_once('/')?;
+        let service = rest.strip_prefix("global/backendServices/")?;
+        if !digits(project) {
+            return None;
+        }
+        let backend_service = match service {
+            "" => None,
+            id if digits(id) => Some(id),
+            _ => return None,
+        };
+        Some(Self {
+            project,
+            backend_service,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `ASTER_SRV_LISTEN`, default `0.0.0.0:8080`.
@@ -133,7 +164,10 @@ impl Config {
         };
         let iap_audience =
             var("ASTER_SRV_IAP_AUDIENCE").map(|audience| audience.trim().to_string());
-        if iap_audience.as_deref().is_some_and(|a| !a.starts_with('/')) {
+        if iap_audience
+            .as_deref()
+            .is_some_and(|a| IapAudience::parse(a).is_none())
+        {
             bail!(
                 "ASTER_SRV_IAP_AUDIENCE must look like /projects/NUMBER/global/backendServices/ID \
                  (or end in / to match any backend service of a project)"
@@ -294,6 +328,21 @@ mod tests {
 
         for (name, bad) in [
             ("ASTER_SRV_IAP_AUDIENCE", "no-slash"),
+            ("ASTER_SRV_IAP_AUDIENCE", "/"),
+            ("ASTER_SRV_IAP_AUDIENCE", "/projects/"),
+            ("ASTER_SRV_IAP_AUDIENCE", "/projects/123456/"),
+            (
+                "ASTER_SRV_IAP_AUDIENCE",
+                "/projects/123456/global/backendServices",
+            ),
+            (
+                "ASTER_SRV_IAP_AUDIENCE",
+                "/projects/abc/global/backendServices/",
+            ),
+            (
+                "ASTER_SRV_IAP_AUDIENCE",
+                "/projects/123456/global/backendServices/9/x",
+            ),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "a@b.com"),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "*."),
         ] {
