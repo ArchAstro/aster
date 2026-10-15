@@ -544,9 +544,8 @@ pub enum ResultsCommands {
     /// In GitHub Actions the job's OIDC token is used (the job needs
     /// `permissions: id-token: write`); elsewhere set ASTER_SRV_TOKEN. Behind
     /// an identity-aware proxy, ASTER_SRV_PROXY_TOKEN is sent as
-    /// `Proxy-Authorization`. A
-    /// failed upload is reported but exits 0 unless --strict, so it never
-    /// fails a build.
+    /// `Proxy-Authorization`. A failed upload is reported but exits 0 unless
+    /// --strict, so it never fails a build.
     Upload {
         /// The NDJSON results file
         path: std::path::PathBuf,
@@ -556,6 +555,48 @@ pub enum ResultsCommands {
         /// Exit non-zero when the upload fails
         #[arg(long)]
         strict: bool,
+    },
+    /// Report the failing tests in a results file
+    ///
+    /// Lists tests whose last attempt failed, and tests that failed then
+    /// passed on retry, as Markdown. With a server (--url or ASTER_SRV_URL,
+    /// and the credentials `upload` uses) each failing test is labelled `new`,
+    /// `broken` or `known flake`; without one it is just `failed`. Looking
+    /// tests up never fails the report.
+    ///
+    /// With --github the Markdown is appended to $GITHUB_STEP_SUMMARY and
+    /// GitHub workflow commands (an error annotation per failing test, a
+    /// warning per test that passed on retry) are printed. Nothing is written
+    /// when there are no failures. Aster runs this itself after
+    /// `--test-results` in GitHub Actions unless ASTER_GITHUB_SUMMARY=0.
+    Summary {
+        /// The NDJSON results file
+        path: std::path::PathBuf,
+        /// The aster-srv URL [default: $ASTER_SRV_URL]
+        #[arg(long)]
+        url: Option<String>,
+        /// Write the GitHub step summary and print annotations
+        #[arg(long)]
+        github: bool,
+    },
+    /// Print the failing tests of a GitHub Actions run, from aster-srv
+    ///
+    /// Asks the server for every Aster run recorded under a GitHub run id
+    /// (one per job or lane) and prints their failures as JSON, all pages
+    /// merged: `{github_run, runs, failures, next_cursor}`. Uses the
+    /// credentials and proxy token `upload` uses. Exits 1 with a message on
+    /// stderr when there is no server or credentials, the server cannot be
+    /// reached, or it has no runs for the id, so a script can fall back.
+    Failures {
+        /// The GitHub Actions run id
+        #[arg(long)]
+        github_run: String,
+        /// Only this attempt of the run (GitHub's run_attempt)
+        #[arg(long)]
+        attempt: Option<u32>,
+        /// The aster-srv URL [default: $ASTER_SRV_URL]
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 

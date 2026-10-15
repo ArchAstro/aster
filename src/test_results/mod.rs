@@ -9,6 +9,7 @@
 //! The plan is applied after the cache key is computed from the original
 //! command, so capturing results never changes what is cached.
 
+pub mod client;
 mod context;
 pub(crate) mod exunit;
 mod gojson;
@@ -17,6 +18,7 @@ mod junit;
 mod libtest;
 pub(crate) mod nodetest;
 mod stream;
+pub mod summary;
 pub mod upload;
 
 pub use context::detect_run;

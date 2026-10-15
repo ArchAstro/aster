@@ -96,20 +96,8 @@ fn run() -> Result<()> {
     if matches!(command, Commands::Init) {
         return handle_init(&cwd, cli.verbose);
     }
-    if let Commands::Results {
-        command: ResultsCommands::Upload { path, url, strict },
-    } = &command
-    {
-        let url = url.clone().or_else(|| env::var("ASTER_SRV_URL").ok());
-        let Some(url) = url.filter(|u| !u.is_empty()) else {
-            return Err(anyhow::anyhow!("give --url or set ASTER_SRV_URL"));
-        };
-        let uploaded = upload_test_results(&url, path, output_mode);
-        return if uploaded || !strict {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("the test results were not uploaded"))
-        };
+    if let Commands::Results { command } = &command {
+        return handle_results(command, output_mode);
     }
     if let Commands::Services {
         command: ServicesCommands::Daemon { command },
@@ -1696,8 +1684,92 @@ fn write_test_results(
             return;
         }
     }
-    if let Some(url) = env::var("ASTER_SRV_URL").ok().filter(|u| !u.is_empty()) {
+    if let Some(url) = srv_url(None) {
         upload_test_results(&url, &path, OutputMode::Normal);
+    }
+    github_test_summary(&path);
+}
+
+/// `aster results ...`.
+fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<()> {
+    match command {
+        ResultsCommands::Upload { path, url, strict } => {
+            let url = srv_url(url.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("give --url or set ASTER_SRV_URL"))?;
+            if upload_test_results(&url, path, output_mode) || !strict {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("the test results were not uploaded"))
+            }
+        }
+        ResultsCommands::Summary { path, url, github } => aster::test_results::summary::run(
+            &aster::test_results::summary::Options {
+                path,
+                url: srv_url(url.as_deref()),
+                github: *github,
+                flaky_warnings: true,
+            },
+            &|name| env::var(name).ok(),
+            &mut io::stdout().lock(),
+        ),
+        ResultsCommands::Failures {
+            github_run,
+            attempt,
+            url,
+        } => {
+            use aster::test_results::{client::Server, upload::Credentials};
+            let url = srv_url(url.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("give --url or set ASTER_SRV_URL"))?;
+            let env = |name: &str| env::var(name).ok();
+            let credentials = Credentials::from_env(&env).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no credentials: in GitHub Actions grant `id-token: write`; \
+                     elsewhere set ASTER_SRV_TOKEN"
+                )
+            })?;
+            let proxy_token = aster::test_results::upload::proxy_token_from_env(&env);
+            let report = Server::connect(&url, &credentials, proxy_token)?
+                .failures_for_github_run(github_run, *attempt)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("aster-srv has no results for GitHub run {github_run}")
+                })?;
+            println!("{report}");
+            Ok(())
+        }
+    }
+}
+
+/// The server URL from `--url`, else `ASTER_SRV_URL`.
+fn srv_url(flag: Option<&str>) -> Option<String> {
+    flag.map(str::to_string)
+        .or_else(|| env::var("ASTER_SRV_URL").ok())
+        .filter(|url| !url.is_empty())
+}
+
+/// In GitHub Actions, add the run's failures to the job's step summary and
+/// annotate them, unless `ASTER_GITHUB_SUMMARY=0`. Annotations go to stderr
+/// like the retry warnings, so `--json` output stays clean; a run that retried
+/// has already warned about its flaky tests. Never fails the build.
+fn github_test_summary(path: &Path) {
+    let set = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
+    if env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+        || set("GITHUB_STEP_SUMMARY").is_none()
+        || env::var("ASTER_GITHUB_SUMMARY").as_deref() == Ok("0")
+    {
+        return;
+    }
+    let result = aster::test_results::summary::run(
+        &aster::test_results::summary::Options {
+            path,
+            url: srv_url(None),
+            github: true,
+            flaky_warnings: false,
+        },
+        &|name| env::var(name).ok(),
+        &mut io::stderr().lock(),
+    );
+    if let Err(error) = result {
+        eprintln!("[aster] Warning: test results summary not written: {error:#}");
     }
 }
 
