@@ -147,6 +147,10 @@ pub struct Run<'a> {
     pub input_hash: &'a str,
     pub cached: bool,
     pub confidence: Option<&'a str>,
+    pub job: Option<&'a str>,
+    pub lane: Option<&'a str>,
+    /// The CI attempt.
+    pub attempt: Option<i32>,
     /// `(test_id, outcome, attempt, failure_hash)`.
     pub results: Vec<(&'a str, &'a str, i32, Option<&'a str>)>,
 }
@@ -162,12 +166,22 @@ impl<'a> Run<'a> {
             input_hash: "h1",
             cached: false,
             confidence: Some("complete"),
+            job: None,
+            lane: None,
+            attempt: None,
             results: Vec::new(),
         }
     }
 
     pub fn hash(mut self, input_hash: &'a str) -> Self {
         self.input_hash = input_hash;
+        self
+    }
+
+    pub fn job(mut self, job: &'a str, lane: &'a str, attempt: i32) -> Self {
+        self.job = Some(job);
+        self.lane = Some(lane);
+        self.attempt = Some(attempt);
         self
     }
 
@@ -198,9 +212,19 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
     client
         .execute(
             "INSERT INTO test_results.runs \
-             (run_id, repo, sha, branch, aster_version, started_at, received_at) \
-             VALUES ($1, $2, $3, $4, '0', $5, $5)",
-            &[&run.run_id, &run.repo, &run.sha, &run.branch, &run.at],
+             (run_id, repo, sha, branch, job, lane, attempt, aster_version, started_at, \
+              received_at) \
+             VALUES ($1, $2, $3, $4, $6, $7, $8, '0', $5, $5)",
+            &[
+                &run.run_id,
+                &run.repo,
+                &run.sha,
+                &run.branch,
+                &run.at,
+                &run.job,
+                &run.lane,
+                &run.attempt,
+            ],
         )
         .await
         .unwrap();

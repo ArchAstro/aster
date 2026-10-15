@@ -435,6 +435,179 @@ async fn reports_a_runs_failures_with_their_state() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn reports_the_failures_of_a_github_run() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    let gh = "gh:ArchAstro/firstlanding:900";
+    let platform = format!("{gh}:1:test-ci:platform:test:00");
+    let web = format!("{gh}:1:test-ci:web:test:01");
+    let rerun = format!("{gh}:2:test-ci:platform:test:02");
+    // Run 9000 must not match run 900.
+    let other_run = "gh:ArchAstro/firstlanding:9000:1:test-ci:x:test:03";
+    seed(
+        &server,
+        &Run::new(&platform, "main", ago(now, 30))
+            .job("test-ci", "platform", 1)
+            .result("dead", "fail", Some("d"))
+            .attempt("retried", "fail", 1, Some("r"))
+            .attempt("retried", "pass", 2, None),
+    )
+    .await;
+    seed(
+        &server,
+        &Run::new(&web, "main", ago(now, 29))
+            .job("test-ci", "web", 1)
+            .result("fresh", "error", Some("n"))
+            .result("fine", "pass", None),
+    )
+    .await;
+    seed(
+        &server,
+        &Run::new(&rerun, "main", ago(now, 5))
+            .job("test-ci", "platform", 2)
+            .result("fine", "pass", None),
+    )
+    .await;
+    seed(
+        &server,
+        &Run::new(other_run, "main", ago(now, 5))
+            .job("test-ci", "x", 1)
+            .result("nine", "fail", Some("z")),
+    )
+    .await;
+    let mut foreign = Run::new("gh:ArchAstro/other:900:1:j:l:t:04", "main", ago(now, 5)).result(
+        "theirs",
+        "fail",
+        Some("x"),
+    );
+    foreign.repo = OTHER;
+    seed(&server, &foreign).await;
+    // Seeded now, then aged past retention.
+    let old = Run::new(
+        "gh:ArchAstro/firstlanding:800:1:j:l:t:05",
+        "main",
+        ago(now, 5),
+    )
+    .result("ancient", "fail", Some("a"));
+    seed(&server, &old).await;
+    server
+        .client()
+        .await
+        .batch_execute(
+            "UPDATE test_results.runs SET received_at = now() - interval '40 days' \
+             WHERE run_id LIKE 'gh:ArchAstro/firstlanding:800:%'",
+        )
+        .await
+        .unwrap();
+    classifier::run_once(&server.app, now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let path = "/v1/test-results/failures?github_run=900";
+    let (status, report) = server.get(path, Some(REPO)).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["github_run"], "900");
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(
+        runs.iter()
+            .map(|r| r["run_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [platform.as_str(), web.as_str(), rerun.as_str()]
+    );
+    assert_eq!(runs[1]["lane"], "web");
+    assert_eq!(runs[1]["job"], "test-ci");
+    assert_eq!(runs[1]["attempt"], 1);
+    assert_eq!(runs[1]["branch"], "main");
+    for key in ["sha", "pr", "received_at"] {
+        assert!(runs[1].get(key).is_some(), "{key}");
+    }
+    assert_eq!(ids(&report, "failures"), ["dead", "retried", "fresh"]);
+    let failures = report["failures"].as_array().unwrap();
+    assert_eq!(failures[0]["run_id"], platform.as_str());
+    assert_eq!(failures[0]["lane"], "platform");
+    assert_eq!(failures[0]["job"], "test-ci");
+    assert_eq!(failures[0]["message"], "boom in dead");
+    assert_eq!(failures[1]["passed_on_retry"], true);
+    assert_eq!(failures[2]["lane"], "web");
+    assert_eq!(failures[2]["state"], "new");
+    assert_eq!(report["next_cursor"], Value::Null);
+
+    // One attempt of the run.
+    let (_, second) = server.get(&format!("{path}&attempt=2"), Some(REPO)).await;
+    assert_eq!(second["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(second["failures"], json!([]));
+
+    // Paged across runs.
+    let mut seen = Vec::new();
+    let mut next = format!("{path}&limit=1");
+    loop {
+        let (status, page) = server.get(&next, Some(REPO)).await;
+        assert_eq!(status, 200, "{page}");
+        seen.extend(ids(&page, "failures"));
+        match page["next_cursor"].as_str() {
+            Some(cursor) => next = format!("{path}&limit=1&cursor={cursor}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["dead", "retried", "fresh"]);
+
+    // Errors: unknown, expired, another repository's, bad parameters.
+    assert_eq!(server.get(path, None).await.0, 401);
+    for missing in ["github_run=1", "github_run=800", "github_run=900&attempt=3"] {
+        assert_eq!(
+            server
+                .get(&format!("/v1/test-results/failures?{missing}"), Some(REPO))
+                .await
+                .0,
+            404,
+            "{missing}"
+        );
+    }
+    let (_, theirs) = server.get(path, Some(OTHER)).await;
+    assert_eq!(ids(&theirs, "failures"), ["theirs"]);
+    for bad in [
+        "",
+        "github_run=",
+        "github_run=9%25",
+        "github_run=x",
+        "github_run=900&attempt=0",
+        "github_run=900&attempt=a",
+        "github_run=900&state=flaky",
+        "github_run=900&limit=1001",
+        "github_run=900&cursor=zz",
+        "github_run=900&cursor=61",
+    ] {
+        assert_eq!(
+            server
+                .get(&format!("/v1/test-results/failures?{bad}"), Some(REPO))
+                .await
+                .0,
+            400,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        server
+            .get(&format!("{path}&repo={OTHER}"), Some(REPO))
+            .await
+            .0,
+        403
+    );
+    // The parameters belong to this route alone.
+    assert_eq!(
+        server
+            .get("/v1/test-results/tests?github_run=900", Some(REPO))
+            .await
+            .0,
+        400
+    );
+    server.stop().await;
+}
+
 /// 20,000 tests in each of 10 runs over three days: 200,000 results.
 async fn seed_large(server: &Server, now: DateTime<Utc>) {
     let client = server.client().await;
