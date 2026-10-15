@@ -16,6 +16,7 @@ upload <file>` sends a file by hand.
 | `GET /v1/test-results/tests` | Tests of the caller's repository, flakiest first. |
 | `GET /v1/test-results/tests/:test_id` | One test's state and history. |
 | `GET /v1/test-results/runs/:run_id/failures` | The failing tests of a run, with their state. |
+| `GET /v1/test-results/failures?github_run=` | The failing tests of every Aster run in one GitHub Actions run. |
 | `GET /healthz` | The process is up. |
 | `GET /readyz` | The database answers. |
 
@@ -144,6 +145,29 @@ any attempt of the run, by `test_id`. Merge-queue reports can skip those with
 
 `state` here is `flaky`, `broken`, or `new` for a failure the classifier
 judges healthy (or has not seen yet).
+
+`GET /v1/test-results/failures?github_run=<id>[&attempt=<n>][&limit=&cursor=]`
+answers the same question for a caller that knows only the GitHub Actions run
+id (one run holds an Aster run per job or lane). It covers the caller's
+repository's runs within the retention period whose `run_id` starts
+`gh:<repo>:<github run>:` (and `<attempt>:`), and is `404` when none match.
+`failures` are the objects above plus `run_id`, `job` and `lane`, ordered by
+`run_id` then `test_id`:
+
+```json
+{
+  "github_run": "18233412",
+  "runs": [
+    { "run_id": "…", "job": "test-ci", "lane": "platform", "sha": "…",
+      "branch": "main", "pr": 16161, "attempt": 1, "received_at": "…" }
+  ],
+  "failures": [ { "run_id": "…", "job": "test-ci", "lane": "platform", "test_id": "…", "…": "as above" } ],
+  "next_cursor": null
+}
+```
+
+`aster results failures --github-run <id>` fetches every page and prints the
+merged JSON.
 
 ## Authentication
 

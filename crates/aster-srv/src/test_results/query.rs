@@ -1,5 +1,7 @@
 //! The read API over test state: `GET /v1/test-results/tests`,
-//! `.../tests/:test_id` and `.../runs/:run_id/failures`.
+//! `.../tests/:test_id`, `.../runs/:run_id/failures` and
+//! `.../failures?github_run=` (the failures of every Aster run in one GitHub
+//! Actions run).
 //!
 //! A caller reads only its own repository's data. Lists page with an opaque
 //! keyset cursor (hex of the last row's sort key), so a page costs the same
@@ -25,6 +27,7 @@ pub enum Route {
     Tests,
     Test(String),
     RunFailures(String),
+    GithubFailures,
 }
 
 /// The route for a request path, with ids percent-decoded (a run id holds
@@ -34,6 +37,7 @@ pub fn parse_route(path: &str) -> Option<Route> {
     let segments: Vec<&str> = rest.split('/').collect();
     match segments.as_slice() {
         ["tests"] => Some(Route::Tests),
+        ["failures"] => Some(Route::GithubFailures),
         ["tests", id] if !id.is_empty() => Some(Route::Test(percent_decode(id)?)),
         ["runs", id, "failures"] if !id.is_empty() => Some(Route::RunFailures(percent_decode(id)?)),
         _ => None,
@@ -102,6 +106,9 @@ struct Params {
     limit: i64,
     cursor: Option<String>,
     state: Option<String>,
+    /// `github_run` and `attempt`, on the route that takes them.
+    github_run: Option<String>,
+    attempt: Option<i32>,
 }
 
 fn params(
@@ -109,6 +116,7 @@ fn params(
     query: Option<&str>,
     max_limit: i64,
     default_limit: i64,
+    github: bool,
 ) -> Result<Params, Reply> {
     let pairs = parse_query(query).ok_or_else(|| Reply::error(400, "the query is not valid"))?;
     let mut found = Params {
@@ -116,6 +124,8 @@ fn params(
         limit: default_limit,
         cursor: None,
         state: None,
+        github_run: None,
+        attempt: None,
     };
     for (key, value) in pairs {
         match key.as_str() {
@@ -151,6 +161,24 @@ fn params(
                 }
                 found.state = Some(value);
             }
+            "github_run" if github => {
+                if value.is_empty()
+                    || value.len() > 20
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(Reply::error(400, "github_run must be a GitHub run id"));
+                }
+                found.github_run = Some(value);
+            }
+            "attempt" if github => {
+                found.attempt = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|attempt| *attempt >= 1)
+                        .ok_or_else(|| Reply::error(400, "attempt must be a positive number"))?,
+                );
+            }
             other => return Err(Reply::error(400, format!("unknown parameter {other}"))),
         }
     }
@@ -162,6 +190,7 @@ pub async fn handle(app: &App, identity: &Identity, route: Route, query: Option<
         Route::Tests => list_tests(app, identity, query).await,
         Route::Test(test_id) => test_detail(app, identity, &test_id, query).await,
         Route::RunFailures(run_id) => run_failures(app, identity, &run_id, query).await,
+        Route::GithubFailures => github_failures(app, identity, query).await,
     };
     match result {
         Ok(reply) | Err(Failure::Reply(reply)) => reply,
@@ -239,7 +268,7 @@ pub fn list_sql(with_state: bool, with_cursor: bool) -> String {
 }
 
 async fn list_tests(app: &App, identity: &Identity, query: Option<&str>) -> Handled {
-    let params = params(identity, query, MAX_LIMIT, DEFAULT_LIMIT)?;
+    let params = params(identity, query, MAX_LIMIT, DEFAULT_LIMIT, false)?;
     let cursor = match &params.cursor {
         Some(cursor) => {
             let (score, test_id) = cursor
@@ -289,7 +318,7 @@ async fn test_detail(
     test_id: &str,
     query: Option<&str>,
 ) -> Handled {
-    let params = params(identity, query, MAX_LIMIT, DEFAULT_LIMIT)?;
+    let params = params(identity, query, MAX_LIMIT, DEFAULT_LIMIT, false)?;
     if params.state.is_some() {
         return Err(Reply::error(400, "state is not a parameter of this route").into());
     }
@@ -399,7 +428,7 @@ async fn run_failures(
     run_id: &str,
     query: Option<&str>,
 ) -> Handled {
-    let params = params(identity, query, MAX_FAILURES, MAX_FAILURES)?;
+    let params = params(identity, query, MAX_FAILURES, MAX_FAILURES, false)?;
     if params.state.is_some() {
         return Err(Reply::error(400, "state is not a parameter of this route").into());
     }
@@ -428,72 +457,20 @@ async fn run_failures(
     let fetch = params.limit + 1;
     let rows = client
         .query(
-            "WITH failing AS MATERIALIZED ( \
-                 SELECT DISTINCT test_id FROM test_results.test_results \
-                 WHERE run_id = $1 AND received_on = $2 AND outcome IN ('fail', 'error') \
-                   AND test_id > $3 \
-                 ORDER BY test_id LIMIT $4) \
-             SELECT tr.test_id, max(tr.target) AS target, \
-                    array_agg(tr.attempt ORDER BY tr.attempt) AS attempts, \
-                    array_agg(tr.outcome ORDER BY tr.attempt) AS outcomes, \
-                    array_agg(tr.duration_ms ORDER BY tr.attempt) AS durations, \
-                    (array_agg(tr.failure_hash ORDER BY tr.attempt DESC) \
-                         FILTER (WHERE tr.outcome IN ('fail', 'error')))[1] AS failure_hash, \
-                    (array_agg(tr.message ORDER BY tr.attempt DESC) \
-                         FILTER (WHERE tr.outcome IN ('fail', 'error')))[1] AS message, \
-                    t.name, t.file, t.suite, t.state, t.flake_score, \
-                    t.broken_since_sha, t.last_flake_at \
-             FROM failing f \
-             JOIN test_results.test_results tr \
-                  ON tr.run_id = $1 AND tr.received_on = $2 AND tr.repo = $5 \
-                 AND tr.test_id = f.test_id \
-             LEFT JOIN test_results.tests t ON t.repo = $5 AND t.test_id = f.test_id \
-             GROUP BY tr.test_id, t.name, t.file, t.suite, t.state, t.flake_score, \
-                      t.broken_since_sha, t.last_flake_at \
-             ORDER BY tr.test_id",
-            &[&run_id, &received_on, &after, &fetch, &repo],
+            &failures_sql(),
+            &[
+                &vec![run_id.to_string()],
+                &vec![received_on],
+                &run_id,
+                &after,
+                &fetch,
+                &repo,
+            ],
         )
         .await?;
     let more = rows.len() as i64 > params.limit;
     let page = &rows[..rows.len().min(params.limit as usize)];
-    let failures: Vec<Value> = page
-        .iter()
-        .map(|row| {
-            let attempts: Vec<i32> = row.get("attempts");
-            let outcomes: Vec<String> = row.get("outcomes");
-            let durations: Vec<Option<i64>> = row.get("durations");
-            // A test the classifier has not seen yet is as new as one it
-            // judged healthy.
-            let state = match row.get::<_, Option<String>>("state").as_deref() {
-                Some("flaky") => "flaky",
-                Some("broken") => "broken",
-                _ => "new",
-            };
-            json!({
-                "test_id": row.get::<_, String>("test_id"),
-                "name": row.get::<_, Option<String>>("name"),
-                "file": row.get::<_, Option<String>>("file"),
-                "suite": row.get::<_, Option<String>>("suite"),
-                "target": row.get::<_, String>("target"),
-                "state": state,
-                "flake_score": row.get::<_, Option<i32>>("flake_score").unwrap_or(0),
-                "last_flake_at": opt_time(row.get("last_flake_at")),
-                "broken_since_sha": row.get::<_, Option<String>>("broken_since_sha"),
-                "failure_hash": row.get::<_, Option<String>>("failure_hash"),
-                "message": row.get::<_, Option<String>>("message"),
-                "final_outcome": outcomes.last(),
-                "passed_on_retry": outcomes.last().is_some_and(|o| o == "pass"),
-                "attempts": attempts
-                    .iter()
-                    .zip(&outcomes)
-                    .zip(&durations)
-                    .map(|((attempt, outcome), duration)| {
-                        json!({"attempt": attempt, "outcome": outcome, "duration_ms": duration})
-                    })
-                    .collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    let failures: Vec<Value> = page.iter().map(failure_json).collect();
     let next = match page.last() {
         Some(last) if more => json!(hex(&last.get::<_, String>("test_id"))),
         _ => Value::Null,
@@ -515,6 +492,196 @@ async fn run_failures(
     ))
 }
 
+/// The failing tests of some runs, ordered by run then test. Parameters:
+/// `$1` run ids and `$2` their `received_on` days (parallel arrays), `$3`/`$4`
+/// the run id and test id to continue after, `$5` the row limit and `$6` the
+/// repository. A run has one `failing` row per test, whatever its attempts.
+fn failures_sql() -> String {
+    "WITH wanted AS (SELECT * FROM unnest($1::text[], $2::date[]) AS w(run_id, received_on)), \
+          failing AS MATERIALIZED ( \
+             SELECT DISTINCT tr.run_id, tr.received_on, tr.test_id \
+             FROM wanted w \
+             JOIN test_results.test_results tr \
+                  ON tr.run_id = w.run_id AND tr.received_on = w.received_on \
+             WHERE tr.repo = $6 AND tr.outcome IN ('fail', 'error') \
+               AND (tr.run_id, tr.test_id) > ($3, $4) \
+             ORDER BY tr.run_id, tr.test_id LIMIT $5) \
+     SELECT tr.run_id, tr.test_id, max(tr.target) AS target, \
+            array_agg(tr.attempt ORDER BY tr.attempt) AS attempts, \
+            array_agg(tr.outcome ORDER BY tr.attempt) AS outcomes, \
+            array_agg(tr.duration_ms ORDER BY tr.attempt) AS durations, \
+            (array_agg(tr.failure_hash ORDER BY tr.attempt DESC) \
+                 FILTER (WHERE tr.outcome IN ('fail', 'error')))[1] AS failure_hash, \
+            (array_agg(tr.message ORDER BY tr.attempt DESC) \
+                 FILTER (WHERE tr.outcome IN ('fail', 'error')))[1] AS message, \
+            t.name, t.file, t.suite, t.state, t.flake_score, \
+            t.broken_since_sha, t.last_flake_at \
+     FROM failing f \
+     JOIN test_results.test_results tr \
+          ON tr.run_id = f.run_id AND tr.received_on = f.received_on AND tr.repo = $6 \
+         AND tr.test_id = f.test_id \
+     LEFT JOIN test_results.tests t ON t.repo = $6 AND t.test_id = f.test_id \
+     GROUP BY tr.run_id, tr.test_id, t.name, t.file, t.suite, t.state, t.flake_score, \
+              t.broken_since_sha, t.last_flake_at \
+     ORDER BY tr.run_id, tr.test_id"
+        .to_string()
+}
+
+/// One failing test as the failure reports show it.
+fn failure_json(row: &Row) -> Value {
+    let attempts: Vec<i32> = row.get("attempts");
+    let outcomes: Vec<String> = row.get("outcomes");
+    let durations: Vec<Option<i64>> = row.get("durations");
+    // A test the classifier has not seen yet is as new as one it judged
+    // healthy.
+    let state = match row.get::<_, Option<String>>("state").as_deref() {
+        Some("flaky") => "flaky",
+        Some("broken") => "broken",
+        _ => "new",
+    };
+    json!({
+        "test_id": row.get::<_, String>("test_id"),
+        "name": row.get::<_, Option<String>>("name"),
+        "file": row.get::<_, Option<String>>("file"),
+        "suite": row.get::<_, Option<String>>("suite"),
+        "target": row.get::<_, String>("target"),
+        "state": state,
+        "flake_score": row.get::<_, Option<i32>>("flake_score").unwrap_or(0),
+        "last_flake_at": opt_time(row.get("last_flake_at")),
+        "broken_since_sha": row.get::<_, Option<String>>("broken_since_sha"),
+        "failure_hash": row.get::<_, Option<String>>("failure_hash"),
+        "message": row.get::<_, Option<String>>("message"),
+        "final_outcome": outcomes.last(),
+        "passed_on_retry": outcomes.last().is_some_and(|o| o == "pass"),
+        "attempts": attempts
+            .iter()
+            .zip(&outcomes)
+            .zip(&durations)
+            .map(|((attempt, outcome), duration)| {
+                json!({"attempt": attempt, "outcome": outcome, "duration_ms": duration})
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The `LIKE` pattern for the `run_id`s of one GitHub Actions run (and
+/// attempt), as `detect_run` builds them: `gh:<repo>:<run>:<attempt>:...`.
+/// The fixed part is escaped, then `%` matches the rest.
+pub fn github_run_pattern(repo: &str, github_run: &str, attempt: Option<i32>) -> String {
+    let mut prefix = format!("gh:{repo}:{github_run}:");
+    if let Some(attempt) = attempt {
+        prefix.push_str(&format!("{attempt}:"));
+    }
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for c in prefix.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// `GET /v1/test-results/failures?github_run=`: the runs Aster recorded for
+/// one GitHub Actions run, and their failing tests, merged.
+async fn github_failures(app: &App, identity: &Identity, query: Option<&str>) -> Handled {
+    let params = params(identity, query, MAX_FAILURES, MAX_FAILURES, true)?;
+    if params.state.is_some() {
+        return Err(Reply::error(400, "state is not a parameter of this route").into());
+    }
+    let Some(github_run) = &params.github_run else {
+        return Err(Reply::error(400, "github_run is required").into());
+    };
+    let (after_run, after_test) = match &params.cursor {
+        Some(cursor) => cursor
+            .split_once('\n')
+            .map(|(run, test)| (run.to_string(), test.to_string()))
+            .ok_or_else(|| Reply::error(400, "the cursor is not valid"))?,
+        None => (String::new(), String::new()),
+    };
+    let pattern = github_run_pattern(&params.repo, github_run, params.attempt);
+    let since = Utc::now() - chrono::Days::new(u64::from(app.config.retention_days));
+    let client = app.pool.get().await?;
+    let runs = client
+        .query(
+            "SELECT run_id, job, lane, sha, branch, pr, attempt, received_at, \
+                    (received_at AT TIME ZONE 'UTC')::date AS received_on \
+             FROM test_results.runs \
+             WHERE repo = $1 AND received_at >= $2 AND run_id ILIKE $3 ESCAPE '\\' \
+             ORDER BY run_id LIMIT 500",
+            &[&params.repo, &since, &pattern],
+        )
+        .await?;
+    if runs.is_empty() {
+        return Err(Reply::error(404, "no runs recorded for that GitHub run").into());
+    }
+    let run_ids: Vec<String> = runs.iter().map(|run| run.get("run_id")).collect();
+    let days: Vec<chrono::NaiveDate> = runs.iter().map(|run| run.get("received_on")).collect();
+    let fetch = params.limit + 1;
+    let rows = client
+        .query(
+            &failures_sql(),
+            &[
+                &run_ids,
+                &days,
+                &after_run,
+                &after_test,
+                &fetch,
+                &params.repo,
+            ],
+        )
+        .await?;
+    let more = rows.len() as i64 > params.limit;
+    let page = &rows[..rows.len().min(params.limit as usize)];
+    let failures: Vec<Value> = page
+        .iter()
+        .map(|row| {
+            let mut failure = failure_json(row);
+            let run_id: String = row.get("run_id");
+            let run = runs
+                .iter()
+                .find(|run| run.get::<_, String>("run_id") == run_id);
+            failure["run_id"] = json!(run_id);
+            failure["job"] = json!(run.and_then(|run| run.get::<_, Option<String>>("job")));
+            failure["lane"] = json!(run.and_then(|run| run.get::<_, Option<String>>("lane")));
+            failure
+        })
+        .collect();
+    let next = match page.last() {
+        Some(last) if more => json!(hex(&format!(
+            "{}\n{}",
+            last.get::<_, String>("run_id"),
+            last.get::<_, String>("test_id")
+        ))),
+        _ => Value::Null,
+    };
+    let runs: Vec<Value> = runs
+        .iter()
+        .map(|run| {
+            json!({
+                "run_id": run.get::<_, String>("run_id"),
+                "job": run.get::<_, Option<String>>("job"),
+                "lane": run.get::<_, Option<String>>("lane"),
+                "sha": run.get::<_, String>("sha"),
+                "branch": run.get::<_, Option<String>>("branch"),
+                "pr": run.get::<_, Option<i64>>("pr"),
+                "attempt": run.get::<_, Option<i32>>("attempt"),
+                "received_at": time(run.get("received_at")),
+            })
+        })
+        .collect();
+    Ok(Reply::json(
+        200,
+        json!({
+            "github_run": github_run,
+            "runs": runs,
+            "failures": failures,
+            "next_cursor": next,
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,7 +697,12 @@ mod tests {
             parse_route("/v1/test-results/runs/gh:A%2Fb:1:1/failures"),
             Some(Route::RunFailures("gh:A/b:1:1".into()))
         );
+        assert_eq!(
+            parse_route("/v1/test-results/failures"),
+            Some(Route::GithubFailures)
+        );
         for path in [
+            "/v1/test-results/failures/x",
             "/v1/test-results/runs",
             "/v1/test-results/tests/",
             "/v1/test-results/runs/x",
@@ -546,6 +718,15 @@ mod tests {
         assert_eq!(unhex(&hex("3\nabc")).as_deref(), Some("3\nabc"));
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
+    }
+
+    #[test]
+    fn github_run_patterns_escape_like_metacharacters() {
+        assert_eq!(github_run_pattern("a/b", "123", None), "gh:a/b:123:%");
+        assert_eq!(
+            github_run_pattern("Arch_Astro/we%ird", "9", Some(2)),
+            r"gh:Arch\_Astro/we\%ird:9:2:%"
+        );
     }
 
     #[test]
