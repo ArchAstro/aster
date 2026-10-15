@@ -55,6 +55,7 @@ table and `retry_setup`.
 | `ASTER_SRV_PROXY_TOKEN` | Sent as `Proxy-Authorization` when the server sits behind an identity-aware proxy. |
 | `ASTER_GITHUB_SUMMARY` | `0` stops the step summary and annotations in GitHub Actions. |
 | `ASTER_QUARANTINE` | `off` stops quarantine; failures fail as usual. |
+| `ASTER_BALANCE_PARTITIONS` | `off` keeps Mix's own split for `mix test --partitions` shards. |
 
 An upload or lookup that fails never fails the build. `aster results upload
 <file>`, `aster results summary <file> [--github]` and `aster results failures
@@ -152,13 +153,26 @@ expires = 2026-11-15
 
 A malformed file stops the run with an error naming the entry.
 
-## 6. Notifications
+## 6. Balanced partitions
+
+A target that runs one partition of a Mix suite
+(`MIX_TEST_PARTITION=K mix test --partitions N`) runs an explicit file list
+when `ASTER_SRV_URL` is set: the suite's files split longest-first by their
+median duration on the server, as of the commit's UTC day, so every shard
+gets the same split. With no history, an error or
+`ASTER_BALANCE_PARTITIONS=off`, the shard keeps Mix's own split. A shard's
+tests are recorded under the project whose suite it runs (the directory the
+command `cd`s to), so a test has one id, and one quarantine entry, whichever
+shard ran it. See
+[Durations](../crates/aster-srv/README.md#durations).
+
+## 7. Notifications
 
 The server can POST to webhooks when a test is quarantined, released, expires
 from quarantine, or breaks. See
 [Webhooks](../crates/aster-srv/README.md#webhooks).
 
-## 7. Self-hosting
+## 8. Self-hosting
 
 aster-srv is one binary (and the image
 `ghcr.io/archastro/aster-srv:<aster version>`) that needs Postgres. The
