@@ -152,6 +152,18 @@ fn validate_restore_entries(
         }
         checked.push(entry.clone());
     }
+    for entry in &checked {
+        refuse_symlinked_ancestor(project_root, &entry.path, &seen)?;
+        if let Some(link) = checked.iter().find(|other| {
+            other.kind == OutputKind::Symlink && entry.path.starts_with(&format!("{}/", other.path))
+        }) {
+            bail!(
+                "cache restore path `{}` is under symlink `{}`",
+                entry.path,
+                link.path
+            );
+        }
+    }
     checked.sort_by(|left, right| {
         left.path
             .matches('/')
@@ -162,16 +174,47 @@ fn validate_restore_entries(
     Ok(checked)
 }
 
+/// Refuse an existing, undeclared ancestor of `rel` that is a symlink, so
+/// removal and writes never pass through a link that may point outside the
+/// project. A declared ancestor is unlinked (not followed) before its
+/// descendants are touched, so checking stops there.
+fn refuse_symlinked_ancestor(
+    project_root: &Path,
+    rel: &str,
+    declared: &BTreeSet<String>,
+) -> Result<()> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    for depth in 1..parts.len() {
+        let ancestor = parts[..depth].join("/");
+        if declared.contains(&ancestor) {
+            return Ok(());
+        }
+        match fs::symlink_metadata(project_root.join(&ancestor)) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("cache restore path `{rel}` is under symlinked directory `{ancestor}`")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to stat cache output parent {ancestor}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shallowest first: a declared parent (dir or symlink) is removed before any
+/// descendant, so a descendant is never reached through a symlinked parent.
 fn remove_outputs(project_root: &Path, paths: &[String]) -> Result<()> {
-    let mut deepest_first = paths.to_vec();
-    deepest_first.sort_by(|left, right| {
-        right
-            .matches('/')
+    let mut ordered = paths.to_vec();
+    ordered.sort_by(|left, right| {
+        left.matches('/')
             .count()
-            .cmp(&left.matches('/').count())
-            .then_with(|| right.cmp(left))
+            .cmp(&right.matches('/').count())
+            .then_with(|| left.cmp(right))
     });
-    for rel in deepest_first {
+    for rel in ordered {
         let path = project_root.join(&rel);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -936,5 +979,30 @@ mod tests {
             b"app"
         );
         assert_eq!(fs::read(outside.path().join("secret")).unwrap(), b"keep-me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_output_under_a_symlinked_parent_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/app.js"), b"app");
+
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist/app.js".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        write_file(&outside.path().join("app.js"), b"outside");
+        std::os::unix::fs::symlink(outside.path(), project.path().join("dist")).unwrap();
+
+        let error = restore(project.path(), &entries, &store).unwrap_err();
+        assert!(error.to_string().contains("symlinked directory"), "{error}");
+        assert_eq!(fs::read(outside.path().join("app.js")).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(project.path().join("dist"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }
