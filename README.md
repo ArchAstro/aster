@@ -278,6 +278,10 @@ artifacts. The default cacheable target names are `deps`, `build`, `test`,
 `lint`, `format`, `typecheck`, and `check`. Other targets must opt in with
 `cache.enabled = true`. Set `enabled = false` to opt out.
 
+GitHub Actions can still warm native tool caches (Cargo registry, npm, and
+the rest) with `aster ci cache-plan`. See
+[GitHub Actions](docs/ci/github-actions.md).
+
 Every cache key includes `platform:<os>-<arch>` (for example `platform:linux-x86_64`), so an artifact built on one OS and CPU architecture is never restored on another.
 
 `include`, `exclude`, and `env` extend a target's detected cache inputs.
