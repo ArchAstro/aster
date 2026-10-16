@@ -957,6 +957,10 @@ impl<'a> Executor<'a> {
         let panic_tx = ctx.tx.clone();
         let handle = thread::spawn(move || {
             let run = move || {
+                #[cfg(test)]
+                if test_hooks::should_panic(&addr) {
+                    panic!("injected panic for {addr}");
+                }
                 // Acquire exclusive resource locks (sorted to prevent deadlocks)
                 let _resource_guards: Vec<_> = target_resource_locks
                     .iter()
@@ -1344,6 +1348,28 @@ pub fn collect_target_deps(
         if collected.insert(dep.clone()) {
             collect_target_deps(dep, project_map, collected);
         }
+    }
+}
+
+/// Test-only switch that makes the runner thread of chosen targets panic,
+/// to exercise the panic report path. Keyed by address so parallel tests
+/// do not interfere.
+#[cfg(test)]
+mod test_hooks {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static PANIC_ADDRS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    pub(super) fn panic_on(addr: &str) {
+        let set = PANIC_ADDRS.get_or_init(Default::default);
+        set.lock().unwrap().insert(addr.to_string());
+    }
+
+    pub(super) fn should_panic(addr: &str) -> bool {
+        PANIC_ADDRS
+            .get()
+            .is_some_and(|set| set.lock().unwrap().contains(addr))
     }
 }
 
@@ -3245,30 +3271,263 @@ mod tests {
         assert!(results.iter().all(|result| result.success));
     }
 
+    /// Command that logs `start_<name>`, waits for `until` to exist, then
+    /// logs `end_<name>`. One appended line per event keeps the log in the
+    /// order the events happened.
+    fn critical_section(name: &str, until: Option<&str>) -> String {
+        let wait = until
+            .map(wait_for)
+            .unwrap_or_else(|| "sleep 0.05".to_string());
+        format!(
+            "sh -c 'echo start_{name} >> events; touch up_{name}; {wait}; echo end_{name} >> events'"
+        )
+    }
+
+    /// Events that must read `start_x end_x` pairs: no section interleaves.
+    fn assert_sections_never_interleave(events: &str, names: &[&str]) {
+        let lines: Vec<&str> = events.lines().collect();
+        assert_eq!(lines.len(), names.len() * 2, "every target ran: {lines:?}");
+        for pair in lines.chunks(2) {
+            let name = pair[0].strip_prefix("start_").expect("a start comes first");
+            assert_eq!(
+                pair[1],
+                format!("end_{name}"),
+                "sections interleaved: {lines:?}"
+            );
+        }
+        for name in names {
+            assert!(
+                lines.contains(&format!("start_{name}").as_str()),
+                "{name} ran"
+            );
+        }
+    }
+
+    /// `first` (level 0) holds its section until `first_waits_for` exists. `second`
+    /// depends on `gate`, so it becomes ready while `first` still holds the
+    /// section, and `third` follows at level 2.
+    fn first_second_third(
+        resource: Option<&str>,
+        first_waits_for: &str,
+    ) -> Vec<(&'static str, Target)> {
+        let resources: Vec<&str> = resource.into_iter().collect();
+        vec![
+            (
+                "first",
+                target_with_resources(
+                    &critical_section("first", Some(first_waits_for)),
+                    vec![],
+                    resources.clone(),
+                ),
+            ),
+            ("gate", target("touch gate_done", vec![])),
+            (
+                "second",
+                target_with_resources(
+                    &critical_section("second", None),
+                    vec!["//a:gate"],
+                    resources.clone(),
+                ),
+            ),
+            (
+                "third",
+                target_with_resources(
+                    &critical_section("third", None),
+                    vec!["//a:second"],
+                    resources,
+                ),
+            ),
+        ]
+    }
+
     #[test]
-    fn exclusive_resource_is_never_held_by_two_targets_across_levels() {
-        // `mkdir` fails while another holder has the directory, so any
-        // overlap shows up as exit 9. The holders sit at levels 0, 1 and 2,
-        // and the level-1 holder becomes ready while the first still runs.
+    fn exclusive_resource_sections_never_interleave_across_levels() {
         let tmp = tempfile::tempdir().unwrap();
-        let hold = "sh -c 'mkdir held || exit 9; sleep 0.2; rmdir held'";
-        let holder =
-            |deps: Vec<&str>| target_with_resources(hold, deps, vec!["shared_test_postgres"]);
-        let (results, by_address) = run_targets(
+        let (results, _) = run_targets(
             tmp.path(),
-            vec![
-                ("first", holder(vec![])),
-                ("gate", target("true", vec![])),
-                ("second", holder(vec!["//a:gate"])),
-                ("third", holder(vec!["//a:second"])),
-            ],
+            first_second_third(Some("shared_test_postgres"), "gate_done"),
             &["first", "third"],
         );
 
-        assert_eq!(results.len(), 4);
-        for result in by_address.values() {
-            assert!(result.success, "{}: {}", result.address, result.output);
+        assert!(results.iter().all(|r| r.success), "{results:?}");
+        let events = std::fs::read_to_string(tmp.path().join("events")).unwrap();
+        assert_sections_never_interleave(&events, &["first", "second", "third"]);
+    }
+
+    #[test]
+    fn without_the_shared_resource_the_same_sections_do_overlap() {
+        // Positive control for the test above: with no resource, `first`
+        // stays in its section until `second` has started, so the log
+        // interleaves. This is what the resource lock has to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let (results, _) = run_targets(
+            tmp.path(),
+            first_second_third(None, "up_second"),
+            &["first", "third"],
+        );
+
+        assert!(results.iter().all(|r| r.success), "{results:?}");
+        let events = std::fs::read_to_string(tmp.path().join("events")).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        let position = |event: &str| lines.iter().position(|l| *l == event).unwrap();
+        assert!(
+            position("start_second") < position("end_first"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn targets_holding_several_resources_do_not_deadlock_or_overlap() {
+        // Declared in opposite orders; the executor locks them sorted.
+        // Every section is a start/end pair in the log, and the run ends.
+        let tmp = tempfile::tempdir().unwrap();
+        let section = |name: &str, deps: Vec<&str>, resources: Vec<&str>| {
+            target_with_resources(&critical_section(name, None), deps, resources)
+        };
+        let (results, _) = run_targets(
+            tmp.path(),
+            vec![
+                ("ab", section("ab", vec![], vec!["res_b", "res_a"])),
+                ("ba", section("ba", vec![], vec!["res_a", "res_b"])),
+                ("only_a", section("only_a", vec![], vec!["res_a"])),
+                ("only_b", section("only_b", vec![], vec!["res_b"])),
+                (
+                    "late",
+                    section("late", vec!["//a:ab"], vec!["res_b", "res_a"]),
+                ),
+            ],
+            &["ab", "ba", "only_a", "only_b", "late"],
+        );
+
+        assert!(results.iter().all(|r| r.success), "{results:?}");
+        let events = std::fs::read_to_string(tmp.path().join("events")).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        assert_eq!(lines.len(), 10, "every target ran: {lines:?}");
+        let span = |name: &str| {
+            let at = |event: String| lines.iter().position(|l| *l == event).unwrap();
+            (at(format!("start_{name}")), at(format!("end_{name}")))
+        };
+        // Sections of targets that share a resource must not overlap.
+        let holders: [(&str, &[&str]); 5] = [
+            ("ab", &["res_a", "res_b"]),
+            ("ba", &["res_a", "res_b"]),
+            ("only_a", &["res_a"]),
+            ("only_b", &["res_b"]),
+            ("late", &["res_a", "res_b"]),
+        ];
+        for (i, (left, left_resources)) in holders.iter().enumerate() {
+            for (right, right_resources) in &holders[i + 1..] {
+                if left_resources.iter().any(|r| right_resources.contains(r)) {
+                    let (ls, le) = span(left);
+                    let (rs, re) = span(right);
+                    assert!(
+                        le < rs || re < ls,
+                        "{left} and {right} overlapped: {lines:?}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn panicking_target_is_reported_blocks_dependents_and_frees_its_resource() {
+        let tmp = tempfile::tempdir().unwrap();
+        test_hooks::panic_on("//a:boom");
+        let (results, by_address) = run_targets(
+            tmp.path(),
+            vec![
+                (
+                    "boom",
+                    target_with_resources("touch boom_ran", vec![], vec!["res"]),
+                ),
+                ("after", target("touch after_ran", vec!["//a:boom"])),
+                (
+                    "sibling",
+                    target_with_resources("touch sibling_ran", vec![], vec!["res"]),
+                ),
+            ],
+            &["after", "sibling"],
+        );
+
+        assert_eq!(
+            results.len(),
+            3,
+            "the run terminated with every target reported"
+        );
+        assert!(!by_address["//a:boom"].success);
+        assert!(by_address["//a:boom"].output.contains("panicked"));
+        assert!(by_address["//a:after"]
+            .output
+            .contains("Blocked: prerequisite target(s) failed: //a:boom"));
+        assert!(
+            by_address["//a:sibling"].success,
+            "the resource was released"
+        );
+        assert!(!tmp.path().join("boom_ran").exists());
+        assert!(!tmp.path().join("after_ran").exists());
+    }
+
+    #[test]
+    fn cache_hit_and_skipped_target_each_release_their_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"a"}"#).unwrap();
+        let mut gen_target = target("touch gen_ran", vec![]);
+        gen_target.cache = Some(CacheConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let mut project = make_project_with_targets(
+            "a",
+            HashMap::from([
+                ("gen".to_string(), gen_target),
+                (
+                    "use_gen".to_string(),
+                    target("touch use_gen_ran", vec!["//a:gen"]),
+                ),
+                ("skipped".to_string(), target("touch skipped_ran", vec![])),
+                (
+                    "use_skipped".to_string(),
+                    target("touch use_skipped_ran", vec!["//a:skipped"]),
+                ),
+            ]),
+        );
+        project.root = tmp.path().to_path_buf();
+        let projects = [&project];
+        let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
+        let requested = HashSet::from(["//a:use_gen".to_string()]);
+
+        // Warm the cache, then clear the markers.
+        assert!(executor
+            .execute_targets(&requested, &projects, false)
+            .iter()
+            .all(|r| r.success));
+        for marker in ["gen_ran", "use_gen_ran"] {
+            std::fs::remove_file(tmp.path().join(marker)).unwrap();
+        }
+
+        let results = executor.execute_targets(&requested, &projects, false);
+        let gen_result = results.iter().find(|r| r.address == "//a:gen").unwrap();
+        assert!(gen_result.cached, "second run hits the cache");
+        assert!(results.iter().all(|r| r.success));
+        assert!(!tmp.path().join("gen_ran").exists());
+        assert!(
+            tmp.path().join("use_gen_ran").exists(),
+            "cache hit released its dependent"
+        );
+
+        let overrides = HashMap::from([(
+            "//a:skipped".to_string(),
+            CommandOverride::Skip("no affected files".to_string()),
+        )]);
+        let results =
+            executor.execute_with_command_overrides("use_skipped", &projects, &overrides, None);
+        let skipped = results.iter().find(|r| r.address == "//a:skipped").unwrap();
+        assert!(skipped.skipped);
+        assert!(!tmp.path().join("skipped_ran").exists());
+        assert!(
+            tmp.path().join("use_skipped_ran").exists(),
+            "skip released its dependent"
+        );
     }
 
     #[test]

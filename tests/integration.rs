@@ -199,6 +199,68 @@ cache = { enabled = false }
 
 #[cfg(unix)]
 #[test]
+fn terminating_aster_mid_run_launches_nothing_more_and_exits() {
+    // `long` is running when SIGTERM arrives. Its dependent `after` is not
+    // launched, and Aster drains `long` and exits instead of hanging.
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.long]
+command = "sh long.sh"
+cache = { enabled = false }
+
+[targets.after]
+command = "touch after_ran"
+depends_on = ["//app:long"]
+cache = { enabled = false }
+"#,
+    );
+    fs::write(
+        tmp.path().join("app/long.sh"),
+        "#!/bin/sh\necho $$ > child.pid\nexec sleep 30\n",
+    )
+    .unwrap();
+
+    let mut aster = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["run", "//app:after"])
+        .spawn()
+        .unwrap();
+
+    let child_pid_path = tmp.path().join("app/child.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !child_pid_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child_pid_path.exists(), "target process never started");
+
+    unsafe {
+        libc::kill(aster.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match aster.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = aster.kill();
+                panic!("aster did not exit after SIGTERM");
+            }
+        }
+    };
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        !tmp.path().join("app/after_ran").exists(),
+        "a dependent launched after shutdown"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn captured_targets_do_not_hang_on_stdin_prompts() {
     use std::io::Read;
     use std::process::Stdio;
