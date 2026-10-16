@@ -1,14 +1,15 @@
 //! Parallel command execution with grouped output
 //!
-//! Executes commands in dependency order using DAG levels based on target dependencies:
+//! Executes commands in dependency order:
 //! - Collects all target dependencies transitively (e.g., test depends on deps)
-//! - Level 0: targets with no dependencies
-//! - Level 1: targets depending only on level 0
-//! - Level N: targets depending on level 0..N-1
-//!
-//! Each level executes in parallel, waiting for completion before the next level.
+//! - A target starts as soon as every dependency has finished, without waiting
+//!   for unrelated targets (the run takes as long as its critical path)
+//! - Targets sharing an `exclusive_resources` name never run at the same time
+//! - DAG levels (level 0: no dependencies; level N: dependencies in levels
+//!   0..N-1) are a display concept: dry-run plans, result ordering and the
+//!   tie-break between targets that become ready together
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -283,7 +284,7 @@ impl<'a> Executor<'a> {
     /// Execute a target on selected projects in dependency order
     ///
     /// Respects target dependencies from Target.depends_on (fully resolved by TargetResolver).
-    /// Targets are grouped into DAG levels and each level is executed in parallel.
+    /// Each target starts as soon as its dependencies have finished.
     /// Output is buffered per-target and printed as a group when complete.
     /// Independent branches continue on failure; dependent targets are blocked.
     ///
@@ -467,8 +468,8 @@ impl<'a> Executor<'a> {
         self.execute_target_set(&targets_to_run, &project_map, command_overrides, target)
     }
 
-    /// Shared pipeline: compute DAG levels from `targets_to_run`, run each level
-    /// in parallel with caching, then finalize progress + logs.
+    /// Shared pipeline: schedule `targets_to_run` by dependency readiness
+    /// with caching, then finalize progress + logs.
     fn execute_target_set(
         &self,
         targets_to_run: &HashSet<String>,
@@ -493,8 +494,6 @@ impl<'a> Executor<'a> {
 
         let mut progress = ProgressDisplay::with_verbose(show_progress, verbose_progress);
 
-        let levels = compute_target_levels(targets_to_run, project_map);
-
         progress.set_total(targets_to_run.len());
 
         let cache_store = if self.use_cache {
@@ -511,24 +510,101 @@ impl<'a> Executor<'a> {
         let env_snapshot: HashMap<String, String> = std::env::vars().collect();
         let runtime_inputs = Arc::new(RuntimeInputCache::new(self.workspace_root));
 
-        let mut all_results = Vec::new();
+        let levels = compute_target_levels(targets_to_run, project_map);
+        let level_of: HashMap<String, usize> = levels
+            .iter()
+            .enumerate()
+            .flat_map(|(level, addrs)| addrs.iter().map(move |addr| (addr.clone(), level)))
+            .collect();
+        let mut queue = ReadyQueue::new(targets_to_run, project_map, &level_of);
+
+        // One lock per exclusive resource for the whole run: targets that
+        // share a resource serialize even when they sit at different levels.
+        let resource_mutexes = exclusive_resource_locks(targets_to_run, project_map);
+        let (tx, rx) = mpsc::channel();
+        let ctx = LaunchContext {
+            project_map,
+            command_overrides,
+            cache_store: cache_store.as_ref(),
+            plugin_registry: &plugin_registry,
+            computed_hashes: &computed_hashes,
+            input_hashes: &input_hashes,
+            env_snapshot: &env_snapshot,
+            runtime_inputs: &runtime_inputs,
+            resource_mutexes: &resource_mutexes,
+            tx: &tx,
+        };
+
+        // (level, rank, result): rank 0 for blocked targets, 1 for the rest,
+        // so the final order groups by level and lists blocked targets first.
+        let mut collected: Vec<(usize, u8, ExecutionResult)> = Vec::new();
         let mut failed_or_blocked: HashSet<String> = HashSet::new();
+        let mut handles = Vec::new();
+        let mut running = 0usize;
 
-        for level in levels {
-            if shutdown_requested() {
-                break;
+        // A target starts the moment its last dependency finishes. The loop
+        // blocks on the result channel whenever nothing new can start.
+        loop {
+            let stopping = shutdown_requested();
+            let mut batch = if stopping {
+                Vec::new()
+            } else {
+                queue.take_ready()
+            };
+            if batch.is_empty() && running == 0 && !stopping {
+                // Nothing runs and nothing is ready: a dependency cycle.
+                batch = queue.take_stuck();
             }
-            let mut runnable = Vec::new();
-            let mut blocked_results = Vec::new();
+            if batch.is_empty() {
+                if running == 0 {
+                    break;
+                }
+                let Ok(result) = rx.recv() else { break };
+                running -= 1;
+                if show_progress && !result.cached {
+                    if result.success {
+                        let flaky = result.tests.as_ref().map_or(0, |t| t.flaky().len());
+                        if flaky > 0 {
+                            progress.mark_flaky(&result.address, flaky);
+                        }
+                        let quarantined = result.tests.as_ref().map_or(0, |t| t.quarantined.len());
+                        if quarantined > 0 {
+                            progress.mark_quarantined(&result.address, quarantined);
+                        }
+                    }
+                    progress.mark_complete(
+                        &result.address,
+                        result.success,
+                        result.skipped,
+                        result.duration_ms,
+                    );
+                }
+                if !result.success {
+                    failed_or_blocked.insert(result.address.clone());
+                }
+                queue.complete(&result.address);
+                collected.push((queue.level(&result.address), 1, result));
+                continue;
+            }
 
-            for target_addr in level {
+            for target_addr in batch {
                 let failed_dependencies = target_dependencies(&target_addr, project_map)
                     .into_iter()
                     .filter(|dependency| failed_or_blocked.contains(dependency))
                     .collect::<Vec<_>>();
 
                 if failed_dependencies.is_empty() {
-                    runnable.push(target_addr);
+                    if self.launch_target(
+                        &target_addr,
+                        &ctx,
+                        &mut progress,
+                        show_progress,
+                        &mut handles,
+                    ) {
+                        running += 1;
+                    } else {
+                        queue.complete(&target_addr);
+                    }
                     continue;
                 }
 
@@ -537,45 +613,36 @@ impl<'a> Executor<'a> {
                     progress.mark_complete(&target_addr, false, false, 0);
                 }
                 failed_or_blocked.insert(target_addr.clone());
-                blocked_results.push(ExecutionResult {
-                    address: target_addr,
-                    success: false,
-                    skipped: false,
-                    cached: false,
-                    output: format!(
-                        "Blocked: prerequisite target(s) failed: {}",
-                        failed_dependencies.join(", ")
-                    ),
-                    log: Vec::new(),
-                    duration_ms: 0,
-                    exit_code: None,
-                    tests: None,
-                    input_hash: None,
-                });
+                queue.complete(&target_addr);
+                let level = queue.level(&target_addr);
+                collected.push((
+                    level,
+                    0,
+                    ExecutionResult {
+                        address: target_addr,
+                        success: false,
+                        skipped: false,
+                        cached: false,
+                        output: format!(
+                            "Blocked: prerequisite target(s) failed: {}",
+                            failed_dependencies.join(", ")
+                        ),
+                        log: Vec::new(),
+                        duration_ms: 0,
+                        exit_code: None,
+                        tests: None,
+                        input_hash: None,
+                    },
+                ));
             }
-
-            let level_results = self.execute_target_level(
-                &runnable,
-                project_map,
-                &mut progress,
-                show_progress,
-                command_overrides,
-                cache_store.as_ref(),
-                &plugin_registry,
-                &computed_hashes,
-                &input_hashes,
-                &env_snapshot,
-                &runtime_inputs,
-            );
-            failed_or_blocked.extend(
-                level_results
-                    .iter()
-                    .filter(|result| !result.success)
-                    .map(|result| result.address.clone()),
-            );
-            all_results.extend(blocked_results);
-            all_results.extend(level_results);
         }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+        collected.sort_by_key(|(level, rank, _)| (*level, *rank));
+        let all_results: Vec<ExecutionResult> =
+            collected.into_iter().map(|(_, _, result)| result).collect();
 
         progress.finish();
 
@@ -594,111 +661,67 @@ impl<'a> Executor<'a> {
         all_results
     }
 
-    /// Execute all targets in a single level in parallel
-    #[allow(clippy::too_many_arguments)]
-    fn execute_target_level(
+    /// Start one target: answer it immediately (skipped, cache hit) or spawn
+    /// the thread that runs it. Every outcome is delivered on `ctx.tx`.
+    ///
+    /// Returns whether a result will arrive on `ctx.tx`. It is `false` only
+    /// for an address that names no known project.
+    fn launch_target(
         &self,
-        target_addrs: &[String],
-        project_map: &HashMap<String, &DiscoveredProject>,
+        target_addr: &str,
+        ctx: &LaunchContext<'_>,
         progress: &mut ProgressDisplay,
         show_progress: bool,
-        command_overrides: Option<&HashMap<String, CommandOverride>>,
-        cache_store: Option<&CacheStore>,
-        plugin_registry: &PluginRegistry,
-        computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
-        input_hashes: &Mutex<HashMap<String, String>>,
-        env_snapshot: &HashMap<String, String>,
-        runtime_inputs: &Arc<RuntimeInputCache>,
-    ) -> Vec<ExecutionResult> {
-        let (tx, rx) = mpsc::channel();
-
-        // Build per-resource mutexes for exclusive access within this level.
-        // Targets sharing a resource will serialize; others run in parallel.
-        let resource_mutexes: HashMap<String, Arc<Mutex<()>>> = {
-            let mut resources = HashSet::new();
-            for addr in target_addrs {
-                if let Some((pa, tn)) = parse_target_address(addr) {
-                    if let Some(p) = project_map.get(&pa) {
-                        if let Some(t) = p.targets.get(&tn) {
-                            for r in &t.exclusive_resources {
-                                resources.insert(r.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            resources
-                .into_iter()
-                .map(|r| (r, Arc::new(Mutex::new(()))))
-                .collect()
+        handles: &mut Vec<thread::JoinHandle<()>>,
+    ) -> bool {
+        let LaunchContext {
+            project_map,
+            command_overrides,
+            cache_store,
+            plugin_registry,
+            computed_hashes,
+            input_hashes,
+            env_snapshot,
+            runtime_inputs,
+            resource_mutexes,
+            tx: _,
+        } = *ctx;
+        let target_addr = &target_addr.to_string();
+        // Parse target address: //path/to/project:target_name
+        let (project_addr, target_name) = match parse_target_address(target_addr) {
+            Some((p, t)) => (p, t),
+            None => return false,
         };
 
-        let mut handles = Vec::new();
+        let project = match project_map.get(&project_addr) {
+            Some(p) => *p,
+            None => return false,
+        };
 
-        for target_addr in target_addrs {
-            if shutdown_requested() {
-                break;
-            }
-            // Parse target address: //path/to/project:target_name
-            let (project_addr, target_name) = match parse_target_address(target_addr) {
-                Some((p, t)) => (p, t),
-                None => continue,
-            };
-
-            let project = match project_map.get(&project_addr) {
-                Some(p) => *p,
-                None => continue,
-            };
-
-            // Get the command for this target
-            // Check for command override first (used with --only-affected-files)
-            let commands: Vec<String> = if let Some(overrides) = command_overrides {
-                if let Some(command_override) = overrides.get(target_addr) {
-                    match command_override {
-                        CommandOverride::Run(commands) => commands.clone(),
-                        CommandOverride::Skip(reason) => {
-                            let result = ExecutionResult {
-                                address: target_addr.clone(),
-                                success: true,
-                                skipped: true,
-                                cached: false,
-                                output: format!("Skipped: {reason}"),
-                                log: Vec::new(),
-                                duration_ms: 0,
-                                exit_code: None,
-                                tests: None,
-                                input_hash: None,
-                            };
-                            if show_progress {
-                                progress.mark_skipped(target_addr);
-                            }
-                            let _ = tx.send(result);
-                            continue;
+        // Get the command for this target
+        // Check for command override first (used with --only-affected-files)
+        let commands: Vec<String> = if let Some(overrides) = command_overrides {
+            if let Some(command_override) = overrides.get(target_addr) {
+                match command_override {
+                    CommandOverride::Run(commands) => commands.clone(),
+                    CommandOverride::Skip(reason) => {
+                        let result = ExecutionResult {
+                            address: target_addr.clone(),
+                            success: true,
+                            skipped: true,
+                            cached: false,
+                            output: format!("Skipped: {reason}"),
+                            log: Vec::new(),
+                            duration_ms: 0,
+                            exit_code: None,
+                            tests: None,
+                            input_hash: None,
+                        };
+                        if show_progress {
+                            progress.mark_skipped(target_addr);
                         }
-                    }
-                } else {
-                    match project.targets.get(&target_name) {
-                        Some(t) => vec![t.command.clone()],
-                        None => {
-                            // No target defined - skip
-                            let result = ExecutionResult {
-                                address: target_addr.clone(),
-                                success: true,
-                                skipped: true,
-                                cached: false,
-                                output: format!("Skipped: no '{target_name}' target defined"),
-                                log: Vec::new(),
-                                duration_ms: 0,
-                                exit_code: None,
-                                tests: None,
-                                input_hash: None,
-                            };
-                            if show_progress {
-                                progress.mark_skipped(target_addr);
-                            }
-                            let _ = tx.send(result);
-                            continue;
-                        }
+                        let _ = ctx.tx.send(result);
+                        return true;
                     }
                 }
             } else {
@@ -708,7 +731,7 @@ impl<'a> Executor<'a> {
                         // No target defined - skip
                         let result = ExecutionResult {
                             address: target_addr.clone(),
-                            success: true, // Not an error, just skipped
+                            success: true,
                             skipped: true,
                             cached: false,
                             output: format!("Skipped: no '{target_name}' target defined"),
@@ -721,195 +744,223 @@ impl<'a> Executor<'a> {
                         if show_progress {
                             progress.mark_skipped(target_addr);
                         }
-                        let _ = tx.send(result);
-                        continue;
+                        let _ = ctx.tx.send(result);
+                        return true;
                     }
                 }
-            };
-            // Cache keys and logs see one command per line.
-            let command = commands.join("\n");
-            let excluded_dirs = nested_project_roots(project, project_map);
-            let input_hash = if self.capture_tests {
-                test_input_hash(
-                    target_addr,
-                    &target_name,
-                    &command,
-                    project,
-                    self.workspace_root,
-                    project_map,
-                    plugin_registry,
-                    input_hashes,
-                    env_snapshot,
-                    &excluded_dirs,
-                    runtime_inputs,
-                )
-            } else {
-                None
-            };
-
-            // Check cache if enabled. A miss carries the exact hash that may
-            // be stored after successful execution; `None` means this target
-            // is not cacheable and must not create a cache entry.
-            let mut cache_hash = None;
-            if let Some(store) = cache_store {
-                if let Some((cache_hit, current_hash)) = check_cache(
-                    target_addr,
-                    &target_name,
-                    &command,
-                    project,
-                    self.workspace_root,
-                    store,
-                    plugin_registry,
-                    computed_hashes,
-                    env_snapshot,
-                    &excluded_dirs,
-                    runtime_inputs,
-                ) {
-                    if cache_hit {
-                        // Cache hit - skip execution
-                        let result = ExecutionResult {
-                            address: target_addr.clone(),
-                            success: true,
-                            skipped: false,
-                            cached: true,
-                            output: String::new(),
-                            log: Vec::new(),
-                            duration_ms: 0,
-                            exit_code: None,
-                            tests: None,
-                            input_hash: input_hash.clone(),
-                        };
-                        if show_progress {
-                            progress.mark_cached(target_addr);
-                        }
-                        let _ = tx.send(result);
-                        continue;
-                    } else {
-                        cache_hash = Some(current_hash);
+            }
+        } else {
+            match project.targets.get(&target_name) {
+                Some(t) => vec![t.command.clone()],
+                None => {
+                    // No target defined - skip
+                    let result = ExecutionResult {
+                        address: target_addr.clone(),
+                        success: true, // Not an error, just skipped
+                        skipped: true,
+                        cached: false,
+                        output: format!("Skipped: no '{target_name}' target defined"),
+                        log: Vec::new(),
+                        duration_ms: 0,
+                        exit_code: None,
+                        tests: None,
+                        input_hash: None,
+                    };
+                    if show_progress {
+                        progress.mark_skipped(target_addr);
                     }
-                } else if let Err(e) = store.remove(target_addr) {
-                    // A disabled or currently unhashable target must not leave
-                    // an older entry available for a future false hit.
-                    eprintln!(
-                        "[aster] Warning: Failed to remove unavailable cache for {target_addr}: {e}"
-                    );
+                    let _ = ctx.tx.send(result);
+                    return true;
                 }
             }
-
-            // Add spinner for this target
-            if show_progress {
-                progress.add_running(target_addr);
-            }
-
-            let addr = target_addr.clone();
-            let project_root = project.root.clone();
-            // Use target's working_dir if set, otherwise use project root
-            let working_dir = project
-                .targets
-                .get(&target_name)
-                .and_then(|t| t.working_dir.clone())
-                .unwrap_or_else(|| project_root.clone());
-            // A partition of a suite runs the share recorded durations give
-            // it. Like test capture, this rewrites the commands only after
-            // the cache key and input hash were computed from them as
-            // written.
-            let commands = match partitions::balance(
+        };
+        // Cache keys and logs see one command per line.
+        let command = commands.join("\n");
+        let excluded_dirs = nested_project_roots(project, project_map);
+        let input_hash = if self.capture_tests {
+            test_input_hash(
                 target_addr,
-                &commands,
-                &working_dir,
+                &target_name,
+                &command,
+                project,
                 self.workspace_root,
-                &|name| std::env::var(name).ok(),
-            ) {
-                Some(balanced) => vec![balanced],
-                None => commands,
-            };
-            // From the command as configured, so an override that narrows
-            // it never changes whose tests these are.
-            let test_project = project.targets.get(&target_name).and_then(|target| {
-                partitions::test_owner(project, target, &target.command, project_map)
-            });
-            // Test capture rewrites the commands only now, after the cache
-            // key was computed from the commands as written.
-            let captures = if self.capture_tests || self.retry_failed > 0 {
-                plugin_registry
-                    .find_by_name(&project.plugin_name)
-                    .map(|plugin| {
-                        plan_captures(plugin, &project_root, &working_dir, &target_name, &commands)
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let invocations: Vec<Invocation> = commands
-                .iter()
-                .enumerate()
-                .map(|(index, command)| match captures.get(index) {
-                    Some(Some((plan, _))) => Invocation::planned(command, plan),
-                    _ => Invocation::plain(command),
-                })
-                .collect();
-            let excluded_dirs_for_rehash = excluded_dirs.clone();
-            let tx_clone = tx.clone();
-            let computed_hashes_clone = Arc::clone(computed_hashes);
-            let cache_store_path = cache_store.map(|_| self.cache_dir.clone());
-            let workspace_root_path = self.workspace_root.to_path_buf();
-            let command_clone = command.clone();
-            let target_name_clone = target_name.clone();
-            let plugin_name = project.plugin_name.clone();
-            let env_snapshot_clone = env_snapshot.clone();
-            let runtime_inputs_clone = Arc::clone(runtime_inputs);
-            let target_deps = project
-                .targets
-                .get(&target_name)
-                .map(|target| target.depends_on.clone())
-                .unwrap_or_default();
-            let target_cache_config = project
-                .targets
-                .get(&target_name)
-                .and_then(|target| target.cache.clone());
-            // Get invalidates_cache flag for cache invalidation after execution
-            let invalidates_cache = project
-                .targets
-                .get(&target_name)
-                .map(|t| t.invalidates_cache)
-                .unwrap_or(false);
-            let null_stdin = self.null_stdin;
-            let log_cap = self.log_cap;
-            // Retrying reruns one command, so a target that runs several
-            // (a split `--only-affected-files` run) is not retried.
-            let retry_command =
-                (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
-            let retry_failed = self.retry_failed;
-            // Quarantine judges one command's results, like a retry.
-            let quarantine = self
-                .quarantine
-                .clone()
-                .filter(|_| !captures.is_empty() && commands.len() == 1);
-            let quarantine_command = commands.first().cloned();
-            let retry_setup = project
-                .targets
-                .get(&target_name)
-                .and_then(|target| target.retry_setup.clone());
-            // Collect per-resource mutexes this target needs to acquire
-            let target_resource_locks: Vec<Arc<Mutex<()>>> = {
-                let mut res_names: Vec<&String> = project
-                    .targets
-                    .get(&target_name)
-                    .map(|t| t.exclusive_resources.iter().collect())
-                    .unwrap_or_default();
-                // Sort by resource name to prevent deadlocks
-                res_names.sort();
-                res_names
-                    .iter()
-                    .filter_map(|name| resource_mutexes.get(*name).map(Arc::clone))
-                    .collect()
-            };
+                project_map,
+                plugin_registry,
+                input_hashes,
+                env_snapshot,
+                &excluded_dirs,
+                runtime_inputs,
+            )
+        } else {
+            None
+        };
 
-            let handle = thread::spawn(move || {
+        // Check cache if enabled. A miss carries the exact hash that may
+        // be stored after successful execution; `None` means this target
+        // is not cacheable and must not create a cache entry.
+        let mut cache_hash = None;
+        if let Some(store) = cache_store {
+            if let Some((cache_hit, current_hash)) = check_cache(
+                target_addr,
+                &target_name,
+                &command,
+                project,
+                self.workspace_root,
+                store,
+                plugin_registry,
+                computed_hashes,
+                env_snapshot,
+                &excluded_dirs,
+                runtime_inputs,
+            ) {
+                if cache_hit {
+                    // Cache hit - skip execution
+                    let result = ExecutionResult {
+                        address: target_addr.clone(),
+                        success: true,
+                        skipped: false,
+                        cached: true,
+                        output: String::new(),
+                        log: Vec::new(),
+                        duration_ms: 0,
+                        exit_code: None,
+                        tests: None,
+                        input_hash: input_hash.clone(),
+                    };
+                    if show_progress {
+                        progress.mark_cached(target_addr);
+                    }
+                    let _ = ctx.tx.send(result);
+                    return true;
+                } else {
+                    cache_hash = Some(current_hash);
+                }
+            } else if let Err(e) = store.remove(target_addr) {
+                // A disabled or currently unhashable target must not leave
+                // an older entry available for a future false hit.
+                eprintln!(
+                    "[aster] Warning: Failed to remove unavailable cache for {target_addr}: {e}"
+                );
+            }
+        }
+
+        // Add spinner for this target
+        if show_progress {
+            progress.add_running(target_addr);
+        }
+
+        let addr = target_addr.clone();
+        let project_root = project.root.clone();
+        // Use target's working_dir if set, otherwise use project root
+        let working_dir = project
+            .targets
+            .get(&target_name)
+            .and_then(|t| t.working_dir.clone())
+            .unwrap_or_else(|| project_root.clone());
+        // A partition of a suite runs the share recorded durations give
+        // it. Like test capture, this rewrites the commands only after
+        // the cache key and input hash were computed from them as
+        // written.
+        let commands = match partitions::balance(
+            target_addr,
+            &commands,
+            &working_dir,
+            self.workspace_root,
+            &|name| std::env::var(name).ok(),
+        ) {
+            Some(balanced) => vec![balanced],
+            None => commands,
+        };
+        // From the command as configured, so an override that narrows
+        // it never changes whose tests these are.
+        let test_project = project.targets.get(&target_name).and_then(|target| {
+            partitions::test_owner(project, target, &target.command, project_map)
+        });
+        // Test capture rewrites the commands only now, after the cache
+        // key was computed from the commands as written.
+        let captures = if self.capture_tests || self.retry_failed > 0 {
+            plugin_registry
+                .find_by_name(&project.plugin_name)
+                .map(|plugin| {
+                    plan_captures(plugin, &project_root, &working_dir, &target_name, &commands)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let invocations: Vec<Invocation> = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| match captures.get(index) {
+                Some(Some((plan, _))) => Invocation::planned(command, plan),
+                _ => Invocation::plain(command),
+            })
+            .collect();
+        let excluded_dirs_for_rehash = excluded_dirs.clone();
+        let tx_clone = ctx.tx.clone();
+        let computed_hashes_clone = Arc::clone(computed_hashes);
+        let cache_store_path = cache_store.map(|_| self.cache_dir.clone());
+        let workspace_root_path = self.workspace_root.to_path_buf();
+        let command_clone = command.clone();
+        let target_name_clone = target_name.clone();
+        let plugin_name = project.plugin_name.clone();
+        let env_snapshot_clone = env_snapshot.clone();
+        let runtime_inputs_clone = Arc::clone(runtime_inputs);
+        let target_deps = project
+            .targets
+            .get(&target_name)
+            .map(|target| target.depends_on.clone())
+            .unwrap_or_default();
+        let target_cache_config = project
+            .targets
+            .get(&target_name)
+            .and_then(|target| target.cache.clone());
+        // Get invalidates_cache flag for cache invalidation after execution
+        let invalidates_cache = project
+            .targets
+            .get(&target_name)
+            .map(|t| t.invalidates_cache)
+            .unwrap_or(false);
+        let null_stdin = self.null_stdin;
+        let log_cap = self.log_cap;
+        // Retrying reruns one command, so a target that runs several
+        // (a split `--only-affected-files` run) is not retried.
+        let retry_command =
+            (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
+        let retry_failed = self.retry_failed;
+        // Quarantine judges one command's results, like a retry.
+        let quarantine = self
+            .quarantine
+            .clone()
+            .filter(|_| !captures.is_empty() && commands.len() == 1);
+        let quarantine_command = commands.first().cloned();
+        let retry_setup = project
+            .targets
+            .get(&target_name)
+            .and_then(|target| target.retry_setup.clone());
+        // Collect per-resource mutexes this target needs to acquire
+        let target_resource_locks: Vec<Arc<Mutex<()>>> = {
+            let mut res_names: Vec<&String> = project
+                .targets
+                .get(&target_name)
+                .map(|t| t.exclusive_resources.iter().collect())
+                .unwrap_or_default();
+            // Sort by resource name to prevent deadlocks
+            res_names.sort();
+            res_names
+                .iter()
+                .filter_map(|name| resource_mutexes.get(*name).map(Arc::clone))
+                .collect()
+        };
+
+        let panic_addr = addr.clone();
+        let panic_tx = ctx.tx.clone();
+        let handle = thread::spawn(move || {
+            let run = move || {
                 // Acquire exclusive resource locks (sorted to prevent deadlocks)
                 let _resource_guards: Vec<_> = target_resource_locks
                     .iter()
-                    .map(|m| m.lock().unwrap())
+                    .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
                     .collect();
 
                 if shutdown_requested() {
@@ -977,8 +1028,8 @@ impl<'a> Executor<'a> {
                     match quarantine.judge(&addr, &plugin_name, command, result.exit_code, report) {
                         Verdict::Pass(tests) => {
                             let mut note = format!(
-                                "[aster] Quarantine: every failing test is quarantined, so {addr} passes\n"
-                            );
+                            "[aster] Quarantine: every failing test is quarantined, so {addr} passes\n"
+                        );
                             for test in &tests {
                                 note.push_str(&format!(
                                     "[aster]   {} ({})\n",
@@ -1030,8 +1081,8 @@ impl<'a> Executor<'a> {
                         let store = CacheStore::new(cache_dir);
                         if let Err(e) = store.remove(&addr) {
                             eprintln!(
-                                "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
-                            );
+                            "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
+                        );
                         }
                     }
                 } else {
@@ -1081,8 +1132,8 @@ impl<'a> Executor<'a> {
                                     };
                                     if let Err(e) = store.set(&addr, entry) {
                                         eprintln!(
-                                            "[aster] Warning: Failed to update cache for {addr}: {e}"
-                                        );
+                                        "[aster] Warning: Failed to update cache for {addr}: {e}"
+                                    );
                                     }
                                 }
                                 _ => {
@@ -1092,8 +1143,8 @@ impl<'a> Executor<'a> {
                                     let store = CacheStore::new(cache_dir);
                                     if let Err(e) = store.remove(&addr) {
                                         eprintln!(
-                                            "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
-                                        );
+                                        "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
+                                    );
                                     }
                                 }
                             }
@@ -1110,52 +1161,35 @@ impl<'a> Executor<'a> {
                             addr.rsplit_once(':').map(|(proj, _)| proj).unwrap_or(&addr);
                         if let Err(e) = store.clear_matching(project_addr) {
                             eprintln!(
-                                "[aster] Warning: Failed to invalidate cache for {project_addr}: {e}"
-                            );
+                            "[aster] Warning: Failed to invalidate cache for {project_addr}: {e}"
+                        );
                         }
                     }
                 }
 
                 let _ = tx_clone.send(result.clone());
                 result
-            });
-
-            handles.push((target_addr.clone(), handle));
-        }
-
-        // Drop our sender so rx.iter() completes after all threads finish
-        drop(tx);
-
-        // Collect results from channel and update progress
-        let mut results = Vec::new();
-        for result in rx.iter() {
-            if show_progress && !result.cached {
-                if result.success {
-                    let flaky = result.tests.as_ref().map_or(0, |t| t.flaky().len());
-                    if flaky > 0 {
-                        progress.mark_flaky(&result.address, flaky);
-                    }
-                    let quarantined = result.tests.as_ref().map_or(0, |t| t.quarantined.len());
-                    if quarantined > 0 {
-                        progress.mark_quarantined(&result.address, quarantined);
-                    }
-                }
-                progress.mark_complete(
-                    &result.address,
-                    result.success,
-                    result.skipped,
-                    result.duration_ms,
-                );
+            };
+            // A panic must still report a result: the scheduler counts
+            // results to know when the run is over.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
+                let _ = panic_tx.send(ExecutionResult {
+                    address: panic_addr,
+                    success: false,
+                    skipped: false,
+                    cached: false,
+                    output: "Internal error: target runner panicked".to_string(),
+                    log: Vec::new(),
+                    duration_ms: 0,
+                    exit_code: None,
+                    tests: None,
+                    input_hash: None,
+                });
             }
-            results.push(result);
-        }
+        });
 
-        // Wait for all threads to complete (they should already be done since we drained the channel)
-        for (_, handle) in handles {
-            let _ = handle.join();
-        }
-
-        results
+        handles.push(handle);
+        true
     }
 
     /// Store execution logs to .aster/logs/latest.json
@@ -1309,6 +1343,129 @@ pub fn collect_target_deps(
     for dep in &target.depends_on {
         if collected.insert(dep.clone()) {
             collect_target_deps(dep, project_map, collected);
+        }
+    }
+}
+
+/// Everything `launch_target` shares across targets for one run.
+struct LaunchContext<'a> {
+    project_map: &'a HashMap<String, &'a DiscoveredProject>,
+    command_overrides: Option<&'a HashMap<String, CommandOverride>>,
+    cache_store: Option<&'a CacheStore>,
+    plugin_registry: &'a PluginRegistry,
+    computed_hashes: &'a Arc<Mutex<HashMap<String, String>>>,
+    input_hashes: &'a Mutex<HashMap<String, String>>,
+    env_snapshot: &'a HashMap<String, String>,
+    runtime_inputs: &'a Arc<RuntimeInputCache>,
+    resource_mutexes: &'a HashMap<String, Arc<Mutex<()>>>,
+    tx: &'a mpsc::Sender<ExecutionResult>,
+}
+
+/// One mutex per `exclusive_resources` name used by `targets`.
+fn exclusive_resource_locks(
+    targets: &HashSet<String>,
+    project_map: &HashMap<String, &DiscoveredProject>,
+) -> HashMap<String, Arc<Mutex<()>>> {
+    let mut resources = HashSet::new();
+    for addr in targets {
+        if let Some((project_addr, target_name)) = parse_target_address(addr) {
+            if let Some(target) = project_map
+                .get(&project_addr)
+                .and_then(|project| project.targets.get(&target_name))
+            {
+                resources.extend(target.exclusive_resources.iter().cloned());
+            }
+        }
+    }
+    resources
+        .into_iter()
+        .map(|resource| (resource, Arc::new(Mutex::new(()))))
+        .collect()
+}
+
+/// Dependency-ready queue over the targets of one run.
+///
+/// A target becomes ready when every dependency inside the run has
+/// completed (passed, failed or been blocked). Ready targets come out ordered
+/// by display level, then address, so launch order is deterministic.
+struct ReadyQueue<'a> {
+    /// Dependencies of each target that have not completed yet.
+    unmet: HashMap<String, HashSet<String>>,
+    dependents: HashMap<String, Vec<String>>,
+    ready: BTreeSet<(usize, String)>,
+    level_of: &'a HashMap<String, usize>,
+}
+
+impl<'a> ReadyQueue<'a> {
+    fn new(
+        targets: &HashSet<String>,
+        project_map: &HashMap<String, &DiscoveredProject>,
+        level_of: &'a HashMap<String, usize>,
+    ) -> Self {
+        let mut queue = Self {
+            unmet: HashMap::new(),
+            dependents: HashMap::new(),
+            ready: BTreeSet::new(),
+            level_of,
+        };
+        for addr in targets {
+            let deps: HashSet<String> = target_dependencies(addr, project_map)
+                .into_iter()
+                .filter(|dep| dep != addr && targets.contains(dep))
+                .collect();
+            for dep in &deps {
+                queue
+                    .dependents
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(addr.clone());
+            }
+            if deps.is_empty() {
+                queue.ready.insert((queue.level(addr), addr.clone()));
+            } else {
+                queue.unmet.insert(addr.clone(), deps);
+            }
+        }
+        queue
+    }
+
+    fn level(&self, addr: &str) -> usize {
+        self.level_of.get(addr).copied().unwrap_or(0)
+    }
+
+    /// Take every ready target, lowest level and address first.
+    fn take_ready(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ready)
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect()
+    }
+
+    /// Take the targets still waiting once nothing is ready or running.
+    /// Only a dependency cycle (or what hangs off one) leaves any.
+    fn take_stuck(&mut self) -> Vec<String> {
+        let level_of = self.level_of;
+        let mut stuck: Vec<(usize, String)> = self
+            .unmet
+            .drain()
+            .map(|(addr, _)| (level_of.get(&addr).copied().unwrap_or(0), addr))
+            .collect();
+        stuck.sort();
+        stuck.into_iter().map(|(_, addr)| addr).collect()
+    }
+
+    /// Record that `addr` finished, releasing dependents whose last
+    /// dependency it was.
+    fn complete(&mut self, addr: &str) {
+        for dependent in self.dependents.remove(addr).unwrap_or_default() {
+            let Some(unmet) = self.unmet.get_mut(&dependent) else {
+                continue;
+            };
+            unmet.remove(addr);
+            if unmet.is_empty() {
+                self.unmet.remove(&dependent);
+                self.ready.insert((self.level(&dependent), dependent));
+            }
         }
     }
 }
@@ -2960,185 +3117,225 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_exclusive_resources_serializes_contending_targets() {
-        // Two targets sharing "hex_registry" resource should not run concurrently.
-        // We verify by having each target sleep briefly, then checking that total
-        // duration indicates serialization rather than parallelism.
-        let tmp = std::env::temp_dir().join("aster_test_exclusive");
-        let _ = std::fs::create_dir_all(&tmp);
-
-        // Use atomic counter to track max concurrent executions
-        // The commands will write to files; we check timing via duration
-        let mut targets_a = HashMap::new();
-        targets_a.insert(
-            "deps".to_string(),
-            target_with_resources("sleep 0.15", vec![], vec!["shared_cache"]),
+    /// Run `targets` of one project "a" rooted in a temp dir, through the
+    /// same entry point `aster run` uses, and return the results by address.
+    fn run_targets(
+        tmp: &Path,
+        targets: Vec<(&str, Target)>,
+        requested: &[&str],
+    ) -> (Vec<ExecutionResult>, HashMap<String, ExecutionResult>) {
+        let mut project = make_project_with_targets(
+            "a",
+            targets
+                .into_iter()
+                .map(|(name, target)| (name.to_string(), target))
+                .collect(),
         );
-        let mut targets_b = HashMap::new();
-        targets_b.insert(
-            "deps".to_string(),
-            target_with_resources("sleep 0.15", vec![], vec!["shared_cache"]),
-        );
-
-        let project_a = DiscoveredProject {
-            root: tmp.clone(),
-            config_path: tmp.join("mix.exs"),
-            metadata: ProjectMetadata {
-                name: "a".to_string(),
-                version: Some("1.0.0".to_string()),
-            },
-            dependencies: vec![],
-            targets: targets_a,
-            plugin_name: "elixir".to_string(),
-            languages: vec!["elixir".to_string()],
-            build_system: None,
-            relative_path: PathBuf::from("a"),
-        };
-        let project_b = DiscoveredProject {
-            root: tmp.clone(),
-            config_path: tmp.join("mix.exs"),
-            metadata: ProjectMetadata {
-                name: "b".to_string(),
-                version: Some("1.0.0".to_string()),
-            },
-            dependencies: vec![],
-            targets: targets_b,
-            plugin_name: "elixir".to_string(),
-            languages: vec!["elixir".to_string()],
-            build_system: None,
-            relative_path: PathBuf::from("b"),
-        };
-
-        let projects = [project_a, project_b];
-        let project_map: HashMap<String, &DiscoveredProject> = projects
+        project.root = tmp.to_path_buf();
+        let projects = [&project];
+        let requested: HashSet<String> = requested.iter().map(|t| format!("//a:{t}")).collect();
+        let executor =
+            Executor::with_all_options(tmp, crate::cli::output::OutputMode::Json, false, false);
+        let results = executor.execute_targets(&requested, &projects, false);
+        let by_address = results
             .iter()
-            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .map(|result| (result.address.clone(), result.clone()))
             .collect();
+        (results, by_address)
+    }
 
-        let executor = Executor::new(&tmp);
-        let target_addrs = vec!["//a:deps".to_string(), "//b:deps".to_string()];
-        let mut progress = crate::ui::ProgressDisplay::new(false);
-        let computed_hashes = Arc::new(Mutex::new(HashMap::new()));
-        let env_snapshot = HashMap::new();
-        let plugin_registry = crate::plugins::PluginRegistry::with_all_plugins();
-
-        let start = Instant::now();
-        let results = executor.execute_target_level(
-            &target_addrs,
-            &project_map,
-            &mut progress,
-            false,
-            None,
-            None,
-            &plugin_registry,
-            &computed_hashes,
-            &Mutex::new(HashMap::new()),
-            &env_snapshot,
-            &Arc::new(RuntimeInputCache::new(&tmp)),
-        );
-        let total_ms = start.elapsed().as_millis();
-
-        // Both targets should succeed
-        assert_eq!(results.len(), 2);
-        for r in &results {
-            assert!(r.success, "Target {} should succeed", r.address);
-        }
-
-        // If serialized, total time >= 300ms (2 x 150ms).
-        // If parallel, total time would be ~150ms.
-        assert!(
-            total_ms >= 280,
-            "Contending targets should serialize (took {total_ms}ms, expected >= 280ms)"
-        );
+    /// Shell snippet that succeeds once `file` exists and fails after about
+    /// five seconds. Targets use it to wait for another target's marker, so
+    /// the test asserts on ordering instead of elapsed time.
+    fn wait_for(file: &str) -> String {
+        format!(
+            "i=0; while [ ! -f {file} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; [ -f {file} ]"
+        )
     }
 
     #[test]
-    fn test_exclusive_resources_non_contending_run_parallel() {
-        // Two targets with DIFFERENT resources should run in parallel
-        let tmp = std::env::temp_dir().join("aster_test_exclusive_parallel");
-        let _ = std::fs::create_dir_all(&tmp);
-
-        let mut targets_a = HashMap::new();
-        targets_a.insert(
-            "deps".to_string(),
-            target_with_resources("sleep 0.5", vec![], vec!["resource_a"]),
+    fn dependent_starts_while_unrelated_lower_level_target_still_runs() {
+        // A (level 0) can only pass if C (level 1, behind the fast B) has
+        // started while A is still running. Under a level barrier C waits
+        // for A, A waits for C, and A fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, by_address) = run_targets(
+            tmp.path(),
+            vec![
+                (
+                    "slow",
+                    target(&format!("sh -c '{}'", wait_for("c_started")), vec![]),
+                ),
+                ("fast", target("touch b_done", vec![])),
+                ("after_fast", target("touch c_started", vec!["//a:fast"])),
+            ],
+            &["slow", "after_fast"],
         );
-        let mut targets_b = HashMap::new();
-        targets_b.insert(
-            "deps".to_string(),
-            target_with_resources("sleep 0.5", vec![], vec!["resource_b"]),
+
+        assert_eq!(by_address.len(), 3);
+        for result in by_address.values() {
+            assert!(result.success, "{}: {}", result.address, result.output);
+        }
+    }
+
+    #[test]
+    fn failure_blocks_transitive_dependents_but_not_independent_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (results, by_address) = run_targets(
+            tmp.path(),
+            vec![
+                ("root", target("sh -c 'exit 3'", vec![])),
+                ("middle", target("touch middle_ran", vec!["//a:root"])),
+                ("leaf", target("touch leaf_ran", vec!["//a:middle"])),
+                ("other", target("touch other_ran", vec![])),
+            ],
+            &["leaf", "other"],
         );
 
-        let project_a = DiscoveredProject {
-            root: tmp.clone(),
-            config_path: tmp.join("mix.exs"),
-            metadata: ProjectMetadata {
-                name: "a".to_string(),
-                version: Some("1.0.0".to_string()),
-            },
-            dependencies: vec![],
-            targets: targets_a,
-            plugin_name: "elixir".to_string(),
-            languages: vec!["elixir".to_string()],
-            build_system: None,
-            relative_path: PathBuf::from("a"),
-        };
-        let project_b = DiscoveredProject {
-            root: tmp.clone(),
-            config_path: tmp.join("mix.exs"),
-            metadata: ProjectMetadata {
-                name: "b".to_string(),
-                version: Some("1.0.0".to_string()),
-            },
-            dependencies: vec![],
-            targets: targets_b,
-            plugin_name: "elixir".to_string(),
-            languages: vec!["elixir".to_string()],
-            build_system: None,
-            relative_path: PathBuf::from("b"),
-        };
+        assert_eq!(results.len(), 4);
+        assert!(!by_address["//a:root"].success);
+        assert_eq!(by_address["//a:root"].exit_code, Some(3));
+        assert!(by_address["//a:other"].success);
+        assert!(tmp.path().join("other_ran").exists());
+        assert!(by_address["//a:middle"]
+            .output
+            .contains("Blocked: prerequisite target(s) failed: //a:root"));
+        assert!(by_address["//a:leaf"]
+            .output
+            .contains("Blocked: prerequisite target(s) failed: //a:middle"));
+        assert!(!by_address["//a:middle"].success && !by_address["//a:leaf"].success);
+        assert!(!tmp.path().join("middle_ran").exists());
+        assert!(!tmp.path().join("leaf_ran").exists());
+    }
 
-        let projects = [project_a, project_b];
-        let project_map: HashMap<String, &DiscoveredProject> = projects
-            .iter()
-            .map(|p| (format!("//{}", p.relative_path.display()), p))
-            .collect();
-
-        let executor = Executor::new(&tmp);
-        let target_addrs = vec!["//a:deps".to_string(), "//b:deps".to_string()];
-        let mut progress = crate::ui::ProgressDisplay::new(false);
-        let computed_hashes = Arc::new(Mutex::new(HashMap::new()));
-        let env_snapshot = HashMap::new();
-        let plugin_registry = crate::plugins::PluginRegistry::with_all_plugins();
-
-        let start = Instant::now();
-        let results = executor.execute_target_level(
-            &target_addrs,
-            &project_map,
-            &mut progress,
-            false,
-            None,
-            None,
-            &plugin_registry,
-            &computed_hashes,
-            &Mutex::new(HashMap::new()),
-            &env_snapshot,
-            &Arc::new(RuntimeInputCache::new(&tmp)),
+    #[test]
+    fn results_are_grouped_by_level_with_blocked_targets_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (results, _) = run_targets(
+            tmp.path(),
+            vec![
+                ("slow", target("sleep 0.3", vec![])),
+                ("bad", target("sh -c 'exit 1'", vec![])),
+                ("blocked", target("true", vec!["//a:bad"])),
+                ("ok", target("true", vec!["//a:slow"])),
+            ],
+            &["blocked", "ok"],
         );
-        let total_ms = start.elapsed().as_millis();
+
+        let order: Vec<&str> = results.iter().map(|r| r.address.as_str()).collect();
+        assert_eq!(order.len(), 4);
+        assert!(order[..2].contains(&"//a:slow") && order[..2].contains(&"//a:bad"));
+        assert_eq!(order[2], "//a:blocked");
+        assert_eq!(order[3], "//a:ok");
+    }
+
+    #[test]
+    fn dependency_cycle_still_runs_every_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (results, _) = run_targets(
+            tmp.path(),
+            vec![
+                ("x", target("true", vec!["//a:y"])),
+                ("y", target("true", vec!["//a:x"])),
+            ],
+            &["x"],
+        );
 
         assert_eq!(results.len(), 2);
-        for r in &results {
-            assert!(r.success, "Target {} should succeed", r.address);
-        }
+        assert!(results.iter().all(|result| result.success));
+    }
 
-        // Non-contending targets should run in parallel (~500ms, not ~1000ms).
-        // Leave enough headroom for process startup on loaded hosted runners.
-        assert!(
-            total_ms < 900,
-            "Non-contending targets should run in parallel (took {total_ms}ms, expected < 900ms)"
+    #[test]
+    fn exclusive_resource_is_never_held_by_two_targets_across_levels() {
+        // `mkdir` fails while another holder has the directory, so any
+        // overlap shows up as exit 9. The holders sit at levels 0, 1 and 2,
+        // and the level-1 holder becomes ready while the first still runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let hold = "sh -c 'mkdir held || exit 9; sleep 0.2; rmdir held'";
+        let holder =
+            |deps: Vec<&str>| target_with_resources(hold, deps, vec!["shared_test_postgres"]);
+        let (results, by_address) = run_targets(
+            tmp.path(),
+            vec![
+                ("first", holder(vec![])),
+                ("gate", target("true", vec![])),
+                ("second", holder(vec!["//a:gate"])),
+                ("third", holder(vec!["//a:second"])),
+            ],
+            &["first", "third"],
         );
+
+        assert_eq!(results.len(), 4);
+        for result in by_address.values() {
+            assert!(result.success, "{}: {}", result.address, result.output);
+        }
+    }
+
+    #[test]
+    fn different_exclusive_resources_run_at_the_same_time() {
+        // Each target waits for the other's marker, so both pass only if
+        // they run concurrently.
+        let tmp = tempfile::tempdir().unwrap();
+        let rendezvous =
+            |mine: &str, theirs: &str| format!("sh -c 'touch {mine}; {}'", wait_for(theirs));
+        let (_, by_address) = run_targets(
+            tmp.path(),
+            vec![
+                (
+                    "left",
+                    target_with_resources(
+                        &rendezvous("left_up", "right_up"),
+                        vec![],
+                        vec!["res_a"],
+                    ),
+                ),
+                (
+                    "right",
+                    target_with_resources(
+                        &rendezvous("right_up", "left_up"),
+                        vec![],
+                        vec!["res_b"],
+                    ),
+                ),
+            ],
+            &["left", "right"],
+        );
+
+        for result in by_address.values() {
+            assert!(result.success, "{}: {}", result.address, result.output);
+        }
+    }
+
+    #[test]
+    fn ready_queue_releases_targets_as_dependencies_complete() {
+        let mut targets = HashMap::new();
+        targets.insert("a".to_string(), target("true", vec![]));
+        targets.insert("b".to_string(), target("true", vec![]));
+        targets.insert("c".to_string(), target("true", vec!["//p:b"]));
+        targets.insert("d".to_string(), target("true", vec!["//p:a", "//p:c"]));
+        let project = make_project_with_targets("p", targets);
+        let project_map = HashMap::from([("//p".to_string(), &project)]);
+        let set: HashSet<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|t| format!("//p:{t}"))
+            .collect();
+        let levels = compute_target_levels(&set, &project_map);
+        let level_of: HashMap<String, usize> = levels
+            .iter()
+            .enumerate()
+            .flat_map(|(level, addrs)| addrs.iter().map(move |addr| (addr.clone(), level)))
+            .collect();
+
+        let mut queue = ReadyQueue::new(&set, &project_map, &level_of);
+        assert_eq!(queue.take_ready(), vec!["//p:a", "//p:b"]);
+        assert!(queue.take_ready().is_empty());
+        queue.complete("//p:b");
+        assert_eq!(queue.take_ready(), vec!["//p:c"]);
+        queue.complete("//p:a");
+        assert!(queue.take_ready().is_empty(), "d still waits for c");
+        queue.complete("//p:c");
+        assert_eq!(queue.take_ready(), vec!["//p:d"]);
+        assert!(queue.take_stuck().is_empty());
     }
 
     #[test]
