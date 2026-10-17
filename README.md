@@ -301,7 +301,8 @@ other than `deps`. A nested Node project hashes a root `package-lock.json`,
 `pnpm-lock.yaml`, or `yarn.lock` when that file exists, and `tsconfig.base.json`
 for targets other than `deps`.
 
-Configured `outputs` must still exist for a cached success to be reused. Clean
+A hit restores declared `outputs` from the artifact cache and skips execution.
+`.aster/cache/cache.json` is obsolete and unused. Clean
 targets invalidate the project's cache after succeeding.
 
 A target that passed only on a retry (see below) is not cached, so the next run

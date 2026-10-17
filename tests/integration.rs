@@ -2373,10 +2373,10 @@ cache = { enabled = true, runtime = ["echo v1"] }
         .unwrap();
     assert!(first.status.success(), "Command failed: {first:?}");
 
-    let cache_path = tmp.path().join(".aster/cache/cache.json");
+    let cache_path = tmp.path().join(".aster/cache/index/%2F%2Fapp.json");
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
-    let hash_v1 = stored["targets"]["//app:build"]["hash"]
+    let hash_v1 = stored["entries"]["//app:build"]["key"]
         .as_str()
         .expect("cache hash")
         .to_string();
@@ -2399,7 +2399,7 @@ cache = { enabled = true, runtime = ["echo v2"] }
 
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
-    let hash_v2 = stored["targets"]["//app:build"]["hash"]
+    let hash_v2 = stored["entries"]["//app:build"]["key"]
         .as_str()
         .expect("cache hash")
         .to_string();
@@ -3800,7 +3800,7 @@ fn test_aster_cache_dir_env_stores_cache_outside_workspace() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let outside_cache = fs::read_to_string(outside.path().join("cache.json")).unwrap();
+    let outside_cache = fs::read_to_string(outside.path().join("index/%2F%2Fapp.json")).unwrap();
     assert!(
         outside_cache.contains("//app:build"),
         "expected cache entry outside the workspace: {outside_cache}"
@@ -3857,13 +3857,13 @@ fn test_cache_dir_flag_overrides_env() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let flag_cache = fs::read_to_string(from_flag.path().join("cache.json")).unwrap();
+    let flag_cache = fs::read_to_string(from_flag.path().join("index/%2F%2Fapp.json")).unwrap();
     assert!(
         flag_cache.contains("//app:build"),
         "flag dir should hold the entry: {flag_cache}"
     );
     assert!(
-        !from_env.path().join("cache.json").exists(),
+        !from_env.path().join("index/%2F%2Fapp.json").exists(),
         "--cache-dir must override ASTER_CACHE_DIR"
     );
     assert!(!tmp.path().join(".aster/cache/cache.json").exists());

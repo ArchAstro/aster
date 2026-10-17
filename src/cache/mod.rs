@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod artifact;
+mod artifact_cache;
 mod hasher;
 mod local;
 pub mod matcher;
@@ -17,6 +18,7 @@ mod runtime;
 mod store;
 
 pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
+pub use artifact_cache::{project_of, ArtifactCache, IndexEntry, StatusEntry, StatusState};
 pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial, RuntimeInput};
 pub use local::{LocalStore, PruneStats};
 pub use matcher::TargetInputMatcher;
@@ -32,10 +34,11 @@ pub use store::CacheStore;
 /// or child process starts, so it is the single source of truth.
 pub const CACHE_DIR_ENV: &str = "ASTER_CACHE_DIR";
 
-/// Resolve the directory that holds `cache.json` and `cache.lock`.
+/// Resolve the directory that holds `cas/`, `ac/`, `index/`, and `cache.lock`.
 ///
 /// Order: `ASTER_CACHE_DIR` (relative paths joined to `workspace_root`) >
-/// `<workspace>/.aster/cache`.
+/// `<workspace>/.aster/cache`. A legacy `cache.json` in that directory is
+/// obsolete: the executor neither reads nor writes it.
 pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
     match std::env::var_os(CACHE_DIR_ENV) {
         Some(value) if !value.is_empty() => {
@@ -69,7 +72,9 @@ pub struct CacheEntry {
     pub success: bool,
 }
 
-/// Complete cache state stored in the resolved cache directory's cache.json.
+/// Obsolete `cache.json` document. The executor no longer reads or writes it.
+///
+/// [`ArtifactCache`] stores address → key rows under `index/` instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheState {
     /// Map of target address to cache entry

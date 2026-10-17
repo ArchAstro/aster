@@ -82,8 +82,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_cache: bool,
 
-    /// Directory for cache.json and cache.lock
+    /// Directory for the artifact cache (`cas/`, `ac/`, `index/`).
     ///
+    /// A legacy `cache.json` in that directory is obsolete and unused.
     /// Overrides `ASTER_CACHE_DIR`. A relative path is resolved against the
     /// current working directory. The default is `<workspace>/.aster/cache`.
     #[arg(long, global = true, value_name = "DIR")]

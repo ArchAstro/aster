@@ -23,8 +23,8 @@ use chrono::Utc;
 use console::style;
 
 use crate::cache::{
-    prune_if_over_cap, resolve_cache_dir, CacheEntry, CacheHasher, CacheStore, PruneLimits,
-    RuntimeInputCache,
+    pack, project_of, prune_if_over_cap, resolve_cache_dir, restore, ArtifactCache, CacheHasher,
+    Digest, Manifest, PruneLimits, RuntimeInputCache, MANIFEST_SCHEMA_VERSION,
 };
 use crate::cli::OutputMode;
 use crate::config::CacheConfig;
@@ -138,7 +138,9 @@ pub struct Executor<'a> {
     full_logs: bool,
     /// Whether to use caching
     use_cache: bool,
-    /// Directory holding `cache.json` and `cache.lock`, resolved once.
+    /// Directory holding `cas/`, `ac/`, `index/`, and `cache.lock`, resolved once.
+    ///
+    /// A legacy `cache.json` in this directory is obsolete and unused.
     cache_dir: PathBuf,
     /// Whether child targets should receive a closed stdin.
     ///
@@ -496,8 +498,8 @@ impl<'a> Executor<'a> {
 
         progress.set_total(targets_to_run.len());
 
-        let cache_store = if self.use_cache {
-            Some(CacheStore::new(&self.cache_dir))
+        let artifact_cache = if self.use_cache {
+            Some(ArtifactCache::new(self.cache_dir.clone()))
         } else {
             None
         };
@@ -525,7 +527,7 @@ impl<'a> Executor<'a> {
         let ctx = LaunchContext {
             project_map,
             command_overrides,
-            cache_store: cache_store.as_ref(),
+            cache_store: artifact_cache.as_ref(),
             plugin_registry: &plugin_registry,
             computed_hashes: &computed_hashes,
             input_hashes: &input_hashes,
@@ -814,7 +816,6 @@ impl<'a> Executor<'a> {
                 runtime_inputs,
             ) {
                 if cache_hit {
-                    // Cache hit - skip execution
                     let result = ExecutionResult {
                         address: target_addr.clone(),
                         success: true,
@@ -823,7 +824,7 @@ impl<'a> Executor<'a> {
                         output: String::new(),
                         log: Vec::new(),
                         duration_ms: 0,
-                        exit_code: None,
+                        exit_code: Some(0),
                         tests: None,
                         input_hash: input_hash.clone(),
                     };
@@ -1079,77 +1080,77 @@ impl<'a> Executor<'a> {
 
                 // A pass that needed a retry or the quarantine is not a
                 // clean pass to replay from the cache: the next run should
-                // see the flake again.
-                if !result.success || retried || let_through {
+                // see the flake again. Failures are never stored.
+                let clean_pass =
+                    result.success && result.exit_code == Some(0) && !retried && !let_through;
+                if !clean_pass {
                     if let Some(cache_dir) = cache_store_path.as_ref() {
-                        let store = CacheStore::new(cache_dir);
+                        let store = ArtifactCache::new(cache_dir.clone());
                         if let Err(e) = store.remove(&addr) {
                             eprintln!(
                             "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
                         );
                         }
                     }
-                } else {
-                    // Update cache only when the preflight cache policy
-                    // produced a hash for this target.
-                    if let (Some(cache_dir), Some(preflight_hash)) =
-                        (cache_store_path.as_ref(), cache_hash)
-                    {
-                        let plugin_registry = PluginRegistry::with_all_plugins();
-                        if let Some(plugin) = plugin_registry.find_by_name(&plugin_name) {
-                            let plugin_inputs = cache_inputs_for(
-                                plugin,
-                                &project_root,
-                                &workspace_root_path,
-                                &target_name_clone,
-                            );
-                            let hasher = CacheHasher::new(&project_root, &workspace_root_path)
-                                .with_excluded_dirs(excluded_dirs_for_rehash);
-                            let hashes_guard = computed_hashes_clone.lock().unwrap();
-                            let dependency_hashes = target_deps
-                                .iter()
-                                .filter_map(|dependency| {
-                                    hashes_guard.get(dependency).map(String::as_str)
-                                })
-                                .collect::<Vec<_>>();
-                            let postflight_hash = hasher.compute_hash(
-                                &plugin_inputs,
-                                target_cache_config.as_ref(),
-                                &command_clone,
-                                &dependency_hashes,
-                                &env_snapshot_clone,
-                                &runtime_inputs_clone,
-                            );
-                            drop(hashes_guard);
+                } else if let (Some(cache_dir), Some(preflight_hash)) =
+                    (cache_store_path.as_ref(), cache_hash)
+                {
+                    let plugin_registry = PluginRegistry::with_all_plugins();
+                    if let Some(plugin) = plugin_registry.find_by_name(&plugin_name) {
+                        let plugin_inputs = cache_inputs_for(
+                            plugin,
+                            &project_root,
+                            &workspace_root_path,
+                            &target_name_clone,
+                        );
+                        let hasher = CacheHasher::new(&project_root, &workspace_root_path)
+                            .with_excluded_dirs(excluded_dirs_for_rehash);
+                        let hashes_guard = computed_hashes_clone.lock().unwrap();
+                        let dependency_hashes = target_deps
+                            .iter()
+                            .filter_map(|dependency| {
+                                hashes_guard.get(dependency).map(String::as_str)
+                            })
+                            .collect::<Vec<_>>();
+                        let postflight_hash = hasher.compute_hash(
+                            &plugin_inputs,
+                            target_cache_config.as_ref(),
+                            &command_clone,
+                            &dependency_hashes,
+                            &env_snapshot_clone,
+                            &runtime_inputs_clone,
+                        );
+                        drop(hashes_guard);
 
-                            match postflight_hash {
-                                Ok(postflight_hash) if postflight_hash == preflight_hash => {
-                                    {
-                                        let mut hashes = computed_hashes_clone.lock().unwrap();
-                                        hashes.insert(addr.clone(), postflight_hash.clone());
-                                    }
-                                    let store = CacheStore::new(cache_dir);
-                                    let entry = CacheEntry {
-                                        hash: postflight_hash,
-                                        timestamp: Utc::now().to_rfc3339(),
-                                        success: true,
-                                    };
-                                    if let Err(e) = store.set(&addr, entry) {
-                                        eprintln!(
+                        match postflight_hash {
+                            Ok(postflight_hash) if postflight_hash == preflight_hash => {
+                                {
+                                    let mut hashes = computed_hashes_clone.lock().unwrap();
+                                    hashes.insert(addr.clone(), postflight_hash.clone());
+                                }
+                                let artifacts = ArtifactCache::new(cache_dir.clone());
+                                if let Err(e) = store_success(
+                                    &artifacts,
+                                    &project_root,
+                                    &addr,
+                                    &postflight_hash,
+                                    target_cache_config.as_ref(),
+                                    &result,
+                                ) {
+                                    eprintln!(
                                         "[aster] Warning: Failed to update cache for {addr}: {e}"
                                     );
-                                    }
                                 }
-                                _ => {
-                                    // An unstable or unhashable execution may
-                                    // have changed outputs. Do not leave an old
-                                    // entry available for a future false hit.
-                                    let store = CacheStore::new(cache_dir);
-                                    if let Err(e) = store.remove(&addr) {
-                                        eprintln!(
+                            }
+                            _ => {
+                                // An unstable or unhashable execution may
+                                // have changed outputs. Do not leave an old
+                                // entry available for a future false hit.
+                                let store = ArtifactCache::new(cache_dir.clone());
+                                if let Err(e) = store.remove(&addr) {
+                                    eprintln!(
                                         "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
                                     );
-                                    }
                                 }
                             }
                         }
@@ -1159,11 +1160,9 @@ impl<'a> Executor<'a> {
                 // Invalidate project cache if target has invalidates_cache flag
                 if result.success && invalidates_cache {
                     if let Some(ref cache_dir) = cache_store_path {
-                        let store = CacheStore::new(cache_dir);
-                        // Extract project address from target address (//project:target -> //project)
-                        let project_addr =
-                            addr.rsplit_once(':').map(|(proj, _)| proj).unwrap_or(&addr);
-                        if let Err(e) = store.clear_matching(project_addr) {
+                        let store = ArtifactCache::new(cache_dir.clone());
+                        let project_addr = project_of(&addr).unwrap_or(&addr);
+                        if let Err(e) = store.invalidate_project(project_addr) {
                             eprintln!(
                             "[aster] Warning: Failed to invalidate cache for {project_addr}: {e}"
                         );
@@ -1377,7 +1376,7 @@ mod test_hooks {
 struct LaunchContext<'a> {
     project_map: &'a HashMap<String, &'a DiscoveredProject>,
     command_overrides: Option<&'a HashMap<String, CommandOverride>>,
-    cache_store: Option<&'a CacheStore>,
+    cache_store: Option<&'a ArtifactCache>,
     plugin_registry: &'a PluginRegistry,
     computed_hashes: &'a Arc<Mutex<HashMap<String, String>>>,
     input_hashes: &'a Mutex<HashMap<String, String>>,
@@ -1698,7 +1697,7 @@ fn check_cache(
     command: &str,
     project: &DiscoveredProject,
     workspace_root: &Path,
-    cache_store: &CacheStore,
+    cache_store: &ArtifactCache,
     plugin_registry: &PluginRegistry,
     computed_hashes: &Arc<Mutex<HashMap<String, String>>>,
     env_snapshot: &HashMap<String, String>,
@@ -1738,26 +1737,72 @@ fn check_cache(
 
     drop(hashes_guard);
 
-    // Check if cached entry matches
-    if let Ok(Some(entry)) = cache_store.get(target_addr) {
-        let outputs_exist = user_config.is_none_or(|config| {
-            config
-                .outputs
-                .iter()
-                .all(|output| project.root.join(output).exists())
-        });
-        if entry.hash == current_hash && entry.success && outputs_exist {
-            // Store computed hash for dependents
+    let project_addr = project_of(target_addr).unwrap_or(target_addr);
+    match cache_store.lookup(project_addr, target_addr, &current_hash) {
+        Ok(Some(manifest)) if manifest.exit_code == 0 => {
+            if let Err(error) = restore(&project.root, &manifest.outputs, cache_store.local_store())
             {
+                eprintln!(
+                    "[aster] Warning: cache restore failed for {target_addr}, running instead: {error:#}"
+                );
+            } else {
                 let mut hashes = computed_hashes.lock().ok()?;
                 hashes.insert(target_addr.to_string(), current_hash.clone());
+                return Some((true, current_hash));
             }
-            return Some((true, current_hash));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "[aster] Warning: cache lookup failed for {target_addr}, running instead: {error:#}"
+            );
         }
     }
 
-    // Cache miss
     Some((false, current_hash))
+}
+
+/// Pack outputs and the log, then store the manifest and project index.
+///
+/// `Ok(None)` from pack means a declared output is missing or unsafe, so
+/// nothing is stored and any previous index entry is removed.
+fn store_success(
+    cache: &ArtifactCache,
+    project_root: &Path,
+    address: &str,
+    key: &str,
+    cache_config: Option<&CacheConfig>,
+    result: &ExecutionResult,
+) -> anyhow::Result<()> {
+    let globs = cache_config
+        .map(|config| config.outputs.as_slice())
+        .unwrap_or(&[]);
+    let Some(outputs) = pack(project_root, globs, cache.local_store())? else {
+        cache.remove(address)?;
+        return Ok(());
+    };
+    let log = if result.log.is_empty() {
+        None
+    } else {
+        let digest = Digest::of_bytes(&result.log);
+        cache
+            .local_store()
+            .put_blob(&digest, result.log.as_slice())?;
+        Some(digest)
+    };
+    let manifest = Manifest {
+        schema: MANIFEST_SCHEMA_VERSION,
+        key: key.to_string(),
+        target: address.to_string(),
+        exit_code: 0,
+        duration_ms: u64::try_from(result.duration_ms).unwrap_or(u64::MAX),
+        created_at: Utc::now().to_rfc3339(),
+        outputs,
+        log,
+        aster_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let project = project_of(address).unwrap_or(address);
+    cache.store(project, address, &manifest)
 }
 
 /// Hash a target's inputs for test tracking, whatever its cache policy.
@@ -2890,21 +2935,34 @@ mod tests {
         let projects = [&project];
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
-        assert!(store.get("//a:deploy").unwrap().is_none());
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
+        assert!(store
+            .lookup("//a", "//a:deploy", &"aa".repeat(32))
+            .unwrap()
+            .is_none());
         store
-            .set(
+            .store(
+                "//a",
                 "//a:deploy",
-                CacheEntry {
-                    hash: "stale".to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    success: true,
+                &Manifest {
+                    schema: MANIFEST_SCHEMA_VERSION,
+                    key: "aa".repeat(32),
+                    target: "//a:deploy".to_string(),
+                    exit_code: 0,
+                    duration_ms: 1,
+                    created_at: Utc::now().to_rfc3339(),
+                    outputs: Vec::new(),
+                    log: None,
+                    aster_version: "0.21.0".to_string(),
                 },
             )
             .unwrap();
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        assert!(store.get("//a:deploy").unwrap().is_none());
+        assert!(store
+            .lookup("//a", "//a:deploy", &"aa".repeat(32))
+            .unwrap()
+            .is_none());
 
         project.targets.get_mut("deploy").unwrap().cache = Some(CacheConfig {
             enabled: Some(true),
@@ -2913,7 +2971,7 @@ mod tests {
         let projects = [&project];
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        assert!(store.get("//a:deploy").unwrap().is_some());
+        assert!(!store.list_project_entries("//a").unwrap().is_empty());
     }
 
     #[test]
@@ -2933,7 +2991,7 @@ mod tests {
             "true",
             &project,
             tmp.path(),
-            &CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path())),
+            &ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path())),
             &PluginRegistry::with_all_plugins(),
             &Arc::new(Mutex::new(HashMap::new())),
             &HashMap::new(),
@@ -3075,21 +3133,31 @@ mod tests {
         let projects = [&project];
         let requested = HashSet::from(["//a:build".to_string()]);
         let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
-        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
         store
-            .set(
+            .store(
+                "//a",
                 "//a:build",
-                CacheEntry {
-                    hash: "old-hash".to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    success: true,
+                &Manifest {
+                    schema: MANIFEST_SCHEMA_VERSION,
+                    key: "bb".repeat(32),
+                    target: "//a:build".to_string(),
+                    exit_code: 0,
+                    duration_ms: 1,
+                    created_at: Utc::now().to_rfc3339(),
+                    outputs: Vec::new(),
+                    log: None,
+                    aster_version: "0.21.0".to_string(),
                 },
             )
             .unwrap();
 
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        assert!(store.get("//a:build").unwrap().is_none());
+        assert!(store
+            .lookup("//a", "//a:build", &"bb".repeat(32))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3106,14 +3174,21 @@ mod tests {
         let mut project = make_project_with_targets("a", targets);
         project.root = tmp.path().to_path_buf();
         project.plugin_name = "nodejs".to_string();
-        let store = CacheStore::new(&crate::cache::resolve_cache_dir(tmp.path()));
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
         store
-            .set(
+            .store(
+                "//a",
                 "//a:build",
-                CacheEntry {
-                    hash: "old-hash".to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    success: true,
+                &Manifest {
+                    schema: MANIFEST_SCHEMA_VERSION,
+                    key: "bb".repeat(32),
+                    target: "//a:build".to_string(),
+                    exit_code: 0,
+                    duration_ms: 1,
+                    created_at: Utc::now().to_rfc3339(),
+                    outputs: Vec::new(),
+                    log: None,
+                    aster_version: "0.21.0".to_string(),
                 },
             )
             .unwrap();
@@ -3124,7 +3199,10 @@ mod tests {
             .execute_targets(&requested, &projects, false);
 
         assert!(results.iter().any(|result| !result.success));
-        assert!(store.get("//a:build").unwrap().is_none());
+        assert!(store
+            .lookup("//a", "//a:build", &"bb".repeat(32))
+            .unwrap()
+            .is_none());
     }
 
     /// Helper to create a Target with exclusive_resources
