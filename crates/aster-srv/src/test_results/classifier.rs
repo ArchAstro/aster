@@ -58,6 +58,19 @@
 //! events and results, never incremented. Each pass re-reads the last
 //! 15 minutes before its watermark, because a run's `received_at` is taken
 //! before its upload commits.
+//!
+//! # Cost
+//!
+//! A pass reads the new runs' results, not each test's history. Rule 2
+//! starts from the target runs with the same input hash, which are few.
+//! Rule 3 and broken streaks read `test_main`: each test's last
+//! default-branch result and failure streak up to the window's start
+//! (`classifier_state.main_through`), followed by the window's own results;
+//! a pass then moves results older than its overlap into it. Quarantine
+//! release counts are kept the same way (`quarantine.passes`). A window that
+//! starts anywhere else rebuilds both from the results. Rule 2 compares runs
+//! of the same target address, and a failure streak longer than the
+//! retention period keeps counting past it.
 
 use std::time::Duration;
 
@@ -190,6 +203,23 @@ impl Window {
         at(self.to)
     }
 
+    /// `from` as a SQL literal: where state carried from earlier passes
+    /// (`test_main`, quarantine pass counts) stops.
+    pub(super) fn start_literal(&self) -> String {
+        at(self.from)
+    }
+
+    /// Where this pass leaves carried state: results up to here are final,
+    /// later ones are read again by the next pass.
+    pub(super) fn through(&self) -> DateTime<Utc> {
+        self.to - OVERLAP
+    }
+
+    /// [`Window::through`] as a SQL literal.
+    pub(super) fn through_literal(&self) -> String {
+        at(self.through())
+    }
+
     fn branch_is_default(&self, branch: &str) -> String {
         format!(
             "{branch} IN ({0}, {1})",
@@ -273,22 +303,34 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
     // earlier time: a broken test could turn healthy and be announced as
     // breaking again. That replica covered this window: skip it, and go on
     // from its watermark if `now` is later still.
-    let committed: Option<DateTime<Utc>> = transaction
-        .query_opt("SELECT watermark FROM test_results.classifier_state", &[])
-        .await?
-        .map(|row| row.get(0));
+    let state = transaction
+        .query_opt(
+            "SELECT watermark, main_through FROM test_results.classifier_state",
+            &[],
+        )
+        .await?;
+    let committed: Option<DateTime<Utc>> = state.as_ref().map(|row| row.get(0));
+    let main_through: Option<DateTime<Utc>> = state.as_ref().and_then(|row| row.get(1));
     if let Some(committed) = committed.filter(|committed| *committed > window.to) {
         transaction.rollback().await?;
         return Ok(Some((Report::default(), committed >= now)));
     }
-    let report = classify(&transaction, &window).await?;
+    // Another replica moved the watermark between the read above and the
+    // lock: this window no longer starts where `test_main` ends. Read again.
+    if committed.is_some_and(|committed| committed != watermark) {
+        transaction.rollback().await?;
+        return Ok(Some((Report::default(), false)));
+    }
+    let report = classify(&transaction, &window, main_through).await?;
     transaction
         .execute(
-            "INSERT INTO test_results.classifier_state (id, watermark) VALUES (1, $1) \
+            "INSERT INTO test_results.classifier_state (id, watermark, main_through) \
+             VALUES (1, $1, $2) \
              ON CONFLICT (id) DO UPDATE SET \
                  watermark = GREATEST(test_results.classifier_state.watermark, EXCLUDED.watermark), \
+                 main_through = EXCLUDED.main_through, \
                  updated_at = now()",
-            &[&window.to],
+            &[&window.to, &window.through()],
         )
         .await?;
     transaction.commit().await?;
@@ -302,6 +344,7 @@ const EVENT_KEY: &str = "(repo, test_id, kind, run_id, observed_on)";
 async fn classify(
     transaction: &tokio_postgres::Transaction<'_>,
     window: &Window,
+    main_through: Option<DateTime<Utc>>,
 ) -> Result<Report> {
     let from_day = window.from.date_naive();
     let to_day = window.to.date_naive();
@@ -313,7 +356,7 @@ async fn classify(
                 "CREATE TEMP TABLE cls_win ON COMMIT DROP AS \
                  WITH attempts AS ( \
                      SELECT tr.repo, tr.run_id, tr.test_id, tr.target, tr.outcome, \
-                            tr.failure_hash, tr.received_on, r.received_at, \
+                            tr.failure_hash, tr.received_on, r.received_at, r.sha, \
                             {on_default} AS on_default, t.input_hash, t.confidence, \
                             row_number() OVER w AS rn, \
                             bool_or(tr.outcome IN ('fail', 'error')) OVER (\
@@ -328,7 +371,7 @@ async fn classify(
                        AND tr.outcome <> 'skip' AND NOT t.cached \
                      WINDOW w AS (PARTITION BY tr.run_id, tr.test_id ORDER BY tr.attempt DESC)) \
                  SELECT repo, run_id, test_id, target, outcome IN ('fail', 'error') AS is_fail, \
-                        failure_hash, received_on, received_at, on_default, input_hash, \
+                        failure_hash, received_on, received_at, sha, on_default, input_hash, \
                         confidence IS NOT DISTINCT FROM 'partial' AS partial, \
                         any_fail AND outcome = 'pass' AS retried \
                  FROM attempts WHERE rn = 1",
@@ -360,75 +403,116 @@ async fn classify(
         )
         .await?;
 
+    // `test_main` holds each test's main sequence up to `window.from`. A
+    // window that starts elsewhere (the first pass, or one after another
+    // replica's) rebuilds it from the results.
+    if main_through != Some(window.from) {
+        rebuild_main(transaction, window).await?;
+    }
+
     // Rule 2: the same input hash gave a different outcome than the nearest
-    // earlier run of that hash.
-    let earlier_same_hash = window.finals(
-        &format!(
-            "tr.repo = w.repo AND tr.test_id = w.test_id AND tr.received_on >= {history} \
-             AND tr.received_on <= w.received_on AND t.input_hash = w.input_hash \
-             AND (r.received_at, r.run_id) < (w.received_at, w.run_id)"
-        ),
-        false,
-    );
+    // earlier run of that hash. Runs of one target with one hash are few
+    // (`target_runs_hash`), so this starts from them, the window's own
+    // included, not from each test's history. A table, not a CTE, so the
+    // planner knows how few.
+    transaction
+        .execute(
+            &format!(
+                "CREATE TEMP TABLE cls_hash ON COMMIT DROP AS \
+                 SELECT t.repo, t.address, t.input_hash, t.run_id, t.received_on, r.received_at \
+                 FROM (SELECT repo, target, input_hash, max(received_on) AS until \
+                       FROM cls_win WHERE input_hash IS NOT NULL \
+                       GROUP BY repo, target, input_hash) k \
+                 JOIN test_results.target_runs t \
+                      ON t.repo = k.repo AND t.address = k.target \
+                     AND t.input_hash = k.input_hash \
+                     AND t.received_on BETWEEN {history} AND k.until \
+                 JOIN test_results.runs r ON r.run_id = t.run_id \
+                 WHERE NOT t.cached"
+            ),
+            &[],
+        )
+        .await?;
+    transaction.batch_execute("ANALYZE cls_hash").await?;
     events += transaction
         .execute(
             &format!(
-                "INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
-                 SELECT w.received_on, w.repo, w.test_id, 'definite', 'input_hash', w.run_id, \
-                        p.run_id, w.target, w.input_hash, w.received_at \
-                 FROM cls_win w \
-                 CROSS JOIN LATERAL ( \
-                     SELECT f.run_id, f.is_fail FROM ({earlier_same_hash}) f \
-                     ORDER BY f.received_at DESC, f.run_id DESC LIMIT 1) p \
-                 WHERE w.input_hash IS NOT NULL AND p.is_fail <> w.is_fail \
+                "WITH earlier AS MATERIALIZED ( \
+                     SELECT DISTINCT ON (tr.run_id, tr.test_id) \
+                            tr.repo, tr.test_id, h.address, h.input_hash, tr.run_id, \
+                            h.received_at, tr.outcome IN ('fail', 'error') AS is_fail \
+                     FROM cls_hash h \
+                     JOIN test_results.test_results tr \
+                          ON tr.run_id = h.run_id AND tr.received_on = h.received_on \
+                         AND tr.target = h.address \
+                     WHERE tr.outcome <> 'skip' \
+                     ORDER BY tr.run_id, tr.test_id, tr.attempt DESC), \
+                 nearest AS ( \
+                     SELECT DISTINCT ON (w.run_id, w.test_id) w.*, \
+                            p.run_id AS prev_run_id, p.is_fail AS prev_is_fail \
+                     FROM cls_win w \
+                     JOIN earlier p \
+                          ON p.repo = w.repo AND p.test_id = w.test_id \
+                         AND p.address = w.target AND p.input_hash = w.input_hash \
+                         AND (p.received_at, p.run_id) < (w.received_at, w.run_id) \
+                     ORDER BY w.run_id, w.test_id, p.received_at DESC, p.run_id DESC) \
+                 INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
+                 SELECT received_on, repo, test_id, 'definite', 'input_hash', run_id, \
+                        prev_run_id, target, input_hash, received_at \
+                 FROM nearest WHERE prev_is_fail <> is_fail \
                  ON CONFLICT {EVENT_KEY} DO NOTHING"
             ),
             &[],
         )
         .await?;
 
+    // The main sequence of every test whose state is re-derived: its
+    // `test_main` row, then its main results in the window, each with the
+    // result before it and the failure streak it ends.
+    transaction
+        .execute(
+            &format!(
+                "CREATE TEMP TABLE cls_main ON COMMIT DROP AS {}",
+                streaks(&format!(
+                    "SELECT m.repo, m.test_id, m.run_id, m.received_at, m.received_on, m.sha, \
+                            m.is_fail, m.failure_hash, true AS is_seed, \
+                            m.streak AS seed_streak, m.streak_since_sha AS seed_since \
+                     FROM test_results.test_main m \
+                     WHERE m.received_on >= {history} \
+                       AND (EXISTS (SELECT 1 FROM cls_win w \
+                                    WHERE w.repo = m.repo AND w.test_id = m.test_id) \
+                            OR EXISTS (SELECT 1 FROM test_results.tests t \
+                                       WHERE t.repo = m.repo AND t.test_id = m.test_id \
+                                         AND (t.state <> 'healthy' OR t.flake_score > 0))) \
+                     UNION ALL \
+                     SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
+                            failure_hash, false, 0, NULL::text \
+                     FROM cls_win WHERE on_default AND NOT partial"
+                ))
+            ),
+            &[],
+        )
+        .await?;
+    transaction.batch_execute("ANALYZE cls_main").await?;
+
     // Rule 3: a default-branch pass right after a default-branch failure
     // that did not end a broken streak.
-    let previous_main = window.finals(
-        &format!(
-            "tr.repo = w.repo AND tr.test_id = w.test_id AND tr.received_on >= {history} \
-             AND tr.received_on <= w.received_on AND {main} \
-             AND (r.received_at, r.run_id) < (w.received_at, w.run_id)",
-            main = window.branch_is_default("r.branch"),
-        ),
-        true,
-    );
-    let streak_before = window.finals(
-        &format!(
-            "tr.repo = w.repo AND tr.test_id = w.test_id AND tr.received_on >= {history} \
-             AND tr.received_on <= w.received_on AND {main} \
-             AND (r.received_at, r.run_id) <= (p.received_at, p.run_id)",
-            main = window.branch_is_default("r.branch"),
-        ),
-        true,
-    );
     events += transaction
         .execute(
             &format!(
                 "INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
                  SELECT w.received_on, w.repo, w.test_id, 'likely', 'next_main_run', w.run_id, \
-                        p.run_id, w.target, w.input_hash, w.received_at \
+                        m.prev_run_id, w.target, w.input_hash, w.received_at \
                  FROM cls_win w \
-                 CROSS JOIN LATERAL ( \
-                     SELECT f.run_id, f.received_at, f.is_fail FROM ({previous_main}) f \
-                     ORDER BY f.received_at DESC, f.run_id DESC LIMIT 1) p \
-                 WHERE w.on_default AND NOT w.partial AND NOT w.is_fail AND p.is_fail \
+                 JOIN cls_main m \
+                      ON m.repo = w.repo AND m.test_id = w.test_id AND m.run_id = w.run_id \
+                     AND NOT m.is_seed \
+                 WHERE w.on_default AND NOT w.partial AND NOT w.is_fail \
+                   AND m.prev_is_fail AND m.prev_streak < {k} \
                    AND NOT EXISTS (SELECT 1 FROM test_results.test_flake_events e \
                                    WHERE e.repo = w.repo AND e.test_id = w.test_id \
                                      AND e.run_id = w.run_id AND e.kind = 'definite' \
                                      AND e.observed_on = w.received_on) \
-                   AND NOT COALESCE((SELECT count(*) = {k} \
-                                            AND bool_and(s.is_fail AND s.failure_hash IS NOT NULL) \
-                                            AND count(DISTINCT s.failure_hash) = 1 \
-                                     FROM (SELECT f.is_fail, f.failure_hash \
-                                           FROM ({streak_before}) f \
-                                           ORDER BY f.received_at DESC, f.run_id DESC \
-                                           LIMIT {k}) s), false) \
                  ON CONFLICT {EVENT_KEY} DO NOTHING",
                 k = window.broken_runs,
             ),
@@ -438,15 +522,6 @@ async fn classify(
 
     // State: re-derived for the tests in the new runs and for every test
     // that is not healthy, whose score ages or whose streak may end.
-    let latest_main = window.finals(
-        &format!(
-            "tr.repo = a.repo AND tr.test_id = a.test_id AND tr.received_on >= {history} \
-             AND {main} AND r.received_at <= {to}",
-            main = window.branch_is_default("r.branch"),
-            to = at(window.to),
-        ),
-        true,
-    );
     let tests_updated = transaction
         .query(
             &format!(
@@ -465,26 +540,9 @@ async fn classify(
                           ON e.repo = a.repo AND e.test_id = a.test_id \
                          AND e.observed_on >= {history} AND e.observed_at <= {to} \
                      GROUP BY a.repo, a.test_id), \
-                 mains AS ( \
-                     SELECT a.repo, a.test_id, f.* FROM affected a \
-                     CROSS JOIN LATERAL ({latest_main}) f), \
-                 marked AS ( \
-                     SELECT *, first_value(failure_hash) OVER latest AS latest_hash \
-                     FROM mains \
-                     WINDOW latest AS (PARTITION BY repo, test_id \
-                                       ORDER BY received_at DESC, run_id DESC)), \
-                 streaking AS ( \
-                     SELECT *, bool_and(is_fail AND failure_hash IS NOT NULL \
-                                        AND failure_hash = latest_hash) \
-                                   OVER (PARTITION BY repo, test_id \
-                                         ORDER BY received_at DESC, run_id DESC) AS in_streak \
-                     FROM marked), \
                  streaks AS ( \
-                     SELECT repo, test_id, count(*) FILTER (WHERE in_streak) AS length, \
-                            (array_agg(sha ORDER BY received_at, run_id) \
-                                 FILTER (WHERE in_streak))[1] AS since_sha, \
-                            max(latest_hash) AS failure_hash \
-                     FROM streaking GROUP BY repo, test_id), \
+                     SELECT repo, test_id, streak AS length, since AS since_sha, failure_hash \
+                     FROM cls_main WHERE is_last), \
                  derived AS ( \
                      SELECT s.repo, s.test_id, s.score, s.last_flake_at, \
                             COALESCE(k.length, 0) >= {k} AS broken, \
@@ -536,6 +594,23 @@ async fn classify(
         })
         .collect();
 
+    // Results old enough that no later upload can come before them move
+    // into `test_main`; the rest are read again by the next pass.
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO test_results.test_main ({MAIN_COLUMNS}) \
+                 SELECT DISTINCT ON (repo, test_id) repo, test_id, run_id, received_at, \
+                        received_on, sha, is_fail, failure_hash, streak, since \
+                 FROM cls_main WHERE NOT is_seed AND received_at <= {through} \
+                 ORDER BY repo, test_id, received_at DESC, run_id DESC \
+                 ON CONFLICT (repo, test_id) DO UPDATE SET {MAIN_UPDATE}",
+                through = at(window.through()),
+            ),
+            &[],
+        )
+        .await?;
+
     let (quarantine, mut changed) =
         quarantine::update(transaction, window, window.quarantine).await?;
     notifications.append(&mut changed);
@@ -549,6 +624,95 @@ async fn classify(
         quarantine,
         deliveries,
     })
+}
+
+const MAIN_COLUMNS: &str = "repo, test_id, run_id, received_at, received_on, sha, is_fail, \
+                            failure_hash, streak, streak_since_sha";
+const MAIN_UPDATE: &str = "run_id = EXCLUDED.run_id, received_at = EXCLUDED.received_at, \
+                           received_on = EXCLUDED.received_on, sha = EXCLUDED.sha, \
+                           is_fail = EXCLUDED.is_fail, failure_hash = EXCLUDED.failure_hash, \
+                           streak = EXCLUDED.streak, streak_since_sha = EXCLUDED.streak_since_sha";
+
+/// `rows` (one test's main results in order, each `repo, test_id, run_id,
+/// received_at, received_on, sha, is_fail, failure_hash, is_seed,
+/// seed_streak, seed_since`) with, per row: `streak`, the failures with the
+/// same non-null hash that end at it (a seed row brings its own count),
+/// `since`, the sha that streak began at, the previous row's `prev_run_id`,
+/// `prev_is_fail` and `prev_streak`, and `is_last`.
+fn streaks(rows: &str) -> String {
+    format!(
+        "(WITH s0 AS ( \
+              SELECT *, (is_fail AND failure_hash IS NOT NULL) AS cont FROM ({rows}) x), \
+          s1 AS ( \
+              SELECT *, CASE WHEN cont AND COALESCE(lag(cont) OVER k, false) \
+                                  AND lag(failure_hash) OVER k = failure_hash \
+                             THEN 0 ELSE 1 END AS starts \
+              FROM s0 WINDOW k AS (PARTITION BY repo, test_id ORDER BY received_at, run_id)), \
+          s2 AS ( \
+              SELECT *, sum(starts) OVER (PARTITION BY repo, test_id \
+                                          ORDER BY received_at, run_id \
+                                          ROWS UNBOUNDED PRECEDING) AS island \
+              FROM s1), \
+          s3 AS ( \
+              SELECT *, \
+                     CASE WHEN cont THEN (sum(CASE WHEN is_seed THEN seed_streak ELSE 1 END) \
+                                          OVER i)::int ELSE 0 END AS streak, \
+                     CASE WHEN cont THEN first_value(CASE WHEN is_seed THEN seed_since \
+                                                          ELSE sha END) OVER i END AS since \
+              FROM s2 WINDOW i AS (PARTITION BY repo, test_id, island \
+                                   ORDER BY received_at, run_id ROWS UNBOUNDED PRECEDING)) \
+          SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, failure_hash, \
+                 is_seed, streak, since, \
+                 lag(run_id) OVER k AS prev_run_id, lag(is_fail) OVER k AS prev_is_fail, \
+                 lag(streak) OVER k AS prev_streak, \
+                 row_number() OVER (PARTITION BY repo, test_id \
+                                    ORDER BY received_at DESC, run_id DESC) = 1 AS is_last \
+          FROM s3 WINDOW k AS (PARTITION BY repo, test_id ORDER BY received_at, run_id))"
+    )
+}
+
+/// Refill `test_main` from the results: each test's last default-branch
+/// result up to `window.from` and its streak, within the retention period.
+async fn rebuild_main(
+    transaction: &tokio_postgres::Transaction<'_>,
+    window: &Window,
+) -> Result<()> {
+    transaction
+        .batch_execute("DELETE FROM test_results.test_main")
+        .await?;
+    let finals = format!(
+        "SELECT DISTINCT ON (tr.run_id, tr.test_id) \
+                tr.repo, tr.test_id, tr.run_id, r.received_at, tr.received_on, r.sha, \
+                tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash, \
+                false AS is_seed, 0 AS seed_streak, NULL::text AS seed_since \
+         FROM test_results.test_results tr \
+         JOIN test_results.runs r ON r.run_id = tr.run_id \
+         JOIN test_results.target_runs t \
+              ON t.run_id = tr.run_id AND t.address = tr.target \
+             AND t.received_on = tr.received_on \
+         WHERE tr.received_on BETWEEN {history} AND {through_day} \
+           AND r.received_at <= {through} AND {main} \
+           AND tr.outcome <> 'skip' AND NOT t.cached \
+           AND t.confidence IS DISTINCT FROM 'partial' \
+         ORDER BY tr.run_id, tr.test_id, tr.attempt DESC",
+        history = day(window.history_from),
+        through_day = day(window.from.date_naive()),
+        through = at(window.from),
+        main = window.branch_is_default("r.branch"),
+    );
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO test_results.test_main ({MAIN_COLUMNS}) \
+                 SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
+                        failure_hash, streak, since \
+                 FROM {} s WHERE is_last",
+                streaks(&finals)
+            ),
+            &[],
+        )
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
