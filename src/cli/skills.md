@@ -354,8 +354,10 @@ references. Sizes accept bytes or `KB`/`MB`/`GB` (powers of 1024); ages accept
 `aster.toml` as `[cache] max_size` and `max_age` (defaults `10GB` and `14d`).
 A run prunes automatically when the local blob store is over that cap.
 
-The cache memoizes successful execution. It does not restore deleted artifacts.
-Declared outputs must still exist for a cached result to be reusable.
+The cache stores successful runs as content-addressed artifacts. A later
+run with the same inputs restores declared outputs and skips execution.
+Failures are not stored. `.aster/cache/cache.json` is obsolete and unused;
+Aster neither reads nor writes it.
 
 `aster cache status <target> --inputs` prints every component of that target's
 cache key: salt, platform, hashed files, command, dependency hashes, tracked

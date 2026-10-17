@@ -1310,20 +1310,20 @@ fn run() -> Result<()> {
             aster::cli::cache_plan::render_cache_plan(&plan, output_mode, github_output)?;
         }
         Commands::Cache { command } => {
-            use aster::cache::{resolve_cache_dir, CacheStore};
+            use aster::cache::{resolve_cache_dir, ArtifactCache};
             use aster::cli::CacheCommands;
 
-            let cache_store = CacheStore::new(&resolve_cache_dir(&workspace_root));
+            let artifact_cache = ArtifactCache::new(resolve_cache_dir(&workspace_root));
 
             match command {
                 CacheCommands::Clear { target } => {
                     if let Some(pattern) = target {
-                        let removed = cache_store.clear_matching(&pattern)?;
+                        let removed = artifact_cache.clear_matching(&pattern)?;
                         if output_mode != OutputMode::Quiet {
                             println!("Cleared {removed} cache entries matching {pattern}");
                         }
                     } else {
-                        cache_store.clear()?;
+                        artifact_cache.clear()?;
                         if output_mode != OutputMode::Quiet {
                             println!("Cache cleared");
                         }
@@ -1344,8 +1344,13 @@ fn run() -> Result<()> {
                             output_mode,
                         )?;
                     } else {
-                        let state = cache_store.load()?;
-                        print_cache_status(&cache_store, &state, target.as_deref(), output_mode)?;
+                        let state = artifact_cache.load_status()?;
+                        print_cache_status(
+                            artifact_cache.cache_dir(),
+                            &state,
+                            target.as_deref(),
+                            output_mode,
+                        )?;
                     }
                 }
                 CacheCommands::Prune { max_size, max_age } => {
@@ -2447,8 +2452,8 @@ fn format_relative_time(timestamp: &str) -> String {
 }
 
 fn print_cache_status(
-    cache_store: &aster::cache::CacheStore,
-    state: &aster::cache::CacheState,
+    cache_dir: &Path,
+    state: &aster::cache::StatusState,
     target: Option<&str>,
     output_mode: OutputMode,
 ) -> Result<()> {
@@ -2472,7 +2477,7 @@ fn print_cache_status(
     if output_mode == OutputMode::Json {
         output_json(&state)?;
     } else {
-        println!("Cache dir: {}", cache_store.cache_dir().display());
+        println!("Cache dir: {}", cache_dir.display());
         if state.targets.is_empty() {
             println!("No cached targets");
         } else {
