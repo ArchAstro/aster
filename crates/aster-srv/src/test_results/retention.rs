@@ -75,6 +75,13 @@ pub async fn run_once(app: &App, today: NaiveDate) -> Result<Option<Report>> {
             &[&cutoff_at],
         )
         .await?;
+    // A main result older than the retention period no longer counts.
+    transaction
+        .execute(
+            "DELETE FROM test_results.test_main WHERE received_at < $1",
+            &[&cutoff_at],
+        )
+        .await?;
     report.log_deleted = transaction
         .execute(
             "DELETE FROM test_results.quarantine_log WHERE at < $1",

@@ -169,6 +169,35 @@ CREATE INDEX test_results_failures ON test_results.test_results (repo, received_
         // New tables only.
         sql: quarantine::MIGRATION_SQL,
     },
+    Migration {
+        feature: "test_results",
+        version: 5,
+        // Each test's latest default-branch result and failure streak, and
+        // each quarantined test's passes, so a classifier pass reads one row
+        // per test instead of its history. A new table and new columns with
+        // constant defaults: the next pass fills them.
+        sql: r#"
+CREATE TABLE test_results.test_main (
+    repo text NOT NULL,
+    test_id text NOT NULL,
+    run_id text NOT NULL,
+    received_at timestamptz NOT NULL,
+    received_on date NOT NULL,
+    sha text NOT NULL,
+    is_fail boolean NOT NULL,
+    failure_hash text,
+    streak integer NOT NULL,
+    streak_since_sha text,
+    PRIMARY KEY (repo, test_id)
+);
+ALTER TABLE test_results.classifier_state ADD COLUMN main_through timestamptz;
+-- A quarantined test's passes in a row since it entered, counted up to
+-- `passes_through`; NULL makes the next pass count them from the results.
+ALTER TABLE test_results.quarantine
+    ADD COLUMN passes integer NOT NULL DEFAULT 0,
+    ADD COLUMN passes_through timestamptz;
+"#,
+    },
 ];
 
 /// The day-partitioned tables.

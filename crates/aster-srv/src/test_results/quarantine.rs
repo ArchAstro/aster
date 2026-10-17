@@ -125,26 +125,61 @@ pub(super) async fn update(
 
     // 3. A run of passes since entering releases. Each run's final attempt
     // counts, with the classifier's rules: cached targets store the results
-    // they replay, and a replayed pass proves nothing.
+    // they replay, and a replayed pass proves nothing. `passes` holds the
+    // count up to `window.from`; the window's results (`cls_win`) carry it
+    // on. A count kept up to anywhere else is redone from the results.
+    let from = window.start_literal();
     let since_entry = window.finals(
         &format!(
             "tr.repo = q.repo AND tr.test_id = q.test_id \
              AND tr.received_on >= (q.entered_at AT TIME ZONE 'UTC')::date \
-             AND r.received_at > q.entered_at AND r.received_at <= {to}"
+             AND r.received_at > q.entered_at AND r.received_at <= {from}"
         ),
         false,
     );
+    transaction
+        .execute(
+            &format!(
+                "UPDATE test_results.quarantine q SET passes_through = {from}, \
+                     passes = (SELECT count(*) FROM ( \
+                                   SELECT bool_and(NOT f.is_fail) OVER ( \
+                                              ORDER BY f.received_at DESC, f.run_id DESC) AS clean \
+                                   FROM ({since_entry}) f) s \
+                               WHERE s.clean) \
+                 WHERE q.passes_through IS DISTINCT FROM {from}"
+            ),
+            &[],
+        )
+        .await?;
+    // Passes in a row up to `until`, per quarantined test: those after its
+    // last failure in the window, or, with no failure there, the count so
+    // far plus the window's passes. One pass over the window's rows.
+    let counted = |until: &str| {
+        format!(
+            "SELECT q.repo, q.test_id, q.entered_at, \
+                    CASE WHEN bool_or(c.is_fail) \
+                         THEN count(*) FILTER (WHERE c.fails_after = 0) \
+                         ELSE q.passes + count(c.run_id) END AS passes \
+             FROM test_results.quarantine q \
+             LEFT JOIN ( \
+                 SELECT w.repo, w.test_id, w.run_id, w.is_fail, \
+                        count(*) FILTER (WHERE w.is_fail) OVER ( \
+                            PARTITION BY w.repo, w.test_id \
+                            ORDER BY w.received_at DESC, w.run_id DESC \
+                            ROWS UNBOUNDED PRECEDING) AS fails_after \
+                 FROM cls_win w \
+                 JOIN test_results.quarantine e \
+                      ON e.repo = w.repo AND e.test_id = w.test_id \
+                     AND w.received_at > e.entered_at \
+                 WHERE w.received_at <= {until}) c \
+                  ON c.repo = q.repo AND c.test_id = q.test_id \
+             GROUP BY q.repo, q.test_id, q.entered_at, q.passes"
+        )
+    };
     let released = log(transaction
         .query(
             &format!(
-                "WITH streaks AS ( \
-                     SELECT q.repo, q.test_id, q.entered_at, \
-                            (SELECT count(*) FROM ( \
-                                 SELECT bool_and(NOT f.is_fail) OVER ( \
-                                            ORDER BY f.received_at DESC, f.run_id DESC) AS clean \
-                                 FROM ({since_entry}) f) s \
-                             WHERE s.clean) AS passes \
-                     FROM test_results.quarantine q), \
+                "WITH streaks AS ({now}), \
                  gone AS ( \
                      DELETE FROM test_results.quarantine q USING streaks s \
                      WHERE s.repo = q.repo AND s.test_id = q.test_id \
@@ -154,11 +189,24 @@ pub(super) async fn update(
                  SELECT repo, test_id, 'released', {to}, \
                         jsonb_build_object('entered_at', entered_at, 'passes', passes) \
                  FROM gone RETURNING id",
+                now = counted(&to),
                 passes = rules.release_passes,
             ),
             &[],
         )
         .await?);
+    let through = window.through_literal();
+    transaction
+        .execute(
+            &format!(
+                "UPDATE test_results.quarantine q \
+                 SET passes = k.passes, passes_through = {through} \
+                 FROM ({kept}) k WHERE k.repo = q.repo AND k.test_id = q.test_id",
+                kept = counted(&through),
+            ),
+            &[],
+        )
+        .await?;
 
     // 4. Proven flakes enter.
     let mut quarantined = 0;
@@ -183,8 +231,9 @@ pub(super) async fn update(
                          HAVING count(DISTINCT e.run_id) >= {runs}), \
                      entered AS ( \
                          INSERT INTO test_results.quarantine \
-                             (repo, test_id, entered_at, expires_at, runs) \
-                         SELECT p.repo, p.test_id, {to}, {to} + {days} * interval '24 hours', p.runs \
+                             (repo, test_id, entered_at, expires_at, runs, passes, passes_through) \
+                         SELECT p.repo, p.test_id, {to}, {to} + {days} * interval '24 hours', p.runs, \
+                                0, {through} \
                          FROM proven p \
                          JOIN test_results.tests t \
                               ON t.repo = p.repo AND t.test_id = p.test_id \
