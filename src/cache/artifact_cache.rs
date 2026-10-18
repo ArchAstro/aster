@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::artifact::Manifest;
+use super::backend::TieredCache;
 use super::local::LocalStore;
 
 /// One address in a project index.
@@ -53,17 +54,36 @@ pub struct CacheStatus {
     pub targets: Vec<CacheStatusTarget>,
 }
 
-/// Local artifact cache: index plus [`LocalStore`].
+/// Artifact cache: project index plus a [`TieredCache`].
+///
+/// Lookup and store go through the tier. The index stays local. Remote
+/// selection uses `ASTER_REMOTE_CACHE` and `ASTER_CACHE_MODE`.
 pub struct ArtifactCache {
     cache_dir: PathBuf,
-    store: LocalStore,
+    tier: TieredCache,
 }
 
 impl ArtifactCache {
     /// `cache_dir` is the resolved cache directory (`cas/`, `ac/`, `index/`).
+    ///
+    /// The remote comes from the environment. A missing or not-yet-implemented
+    /// remote is local-only and does not fail construction.
     pub fn new(cache_dir: PathBuf) -> Self {
-        let store = LocalStore::new(cache_dir.clone());
-        Self { cache_dir, store }
+        let tier = super::backend::tier_from_env(&cache_dir).unwrap_or_else(|error| {
+            eprintln!(
+                "[aster] Warning: remote cache config ignored, using the local cache only: {error:#}"
+            );
+            TieredCache::local_only(LocalStore::new(cache_dir.clone()))
+        });
+        Self { cache_dir, tier }
+    }
+
+    /// Same as [`Self::new`], but lookup and store use `tier`.
+    ///
+    /// Tests pass a [`TieredCache`] wrapped around an in-memory remote.
+    /// Production uses [`Self::new`], which selects the remote from the environment.
+    pub fn with_tier(cache_dir: PathBuf, tier: TieredCache) -> Self {
+        Self { cache_dir, tier }
     }
 
     /// Directory that holds `cas/`, `ac/`, `index/`, and `cache.lock`.
@@ -71,9 +91,9 @@ impl ArtifactCache {
         &self.cache_dir
     }
 
-    /// The local blob and manifest store.
+    /// The local blob and manifest store. Restore and pack read this, not the remote.
     pub fn local_store(&self) -> &LocalStore {
-        &self.store
+        self.tier.local_store()
     }
 
     /// Manifest for `address` when the index key matches `key`.
@@ -89,15 +109,16 @@ impl ArtifactCache {
         if entry.key != key {
             return Ok(None);
         }
-        self.store.get_manifest(key)
+        self.tier.lookup(key)
     }
 
     /// Store `manifest`, then record `address` in the project index.
     ///
-    /// Blobs must already be in the store: [`LocalStore::put_manifest`]
-    /// refuses a manifest whose blobs are missing.
+    /// Blobs must already be in the local store: [`LocalStore::put_manifest`]
+    /// refuses a manifest whose blobs are missing. A configured remote is
+    /// uploaded after the local write and cannot fail this call.
     pub fn store(&self, project: &str, address: &str, manifest: &Manifest) -> Result<()> {
-        self.store.put_manifest(manifest)?;
+        self.tier.store(manifest)?;
         let _lock = self.lock_exclusive()?;
         let mut index = self.read_index(project)?;
         index.entries.insert(
@@ -173,7 +194,7 @@ impl ArtifactCache {
                 if !status_matches(filter, &address) {
                     continue;
                 }
-                let manifest = self.store.get_manifest(&row.key)?;
+                let manifest = self.tier.local_store().get_manifest(&row.key)?;
                 let (outputs, output_bytes, exit_code) = match &manifest {
                     Some(manifest) => (
                         manifest.outputs.len() as u64,
@@ -205,7 +226,7 @@ impl ArtifactCache {
             let Some(digest) = &output.digest else {
                 continue;
             };
-            let path = self.store.blob_path(digest)?;
+            let path = self.tier.local_store().blob_path(digest)?;
             match fs::metadata(&path) {
                 Ok(meta) => total += meta.len(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -362,6 +383,7 @@ fn url_safe(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::cache::artifact::{Digest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
+    use crate::cache::CacheBackend;
 
     fn manifest(key: &str, target: &str) -> Manifest {
         Manifest {
@@ -521,5 +543,66 @@ mod tests {
                 .all(|row| row.address == "//p:build"),
             "//p must not match //p-v2"
         );
+    }
+
+    #[test]
+    fn tiered_lookup_downloads_remote_hit_into_local_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let digest = Digest::of_bytes(b"from-remote");
+        let key = "ab".repeat(32);
+        let stored = Manifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            key: key.clone(),
+            target: "//app:build".to_string(),
+            exit_code: 0,
+            duration_ms: 1,
+            created_at: "2026-10-17T00:00:00Z".to_string(),
+            outputs: vec![OutputEntry {
+                path: "out/file.txt".into(),
+                kind: OutputKind::File,
+                digest: Some(digest.clone()),
+                mode: 0o644,
+                target: None,
+            }],
+            log: None,
+            aster_version: "0.21.0".to_string(),
+        };
+        let remote = crate::cache::InMemoryBackend::new();
+        let tier = crate::cache::TieredCache::with_remote(
+            crate::cache::LocalStore::new(cache_dir.clone()),
+            crate::cache::CacheMode::ReadWrite,
+            std::sync::Arc::new(remote.clone()),
+        );
+        let cache = ArtifactCache::with_tier(cache_dir, tier);
+        // Index the key with an empty local manifest, then delete that file
+        // so lookup has nothing local. Seed the remote only after that store,
+        // or the upload would overwrite the remote artifact with the empty one.
+        cache
+            .store("//app", "//app:build", &manifest(&key, "//app:build"))
+            .unwrap();
+        let manifest_path = cache
+            .cache_dir()
+            .join("ac")
+            .join(&key[..2])
+            .join(format!("{key}.json"));
+        std::fs::remove_file(&manifest_path).unwrap();
+        assert!(cache.local_store().get_manifest(&key).unwrap().is_none());
+        remote
+            .put_blob(&digest, &mut b"from-remote".to_vec().as_slice())
+            .unwrap();
+        remote.put_manifest(&stored).unwrap();
+
+        let hit = cache
+            .lookup("//app", "//app:build", &key)
+            .unwrap()
+            .expect("hit");
+        assert_eq!(hit, stored);
+        let mut restored = Vec::new();
+        cache
+            .local_store()
+            .get_blob(&digest, &mut restored)
+            .unwrap();
+        assert_eq!(restored, b"from-remote");
     }
 }
