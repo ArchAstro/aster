@@ -120,7 +120,13 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
     // handlers query. `/healthz` stays up so the process is not killed while
     // it waits for locks; `/readyz` reports the wait.
     if !app.schema_ready() && request.uri().path() != "/healthz" {
-        return Reply::error(503, "the database schema is being migrated");
+        let mut body = json!({"error": "the database schema is being migrated"});
+        if request.uri().path() == "/readyz" {
+            if let Some(failure) = app.migration_failure() {
+                body["migration"] = json!(failure);
+            }
+        }
+        return Reply::json(503, body);
     }
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/healthz") => Reply::json(200, json!({"ok": true})),
