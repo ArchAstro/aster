@@ -265,7 +265,7 @@ impl ProgressDisplay {
         } else {
             // Normal mode stays quiet for live passes, but a hit must still
             // show the (cached) suffix next to the replayed log.
-            let msg = format!("{} {suffix}", address);
+            let msg = format!("{address} {suffix}");
             let _ = self.multi.println(msg);
         }
     }
