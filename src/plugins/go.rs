@@ -343,58 +343,36 @@ impl LanguagePlugin for GoPlugin {
     }
 }
 
-/// Path after a Go `-o` flag, when the command writes one binary.
+/// Path after the `-o` flag of a `go build` invocation in `command`.
 ///
-/// Accepts `-o path` and `-o./path`. The path must be project-relative: an
-/// absolute path, a `..` segment, or a flag-looking value stores nothing.
+/// The command is split with shell quoting rules. Only flags after a
+/// `go build` word and before the next shell operator count, in Go's flag
+/// forms `-o path`, `--o path`, `-o=path`, and `--o=path`. Unparseable
+/// quoting, an absolute path, a `..` segment, or a flag-looking value stores
+/// nothing, so a misread command never declares an output.
 fn go_output_flag(command: &str) -> Option<String> {
-    let tokens = split_command_tokens(command);
-    let mut index = 0;
-    while index < tokens.len() {
-        let token = tokens[index].as_str();
-        let path = if token == "-o" {
-            index += 1;
-            tokens.get(index).map(String::as_str)
-        } else if is_inline_output_flag(token) {
-            Some(&token[2..])
-        } else {
-            None
+    let tokens = shell_words::split(command).ok()?;
+    let start = tokens.windows(2).position(|pair| {
+        Path::new(&pair[0])
+            .file_name()
+            .is_some_and(|name| name == "go")
+            && pair[1] == "build"
+    })?;
+    let mut rest = tokens[start + 2..]
+        .iter()
+        .take_while(|token| !matches!(token.as_str(), "&&" | "||" | ";" | "|" | "&"));
+    while let Some(token) = rest.next() {
+        let flag = token.strip_prefix("--").or_else(|| token.strip_prefix('-'));
+        let path = match flag {
+            Some("o") => rest.next().map(String::as_str),
+            Some(flag) => flag.strip_prefix("o="),
+            None => None,
         };
         if let Some(path) = path {
             return project_relative_output(path);
         }
-        index += 1;
     }
     None
-}
-
-/// `-o./path` is Go's inline `-o` flag. `-overlay` is a different flag.
-fn is_inline_output_flag(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    bytes.len() > 2 && bytes[1] == b'o' && !bytes[2].is_ascii_alphabetic()
-}
-
-fn split_command_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    for ch in command.chars() {
-        match quote {
-            Some(mark) if ch == mark => quote = None,
-            Some(_) => current.push(ch),
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
-            None if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            None => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
 }
 
 fn project_relative_output(path: &str) -> Option<String> {
@@ -483,10 +461,31 @@ mod tests {
             plugin.default_outputs("build", "go build -o bin/app ./cmd/app", &ctx),
             vec!["bin/app"]
         );
-        assert_eq!(
-            plugin.default_outputs("build", "go build -o./bin/app", &ctx),
-            vec!["./bin/app"]
-        );
+        for command in [
+            "go build -o=bin/app ./cmd/app",
+            "go build --o bin/app",
+            "go build --o=bin/app",
+            "CGO_ENABLED=0 go build -trimpath -o 'bin/app' ./cmd/app && strip bin/app",
+            "/usr/local/go/bin/go build -o bin/app",
+        ] {
+            assert_eq!(
+                plugin.default_outputs("build", command, &ctx),
+                vec!["bin/app"],
+                "{command}"
+            );
+        }
+        for command in [
+            "go build -obin/app",
+            "go build ./... && gcc -o bin/app main.c",
+            "go vet -o bin/app",
+            "go build -o 'bin/app",
+            "go build -o",
+        ] {
+            assert!(
+                plugin.default_outputs("build", command, &ctx).is_empty(),
+                "{command} must not declare an output"
+            );
+        }
         assert!(plugin
             .default_outputs("build", "go build -o /tmp/app", &ctx)
             .is_empty());

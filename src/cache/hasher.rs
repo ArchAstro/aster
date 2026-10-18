@@ -938,6 +938,37 @@ mod tests {
     }
 
     #[test]
+    fn default_outputs_do_not_change_the_key() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();
+        let hasher = CacheHasher::new(tmp.path(), tmp.path());
+        let inputs = CacheInputs {
+            config_files: vec!["package.json".to_string()],
+            ..Default::default()
+        };
+        let defaulted = CacheConfig {
+            outputs: Some(vec!["dist/**".to_string()]),
+            ..Default::default()
+        };
+        let env = HashMap::new();
+        let runtime = RuntimeInputCache::new(tmp.path());
+        let without = hasher
+            .compute_hash(&inputs, None, "npm run build", &[], &env, &runtime)
+            .unwrap();
+        let with = hasher
+            .compute_hash(
+                &inputs,
+                Some(&defaulted),
+                "npm run build",
+                &[],
+                &env,
+                &runtime,
+            )
+            .unwrap();
+        assert_eq!(without, with);
+    }
+
+    #[test]
     fn key_material_hash_matches_compute_hash() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();

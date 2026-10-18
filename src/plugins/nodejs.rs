@@ -1118,39 +1118,115 @@ fn matches_workspace_pattern(pattern: &str, relative_path: &str) -> bool {
         .all(|(pat, path)| *pat == "*" || *pat == *path)
 }
 
-/// Whether a package.json script names `dir` as an output directory.
+/// Whether a package.json script writes into the project's `dir` directory.
 ///
-/// A match is a whole path segment, so `dist` matches `dist`, `./dist`, and
-/// `dist/a.txt`, but not `redistribute`, `distance`, `scripts/build.js`, or
-/// `webpack.dist.js`. Dots inside a token stay put. The script body is what
-/// the build runs; the generated `npm run build` command never names the
-/// directory.
+/// Only write positions count: `mkdir` arguments, a redirect target, the
+/// destination of `cp`/`mv`/`rsync`, and the value of an output flag such as
+/// `--outDir`, `--out-dir`, `-o`, or `-d`. The path's first segment must be
+/// `dir`, so `src/build/x` is not a match. Cleanup (`rm -rf dist`) and inputs
+/// (`node build/script.js`) are not writes. Without a match the build stores
+/// no default outputs, because a declared output that does not exist
+/// prevents a successful build from being stored at all. Unparseable quoting
+/// declares nothing.
 fn script_references_dir(script: &str, dir: &str) -> bool {
-    script
-        .split(|ch: char| {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    ';' | '&' | '|' | '"' | '\'' | '`' | '(' | ')' | '=' | ','
-                )
-        })
-        .any(|token| path_names_dir(token, dir))
+    let Ok(tokens) = shell_words::split(script) else {
+        return false;
+    };
+    let mut command: Vec<&str> = Vec::new();
+    for token in &tokens {
+        let token = token.as_str();
+        let separator = token.trim_end_matches(';');
+        if matches!(separator, "" | "&&" | "||" | "|" | "&") {
+            if command_writes_dir(&command, dir) {
+                return true;
+            }
+            command.clear();
+            continue;
+        }
+        command.push(separator);
+        if separator.len() != token.len() {
+            if command_writes_dir(&command, dir) {
+                return true;
+            }
+            command.clear();
+        }
+    }
+    command_writes_dir(&command, dir)
 }
 
-fn path_names_dir(token: &str, dir: &str) -> bool {
-    let token = token.trim_matches(['/', '\\']);
-    if token == dir {
-        return true;
-    }
-    let mut rest = token.strip_prefix("./").unwrap_or(token);
-    rest = rest.strip_prefix(".\\").unwrap_or(rest);
-    // A bare command such as `build` is not the `build/` directory.
-    if !rest.contains(['/', '\\']) {
+const OUTPUT_FLAGS: &[&str] = &[
+    "-o",
+    "-d",
+    "--out",
+    "--outDir",
+    "--outdir",
+    "--out-dir",
+    "--output",
+    "--output-path",
+    "--dist-dir",
+    "--outFile",
+    "--outfile",
+    "--out-file",
+];
+
+fn command_writes_dir(words: &[&str], dir: &str) -> bool {
+    let Some((&program, args)) = words.split_first() else {
         return false;
+    };
+    let mut iter = args.iter().copied().peekable();
+    let mut positionals = Vec::new();
+    while let Some(arg) = iter.next() {
+        if let Some(target) = arg.strip_prefix('>') {
+            let target = target.trim_start_matches('>');
+            let target = if target.is_empty() {
+                iter.next().unwrap_or("")
+            } else {
+                target
+            };
+            if path_starts_with_dir(target, dir) {
+                return true;
+            }
+            continue;
+        }
+        if let Some((flag, value)) = arg.split_once('=') {
+            if OUTPUT_FLAGS.contains(&flag) && path_starts_with_dir(value, dir) {
+                return true;
+            }
+            continue;
+        }
+        if OUTPUT_FLAGS.contains(&arg) {
+            if iter
+                .next()
+                .is_some_and(|value| path_starts_with_dir(value, dir))
+            {
+                return true;
+            }
+            continue;
+        }
+        if !arg.starts_with('-') {
+            positionals.push(arg);
+        }
     }
-    rest.split(['/', '\\'])
-        .filter(|segment| !segment.is_empty())
-        .any(|segment| segment.strip_prefix("./").unwrap_or(segment) == dir)
+    match Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("mkdir") => positionals.iter().any(|arg| path_starts_with_dir(arg, dir)),
+        Some("cp" | "mv" | "rsync") => {
+            positionals.len() >= 2
+                && positionals
+                    .last()
+                    .is_some_and(|arg| path_starts_with_dir(arg, dir))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a project-relative `path` lies in `dir`: `dist`, `./dist`, or
+/// `dist/a.txt`, but not `redistribute`, `src/dist`, or `webpack.dist.js`.
+fn path_starts_with_dir(path: &str, dir: &str) -> bool {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    path.split('/').next() == Some(dir)
 }
 
 /// Resolve LocalDependency paths to project addresses
@@ -1375,7 +1451,34 @@ mod tests {
             "a script that never names dist or build stores nothing"
         );
 
-        for script in ["webpack --config webpack.dist.js", "node scripts/build.js"] {
+        for script in [
+            "webpack --outDir=dist",
+            "esbuild src/index.ts --outfile=dist/index.js",
+            "rm -rf dist; mkdir dist && cp -r public/ dist",
+            "tsc && echo done >> build/log.txt",
+        ] {
+            let body = format!(r#"{{"scripts":{{"build":{script:?}}}}}"#);
+            std::fs::write(&pkg_json, body).unwrap();
+            let ctx = make_context(&pkg_json, tmp.path(), &[]);
+            assert!(
+                !plugin
+                    .default_outputs("build", "npm run build", &ctx)
+                    .is_empty(),
+                "{script} writes an output directory"
+            );
+        }
+
+        for script in [
+            "webpack --config webpack.dist.js",
+            "node scripts/build.js",
+            "rm -rf dist build && tsc --noEmit",
+            "node build/compile.js",
+            "eslint src/build && cat dist/manifest.json",
+            "cp dist/a.txt public/",
+            "mkdir -p src/dist",
+            "npm run build:lib",
+            "echo 'unterminated > dist/a.txt",
+        ] {
             let body = format!(r#"{{"scripts":{{"build":{script:?}}}}}"#);
             std::fs::write(&pkg_json, body).unwrap();
             let ctx = make_context(&pkg_json, tmp.path(), &[]);
