@@ -58,6 +58,7 @@ async fn run() -> anyhow::Result<()> {
                 },
                 move || {
                     aster_srv::test_results::retention::spawn(on_ready_app.clone());
+                    aster_srv::cache::spawn(on_ready_app.clone());
                     aster_srv::test_results::classifier::spawn(on_ready_app.clone());
                     aster_srv::webhooks::spawn(on_ready_app);
                 },

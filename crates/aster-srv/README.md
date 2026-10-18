@@ -403,7 +403,10 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_QUARANTINE_RELEASE_PASSES` | `20` | Consecutive passes that release a quarantined test. |
 | `ASTER_SRV_QUARANTINE_DAYS` | `30` | The longest a test stays quarantined; at most `ASTER_SRV_RETENTION_DAYS`. |
 | `ASTER_SRV_WEBHOOKS` | unset | Webhook endpoints, as JSON. See [Webhooks](#webhooks). |
-| `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. |
+| `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. They may write the artifact cache. |
+| `ASTER_SRV_CACHE_BUCKET` | unset | The GCS bucket for cache blobs (`cas/<sha256>`). Unset disables the cache. The pod's Workload Identity needs `storage.objects.*` on the bucket and `iam.serviceAccounts.signBlob` on itself. |
+| `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names. |
+| `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. |
 
 Logs are one JSON object per line, with `severity` and `message`.
 
@@ -439,3 +442,27 @@ ASTER_SRV_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 Without `ASTER_SRV_TEST_DATABASE_URL` the database tests skip. Set
 `ASTER_SRV_TEST_TLS_DATABASE_URL` to a TLS-enabled Postgres URL with
 `sslmode=require` to also check that connections are encrypted.
+
+## Artifact cache
+
+The server is the gateway to the shared artifact cache. Manifests are rows in
+`cache.manifests`, keyed by repository and task key. Blobs are objects
+`cas/<sha256>` in `ASTER_SRV_CACHE_BUCKET`, named in `cache.blobs`. Clients
+move blob bytes directly to and from GCS through V4 signed URLs that last 15
+minutes. The pod signs them with IAM Credentials `signBlob` as its own
+service account; no key file is stored.
+
+| Route | |
+|---|---|
+| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A lookup updates `last_used_at`. |
+| `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
+| `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists. `201` stored, `409` the key is already stored, `422` a named blob is missing. Writers only. |
+
+Reads accept any authenticated CI token for the repository, and an IAP viewer
+whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. Writes accept a static
+development token, or a CI token whose `ref` matches `ASTER_SRV_CACHE_WRITERS`
+(default the repository's default branch, `refs/heads/main`). A pull-request
+ref is refused with `403`, so a branch cannot poison the cache.
+
+Every six hours one replica drops manifests unused for `ASTER_SRV_CACHE_DAYS`
+(default 14) and blobs no remaining manifest names, and deletes those objects.

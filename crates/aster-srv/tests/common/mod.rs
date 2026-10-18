@@ -86,6 +86,14 @@ impl Server {
 /// A server on a fresh database, or `None` when no test database is set.
 /// `env` adds settings such as `ASTER_SRV_BROKEN_RUNS`.
 pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
+    start_with(env, None).await
+}
+
+/// [`start`] with a chosen cache blob store.
+pub async fn start_with(
+    env: &[(&str, &str)],
+    cache_store: Option<aster_srv::cache::BlobStore>,
+) -> Option<Server> {
     let Ok(admin_url) = std::env::var("ASTER_SRV_TEST_DATABASE_URL") else {
         eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
         return None;
@@ -124,11 +132,12 @@ pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
         Verifier::new(&config).with_key("test", DecodingKey::from_rsa_pem(PUBLIC).unwrap());
     let iap =
         IapVerifier::new(&config).with_key("iap", DecodingKey::from_ec_der(&iap_key_pair().1));
-    let app = App::start_with_iap(
+    let app = App::start_with_cache(
         config,
         verifier,
         iap,
         Some(RawStore::Memory(Default::default())),
+        cache_store,
     )
     .await
     .unwrap();
@@ -145,6 +154,33 @@ pub async fn start(env: &[(&str, &str)]) -> Option<Server> {
         database,
         shutdown: Some(shutdown),
     })
+}
+
+impl Server {
+    /// `POST path` with JSON. `bearer` is an `Authorization` value already
+    /// including `Bearer `; `iap` is an IAP assertion.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        bearer: Option<&str>,
+        iap: Option<&str>,
+    ) -> (u16, Value) {
+        let mut request = aster_srv::http_client()
+            .build()
+            .unwrap()
+            .post(format!("{}{path}", self.url))
+            .json(body);
+        if let Some(bearer) = bearer {
+            request = request.header("Authorization", bearer);
+        }
+        if let Some(iap) = iap {
+            request = request.header("x-goog-iap-jwt-assertion", iap);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(json!(null)))
+    }
 }
 
 impl Server {
@@ -191,20 +227,29 @@ pub fn iap_assertion_for(email: &str, audience: &str) -> String {
     .unwrap()
 }
 
-pub fn token(repository: &str) -> String {
+/// An OIDC token for `repository` on `workflow_ref` (`None` omits `ref`).
+pub fn token_with_ref(repository: &str, workflow_ref: Option<&str>) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test".into());
+    let mut claims = json!({
+        "iss": "https://token.actions.githubusercontent.com",
+        "aud": "aster-srv",
+        "exp": Utc::now().timestamp() + 300,
+        "repository": repository,
+    });
+    if let Some(workflow_ref) = workflow_ref {
+        claims["ref"] = json!(workflow_ref);
+    }
     encode(
         &header,
-        &json!({
-            "iss": "https://token.actions.githubusercontent.com",
-            "aud": "aster-srv",
-            "exp": Utc::now().timestamp() + 300,
-            "repository": repository,
-        }),
+        &claims,
         &EncodingKey::from_rsa_pem(PRIVATE).unwrap(),
     )
     .unwrap()
+}
+
+pub fn token(repository: &str) -> String {
+    token_with_ref(repository, None)
 }
 
 /// One run to put in the database. Its single target is `//a:test`.

@@ -21,6 +21,11 @@ use crate::config::{Config, RepositoryAllowlist, StaticToken};
 pub struct Identity {
     /// `owner/name`.
     pub repository: String,
+    /// GitHub Actions `ref` (`refs/heads/main`, `refs/pull/7/merge`).
+    /// `None` for a static token, which may write the cache.
+    pub workflow_ref: Option<String>,
+    /// A configured static token, not an OIDC token.
+    pub static_token: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,6 +53,9 @@ impl std::fmt::Display for AuthError {
 #[derive(Deserialize)]
 struct Claims {
     repository: String,
+    #[serde(default)]
+    #[serde(rename = "ref")]
+    workflow_ref: Option<String>,
 }
 
 const REFETCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -110,6 +118,8 @@ impl Verifier {
         {
             return Ok(Identity {
                 repository: found.repository.clone(),
+                workflow_ref: None,
+                static_token: true,
             });
         }
 
@@ -136,6 +146,8 @@ impl Verifier {
         }
         Ok(Identity {
             repository: claims.repository,
+            workflow_ref: claims.workflow_ref.filter(|r| !r.is_empty()),
+            static_token: false,
         })
     }
 

@@ -2,11 +2,12 @@
 //!
 //! One service for what Aster runs need beyond a single machine. Its first
 //! feature is CI test results (`/v1/test-results/...`, the `test_results`
-//! schema); others, such as a shared build cache, sit beside it under their
-//! own routes and schema and share the core: configuration, GitHub Actions
+//! schema); the shared artifact cache (`/v1/cache/...`, the `cache` schema)
+//! sits beside it. Both share the core: configuration, GitHub Actions
 //! OIDC authentication, migrations and the HTTP server.
 
 pub mod auth;
+pub mod cache;
 pub mod config;
 pub mod db;
 mod http;
@@ -67,6 +68,8 @@ pub struct App {
     pub verifier: auth::Verifier,
     pub iap: iap::IapVerifier,
     pub raw_store: raw_store::RawStore,
+    /// Blobs for the shared artifact cache. Disabled when no bucket is set.
+    pub cache_store: cache::BlobStore,
     /// Test durations already answered (they cannot change).
     pub durations: test_results::durations::Answers,
     /// Set once every migration has been applied. Until then the server
@@ -98,6 +101,7 @@ pub fn migrations() -> Vec<&'static db::Migration> {
     test_results::MIGRATIONS
         .iter()
         .chain(webhooks::MIGRATIONS)
+        .chain(cache::MIGRATIONS)
         .collect()
 }
 
@@ -125,7 +129,18 @@ impl App {
         iap: iap::IapVerifier,
         raw_store: Option<raw_store::RawStore>,
     ) -> Result<Arc<Self>> {
-        let app = Self::connect_with_iap(config, verifier, iap, raw_store)?;
+        Self::start_with_cache(config, verifier, iap, raw_store, None).await
+    }
+
+    /// [`Self::start_with_iap`] with a chosen cache blob store. For tests.
+    pub async fn start_with_cache(
+        config: Config,
+        verifier: auth::Verifier,
+        iap: iap::IapVerifier,
+        raw_store: Option<raw_store::RawStore>,
+        cache_store: Option<cache::BlobStore>,
+    ) -> Result<Arc<Self>> {
+        let app = Self::connect_with_iap(config, verifier, iap, raw_store, cache_store)?;
         app.migrate().await?;
         Ok(app)
     }
@@ -139,7 +154,7 @@ impl App {
     pub fn connect(config: Config) -> Result<Arc<Self>> {
         let verifier = auth::Verifier::new(&config);
         let iap = iap::IapVerifier::new(&config);
-        Self::connect_with_iap(config, verifier, iap, None)
+        Self::connect_with_iap(config, verifier, iap, None, None)
     }
 
     fn connect_with_iap(
@@ -147,16 +162,20 @@ impl App {
         verifier: auth::Verifier,
         iap: iap::IapVerifier,
         raw_store: Option<raw_store::RawStore>,
+        cache_store: Option<cache::BlobStore>,
     ) -> Result<Arc<Self>> {
         let pool = db::pool(&config.database_url)?;
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
+        let cache_store =
+            cache_store.unwrap_or_else(|| cache::BlobStore::new(config.cache_bucket.clone()));
         Ok(Arc::new(Self {
             config,
             pool,
             verifier,
             iap,
             raw_store,
+            cache_store,
             durations: Default::default(),
             schema_ready: AtomicBool::new(false),
             migration_failure: Default::default(),
