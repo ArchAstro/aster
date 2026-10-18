@@ -273,8 +273,9 @@ errors.
 
 ### Cache behavior
 
-Aster's local cache memoizes successful target executions; it does not restore
-artifacts. The default cacheable target names are `deps`, `build`, `test`,
+Aster's local cache stores successful target executions as content-addressed
+artifacts and restores declared outputs on a hit. The default cacheable target
+names are `deps`, `build`, `test`,
 `lint`, `format`, `typecheck`, and `check`. Other targets must opt in with
 `cache.enabled = true`. Set `enabled = false` to opt out.
 
@@ -302,7 +303,12 @@ other than `deps`. A nested Node project hashes a root `package-lock.json`,
 for targets other than `deps`.
 
 A hit restores declared `outputs` from the artifact cache and skips execution.
-`.aster/cache/cache.json` is obsolete and unused. Clean
+`aster cache status` reads that store's per-project index. `--json` prints
+`{"cache_dir","targets":[{"address","key","created_at","outputs","output_bytes","exit_code"}]}`;
+human output prints the same fields as a table. `aster cache clear //proj`
+drops that project's index (`ArtifactCache::invalidate_project`);
+`aster cache clear //proj:target` drops one address. Blobs stay until
+`aster cache prune`. `.aster/cache/cache.json` is obsolete and unused. Clean
 targets invalidate the project's cache after succeeding.
 
 A target that passed only on a retry (see below) is not cached, so the next run

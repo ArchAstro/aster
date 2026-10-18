@@ -614,7 +614,10 @@ fn cache_status_inputs_json_matches_executor_hash() {
         .unwrap();
     assert!(stored.status.success(), "{stored:?}");
     let entry: Value = serde_json::from_slice(&stored.stdout).expect("cache status json");
-    let stored_hash = entry["hash"].as_str().expect("stored hash").to_string();
+    let stored_hash = entry["targets"][0]["key"]
+        .as_str()
+        .expect("stored key")
+        .to_string();
 
     let status = assert_cmd::cargo::cargo_bin_cmd!("aster")
         .current_dir(tmp.path())
@@ -728,7 +731,10 @@ fn cache_status_inputs_recomputes_stale_dependency_keys() {
             .output()
             .unwrap();
         let entry: Value = serde_json::from_slice(&stored.stdout).expect("status json");
-        entry["hash"].as_str().expect("stored hash").to_string()
+        entry["targets"][0]["key"]
+            .as_str()
+            .expect("stored key")
+            .to_string()
     };
     let run = || {
         let run = assert_cmd::cargo::cargo_bin_cmd!("aster")
@@ -757,4 +763,102 @@ fn cache_status_inputs_recomputes_stale_dependency_keys() {
     run();
     assert_eq!(key, stored_key("//app:build"));
     assert_eq!(dep.as_deref(), Some(stored_key("//lib:build").as_str()));
+}
+
+/// After one successful cached run of a rich target, `cache status --json`
+/// lists that artifact. `cache clear //p` then leaves `targets` empty.
+#[test]
+fn cache_status_json_lists_artifact_then_clear_empties_project() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "p/package.json", "{\"name\":\"p\"}\n");
+    write_file(
+        &tmp,
+        "p/aster.toml",
+        "[targets.build]\ncommand = \"bash -c 'mkdir -p out && echo hi > out/file.txt'\"\n\n[targets.build.cache]\nenabled = true\ninclude = [\"package.json\"]\noutputs = [\"out/file.txt\"]\n",
+    );
+
+    let run = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["run", "//p:build", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "run failed: {} {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let status = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["cache", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert!(
+        parsed["cache_dir"]
+            .as_str()
+            .is_some_and(|dir| !dir.is_empty()),
+        "cache_dir: {}",
+        parsed["cache_dir"]
+    );
+    let targets = parsed["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 1, "{parsed}");
+    let row = &targets[0];
+    assert_eq!(row["address"], "//p:build");
+    let key = row["key"].as_str().expect("key");
+    assert!(
+        key.len() == 64 && key.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "key: {key}"
+    );
+    assert_eq!(row["outputs"], 1);
+    assert!(row["output_bytes"].as_u64().is_some());
+    assert_eq!(row["exit_code"], 0);
+    assert!(
+        row["created_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.contains('T')),
+        "created_at: {}",
+        row["created_at"]
+    );
+
+    let human = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["cache", "status"])
+        .output()
+        .unwrap();
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(human.status.success(), "{human_out}");
+    assert!(human_out.contains("//p:build"), "{human_out}");
+    assert!(human_out.contains("OUTPUTS"), "{human_out}");
+
+    let clear = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["cache", "clear", "//p"])
+        .output()
+        .unwrap();
+    assert!(
+        clear.status.success(),
+        "clear failed: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+
+    let after = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["cache", "status", "--json"])
+        .output()
+        .unwrap();
+    let after_json: Value = serde_json::from_slice(&after.stdout).expect("status json");
+    assert!(
+        after_json["targets"]
+            .as_array()
+            .is_some_and(|rows| rows.is_empty()),
+        "targets should be empty after clear //p: {after_json}"
+    );
 }
