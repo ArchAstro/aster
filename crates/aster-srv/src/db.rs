@@ -113,6 +113,20 @@ const MIGRATION_LOCK_TIMEOUT: &str = "5s";
 /// Attempts at a migration that keeps meeting a deadlock or a lock timeout.
 const MIGRATION_ATTEMPTS: u32 = 12;
 
+/// Whether `error` is a table-lock wait or deadlock, which clears when the
+/// other session finishes, as opposed to an error that will not.
+pub fn is_lock_contention(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            .is_some_and(|code| {
+                *code == tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+                    || *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
+            })
+    })
+}
+
 /// Apply every migration not yet applied.
 pub async fn migrate(pool: &Pool, migrations: &[&Migration]) -> Result<()> {
     let mut client = pool.get().await.context("cannot connect to the database")?;

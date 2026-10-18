@@ -106,3 +106,148 @@ async fn the_server_stays_alive_while_a_migration_waits_for_a_table_lock() {
         .await
         .unwrap();
 }
+
+fn quick_policy() -> aster_srv::RetryPolicy {
+    aster_srv::RetryPolicy {
+        first_pause: Duration::from_millis(50),
+        later_pause: Duration::from_millis(50),
+        escalate_after: Duration::from_secs(600),
+    }
+}
+
+/// An error that waiting will not clear (here, no database is listening)
+/// logs at error severity on the first pass, keeps retrying, leaves the
+/// server unready, and never starts the background loops.
+#[tokio::test]
+async fn a_migration_error_that_is_not_a_lock_wait_logs_an_error_and_stays_unready() {
+    // Setup: a database URL nothing listens on.
+    let config = Config::from_env(|name| match name {
+        "ASTER_SRV_DATABASE_URL" => Some("postgres://postgres:postgres@127.0.0.1:1/none".into()),
+        "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
+        _ => None,
+    })
+    .unwrap();
+    let app = App::connect(config).unwrap();
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Action: let several passes fail.
+    let task = tokio::spawn({
+        let (app, logs, started) = (Arc::clone(&app), Arc::clone(&logs), Arc::clone(&started));
+        async move {
+            app.migrate_until_ready(
+                &quick_policy(),
+                move |severity, message, _| {
+                    logs.lock().unwrap().push((severity, message.to_string()))
+                },
+                move || started.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+            .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Outcome: still retrying, every failure an error, nothing started.
+    assert!(!task.is_finished(), "retries must not give up");
+    task.abort();
+    let logs = logs.lock().unwrap();
+    assert!(logs.len() >= 2, "expected repeated passes, got {logs:?}");
+    assert!(logs
+        .iter()
+        .all(|(severity, _)| *severity == aster_srv::Severity::Error));
+    assert!(!app.schema_ready());
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// While a table lock blocks the migration the pod logs warnings (not
+/// errors) and the background loops do not start; they start only after the
+/// schema is applied.
+#[tokio::test]
+async fn background_loops_start_only_after_the_schema_is_ready() {
+    let Ok(admin_url) = std::env::var("ASTER_SRV_TEST_DATABASE_URL") else {
+        eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
+        return;
+    };
+    // Setup: previous release's schema, and its reader holding quarantine.
+    let database = format!("aster_srv_test_loops_{}", std::process::id());
+    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await
+        .unwrap();
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let database_url = format!("{base}/{database}");
+    let setup = aster_srv::db::pool(&database_url).unwrap();
+    aster_srv::db::migrate(&setup, &aster_srv::migrations()[..4])
+        .await
+        .unwrap();
+    setup.close();
+    let (mut old_release, connection) =
+        tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(connection);
+    let old_pass = old_release.transaction().await.unwrap();
+    old_pass
+        .batch_execute("LOCK TABLE test_results.quarantine IN ACCESS SHARE MODE")
+        .await
+        .unwrap();
+
+    let config = Config::from_env(|name| match name {
+        "ASTER_SRV_DATABASE_URL" => Some(database_url.clone()),
+        "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
+        _ => None,
+    })
+    .unwrap();
+    let app = App::connect(config).unwrap();
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn({
+        let (app, logs, started) = (Arc::clone(&app), Arc::clone(&logs), Arc::clone(&started));
+        async move {
+            app.migrate_until_ready(
+                &quick_policy(),
+                move |severity, message, _| {
+                    logs.lock().unwrap().push((severity, message.to_string()))
+                },
+                move || started.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+            .await;
+        }
+    });
+
+    // While blocked (past one pass of lock timeouts): warnings only, no loops.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while logs.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no failed pass was logged");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(logs
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(severity, _)| *severity == aster_srv::Severity::Warning));
+
+    // Release the lock: ready, then the loops start.
+    old_pass.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), task)
+        .await
+        .expect("migration finishes after the lock is released")
+        .unwrap();
+    assert!(app.schema_ready());
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+    app.pool.close();
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+}
