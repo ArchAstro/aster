@@ -38,15 +38,32 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     let listen = config.listen;
-    let app = App::start(config).await?;
-    aster_srv::test_results::retention::spawn(app.clone());
-    aster_srv::test_results::classifier::spawn(app.clone());
-    aster_srv::webhooks::spawn(app.clone());
+    let app = App::connect(config)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     log::info(
         "aster-srv listening",
         json!({"address": listen.to_string()}),
     );
+    // Migrate in the background so `/healthz` answers meanwhile. A rolling
+    // deploy can hold table locks for minutes; exiting after a few attempts
+    // (or being killed by the liveness probe) only restarts the wait.
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut attempt = 1u32;
+            while let Err(error) = app.migrate().await {
+                log::warn(
+                    "migrations not applied yet; retrying",
+                    json!({"attempt": attempt, "error": format!("{error:#}")}),
+                );
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            aster_srv::test_results::retention::spawn(app.clone());
+            aster_srv::test_results::classifier::spawn(app.clone());
+            aster_srv::webhooks::spawn(app);
+        }
+    });
     aster_srv::serve(app, listener, shutdown_signal()).await?;
     log::info("aster-srv stopped", json!({}));
     Ok(())
