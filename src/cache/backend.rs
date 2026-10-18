@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -313,14 +313,15 @@ impl TieredCache {
             if self.local.has_blob(&digest) {
                 continue;
             }
-            let mut bytes = Vec::new();
-            if !remote.get_blob(&digest, &mut bytes)? {
+            // Spool to disk: a blob can be larger than memory.
+            let mut spool = self.local.spool()?;
+            if !remote.get_blob(&digest, &mut spool)? {
                 anyhow::bail!(
                     "remote blob {} disappeared during download",
                     digest.as_str()
                 );
             }
-            self.local.put_blob(&digest, bytes.as_slice())?;
+            self.local.put_blob_file(&digest, &mut spool)?;
         }
         self.local.put_manifest(&manifest)?;
         if let Some(handle) = &self.remote {
@@ -333,11 +334,15 @@ impl TieredCache {
         let refs = manifest.blob_refs();
         let missing = remote.find_missing(&refs)?;
         for digest in missing {
-            let mut bytes = Vec::new();
+            // Decompress to a spool file rather than memory, then stream it.
+            let mut spool = self.local.spool()?;
             self.local
-                .get_blob(&digest, &mut bytes)
+                .get_blob(&digest, &mut spool)
                 .with_context(|| format!("local blob {} missing before upload", digest.as_str()))?;
-            remote.put_blob(&digest, &mut bytes.as_slice())?;
+            spool
+                .seek(SeekFrom::Start(0))
+                .context("Failed to rewind blob spool")?;
+            remote.put_blob(&digest, &mut spool)?;
         }
         remote.put_manifest(manifest)?;
         if let Some(handle) = &self.remote {
@@ -555,6 +560,48 @@ mod tests {
         let again = tier.lookup(&key).unwrap().expect("local hit");
         assert_eq!(again.key, key);
         assert_eq!(remote.put_calls(), puts_after_seed);
+    }
+
+    #[test]
+    fn large_blob_round_trips_through_spool_files() {
+        // Larger than the 64 KiB copy buffer, so both directions stream in
+        // several chunks through the on-disk spool.
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let key = "ef".repeat(32);
+        let (remote, _stored, digest) = seeded_remote(&key, &bytes);
+
+        let down = tempfile::tempdir().unwrap();
+        let tier = TieredCache::with_remote(
+            LocalStore::new(down.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote.clone()),
+        );
+        tier.lookup(&key).unwrap().expect("remote hit");
+        let mut restored = Vec::new();
+        tier.local_store().get_blob(&digest, &mut restored).unwrap();
+        assert_eq!(restored, bytes);
+
+        let up = tempfile::tempdir().unwrap();
+        let local = LocalStore::new(up.path().to_path_buf());
+        local.put_blob(&digest, bytes.as_slice()).unwrap();
+        let target = InMemoryBackend::new();
+        let uploader =
+            TieredCache::with_remote(local, CacheMode::ReadWrite, Arc::new(target.clone()));
+        uploader.store(&manifest(&key, Some(&digest))).unwrap();
+        let mut uploaded = Vec::new();
+        assert!(target.get_blob(&digest, &mut uploaded).unwrap());
+        assert_eq!(uploaded, bytes);
+
+        // Spool files are unnamed and leave nothing behind in the cache dir.
+        for dir in [down.path(), up.path()] {
+            let stray: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_file())
+                .filter(|entry| entry.file_name() != "cache.lock")
+                .collect();
+            assert!(stray.is_empty(), "unexpected files: {stray:?}");
+        }
     }
 
     #[test]
