@@ -36,29 +36,33 @@ pub enum BlobStore {
         bucket: String,
         client: reqwest::Client,
         auth: OnceCell<Arc<dyn gcp_auth::TokenProvider>>,
+        signer_email: String,
         signer: OnceCell<Arc<dyn Signer>>,
     },
     /// Objects in memory, signed by `signer`. For tests.
     Memory {
         bucket: String,
-        objects: Mutex<HashMap<String, Bytes>>,
+        objects: Mutex<HashMap<String, (Bytes, DateTime<Utc>)>>,
         signer: Arc<dyn Signer>,
     },
 }
 
 impl BlobStore {
-    pub fn new(bucket: Option<String>) -> Self {
-        match bucket {
-            None => BlobStore::Disabled,
-            Some(bucket) => BlobStore::Gcs {
+    /// `signer_email` is the service account that signs URLs. Config
+    /// requires it whenever a bucket is set.
+    pub fn new(bucket: Option<String>, signer_email: Option<String>) -> Self {
+        match (bucket, signer_email) {
+            (Some(bucket), Some(signer_email)) => BlobStore::Gcs {
                 bucket,
                 client: crate::http_client()
                     .timeout(Duration::from_secs(30))
                     .build()
                     .expect("HTTP client builds"),
                 auth: OnceCell::new(),
+                signer_email,
                 signer: OnceCell::new(),
             },
+            _ => BlobStore::Disabled,
         }
     }
 
@@ -80,6 +84,86 @@ impl BlobStore {
                 names
             }
             BlobStore::Disabled | BlobStore::Gcs { .. } => Vec::new(),
+        }
+    }
+
+    /// Pretend `cas/<sha256>` was created at `at`. For tests.
+    pub async fn backdate(&self, sha256: &str, at: DateTime<Utc>) {
+        if let BlobStore::Memory { objects, .. } = self {
+            if let Some(object) = objects.lock().await.get_mut(sha256) {
+                object.1 = at;
+            }
+        }
+    }
+
+    /// Every `cas/<sha256>` object and when it was created, including
+    /// signed PUTs no commit ever recorded.
+    pub async fn list(&self) -> Result<Vec<(String, DateTime<Utc>)>> {
+        match self {
+            BlobStore::Disabled => Ok(Vec::new()),
+            BlobStore::Memory { objects, .. } => Ok(objects
+                .lock()
+                .await
+                .iter()
+                .map(|(sha256, (_, created))| (sha256.clone(), *created))
+                .collect()),
+            BlobStore::Gcs { client, .. } => {
+                #[derive(serde::Deserialize)]
+                struct Page {
+                    #[serde(default)]
+                    items: Vec<Item>,
+                    #[serde(rename = "nextPageToken")]
+                    next_page_token: Option<String>,
+                }
+                #[derive(serde::Deserialize)]
+                struct Item {
+                    name: String,
+                    #[serde(rename = "timeCreated")]
+                    time_created: String,
+                }
+                let (bucket, token) = self.gcs_auth().await?;
+                let url = format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o");
+                let mut listed = Vec::new();
+                let mut page_token: Option<String> = None;
+                loop {
+                    let mut query = vec![
+                        ("prefix", "cas/".to_string()),
+                        (
+                            "fields",
+                            "items(name,timeCreated),nextPageToken".to_string(),
+                        ),
+                    ];
+                    if let Some(page_token) = &page_token {
+                        query.push(("pageToken", page_token.clone()));
+                    }
+                    let page: Page = client
+                        .get(&url)
+                        .bearer_auth(&token)
+                        .query(&query)
+                        .send()
+                        .await
+                        .context("cannot reach the bucket")?
+                        .error_for_status()
+                        .context("the bucket refused the listing")?
+                        .json()
+                        .await
+                        .context("cannot read the bucket listing")?;
+                    for item in page.items {
+                        let Some(sha256) = item.name.strip_prefix("cas/") else {
+                            continue;
+                        };
+                        let created = DateTime::parse_from_rfc3339(&item.time_created)
+                            .with_context(|| format!("{} has no creation time", item.name))?
+                            .with_timezone(&Utc);
+                        listed.push((sha256.to_string(), created));
+                    }
+                    match page.next_page_token {
+                        Some(next) => page_token = Some(next),
+                        None => break,
+                    }
+                }
+                Ok(listed)
+            }
         }
     }
 
@@ -141,7 +225,10 @@ impl BlobStore {
         match self {
             BlobStore::Disabled => anyhow::bail!("no cache bucket is configured"),
             BlobStore::Memory { objects, .. } => {
-                objects.lock().await.insert(sha256.to_string(), body);
+                objects
+                    .lock()
+                    .await
+                    .insert(sha256.to_string(), (body, Utc::now()));
                 Ok(())
             }
             BlobStore::Gcs { client, .. } => {
@@ -205,10 +292,15 @@ impl BlobStore {
         match self {
             BlobStore::Disabled => anyhow::bail!("no cache bucket is configured"),
             BlobStore::Memory { bucket, signer, .. } => Ok((bucket.clone(), Arc::clone(signer))),
-            BlobStore::Gcs { bucket, signer, .. } => {
+            BlobStore::Gcs {
+                bucket,
+                signer,
+                signer_email,
+                ..
+            } => {
                 let signer = signer
                     .get_or_try_init(|| async {
-                        signing::IamSigner::from_metadata()
+                        signing::IamSigner::new(signer_email.clone())
                             .await
                             .map(|signer| Arc::new(signer) as Arc<dyn Signer>)
                     })
@@ -247,7 +339,9 @@ fn object_url(bucket: &str, sha256: &str) -> String {
 }
 
 /// Drop manifests unused for `cache_days`, then blobs no remaining manifest
-/// names, and delete those objects. Safe to run again; replicas take turns
+/// names, and delete those objects. Objects with no row, from signed PUTs
+/// never committed, go too once they are older than the same cutoff, so an
+/// upload awaiting its commit is left alone. Safe to run again; replicas take turns
 /// through an advisory lock.
 pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Option<Report>> {
     let mut client = app.pool.get().await?;
@@ -284,6 +378,13 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
             orphans.push(sha256);
         }
     }
+    let rows = orphans.len() as u64;
+    let mut targets: HashSet<String> = orphans.iter().cloned().collect();
+    for (sha256, created) in app.cache_store.list().await? {
+        if created < cutoff && !keep.contains(&sha256) {
+            targets.insert(sha256);
+        }
+    }
     if !orphans.is_empty() {
         transaction
             .execute(
@@ -296,7 +397,7 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     // rows back, so the next pass tries them again instead of leaving an
     // object nothing names.
     let mut objects = Vec::new();
-    for sha256 in &orphans {
+    for sha256 in &targets {
         app.cache_store.delete(sha256).await?;
         objects.push(object_name(sha256));
     }
@@ -304,7 +405,7 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     objects.sort();
     Ok(Some(Report {
         manifests,
-        blobs: orphans.len() as u64,
+        blobs: rows,
         objects,
     }))
 }

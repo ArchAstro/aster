@@ -167,8 +167,9 @@ impl App {
         let pool = db::pool(&config.database_url)?;
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
-        let cache_store =
-            cache_store.unwrap_or_else(|| cache::BlobStore::new(config.cache_bucket.clone()));
+        let cache_store = cache_store.unwrap_or_else(|| {
+            cache::BlobStore::new(config.cache_bucket.clone(), config.cache_signer.clone())
+        });
         Ok(Arc::new(Self {
             config,
             pool,

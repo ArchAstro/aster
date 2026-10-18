@@ -54,6 +54,10 @@ async fn server() -> Option<(common::Server, Arc<FixedSigner>)> {
     let started = common::start_with(
         &[
             ("ASTER_SRV_CACHE_BUCKET", "aster-cache-test"),
+            (
+                "ASTER_SRV_CACHE_SIGNER",
+                "cache-test@example.iam.gserviceaccount.com",
+            ),
             ("ASTER_SRV_CACHE_DAYS", "14"),
             (
                 "ASTER_SRV_IAP_AUDIENCE",
@@ -78,13 +82,9 @@ fn canonical_request_hash(url: &str, method: &str, object: &str) -> String {
         .filter(|pair| !pair.starts_with("X-Goog-Signature="))
         .collect::<Vec<_>>()
         .join("&");
-    let date = query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("X-Goog-Date="))
-        .unwrap();
     let encoded = object.replace('/', "%2F");
     let canonical = format!(
-        "{method}\n/aster-cache-test/{encoded}\n{query}\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-date:{date}\n\nhost;x-goog-content-sha256;x-goog-date\nUNSIGNED-PAYLOAD"
+        "{method}\n/aster-cache-test/{encoded}\n{query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
     );
     use sha2::{Digest, Sha256};
     Sha256::digest(canonical.as_bytes())
@@ -402,6 +402,9 @@ async fn signed_urls_expire_and_no_key_is_stored() {
     assert!(remaining <= URL_TTL.as_secs(), "ttl {remaining}");
     assert!(remaining + 5 >= URL_TTL.as_secs(), "ttl {remaining}");
     assert!(url.contains("X-Goog-Algorithm=GOOG4-RSA-SHA256"));
+    // The client sends only the URL, so the signature may cover no header
+    // but `host`.
+    assert!(url.contains("X-Goog-SignedHeaders=host&"), "{url}");
     assert!(url.contains("cache-test%40example.iam.gserviceaccount.com"));
     assert!(!url.contains("PRIVATE"));
     assert!(!url.to_ascii_lowercase().contains("begin private"));
@@ -478,6 +481,21 @@ async fn retention_drops_expired_rows_and_objects() {
         .await
         .unwrap();
 
+    // Signed PUTs no commit recorded: an old one is abandoned, a new one
+    // may still be awaiting its commit.
+    let abandoned = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let pending = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let store = &server.app.cache_store;
+    store
+        .put_unrecorded(abandoned, bytes::Bytes::from_static(b"blob"))
+        .await
+        .unwrap();
+    store.backdate(abandoned, stale).await;
+    store
+        .put_unrecorded(pending, bytes::Bytes::from_static(b"blob"))
+        .await
+        .unwrap();
+
     let report = aster_srv::cache::run_retention(&server.app, Utc::now())
         .await
         .unwrap()
@@ -491,7 +509,12 @@ async fn retention_drops_expired_rows_and_objects() {
         .objects
         .iter()
         .any(|object| object == &format!("cas/{orphan}")));
+    assert!(report
+        .objects
+        .iter()
+        .any(|object| object == &format!("cas/{abandoned}")));
     assert!(!report.objects.iter().any(|object| object.contains(OTHER)));
+    assert!(!report.objects.iter().any(|object| object.contains(pending)));
 
     let left: i64 = client
         .query_one("SELECT count(*) FROM cache.manifests", &[])
@@ -500,6 +523,6 @@ async fn retention_drops_expired_rows_and_objects() {
         .get(0);
     assert_eq!(left, 1);
     let blobs = server.app.cache_store.objects().await;
-    assert_eq!(blobs, vec![OTHER.to_string()]);
+    assert_eq!(blobs, vec![OTHER.to_string(), pending.to_string()]);
     server.stop().await;
 }

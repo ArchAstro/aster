@@ -46,55 +46,26 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 pub struct IamSigner {
     client: reqwest::Client,
     email: String,
-    access_token: String,
+    /// Asked for a token on every signature; it caches and refreshes them.
+    auth: std::sync::Arc<dyn gcp_auth::TokenProvider>,
 }
 
 impl IamSigner {
-    /// The pod's own service account and a token that can call `signBlob`.
-    pub async fn from_metadata() -> Result<Self> {
-        let provider = gcp_auth::provider()
+    /// Sign as `email`, the pod's own service account, with the ambient
+    /// Workload Identity token.
+    pub async fn new(email: String) -> Result<Self> {
+        let auth = gcp_auth::provider()
             .await
             .context("no Google credentials")?;
-        let access = provider
-            .token(&[SIGN_SCOPE])
-            .await
-            .context("cannot get a Google access token")?;
-        let email = service_account_email()
-            .await
-            .context("cannot read the pod service account")?;
         Ok(Self {
             client: crate::http_client()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP client builds"),
             email,
-            access_token: access.as_str().to_string(),
+            auth,
         })
     }
-}
-
-async fn service_account_email() -> Result<String> {
-    // Workload Identity exposes the account email on the metadata server.
-    // gcp_auth does not surface it, so read the same metadata the token came from.
-    let client = crate::http_client()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("HTTP client builds");
-    let email = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email")
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await
-        .context("cannot reach the metadata server")?
-        .error_for_status()
-        .context("the metadata server refused the service account email")?
-        .text()
-        .await?;
-    let email = email.trim().to_string();
-    if email.is_empty() || !email.contains('@') {
-        anyhow::bail!("the metadata server returned no service account email");
-    }
-    Ok(email)
 }
 
 #[derive(Serialize)]
@@ -111,6 +82,11 @@ struct SignBlobResponse {
 impl Signer for IamSigner {
     fn sign<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
+            let access = self
+                .auth
+                .token(&[SIGN_SCOPE])
+                .await
+                .context("cannot get a Google access token")?;
             let body = SignBlobRequest {
                 payload: &base64::engine::general_purpose::STANDARD.encode(payload),
             };
@@ -121,7 +97,7 @@ impl Signer for IamSigner {
             let signed: SignBlobResponse = self
                 .client
                 .post(url)
-                .bearer_auth(&self.access_token)
+                .bearer_auth(access.as_str())
                 .json(&body)
                 .send()
                 .await
@@ -156,10 +132,10 @@ pub async fn signed_url(
     let datestamp = &datetime[..8];
     let credential_scope = format!("{datestamp}/auto/storage/goog4_request");
     let credential = format!("{}/{}", signer.service_account_email(), credential_scope);
-    let canonical_headers = format!(
-        "host:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-date:{datetime}\n"
-    );
-    let signed_headers = "host;x-goog-content-sha256;x-goog-date";
+    // Sign only `host`. The client sends nothing but the URL, so any other
+    // signed header would make GCS reject the request.
+    let canonical_headers = "host:storage.googleapis.com\n";
+    let signed_headers = "host";
     let canonical_query = canonical_query(&credential, &datetime, expires, signed_headers);
     let encoded_object = canonical_object(object);
     let canonical_request = format!(
