@@ -10,7 +10,7 @@ use fs2::FileExt;
 use sha2::{Digest as Sha256Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -56,7 +56,7 @@ impl LocalStore {
         let _lock = self.acquire_lock(LockMode::Shared)?;
         let mut last_error = None;
         for _ in 0..PUT_BLOB_ATTEMPTS {
-            match self.put_blob_once(digest, &buffered) {
+            match self.put_blob_once(digest, buffered.as_slice()) {
                 Ok(()) => return Ok(()),
                 Err(error) if missing_after_race(&error, digest, self) => {
                     last_error = Some(error);
@@ -67,7 +67,41 @@ impl LocalStore {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("blob put failed")))
     }
 
-    fn put_blob_once(&self, digest: &Digest, bytes: &[u8]) -> Result<()> {
+    /// [`Self::put_blob`] reading from a file instead of memory.
+    ///
+    /// Each attempt seeks `file` back to its start, so a large blob is never
+    /// held in memory.
+    pub(crate) fn put_blob_file(&self, digest: &Digest, file: &mut File) -> Result<()> {
+        let _lock = self.acquire_lock(LockMode::Shared)?;
+        let mut last_error = None;
+        for _ in 0..PUT_BLOB_ATTEMPTS {
+            file.seek(SeekFrom::Start(0))
+                .context("Failed to rewind blob spool")?;
+            match self.put_blob_once(digest, &mut *file) {
+                Ok(()) => return Ok(()),
+                Err(error) if missing_after_race(&error, digest, self) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("blob put failed")))
+    }
+
+    /// Unnamed temp file under the cache directory, deleted when dropped.
+    /// Holds a blob in transit between the local store and a remote.
+    pub(crate) fn spool(&self) -> Result<File> {
+        fs::create_dir_all(&self.cache_dir)
+            .with_context(|| format!("Failed to create {}", self.cache_dir.display()))?;
+        tempfile::tempfile_in(&self.cache_dir).with_context(|| {
+            format!(
+                "Failed to create a spool file in {}",
+                self.cache_dir.display()
+            )
+        })
+    }
+
+    fn put_blob_once(&self, digest: &Digest, bytes: impl Read) -> Result<()> {
         let path = self.blob_path(digest)?;
         if path.is_file() {
             // Refresh mtime so prune's grace window covers this writer until
