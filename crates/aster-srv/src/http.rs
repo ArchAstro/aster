@@ -128,7 +128,8 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
         }
         return Reply::json(503, body);
     }
-    match (request.method(), request.uri().path()) {
+    let path = request.uri().path().to_string();
+    match (request.method(), path.as_str()) {
         (&Method::GET, "/healthz") => Reply::json(200, json!({"ok": true})),
         (&Method::GET, "/readyz") => match ready(app).await {
             Ok(()) => Reply::json(200, json!({"ok": true})),
@@ -161,6 +162,29 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             let route = query::parse_route(path).expect("checked above");
             query::handle(app, &identity, route, request.uri().query()).await
+        }
+        (&Method::POST, path) if path.starts_with("/v1/cache/") => {
+            let authorization = header(&request, AUTHORIZATION);
+            let iap_assertion = request
+                .headers()
+                .get(crate::iap::IAP_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = match read_body(request, app.config.max_body_bytes).await {
+                Ok(body) => body,
+                Err(reply) => return reply,
+            };
+            crate::cache::handle(
+                app,
+                "POST",
+                path,
+                &crate::cache::Headers {
+                    authorization: authorization.as_deref(),
+                    iap_assertion: iap_assertion.as_deref(),
+                },
+                body,
+            )
+            .await
         }
         (method, path) if crate::ui::is_ui_path(path) => {
             let assertion = request

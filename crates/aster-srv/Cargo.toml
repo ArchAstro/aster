@@ -29,3 +29,8 @@ tokio-postgres-rustls = "0.14"
 gcp_auth = { version = "0.12.7", default-features = false, features = ["aws-lc-rs"] }
 # HMAC for webhook signatures; already in the build through rustls.
 aws-lc-rs = "1"
+base64 = "0.22"
+sha2 = "0.10"
+
+[dev-dependencies]
+sha2 = "0.10"

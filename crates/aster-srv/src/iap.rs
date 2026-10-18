@@ -102,6 +102,13 @@ impl IapVerifier {
         self
     }
 
+    pub fn allows_email(&self, email: &str) -> bool {
+        match &self.domains {
+            Some(domains) => domains.allows(email),
+            None => true,
+        }
+    }
+
     /// Whether the dashboard is on at all.
     pub fn enabled(&self) -> bool {
         !matches!(self.mode, Mode::Disabled)

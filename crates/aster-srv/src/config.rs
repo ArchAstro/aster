@@ -89,6 +89,15 @@ pub struct Config {
     /// `ASTER_SRV_WEBHOOKS`: where state changes are sent. Empty sends
     /// nothing.
     pub webhooks: Vec<crate::webhooks::Endpoint>,
+    /// `ASTER_SRV_CACHE_BUCKET`: the GCS bucket that holds `cas/<sha256>`
+    /// blobs. Unset disables the cache.
+    pub cache_bucket: Option<String>,
+    /// `ASTER_SRV_CACHE_DAYS`: drop manifests unused this long, and blobs
+    /// no remaining manifest names. Default 14.
+    pub cache_days: u32,
+    /// `ASTER_SRV_CACHE_WRITERS`: `repo=ref` patterns that may upload and
+    /// commit. Default `*=refs/heads/<default branch>`.
+    pub cache_writers: CacheWriters,
 }
 
 /// When tests enter and leave quarantine.
@@ -218,6 +227,17 @@ impl Config {
             Some(value) => crate::webhooks::Endpoint::parse_all(&value)?,
             None => Vec::new(),
         };
+        let default_branch = var("ASTER_SRV_DEFAULT_BRANCH").unwrap_or_else(|| "main".to_string());
+        let cache_days = match var("ASTER_SRV_CACHE_DAYS") {
+            Some(days) => days
+                .parse()
+                .ok()
+                .filter(|days| *days > 0)
+                .context("ASTER_SRV_CACHE_DAYS must be a positive number of days")?,
+            None => 14,
+        };
+        let cache_writers =
+            CacheWriters::parse(var("ASTER_SRV_CACHE_WRITERS").as_deref(), &default_branch)?;
         Ok(Self {
             listen,
             database_url,
@@ -227,7 +247,7 @@ impl Config {
             static_tokens,
             raw_bucket: var("ASTER_SRV_RAW_BUCKET"),
             retention_days,
-            default_branch: var("ASTER_SRV_DEFAULT_BRANCH").unwrap_or_else(|| "main".to_string()),
+            default_branch,
             broken_runs,
             max_body_bytes,
             iap_audience,
@@ -235,6 +255,9 @@ impl Config {
             ui_dev_email: var("ASTER_SRV_UI_DEV_EMAIL").map(|email| email.trim().to_string()),
             quarantine,
             webhooks,
+            cache_bucket: var("ASTER_SRV_CACHE_BUCKET"),
+            cache_days,
+            cache_writers,
         })
     }
 }
@@ -276,6 +299,58 @@ impl RepositoryAllowlist {
                     .strip_suffix("/*")
                     .is_some_and(|allowed_owner| allowed_owner == owner)
         })
+    }
+}
+
+/// `repo=ref` patterns that may write the cache. `*` matches any repository.
+/// A ref pattern matches exactly, or as a prefix when it ends in `*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheWriters {
+    patterns: Vec<(String, String)>,
+}
+
+impl CacheWriters {
+    /// `None` is the default: any allowed repository, on `refs/heads/<branch>`.
+    pub fn parse(value: Option<&str>, default_branch: &str) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self {
+                patterns: vec![("*".into(), format!("refs/heads/{default_branch}"))],
+            });
+        };
+        let mut patterns = Vec::new();
+        for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (repo, pattern) = entry.split_once('=').with_context(|| {
+                format!("ASTER_SRV_CACHE_WRITERS entry '{entry}' must be repo=ref")
+            })?;
+            let repo = repo.trim();
+            let pattern = pattern.trim();
+            if repo.is_empty() || pattern.is_empty() || repo.contains('*') && repo != "*" {
+                bail!("ASTER_SRV_CACHE_WRITERS entry '{entry}' must be owner/name=ref or *=ref");
+            }
+            patterns.push((repo.to_string(), pattern.to_string()));
+        }
+        if patterns.is_empty() {
+            bail!("ASTER_SRV_CACHE_WRITERS lists no writer");
+        }
+        Ok(Self { patterns })
+    }
+
+    /// Whether `workflow_ref` may write for `repository`.
+    pub fn allows(&self, repository: &str, workflow_ref: Option<&str>) -> bool {
+        let Some(workflow_ref) = workflow_ref else {
+            return false;
+        };
+        self.patterns.iter().any(|(repo, pattern)| {
+            (*repo == "*" || repo.eq_ignore_ascii_case(repository))
+                && ref_matches(pattern, workflow_ref)
+        })
+    }
+}
+
+fn ref_matches(pattern: &str, workflow_ref: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => !prefix.is_empty() && workflow_ref.starts_with(prefix),
+        None => pattern == workflow_ref,
     }
 }
 
@@ -362,6 +437,15 @@ mod tests {
             }
         );
         assert!(config.webhooks.is_empty());
+        assert!(config.cache_bucket.is_none());
+        assert_eq!(config.cache_days, 14);
+        assert!(config
+            .cache_writers
+            .allows("ArchAstro/aster", Some("refs/heads/main")));
+        assert!(!config
+            .cache_writers
+            .allows("ArchAstro/aster", Some("refs/pull/7/merge")));
+        assert!(!config.cache_writers.allows("ArchAstro/aster", None));
     }
 
     #[test]
