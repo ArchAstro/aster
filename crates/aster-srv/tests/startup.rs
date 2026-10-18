@@ -257,3 +257,20 @@ async fn background_loops_start_only_after_the_schema_is_ready() {
         .await
         .unwrap();
 }
+
+/// `/readyz` is unauthenticated, so the reported failure must not carry the
+/// database error text, which can include connection and schema details.
+#[test]
+fn readiness_failure_omits_the_database_error() {
+    let failure = aster_srv::MigrationFailure {
+        state: "failing",
+        pass: 3,
+        waiting_seconds: 42,
+        error: "connect to postgres://user:secret@db/aster failed".into(),
+    };
+    let body = serde_json::to_value(&failure).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"state": "failing", "pass": 3, "waiting_seconds": 42})
+    );
+}
