@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{find_aster_toml, parse_aster_toml, WorkspaceConfig};
-use crate::plugins::{LocalDependency, PluginRegistry, ProjectMetadata, Target, TargetContext};
+use crate::plugins::{
+    LanguagePlugin, LocalDependency, PluginRegistry, ProjectMetadata, Target, TargetContext,
+};
 use crate::targets::TargetResolver;
 
 /// Build a GlobSet from ignore patterns
@@ -268,8 +270,9 @@ pub fn discover_projects(
         })?;
 
         // Resolve targets: detected + aster.toml overrides, resolving //self: references
-        let targets =
+        let mut targets =
             TargetResolver::resolve(&detected_targets, &partial.custom_targets, &project_address);
+        apply_default_outputs(&mut targets, plugin, &target_ctx);
         explicit_target_dependencies.extend(partial.explicit_target_dependencies);
 
         projects.push(DiscoveredProject {
@@ -292,6 +295,34 @@ pub fn discover_projects(
     normalize_target_dependencies(&mut projects, &explicit_target_dependencies)?;
 
     Ok(projects)
+}
+
+/// Fill plugin default outputs when the user did not set `cache.outputs`.
+///
+/// A resolved `cache.outputs` of `Some`, including an empty list, is the
+/// user's declaration and replaces the default. `None` means the field was
+/// omitted, so the plugin's project-relative globs are stored on the target.
+/// An empty default leaves the target unchanged.
+fn apply_default_outputs(
+    targets: &mut HashMap<String, Target>,
+    plugin: &dyn LanguagePlugin,
+    ctx: &TargetContext,
+) {
+    for (name, target) in targets.iter_mut() {
+        if target
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.outputs.is_some())
+        {
+            continue;
+        }
+        let defaults = plugin.default_outputs(name, &target.command, ctx);
+        if defaults.is_empty() {
+            continue;
+        }
+        let cache = target.cache.get_or_insert_with(Default::default);
+        cache.outputs = Some(defaults);
+    }
 }
 
 impl DiscoveredProject {

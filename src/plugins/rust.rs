@@ -319,6 +319,17 @@ impl LanguagePlugin for RustPlugin {
         files
     }
 
+    fn default_outputs(
+        &self,
+        _target_name: &str,
+        _command: &str,
+        _ctx: &TargetContext,
+    ) -> Vec<String> {
+        // `target/` is a native warm cache. L1 stores a Rust binary only when
+        // the user configures outputs.
+        Vec::new()
+    }
+
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
         let cargo_root = cargo_workspace_root(ctx.project_dir, ctx.workspace_root);
         let lock_file = workspace_relative(&cargo_root.join("Cargo.lock"), ctx.workspace_root);
@@ -503,6 +514,26 @@ fn workspace_relative(path: &Path, workspace_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_outputs_are_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cargo_toml = tmp.path().join("Cargo.toml");
+        std::fs::write(&cargo_toml, "[package]\nname = \"app\"\n").unwrap();
+        let plugin = RustPlugin;
+        let ctx = TargetContext {
+            config_path: &cargo_toml,
+            project_dir: tmp.path(),
+            workspace_root: tmp.path(),
+            dependencies: &[],
+        };
+        for name in ["build", "test", "lint", "check", "format"] {
+            assert!(
+                plugin.default_outputs(name, "cargo build", &ctx).is_empty(),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_simple_cargo_toml() {

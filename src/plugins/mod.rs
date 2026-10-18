@@ -353,6 +353,26 @@ pub trait LanguagePlugin: Send + Sync {
         CacheInputs::default()
     }
 
+    /// Project-relative output globs the artifact cache stores for this target
+    /// when the user did not set `[targets.<name>.cache] outputs`.
+    ///
+    /// Globs are expanded by the outputs packer. An empty list stores no
+    /// artifacts. Log-only targets (`test`, `lint`, `typecheck`, `check`,
+    /// `format`) return none. A user-set `outputs` list, including an empty
+    /// one, replaces this default.
+    ///
+    /// - target_name: name of the target (e.g., "build", "release")
+    /// - command: the effective command after aster.toml overrides
+    /// - ctx: project paths and the native config, used to read the build script
+    fn default_outputs(
+        &self,
+        _target_name: &str,
+        _command: &str,
+        _ctx: &TargetContext,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Workspace-root files that belong in this project's cache key.
     ///
     /// `cache_inputs` has no project path, so it cannot tell a workspace

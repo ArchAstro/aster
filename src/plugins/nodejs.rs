@@ -668,6 +668,38 @@ impl LanguagePlugin for NodeJsPlugin {
         files
     }
 
+    fn default_outputs(
+        &self,
+        target_name: &str,
+        _command: &str,
+        ctx: &TargetContext,
+    ) -> Vec<String> {
+        if target_name != "build" {
+            return Vec::new();
+        }
+        let Ok(content) = std::fs::read_to_string(ctx.config_path) else {
+            return Vec::new();
+        };
+        let Ok(pkg) = serde_json::from_str::<PackageJson>(&content) else {
+            return Vec::new();
+        };
+        let Some(script) = pkg
+            .scripts
+            .as_ref()
+            .and_then(|scripts| scripts.get("build"))
+        else {
+            return Vec::new();
+        };
+        let mut outputs = Vec::new();
+        if script_references_dir(script, "dist") {
+            outputs.push("dist/**".to_string());
+        }
+        if script_references_dir(script, "build") {
+            outputs.push("build/**".to_string());
+        }
+        outputs
+    }
+
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
         let pm = detect_package_manager(ctx.project_dir, ctx.workspace_root);
         let (store_id, store_path) = match pm {
@@ -1086,6 +1118,41 @@ fn matches_workspace_pattern(pattern: &str, relative_path: &str) -> bool {
         .all(|(pat, path)| *pat == "*" || *pat == *path)
 }
 
+/// Whether a package.json script names `dir` as an output directory.
+///
+/// A match is a whole path segment, so `dist` matches `dist`, `./dist`, and
+/// `dist/a.txt`, but not `redistribute`, `distance`, `scripts/build.js`, or
+/// `webpack.dist.js`. Dots inside a token stay put. The script body is what
+/// the build runs; the generated `npm run build` command never names the
+/// directory.
+fn script_references_dir(script: &str, dir: &str) -> bool {
+    script
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '&' | '|' | '"' | '\'' | '`' | '(' | ')' | '=' | ','
+                )
+        })
+        .any(|token| path_names_dir(token, dir))
+}
+
+fn path_names_dir(token: &str, dir: &str) -> bool {
+    let token = token.trim_matches(['/', '\\']);
+    if token == dir {
+        return true;
+    }
+    let mut rest = token.strip_prefix("./").unwrap_or(token);
+    rest = rest.strip_prefix(".\\").unwrap_or(rest);
+    // A bare command such as `build` is not the `build/` directory.
+    if !rest.contains(['/', '\\']) {
+        return false;
+    }
+    rest.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment.strip_prefix("./").unwrap_or(segment) == dir)
+}
+
 /// Resolve LocalDependency paths to project addresses
 ///
 /// Handles both address strings (//libs/shared) and relative paths (../../libs/shared)
@@ -1252,6 +1319,72 @@ mod tests {
             project_dir: config_path.parent().unwrap(),
             workspace_root,
             dependencies,
+        }
+    }
+
+    #[test]
+    fn default_outputs_follow_the_build_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"scripts":{"build":"mkdir -p dist && echo ok > dist/a.txt","test":"jest","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        let plugin = NodeJsPlugin;
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+
+        assert_eq!(
+            plugin.default_outputs("build", "npm run build", &ctx),
+            vec!["dist/**"]
+        );
+        for name in ["test", "lint", "typecheck", "check", "format"] {
+            assert!(
+                plugin
+                    .default_outputs(name, "npm run build", &ctx)
+                    .is_empty(),
+                "{name} must not declare outputs"
+            );
+        }
+
+        std::fs::write(
+            &pkg_json,
+            r#"{"scripts":{"build":"tsc -p tsconfig.json && cp package.json build/"}}"#,
+        )
+        .unwrap();
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        assert_eq!(
+            plugin.default_outputs("build", "npm run build", &ctx),
+            vec!["build/**"]
+        );
+
+        std::fs::write(&pkg_json, r#"{"scripts":{"build":"tsc --outDir dist"}}"#).unwrap();
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        assert_eq!(
+            plugin.default_outputs("build", "npm run build", &ctx),
+            vec!["dist/**"],
+            "--outDir dist names the output directory"
+        );
+
+        std::fs::write(&pkg_json, r#"{"scripts":{"build":"tsc"}}"#).unwrap();
+        let ctx = make_context(&pkg_json, tmp.path(), &[]);
+        assert!(
+            plugin
+                .default_outputs("build", "npm run build", &ctx)
+                .is_empty(),
+            "a script that never names dist or build stores nothing"
+        );
+
+        for script in ["webpack --config webpack.dist.js", "node scripts/build.js"] {
+            let body = format!(r#"{{"scripts":{{"build":{script:?}}}}}"#);
+            std::fs::write(&pkg_json, body).unwrap();
+            let ctx = make_context(&pkg_json, tmp.path(), &[]);
+            assert!(
+                plugin
+                    .default_outputs("build", "npm run build", &ctx)
+                    .is_empty(),
+                "{script} must not guess an output directory"
+            );
         }
     }
 

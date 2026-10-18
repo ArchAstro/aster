@@ -315,6 +315,23 @@ impl LanguagePlugin for GradlePlugin {
         inputs
     }
 
+    fn default_outputs(
+        &self,
+        target_name: &str,
+        _command: &str,
+        ctx: &TargetContext,
+    ) -> Vec<String> {
+        // `build/libs/*.jar` is the java/kotlin jar task. An application
+        // plugin writes distributions instead, and a project with no JVM
+        // sources writes neither. Declaring a missing glob would drop the
+        // cache entry for a successful build.
+        if target_name == "build" && gradle_writes_jar(ctx) {
+            vec!["build/libs/*.jar".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
         let gradle_root = find_gradle_root(ctx.project_dir);
         let root_rel = workspace_relative(&gradle_root, ctx.workspace_root);
@@ -356,6 +373,21 @@ fn directory_name(directory: &Path) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
+}
+
+/// The java plugin writes `build/libs/*.jar`. The application plugin writes
+/// distributions instead, so that project gets no default.
+fn gradle_writes_jar(ctx: &TargetContext) -> bool {
+    if !ctx.project_dir.join("src/main").is_dir() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(ctx.config_path) else {
+        return false;
+    };
+    if content.contains("application") {
+        return false;
+    }
+    content.contains("java") || content.contains("kotlin")
 }
 
 fn gradle_build_name(filename: &str) -> Option<String> {
@@ -503,6 +535,35 @@ mod tests {
             workspace_root,
             dependencies,
         }
+    }
+
+    #[test]
+    fn default_outputs_are_the_build_jar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build.gradle.kts");
+        std::fs::write(&build, "plugins {\n    java\n}\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/main/java")).unwrap();
+        let plugin = GradlePlugin;
+        let ctx = context(&build, tmp.path(), &[]);
+
+        assert_eq!(
+            plugin.default_outputs("build", "./gradlew build", &ctx),
+            vec!["build/libs/*.jar"]
+        );
+        for name in ["test", "lint", "format", "check", "deps"] {
+            assert!(plugin
+                .default_outputs(name, "./gradlew test", &ctx)
+                .is_empty());
+        }
+
+        std::fs::write(&build, "plugins {\n    application\n}\n").unwrap();
+        let ctx = context(&build, tmp.path(), &[]);
+        assert!(
+            plugin
+                .default_outputs("build", "./gradlew build", &ctx)
+                .is_empty(),
+            "the application plugin writes distributions, not build/libs"
+        );
     }
 
     #[test]

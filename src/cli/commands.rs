@@ -549,8 +549,9 @@ pub enum CacheCommands {
         ///
         /// Lists the salt, platform, each hashed file and its digest, the
         /// command, dependency hashes, tracked environment variables (names
-        /// and whether set; values are SHA256-hashed), and runtime inputs,
-        /// then the key execution stores. Requires a target address.
+        /// and whether set; values are SHA256-hashed), runtime inputs, and
+        /// the effective output globs, then the key execution stores.
+        /// Requires a target address.
         #[arg(long)]
         inputs: bool,
     },

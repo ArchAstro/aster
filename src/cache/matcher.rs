@@ -152,7 +152,7 @@ mod tests {
             include: vec![],
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
-            outputs: vec![],
+            outputs: None,
             ..Default::default()
         };
         let m =
@@ -169,7 +169,7 @@ mod tests {
             include: vec!["extra/**/*.json".to_string()],
             exclude: vec![],
             env: vec![],
-            outputs: vec![],
+            outputs: None,
             ..Default::default()
         };
         let m =
