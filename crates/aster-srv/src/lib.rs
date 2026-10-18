@@ -72,6 +72,22 @@ pub struct App {
     /// Set once every migration has been applied. Until then the server
     /// answers `/healthz` and nothing else (see [`App::connect`]).
     schema_ready: AtomicBool,
+    /// The last failed migration pass, for `/readyz` while not ready.
+    migration_failure: std::sync::Mutex<Option<MigrationFailure>>,
+}
+
+/// Why the schema is not ready yet, as `/readyz` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MigrationFailure {
+    /// `waiting_for_locks` (clears once the other release lets go) or
+    /// `failing` (waiting will not fix it; an operator must).
+    pub state: &'static str,
+    /// Failed passes so far.
+    pub pass: u32,
+    /// Seconds since the first pass started.
+    pub waiting_seconds: u64,
+    /// The last pass's error.
+    pub error: String,
 }
 
 /// Every feature's migrations, in order.
@@ -140,6 +156,7 @@ impl App {
             raw_store,
             durations: Default::default(),
             schema_ready: AtomicBool::new(false),
+            migration_failure: Default::default(),
         }))
     }
 
@@ -175,6 +192,16 @@ impl App {
             } else {
                 Severity::Error
             };
+            let failure = MigrationFailure {
+                state: if contended {
+                    "waiting_for_locks"
+                } else {
+                    "failing"
+                },
+                pass,
+                waiting_seconds: started.elapsed().as_secs(),
+                error: format!("{error:#}"),
+            };
             log(
                 severity,
                 if contended {
@@ -183,11 +210,12 @@ impl App {
                     "migrations failed; retrying"
                 },
                 serde_json::json!({
-                    "pass": pass,
-                    "waiting_seconds": started.elapsed().as_secs(),
-                    "error": format!("{error:#}"),
+                    "pass": failure.pass,
+                    "waiting_seconds": failure.waiting_seconds,
+                    "error": failure.error,
                 }),
             );
+            *self.migration_failure.lock().unwrap() = Some(failure);
             let pause = if pass == 1 {
                 policy.first_pause
             } else {
@@ -196,7 +224,17 @@ impl App {
             tokio::time::sleep(pause).await;
             pass += 1;
         }
+        *self.migration_failure.lock().unwrap() = None;
         on_ready();
+    }
+
+    /// The last failed migration pass while the schema is not ready.
+    ///
+    /// Retries never stop, so a permanent failure leaves the process live
+    /// (`/healthz` 200) and unready forever; this is how `/readyz` and
+    /// rollout monitoring tell that apart from a lock wait that will clear.
+    pub fn migration_failure(&self) -> Option<MigrationFailure> {
+        self.migration_failure.lock().unwrap().clone()
     }
 
     /// Whether every migration has been applied.

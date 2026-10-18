@@ -157,6 +157,10 @@ async fn a_migration_error_that_is_not_a_lock_wait_logs_an_error_and_stays_unrea
         .all(|(severity, _)| *severity == aster_srv::Severity::Error));
     assert!(!app.schema_ready());
     assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    // Monitoring can tell this from a lock wait that will clear.
+    let failure = app.migration_failure().expect("a failed pass is recorded");
+    assert_eq!(failure.state, "failing");
+    assert!(failure.pass >= 2);
 }
 
 /// While a table lock blocks the migration the pod logs warnings (not
@@ -235,6 +239,7 @@ async fn background_loops_start_only_after_the_schema_is_ready() {
         .unwrap()
         .iter()
         .all(|(severity, _)| *severity == aster_srv::Severity::Warning));
+    assert_eq!(app.migration_failure().unwrap().state, "waiting_for_locks");
 
     // Release the lock: ready, then the loops start.
     old_pass.rollback().await.unwrap();
@@ -244,6 +249,7 @@ async fn background_loops_start_only_after_the_schema_is_ready() {
         .unwrap();
     assert!(app.schema_ready());
     assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(app.migration_failure(), None);
 
     app.pool.close();
     admin
