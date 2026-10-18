@@ -405,7 +405,8 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_WEBHOOKS` | unset | Webhook endpoints, as JSON. See [Webhooks](#webhooks). |
 | `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. They may write the artifact cache. |
 | `ASTER_SRV_CACHE_BUCKET` | unset | The GCS bucket for cache blobs (`cas/<sha256>`). Unset disables the cache. The pod's Workload Identity needs `storage.objects.*` on the bucket and `iam.serviceAccounts.signBlob` on itself. |
-| `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names. |
+| `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
+| `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. |
 
 Logs are one JSON object per line, with `severity` and `message`.
@@ -449,8 +450,9 @@ The server is the gateway to the shared artifact cache. Manifests are rows in
 `cache.manifests`, keyed by repository and task key. Blobs are objects
 `cas/<sha256>` in `ASTER_SRV_CACHE_BUCKET`, named in `cache.blobs`. Clients
 move blob bytes directly to and from GCS through V4 signed URLs that last 15
-minutes. The pod signs them with IAM Credentials `signBlob` as its own
-service account; no key file is stored.
+minutes and sign only the `host` header, so the URL alone is enough. The pod
+signs them with IAM Credentials `signBlob` as its own service account
+(`ASTER_SRV_CACHE_SIGNER`); no key file is stored.
 
 | Route | |
 |---|---|
@@ -466,3 +468,6 @@ ref is refused with `403`, so a branch cannot poison the cache.
 
 Every six hours one replica drops manifests unused for `ASTER_SRV_CACHE_DAYS`
 (default 14) and blobs no remaining manifest names, and deletes those objects.
+It also deletes `cas/` objects no commit recorded once they are older than
+the same cutoff: signed PUTs whose commit never came. The pod needs
+`storage.objects.list` on the bucket for this.

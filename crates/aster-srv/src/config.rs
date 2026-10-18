@@ -92,6 +92,10 @@ pub struct Config {
     /// `ASTER_SRV_CACHE_BUCKET`: the GCS bucket that holds `cas/<sha256>`
     /// blobs. Unset disables the cache.
     pub cache_bucket: Option<String>,
+    /// `ASTER_SRV_CACHE_SIGNER`: the pod's Workload Identity service account
+    /// email, which signs blob URLs through `signBlob`. Required with a
+    /// cache bucket.
+    pub cache_signer: Option<String>,
     /// `ASTER_SRV_CACHE_DAYS`: drop manifests unused this long, and blobs
     /// no remaining manifest names. Default 14.
     pub cache_days: u32,
@@ -236,6 +240,15 @@ impl Config {
                 .context("ASTER_SRV_CACHE_DAYS must be a positive number of days")?,
             None => 14,
         };
+        let cache_bucket = var("ASTER_SRV_CACHE_BUCKET");
+        let cache_signer = var("ASTER_SRV_CACHE_SIGNER").map(|email| email.trim().to_string());
+        if cache_bucket.is_some()
+            && !cache_signer
+                .as_deref()
+                .is_some_and(|email| email.contains('@'))
+        {
+            bail!("ASTER_SRV_CACHE_BUCKET needs ASTER_SRV_CACHE_SIGNER, the pod's service account email");
+        }
         let cache_writers =
             CacheWriters::parse(var("ASTER_SRV_CACHE_WRITERS").as_deref(), &default_branch)?;
         Ok(Self {
@@ -255,7 +268,8 @@ impl Config {
             ui_dev_email: var("ASTER_SRV_UI_DEV_EMAIL").map(|email| email.trim().to_string()),
             quarantine,
             webhooks,
-            cache_bucket: var("ASTER_SRV_CACHE_BUCKET"),
+            cache_bucket,
+            cache_signer,
             cache_days,
             cache_writers,
         })
@@ -438,6 +452,7 @@ mod tests {
         );
         assert!(config.webhooks.is_empty());
         assert!(config.cache_bucket.is_none());
+        assert!(config.cache_signer.is_none());
         assert_eq!(config.cache_days, 14);
         assert!(config
             .cache_writers
@@ -554,6 +569,20 @@ mod tests {
             pairs.push(("ASTER_SRV_BROKEN_RUNS", bad));
             assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_cache_bucket_needs_a_signer() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_CACHE_BUCKET", "aster-cache"));
+        let error = Config::from_env(env_of(&pairs)).unwrap_err();
+        assert!(error.to_string().contains("ASTER_SRV_CACHE_SIGNER"));
+        pairs.push(("ASTER_SRV_CACHE_SIGNER", "srv@proj.iam.gserviceaccount.com"));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(
+            config.cache_signer.as_deref(),
+            Some("srv@proj.iam.gserviceaccount.com")
+        );
     }
 
     #[test]
