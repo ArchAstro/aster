@@ -233,10 +233,41 @@ impl ProgressDisplay {
         }
     }
 
-    /// Mark a target as cached (no execution needed)
-    pub fn mark_cached(&mut self, _address: &str) {
+    /// Mark a target as cached.
+    ///
+    /// Counts the hit for the summary. The stored log is printed by the
+    /// executor on the same channel as `aster logs`, then this status line
+    /// gets a `(cached)` suffix.
+    pub fn mark_cached(&mut self, address: &str, duration_ms: u128) {
         self.cached.fetch_add(1, Ordering::SeqCst);
         self.refresh_status();
+        if !self.enabled {
+            return;
+        }
+        let duration = format_duration(duration_ms);
+        let suffix = format!("({})", style("cached").dim());
+        if self.ci_mode {
+            eprintln!(
+                "{} {} {} ({}) {suffix}",
+                style(format_timestamp()).dim(),
+                style("PASS").green(),
+                address,
+                style(&duration).dim()
+            );
+        } else if self.verbose {
+            let msg = format!(
+                "{} {} ({}) {suffix}",
+                style("PASS").green(),
+                address,
+                style(&duration).dim()
+            );
+            let _ = self.multi.println(msg);
+        } else {
+            // Normal mode stays quiet for live passes, but a hit must still
+            // show the (cached) suffix next to the replayed log.
+            let msg = format!("{} {suffix}", address);
+            let _ = self.multi.println(msg);
+        }
     }
 
     /// Note that a target passed with `tests` tests that failed first, so

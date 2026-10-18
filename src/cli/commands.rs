@@ -82,6 +82,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_cache: bool,
 
+    /// Do not print a cache hit's stored log.
+    ///
+    /// The hit is still reported (`cached: true`, stored exit code and
+    /// duration). Only the replayed log is suppressed.
+    #[arg(long, global = true)]
+    pub no_replay: bool,
+
     /// Directory for the artifact cache (`cas/`, `ac/`, `index/`).
     ///
     /// A legacy `cache.json` in that directory is obsolete and unused.

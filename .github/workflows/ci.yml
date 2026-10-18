@@ -35,6 +35,7 @@ jobs:
             --test config_bug_bash \
             --test dev_tls \
             --test integration \
+            --test cache_artifacts \
             --test related \
             --test test_results \
             --test watch_tests
