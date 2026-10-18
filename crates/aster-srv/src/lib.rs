@@ -86,7 +86,10 @@ pub struct MigrationFailure {
     pub pass: u32,
     /// Seconds since the first pass started.
     pub waiting_seconds: u64,
-    /// The last pass's error.
+    /// The last pass's error, for logs only. Not serialized: `/readyz` is
+    /// unauthenticated, and database errors can carry connection and schema
+    /// details.
+    #[serde(skip)]
     pub error: String,
 }
 
