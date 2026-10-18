@@ -97,7 +97,7 @@ pub struct TargetResult {
     pub status: String,
     /// Whether result was from cache
     pub cached: bool,
-    /// Exit code (None if skipped or cached)
+    /// Exit code (None if skipped). A cache hit reports the stored code.
     pub exit_code: Option<i32>,
     /// Duration in milliseconds
     pub duration_ms: u128,
@@ -310,11 +310,9 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
                 "failed".to_string()
             };
 
-            let exit_code = if r.skipped || r.cached {
-                None
-            } else {
-                r.exit_code
-            };
+            // A cache hit reports the stored exit code. Failures are never
+            // cached, so this is 0. Skips never ran a process.
+            let exit_code = if r.skipped { None } else { r.exit_code };
 
             TargetResult {
                 address: r.address.clone(),

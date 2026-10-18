@@ -159,6 +159,9 @@ pub struct Executor<'a> {
     log_cap: usize,
     /// The tests whose failures may not fail their target.
     quarantine: Option<Arc<Quarantine>>,
+    /// When set, a cache hit still reports `cached` but does not print the
+    /// stored log. Status and JSON fields are unchanged.
+    no_replay: bool,
 }
 
 /// Default cap on one command's combined log: 16 MiB.
@@ -178,6 +181,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            no_replay: false,
         }
     }
 
@@ -194,6 +198,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            no_replay: false,
         }
     }
 
@@ -214,6 +219,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            no_replay: false,
         }
     }
 
@@ -235,6 +241,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            no_replay: false,
         }
     }
 
@@ -249,6 +256,12 @@ impl<'a> Executor<'a> {
     /// `0` keeps only the marker once any output arrives.
     pub fn with_log_cap(mut self, bytes: usize) -> Self {
         self.log_cap = bytes;
+        self
+    }
+
+    /// Suppress printing a cache hit's stored log. The hit is still reported.
+    pub fn with_no_replay(mut self, no_replay: bool) -> Self {
+        self.no_replay = no_replay;
         self
     }
 
@@ -802,7 +815,7 @@ impl<'a> Executor<'a> {
         // is not cacheable and must not create a cache entry.
         let mut cache_hash = None;
         if let Some(store) = cache_store {
-            if let Some((cache_hit, current_hash)) = check_cache(
+            if let Some(lookup) = check_cache(
                 target_addr,
                 &target_name,
                 &command,
@@ -815,26 +828,25 @@ impl<'a> Executor<'a> {
                 &excluded_dirs,
                 runtime_inputs,
             ) {
-                if cache_hit {
-                    let result = ExecutionResult {
-                        address: target_addr.clone(),
-                        success: true,
-                        skipped: false,
-                        cached: true,
-                        output: String::new(),
-                        log: Vec::new(),
-                        duration_ms: 0,
-                        exit_code: Some(0),
-                        tests: None,
-                        input_hash: input_hash.clone(),
-                    };
-                    if show_progress {
-                        progress.mark_cached(target_addr);
+                match lookup {
+                    CacheLookup::Hit { manifest, log } => {
+                        let result = cached_result(target_addr, &manifest, log, input_hash.clone());
+                        // Same channel as live captured output: `aster logs`
+                        // prints `ExecutionResult.output`, and a hit replays
+                        // that stored log here unless `--no-replay` is set.
+                        // JSON keeps the log on the result and does not print it.
+                        if self.output_mode != OutputMode::Json && !self.no_replay {
+                            print_replayed_log(&result.output);
+                        }
+                        if show_progress {
+                            progress.mark_cached(target_addr, result.duration_ms);
+                        }
+                        let _ = ctx.tx.send(result);
+                        return true;
                     }
-                    let _ = ctx.tx.send(result);
-                    return true;
-                } else {
-                    cache_hash = Some(current_hash);
+                    CacheLookup::Miss(current_hash) => {
+                        cache_hash = Some(current_hash);
+                    }
                 }
             } else if let Err(e) = store.remove(target_addr) {
                 // A disabled or currently unhashable target must not leave
@@ -1686,10 +1698,18 @@ pub fn fresh_cache_key(
     key
 }
 
-/// Check if a target is cached and return (cache_hit, current_hash)
+/// A cache lookup that can be stored, or a hit whose outputs were restored.
+enum CacheLookup {
+    /// Manifest key matches, outputs were restored, and the log blob was read.
+    Hit { manifest: Manifest, log: Vec<u8> },
+    /// Cacheable, but nothing reusable is stored. Carries the key to store.
+    Miss(String),
+}
+
+/// Check if a target is cached.
 ///
-/// Returns Some((true, hash)) if cache hit, Some((false, hash)) if cache miss,
-/// or None if caching cannot be performed for this target.
+/// `Some(Hit)` when outputs were restored. `Some(Miss)` carries the hash to
+/// store after a successful run. `None` when caching cannot be performed.
 #[allow(clippy::too_many_arguments)]
 fn check_cache(
     target_addr: &str,
@@ -1703,7 +1723,7 @@ fn check_cache(
     env_snapshot: &HashMap<String, String>,
     excluded_dirs: &[PathBuf],
     runtime_inputs: &RuntimeInputCache,
-) -> Option<(bool, String)> {
+) -> Option<CacheLookup> {
     let target = project.targets.get(target_name)?;
     let user_config: Option<&CacheConfig> = target.cache.as_ref();
     let plugin_inputs = cacheable_inputs(target_name, project, workspace_root, plugin_registry)?;
@@ -1740,15 +1760,29 @@ fn check_cache(
     let project_addr = project_of(target_addr).unwrap_or(target_addr);
     match cache_store.lookup(project_addr, target_addr, &current_hash) {
         Ok(Some(manifest)) if manifest.exit_code == 0 => {
-            if let Err(error) = restore(&project.root, &manifest.outputs, cache_store.local_store())
-            {
-                eprintln!(
-                    "[aster] Warning: cache restore failed for {target_addr}, running instead: {error:#}"
-                );
-            } else {
-                let mut hashes = computed_hashes.lock().ok()?;
-                hashes.insert(target_addr.to_string(), current_hash.clone());
-                return Some((true, current_hash));
+            let store = cache_store.local_store();
+            // Load the log before restore so a missing blob is a miss, same
+            // as a restore failure: the target runs instead of replaying nothing.
+            match load_log(store, &manifest) {
+                Err(error) => {
+                    eprintln!(
+                        "[aster] Warning: cache log missing for {target_addr}, running instead: {error:#}"
+                    );
+                }
+                Ok(log) => {
+                    if let Err(error) = restore(&project.root, &manifest.outputs, store) {
+                        eprintln!(
+                            "[aster] Warning: cache restore failed for {target_addr}, running instead: {error:#}"
+                        );
+                    } else {
+                        let mut hashes = computed_hashes.lock().ok()?;
+                        hashes.insert(target_addr.to_string(), current_hash);
+                        return Some(CacheLookup::Hit {
+                            manifest,
+                            log: log.unwrap_or_default(),
+                        });
+                    }
+                }
             }
         }
         Ok(_) => {}
@@ -1759,7 +1793,57 @@ fn check_cache(
         }
     }
 
-    Some((false, current_hash))
+    Some(CacheLookup::Miss(current_hash))
+}
+
+/// Print a cache hit's stored log the way `aster logs` prints a stored target log.
+fn print_replayed_log(output: &str) {
+    if output.is_empty() {
+        return;
+    }
+    print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
+}
+
+/// Build the result a cache hit reports, including the stored log.
+///
+/// The log is the `Manifest.log` blob. A missing digest is an empty log,
+/// which is what a silent success stored. Callers treat a blob that cannot
+/// be read as a miss before calling this.
+fn cached_result(
+    address: &str,
+    manifest: &Manifest,
+    log: Vec<u8>,
+    input_hash: Option<String>,
+) -> ExecutionResult {
+    ExecutionResult {
+        address: address.to_string(),
+        success: true,
+        skipped: false,
+        cached: true,
+        output: String::from_utf8_lossy(&log).into_owned(),
+        log,
+        duration_ms: u128::from(manifest.duration_ms),
+        exit_code: Some(manifest.exit_code),
+        tests: None,
+        input_hash,
+    }
+}
+
+/// Read `manifest.log`. `Ok(None)` is a manifest with no log. `Err` means
+/// the blob is missing or corrupt, so the hit must not be replayed.
+fn load_log(
+    store: &crate::cache::LocalStore,
+    manifest: &Manifest,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(digest) = &manifest.log else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    store.get_blob(digest, &mut bytes)?;
+    Ok(Some(bytes))
 }
 
 /// Pack outputs and the log, then store the manifest and project index.
