@@ -23,7 +23,7 @@ from this server's state, looked up with the same credentials.
 | `GET /v1/test-results/failures?github_run=` | The failing tests of every Aster run in one GitHub Actions run. |
 | `GET /v1/test-results/quarantine` | The caller's quarantine list and its version. See [Quarantine](#quarantine). |
 | `GET /v1/test-results/durations?target=&day=` | Each test file's median duration, for splitting a partitioned suite. |
-| `GET /healthz` | The process is up. |
+| `GET /healthz` | The process is up. Answers while migrations wait for locks. |
 | `GET /readyz` | The database answers. |
 
 Rows are kept for the retention period (30 days by default). Day partitions
@@ -416,7 +416,7 @@ Logs are one JSON object per line, with `severity` and `message`.
 | A real regression is being let through | `/ui/quarantine`, the test's page | In CI set `ASTER_QUARANTINE=off` for the job to fail it at once. On the server, delete its row: `DELETE FROM test_results.quarantine WHERE repo = '…' AND test_id = '…'` (it can re-enter on new flakes after now). Set `ASTER_SRV_QUARANTINE_RUNS=0` to stop new entries. |
 | Too many or too few tests quarantined | `SELECT action, count(*) FROM test_results.quarantine_log WHERE at > now() - interval '1 day' GROUP BY 1` | Tune `ASTER_SRV_QUARANTINE_RUNS` and `ASTER_SRV_QUARANTINE_RELEASE_PASSES`; they apply from the next pass. |
 | Webhooks not arriving | `SELECT endpoint, event, attempts, last_status, last_error FROM webhooks.deliveries WHERE delivered_at IS NULL ORDER BY id DESC LIMIT 20` | Abandoned rows have `abandoned_at`; to resend, `UPDATE webhooks.deliveries SET abandoned_at = NULL, attempts = 0, next_attempt_at = now() WHERE id = …`. |
-| A deploy waits at startup | `migration waiting for table locks` in the logs | Expected while the old release writes; it retries for about a minute. |
+| A deploy waits at startup | `migration waiting for table locks` in the logs | Expected while the old release holds the tables. The server listens meanwhile: `/healthz` is 200, `/readyz` and every other route are 503, and migrations retry every few seconds until they apply. |
 
 ## Image
 

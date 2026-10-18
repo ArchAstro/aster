@@ -25,6 +25,7 @@ pub fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -41,6 +42,9 @@ pub struct App {
     pub raw_store: raw_store::RawStore,
     /// Test durations already answered (they cannot change).
     pub durations: test_results::durations::Answers,
+    /// Set once every migration has been applied. Until then the server
+    /// answers `/healthz` and nothing else (see [`App::connect`]).
+    schema_ready: AtomicBool,
 }
 
 /// Every feature's migrations, in order.
@@ -75,8 +79,30 @@ impl App {
         iap: iap::IapVerifier,
         raw_store: Option<raw_store::RawStore>,
     ) -> Result<Arc<Self>> {
+        let app = Self::connect_with_iap(config, verifier, iap, raw_store)?;
+        app.migrate().await?;
+        Ok(app)
+    }
+
+    /// Build the app without touching the database's schema.
+    ///
+    /// The server can then listen and answer `/healthz` while [`Self::migrate`]
+    /// waits for table locks, which a rolling deploy can hold for minutes
+    /// (the previous release is still running its background passes). Every
+    /// other route answers 503 until the migrations have been applied.
+    pub fn connect(config: Config) -> Result<Arc<Self>> {
+        let verifier = auth::Verifier::new(&config);
+        let iap = iap::IapVerifier::new(&config);
+        Self::connect_with_iap(config, verifier, iap, None)
+    }
+
+    fn connect_with_iap(
+        config: Config,
+        verifier: auth::Verifier,
+        iap: iap::IapVerifier,
+        raw_store: Option<raw_store::RawStore>,
+    ) -> Result<Arc<Self>> {
         let pool = db::pool(&config.database_url)?;
-        db::migrate(&pool, &migrations()).await?;
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
         Ok(Arc::new(Self {
@@ -86,6 +112,19 @@ impl App {
             iap,
             raw_store,
             durations: Default::default(),
+            schema_ready: AtomicBool::new(false),
         }))
+    }
+
+    /// Apply every migration not yet applied, then mark the schema ready.
+    pub async fn migrate(&self) -> Result<()> {
+        db::migrate(&self.pool, &migrations()).await?;
+        self.schema_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether every migration has been applied.
+    pub fn schema_ready(&self) -> bool {
+        self.schema_ready.load(Ordering::Acquire)
     }
 }

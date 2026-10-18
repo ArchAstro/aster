@@ -116,6 +116,12 @@ pub async fn serve(
 }
 
 async fn route(app: &App, request: Request<Incoming>) -> Reply {
+    // Until the migrations are applied the tables may not match what the
+    // handlers query. `/healthz` stays up so the process is not killed while
+    // it waits for locks; `/readyz` reports the wait.
+    if !app.schema_ready() && request.uri().path() != "/healthz" {
+        return Reply::error(503, "the database schema is being migrated");
+    }
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/healthz") => Reply::json(200, json!({"ok": true})),
         (&Method::GET, "/readyz") => match ready(app).await {
