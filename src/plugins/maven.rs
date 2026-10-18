@@ -249,6 +249,33 @@ impl LanguagePlugin for MavenPlugin {
         inputs
     }
 
+    fn default_outputs(
+        &self,
+        target_name: &str,
+        command: &str,
+        ctx: &TargetContext,
+    ) -> Vec<String> {
+        // Detected build runs `package -DskipTests`. A custom target whose
+        // command is a package goal gets the same jar glob. A reactor parent,
+        // a war, or a project with no JVM sources does not write
+        // `target/*.jar`, so declaring it would make a successful run unstored.
+        if matches!(
+            target_name,
+            "test" | "lint" | "typecheck" | "check" | "format"
+        ) {
+            return Vec::new();
+        }
+        let packages = target_name == "build"
+            || command
+                .split_whitespace()
+                .any(|token| token == "package" || token.ends_with(":package"));
+        if packages && maven_writes_jar(ctx) {
+            vec!["target/*.jar".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
         // A reactor module resolves against the root pom. A standalone
         // project uses its own.
@@ -286,6 +313,24 @@ fn has_jvm_sources(project_dir: &Path) -> bool {
     ["java", "kotlin", "groovy", "scala"]
         .iter()
         .any(|language| project_dir.join("src/main").join(language).is_dir())
+}
+
+/// A package goal writes `target/*.jar` for a JVM module whose packaging is
+/// jar (the default) or unset. `pom`, `war`, and other packagings do not.
+fn maven_writes_jar(ctx: &TargetContext) -> bool {
+    if !has_jvm_sources(ctx.project_dir) {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(ctx.config_path) else {
+        return false;
+    };
+    let Ok(document) = Document::parse(&content) else {
+        return false;
+    };
+    match child_text(document.root_element(), "packaging") {
+        None | Some("jar") => true,
+        Some(_) => false,
+    }
 }
 
 fn read_maven_artifact(config_path: &Path) -> Option<String> {
@@ -387,6 +432,45 @@ mod tests {
             workspace_root,
             dependencies,
         }
+    }
+
+    #[test]
+    fn default_outputs_are_the_package_jar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pom = tmp.path().join("pom.xml");
+        std::fs::write(&pom, "<project><artifactId>app</artifactId></project>").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/main/java")).unwrap();
+        let plugin = MavenPlugin;
+        let ctx = context(&pom, tmp.path(), &[]);
+
+        assert_eq!(
+            plugin.default_outputs("build", "mvn package -DskipTests", &ctx),
+            vec!["target/*.jar"]
+        );
+        assert_eq!(
+            plugin.default_outputs("package", "mvn -pl :app package", &ctx),
+            vec!["target/*.jar"]
+        );
+        assert!(plugin.default_outputs("test", "mvn test", &ctx).is_empty());
+        assert!(plugin
+            .default_outputs("lint", "mvn verify -DskipTests", &ctx)
+            .is_empty());
+        assert!(plugin
+            .default_outputs("deps", "mvn dependency:go-offline", &ctx)
+            .is_empty());
+
+        std::fs::write(
+            &pom,
+            "<project><artifactId>app</artifactId><packaging>war</packaging></project>",
+        )
+        .unwrap();
+        let ctx = context(&pom, tmp.path(), &[]);
+        assert!(
+            plugin
+                .default_outputs("build", "mvn package -DskipTests", &ctx)
+                .is_empty(),
+            "war packaging does not write target/*.jar"
+        );
     }
 
     #[test]

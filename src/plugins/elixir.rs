@@ -274,6 +274,21 @@ impl LanguagePlugin for ElixirPlugin {
         ]
     }
 
+    fn default_outputs(
+        &self,
+        target_name: &str,
+        _command: &str,
+        _ctx: &TargetContext,
+    ) -> Vec<String> {
+        // A release target writes the prod release. `mix compile` writes into
+        // `_build`, which stays in the native warm cache, not the artifact cache.
+        if target_name == "release" {
+            vec!["_build/prod/rel/**".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
         Some(Target {
             command: "mix clean".to_string(),
@@ -637,6 +652,32 @@ fn detect_standalone_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context<'a>(config_path: &'a Path, workspace_root: &'a Path) -> TargetContext<'a> {
+        TargetContext {
+            config_path,
+            project_dir: config_path.parent().unwrap(),
+            workspace_root,
+            dependencies: &[],
+        }
+    }
+
+    #[test]
+    fn default_outputs_are_the_prod_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mix_exs = tmp.path().join("mix.exs");
+        std::fs::write(&mix_exs, "defmodule App.MixProject do\nend\n").unwrap();
+        let plugin = ElixirPlugin;
+        let ctx = context(&mix_exs, tmp.path());
+
+        assert_eq!(
+            plugin.default_outputs("release", "mix release", &ctx),
+            vec!["_build/prod/rel/**"]
+        );
+        for name in ["build", "test", "lint", "format", "check"] {
+            assert!(plugin.default_outputs(name, "mix compile", &ctx).is_empty());
+        }
+    }
 
     #[test]
     fn test_parse_simple_mix_exs() {

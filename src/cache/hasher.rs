@@ -1399,7 +1399,7 @@ mod tests {
             include: vec![],
             exclude: vec!["**/*.test.ts".to_string()],
             env: vec![],
-            outputs: vec![],
+            outputs: None,
             ..Default::default()
         };
 

@@ -311,6 +311,22 @@ impl LanguagePlugin for GoPlugin {
         ]
     }
 
+    fn default_outputs(
+        &self,
+        target_name: &str,
+        command: &str,
+        _ctx: &TargetContext,
+    ) -> Vec<String> {
+        if target_name != "build" {
+            return Vec::new();
+        }
+        // `go build ./...` writes no binary. A command that contains
+        // `-o <path>` names the binary the cache should store.
+        go_output_flag(command)
+            .map(|path| vec![path])
+            .unwrap_or_default()
+    }
+
     fn clean_target(&self, _ctx: &TargetContext) -> Option<Target> {
         Some(Target {
             command: "go clean".to_string(),
@@ -325,6 +341,75 @@ impl LanguagePlugin for GoPlugin {
             retry_setup: None,
         })
     }
+}
+
+/// Path after a Go `-o` flag, when the command writes one binary.
+///
+/// Accepts `-o path` and `-o./path`. The path must be project-relative: an
+/// absolute path, a `..` segment, or a flag-looking value stores nothing.
+fn go_output_flag(command: &str) -> Option<String> {
+    let tokens = split_command_tokens(command);
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        let path = if token == "-o" {
+            index += 1;
+            tokens.get(index).map(String::as_str)
+        } else if is_inline_output_flag(token) {
+            Some(&token[2..])
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            return project_relative_output(path);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// `-o./path` is Go's inline `-o` flag. `-overlay` is a different flag.
+fn is_inline_output_flag(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() > 2 && bytes[1] == b'o' && !bytes[2].is_ascii_alphabetic()
+}
+
+fn split_command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        match quote {
+            Some(mark) if ch == mark => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn project_relative_output(path: &str) -> Option<String> {
+    if path.is_empty() || path.starts_with('-') || path.starts_with('/') {
+        return None;
+    }
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    Some(path.replace('\\', "/"))
 }
 
 /// Resolve LocalDependency paths to project addresses
@@ -380,6 +465,44 @@ mod tests {
             project_dir: config_path.parent().unwrap(),
             workspace_root,
             dependencies,
+        }
+    }
+
+    #[test]
+    fn default_outputs_use_the_go_output_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let go_mod = tmp.path().join("go.mod");
+        std::fs::write(&go_mod, "module example.com/app\n").unwrap();
+        let plugin = GoPlugin;
+        let ctx = make_context(&go_mod, tmp.path(), &[]);
+
+        assert!(plugin
+            .default_outputs("build", "go build ./...", &ctx)
+            .is_empty());
+        assert_eq!(
+            plugin.default_outputs("build", "go build -o bin/app ./cmd/app", &ctx),
+            vec!["bin/app"]
+        );
+        assert_eq!(
+            plugin.default_outputs("build", "go build -o./bin/app", &ctx),
+            vec!["./bin/app"]
+        );
+        assert!(plugin
+            .default_outputs("build", "go build -o /tmp/app", &ctx)
+            .is_empty());
+        assert!(plugin
+            .default_outputs("build", "go build -o ../app", &ctx)
+            .is_empty());
+        assert!(plugin
+            .default_outputs("build", "go build -overlay overlay.json", &ctx)
+            .is_empty());
+        for name in ["test", "lint", "format", "check"] {
+            assert!(
+                plugin
+                    .default_outputs(name, "go test -o bin/app", &ctx)
+                    .is_empty(),
+                "{name}"
+            );
         }
     }
 

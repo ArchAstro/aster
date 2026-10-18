@@ -689,6 +689,53 @@ fn cache_status_inputs_json_matches_executor_hash() {
     }
 }
 
+/// `cache status --inputs` prints the outputs the artifact cache will store:
+/// the plugin default when the user omitted the field, and the user's list
+/// when they set it.
+#[test]
+fn cache_status_inputs_shows_effective_outputs() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "p/package.json",
+        "{\"name\":\"p\",\"scripts\":{\"build\":\"mkdir -p dist && echo ok > dist/a.txt\"}}\n",
+    );
+
+    let status = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["--json", "cache", "status", "//p:build", "--inputs"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success(),
+        "cache status --inputs failed: {} {stdout}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let parsed: Value = serde_json::from_str(&stdout).expect("inputs json");
+    assert_eq!(parsed["outputs"], serde_json::json!(["dist/**"]));
+
+    write_file(
+        &tmp,
+        "p/aster.toml",
+        "[targets.build]\ncommand = \"npm run build\"\ncache = { outputs = [\"out/**\"] }\n",
+    );
+    let replaced = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(tmp.path())
+        .args(["--json", "cache", "status", "//p:build", "--inputs"])
+        .output()
+        .unwrap();
+    let replaced_stdout = String::from_utf8_lossy(&replaced.stdout);
+    assert!(
+        replaced.status.success(),
+        "replaced status failed: {} {replaced_stdout}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let replaced_json: Value = serde_json::from_str(&replaced_stdout).expect("inputs json");
+    assert_eq!(replaced_json["outputs"], serde_json::json!(["out/**"]));
+}
+
 /// `cache status --inputs` recomputes dependency keys from current inputs, so
 /// a stale stored dependency entry cannot change the displayed key.
 #[test]

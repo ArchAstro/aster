@@ -2571,6 +2571,15 @@ fn print_cache_inputs(
                 ordered.insert(field.clone(), field_value.clone());
             }
         }
+        ordered.insert(
+            "outputs".to_string(),
+            serde_json::Value::Array(
+                effective_outputs(target)
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
         output_json(&ordered)?;
     } else {
         println!("salt: {}", material.salt.replace('\n', " "));
@@ -2629,6 +2638,15 @@ fn print_cache_inputs(
                 }
             }
         }
+        let outputs = effective_outputs(target);
+        if outputs.is_empty() {
+            println!("outputs: (none)");
+        } else {
+            println!("outputs:");
+            for output in outputs {
+                println!("  {output}");
+            }
+        }
         match &key {
             Ok(key) => println!("key: {key}"),
             Err(_) => println!("key: (unavailable)"),
@@ -2636,6 +2654,18 @@ fn print_cache_inputs(
     }
 
     key.map(|_| ())
+}
+
+/// Output globs the artifact cache stores for this resolved target.
+///
+/// Discovery already replaced an omitted `outputs` field with the plugin
+/// default, and left a user-set list (including empty) in place.
+fn effective_outputs(target: &aster::plugins::Target) -> Vec<String> {
+    target
+        .cache
+        .as_ref()
+        .and_then(|cache| cache.outputs.clone())
+        .unwrap_or_default()
 }
 
 fn project_address(project: &DiscoveredProject) -> String {

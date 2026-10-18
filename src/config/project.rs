@@ -128,9 +128,13 @@ pub struct CacheConfig {
     /// without that `*`.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Output paths that must exist before a cached success may be reused.
+    /// Output paths the artifact cache stores and restores.
+    ///
+    /// `None` means the user did not set outputs, so the language plugin's
+    /// `default_outputs` apply. `Some`, including `Some([])`, replaces those
+    /// defaults and stores exactly the listed project-relative globs.
     #[serde(default)]
-    pub outputs: Vec<String>,
+    pub outputs: Option<Vec<String>>,
     /// Commands whose trimmed stdout+stderr is hashed into the cache key.
     ///
     /// `None` keeps the plugin's default runtime commands. `Some` replaces

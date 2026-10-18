@@ -1775,7 +1775,7 @@ fn store_success(
     result: &ExecutionResult,
 ) -> anyhow::Result<()> {
     let globs = cache_config
-        .map(|config| config.outputs.as_slice())
+        .and_then(|config| config.outputs.as_deref())
         .unwrap_or(&[]);
     let Some(outputs) = pack(project_root, globs, cache.local_store())? else {
         cache.remove(address)?;
