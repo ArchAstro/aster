@@ -34,7 +34,6 @@ use aster::git::{
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::PluginRegistry;
 use aster::test_results::detect_run;
-use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1318,7 +1317,15 @@ fn run() -> Result<()> {
             match command {
                 CacheCommands::Clear { target } => {
                     if let Some(pattern) = target {
-                        let removed = artifact_cache.clear_matching(&pattern)?;
+                        let removed = if pattern.contains(':') {
+                            let before = artifact_cache.status(Some(&pattern))?.targets.len();
+                            artifact_cache.remove(&pattern)?;
+                            before
+                        } else {
+                            let before = artifact_cache.list_project_entries(&pattern)?.len();
+                            artifact_cache.invalidate_project(&pattern)?;
+                            before
+                        };
                         if output_mode != OutputMode::Quiet {
                             println!("Cleared {removed} cache entries matching {pattern}");
                         }
@@ -1344,13 +1351,8 @@ fn run() -> Result<()> {
                             output_mode,
                         )?;
                     } else {
-                        let state = artifact_cache.load_status()?;
-                        print_cache_status(
-                            artifact_cache.cache_dir(),
-                            &state,
-                            target.as_deref(),
-                            output_mode,
-                        )?;
+                        let status = artifact_cache.status(target.as_deref())?;
+                        print_cache_status(&status, target.as_deref(), output_mode)?;
                     }
                 }
                 CacheCommands::Prune { max_size, max_age } => {
@@ -2398,99 +2400,47 @@ fn validate_lang_filter(langs: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Parses an RFC3339 timestamp and returns a string like "2 minutes ago"
-/// Falls back to the raw timestamp if parsing fails.
-fn format_relative_time(timestamp: &str) -> String {
-    let parsed: Result<DateTime<Utc>, _> = timestamp.parse();
-    match parsed {
-        Ok(dt) => {
-            let now = Utc::now();
-            let duration = now.signed_duration_since(dt);
-
-            if duration.num_seconds() < 0 {
-                // Future time (shouldn't happen, but handle gracefully)
-                return timestamp.to_string();
-            }
-
-            let seconds = duration.num_seconds();
-            if seconds < 60 {
-                return "just now".to_string();
-            }
-
-            let minutes = duration.num_minutes();
-            if minutes < 60 {
-                return if minutes == 1 {
-                    "1 minute ago".to_string()
-                } else {
-                    format!("{minutes} minutes ago")
-                };
-            }
-
-            let hours = duration.num_hours();
-            if hours < 24 {
-                return if hours == 1 {
-                    "1 hour ago".to_string()
-                } else {
-                    format!("{hours} hours ago")
-                };
-            }
-
-            let days = duration.num_days();
-            if days < 30 {
-                return if days == 1 {
-                    "1 day ago".to_string()
-                } else {
-                    format!("{days} days ago")
-                };
-            }
-
-            // Fall back to date for older entries
-            dt.format("%Y-%m-%d").to_string()
-        }
-        Err(_) => timestamp.to_string(),
-    }
-}
-
 fn print_cache_status(
-    cache_dir: &Path,
-    state: &aster::cache::StatusState,
+    status: &aster::cache::CacheStatus,
     target: Option<&str>,
     output_mode: OutputMode,
 ) -> Result<()> {
-    if let Some(addr) = target {
-        if let Some(entry) = state.targets.get(addr) {
-            if output_mode == OutputMode::Json {
-                output_json(&entry)?;
-            } else {
-                let hash_display = &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
-                let time_display = format_relative_time(&entry.timestamp);
-                println!("{addr}: {hash_display} ({time_display})");
-            }
-        } else if output_mode == OutputMode::Json {
+    if output_mode == OutputMode::Json {
+        if target.is_some_and(|addr| addr.contains(':')) && status.targets.is_empty() {
             println!("null");
-        } else {
-            println!("{addr}: not cached");
+            return Ok(());
         }
+        output_json(status)?;
         return Ok(());
     }
 
-    if output_mode == OutputMode::Json {
-        output_json(&state)?;
-    } else {
-        println!("Cache dir: {}", cache_dir.display());
-        if state.targets.is_empty() {
-            println!("No cached targets");
-        } else {
-            println!("Cached targets ({}):", state.targets.len());
-            let mut addrs: Vec<_> = state.targets.keys().collect();
-            addrs.sort();
-            for addr in addrs {
-                let entry = &state.targets[addr];
-                let hash_display = &entry.hash[..CACHE_HASH_DISPLAY_LENGTH.min(entry.hash.len())];
-                let time_display = format_relative_time(&entry.timestamp);
-                println!("  {addr}: {hash_display} ({time_display})");
-            }
+    if let Some(addr) = target.filter(|addr| addr.contains(':')) {
+        if status.targets.is_empty() {
+            println!("{addr}: not cached");
+            return Ok(());
         }
+    }
+
+    println!("Cache dir: {}", status.cache_dir);
+    if status.targets.is_empty() {
+        println!("No cached targets");
+        return Ok(());
+    }
+    println!("Cached targets ({}):", status.targets.len());
+    println!(
+        "  {:<24} {:<12} {:>8} {:>12} {:>6}  CREATED",
+        "ADDRESS", "KEY", "OUTPUTS", "BYTES", "EXIT"
+    );
+    for row in &status.targets {
+        let key = &row.key[..CACHE_HASH_DISPLAY_LENGTH.min(row.key.len())];
+        let exit = row
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {:<24} {:<12} {:>8} {:>12} {:>6}  {}",
+            row.address, key, row.outputs, row.output_bytes, exit, row.created_at
+        );
     }
     Ok(())
 }

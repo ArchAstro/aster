@@ -3901,7 +3901,9 @@ fn test_cache_dir_flag_overrides_env() {
         "JSON status must stay unchanged: {json_stdout}"
     );
     let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
-    assert!(parsed["targets"]["//app:build"].is_object());
+    assert!(parsed["targets"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["address"] == "//app:build")));
 }
 
 /// A Cargo workspace member's cache key includes the root Cargo.lock, so
@@ -3954,9 +3956,9 @@ fn cargo_workspace_root_lockfile_invalidates_member_cache_keys() {
         let output = run(&["--json", "cache", "status", address]);
         let entry: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("cache status json");
-        entry["hash"]
+        entry["targets"][0]["key"]
             .as_str()
-            .unwrap_or_else(|| panic!("missing hash for {address}: {entry}"))
+            .unwrap_or_else(|| panic!("missing key for {address}: {entry}"))
             .to_string()
     };
     let one = hash("//crates/one:stamp");
@@ -4010,9 +4012,9 @@ fn cached_build_hash(tmp: &TempDir, ci: Option<&str>) -> String {
     let stdout = String::from_utf8(status.stdout).unwrap();
     let entry: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|err| panic!("cache status was not an entry ({err}): {stdout}"));
-    entry["hash"]
+    entry["targets"][0]["key"]
         .as_str()
-        .unwrap_or_else(|| panic!("cache status has no hash: {stdout}"))
+        .unwrap_or_else(|| panic!("cache status has no key: {stdout}"))
         .to_string()
 }
 

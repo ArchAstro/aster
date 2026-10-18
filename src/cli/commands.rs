@@ -524,6 +524,11 @@ pub enum CiCommands {
 #[derive(Subcommand)]
 pub enum CacheCommands {
     /// Clear cached results
+    ///
+    /// `//proj:target` removes that address from the artifact index.
+    /// `//proj` removes the project's index (`invalidate_project`).
+    /// With no argument, every project index is removed. Blobs stay until
+    /// `aster cache prune`.
     Clear {
         /// Specific target to clear (e.g., //services/api:test)
         /// If not specified, clears all cache
@@ -531,6 +536,11 @@ pub enum CacheCommands {
     },
 
     /// Show cache status
+    ///
+    /// Lists artifact-index entries: address, key, created time, output count,
+    /// on-disk output bytes, and exit code. `--json` prints
+    /// `{"cache_dir","targets":[...]}`. A target address filters to that
+    /// address; a project address (`//proj`) filters to that project.
     Status {
         /// Specific target to show (e.g., //services/api:test)
         target: Option<String>,

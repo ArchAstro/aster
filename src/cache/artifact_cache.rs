@@ -31,20 +31,26 @@ struct ProjectIndex {
     entries: BTreeMap<String, IndexEntry>,
 }
 
-/// Status row shaped like the obsolete `cache.json` entry.
+/// One indexed target, as `aster cache status` prints it.
 ///
-/// `success` is always true: only exit code 0 is stored.
+/// `exit_code` is null when the index names a key whose manifest is missing.
+/// `output_bytes` is the on-disk size of the manifest's output blobs, not the
+/// log blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusEntry {
-    pub hash: String,
-    pub timestamp: String,
-    pub success: bool,
+pub struct CacheStatusTarget {
+    pub address: String,
+    pub key: String,
+    pub created_at: String,
+    pub outputs: u64,
+    pub output_bytes: u64,
+    pub exit_code: Option<i32>,
 }
 
-/// Status document shaped like the obsolete `CacheState`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusState {
-    pub targets: BTreeMap<String, StatusEntry>,
+/// Status document `aster cache status` prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStatus {
+    pub cache_dir: String,
+    pub targets: Vec<CacheStatusTarget>,
 }
 
 /// Local artifact cache: index plus [`LocalStore`].
@@ -135,14 +141,23 @@ impl ArtifactCache {
         self.write_index(project, &index)
     }
 
-    /// Every indexed target, as the status document `aster cache status` prints.
-    pub fn load_status(&self) -> Result<StatusState> {
+    /// Every indexed target, joined to its manifest, in address order.
+    ///
+    /// A missing manifest still appears, with `outputs` 0, `output_bytes` 0,
+    /// and `exit_code` null. `filter` keeps one address, or every address in
+    /// a project (`//project`).
+    pub fn status(&self, filter: Option<&str>) -> Result<CacheStatus> {
         let _lock = self.lock_shared()?;
-        let mut state = StatusState::default();
+        let mut targets = Vec::new();
         let dir = self.cache_dir.join("index");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(state),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CacheStatus {
+                    cache_dir: self.cache_dir.display().to_string(),
+                    targets,
+                })
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("Failed to read {}", dir.display()))
             }
@@ -150,67 +165,56 @@ impl ArtifactCache {
         for entry in entries {
             let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
             let index = read_index_file(&path)?;
             for (address, row) in index.entries {
-                state.targets.insert(
+                if !status_matches(filter, &address) {
+                    continue;
+                }
+                let manifest = self.store.get_manifest(&row.key)?;
+                let (outputs, output_bytes, exit_code) = match &manifest {
+                    Some(manifest) => (
+                        manifest.outputs.len() as u64,
+                        self.output_bytes(manifest)?,
+                        Some(manifest.exit_code),
+                    ),
+                    None => (0, 0, None),
+                };
+                targets.push(CacheStatusTarget {
                     address,
-                    StatusEntry {
-                        hash: row.key,
-                        timestamp: row.created_at,
-                        success: true,
-                    },
-                );
+                    key: row.key,
+                    created_at: row.created_at,
+                    outputs,
+                    output_bytes,
+                    exit_code,
+                });
             }
         }
-        Ok(state)
+        targets.sort_by(|left, right| left.address.cmp(&right.address));
+        Ok(CacheStatus {
+            cache_dir: self.cache_dir.display().to_string(),
+            targets,
+        })
     }
 
-    /// Delete one address, or every address in a project (`//project`).
-    ///
-    /// Returns how many index entries were removed. Manifests are left for
-    /// prune. Does not read `cache.json`.
-    pub fn clear_matching(&self, pattern: &str) -> Result<usize> {
-        if pattern.contains(':') {
-            let before = self.load_status()?.targets.contains_key(pattern);
-            self.remove(pattern)?;
-            return Ok(usize::from(before));
-        }
-        let _lock = self.lock_exclusive()?;
-        let mut removed = 0usize;
-        let dir = self.cache_dir.join("index");
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(error).with_context(|| format!("Failed to read {}", dir.display()))
-            }
-        };
-        let prefix = format!("{pattern}:");
-        for entry in entries {
-            let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+    fn output_bytes(&self, manifest: &Manifest) -> Result<u64> {
+        let mut total = 0u64;
+        for output in &manifest.outputs {
+            let Some(digest) = &output.digest else {
                 continue;
+            };
+            let path = self.store.blob_path(digest)?;
+            match fs::metadata(&path) {
+                Ok(meta) => total += meta.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Failed to stat {}", path.display()))
+                }
             }
-            let mut index = read_index_file(&path)?;
-            let before = index.entries.len();
-            index
-                .entries
-                .retain(|address, _| !address.starts_with(&prefix));
-            let dropped = before - index.entries.len();
-            if dropped == 0 {
-                continue;
-            }
-            removed += dropped;
-            write_index_file(&path, &index)?;
         }
-        Ok(removed)
+        Ok(total)
     }
 
     /// Delete every project index. Manifests and blobs stay for prune.
@@ -329,6 +333,17 @@ pub fn project_of(address: &str) -> Option<&str> {
     address.rsplit_once(':').map(|(project, _)| project)
 }
 
+/// `None` matches every address. An address matches itself. A project
+/// matches addresses whose project component is exactly that project, so
+/// `//app` does not match `//app-v2` or `//apps/web`.
+fn status_matches(filter: Option<&str>, address: &str) -> bool {
+    match filter {
+        None => true,
+        Some(filter) if filter.contains(':') => filter == address,
+        Some(filter) => project_of(address) == Some(filter),
+    }
+}
+
 /// Percent-encode everything but unreserved characters, so a project address
 /// is one filename on every platform.
 fn url_safe(text: &str) -> String {
@@ -433,21 +448,78 @@ mod tests {
             )
             .unwrap();
 
-        let status = cache.load_status().unwrap();
-        assert_eq!(status.targets["//apps/web:build"].hash, "aa".repeat(32));
-        assert!(status.targets["//apps/web:build"].success);
+        let status = cache.status(None).unwrap();
+        let web = status
+            .targets
+            .iter()
+            .find(|row| row.address == "//apps/web:build")
+            .expect("web entry");
+        assert_eq!(web.key, "aa".repeat(32));
+        assert_eq!(web.outputs, 1);
+        assert_eq!(web.exit_code, Some(0));
+        assert_eq!(web.output_bytes, 0, "a directory output has no blob");
 
-        let removed = cache.clear_matching("//apps/web").unwrap();
-        assert_eq!(removed, 1);
+        cache.invalidate_project("//apps/web").unwrap();
+        let remaining = cache.status(None).unwrap();
+        assert!(remaining
+            .targets
+            .iter()
+            .any(|row| row.address == "//apps/api:build"));
+        assert!(!remaining
+            .targets
+            .iter()
+            .any(|row| row.address == "//apps/web:build"));
+    }
+
+    #[test]
+    fn status_joins_manifest_outputs_and_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ArtifactCache::new(tmp.path().to_path_buf());
+        let bytes = b"hello artifact";
+        let digest = Digest::of_bytes(bytes);
+        cache.local_store().put_blob(&digest, &bytes[..]).unwrap();
+        let mut stored = manifest(&"cc".repeat(32), "//p:build");
+        stored.outputs.push(OutputEntry {
+            path: "out/file.txt".into(),
+            kind: OutputKind::File,
+            digest: Some(digest),
+            mode: 0o644,
+            target: None,
+        });
+        cache.store("//p", "//p:build", &stored).unwrap();
+        cache
+            .store(
+                "//p-v2",
+                "//p-v2:build",
+                &manifest(&"dd".repeat(32), "//p-v2:build"),
+            )
+            .unwrap();
+
+        let status = cache.status(Some("//p")).unwrap();
+        assert_eq!(status.cache_dir, tmp.path().display().to_string());
+        assert_eq!(status.targets.len(), 1);
+        let row = &status.targets[0];
+        assert_eq!(row.address, "//p:build");
+        assert_eq!(row.key, "cc".repeat(32));
+        assert_eq!(row.outputs, 1);
+        assert_eq!(row.exit_code, Some(0));
+        assert!(row.output_bytes > 0);
+
+        let filtered = cache.status(Some("//p:build")).unwrap();
+        assert_eq!(filtered.targets.len(), 1);
         assert!(cache
-            .load_status()
+            .status(Some("//other:build"))
             .unwrap()
             .targets
-            .contains_key("//apps/api:build"));
-        assert!(!cache
-            .load_status()
-            .unwrap()
-            .targets
-            .contains_key("//apps/web:build"));
+            .is_empty());
+        assert!(
+            cache
+                .status(Some("//p"))
+                .unwrap()
+                .targets
+                .iter()
+                .all(|row| row.address == "//p:build"),
+            "//p must not match //p-v2"
+        );
     }
 }

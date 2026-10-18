@@ -356,8 +356,13 @@ A run prunes automatically when the local blob store is over that cap.
 
 The cache stores successful runs as content-addressed artifacts. A later
 run with the same inputs restores declared outputs and skips execution.
-Failures are not stored. `.aster/cache/cache.json` is obsolete and unused;
-Aster neither reads nor writes it.
+Failures are not stored. `aster cache status` lists the artifact index:
+address, key, created time, output count, output bytes, and exit code.
+`--json` prints `{"cache_dir","targets":[...]}`. `aster cache clear //proj`
+removes that project's index entries; `aster cache clear //proj:target`
+removes one address. Blobs stay until `aster cache prune`.
+`.aster/cache/cache.json` is obsolete and unused; Aster neither reads nor
+writes it.
 
 `aster cache status <target> --inputs` prints every component of that target's
 cache key: salt, platform, hashed files, command, dependency hashes, tracked
