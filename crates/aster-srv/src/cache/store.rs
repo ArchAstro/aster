@@ -2,8 +2,9 @@
 //! what nothing still names.
 //!
 //! A blob is present only when the row exists and a HEAD of `cas/<sha256>`
-//! succeeds. The row is written when a commit finds the object, so a signed
-//! PUT that never completed cannot be committed.
+//! succeeds. The row is written when a commit hashes the object and finds it
+//! matches its name, so neither a signed PUT that never completed nor one
+//! that sent other bytes can be committed or served.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,6 +19,11 @@ use super::signing::{self, Method, Signer};
 
 const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const RETENTION_LOCK: i64 = 0x6173_7465_722d_6363; // "aster-cc"
+/// Commits hold this shared while they check blobs and insert the manifest
+/// naming them; retention holds it exclusively while it decides what to
+/// delete and deletes it. So a blob a commit has just checked cannot be
+/// deleted before the manifest naming it is visible.
+pub(crate) const BLOB_LOCK: i64 = 0x6173_7465_722d_6362; // "aster-cb"
 
 /// What one retention pass removed. `None` from [`run_retention`] means
 /// another replica held the lock.
@@ -195,6 +201,44 @@ impl BlobStore {
         }
     }
 
+    /// The sha256 and length of `cas/<name>`'s bytes, or `None` when there
+    /// is no such object.
+    pub async fn hash(&self, name: &str) -> Result<Option<(String, u64)>> {
+        use sha2::{Digest, Sha256};
+        match self {
+            BlobStore::Disabled => Ok(None),
+            BlobStore::Memory { objects, .. } => Ok(objects
+                .lock()
+                .await
+                .get(name)
+                .map(|(bytes, _)| (signing::hex(&Sha256::digest(bytes)), bytes.len() as u64))),
+            BlobStore::Gcs { client, .. } => {
+                let (bucket, token) = self.gcs_auth().await?;
+                let mut response = client
+                    .get(object_url(&bucket, name))
+                    .query(&[("alt", "media")])
+                    .bearer_auth(token)
+                    .timeout(Duration::from_secs(600))
+                    .send()
+                    .await
+                    .context("cannot reach the bucket")?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                response = response
+                    .error_for_status()
+                    .context("the bucket refused the download")?;
+                let mut hasher = Sha256::new();
+                let mut size = 0u64;
+                while let Some(chunk) = response.chunk().await.context("cannot read the blob")? {
+                    size += chunk.len() as u64;
+                    hasher.update(&chunk);
+                }
+                Ok(Some((signing::hex(&hasher.finalize()), size)))
+            }
+        }
+    }
+
     /// Store bytes under `cas/<sha256>` and record the blob, the way a
     /// client does after a signed PUT. Tests use this in place of uploading.
     pub async fn put(
@@ -354,6 +398,12 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
         return Ok(None);
     }
     let cutoff = now - chrono::Duration::days(i64::from(app.config.cache_days));
+    // List first, without blocking commits. An object created after this
+    // listing is not a candidate this pass.
+    let listed = app.cache_store.list().await?;
+    transaction
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&BLOB_LOCK])
+        .await?;
     let manifests = transaction
         .execute(
             "DELETE FROM cache.manifests WHERE last_used_at < $1",
@@ -380,7 +430,7 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     }
     let rows = orphans.len() as u64;
     let mut targets: HashSet<String> = orphans.iter().cloned().collect();
-    for (sha256, created) in app.cache_store.list().await? {
+    for (sha256, created) in listed {
         if created < cutoff && !keep.contains(&sha256) {
             targets.insert(sha256);
         }
