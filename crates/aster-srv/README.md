@@ -458,7 +458,7 @@ signs them with IAM Credentials `signBlob` as its own service account
 |---|---|
 | `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A lookup updates `last_used_at`. |
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
-| `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists. `201` stored, `409` the key is already stored, `422` a named blob is missing. Writers only. |
+| `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists. A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
 
 Reads accept any authenticated CI token for the repository, and an IAP viewer
 whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. Writes accept a static

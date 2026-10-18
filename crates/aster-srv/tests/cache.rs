@@ -197,23 +197,6 @@ async fn commit_refuses_missing_blob() {
         return;
     };
     let writer = bearer(REPO, Some("refs/heads/main"));
-    // The object is in GCS, but nobody has told the server about it.
-    server
-        .app
-        .cache_store
-        .put_unrecorded(DIGEST, bytes::Bytes::from_static(b"blob"))
-        .await
-        .unwrap();
-    let (status, upload) = server
-        .post_json(
-            "/v1/cache/upload",
-            &json!({"repo": REPO, "digests": [DIGEST]}),
-            Some(&writer),
-            None,
-        )
-        .await;
-    assert_eq!(status, 200, "{upload}");
-    assert!(upload["missing"].get(DIGEST).is_none(), "{upload}");
     let (status, body) = server
         .post_json(
             "/v1/cache/commit",
@@ -239,6 +222,94 @@ async fn commit_refuses_missing_blob() {
         .await;
     assert_eq!(status, 200, "{looked}");
     assert_eq!(looked["hits"], json!({}));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn commit_verifies_uploaded_bytes_against_their_digest() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let store = &server.app.cache_store;
+    // A signed PUT that sent other bytes under DIGEST, the sha256 of "".
+    store
+        .put_unrecorded(DIGEST, bytes::Bytes::from_static(b"forged"))
+        .await
+        .unwrap();
+    let (status, upload) = server
+        .post_json(
+            "/v1/cache/upload",
+            &json!({"repo": REPO, "digests": [DIGEST]}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{upload}");
+    // Unverified bytes are not trusted, so the client may upload again.
+    assert!(upload["missing"][DIGEST].as_str().is_some(), "{upload}");
+    let commit = json!({
+        "repo": REPO,
+        "key": "verified",
+        "manifest": manifest("verified", &[DIGEST]),
+    });
+    let (status, body) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["missing"], json!([DIGEST]));
+    assert!(
+        store.objects().await.is_empty(),
+        "the forged object is deleted"
+    );
+
+    // The right bytes commit, and the blob is recorded with its size.
+    store
+        .put_unrecorded(DIGEST, bytes::Bytes::new())
+        .await
+        .unwrap();
+    let (status, body) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, upload) = server
+        .post_json(
+            "/v1/cache/upload",
+            &json!({"repo": REPO, "digests": [DIGEST]}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{upload}");
+    assert_eq!(upload["missing"], json!({}));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn retention_waits_for_a_commit_in_progress() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    // A commit holds the blob lock shared between checking its blobs and
+    // inserting the manifest. Retention must not delete under it.
+    let mut held = server.client().await;
+    let transaction = held.transaction().await.unwrap();
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock_shared($1)",
+            &[&0x6173_7465_722d_6362_i64],
+        )
+        .await
+        .unwrap();
+    let app = Arc::clone(&server.app);
+    let pass = tokio::spawn(async move { aster_srv::cache::run_retention(&app, Utc::now()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!pass.is_finished(), "retention ran during a commit");
+    transaction.rollback().await.unwrap();
+    pass.await
+        .unwrap()
+        .unwrap()
+        .expect("this replica holds the lock");
     server.stop().await;
 }
 

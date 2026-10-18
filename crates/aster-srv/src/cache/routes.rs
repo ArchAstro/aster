@@ -195,39 +195,49 @@ async fn commit(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         return Reply::error(400, "the manifest is not valid");
     }
     let digests = blob_refs(&manifest);
-    let mut missing = Vec::new();
-    for digest in &digests {
-        match blob_present(app, digest).await {
-            Ok(true) => {}
-            Ok(false) => missing.push(digest.clone()),
-            Err(error) => return db_error(error),
-        }
-    }
-    if !missing.is_empty() {
-        return Reply::json(
+    match commit_manifest(app, &reader.repository, &request.key, &manifest, &digests).await {
+        Ok(Committed::Stored) => Reply::json(201, json!({"stored": true})),
+        Ok(Committed::Exists) => Reply::error(409, "the key is already stored"),
+        Ok(Committed::Missing(missing)) => Reply::json(
             422,
             json!({
                 "error": "the manifest names blobs that are not in the cache",
                 "missing": missing,
             }),
-        );
-    }
-    match insert_manifest(app, &reader.repository, &request.key, &manifest, &digests).await {
-        Ok(true) => Reply::json(201, json!({"stored": true})),
-        Ok(false) => Reply::error(409, "the key is already stored"),
+        ),
         Err(error) => db_error(error),
     }
 }
 
-async fn insert_manifest(
+enum Committed {
+    Stored,
+    Exists,
+    /// Blobs that are absent, or whose bytes do not hash to their name.
+    Missing(Vec<String>),
+}
+
+/// Store a manifest whose blobs are all present and verified.
+///
+/// The transaction holds the retention lock shared, so a retention pass
+/// cannot delete a blob between this check and the insert that names it.
+/// A blob with no `cache.blobs` row has only been PUT through a signed URL;
+/// its bytes are hashed here before a row vouches for them, and an object
+/// that does not match its name is deleted so the client can upload again.
+async fn commit_manifest(
     app: &App,
     repo: &str,
     key: &str,
     manifest: &[u8],
     digests: &[String],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Committed> {
     let mut client = app.pool.get().await?;
     let transaction = client.transaction().await?;
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock_shared($1)",
+            &[&super::store::BLOB_LOCK],
+        )
+        .await?;
     let inserted = transaction
         .execute(
             "INSERT INTO cache.manifests (repo, key, manifest, size_bytes) \
@@ -238,28 +248,77 @@ async fn insert_manifest(
         .await?;
     if inserted == 0 {
         transaction.rollback().await?;
-        return Ok(false);
+        return Ok(Committed::Exists);
     }
+    let mut missing = Vec::new();
     for digest in digests {
-        transaction
+        let recorded = transaction
+            .query_opt("SELECT 1 FROM cache.blobs WHERE sha256 = $1", &[&digest])
+            .await?
+            .is_some();
+        if recorded && app.cache_store.exists(digest).await? {
+            transaction
+                .execute(
+                    "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
+                    &[&digest],
+                )
+                .await?;
+            continue;
+        }
+        match app.cache_store.hash(digest).await? {
+            Some((actual, size)) if actual == *digest => {
+                transaction
+                    .execute(
+                        "INSERT INTO cache.blobs (sha256, size_bytes) VALUES ($1, $2) \
+                         ON CONFLICT (sha256) DO UPDATE \
+                         SET size_bytes = EXCLUDED.size_bytes, last_used_at = now()",
+                        &[&digest, &(size as i64)],
+                    )
+                    .await?;
+            }
+            Some(_) => {
+                crate::log::error(
+                    "cache blob does not match its digest",
+                    json!({"sha256": digest, "repo": repo}),
+                );
+                app.cache_store.delete(digest).await?;
+                missing.push(digest.clone());
+            }
+            None => missing.push(digest.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        transaction.rollback().await?;
+        // Forget rows for blobs that are gone or were deleted as corrupt, so
+        // upload hands out a fresh PUT URL.
+        let client = app.pool.get().await?;
+        client
             .execute(
-                "INSERT INTO cache.blobs (sha256, size_bytes) VALUES ($1, 0) \
-                 ON CONFLICT (sha256) DO UPDATE SET last_used_at = now()",
-                &[&digest],
+                "DELETE FROM cache.blobs WHERE sha256 = ANY($1)",
+                &[&missing],
             )
             .await?;
+        return Ok(Committed::Missing(missing));
     }
     transaction.commit().await?;
-    Ok(true)
+    Ok(Committed::Stored)
 }
 
-/// A blob is present when GCS has the object or a commit has recorded it.
+/// A blob is present when a commit has verified it (its row exists) and
+/// the object is still in GCS. An unverified object gets a fresh PUT URL.
 /// A row whose object is gone is dropped, so a later upload can replace it.
 async fn blob_present(app: &App, digest: &str) -> anyhow::Result<bool> {
+    let client = app.pool.get().await?;
+    let recorded = client
+        .query_opt("SELECT 1 FROM cache.blobs WHERE sha256 = $1", &[&digest])
+        .await?
+        .is_some();
+    if !recorded {
+        return Ok(false);
+    }
     if app.cache_store.exists(digest).await? {
         return Ok(true);
     }
-    let client = app.pool.get().await?;
     client
         .execute("DELETE FROM cache.blobs WHERE sha256 = $1", &[&digest])
         .await?;

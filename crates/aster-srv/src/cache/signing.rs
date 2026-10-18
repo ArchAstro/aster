@@ -210,6 +210,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
 
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    hex_encode(bytes)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
