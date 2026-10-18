@@ -33,6 +33,33 @@ use anyhow::Result;
 pub use config::Config;
 pub use http::{serve, Body, Reply};
 
+/// How [`App::migrate_until_ready`] paces and escalates its retries.
+pub struct RetryPolicy {
+    /// Pause after the first failed pass.
+    pub first_pause: std::time::Duration,
+    /// Pause after every later failed pass.
+    pub later_pause: std::time::Duration,
+    /// How long a table-lock wait stays a warning before it is an error.
+    pub escalate_after: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            first_pause: std::time::Duration::from_secs(5),
+            later_pause: std::time::Duration::from_secs(30),
+            escalate_after: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+/// Log severity for [`App::migrate_until_ready`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Warning,
+    Error,
+}
+
 /// Everything a request handler needs.
 pub struct App {
     pub config: Config,
@@ -121,6 +148,55 @@ impl App {
         db::migrate(&self.pool, &migrations()).await?;
         self.schema_ready.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Migrate, retrying until it succeeds, then call `on_ready`.
+    ///
+    /// Never returns an error: a rolling deploy can hold table locks for
+    /// minutes, and exiting only restarts the wait. Each pass is itself up to
+    /// 12 attempts of `lock_timeout` 5s against the other release's readers,
+    /// so the pause after the first pass is the longer `policy.later_pause`
+    /// to keep the lock queue from stalling them. A table-lock wait logs a
+    /// warning until it has lasted `policy.escalate_after`; any other error
+    /// logs at error severity immediately. `on_ready` is where the background
+    /// loops start: they must not run against an unmigrated schema.
+    pub async fn migrate_until_ready(
+        &self,
+        policy: &RetryPolicy,
+        mut log: impl FnMut(Severity, &str, serde_json::Value),
+        on_ready: impl FnOnce(),
+    ) {
+        let started = std::time::Instant::now();
+        let mut pass = 1u32;
+        while let Err(error) = self.migrate().await {
+            let contended = db::is_lock_contention(&error);
+            let severity = if contended && started.elapsed() < policy.escalate_after {
+                Severity::Warning
+            } else {
+                Severity::Error
+            };
+            log(
+                severity,
+                if contended {
+                    "migrations waiting for table locks; retrying"
+                } else {
+                    "migrations failed; retrying"
+                },
+                serde_json::json!({
+                    "pass": pass,
+                    "waiting_seconds": started.elapsed().as_secs(),
+                    "error": format!("{error:#}"),
+                }),
+            );
+            let pause = if pass == 1 {
+                policy.first_pause
+            } else {
+                policy.later_pause
+            };
+            tokio::time::sleep(pause).await;
+            pass += 1;
+        }
+        on_ready();
     }
 
     /// Whether every migration has been applied.
