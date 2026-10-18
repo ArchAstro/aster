@@ -528,6 +528,7 @@ fn resolve_ruby_workspace_dependencies_partial(projects: &mut [PartialProject]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CacheConfig;
     use crate::plugins::NodeJsPlugin;
 
     fn setup_registry() -> PluginRegistry {
@@ -583,6 +584,38 @@ mod tests {
             test_target.depends_on,
             vec!["//services/api:deps".to_string()]
         );
+    }
+
+    #[test]
+    fn default_outputs_leave_cache_policy_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"mkdir -p dist && tsc --outDir dist","test":"jest"}}"#,
+        )
+        .unwrap();
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let targets = &projects[0].targets;
+
+        let build = targets["build"].cache.as_ref().unwrap();
+        assert_eq!(build.outputs.as_deref(), Some(&["dist/**".to_string()][..]));
+        assert_eq!(
+            build,
+            &CacheConfig {
+                outputs: Some(vec!["dist/**".to_string()]),
+                ..Default::default()
+            },
+            "only outputs are filled; enabled, inputs, env, and runtime stay unset"
+        );
+        assert!(
+            targets["test"].cache.is_none(),
+            "a target without default outputs keeps no cache config"
+        );
+        assert!(targets["deps"].cache.is_none());
     }
 
     #[test]
