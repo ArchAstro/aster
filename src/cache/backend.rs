@@ -197,6 +197,13 @@ impl RemoteHandle {
     }
 }
 
+/// Which side of a download failed. Only remote faults count toward
+/// disabling the remote; local faults are returned to the caller.
+enum DownloadError {
+    Remote(anyhow::Error),
+    Local(anyhow::Error),
+}
+
 /// Local store plus an optional remote.
 ///
 /// Lookup checks local first. A remote hit is written into the local store
@@ -247,8 +254,11 @@ impl TieredCache {
     /// Manifest for `key`.
     ///
     /// Local hit wins. A remote hit is downloaded (missing blobs, then the
-    /// manifest) into [`LocalStore`] and returned from there. Remote errors
-    /// are a miss. Local I/O errors are returned.
+    /// manifest) into [`LocalStore`] and returned from there. Remote errors,
+    /// including a blob whose bytes do not match its digest, are a miss and
+    /// count toward disabling the remote. Local I/O errors (spool files,
+    /// writing blobs or the manifest) are returned so cache filesystem
+    /// problems stay visible.
     pub fn lookup(&self, key: &str) -> Result<Option<Manifest>> {
         if let Some(manifest) = self.local.get_manifest(key)? {
             if self.local_has_blobs(&manifest) {
@@ -263,12 +273,13 @@ impl TieredCache {
         };
         match self.download(remote, key) {
             Ok(manifest) => Ok(manifest),
-            Err(error) => {
+            Err(DownloadError::Remote(error)) => {
                 if let Some(handle) = &self.remote {
                     handle.fail(&error);
                 }
                 Ok(None)
             }
+            Err(DownloadError::Local(error)) => Err(error),
         }
     }
 
@@ -298,36 +309,62 @@ impl TieredCache {
             .all(|digest| self.local.has_blob(digest))
     }
 
-    fn download(&self, remote: &dyn CacheBackend, key: &str) -> Result<Option<Manifest>> {
-        let Some(manifest) = remote.get_manifest(key)? else {
+    fn download(
+        &self,
+        remote: &dyn CacheBackend,
+        key: &str,
+    ) -> Result<Option<Manifest>, DownloadError> {
+        use DownloadError::{Local, Remote};
+        let Some(manifest) = remote.get_manifest(key).map_err(Remote)? else {
             if let Some(handle) = &self.remote {
                 handle.succeed();
             }
             return Ok(None);
         };
-        let missing = remote.find_missing(&manifest.blob_refs())?;
+        let missing = remote.find_missing(&manifest.blob_refs()).map_err(Remote)?;
         if !missing.is_empty() {
-            anyhow::bail!("remote manifest {key} is missing {} blob(s)", missing.len());
+            return Err(Remote(anyhow::anyhow!(
+                "remote manifest {key} is missing {} blob(s)",
+                missing.len()
+            )));
         }
         for digest in manifest.blob_refs() {
             if self.local.has_blob(&digest) {
                 continue;
             }
             // Spool to disk: a blob can be larger than memory.
-            let mut spool = self.local.spool()?;
-            if !remote.get_blob(&digest, &mut spool)? {
-                anyhow::bail!(
+            let mut spool = self.local.spool().map_err(Local)?;
+            if !remote.get_blob(&digest, &mut spool).map_err(Remote)? {
+                return Err(Remote(anyhow::anyhow!(
                     "remote blob {} disappeared during download",
                     digest.as_str()
-                );
+                )));
             }
-            self.local.put_blob_file(&digest, &mut spool)?;
+            // Check the remote's bytes before storing, so a digest mismatch
+            // in `put_blob_file` can only be a local fault.
+            spool
+                .seek(SeekFrom::Start(0))
+                .context("Failed to rewind blob spool")
+                .map_err(Local)?;
+            let hashed = Digest::of_reader(&mut spool)
+                .context("Failed to hash blob spool")
+                .map_err(Local)?;
+            if hashed != digest {
+                return Err(Remote(anyhow::anyhow!(
+                    "remote blob digest mismatch: expected {}, got {}",
+                    digest.as_str(),
+                    hashed.as_str()
+                )));
+            }
+            self.local
+                .put_blob_file(&digest, &mut spool)
+                .map_err(Local)?;
         }
-        self.local.put_manifest(&manifest)?;
+        self.local.put_manifest(&manifest).map_err(Local)?;
         if let Some(handle) = &self.remote {
             handle.succeed();
         }
-        self.local.get_manifest(key)
+        self.local.get_manifest(key).map_err(Local)
     }
 
     fn upload(&self, remote: &dyn CacheBackend, manifest: &Manifest) -> Result<()> {
@@ -766,6 +803,46 @@ mod tests {
         assert!(tier.lookup(&key).unwrap().is_none());
         assert!(tier.lookup(&key).unwrap().is_none());
         assert!(tier.remote_enabled());
+    }
+
+    #[test]
+    fn local_write_failure_during_download_is_an_error_not_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "55".repeat(32);
+        let (remote, _, _) = seeded_remote(&key, b"remote-bytes");
+        let local = LocalStore::new(tmp.path().to_path_buf());
+        // A file where the manifest shard directory belongs makes the local
+        // manifest write fail.
+        let shard_dir = local.manifest_path(&key).unwrap();
+        let shard_dir = shard_dir.parent().unwrap();
+        std::fs::create_dir_all(shard_dir.parent().unwrap()).unwrap();
+        std::fs::write(shard_dir, b"not a directory").unwrap();
+        let tier = TieredCache::with_remote(local, CacheMode::ReadWrite, Arc::new(remote.clone()));
+
+        assert!(tier.lookup(&key).is_err());
+        // A local fault is not charged to the remote.
+        for _ in 0..FAILURES_BEFORE_DISABLE {
+            let _ = tier.lookup(&key);
+        }
+        assert!(tier.remote_enabled());
+    }
+
+    #[test]
+    fn remote_blob_with_wrong_bytes_is_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "66".repeat(32);
+        let digest = Digest::of_bytes(b"expected");
+        let remote = InMemoryBackend::new();
+        remote.put_blob(&digest, &mut &b"tampered"[..]).unwrap();
+        remote.put_manifest(&manifest(&key, Some(&digest))).unwrap();
+        let tier = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote),
+        );
+
+        assert!(tier.lookup(&key).unwrap().is_none());
+        assert!(!tier.local_store().has_blob(&digest));
     }
 
     #[test]
