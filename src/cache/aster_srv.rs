@@ -97,6 +97,9 @@ pub struct AsterSrvBackend {
     iap_client_id: Mutex<Option<String>>,
     /// Stands in for `gcloud` in tests. `None` runs gcloud.
     minter: Mutex<Option<IdentityMinter>>,
+    /// When set, blob URLs on `storage.googleapis.com` are fetched here
+    /// instead. Tests only; production is `None`.
+    gcs_base: Option<String>,
     agent: ureq::Agent,
     blob_agent: ureq::Agent,
     state: Mutex<State>,
@@ -145,6 +148,19 @@ impl AsterSrvBackend {
         ))
     }
 
+    /// Rewrite `https://storage.googleapis.com` blob URLs to `base`.
+    ///
+    /// Production leaves this unset and talks to GCS. The end-to-end test
+    /// sets it so a local stand-in can hold the bytes a signed URL names,
+    /// without changing the URL the server signs.
+    pub fn redirect_gcs_to(mut self, base: impl Into<String>) -> Self {
+        let base = base.into().trim_end_matches('/').to_string();
+        if !base.is_empty() {
+            self.gcs_base = Some(base);
+        }
+        self
+    }
+
     fn new(
         base_url: String,
         repo: String,
@@ -161,6 +177,7 @@ impl AsterSrvBackend {
             token_path,
             iap_client_id: Mutex::new(iap_client_id),
             minter: Mutex::new(None),
+            gcs_base: None,
             agent: build_agent(REQUEST_TIMEOUT),
             blob_agent: build_agent(BLOB_TIMEOUT),
             state: Mutex::new(State {
@@ -424,6 +441,7 @@ impl AsterSrvBackend {
 
     /// Stream `url` into `writer`, returning the sha256 of the bytes written.
     fn stream_get(&self, url: &str, writer: &mut dyn Write) -> Result<String> {
+        let url = self.blob_url(url);
         let response = self
             .blob_agent
             .get(url)
@@ -450,6 +468,7 @@ impl AsterSrvBackend {
     }
 
     fn stream_put(&self, url: &str, reader: &mut dyn Read) -> Result<()> {
+        let url = self.blob_url(url);
         // ureq sends a file or a buffer, not a trait object. The spool is
         // unnamed and removed when this call returns.
         let mut spool = tempfile::NamedTempFile::new().context("create upload spool")?;
@@ -472,6 +491,20 @@ impl AsterSrvBackend {
             bail!("remote blob upload returned {status}");
         }
         Ok(())
+    }
+
+    /// The URL blob bytes actually move through.
+    ///
+    /// A test stand-in replaces the GCS host and keeps the signed path, so
+    /// the object name the server signed is the object the stand-in stores.
+    fn blob_url(&self, url: &str) -> String {
+        let Some(base) = &self.gcs_base else {
+            return url.to_string();
+        };
+        let Some(rest) = url.strip_prefix("https://storage.googleapis.com") else {
+            return url.to_string();
+        };
+        format!("{base}{rest}")
     }
 
     /// Whether a lookup hit named a signed GET for `digest`.

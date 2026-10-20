@@ -35,6 +35,8 @@ pub enum Body {
     Json(serde_json::Value),
     /// A page for a browser, sent with the dashboard's security headers.
     Html(String),
+    /// Raw bytes, as a signed blob GET returns them.
+    Bytes(Bytes),
 }
 
 impl Reply {
@@ -52,16 +54,24 @@ impl Reply {
         }
     }
 
+    pub fn bytes(status: u16, body: Bytes) -> Self {
+        Self {
+            status,
+            body: Body::Bytes(body),
+        }
+    }
+
     pub fn error(status: u16, message: impl Into<String>) -> Self {
         Self::json(status, json!({"error": message.into()}))
     }
 
     fn into_response(self) -> Response<Full<Bytes>> {
         let (content_type, body, is_html) = match self.body {
-            Body::Json(body) => ("application/json", body.to_string(), false),
-            Body::Html(page) => ("text/html; charset=utf-8", page, true),
+            Body::Json(body) => ("application/json", Bytes::from(body.to_string()), false),
+            Body::Html(page) => ("text/html; charset=utf-8", Bytes::from(page), true),
+            Body::Bytes(body) => ("application/octet-stream", body, false),
         };
-        let mut response = Response::new(Full::new(Bytes::from(body)));
+        let mut response = Response::new(Full::new(body));
         *response.status_mut() =
             StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let headers = response.headers_mut();
@@ -164,27 +174,18 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             query::handle(app, &identity, route, request.uri().query()).await
         }
         (&Method::POST, path) if path.starts_with("/v1/cache/") => {
-            let authorization = header(&request, AUTHORIZATION);
-            let iap_assertion = request
-                .headers()
-                .get(crate::iap::IAP_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let body = match read_body(request, app.config.max_body_bytes).await {
-                Ok(body) => body,
-                Err(reply) => return reply,
-            };
-            crate::cache::handle(
-                app,
-                "POST",
-                path,
-                &crate::cache::Headers {
-                    authorization: authorization.as_deref(),
-                    iap_assertion: iap_assertion.as_deref(),
-                },
-                body,
-            )
-            .await
+            cache_request(app, request, "POST", path).await
+        }
+        // A rewritten signed blob URL: `PUT|GET /<bucket>/cas/<sha256>`.
+        // Only the in-memory store answers it. A GCS-backed server, which is
+        // every production deploy, falls through to 404.
+        (method, path)
+            if app.cache_store.is_memory()
+                && matches!(method, &Method::PUT | &Method::GET)
+                && path.split('/').nth(2) == Some("cas") =>
+        {
+            let method = method.as_str().to_string();
+            cache_request(app, request, &method, path).await
         }
         (method, path) if crate::ui::is_ui_path(path) => {
             let assertion = request
@@ -218,6 +219,36 @@ fn header(request: &Request<Incoming>, name: hyper::header::HeaderName) -> Optio
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
+}
+
+async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path: &str) -> Reply {
+    let authorization = header(&request, AUTHORIZATION);
+    let iap_assertion = request
+        .headers()
+        .get(crate::iap::IAP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    // JSON cache routes carry a small body. The rewritten blob GET does not,
+    // and waiting for one stalls the client until its request timeout.
+    let body = if method == "GET" {
+        Bytes::new()
+    } else {
+        match read_body(request, app.config.max_body_bytes).await {
+            Ok(body) => body,
+            Err(reply) => return reply,
+        }
+    };
+    crate::cache::handle(
+        app,
+        method,
+        path,
+        &crate::cache::Headers {
+            authorization: authorization.as_deref(),
+            iap_assertion: iap_assertion.as_deref(),
+        },
+        body,
+    )
+    .await
 }
 
 async fn read_body(request: Request<Incoming>, limit: usize) -> Result<Bytes, Reply> {

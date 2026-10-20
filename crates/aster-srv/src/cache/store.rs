@@ -81,6 +81,26 @@ impl BlobStore {
         }
     }
 
+    /// Whether this is the in-memory store tests use in place of GCS.
+    pub fn is_memory(&self) -> bool {
+        matches!(self, BlobStore::Memory { .. })
+    }
+
+    /// Bytes stored as `cas/<sha256>`, or `None` when the object is absent.
+    ///
+    /// The in-memory store answers this directly. A GCS-backed store does
+    /// not: production clients read through the signed URL, not this server.
+    pub async fn get(&self, sha256: &str) -> Result<Option<Bytes>> {
+        match self {
+            BlobStore::Memory { objects, .. } => Ok(objects
+                .lock()
+                .await
+                .get(sha256)
+                .map(|(bytes, _)| bytes.clone())),
+            BlobStore::Disabled | BlobStore::Gcs { .. } => Ok(None),
+        }
+    }
+
     /// Objects currently stored, by sha256. For tests.
     pub async fn objects(&self) -> Vec<String> {
         match self {
