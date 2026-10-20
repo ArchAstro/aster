@@ -25,6 +25,10 @@ pub struct IndexEntry {
     pub key: String,
     /// RFC 3339 timestamp copied from the stored manifest.
     pub created_at: String,
+    /// Set when [`ArtifactCache::remove`] dropped this address. The manifest
+    /// stays, but lookup must not restore it until something stores again.
+    #[serde(default)]
+    removed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,11 +69,12 @@ pub struct ArtifactCache {
 
 impl ArtifactCache {
     /// `cache_dir` is the resolved cache directory (`cas/`, `ac/`, `index/`).
+    /// `workspace_root` is the checkout, used to name the remote cache repo.
     ///
-    /// The remote comes from the environment. A missing or not-yet-implemented
-    /// remote is local-only and does not fail construction.
-    pub fn new(cache_dir: PathBuf) -> Self {
-        let tier = super::backend::tier_from_env(&cache_dir).unwrap_or_else(|error| {
+    /// The remote comes from the environment. A missing credential or a
+    /// not-yet-implemented remote is local-only and does not fail construction.
+    pub fn new(cache_dir: PathBuf, workspace_root: &Path) -> Self {
+        let tier = super::backend::tier_from_env(&cache_dir, workspace_root).unwrap_or_else(|error| {
             eprintln!(
                 "[aster] Warning: remote cache config ignored, using the local cache only: {error:#}"
             );
@@ -96,20 +101,50 @@ impl ArtifactCache {
         self.tier.local_store()
     }
 
+    /// Batch-lookup `keys` on the remote before this level runs.
+    pub fn prefetch(&self, keys: &[String]) {
+        self.tier.prefetch(keys);
+    }
+
     /// Manifest for `address` when the index key matches `key`.
     ///
-    /// A missing index entry, a different key, a missing manifest, or a
-    /// manifest that does not decode is a miss (`Ok(None)`).
+    /// A missing index entry asks the tier, so a remote hit can restore
+    /// into a checkout that has never stored this address. A different key
+    /// is a miss. A missing manifest, or one that does not decode, is a miss.
     pub fn lookup(&self, project: &str, address: &str, key: &str) -> Result<Option<Manifest>> {
         let _lock = self.lock_shared()?;
         let index = self.read_index(project)?;
-        let Some(entry) = index.entries.get(address) else {
+        if let Some(entry) = index.entries.get(address) {
+            if entry.removed || entry.key != key {
+                return Ok(None);
+            }
+        }
+        // No index row is a local miss, not a remote miss: another checkout
+        // may have stored this key. A different key is a real miss.
+        let manifest = self.tier.lookup(key)?;
+        let Some(manifest) = manifest else {
             return Ok(None);
         };
-        if entry.key != key {
+        // A remote hit for another address must not be claimed by this one.
+        if manifest.target != address {
             return Ok(None);
         }
-        self.tier.lookup(key)
+        if index.entries.get(address).is_none_or(|entry| entry.removed) {
+            let created_at = manifest.created_at.clone();
+            drop(_lock);
+            let _exclusive = self.lock_exclusive()?;
+            let mut index = self.read_index(project)?;
+            index
+                .entries
+                .entry(address.to_string())
+                .or_insert(IndexEntry {
+                    key: key.to_string(),
+                    created_at,
+                    removed: false,
+                });
+            self.write_index(project, &index)?;
+        }
+        Ok(Some(manifest))
     }
 
     /// Store `manifest`, then record `address` in the project index.
@@ -126,6 +161,7 @@ impl ArtifactCache {
             IndexEntry {
                 key: manifest.key.clone(),
                 created_at: manifest.created_at.clone(),
+                removed: false,
             },
         );
         self.write_index(project, &index)
@@ -135,7 +171,11 @@ impl ArtifactCache {
     pub fn list_project_entries(&self, project: &str) -> Result<Vec<(String, IndexEntry)>> {
         let _lock = self.lock_shared()?;
         let index = self.read_index(project)?;
-        Ok(index.entries.into_iter().collect())
+        Ok(index
+            .entries
+            .into_iter()
+            .filter(|(_, entry)| !entry.removed)
+            .collect())
     }
 
     /// Delete every index entry for `project`. Blobs and manifests stay.
@@ -156,7 +196,9 @@ impl ArtifactCache {
         };
         let _lock = self.lock_exclusive()?;
         let mut index = self.read_index(project)?;
-        if index.entries.remove(address).is_none() {
+        if let Some(entry) = index.entries.get_mut(address) {
+            entry.removed = true;
+        } else {
             return Ok(());
         }
         self.write_index(project, &index)
@@ -191,7 +233,7 @@ impl ArtifactCache {
             }
             let index = read_index_file(&path)?;
             for (address, row) in index.entries {
-                if !status_matches(filter, &address) {
+                if row.removed || !status_matches(filter, &address) {
                     continue;
                 }
                 let manifest = self.tier.local_store().get_manifest(&row.key)?;
@@ -402,7 +444,7 @@ mod tests {
     #[test]
     fn lookup_requires_matching_index_key_and_a_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = ArtifactCache::new(tmp.path().to_path_buf());
+        let cache = ArtifactCache::new(tmp.path().to_path_buf(), tmp.path());
         let key = "ab".repeat(32);
         let stored = manifest(&key, "//app:build");
         cache.store("//app", "//app:build", &stored).unwrap();
@@ -425,7 +467,7 @@ mod tests {
     #[test]
     fn remove_and_invalidate_drop_index_entries_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = ArtifactCache::new(tmp.path().to_path_buf());
+        let cache = ArtifactCache::new(tmp.path().to_path_buf(), tmp.path());
         let key = "11".repeat(32);
         cache
             .store("//app", "//app:build", &manifest(&key, "//app:build"))
@@ -447,7 +489,7 @@ mod tests {
     #[test]
     fn status_lists_indexed_targets_and_clear_matching_is_project_scoped() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = ArtifactCache::new(tmp.path().to_path_buf());
+        let cache = ArtifactCache::new(tmp.path().to_path_buf(), tmp.path());
         let blob = Digest::of_bytes(b"log");
         cache.local_store().put_blob(&blob, &b"log"[..]).unwrap();
         let mut with_log = manifest(&"aa".repeat(32), "//apps/web:build");
@@ -496,7 +538,7 @@ mod tests {
     #[test]
     fn status_joins_manifest_outputs_and_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = ArtifactCache::new(tmp.path().to_path_buf());
+        let cache = ArtifactCache::new(tmp.path().to_path_buf(), tmp.path());
         let bytes = b"hello artifact";
         let digest = Digest::of_bytes(bytes);
         cache.local_store().put_blob(&digest, &bytes[..]).unwrap();

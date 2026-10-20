@@ -309,6 +309,10 @@ impl CacheBackend for HttpCache {
             &[("Content-Type", "application/octet-stream")],
         )
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Manifests are small JSON. A larger body is a protocol error, not a blob.

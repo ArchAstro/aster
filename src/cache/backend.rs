@@ -5,11 +5,11 @@
 //! error is logged, and after [`FAILURES_BEFORE_DISABLE`] consecutive
 //! failures the remote is skipped for the rest of the process.
 //!
-//! Remote clients (aster-srv, GitHub Actions, HTTP) are separate tasks.
-//! This module only selects which kind would be used and, until those
-//! clients exist, runs local-only.
+//! Remote clients (GitHub Actions, HTTP) are separate tasks. aster-srv is
+//! selected here when `ASTER_SRV_URL` is set. This module does not speak HTTP.
 
 use anyhow::{Context, Result};
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -112,7 +112,7 @@ impl RemoteKind {
 }
 
 /// Synchronous blob and manifest store. HTTP backends use blocking clients.
-pub trait CacheBackend: Send + Sync {
+pub trait CacheBackend: Send + Sync + Any {
     /// Manifest for `key`, or `Ok(None)` on a miss.
     fn get_manifest(&self, key: &str) -> Result<Option<Manifest>>;
 
@@ -120,6 +120,9 @@ pub trait CacheBackend: Send + Sync {
     fn put_manifest(&self, manifest: &Manifest) -> Result<()>;
 
     /// Digests in `digests` that this backend does not have.
+    ///
+    /// Download uses [`Self::get_blob`] for presence: a miss there is a
+    /// missing blob. This method is the upload path and may reserve writes.
     fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>>;
 
     /// Write `digest` into `writer`. `Ok(false)` is a miss.
@@ -127,6 +130,9 @@ pub trait CacheBackend: Send + Sync {
 
     /// Store the bytes from `reader` under `digest`.
     fn put_blob(&self, digest: &Digest, reader: &mut dyn Read) -> Result<()>;
+
+    /// Downcast so a batch lookup can reach the aster-srv client.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Process-lifetime remote that stops after repeated failures.
@@ -171,6 +177,14 @@ impl RemoteHandle {
             if !state.disabled {
                 state.failures = 0;
             }
+        }
+    }
+
+    /// Skip the remote for the rest of the run. The first error is still logged
+    /// by [`Self::fail`].
+    fn disable(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.disabled = true;
         }
     }
 
@@ -251,6 +265,28 @@ impl TieredCache {
             .is_some_and(|remote| remote.active().is_some())
     }
 
+    /// Ask the remote for every `keys` entry before the executor runs them.
+    ///
+    /// A failure is a miss for the batch: the remote is charged, and each
+    /// target still looks up locally. Backends that do not batch ignore this.
+    pub fn prefetch(&self, keys: &[String]) {
+        if !self.mode.reads() {
+            return;
+        }
+        let Some(remote) = self.remote.as_ref().and_then(|remote| remote.active()) else {
+            return;
+        };
+        let Some(backend) = remote
+            .as_any()
+            .downcast_ref::<super::aster_srv::AsterSrvBackend>()
+        else {
+            return;
+        };
+        if let Err(error) = backend.prefetch(keys) {
+            self.note_remote_failure(&error);
+        }
+    }
+
     /// Manifest for `key`.
     ///
     /// Local hit wins. A remote hit is downloaded (missing blobs, then the
@@ -274,9 +310,7 @@ impl TieredCache {
         match self.download(remote, key) {
             Ok(manifest) => Ok(manifest),
             Err(DownloadError::Remote(error)) => {
-                if let Some(handle) = &self.remote {
-                    handle.fail(&error);
-                }
+                self.note_remote_failure(&error);
                 Ok(None)
             }
             Err(DownloadError::Local(error)) => Err(error),
@@ -295,11 +329,22 @@ impl TieredCache {
             return Ok(());
         };
         if let Err(error) = self.upload(remote, manifest) {
-            if let Some(handle) = &self.remote {
-                handle.fail(&error);
-            }
+            self.note_remote_failure(&error);
         }
         Ok(())
+    }
+
+    /// Charge a remote failure. A [`super::aster_srv::DisablingFailure`] (a
+    /// timeout) skips the remote immediately so a hung gateway is one wait,
+    /// not three.
+    fn note_remote_failure(&self, error: &anyhow::Error) {
+        let Some(handle) = &self.remote else {
+            return;
+        };
+        if disables_remote(error) {
+            handle.disable();
+        }
+        handle.fail(error);
     }
 
     fn local_has_blobs(&self, manifest: &Manifest) -> bool {
@@ -321,7 +366,18 @@ impl TieredCache {
             }
             return Ok(None);
         };
-        let missing = remote.find_missing(&manifest.blob_refs()).map_err(Remote)?;
+        let refs = manifest.blob_refs();
+        let mut missing = Vec::new();
+        for digest in &refs {
+            let present = remote
+                .as_any()
+                .downcast_ref::<super::aster_srv::AsterSrvBackend>()
+                .map(|backend| backend.has_blob(digest))
+                .unwrap_or(true);
+            if !present {
+                missing.push(digest.clone());
+            }
+        }
         if !missing.is_empty() {
             return Err(Remote(anyhow::anyhow!(
                 "remote manifest {key} is missing {} blob(s)",
@@ -389,25 +445,29 @@ impl TieredCache {
     }
 }
 
+fn disables_remote(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<super::aster_srv::DisablingFailure>()
+            .is_some()
+    })
+}
+
 /// Build the remote for this process.
 ///
-/// `none` and `gha` stay local until their clients exist. `aster-srv` stays
-/// local too: its client is another task. When `ASTER_SRV_URL` is set and
-/// aster-srv was selected, one warning is printed so a configured gateway is
-/// not a silent no-op. `http` uses [`super::http::HttpCache`] when
-/// `ASTER_REMOTE_CACHE_URL` is set.
+/// `none` and `gha` stay local until their clients exist. `aster-srv` is
+/// used when `ASTER_SRV_URL` is set and credentials exist (`ASTER_SRV_TOKEN`,
+/// or GitHub Actions OIDC). A configured URL with no credential is local-only,
+/// with one warning, rather than a build failure. `workspace_root` names the
+/// checkout whose origin is the cache repo. `http` uses
+/// [`super::http::HttpCache`] when `ASTER_REMOTE_CACHE_URL` is set.
 pub fn select_remote(
     kind: RemoteKind,
     aster_srv_url: Option<&str>,
+    workspace_root: Option<&Path>,
     http_url: Option<&str>,
     http_token: Option<String>,
 ) -> Result<Option<Arc<dyn CacheBackend>>> {
-    let url_set = aster_srv_url.is_some_and(|url| !url.trim().is_empty());
-    if kind == RemoteKind::AsterSrv && url_set {
-        eprintln!(
-            "[aster] Warning: {ASTER_SRV_URL_ENV} is set but the aster-srv cache client is not available; using the local cache only"
-        );
-    }
     if kind == RemoteKind::Http {
         return match super::http::HttpCache::from_vars(http_url, http_token)? {
             Some(cache) => Ok(Some(Arc::new(cache))),
@@ -420,11 +480,33 @@ pub fn select_remote(
             }
         };
     }
-    Ok(None)
+    if kind != RemoteKind::AsterSrv {
+        return Ok(None);
+    }
+    let url_set = aster_srv_url.is_some_and(|url| !url.trim().is_empty());
+    if !url_set {
+        return Ok(None);
+    }
+    let repo = workspace_root
+        .map(super::aster_srv::repo_from_env)
+        .filter(|repo| !repo.is_empty())
+        .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
+        .filter(|repo| !repo.trim().is_empty());
+    match super::aster_srv::AsterSrvBackend::from_env(aster_srv_url, repo.as_deref()) {
+        Some(backend) => Ok(Some(Arc::new(backend))),
+        None => {
+            eprintln!(
+                "[aster] Warning: {ASTER_SRV_URL_ENV} is set but no remote cache credential is available; using the local cache only"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Remote kind and mode from the environment, then [`select_remote`].
-pub fn tier_from_env(cache_dir: impl AsRef<Path>) -> Result<TieredCache> {
+///
+/// `workspace_root` names the checkout whose origin is the cache repo.
+pub fn tier_from_env(cache_dir: impl AsRef<Path>, workspace_root: &Path) -> Result<TieredCache> {
     let mode = CacheMode::from_env()?;
     let kind = RemoteKind::from_env()?;
     let local = LocalStore::new(cache_dir.as_ref().to_path_buf());
@@ -434,7 +516,13 @@ pub fn tier_from_env(cache_dir: impl AsRef<Path>) -> Result<TieredCache> {
     let url = std::env::var(ASTER_SRV_URL_ENV).ok();
     let http_url = std::env::var(super::http::REMOTE_CACHE_URL_ENV).ok();
     let http_token = std::env::var(super::http::REMOTE_CACHE_TOKEN_ENV).ok();
-    match select_remote(kind, url.as_deref(), http_url.as_deref(), http_token)? {
+    match select_remote(
+        kind,
+        url.as_deref(),
+        Some(workspace_root),
+        http_url.as_deref(),
+        http_token,
+    )? {
         Some(remote) => Ok(TieredCache::with_remote(local, mode, remote)),
         None => Ok(TieredCache {
             local,
@@ -543,6 +631,10 @@ impl CacheBackend for InMemoryBackend {
         reader.read_to_end(&mut bytes)?;
         state.blobs.insert(digest.as_str().to_string(), bytes);
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -878,21 +970,26 @@ mod tests {
         assert_eq!(RemoteKind::parse("http").unwrap(), RemoteKind::Http);
         assert!(RemoteKind::parse("s3").is_err());
         assert!(select_remote(
-            RemoteKind::AsterSrv,
+            RemoteKind::Gha,
             Some("https://example.test"),
+            None,
             None,
             None
         )
         .unwrap()
         .is_none());
-        assert!(select_remote(RemoteKind::None, None, None, None)
+        assert!(select_remote(RemoteKind::None, None, None, None, None)
             .unwrap()
             .is_none());
-        assert!(select_remote(RemoteKind::Http, None, None, None)
+        assert!(select_remote(RemoteKind::AsterSrv, None, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(select_remote(RemoteKind::Http, None, None, None, None)
             .unwrap()
             .is_none());
         assert!(select_remote(
             RemoteKind::Http,
+            None,
             None,
             Some("http://127.0.0.1:9"),
             Some("token".into()),
@@ -928,6 +1025,10 @@ mod tests {
         fn put_blob(&self, digest: &Digest, reader: &mut dyn Read) -> Result<()> {
             self.order.lock().unwrap().push("put_blob");
             self.inner.put_blob(digest, reader)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 mod artifact;
 mod artifact_cache;
+mod aster_srv;
 mod backend;
 mod hasher;
 mod http;
