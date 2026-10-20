@@ -495,7 +495,7 @@ fn env_selects_http_backend() {
     std::env::set_var("ASTER_REMOTE_CACHE_TOKEN", TOKEN);
 
     let dir = tempfile::tempdir().unwrap();
-    let tier = aster::cache::tier_from_env(dir.path()).unwrap();
+    let tier = aster::cache::tier_from_env(dir.path(), dir.path()).unwrap();
     assert!(tier.remote_enabled());
 
     let bytes = b"from-env";

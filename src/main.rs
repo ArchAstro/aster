@@ -1314,7 +1314,8 @@ fn run() -> Result<()> {
             use aster::cache::{resolve_cache_dir, ArtifactCache};
             use aster::cli::CacheCommands;
 
-            let artifact_cache = ArtifactCache::new(resolve_cache_dir(&workspace_root));
+            let artifact_cache =
+                ArtifactCache::new(resolve_cache_dir(&workspace_root), &workspace_root);
 
             match command {
                 CacheCommands::Clear { target } => {

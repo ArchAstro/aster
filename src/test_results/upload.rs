@@ -73,7 +73,7 @@ pub(super) fn agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
-pub(super) fn bearer(agent: &ureq::Agent, credentials: &Credentials) -> Result<String> {
+pub(crate) fn bearer(agent: &ureq::Agent, credentials: &Credentials) -> Result<String> {
     match credentials {
         Credentials::Static(token) => Ok(token.clone()),
         Credentials::GitHubOidc {

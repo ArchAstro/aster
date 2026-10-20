@@ -512,7 +512,10 @@ impl<'a> Executor<'a> {
         progress.set_total(targets_to_run.len());
 
         let artifact_cache = if self.use_cache {
-            Some(ArtifactCache::new(self.cache_dir.clone()))
+            Some(ArtifactCache::new(
+                self.cache_dir.clone(),
+                self.workspace_root,
+            ))
         } else {
             None
         };
@@ -600,6 +603,32 @@ impl<'a> Executor<'a> {
                 queue.complete(&result.address);
                 collected.push((queue.level(&result.address), 1, result));
                 continue;
+            }
+
+            if let Some(cache) = artifact_cache.as_ref() {
+                let mut memo = HashMap::new();
+                if let Ok(guard) = computed_hashes.lock() {
+                    memo.extend(
+                        guard
+                            .iter()
+                            .map(|(addr, key)| (addr.clone(), Some(key.clone()))),
+                    );
+                }
+                let keys: Vec<String> = batch
+                    .iter()
+                    .filter_map(|addr| {
+                        fresh_cache_key(
+                            addr,
+                            project_map,
+                            self.workspace_root,
+                            &plugin_registry,
+                            &env_snapshot,
+                            &runtime_inputs,
+                            &mut memo,
+                        )
+                    })
+                    .collect();
+                cache.prefetch(&keys);
             }
 
             for target_addr in batch {
@@ -1097,7 +1126,7 @@ impl<'a> Executor<'a> {
                     result.success && result.exit_code == Some(0) && !retried && !let_through;
                 if !clean_pass {
                     if let Some(cache_dir) = cache_store_path.as_ref() {
-                        let store = ArtifactCache::new(cache_dir.clone());
+                        let store = ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                         if let Err(e) = store.remove(&addr) {
                             eprintln!(
                             "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
@@ -1140,7 +1169,8 @@ impl<'a> Executor<'a> {
                                     let mut hashes = computed_hashes_clone.lock().unwrap();
                                     hashes.insert(addr.clone(), postflight_hash.clone());
                                 }
-                                let artifacts = ArtifactCache::new(cache_dir.clone());
+                                let artifacts =
+                                    ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                                 if let Err(e) = store_success(
                                     &artifacts,
                                     &project_root,
@@ -1158,7 +1188,8 @@ impl<'a> Executor<'a> {
                                 // An unstable or unhashable execution may
                                 // have changed outputs. Do not leave an old
                                 // entry available for a future false hit.
-                                let store = ArtifactCache::new(cache_dir.clone());
+                                let store =
+                                    ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                                 if let Err(e) = store.remove(&addr) {
                                     eprintln!(
                                         "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
@@ -1172,7 +1203,7 @@ impl<'a> Executor<'a> {
                 // Invalidate project cache if target has invalidates_cache flag
                 if result.success && invalidates_cache {
                     if let Some(ref cache_dir) = cache_store_path {
-                        let store = ArtifactCache::new(cache_dir.clone());
+                        let store = ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                         let project_addr = project_of(&addr).unwrap_or(&addr);
                         if let Err(e) = store.invalidate_project(project_addr) {
                             eprintln!(
@@ -3019,7 +3050,7 @@ mod tests {
         let projects = [&project];
         let results = executor.execute_targets(&requested, &projects, false);
         assert!(results.iter().all(|result| result.success));
-        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()), tmp.path());
         assert!(store
             .lookup("//a", "//a:deploy", &"aa".repeat(32))
             .unwrap()
@@ -3075,7 +3106,7 @@ mod tests {
             "true",
             &project,
             tmp.path(),
-            &ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path())),
+            &ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()), tmp.path()),
             &PluginRegistry::with_all_plugins(),
             &Arc::new(Mutex::new(HashMap::new())),
             &HashMap::new(),
@@ -3217,7 +3248,7 @@ mod tests {
         let projects = [&project];
         let requested = HashSet::from(["//a:build".to_string()]);
         let executor = Executor::with_output_mode(tmp.path(), crate::cli::output::OutputMode::Json);
-        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()), tmp.path());
         store
             .store(
                 "//a",
@@ -3258,7 +3289,7 @@ mod tests {
         let mut project = make_project_with_targets("a", targets);
         project.root = tmp.path().to_path_buf();
         project.plugin_name = "nodejs".to_string();
-        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()));
+        let store = ArtifactCache::new(crate::cache::resolve_cache_dir(tmp.path()), tmp.path());
         store
             .store(
                 "//a",
