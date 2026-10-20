@@ -497,7 +497,13 @@ pub fn select_remote(
         .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
         .filter(|repo| !repo.trim().is_empty());
     match super::aster_srv::AsterSrvBackend::from_env(aster_srv_url, repo.as_deref()) {
-        Some(backend) => Ok(Some(Arc::new(backend))),
+        Some(backend) => {
+            let backend = match std::env::var("ASTER_SRV_GCS_BASE") {
+                Ok(base) if !base.trim().is_empty() => backend.redirect_gcs_to(base),
+                _ => backend,
+            };
+            Ok(Some(Arc::new(backend)))
+        }
         None => {
             eprintln!(
                 "[aster] Warning: {ASTER_SRV_URL_ENV} is set but the repository cannot be determined; using the local cache only"

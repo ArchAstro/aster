@@ -53,6 +53,16 @@ pub async fn handle(
     headers: &Headers<'_>,
     body: Bytes,
 ) -> Reply {
+    // Test-only stand-in for the signed GCS URL. Production URLs are
+    // `https://storage.googleapis.com/...` and never hit this path. The
+    // end-to-end test rewrites that host to this server and keeps the signed
+    // path, so `PUT /<bucket>/cas/<sha256>` stores the bytes commit later hashes.
+    // A GCS-backed server does not answer this path at all.
+    if app.cache_store.is_memory() {
+        if let Some(digest) = test_blob_digest(path) {
+            return test_blob(app, method, digest, body).await;
+        }
+    }
     if method != "POST" {
         return Reply::error(405, "method not allowed");
     }
@@ -65,6 +75,50 @@ pub async fn handle(
         "/v1/cache/upload" => upload(app, headers, request).await,
         "/v1/cache/commit" => commit(app, headers, request).await,
         _ => Reply::error(404, "not found"),
+    }
+}
+
+/// The sha256 a rewritten signed URL names, if this path is one.
+///
+/// A signed URL is `https://storage.googleapis.com/<bucket>/cas/<sha256>`.
+/// After the test rewrites the host, the path is `/<bucket>/cas/<sha256>`.
+fn test_blob_digest(path: &str) -> Option<&str> {
+    let mut parts = path.split('/');
+    if parts.next() != Some("") {
+        return None;
+    }
+    let bucket = parts.next()?;
+    if bucket.is_empty() || parts.next() != Some("cas") {
+        return None;
+    }
+    let digest = parts.next()?;
+    if parts.next().is_some() || !is_sha256(digest) {
+        return None;
+    }
+    Some(digest)
+}
+
+/// PUT or GET one blob on the in-memory store. Not authenticated: a signed
+/// GCS URL is the credential in production, and this path exists only so a
+/// test can stand in for that URL. A GCS-backed store refuses it.
+async fn test_blob(app: &App, method: &str, digest: &str, body: Bytes) -> Reply {
+    if !is_sha256(digest) {
+        return Reply::error(400, "digest is not a sha256");
+    }
+    if !app.cache_store.is_memory() {
+        return Reply::error(404, "not found");
+    }
+    match method {
+        "PUT" => match app.cache_store.put_unrecorded(digest, body).await {
+            Ok(()) => Reply::bytes(200, Bytes::new()),
+            Err(error) => db_error(error),
+        },
+        "GET" => match app.cache_store.get(digest).await {
+            Ok(Some(bytes)) => Reply::bytes(200, bytes),
+            Ok(None) => Reply::error(404, "missing"),
+            Err(error) => db_error(error),
+        },
+        _ => Reply::error(405, "method not allowed"),
     }
 }
 

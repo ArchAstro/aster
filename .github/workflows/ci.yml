@@ -75,6 +75,9 @@ jobs:
             docker exec postgres-tls pg_isready -U postgres && break
             sleep 1
           done
+      - run: cargo test --locked --test cache_remote_e2e -- --test-threads=1
+        env:
+          ASTER_SRV_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - run: cargo test --locked -p aster-srv
         env:
           ASTER_SRV_TEST_TLS_DATABASE_URL: postgres://postgres:postgres@localhost:5433/postgres?sslmode=require
