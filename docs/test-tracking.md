@@ -52,7 +52,8 @@ table and `retry_setup`.
 | `ASTER_SRV_URL` | The server. Set, Aster uploads after the run and fetches the quarantine list before it. |
 | `ASTER_SRV_TOKEN` | A static token. Without it, GitHub Actions' OIDC token is used (the job needs `permissions: id-token: write`). |
 | `ASTER_SRV_AUDIENCE` | The OIDC audience; default `aster-srv`. |
-| `ASTER_SRV_PROXY_TOKEN` | Sent as `Proxy-Authorization` when the server sits behind an identity-aware proxy. |
+| `ASTER_SRV_PROXY_TOKEN` | Sent as `Proxy-Authorization` when the server sits behind an identity-aware proxy. CI sets this. A laptop does not: see [Reading the cache from a laptop](#reading-the-cache-from-a-laptop). |
+| `ASTER_SRV_IAP_CLIENT_ID` | IAP OAuth client id. Aster uses it as the audience when minting a personal identity token. |
 | `ASTER_GITHUB_SUMMARY` | `0` stops the step summary and annotations in GitHub Actions. |
 | `ASTER_QUARANTINE` | `off` stops quarantine; failures fail as usual. |
 | `ASTER_BALANCE_PARTITIONS` | `off` keeps Mix's own split for `mix test --partitions` shards. |
@@ -76,6 +77,37 @@ steps:
 The step summary lists each failing test as `new`, `broken` (with the commit
 it broke at), `known flake`, `quarantined` or, without a server, `failed`,
 and each gets an annotation on its file.
+
+
+## Reading the cache from a laptop
+
+aster-srv's host is behind Google IAP. CI passes that with a workload-identity
+token in `ASTER_SRV_PROXY_TOKEN`. A laptop or a devbox uses the person's own
+Google account instead, and no shared token.
+
+One-time setup, on the laptop and again on a devbox (a devbox does not share
+the laptop's gcloud login):
+
+```console
+gcloud auth login          # an archastro.ai account that IAP allows to view
+export ASTER_SRV_URL=https://aster-srv.example.com
+export ASTER_SRV_IAP_CLIENT_ID=<IAP OAuth client id>
+aster cache login
+```
+
+`aster cache login` runs `gcloud auth print-identity-token --audiences=$ASTER_SRV_IAP_CLIENT_ID`
+and stores the token at `<workspace>/.aster/iap-token.json` until it expires.
+The file is mode `0600` and `.aster/` is gitignored, so the token never enters
+the repository. The next `aster run` with `ASTER_SRV_URL` set sends it as
+`Proxy-Authorization` and restores a cached target. No other environment
+variable is required.
+
+If gcloud is missing or the account is signed out, `aster cache login` prints
+the command to run and exits 1. A later `aster run` prints one line
+(`not signed in to Google; remote cache skipped`) and builds from the local
+cache. It does not fail.
+
+IAP viewers can read the cache, not write it. A laptop restore does not upload.
 
 ## 4. Flaky and broken
 
