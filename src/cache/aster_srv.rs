@@ -535,11 +535,14 @@ impl CacheBackend for AsterSrvBackend {
         if self.read_only() {
             return Ok(());
         }
+        let encoded = manifest.encode();
         let body = json!({
             "repo": self.repo,
             "key": manifest.key,
-            "manifest": BASE64.encode(manifest.encode()),
+            "manifest": BASE64.encode(&encoded),
         });
+        // Do not attach a signature. aster-srv drops unknown commit fields
+        // and lookup does not return one, so a required sig would miss every hit.
         match self.post("/v1/cache/commit", &body, true) {
             Ok(_) => Ok(()),
             Err(error) if self.read_only() => {
@@ -643,6 +646,7 @@ fn decode_hit(entry: &Value) -> Result<Option<Hit>> {
         .decode(encoded.trim())
         .context("lookup manifest is not base64")?;
     // An undecodable manifest is a miss, same as a local decode failure.
+    // aster-srv does not store or return a signature (see put_manifest).
     let Some(manifest) = Manifest::decode(&bytes) else {
         return Ok(None);
     };
@@ -787,6 +791,7 @@ mod tests {
         uploads: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        manifests: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         commit_status: Arc<Mutex<u16>>,
         /// When set, a lookup without Proxy-Authorization is an IAP challenge.
         challenge: Arc<AtomicBool>,
@@ -913,6 +918,7 @@ mod tests {
                 uploads,
                 commits,
                 objects,
+                manifests,
                 commit_status,
                 challenge,
                 proxy_seen,
@@ -1250,5 +1256,42 @@ mod tests {
         // A later call does not ask gcloud again.
         let again = reader.get_manifest("anything").unwrap_err();
         assert!(again.to_string().contains("not signed in"), "{again:#}");
+    }
+
+    #[test]
+    fn signature_key_does_not_change_the_aster_srv_commit() {
+        let _guard = env_lock();
+        let previous = std::env::var_os("ASTER_REMOTE_CACHE_SIGNATURE_KEY");
+        std::env::set_var("ASTER_REMOTE_CACHE_SIGNATURE_KEY", "srv-test-key");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fake = Fake::spawn();
+            let digest = Digest::of_bytes(b"signed");
+            let stored = manifest(&"99".repeat(32), &digest);
+            backend(&fake).put_manifest(&stored).unwrap();
+            let saved = fake
+                .manifests
+                .lock()
+                .unwrap()
+                .get(&stored.key)
+                .cloned()
+                .unwrap();
+            assert_eq!(saved, stored.encode());
+
+            let reader = backend(&fake);
+            reader.prefetch(std::slice::from_ref(&stored.key)).unwrap();
+            assert_eq!(reader.get_manifest(&stored.key).unwrap().unwrap(), stored);
+        }));
+        match previous {
+            Some(value) => std::env::set_var("ASTER_REMOTE_CACHE_SIGNATURE_KEY", value),
+            None => std::env::remove_var("ASTER_REMOTE_CACHE_SIGNATURE_KEY"),
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }

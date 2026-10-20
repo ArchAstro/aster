@@ -20,6 +20,7 @@ pub mod matcher;
 mod outputs;
 mod prune;
 mod runtime;
+mod signature;
 mod store;
 
 pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, PackRef, MANIFEST_SCHEMA_VERSION};
@@ -38,6 +39,7 @@ pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
 pub use prune::{prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE, DEFAULT_MAX_SIZE};
 pub use runtime::RuntimeInputCache;
+pub use signature::SIGNATURE_KEY_ENV;
 pub use store::CacheStore;
 
 /// Environment variable that overrides the cache directory.
