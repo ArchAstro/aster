@@ -15,10 +15,11 @@ use aster::cli::affected_files::{
 };
 use aster::cli::source_graph;
 use aster::cli::{
-    build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
-    print_summary, select_projects, CacheCommands, CiCommands, Cli, Commands, GraphOutput,
-    OutputMode, ProjectCommands, ProjectInfo, ResultsCommands, ServicesCommands,
-    ServicesDaemonCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
+    build_execution_output, build_execution_output_with_cache, check_reserved_target,
+    expand_selection, output_json, parse_run_args, print_summary, select_projects, CacheCommands,
+    CiCommands, Cli, Commands, GraphOutput, OutputMode, ProjectCommands, ProjectInfo,
+    ResultsCommands, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput,
+    SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -1185,7 +1186,10 @@ fn run() -> Result<()> {
 
                 // Output results based on mode
                 if output_mode == OutputMode::Json {
-                    let output = build_execution_output(&results);
+                    let output = build_execution_output_with_cache(
+                        &results,
+                        aster::cache::current_gha().map(|backend| backend.summary()),
+                    );
                     output_json(&output)?;
                 } else {
                     print_summary(&results, &target, output_mode, true);
@@ -1287,7 +1291,10 @@ fn run() -> Result<()> {
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
-                let output = build_execution_output(&results);
+                let output = build_execution_output_with_cache(
+                    &results,
+                    aster::cache::current_gha().map(|backend| backend.summary()),
+                );
                 output_json(&output)?;
             } else {
                 print_heterogeneous_summary(&results, output_mode);
@@ -1689,7 +1696,10 @@ fn run() -> Result<()> {
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
-                let output = build_execution_output(&results);
+                let output = build_execution_output_with_cache(
+                    &results,
+                    aster::cache::current_gha().map(|backend| backend.summary()),
+                );
                 output_json(&output)?;
             } else {
                 print_summary(&results, &run_args.target, output_mode, false);

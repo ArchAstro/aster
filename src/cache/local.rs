@@ -735,6 +735,7 @@ mod tests {
                 .collect(),
             log: None,
             aster_version: "0.17.2".into(),
+            packs: Vec::new(),
         }
     }
 

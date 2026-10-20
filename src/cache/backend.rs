@@ -5,8 +5,10 @@
 //! error is logged, and after [`FAILURES_BEFORE_DISABLE`] consecutive
 //! failures the remote is skipped for the rest of the process.
 //!
-//! Remote clients (GitHub Actions, HTTP) are separate tasks. aster-srv is
-//! selected here when `ASTER_SRV_URL` is set. This module does not speak HTTP.
+//! Remote clients are selected here. aster-srv is used when `ASTER_SRV_URL`
+//! is set. GitHub Actions is used when `ASTER_REMOTE_CACHE=gha`, and also
+//! when that variable is unset, `GITHUB_ACTIONS=true`, and the Actions
+//! runtime env is present.
 
 use anyhow::{Context, Result};
 use std::any::Any;
@@ -14,9 +16,10 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::artifact::{Digest, Manifest};
+use super::gha::GhaBackend;
 use super::local::LocalStore;
 
 /// Consecutive remote failures before the remote is skipped for the run.
@@ -102,13 +105,27 @@ impl RemoteKind {
         }
     }
 
-    /// `ASTER_REMOTE_CACHE`, or [`RemoteKind::AsterSrv`] when unset or empty.
+    /// `ASTER_REMOTE_CACHE`. Unset on a GitHub Actions job that has the
+    /// cache runtime env selects [`RemoteKind::Gha`]. Otherwise unset is
+    /// [`RemoteKind::AsterSrv`].
     pub fn from_env() -> Result<Self> {
         match std::env::var(REMOTE_CACHE_ENV) {
             Ok(value) if !value.trim().is_empty() => Self::parse(&value),
+            _ if gha_runtime_present() => Ok(Self::Gha),
             _ => Ok(Self::AsterSrv),
         }
     }
+}
+
+/// `GITHUB_ACTIONS=true` and both Actions cache runtime variables set.
+fn gha_runtime_present() -> bool {
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+        && std::env::var("ACTIONS_RESULTS_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty())
+        && std::env::var("ACTIONS_RUNTIME_TOKEN")
+            .ok()
+            .is_some_and(|token| !token.trim().is_empty())
 }
 
 /// Synchronous blob and manifest store. HTTP backends use blocking clients.
@@ -456,15 +473,41 @@ fn disables_remote(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Process-wide GitHub Actions backend.
+///
+/// The executor builds a fresh tier per target. A pack is one entry per
+/// run, so every tier must share the backend that stages it.
+fn gha_slot() -> &'static OnceLock<Arc<GhaBackend>> {
+    static SHARED: OnceLock<Arc<GhaBackend>> = OnceLock::new();
+    &SHARED
+}
+
+/// Install `backend` as the process-wide GitHub Actions cache.
+///
+/// The first call wins. Later calls return the backend already installed,
+/// which is the one holding the staged pack.
+pub fn install_gha_backend(backend: GhaBackend) -> Arc<GhaBackend> {
+    gha_slot()
+        .get_or_init(|| Arc::new(backend))
+        .clone()
+}
+
+/// The process-wide backend, after [`install_gha_backend`] or the first
+/// `gha` selection.
+pub fn current_gha() -> Option<Arc<GhaBackend>> {
+    gha_slot().get().cloned()
+}
+
 /// Build the remote for this process.
 ///
-/// `none` and `gha` stay local until their clients exist. `aster-srv` is
-/// used when `ASTER_SRV_URL` is set. CI authenticates with `ASTER_SRV_TOKEN`
-/// or GitHub Actions OIDC; a laptop has neither and reads through IAP with
-/// its own Google login. A configured URL with no repository is local-only,
-/// with one warning, rather than a build failure. `workspace_root` names the
-/// checkout whose origin is the cache repo. `http` uses
-/// [`super::http::HttpCache`] when `ASTER_REMOTE_CACHE_URL` is set.
+/// `none` stays local. `gha` uses [`GhaBackend`] when the Actions runtime
+/// env is present. `aster-srv` is used when `ASTER_SRV_URL` is set. CI
+/// authenticates with `ASTER_SRV_TOKEN` or GitHub Actions OIDC; a laptop has
+/// neither and reads through IAP with its own Google login. A configured URL
+/// with no repository is local-only, with one warning, rather than a build
+/// failure. `workspace_root` names the checkout whose origin is the cache
+/// repo. `http` uses [`super::http::HttpCache`] when `ASTER_REMOTE_CACHE_URL`
+/// is set.
 pub fn select_remote(
     kind: RemoteKind,
     aster_srv_url: Option<&str>,
@@ -472,6 +515,20 @@ pub fn select_remote(
     http_url: Option<&str>,
     http_token: Option<String>,
 ) -> Result<Option<Arc<dyn CacheBackend>>> {
+    if kind == RemoteKind::Gha {
+        return match current_gha() {
+            Some(backend) => Ok(Some(backend)),
+            None => match GhaBackend::from_env() {
+                Some(backend) => Ok(Some(install_gha_backend(backend))),
+                None => {
+                    eprintln!(
+                        "[aster] Warning: {REMOTE_CACHE_ENV}=gha but ACTIONS_RESULTS_URL or ACTIONS_RUNTIME_TOKEN is unset; using the local cache only"
+                    );
+                    Ok(None)
+                }
+            },
+        };
+    }
     if kind == RemoteKind::Http {
         return match super::http::HttpCache::from_vars(http_url, http_token)? {
             Some(cache) => Ok(Some(Arc::new(cache))),
@@ -673,6 +730,7 @@ mod tests {
                 .collect(),
             log: None,
             aster_version: "0.21.0".to_string(),
+            packs: Vec::new(),
         }
     }
 

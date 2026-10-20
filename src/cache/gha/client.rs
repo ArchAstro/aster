@@ -98,6 +98,15 @@ impl GhaCacheClient {
         }
     }
 
+    /// Client for an in-test Twirp server. Accepts `http://`, which
+    /// [`Self::from_vars`] rejects so a runtime token never travels in
+    /// plaintext outside a test.
+    pub fn for_test(results_url: impl Into<String>, token: impl Into<String>) -> Self {
+        let mut client = Self::new(results_url, token);
+        client.sleeper = |_| {};
+        client
+    }
+
     /// Signed download URL for `key` at `version`, or `None` on a cache miss.
     pub fn lookup(&self, key: &str, version: &str) -> Result<Option<String>> {
         validate_key(key)?;

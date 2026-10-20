@@ -45,7 +45,7 @@ impl Digest {
     }
 
     /// Wrap an already-computed lowercase hex digest.
-    pub(super) fn from_hex(hex: String) -> Self {
+    pub(crate) fn from_hex(hex: String) -> Self {
         Self(hex)
     }
 }
@@ -71,6 +71,15 @@ pub struct OutputEntry {
     pub target: Option<String>,
 }
 
+/// A small blob stored inside a per-run pack entry rather than its own key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackRef {
+    /// Content digest of the blob.
+    pub digest: Digest,
+    /// Cache key of the pack entry that contains the blob's compressed bytes.
+    pub pack: String,
+}
+
 /// Action-cache manifest for one target execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -86,6 +95,11 @@ pub struct Manifest {
     pub outputs: Vec<OutputEntry>,
     pub log: Option<Digest>,
     pub aster_version: String,
+    /// Pack entries that hold this manifest's small blobs. Empty for a
+    /// manifest whose blobs each have their own cache entry. Absent in
+    /// manifests written before packs existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<PackRef>,
 }
 
 impl Manifest {
@@ -225,6 +239,7 @@ mod tests {
             ],
             log: Some(Digest::of_bytes(b"log")),
             aster_version: "0.17.2".into(),
+            packs: Vec::new(),
         }
     }
 
