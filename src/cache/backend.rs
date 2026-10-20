@@ -391,21 +391,36 @@ impl TieredCache {
 
 /// Build the remote for this process.
 ///
-/// `none`, `gha`, and `http` stay local until their clients exist. `aster-srv`
-/// stays local too: its client is another task. When `ASTER_SRV_URL` is set
-/// and aster-srv was selected, one warning is printed so a configured gateway
-/// is not a silent no-op.
+/// `none` and `gha` stay local until their clients exist. `aster-srv` stays
+/// local too: its client is another task. When `ASTER_SRV_URL` is set and
+/// aster-srv was selected, one warning is printed so a configured gateway is
+/// not a silent no-op. `http` uses [`super::http::HttpCache`] when
+/// `ASTER_REMOTE_CACHE_URL` is set.
 pub fn select_remote(
     kind: RemoteKind,
     aster_srv_url: Option<&str>,
-) -> Option<Arc<dyn CacheBackend>> {
+    http_url: Option<&str>,
+    http_token: Option<String>,
+) -> Result<Option<Arc<dyn CacheBackend>>> {
     let url_set = aster_srv_url.is_some_and(|url| !url.trim().is_empty());
     if kind == RemoteKind::AsterSrv && url_set {
         eprintln!(
             "[aster] Warning: {ASTER_SRV_URL_ENV} is set but the aster-srv cache client is not available; using the local cache only"
         );
     }
-    None
+    if kind == RemoteKind::Http {
+        return match super::http::HttpCache::from_vars(http_url, http_token)? {
+            Some(cache) => Ok(Some(Arc::new(cache))),
+            None => {
+                eprintln!(
+                    "[aster] Warning: {REMOTE_CACHE_ENV}=http but {} is unset; using the local cache only",
+                    super::http::REMOTE_CACHE_URL_ENV
+                );
+                Ok(None)
+            }
+        };
+    }
+    Ok(None)
 }
 
 /// Remote kind and mode from the environment, then [`select_remote`].
@@ -417,7 +432,9 @@ pub fn tier_from_env(cache_dir: impl AsRef<Path>) -> Result<TieredCache> {
         return Ok(TieredCache::local_only(local));
     }
     let url = std::env::var(ASTER_SRV_URL_ENV).ok();
-    match select_remote(kind, url.as_deref()) {
+    let http_url = std::env::var(super::http::REMOTE_CACHE_URL_ENV).ok();
+    let http_token = std::env::var(super::http::REMOTE_CACHE_TOKEN_ENV).ok();
+    match select_remote(kind, url.as_deref(), http_url.as_deref(), http_token)? {
         Some(remote) => Ok(TieredCache::with_remote(local, mode, remote)),
         None => Ok(TieredCache {
             local,
@@ -860,8 +877,28 @@ mod tests {
         assert_eq!(RemoteKind::parse("gha").unwrap(), RemoteKind::Gha);
         assert_eq!(RemoteKind::parse("http").unwrap(), RemoteKind::Http);
         assert!(RemoteKind::parse("s3").is_err());
-        assert!(select_remote(RemoteKind::AsterSrv, Some("https://example.test")).is_none());
-        assert!(select_remote(RemoteKind::None, None).is_none());
+        assert!(select_remote(
+            RemoteKind::AsterSrv,
+            Some("https://example.test"),
+            None,
+            None
+        )
+        .unwrap()
+        .is_none());
+        assert!(select_remote(RemoteKind::None, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(select_remote(RemoteKind::Http, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(select_remote(
+            RemoteKind::Http,
+            None,
+            Some("http://127.0.0.1:9"),
+            Some("token".into()),
+        )
+        .unwrap()
+        .is_some());
     }
 
     /// Records upload method names so the blob-then-manifest order is asserted.

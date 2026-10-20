@@ -11,6 +11,7 @@ mod artifact;
 mod artifact_cache;
 mod backend;
 mod hasher;
+mod http;
 mod local;
 pub mod matcher;
 mod outputs;
@@ -21,10 +22,11 @@ mod store;
 pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
 pub use artifact_cache::{project_of, ArtifactCache, CacheStatus, CacheStatusTarget, IndexEntry};
 pub use backend::{
-    CacheBackend, CacheMode, InMemoryBackend, RemoteKind, TieredCache, ASTER_SRV_URL_ENV,
-    CACHE_MODE_ENV, FAILURES_BEFORE_DISABLE, REMOTE_CACHE_ENV,
+    select_remote, tier_from_env, CacheBackend, CacheMode, InMemoryBackend, RemoteKind,
+    TieredCache, ASTER_SRV_URL_ENV, CACHE_MODE_ENV, FAILURES_BEFORE_DISABLE, REMOTE_CACHE_ENV,
 };
 pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial, RuntimeInput};
+pub use http::{HttpCache, REMOTE_CACHE_TOKEN_ENV, REMOTE_CACHE_URL_ENV};
 pub use local::{LocalStore, PruneStats};
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
