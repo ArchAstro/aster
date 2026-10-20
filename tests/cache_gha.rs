@@ -323,10 +323,18 @@ fn upload_from_a_hits_from_b() {
         .local_store()
         .put_blob(&digest, bytes.as_slice())
         .unwrap();
-    uploader.store(&manifest(&key, "//app:build", &digest)).unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
     backend.finish().unwrap();
 
-    let keys = server.entries.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+    let keys = server
+        .entries
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     let manifest_key = format!("aster-v{CACHE_SCHEMA_VERSION}-ac-linux-x86_64-{key}");
     assert!(
         keys.iter().any(|entry| entry == &manifest_key),
@@ -339,7 +347,8 @@ fn upload_from_a_hits_from_b() {
         "pack key missing from {keys:?}"
     );
     assert!(
-        keys.iter().all(|entry| !entry.contains(&format!("-cas-{}", digest.as_str()))),
+        keys.iter()
+            .all(|entry| !entry.contains(&format!("-cas-{}", digest.as_str()))),
         "small blob must not have its own entry: {keys:?}"
     );
 
@@ -375,7 +384,9 @@ fn existing_key_is_not_overwritten() {
         .local_store()
         .put_blob(&digest, bytes.as_slice())
         .unwrap();
-    uploader.store(&manifest(&key, "//app:build", &digest)).unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
     backend.finish().unwrap();
     let creates = server.creates.load(Ordering::Relaxed);
 
@@ -393,7 +404,9 @@ fn existing_key_is_not_overwritten() {
         .entries
         .lock()
         .unwrap()
-        .get(&format!("aster-v{CACHE_SCHEMA_VERSION}-ac-linux-x86_64-{key}"))
+        .get(&format!(
+            "aster-v{CACHE_SCHEMA_VERSION}-ac-linux-x86_64-{key}"
+        ))
         .cloned()
         .unwrap();
     let decoded = Manifest::decode(&stored).unwrap();
@@ -447,9 +460,7 @@ fn fifty_small_outputs_bundle_into_one_pack() {
             .put_blob(&digest, bytes.as_bytes())
             .unwrap();
         // Stage into the remote before any manifest seals the pack.
-        bundled
-            .put_blob(&digest, &mut bytes.as_bytes())
-            .unwrap();
+        bundled.put_blob(&digest, &mut bytes.as_bytes()).unwrap();
         staged.push((format!("{index:064x}"), digest));
     }
     for (key, digest) in &staged {
@@ -516,7 +527,9 @@ fn large_blob_is_its_own_entry() {
         .local_store()
         .put_blob(&digest, bytes.as_slice())
         .unwrap();
-    uploader.store(&manifest(&key, "//app:build", &digest)).unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
     backend.finish().unwrap();
     let keys: Vec<_> = server.entries.lock().unwrap().keys().cloned().collect();
     let cas = format!("aster-v{CACHE_SCHEMA_VERSION}-cas-{}", digest.as_str());
@@ -566,7 +579,19 @@ fn gha_selected_when_runtime_env_present() {
     let selected = select_remote(RemoteKind::Gha, None, None, None, None).unwrap();
     // The test URL was rewritten to https, which does not answer. from_env
     // still builds a backend: the URL is https and the token is set.
-    assert!(selected.is_some(), "gha with runtime env must select a backend");
+    assert!(
+        selected.is_some(),
+        "gha with runtime env must select a backend"
+    );
+    // Unset ASTER_REMOTE_CACHE on a GitHub Actions job with both runtime
+    // vars selects gha. Explicit gha is the parse above.
+    let auto = EnvGuard::clear(&["ASTER_REMOTE_CACHE"]);
+    assert_eq!(
+        RemoteKind::from_env().unwrap(),
+        RemoteKind::Gha,
+        "unset remote kind on a GitHub Actions job selects gha"
+    );
+    drop(auto);
     drop(previous);
 
     let bare = EnvGuard::clear(&["ASTER_REMOTE_CACHE", "GITHUB_ACTIONS"]);
@@ -591,7 +616,9 @@ fn summary_line_and_json_object() {
         .local_store()
         .put_blob(&digest, b"counted".as_slice())
         .unwrap();
-    uploader.store(&manifest(&key, "//app:build", &digest)).unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
     backend.finish().unwrap();
     let other = tempfile::tempdir().unwrap();
     let downloader = tier(other.path(), Arc::clone(&backend));
@@ -602,10 +629,34 @@ fn summary_line_and_json_object() {
     assert!(summary.remote_hits >= 1);
     assert!(summary.remote_misses >= 1);
     assert!(summary.entries_created >= 1);
+    let line = summary.to_string();
+    assert!(
+        line.starts_with("aster cache summary: "),
+        "summary line must use the end-of-run prefix: {line}"
+    );
+    for field in [
+        "remote_hits",
+        "remote_misses",
+        "entries_created",
+        "rate_limited",
+    ] {
+        assert!(line.contains(field), "summary line missing {field}: {line}");
+    }
     let json = serde_json::to_value(summary).unwrap();
-    for field in ["remote_hits", "remote_misses", "entries_created", "rate_limited"] {
+    for field in [
+        "remote_hits",
+        "remote_misses",
+        "entries_created",
+        "rate_limited",
+    ] {
         assert!(json.get(field).is_some(), "missing {field}");
     }
+    let output = aster::cli::build_execution_output_with_cache(&[], Some(summary));
+    let rendered = serde_json::to_value(&output).unwrap();
+    let nested = rendered
+        .pointer("/summary/cache_summary")
+        .expect("aster run --json must nest cache_summary under summary");
+    assert_eq!(nested, &json);
 }
 
 /// Saves and restores process env so selection tests do not leak.

@@ -54,6 +54,16 @@ pub struct CacheSummary {
     pub rate_limited: u64,
 }
 
+impl std::fmt::Display for CacheSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "aster cache summary: remote_hits={} remote_misses={} entries_created={} rate_limited={}",
+            self.remote_hits, self.remote_misses, self.entries_created, self.rate_limited
+        )
+    }
+}
+
 struct Staged {
     frame: Vec<u8>,
 }
@@ -168,8 +178,7 @@ impl GhaBackend {
                 .order
                 .iter()
                 .filter(|digest| {
-                    state.pack_members.is_empty()
-                        || state.pack_members.contains(digest.as_str())
+                    state.pack_members.is_empty() || state.pack_members.contains(digest.as_str())
                 })
                 .filter_map(|digest| {
                     state

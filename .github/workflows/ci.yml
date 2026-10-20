@@ -36,6 +36,7 @@ jobs:
             --test dev_tls \
             --test integration \
             --test cache_artifacts \
+            --test cache_gha \
             --test cache_remote \
             --test related \
             --test test_results \

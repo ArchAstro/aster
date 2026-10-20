@@ -487,9 +487,7 @@ fn gha_slot() -> &'static OnceLock<Arc<GhaBackend>> {
 /// The first call wins. Later calls return the backend already installed,
 /// which is the one holding the staged pack.
 pub fn install_gha_backend(backend: GhaBackend) -> Arc<GhaBackend> {
-    gha_slot()
-        .get_or_init(|| Arc::new(backend))
-        .clone()
+    gha_slot().get_or_init(|| Arc::new(backend)).clone()
 }
 
 /// The process-wide backend, after [`install_gha_backend`] or the first
