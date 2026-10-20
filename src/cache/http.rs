@@ -1,7 +1,7 @@
 //! HTTP cache backend speaking the bazel-remote REST layout.
 //!
-//! `GET`/`PUT`/`HEAD <base>/ac/<key>` stores manifests. `GET`/`PUT`/`HEAD
-//! <base>/cas/<sha256>` stores blobs, addressed by the sha256 of the
+//! `GET`/`PUT`/`HEAD <base>/ac/<key>` stores manifests.
+//! `GET`/`PUT`/`HEAD <base>/cas/<sha256>` stores blobs, addressed by the sha256 of the
 //! uncompressed bytes. Blobs travel uncompressed: a response that names
 //! `Content-Encoding: zstd` is rejected rather than stored as if it were raw.
 //!
