@@ -13,6 +13,7 @@ mod aster_srv;
 mod backend;
 mod hasher;
 mod http;
+mod iap;
 mod local;
 pub mod matcher;
 mod outputs;
@@ -28,6 +29,7 @@ pub use backend::{
 };
 pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial, RuntimeInput};
 pub use http::{HttpCache, REMOTE_CACHE_TOKEN_ENV, REMOTE_CACHE_URL_ENV};
+pub use iap::{login as iap_login, GCLOUD_LOGIN_HINT, IAP_CLIENT_ID_ENV, SIGNED_OUT_MESSAGE};
 pub use local::{LocalStore, PruneStats};
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};

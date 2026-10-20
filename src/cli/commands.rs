@@ -563,6 +563,20 @@ pub enum CacheCommands {
         inputs: bool,
     },
 
+    /// Sign in to the remote cache with your Google account
+    ///
+    /// Mints a short-lived identity token from `gcloud auth print-identity-token`
+    /// and caches it under `.aster/` until it expires. The file is readable
+    /// only by you. When gcloud is missing or you are signed out, prints the
+    /// command to run.
+    ///
+    /// The audience is `ASTER_SRV_IAP_CLIENT_ID` (the IAP OAuth client id).
+    Login {
+        /// IAP OAuth client id. Defaults to `ASTER_SRV_IAP_CLIENT_ID`.
+        #[arg(long, value_name = "CLIENT_ID")]
+        audience: Option<String>,
+    },
+
     /// Evict old and least-recently-used artifact cache entries
     ///
     /// Manifests older than --max-age are removed first. Remaining manifests

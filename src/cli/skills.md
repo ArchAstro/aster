@@ -344,6 +344,7 @@ aster cache status //services/api:test --inputs
 aster cache clear //services/api:test
 aster cache clear
 aster cache prune --max-size 10GB --max-age 14d
+aster cache login
 aster test //services/api --no-cache
 ```
 
@@ -363,6 +364,14 @@ removes that project's index entries; `aster cache clear //proj:target`
 removes one address. Blobs stay until `aster cache prune`.
 `.aster/cache/cache.json` is obsolete and unused; Aster neither reads nor
 writes it.
+
+`aster cache login` signs a laptop or devbox in to an aster-srv behind Google
+IAP. It needs `ASTER_SRV_IAP_CLIENT_ID` (or `--audience`) and a `gcloud auth
+login`. The identity token is cached at `.aster/iap-token.json` (mode 0600)
+until it expires. If gcloud is missing or signed out, the command prints what
+to run. A later `aster run` with `ASTER_SRV_URL` set then reads the remote
+cache with no extra token variable. Signed out, the run prints one line and
+continues locally.
 
 `aster cache status <target> --inputs` prints every component of that target's
 cache key: salt, platform, hashed files, command, dependency hashes, tracked

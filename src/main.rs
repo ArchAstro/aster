@@ -16,9 +16,9 @@ use aster::cli::affected_files::{
 use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, check_reserved_target, expand_selection, output_json, parse_run_args,
-    print_summary, select_projects, CiCommands, Cli, Commands, GraphOutput, OutputMode,
-    ProjectCommands, ProjectInfo, ResultsCommands, ServicesCommands, ServicesDaemonCommands,
-    TlsCommands, WhyOutput, SKILLS_MARKDOWN,
+    print_summary, select_projects, CacheCommands, CiCommands, Cli, Commands, GraphOutput,
+    OutputMode, ProjectCommands, ProjectInfo, ResultsCommands, ServicesCommands,
+    ServicesDaemonCommands, TlsCommands, WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -272,6 +272,34 @@ fn run() -> Result<()> {
             TlsCommands::Serve { edge } => {
                 aster::dev::serve_tls(&workspace_root, &workspace_config.dev, edge)
             }
+        };
+    }
+
+    // Login only needs the workspace root (the token file lives under
+    // `.aster/`) and gcloud. It must not wait on project discovery.
+    if let Commands::Cache {
+        command: CacheCommands::Login { audience },
+    } = &command
+    {
+        let audience = audience
+            .clone()
+            .or_else(|| std::env::var(aster::cache::IAP_CLIENT_ID_ENV).ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "set {env} to the IAP OAuth client id, or pass --audience. Then: {hint}",
+                    env = aster::cache::IAP_CLIENT_ID_ENV,
+                    hint = aster::cache::GCLOUD_LOGIN_HINT
+                )
+            })?;
+        return match aster::cache::iap_login(&workspace_root, &audience) {
+            Ok(message) => {
+                if output_mode != OutputMode::Quiet {
+                    println!("{message}");
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
         };
     }
 
@@ -1358,6 +1386,7 @@ fn run() -> Result<()> {
                         print_cache_status(&status, target.as_deref(), output_mode)?;
                     }
                 }
+                CacheCommands::Login { .. } => unreachable!("login handled above"),
                 CacheCommands::Prune { max_size, max_age } => {
                     use aster::cache::{prune_cache, PruneLimits};
                     use aster::config::WorkspaceConfig;

@@ -302,6 +302,14 @@ other than `deps`. A nested Node project hashes a root `package-lock.json`,
 `pnpm-lock.yaml`, or `yarn.lock` when that file exists, and `tsconfig.base.json`
 for targets other than `deps`.
 
+When `ASTER_SRV_URL` points at an aster-srv behind Google IAP, a signed-in
+laptop or devbox reads that cache with its own Google account. Set
+`ASTER_SRV_IAP_CLIENT_ID` to the IAP OAuth client id and run `aster cache login`
+once. The token is cached under `.aster/` until it expires and is sent as
+`Proxy-Authorization`. Signed out, Aster prints one line and continues with
+the local cache. See
+[Reading the cache from a laptop](docs/test-tracking.md#reading-the-cache-from-a-laptop).
+
 A hit restores declared `outputs` from the artifact cache and skips execution.
 `aster cache status` reads that store's per-project index. `--json` prints
 `{"cache_dir","targets":[{"address","key","created_at","outputs","output_bytes","exit_code"}]}`;

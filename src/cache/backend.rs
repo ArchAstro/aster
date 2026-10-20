@@ -342,7 +342,10 @@ impl TieredCache {
             return;
         };
         if disables_remote(error) {
+            // The aster-srv client already printed the one-line sign-in
+            // warning. Do not add a second "remote cache failed" line.
             handle.disable();
+            return;
         }
         handle.fail(error);
     }
@@ -456,8 +459,9 @@ fn disables_remote(error: &anyhow::Error) -> bool {
 /// Build the remote for this process.
 ///
 /// `none` and `gha` stay local until their clients exist. `aster-srv` is
-/// used when `ASTER_SRV_URL` is set and credentials exist (`ASTER_SRV_TOKEN`,
-/// or GitHub Actions OIDC). A configured URL with no credential is local-only,
+/// used when `ASTER_SRV_URL` is set. CI authenticates with `ASTER_SRV_TOKEN`
+/// or GitHub Actions OIDC; a laptop has neither and reads through IAP with
+/// its own Google login. A configured URL with no repository is local-only,
 /// with one warning, rather than a build failure. `workspace_root` names the
 /// checkout whose origin is the cache repo. `http` uses
 /// [`super::http::HttpCache`] when `ASTER_REMOTE_CACHE_URL` is set.
@@ -496,7 +500,7 @@ pub fn select_remote(
         Some(backend) => Ok(Some(Arc::new(backend))),
         None => {
             eprintln!(
-                "[aster] Warning: {ASTER_SRV_URL_ENV} is set but no remote cache credential is available; using the local cache only"
+                "[aster] Warning: {ASTER_SRV_URL_ENV} is set but the repository cannot be determined; using the local cache only"
             );
             Ok(None)
         }
