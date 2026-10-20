@@ -438,6 +438,7 @@ mod tests {
             outputs: Vec::new(),
             log: None,
             aster_version: "0.21.0".to_string(),
+            packs: Vec::new(),
         }
     }
 
@@ -609,6 +610,7 @@ mod tests {
             }],
             log: None,
             aster_version: "0.21.0".to_string(),
+            packs: Vec::new(),
         };
         let remote = crate::cache::InMemoryBackend::new();
         let tier = crate::cache::TieredCache::with_remote(

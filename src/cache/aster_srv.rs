@@ -743,6 +743,7 @@ mod tests {
             }],
             log: None,
             aster_version: "0.21.0".to_string(),
+            packs: Vec::new(),
         }
     }
 

@@ -212,6 +212,9 @@ pub struct ExecutionSummary {
     pub cached: usize,
     /// Total duration in milliseconds
     pub duration_ms: u128,
+    /// Remote cache counters, present when a GitHub Actions cache ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_summary: Option<crate::cache::CacheSummary>,
 }
 
 /// Print execution summary based on output mode
@@ -297,6 +300,14 @@ pub fn print_summary(
 
 /// Build ExecutionOutput from execution results
 pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
+    build_execution_output_with_cache(results, None)
+}
+
+/// [`build_execution_output`] plus the remote cache counters from this run.
+pub fn build_execution_output_with_cache(
+    results: &[ExecutionResult],
+    cache_summary: Option<crate::cache::CacheSummary>,
+) -> ExecutionOutput {
     let target_results: Vec<TargetResult> = results
         .iter()
         .map(|r| {
@@ -349,6 +360,7 @@ pub fn build_execution_output(results: &[ExecutionResult]) -> ExecutionOutput {
             skipped,
             cached,
             duration_ms: total_duration,
+            cache_summary,
         },
     }
 }
@@ -435,6 +447,7 @@ mod tests {
             skipped: 1,
             cached: 0,
             duration_ms: 5000,
+            cache_summary: None,
         };
 
         let json = serde_json::to_string(&summary).unwrap();

@@ -700,6 +700,19 @@ impl<'a> Executor<'a> {
 
         if self.use_cache {
             auto_prune_cache(self.workspace_root, self.output_mode);
+            if let Some(backend) = crate::cache::current_gha() {
+                if let Err(error) = backend.finish() {
+                    eprintln!("[aster] Warning: remote cache pack upload failed: {error:#}");
+                }
+                let summary = backend.summary();
+                eprintln!(
+                    "aster cache summary: remote_hits={} remote_misses={} entries_created={} rate_limited={}",
+                    summary.remote_hits,
+                    summary.remote_misses,
+                    summary.entries_created,
+                    summary.rate_limited
+                );
+            }
         }
 
         all_results
@@ -1915,6 +1928,7 @@ fn store_success(
         outputs,
         log,
         aster_version: env!("CARGO_PKG_VERSION").to_string(),
+        packs: Vec::new(),
     };
     let project = project_of(address).unwrap_or(address);
     cache.store(project, address, &manifest)
@@ -3069,6 +3083,7 @@ mod tests {
                     outputs: Vec::new(),
                     log: None,
                     aster_version: "0.21.0".to_string(),
+                    packs: Vec::new(),
                 },
             )
             .unwrap();
@@ -3167,6 +3182,7 @@ mod tests {
             }],
             log: None,
             aster_version: "0.17.2".into(),
+            packs: Vec::new(),
         };
         store.put_manifest(&manifest(old_key, &old)).unwrap();
         store.put_manifest(&manifest(new_key, &new)).unwrap();
@@ -3263,6 +3279,7 @@ mod tests {
                     outputs: Vec::new(),
                     log: None,
                     aster_version: "0.21.0".to_string(),
+                    packs: Vec::new(),
                 },
             )
             .unwrap();
@@ -3304,6 +3321,7 @@ mod tests {
                     outputs: Vec::new(),
                     log: None,
                     aster_version: "0.21.0".to_string(),
+                    packs: Vec::new(),
                 },
             )
             .unwrap();
