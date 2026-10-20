@@ -705,13 +705,7 @@ impl<'a> Executor<'a> {
                     eprintln!("[aster] Warning: remote cache pack upload failed: {error:#}");
                 }
                 let summary = backend.summary();
-                eprintln!(
-                    "aster cache summary: remote_hits={} remote_misses={} entries_created={} rate_limited={}",
-                    summary.remote_hits,
-                    summary.remote_misses,
-                    summary.entries_created,
-                    summary.rate_limited
-                );
+                eprintln!("{summary}");
             }
         }
 
