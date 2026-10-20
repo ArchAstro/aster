@@ -30,6 +30,7 @@ use ureq::Body;
 
 use super::artifact::{Digest, Manifest};
 use super::backend::CacheBackend;
+use super::signature;
 
 /// `ASTER_REMOTE_CACHE_URL`. Base URL of a bazel-remote-compatible server.
 pub const REMOTE_CACHE_URL_ENV: &str = "ASTER_REMOTE_CACHE_URL";
@@ -49,6 +50,11 @@ const RECV_BODY_TIMEOUT: Duration = Duration::from_secs(3600);
 const AC_KEY_LEN: usize = 64;
 
 /// HTTP cache selected by `ASTER_REMOTE_CACHE=http`.
+///
+/// When [`super::signature::SIGNATURE_KEY_ENV`] is set, action-cache
+/// objects are a JSON envelope signed over [`super::artifact::Manifest::encode`].
+/// A missing or wrong signature is a miss. Blobs stay unsigned: the manifest
+/// names their digests, and restore checks those digests.
 pub struct HttpCache {
     base: String,
     token: Option<String>,
@@ -257,14 +263,14 @@ impl CacheBackend for HttpCache {
             Get::Hit(response) => {
                 let bytes =
                     read_limited(response, MANIFEST_LIMIT).context("read remote manifest")?;
-                Ok(Manifest::decode(&bytes))
+                Ok(signature::open(signature::signing_key().as_deref(), &bytes))
             }
         }
     }
 
     fn put_manifest(&self, manifest: &Manifest) -> Result<()> {
         validate_ac_key(&manifest.key)?;
-        let bytes = manifest.encode();
+        let bytes = signature::seal(signature::signing_key().as_deref(), manifest);
         self.put_bytes(
             &self.object_url("ac", &manifest.key),
             &bytes,

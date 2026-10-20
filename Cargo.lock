@@ -171,6 +171,7 @@ dependencies = [
  "getrandom 0.4.3",
  "git2",
  "globset",
+ "hmac",
  "http-body-util",
  "humantime",
  "hyper",

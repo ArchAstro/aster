@@ -301,6 +301,7 @@ fn client(server: &Server) -> HttpCache {
 
 #[test]
 fn upload_from_a_hits_from_b() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let bytes = b"artifact-from-a";
     let digest = Digest::of_bytes(bytes);
@@ -329,6 +330,7 @@ fn upload_from_a_hits_from_b() {
 
 #[test]
 fn get_404_is_a_miss() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let cache = client(&server);
     let key = "cd".repeat(32);
@@ -341,6 +343,7 @@ fn get_404_is_a_miss() {
 
 #[test]
 fn put_409_is_success() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let bytes = b"already-there";
     let digest = Digest::of_bytes(bytes);
@@ -358,7 +361,93 @@ fn put_409_is_success() {
 }
 
 #[test]
+fn signed_manifest_round_trips_and_tamper_or_wrong_key_is_a_miss() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::capture();
+    std::env::set_var(aster::cache::SIGNATURE_KEY_ENV, "http-test-key");
+
+    let server = Server::spawn();
+    let bytes = b"signed-artifact";
+    let digest = Digest::of_bytes(bytes);
+    let key = "33".repeat(32);
+    let stored = manifest(&key, &digest);
+    let writer = client(&server);
+    writer.put_blob(&digest, &mut bytes.as_slice()).unwrap();
+    writer.put_manifest(&stored).unwrap();
+
+    let stored_body = server
+        .objects
+        .lock()
+        .unwrap()
+        .get(&format!("/ac/{key}"))
+        .cloned()
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&stored_body).unwrap();
+    assert!(envelope["sig"].as_str().unwrap().len() == 64);
+    assert_ne!(stored_body, stored.encode());
+
+    let reader = client(&server);
+    assert_eq!(reader.get_manifest(&key).unwrap().unwrap(), stored);
+
+    // Tamper the signed manifest bytes. The envelope still parses.
+    let mut tampered = envelope.clone();
+    let inner = tampered["manifest"].as_str().unwrap().to_string() + " ";
+    tampered["manifest"] = serde_json::Value::String(inner);
+    server
+        .objects
+        .lock()
+        .unwrap()
+        .insert(format!("/ac/{key}"), serde_json::to_vec(&tampered).unwrap());
+    assert!(reader.get_manifest(&key).unwrap().is_none());
+
+    // A different key does not restore the original envelope.
+    server
+        .objects
+        .lock()
+        .unwrap()
+        .insert(format!("/ac/{key}"), stored_body);
+    std::env::set_var(aster::cache::SIGNATURE_KEY_ENV, "other-key");
+    assert!(reader.get_manifest(&key).unwrap().is_none());
+
+    // Unsigned JSON is a miss while a key is configured.
+    server
+        .objects
+        .lock()
+        .unwrap()
+        .insert(format!("/ac/{key}"), stored.encode());
+    std::env::set_var(aster::cache::SIGNATURE_KEY_ENV, "http-test-key");
+    assert!(reader.get_manifest(&key).unwrap().is_none());
+}
+
+struct EnvRestore {
+    previous: Option<std::ffi::OsString>,
+}
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl EnvRestore {
+    fn capture() -> Self {
+        Self {
+            previous: std::env::var_os(aster::cache::SIGNATURE_KEY_ENV),
+        }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(aster::cache::SIGNATURE_KEY_ENV, value),
+            None => std::env::remove_var(aster::cache::SIGNATURE_KEY_ENV),
+        }
+    }
+}
+
+#[test]
 fn put_403_degrades_to_read_only() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let bytes = b"readable";
     let digest = Digest::of_bytes(bytes);
@@ -426,6 +515,7 @@ fn large_blob_is_streamed() {
 
 #[test]
 fn tier_upload_from_a_hits_from_b() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let bytes = b"tier-bytes";
     let digest = Digest::of_bytes(bytes);
@@ -456,6 +546,7 @@ fn tier_upload_from_a_hits_from_b() {
 
 #[test]
 fn tier_403_does_not_publish_a_manifest() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let bytes = b"not-uploaded";
     let digest = Digest::of_bytes(bytes);
@@ -486,6 +577,7 @@ fn tier_403_does_not_publish_a_manifest() {
 
 #[test]
 fn env_selects_http_backend() {
+    let _guard = env_lock();
     let server = Server::spawn();
     let previous_kind = std::env::var_os("ASTER_REMOTE_CACHE");
     let previous_url = std::env::var_os("ASTER_REMOTE_CACHE_URL");

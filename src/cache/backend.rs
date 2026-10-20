@@ -1035,4 +1035,103 @@ mod tests {
             self
         }
     }
+
+    /// Remote that stores the HTTP envelope. Used to prove a key rejects an
+    /// unsigned manifest before any blob is restored.
+    struct SignedBackend {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+        key: Option<String>,
+    }
+
+    impl SignedBackend {
+        fn new(key: Option<&str>) -> Self {
+            Self {
+                objects: Mutex::new(HashMap::new()),
+                key: key.map(str::to_string),
+            }
+        }
+    }
+
+    impl CacheBackend for SignedBackend {
+        fn get_manifest(&self, key: &str) -> Result<Option<Manifest>> {
+            let objects = self.objects.lock().unwrap();
+            let Some(bytes) = objects.get(key) else {
+                return Ok(None);
+            };
+            Ok(crate::cache::signature::open(self.key.as_deref(), bytes))
+        }
+
+        fn put_manifest(&self, manifest: &Manifest) -> Result<()> {
+            let bytes = crate::cache::signature::seal(self.key.as_deref(), manifest);
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(manifest.key.clone(), bytes);
+            Ok(())
+        }
+
+        fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>> {
+            let objects = self.objects.lock().unwrap();
+            Ok(digests
+                .iter()
+                .filter(|digest| !objects.contains_key(digest.as_str()))
+                .cloned()
+                .collect())
+        }
+
+        fn get_blob(&self, digest: &Digest, writer: &mut dyn Write) -> Result<bool> {
+            let objects = self.objects.lock().unwrap();
+            let Some(bytes) = objects.get(digest.as_str()) else {
+                return Ok(false);
+            };
+            writer.write_all(bytes)?;
+            Ok(true)
+        }
+
+        fn put_blob(&self, digest: &Digest, reader: &mut dyn Read) -> Result<()> {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(digest.as_str().to_string(), bytes);
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn unsigned_remote_manifest_is_a_miss_when_a_key_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "77".repeat(32);
+        let digest = Digest::of_bytes(b"should-not-restore");
+        let remote = SignedBackend::new(Some("tier-key"));
+        remote
+            .put_blob(&digest, &mut &b"should-not-restore"[..])
+            .unwrap();
+        // Plant the historical unsigned body under a key the reader requires.
+        remote
+            .objects
+            .lock()
+            .unwrap()
+            .insert(key.clone(), manifest(&key, Some(&digest)).encode());
+        let tier = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote),
+        );
+
+        assert!(tier.lookup(&key).unwrap().is_none());
+        assert!(!tier.local_store().has_blob(&digest));
+        assert!(tier.local_store().get_manifest(&key).unwrap().is_none());
+        // A bad signature is a miss, not a remote failure.
+        assert!(tier.remote_enabled());
+        for _ in 0..FAILURES_BEFORE_DISABLE {
+            assert!(tier.lookup(&key).unwrap().is_none());
+        }
+        assert!(tier.remote_enabled());
+    }
 }
