@@ -68,17 +68,12 @@ struct Hit {
     blobs: HashMap<String, String>,
 }
 
-/// Signed PUT URLs from one `upload` call, shared by the `put_blob` calls
-/// that follow `find_missing`.
-struct UploadGrant {
-    missing: HashMap<String, String>,
-}
-
 struct State {
     /// Keys already asked of lookup. `None` is a confirmed miss.
     hits: HashMap<String, Option<Hit>>,
-    /// The upload call whose URLs `put_blob` should consume.
-    grant: Option<UploadGrant>,
+    /// Signed PUT URLs from `upload` calls, keyed by digest. Merged, not
+    /// replaced, so concurrent stores keep each other's URLs.
+    upload_urls: HashMap<String, String>,
     /// Set after a 403 on upload or commit. Writes become no-ops.
     read_only: bool,
 }
@@ -137,7 +132,7 @@ impl AsterSrvBackend {
             blob_agent: build_agent(BLOB_TIMEOUT),
             state: Mutex::new(State {
                 hits: HashMap::new(),
-                grant: None,
+                upload_urls: HashMap::new(),
                 read_only: false,
             }),
             logged_read_only: AtomicBool::new(false),
@@ -250,7 +245,7 @@ impl AsterSrvBackend {
     fn become_read_only(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.read_only = true;
-            state.grant = None;
+            state.upload_urls.clear();
         }
         if self
             .logged_read_only
@@ -394,7 +389,7 @@ impl CacheBackend for AsterSrvBackend {
             }
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.grant = Some(UploadGrant { missing: urls });
+        state.upload_urls.extend(urls);
         Ok(missing)
     }
 
@@ -427,10 +422,7 @@ impl CacheBackend for AsterSrvBackend {
         }
         let url = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state
-                .grant
-                .as_ref()
-                .and_then(|grant| grant.missing.get(digest.as_str()).cloned())
+            state.upload_urls.get(digest.as_str()).cloned()
         };
         let Some(url) = url else {
             bail!(
@@ -821,6 +813,32 @@ mod tests {
         assert_eq!(hit, stored);
         assert_eq!(fake.lookups.load(Ordering::Relaxed), 1);
         assert!(reader.get_manifest("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_find_missing_keeps_each_stores_upload_url() {
+        let fake = Fake::spawn();
+        let first = Digest::of_bytes(b"first");
+        let second = Digest::of_bytes(b"second");
+        let client = backend(&fake);
+        // Two stores reserve URLs before either uploads.
+        assert_eq!(
+            client.find_missing(std::slice::from_ref(&first)).unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            client.find_missing(std::slice::from_ref(&second)).unwrap(),
+            vec![second.clone()]
+        );
+        client
+            .put_blob(&first, &mut Cursor::new(b"first".to_vec()))
+            .unwrap();
+        client
+            .put_blob(&second, &mut Cursor::new(b"second".to_vec()))
+            .unwrap();
+        let objects = fake.objects.lock().unwrap();
+        assert_eq!(objects.get(first.as_str()).unwrap(), b"first");
+        assert_eq!(objects.get(second.as_str()).unwrap(), b"second");
     }
 
     #[test]
