@@ -317,3 +317,157 @@ cache = { enabled = true }
     )
     .unwrap();
 }
+
+/// A cache built in checkout A restores in checkout B.
+///
+/// Both workspaces share `ASTER_CACHE_DIR` and have different absolute paths.
+/// `gen` writes `out/gen.txt`; `build` depends on it and writes `out/build.txt`.
+/// Each command appends one line to `$COUNTER_FILE`, which lives outside both
+/// workspaces, so a hit in B cannot hide a re-run.
+#[test]
+fn cache_built_in_one_checkout_restores_in_another() {
+    let parent = TempDir::new().unwrap();
+    let workspace_a = parent.path().join("machine-a").join("checkout");
+    let workspace_b = parent.path().join("other").join("machine-b").join("src");
+    let shared = parent.path().join("shared-cache");
+    let counter = parent.path().join("runs.txt");
+    fs::create_dir_all(&shared).unwrap();
+    assert_ne!(workspace_a, workspace_b);
+
+    write_rich_fixture(&workspace_a);
+
+    let run = |root: &std::path::Path, extra: &[&str]| {
+        let mut args = vec!["run", "//app:build"];
+        args.extend_from_slice(extra);
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(root)
+            .env("ASTER_CACHE_DIR", &shared)
+            .env("COUNTER_FILE", &counter)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "aster failed in {}: stdout={} stderr={}",
+            root.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    run(&workspace_a, &[]);
+    let gen_a = fs::read(workspace_a.join("app/out/gen.txt")).unwrap();
+    let build_a = fs::read(workspace_a.join("app/out/build.txt")).unwrap();
+    assert_eq!(gen_a, b"from-gen\n");
+    assert_eq!(build_a, b"from-gen\n");
+    assert_eq!(
+        fs::read_to_string(&counter).unwrap().lines().count(),
+        2,
+        "gen and build each append once in A"
+    );
+
+    copy_sources(&workspace_a, &workspace_b);
+    assert!(
+        !workspace_b.join("app/out").exists(),
+        "copy must not bring A's outputs along"
+    );
+
+    let second = run(&workspace_b, &["--json"]);
+    assert_eq!(
+        fs::read(workspace_b.join("app/out/gen.txt")).unwrap(),
+        gen_a,
+        "gen output must restore byte-identical"
+    );
+    assert_eq!(
+        fs::read(workspace_b.join("app/out/build.txt")).unwrap(),
+        build_a,
+        "build output must restore byte-identical"
+    );
+    assert_eq!(
+        fs::read_to_string(&counter).unwrap().lines().count(),
+        2,
+        "workspace B must not execute either command"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let results = parsed["results"].as_array().expect("results");
+    for address in ["//app:gen", "//app:build"] {
+        let hit = results
+            .iter()
+            .find(|result| result["address"] == address)
+            .unwrap_or_else(|| panic!("{address} missing from {parsed}"));
+        assert_eq!(hit["cached"], true, "{address} must be a hit: {hit}");
+        let output = hit["output"].as_str().unwrap_or("");
+        let marker = if address.ends_with(":gen") {
+            "generated"
+        } else {
+            "built"
+        };
+        assert!(
+            output.contains(marker),
+            "{address} json should replay the stored log: {hit}"
+        );
+    }
+    let replayed = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !replayed.contains("generated") && !replayed.contains("built"),
+        "json mode must not print replayed logs: {replayed}"
+    );
+
+    let logs = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(&workspace_b)
+        .env("ASTER_CACHE_DIR", &shared)
+        .args(["logs", "//app:build"])
+        .output()
+        .unwrap();
+    let logged = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs.status.success() && logged.contains("built"),
+        "B should replay the stored build log: {} {logged}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+}
+
+fn write_rich_fixture(root: &std::path::Path) {
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.gen]
+command = "bash -c 'mkdir -p out && echo from-gen > out/gen.txt && echo generated && echo gen >> \"$COUNTER_FILE\"'"
+cache = { enabled = true, outputs = ["out/gen.txt"] }
+
+[targets.build]
+command = "bash -c 'mkdir -p out && cp out/gen.txt out/build.txt && echo built && echo build >> \"$COUNTER_FILE\"'"
+depends_on = ["//self:gen"]
+cache = { enabled = true, outputs = ["out/build.txt"] }
+"#,
+    )
+    .unwrap();
+}
+
+/// Copy sources only. Declared outputs under `out/` stay behind in A.
+fn copy_sources(from: &std::path::Path, to: &std::path::Path) {
+    fn walk(from: &std::path::Path, to: &std::path::Path, rel: &std::path::Path) {
+        for entry in fs::read_dir(from.join(rel)).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "out" {
+                continue;
+            }
+            let child = rel.join(&name);
+            if entry.file_type().unwrap().is_dir() {
+                fs::create_dir_all(to.join(&child)).unwrap();
+                walk(from, to, &child);
+            } else {
+                fs::create_dir_all(to.join(rel)).unwrap();
+                fs::copy(from.join(&child), to.join(&child)).unwrap();
+            }
+        }
+    }
+    fs::create_dir_all(to).unwrap();
+    walk(from, to, std::path::Path::new(""));
+}
