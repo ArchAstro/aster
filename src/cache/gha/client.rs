@@ -14,8 +14,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Value};
-use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 use ureq::Body;
+
+/// PEM file of an extra root CA. Unset in production. The action integration
+/// test sets it so a loopback HTTPS fake can stand in for the Actions cache.
+const EXTRA_CA_ENV: &str = "ASTER_GHA_EXTRA_CA";
 
 const SERVICE: &str = "github.actions.results.api.v1.CacheService";
 const USER_AGENT: &str = concat!("aster/", env!("CARGO_PKG_VERSION"));
@@ -482,14 +486,17 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn build_agent() -> ureq::Agent {
-    let tls = TlsConfig::builder()
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
         // aws-lc-rs, not ring. Installing ring as the process default would
         // panic ServerConfig::builder() in src/dev/tls.rs, which uses the
         // aws-lc-rs provider tokio-rustls already pulled in.
-        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .root_certs(RootCerts::WebPki)
-        .build();
+        .unversioned_rustls_crypto_provider(Arc::clone(&provider));
+    if let Some(roots) = extra_root_certs() {
+        tls = tls.root_certs(roots);
+    }
+    let tls = tls.build();
     ureq::Agent::config_builder()
         .https_only(false)
         .http_status_as_error(false)
@@ -501,6 +508,32 @@ fn build_agent() -> ureq::Agent {
         .timeout_recv_body(Some(RECV_BODY_TIMEOUT))
         .build()
         .new_agent()
+}
+
+/// Roots for the cache client. Unset `ASTER_GHA_EXTRA_CA` keeps WebPKI.
+/// A set PEM replaces WebPKI with that one certificate: ureq's specific-root
+/// mode cannot add to WebPKI, and the integration server is the only host
+/// the test client talks to.
+fn extra_root_certs() -> Option<RootCerts> {
+    let path = std::env::var_os(EXTRA_CA_ENV)?;
+    if path.is_empty() {
+        return None;
+    }
+    let pem = std::fs::read(&path).unwrap_or_else(|error| {
+        panic!("{EXTRA_CA_ENV}={}: {error}", PathDisplay(&path))
+    });
+    let cert = Certificate::from_pem(&pem).unwrap_or_else(|error| {
+        panic!("{EXTRA_CA_ENV} is not a PEM certificate: {error}")
+    });
+    Some(RootCerts::new_with_certs(&[cert]))
+}
+
+struct PathDisplay<'a>(&'a std::ffi::OsStr);
+
+impl std::fmt::Display for PathDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.to_string_lossy())
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,3 @@
+[targets.build]
+command = "bash -c 'mkdir -p out && echo hi > out/file.txt && echo ran >> runs.txt'"
+cache = { enabled = true, outputs = ["out/**"] }

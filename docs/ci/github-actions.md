@@ -139,3 +139,22 @@ appear once in `combined.paths`.
 Do not loop it into one `actions/cache` step per entry: Actions expands
 `uses:` steps before the job runs, so a dynamic list cannot become a
 dynamic number of steps.
+
+## Install Aster and share its artifact cache
+
+`action/` is a JavaScript action that installs a pinned Aster release and
+runs one command. Use it as `ArchAstro/aster/action@vX`, where `vX` is an
+Aster release tag.
+
+```yaml
+- uses: ArchAstro/aster/action@v0.21.0
+  with:
+    run: run //app:build
+```
+
+`cache-mode` defaults to `auto`. That writes on `push`, `schedule`, and
+`workflow_dispatch` to the repository's default branch, and reads otherwise.
+`rw`, `read`, and `off` override it. The action passes
+`ACTIONS_RESULTS_URL`, `ACTIONS_RUNTIME_TOKEN`, `ASTER_REMOTE_CACHE=gha`,
+and `ASTER_CACHE_MODE` only to the spawned `aster` process. Later steps do
+not receive the runtime token.

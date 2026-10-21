@@ -1,3 +1,4 @@
 /target
 .aster/
 archdev.local.json
+node_modules/

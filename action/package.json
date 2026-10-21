@@ -1,0 +1,18 @@
+{
+  "name": "aster-action",
+  "private": true,
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist --license licenses.txt && ncc build src/mode.ts -o dist/mode --license licenses.txt && ncc build src/run-env.ts -o dist/run --license licenses.txt && node scripts/expose.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@actions/core": "1.11.1",
+    "@actions/exec": "1.1.1",
+    "@actions/tool-cache": "2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@vercel/ncc": "0.38.4",
+    "typescript": "5.9.3"
+  }
+}
