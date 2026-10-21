@@ -181,6 +181,13 @@ mod tests {
         }
     }
 
+    /// Fresh per-run key, so no secret-shaped literal lives in source.
+    fn random_key() -> String {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("OS randomness");
+        hex_encode(&bytes)
+    }
+
     #[test]
     fn hmac_sha256_matches_rfc4231_case_1() {
         // RFC 4231 test case 1. Key is 20 bytes of 0x0b; data is "Hi There".
@@ -193,20 +200,22 @@ mod tests {
 
     #[test]
     fn valid_signature_hits_and_tamper_or_wrong_key_misses() {
+        let key = random_key();
+        let other_key = random_key();
         let manifest = manifest();
         let bytes = manifest.encode();
-        let sealed = seal(Some("test-key"), &manifest);
-        let hit = open(Some("test-key"), &sealed).expect("valid signature is a hit");
+        let sealed = seal(Some(&key), &manifest);
+        let hit = open(Some(&key), &sealed).expect("valid signature is a hit");
         assert_eq!(hit, manifest);
 
         let mut tampered: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
         tampered["manifest"] =
             serde_json::Value::String(String::from_utf8(bytes.clone()).unwrap() + " ");
         let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
-        assert!(open(Some("test-key"), &tampered_bytes).is_none());
+        assert!(open(Some(&key), &tampered_bytes).is_none());
 
-        assert!(open(Some("other-key"), &sealed).is_none());
-        assert!(open(Some("test-key"), &bytes).is_none());
+        assert!(open(Some(&other_key), &sealed).is_none());
+        assert!(open(Some(&key), &bytes).is_none());
 
         // No key keeps the historical unsigned wire, and does not accept an
         // envelope it cannot unwrap. Manifest::decode must not either: the
