@@ -701,8 +701,11 @@ impl<'a> Executor<'a> {
         if self.use_cache {
             auto_prune_cache(self.workspace_root, self.output_mode);
             if let Some(backend) = crate::cache::current_gha() {
+                // A failed pack upload drops the manifests held for it, so
+                // no stored manifest names missing blobs; those targets are
+                // remote misses next run, not a failed build.
                 if let Err(error) = backend.finish() {
-                    eprintln!("[aster] Warning: remote cache pack upload failed: {error:#}");
+                    eprintln!("[aster] Warning: remote cache upload failed; targets bundled into the pack were not published: {error:#}");
                 }
                 let summary = backend.summary();
                 eprintln!("{summary}");

@@ -11,6 +11,10 @@
 //! The member set is sealed when the first manifest is uploaded, so the
 //! key is known and immutable. A small blob staged after that is its own
 //! entry. Each manifest records the pack key for every blob it bundled.
+//! A manifest that names the pack is held until the pack upload succeeds,
+//! so a reader never finds a manifest whose packed blobs are missing. If
+//! the pack upload fails or the run stops first, those manifests are never
+//! uploaded and the targets are plain remote misses.
 //!
 //! Keys are immutable. [`CacheBackend::find_missing`] only looks keys up;
 //! it never calls `CreateCacheEntry`. A create that reports the key already
@@ -80,6 +84,11 @@ struct State {
     pack_members: HashSet<String>,
     /// Pack key to the digests it holds, so `get_blob` can find a bundled blob.
     known_packs: HashMap<String, HashSet<String>>,
+    /// Set once the sealed pack is stored. Manifests naming it upload directly.
+    pack_uploaded: bool,
+    /// Encoded manifests that name the pack, keyed by entry key. Uploaded by
+    /// [`GhaBackend::finish`] after the pack; dropped if the pack fails.
+    held_manifests: Vec<(String, Vec<u8>)>,
 }
 
 /// [`CacheBackend`] selected by `ASTER_REMOTE_CACHE=gha`.
@@ -120,6 +129,8 @@ impl GhaBackend {
                 pack_key: None,
                 pack_members: HashSet::new(),
                 known_packs: HashMap::new(),
+                pack_uploaded: false,
+                held_manifests: Vec::new(),
             }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -157,10 +168,32 @@ impl GhaBackend {
         self.writes_stopped.load(Ordering::Acquire)
     }
 
-    /// Upload the staged pack. Called at the end of the run, and also before
-    /// a manifest is uploaded so a reader never sees a manifest whose pack
-    /// does not exist yet. A second call with an empty stage is a no-op.
+    /// Upload the staged pack, then the manifests held for it. Called at
+    /// the end of the run. If the pack upload fails, the held manifests are
+    /// dropped so no stored manifest names a pack that does not exist. A
+    /// second call with an empty stage is a no-op.
     pub fn finish(&self) -> Result<()> {
+        let result = self.upload_pack();
+        let held = {
+            let mut state = self.state.lock().expect("gha cache state");
+            let held = std::mem::take(&mut state.held_manifests);
+            if result.is_ok() && state.pack_uploaded {
+                held
+            } else {
+                Vec::new()
+            }
+        };
+        result?;
+        let mut first_error = None;
+        for (key, bytes) in held {
+            if let Err(error) = self.upload_entry(&key, &bytes) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn upload_pack(&self) -> Result<()> {
         if self.writes_stopped() {
             return Ok(());
         }
@@ -193,7 +226,12 @@ impl GhaBackend {
             return Ok(());
         }
         self.upload_entry(&key, &pack_archive(&frames)?)?;
+        if self.writes_stopped() {
+            // upload_entry skips without a request once writes stop.
+            return Ok(());
+        }
         let mut state = self.state.lock().expect("gha cache state");
+        state.pack_uploaded = true;
         let pending = state.pack_key.clone();
         for (digest, _) in &frames {
             state.frames.remove(digest.as_str());
@@ -406,6 +444,7 @@ impl CacheBackend for GhaBackend {
             .pack_members
             .clone();
         let mut stored = manifest.clone();
+        let names_pack = pack.is_some();
         if let Some(pack) = pack {
             stored.packs = manifest
                 .blob_refs()
@@ -418,7 +457,15 @@ impl CacheBackend for GhaBackend {
                 .collect();
         }
         self.remember_manifest(&stored);
-        self.upload_entry(&self.manifest_key(&manifest.key), &stored.encode())
+        let key = self.manifest_key(&manifest.key);
+        if names_pack && !self.writes_stopped() {
+            let mut state = self.state.lock().expect("gha cache state");
+            if !state.pack_uploaded {
+                state.held_manifests.push((key, stored.encode()));
+                return Ok(());
+            }
+        }
+        self.upload_entry(&key, &stored.encode())
     }
 
     fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>> {

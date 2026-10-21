@@ -428,10 +428,12 @@ fn repeated_429_stops_writes() {
         .local_store()
         .put_blob(&digest, b"small".as_slice())
         .unwrap();
-    // put_manifest uploads the pack (429) and then the manifest (429).
+    // The manifest names the pack, so it is held. finish uploads the pack
+    // first; that create is rate limited and stops writes.
     uploader
         .store(&manifest(&"11".repeat(32), "//app:build", &digest))
         .unwrap();
+    assert!(backend.finish().is_err());
     assert!(backend.writes_stopped());
     let created_before = server.creates.load(Ordering::Relaxed);
     uploader
@@ -439,6 +441,59 @@ fn repeated_429_stops_writes() {
         .unwrap();
     assert_eq!(server.creates.load(Ordering::Relaxed), created_before);
     assert!(backend.summary().rate_limited >= 1);
+}
+
+/// A manifest that names the pack is not stored before the pack, and is
+/// never stored when the pack upload fails. Otherwise a reader would hit a
+/// manifest whose packed blobs cannot be restored.
+#[test]
+fn manifest_waits_for_pack_and_is_dropped_when_pack_fails() {
+    let server = Server::spawn();
+    let backend = Arc::new(server.backend(true));
+    let digest = Digest::of_bytes(b"packed");
+    let key = "66".repeat(32);
+    let manifest_key = format!("aster-v{CACHE_SCHEMA_VERSION}-ac-linux-x86_64-{key}");
+    let dir = tempfile::tempdir().unwrap();
+    let uploader = tier(dir.path(), Arc::clone(&backend));
+    uploader
+        .local_store()
+        .put_blob(&digest, b"packed".as_slice())
+        .unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
+    assert!(
+        server.entries.lock().unwrap().is_empty(),
+        "manifest must wait for its pack"
+    );
+
+    *server.rate_limit.lock().unwrap() = true;
+    assert!(backend.finish().is_err(), "pack upload must report failure");
+    *server.rate_limit.lock().unwrap() = false;
+    assert!(
+        !server.entries.lock().unwrap().contains_key(&manifest_key),
+        "a manifest whose pack failed must not be stored"
+    );
+    backend.finish().unwrap();
+    assert!(!server.entries.lock().unwrap().contains_key(&manifest_key));
+
+    // The pack goes first when it succeeds.
+    let ok_server = Server::spawn();
+    let ok = Arc::new(ok_server.backend(true));
+    let other = tempfile::tempdir().unwrap();
+    let uploader = tier(other.path(), Arc::clone(&ok));
+    uploader
+        .local_store()
+        .put_blob(&digest, b"packed".as_slice())
+        .unwrap();
+    uploader
+        .store(&manifest(&key, "//app:build", &digest))
+        .unwrap();
+    assert!(ok_server.entries.lock().unwrap().is_empty());
+    ok.finish().unwrap();
+    let entries = ok_server.entries.lock().unwrap();
+    assert!(entries.contains_key(&manifest_key));
+    assert!(entries.keys().any(|entry| entry.contains("-pack-")));
 }
 
 /// 50 targets with one small output each: 50 manifests plus one pack.
