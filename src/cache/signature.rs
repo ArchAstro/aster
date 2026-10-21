@@ -23,6 +23,9 @@ use super::artifact::Manifest;
 
 /// `ASTER_REMOTE_CACHE_SIGNATURE_KEY`. Unset or empty means remote manifests
 /// are unsigned, which is the historical wire format.
+///
+/// Applies to the HTTP backend only. aster-srv is explicitly excluded (it
+/// cannot store a signature) and prints a notice when this key is set.
 pub const SIGNATURE_KEY_ENV: &str = "ASTER_REMOTE_CACHE_SIGNATURE_KEY";
 
 type HmacSha256 = Hmac<Sha256>;

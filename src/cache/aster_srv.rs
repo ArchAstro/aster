@@ -118,14 +118,19 @@ impl AsterSrvBackend {
     pub fn from_env(url: Option<&str>, repo: Option<&str>) -> Option<Self> {
         let env = |name: &str| std::env::var(name).ok();
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::from_parts(
+        let backend = Self::from_parts(
             url,
             repo,
             Credentials::from_env(&env),
             proxy_token_from_env(&env),
             iap::token_path(&workspace),
             env(iap::IAP_CLIENT_ID_ENV),
-        )
+        )?;
+        if let Some(notice) = signature_exclusion_notice(super::signature::signing_key().is_some())
+        {
+            eprintln!("{notice}");
+        }
+        Some(backend)
     }
 
     fn from_parts(
@@ -629,6 +634,17 @@ impl CacheBackend for AsterSrvBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// aster-srv is excluded from manifest signing: the server drops a `sig`
+/// on commit and never returns one, so lookups trust its authenticated
+/// API instead. When a key is set, say so once rather than skip the check
+/// silently.
+fn signature_exclusion_notice(key_set: bool) -> Option<&'static str> {
+    key_set.then_some(
+        "[aster] Note: ASTER_REMOTE_CACHE_SIGNATURE_KEY does not apply to the aster-srv cache; \
+         its manifests are not signature-verified and are trusted from the authenticated server",
+    )
 }
 
 /// Downcast is unavailable across crate errors, so 409 is matched on the
@@ -1288,6 +1304,17 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn signature_key_on_aster_srv_is_reported_not_silently_skipped() {
+        assert_eq!(signature_exclusion_notice(false), None);
+        let notice = signature_exclusion_notice(true).unwrap();
+        assert!(
+            notice.contains("ASTER_REMOTE_CACHE_SIGNATURE_KEY"),
+            "{notice}"
+        );
+        assert!(notice.contains("not signature-verified"), "{notice}");
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
