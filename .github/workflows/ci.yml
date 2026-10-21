@@ -211,3 +211,18 @@ jobs:
           scripts/build-linux-repositories \
             dist package-repositories https://packages.example.test "${fingerprint}" "${version}"
           scripts/test-linux-repositories "${version}" package-repositories
+
+  action:
+    name: Action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - name: Test the Aster action
+        working-directory: action
+        run: |
+          npm ci
+          npm test

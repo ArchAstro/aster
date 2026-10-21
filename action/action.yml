@@ -1,0 +1,32 @@
+name: Aster
+description: Install Aster and run a command with the GitHub Actions cache token scoped to that process
+author: ArchAstro
+
+inputs:
+  version:
+    description: Aster release to install. Empty installs the latest stable release. A leading v is optional.
+    required: false
+    default: ""
+  run:
+    description: Arguments passed to the aster binary, for example "run //app:build".
+    required: true
+  cache-mode:
+    description: auto writes on push, schedule, and workflow_dispatch to the default branch and reads otherwise. rw, read, and off override that.
+    required: false
+    default: auto
+  working-directory:
+    description: Directory the aster command runs in, relative to GITHUB_WORKSPACE.
+    required: false
+    default: ""
+  aster-path:
+    description: Local aster binary. Skips the release download. Test-only.
+    required: false
+    default: ""
+
+runs:
+  using: node24
+  main: dist/index.js
+
+branding:
+  icon: box
+  color: blue
