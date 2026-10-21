@@ -519,12 +519,10 @@ fn extra_root_certs() -> Option<RootCerts> {
     if path.is_empty() {
         return None;
     }
-    let pem = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{EXTRA_CA_ENV}={}: {error}", PathDisplay(&path))
-    });
-    let cert = Certificate::from_pem(&pem).unwrap_or_else(|error| {
-        panic!("{EXTRA_CA_ENV} is not a PEM certificate: {error}")
-    });
+    let pem = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("{EXTRA_CA_ENV}={}: {error}", PathDisplay(&path)));
+    let cert = Certificate::from_pem(&pem)
+        .unwrap_or_else(|error| panic!("{EXTRA_CA_ENV} is not a PEM certificate: {error}"));
     Some(RootCerts::new_with_certs(&[cert]))
 }
 
