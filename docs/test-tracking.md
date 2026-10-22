@@ -52,8 +52,7 @@ table and `retry_setup`.
 | `ASTER_SRV_URL` | The server. Set, Aster uploads after the run and fetches the quarantine list before it. |
 | `ASTER_SRV_TOKEN` | A static token. Without it, GitHub Actions' OIDC token is used (the job needs `permissions: id-token: write`). |
 | `ASTER_SRV_AUDIENCE` | The OIDC audience; default `aster-srv`. |
-| `ASTER_SRV_PROXY_TOKEN` | Sent as `Proxy-Authorization` when the server sits behind an identity-aware proxy. CI sets this. A laptop does not: see [Reading the cache from a laptop](#reading-the-cache-from-a-laptop). |
-| `ASTER_SRV_IAP_CLIENT_ID` | IAP OAuth client id. Aster uses it as the audience when minting a personal identity token. |
+| `ASTER_SRV_PROXY_TOKEN` | Sent as `Proxy-Authorization` when set, for a deployment that still keeps an identity-aware proxy in front of `/v1`. The server ignores it. A laptop does not set it: see [Reading the cache from a laptop](#reading-the-cache-from-a-laptop). |
 | `ASTER_GITHUB_SUMMARY` | `0` stops the step summary and annotations in GitHub Actions. |
 | `ASTER_QUARANTINE` | `off` stops quarantine; failures fail as usual. |
 | `ASTER_BALANCE_PARTITIONS` | `off` keeps Mix's own split for `mix test --partitions` shards. |
@@ -81,33 +80,44 @@ and each gets an annotation on its file.
 
 ## Reading the cache from a laptop
 
-aster-srv's host is behind Google IAP. CI passes that with a workload-identity
-token in `ASTER_SRV_PROXY_TOKEN`. A laptop or a devbox uses the person's own
-Google account instead, and no shared token.
-
-One-time setup, on the laptop and again on a devbox (a devbox does not share
-the laptop's gcloud login):
+CI authenticates every request with its GitHub OIDC token. A laptop or a devbox
+has none, so it signs in as a person, once per machine (a devbox does not
+share the laptop's sign-in):
 
 ```console
-gcloud auth login          # an archastro.ai account that IAP allows to view
 export ASTER_SRV_URL=https://aster-srv.example.com
-export ASTER_SRV_IAP_CLIENT_ID=<IAP OAuth client id>
 aster cache login
 ```
 
-`aster cache login` runs `gcloud auth print-identity-token --audiences=$ASTER_SRV_IAP_CLIENT_ID`
-and stores the token at `<workspace>/.aster/iap-token.json` until it expires.
-The file is mode `0600` and `.aster/` is gitignored, so the token never enters
-the repository. The next `aster run` with `ASTER_SRV_URL` set sends it as
-`Proxy-Authorization` and restores a cached target. No other environment
-variable is required.
+1. `aster cache login` listens on a random port on `127.0.0.1` and opens
+   `$ASTER_SRV_URL/cli-auth` in your browser. It prints the URL as well.
+2. You sign in there with your company Google account (the server's
+   identity-aware proxy asks) and click **Authorize**.
+3. The server redirects the browser to `http://127.0.0.1:<port>/callback`
+   with a single-use code (valid 60 seconds). Aster trades the code, plus a
+   PKCE verifier only it knows, for a token.
+4. The token is stored in `$XDG_CONFIG_HOME/aster/cache-tokens/<server host>.json`
+   (else `~/.config/aster/...`; `%APPDATA%\aster\...` on Windows), mode `0600` in
+   a `0700` directory. It is never printed, and it lives outside the
+   repository. It lasts 12 hours by default (`ASTER_SRV_CLI_TOKEN_TTL` on the
+   server); then run `aster cache login` again.
 
-If gcloud is missing or the account is signed out, `aster cache login` prints
-the command to run and exits 1. A later `aster run` prints one line
-(`not signed in to Google; remote cache skipped`) and builds from the local
-cache. It does not fail.
+The next `aster run` with `ASTER_SRV_URL` set sends the token as a bearer
+token and restores a cached target. Nothing else needs configuring.
 
-IAP viewers can read the cache, not write it. A laptop restore does not upload.
+On a machine with no browser, run `aster cache login --no-browser`, open the
+printed URL on a computer where you are signed in, and forward the port it
+names to the machine (`ssh -R PORT:127.0.0.1:PORT`).
+
+Signed out, or with an expired or refused token, `aster run` prints one line
+(`not signed in; run aster cache login`) and builds from the local cache. It
+does not fail. If the server has not enabled sign-in, `aster cache login`
+says the server refused it.
+
+A person's token reads the cache and nothing else: it cannot upload or commit
+(the server answers `403`), cannot use test-result routes, and Aster never
+asks to write with it. Entries CI writes carry the CI runner's platform in
+their key, so a macOS laptop mostly misses entries written on Linux CI.
 
 ## 4. Flaky and broken
 

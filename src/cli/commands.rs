@@ -563,18 +563,23 @@ pub enum CacheCommands {
         inputs: bool,
     },
 
-    /// Sign in to the remote cache with your Google account
+    /// Sign in to the shared remote cache from this machine
     ///
-    /// Mints a short-lived identity token from `gcloud auth print-identity-token`
-    /// and caches it under `.aster/` until it expires. The file is readable
-    /// only by you. When gcloud is missing or you are signed out, prints the
-    /// command to run.
+    /// Opens `$ASTER_SRV_URL/cli-auth` in your browser. Sign in there with
+    /// the company account the server's proxy uses and confirm. Aster
+    /// receives the answer on a one-shot listener on 127.0.0.1 and stores a
+    /// read-only token under your config directory ($XDG_CONFIG_HOME/aster,
+    /// else ~/.config/aster), readable only by you, until it expires (hours).
+    /// Later `aster run`s with `ASTER_SRV_URL` set restore from the shared
+    /// cache; without a sign-in they print one line and use the local cache.
     ///
-    /// The audience is `ASTER_SRV_IAP_CLIENT_ID` (the IAP OAuth client id).
+    /// On a machine with no browser (a remote shell), pass `--no-browser`,
+    /// open the printed URL on a computer that is signed in, and forward the
+    /// port it names (`ssh -R PORT:127.0.0.1:PORT`).
     Login {
-        /// IAP OAuth client id. Defaults to `ASTER_SRV_IAP_CLIENT_ID`.
-        #[arg(long, value_name = "CLIENT_ID")]
-        audience: Option<String>,
+        /// Print the sign-in URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
 
     /// Evict old and least-recently-used artifact cache entries

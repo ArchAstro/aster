@@ -365,13 +365,13 @@ removes one address. Blobs stay until `aster cache prune`.
 `.aster/cache/cache.json` is obsolete and unused; Aster neither reads nor
 writes it.
 
-`aster cache login` signs a laptop or devbox in to an aster-srv behind Google
-IAP. It needs `ASTER_SRV_IAP_CLIENT_ID` (or `--audience`) and a `gcloud auth
-login`. The identity token is cached at `.aster/iap-token.json` (mode 0600)
-until it expires. If gcloud is missing or signed out, the command prints what
-to run. A later `aster run` with `ASTER_SRV_URL` set then reads the remote
-cache with no extra token variable. Signed out, the run prints one line and
-continues locally.
+`aster cache login` signs a laptop or devbox in to the aster-srv named by
+`ASTER_SRV_URL`. It opens your browser (`--no-browser` prints the URL
+instead), you sign in and confirm, and Aster stores a read-only token under
+`$XDG_CONFIG_HOME/aster` (else `~/.config/aster`, mode 0600) until it
+expires. A later `aster run` with `ASTER_SRV_URL` set then reads the remote
+cache with no extra variable. Signed out, the run prints
+`not signed in; run aster cache login` once and continues locally.
 
 `aster cache status <target> --inputs` prints every component of that target's
 cache key: salt, platform, hashed files, command, dependency hashes, tracked
