@@ -82,9 +82,8 @@ fn canonical_request_hash(url: &str, method: &str, object: &str) -> String {
         .filter(|pair| !pair.starts_with("X-Goog-Signature="))
         .collect::<Vec<_>>()
         .join("&");
-    let encoded = object.replace('/', "%2F");
     let canonical = format!(
-        "{method}\n/aster-cache-test/{encoded}\n{query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
+        "{method}\n/aster-cache-test/{object}\n{query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
     );
     use sha2::{Digest, Sha256};
     Sha256::digest(canonical.as_bytes())
@@ -483,8 +482,8 @@ async fn signed_urls_expire_and_no_key_is_stored() {
     assert_eq!(payloads.len(), 1);
     let payload = String::from_utf8(payloads[0].clone()).unwrap();
     assert!(payload.starts_with("GOOG4-RSA-SHA256\n"), "{payload}");
-    // The URL keeps the slash. GCS hashes each segment with `/` as `%2F`,
-    // so the canonical request that was signed must encode it that way.
+    // The URL and the canonical request both keep `/` literal. This stand-in
+    // check cannot prove GCS accepts it; the V4 vectors in `signing.rs` do.
     assert!(url.contains(&format!("/aster-cache-test/cas/{DIGEST}?")));
     assert!(!url.contains("cas%2F"));
     let signed_hash = payload.lines().next_back().unwrap();
