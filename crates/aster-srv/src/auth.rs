@@ -1,11 +1,16 @@
-//! Who is calling: a GitHub Actions OIDC token, or a configured static
-//! token in development.
+//! Who is calling: a GitHub Actions OIDC token, a person's token from
+//! `aster cache login`, or a configured static token in development.
 //!
 //! An OIDC token is accepted when it is signed by the issuer's current key,
 //! is unexpired, names this server's audience, and comes from a repository
 //! on the allowlist. Keys are fetched from the issuer's JWKS and refetched
 //! when a token names a key not yet seen, at most once a minute; callers
 //! that arrive during a fetch wait for it and share its keys.
+//!
+//! [`authenticate`] is the one entry point for `/v1/*`. It reads the
+//! token's `alg` and sends HS256 to the server's own person-token keys and
+//! RS256 to the OIDC verifier. Neither path accepts the other's tokens, and
+//! any other algorithm is refused.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,6 +21,54 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{Config, RepositoryAllowlist, StaticToken};
+use crate::person::{Person, TokenIssuer};
+
+/// Who a bearer token names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    /// A CI job (or a development static token).
+    Ci(Identity),
+    /// A person signed in with `aster cache login`.
+    Person(Person),
+}
+
+/// Check an `Authorization` header value against both token kinds.
+///
+/// `tokens` is `None` when person login is not configured; HS256 tokens are
+/// then refused like any other token this server did not issue.
+pub async fn authenticate(
+    verifier: &Verifier,
+    tokens: Option<&TokenIssuer>,
+    authorization: Option<&str>,
+) -> Result<Principal, AuthError> {
+    let token = bearer_token(authorization)?;
+    if verifier.is_static(token) {
+        return verifier.verify(authorization).await.map(Principal::Ci);
+    }
+    let header = decode_header(token).map_err(|e| AuthError::Invalid(e.to_string()))?;
+    match header.alg {
+        Algorithm::HS256 => match tokens {
+            Some(tokens) => tokens.verify(token).map(Principal::Person),
+            None => Err(AuthError::Invalid("person tokens are not accepted".into())),
+        },
+        Algorithm::RS256 => verifier.verify(authorization).await.map(Principal::Ci),
+        other => Err(AuthError::Invalid(format!(
+            "tokens signed with {other:?} are not accepted"
+        ))),
+    }
+}
+
+fn bearer_token(authorization: Option<&str>) -> Result<&str, AuthError> {
+    authorization
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or(AuthError::Missing)
+}
 
 /// The caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +98,19 @@ pub enum AuthError {
     Invalid(String),
     /// A valid token for a repository that may not use the server: 403.
     Forbidden(String),
+}
+
+impl AuthError {
+    /// The reply to send: 403 for a valid token that may not use the
+    /// server, 401 for everything else.
+    pub fn into_reply(self) -> crate::Reply {
+        let status = if matches!(self, AuthError::Forbidden(_)) {
+            403
+        } else {
+            401
+        };
+        crate::Reply::error(status, self.to_string())
+    }
 }
 
 impl std::fmt::Display for AuthError {
@@ -135,17 +201,17 @@ impl Verifier {
         self
     }
 
-    /// Check an `Authorization` header value.
+    /// Whether `token` is a configured static token.
+    fn is_static(&self, token: &str) -> bool {
+        self.static_tokens
+            .iter()
+            .any(|candidate| constant_time_eq(candidate.token.as_bytes(), token.as_bytes()))
+    }
+
+    /// Check an `Authorization` header value for a CI token. Use
+    /// [`authenticate`] where person tokens are accepted too.
     pub async fn verify(&self, authorization: Option<&str>) -> Result<Identity, AuthError> {
-        let token = authorization
-            .and_then(|value| {
-                value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| value.strip_prefix("bearer "))
-            })
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .ok_or(AuthError::Missing)?;
+        let token = bearer_token(authorization)?;
 
         if let Some(found) = self
             .static_tokens
@@ -233,7 +299,7 @@ impl Verifier {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -383,6 +449,186 @@ mod tests {
             ),
             (None, None, None, None)
         );
+    }
+
+    // ---- person tokens and the algorithm switch ----
+
+    const K1: &str = "k1:0123456789abcdef0123456789abcdef";
+
+    fn person_config(keys: &str) -> Config {
+        let keys = keys.to_string();
+        Config::from_env(|name| match name {
+            "ASTER_SRV_DATABASE_URL" => Some("postgres://localhost/x".into()),
+            "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
+            "ASTER_SRV_STATIC_TOKENS" => Some("ArchAstro/dev=dev-token-0123456789".into()),
+            "ASTER_SRV_PUBLIC_URL" => Some("https://aster-srv.example.com".into()),
+            "ASTER_SRV_CLI_TOKEN_KEYS" => Some(keys.clone()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    fn issuer() -> TokenIssuer {
+        TokenIssuer::from_config(&person_config(K1)).unwrap()
+    }
+
+    fn hs256(claims: serde_json::Value, kid: Option<&str>, secret: &[u8]) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = kid.map(str::to_string);
+        encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+    }
+
+    fn person_claims() -> serde_json::Value {
+        json!({
+            "iss": "https://aster-srv.example.com",
+            "aud": "aster-cli",
+            "sub": "ada@example.com",
+            "scope": "cache:read",
+            "iat": chrono::Utc::now().timestamp(),
+            "exp": chrono::Utc::now().timestamp() + 300,
+            "jti": "x",
+        })
+    }
+
+    async fn principal(issuer: Option<&TokenIssuer>, token: &str) -> Result<Principal, AuthError> {
+        authenticate(&verifier(), issuer, Some(&format!("Bearer {token}"))).await
+    }
+
+    #[tokio::test]
+    async fn the_algorithm_picks_the_verifier_and_neither_accepts_the_others_tokens() {
+        let issuer = issuer();
+        let person = issuer.issue("ada@example.com").unwrap().token;
+        assert_eq!(
+            principal(Some(&issuer), &person).await,
+            Ok(Principal::Person(crate::person::Person {
+                email: "ada@example.com".into()
+            }))
+        );
+        let ci = token(claims("ArchAstro/firstlanding"), "k1");
+        assert!(matches!(
+            principal(Some(&issuer), &ci).await,
+            Ok(Principal::Ci(_))
+        ));
+        let dev = authenticate(
+            &verifier(),
+            Some(&issuer),
+            Some("Bearer dev-token-0123456789"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(dev, Principal::Ci(identity) if identity.static_token));
+
+        // Person login off: a person token is just a token nobody issued.
+        assert!(matches!(
+            principal(None, &person).await,
+            Err(AuthError::Invalid(_))
+        ));
+
+        // HS256 signed with the OIDC public key as the secret (the classic
+        // algorithm-confusion token), naming the OIDC key id, goes to the
+        // person keys, which do not have that id.
+        let confused = hs256(claims("ArchAstro/firstlanding"), Some("oidc"), PUBLIC);
+        assert!(matches!(
+            principal(Some(&issuer), &confused).await,
+            Err(AuthError::Invalid(reason)) if reason.contains("unknown signing key")
+        ));
+        // The person path refuses an RS256 token even under a person kid.
+        let rs_as_person = {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("k1".into());
+            encode(
+                &header,
+                &person_claims(),
+                &EncodingKey::from_rsa_pem(PRIVATE).unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            issuer.verify(&rs_as_person),
+            Err(AuthError::Invalid(_))
+        ));
+        // And an RS256 person-shaped token on the main path fails the OIDC
+        // checks (no repository, wrong audience and issuer).
+        assert!(matches!(
+            principal(Some(&issuer), &rs_as_person).await,
+            Err(AuthError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn other_algorithms_and_unsigned_tokens_are_refused() {
+        let issuer = issuer();
+        let b64 = |text: &str| {
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, text)
+        };
+        let unsigned = format!(
+            "{}.{}.",
+            b64(r#"{"alg":"none","typ":"JWT"}"#),
+            b64(&person_claims().to_string())
+        );
+        assert!(matches!(
+            principal(Some(&issuer), &unsigned).await,
+            Err(AuthError::Invalid(_))
+        ));
+        let mut header = Header::new(Algorithm::HS512);
+        header.kid = Some("k1".into());
+        let hs512 = encode(
+            &header,
+            &person_claims(),
+            &EncodingKey::from_secret(K1.split_once(':').unwrap().1.as_bytes()),
+        )
+        .unwrap();
+        assert!(matches!(
+            principal(Some(&issuer), &hs512).await,
+            Err(AuthError::Invalid(reason)) if reason.contains("not accepted")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_person_token_must_be_current_signed_by_a_known_key_for_this_server() {
+        let issuer = issuer();
+        let secret = K1.split_once(':').unwrap().1.as_bytes();
+        let good = hs256(person_claims(), Some("k1"), secret);
+        assert!(principal(Some(&issuer), &good).await.is_ok());
+        let tampered = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut claims = person_claims();
+            change(&mut claims);
+            hs256(claims, Some("k1"), secret)
+        };
+        for (name, token) in [
+            (
+                "expired",
+                tampered(&|c| c["exp"] = json!(chrono::Utc::now().timestamp() - 3600)),
+            ),
+            (
+                "wrong audience",
+                tampered(&|c| c["aud"] = json!("aster-srv")),
+            ),
+            (
+                "wrong issuer",
+                tampered(&|c| c["iss"] = json!("https://evil.example")),
+            ),
+            ("no scope", tampered(&|c| c["scope"] = json!("cache:write"))),
+            ("no subject", tampered(&|c| c["sub"] = json!(""))),
+            (
+                "wrong secret",
+                hs256(
+                    person_claims(),
+                    Some("k1"),
+                    b"another-secret-of-thirty-two-chars!!",
+                ),
+            ),
+            ("no kid", hs256(person_claims(), None, secret)),
+            ("unknown kid", hs256(person_claims(), Some("k9"), secret)),
+        ] {
+            assert!(
+                matches!(
+                    principal(Some(&issuer), &token).await,
+                    Err(AuthError::Invalid(_))
+                ),
+                "{name} must be refused"
+            );
+        }
     }
 
     /// The test OIDC key as a JWK, served by a stub that answers slowly.

@@ -490,10 +490,18 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     }))
 }
 
-/// Run a pass now and every six hours after.
+/// Run a pass now and every six hours after. The pass also drops sign-in
+/// codes nobody redeemed (`auth.cli_codes`), which would otherwise wait for
+/// the next sign-in to clear them.
 pub fn spawn(app: Arc<crate::App>) {
     tokio::spawn(async move {
         loop {
+            if let Err(error) = crate::cli_auth::purge_expired(&app).await {
+                crate::log::warn(
+                    "sign-in code purge failed",
+                    serde_json::json!({"error": format!("{error:#}")}),
+                );
+            }
             match run_retention(&app, Utc::now()).await {
                 Ok(Some(report)) => crate::log::info(
                     "cache retention pass",

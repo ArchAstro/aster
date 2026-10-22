@@ -12,7 +12,7 @@
 //! pages only read; there is no state-changing route.
 
 mod data;
-mod html;
+pub(crate) mod html;
 mod pages;
 
 use chrono::Utc;
