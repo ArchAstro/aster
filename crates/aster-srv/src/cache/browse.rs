@@ -1,9 +1,10 @@
 //! Read-only browsing of the cache: `GET /v1/cache/summary` and
 //! `GET /v1/cache/entries`.
 //!
-//! Callers are an IAP-verified viewer (the viewer domain rule or an exact
-//! `ASTER_SRV_CACHE_ADMIN_EMAILS` entry) or a CI token for its own
-//! repository. The repository must pass the server's allowlist.
+//! Callers are an IAP-verified viewer (the `ASTER_SRV_UI_EMAIL_DOMAINS` rule)
+//! or a CI token for its own repository. The repository must pass the
+//! server's allowlist. The dashboard's `/ui/cache` page reads through
+//! [`read_summary`] and [`read_entries`].
 
 use base64::Engine;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -13,14 +14,16 @@ use serde_json::{json, Value};
 use super::policy;
 use super::routes::{db_error, Headers};
 use crate::auth::AuthError;
+use crate::iap::ViewerError;
 use crate::test_results::query::parse_query;
 use crate::App;
 use crate::Reply;
 
-const DEFAULT_LIMIT: usize = 50;
+/// Entries in a page unless `limit` says otherwise.
+pub const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 /// Days of lookup counts in a summary.
-const LOOKUP_DAYS: i64 = 14;
+pub const LOOKUP_DAYS: i64 = 14;
 /// With a `target` filter the substring is matched here, not in SQL (a
 /// stored manifest need not be valid JSON), so a page reads rows in batches
 /// and stops after this many. `next` then resumes from the last row read.
@@ -35,6 +38,27 @@ pub struct WriterOut {
     pub run_id: Option<String>,
     pub sha: Option<String>,
     pub workflow: Option<String>,
+}
+
+/// One day of lookup counts in a summary.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LookupDay {
+    pub day: String,
+    pub hits: i64,
+    pub misses: i64,
+}
+
+/// What `summary` reports; see [`summary`] for the meaning of each field.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Summary {
+    pub repo: String,
+    pub manifests: i64,
+    pub manifest_bytes: i64,
+    pub blobs: i64,
+    pub blob_bytes: i64,
+    pub last_write_at: Option<String>,
+    pub last_writer: Option<WriterOut>,
+    pub lookups: Vec<LookupDay>,
 }
 
 /// One manifest in a page of `entries`.
@@ -85,6 +109,11 @@ impl Cursor {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// The cursor `text` encodes, if this server could have issued it.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::decode(text).filter(|cursor| cursor.created_at().is_some())
+    }
+
     fn created_at(&self) -> Option<DateTime<Utc>> {
         DateTime::from_timestamp_micros(self.t)
     }
@@ -109,11 +138,12 @@ async fn authorize(app: &App, headers: &Headers<'_>, repo: &str) -> Result<(), R
     if !app.iap.enabled() {
         return Err(Reply::error(401, "send a bearer token"));
     }
-    let viewer = match app.iap.verify_unrestricted(headers.iap_assertion).await {
+    let viewer = match app.iap.verify(headers.iap_assertion).await {
         Ok(viewer) => viewer,
+        Err(error @ ViewerError::Forbidden(_)) => return Err(Reply::error(403, error.to_string())),
         Err(error) => return Err(Reply::error(401, error.to_string())),
     };
-    policy::iap_browser(&app.iap, &viewer, repo, &app.config)
+    policy::iap_browser(&app.iap, &viewer, repo, &app.config.repositories)
         .map_err(|message| Reply::error(403, message))
 }
 
@@ -153,7 +183,7 @@ pub async fn summary(app: &App, headers: &Headers<'_>) -> Reply {
         return reply;
     }
     match read_summary(app, repo).await {
-        Ok(body) => Reply::json(200, body),
+        Ok(body) => Reply::json(200, json!(body)),
         Err(error) => db_error(error),
     }
 }
@@ -176,7 +206,7 @@ async fn authorize_first_then(
     Reply::error(400, message)
 }
 
-async fn read_summary(app: &App, repo: &str) -> anyhow::Result<Value> {
+pub async fn read_summary(app: &App, repo: &str) -> anyhow::Result<Summary> {
     let client = app.pool.get().await?;
     let totals = client
         .query_one(
@@ -221,19 +251,23 @@ async fn read_summary(app: &App, repo: &str) -> anyhow::Result<Value> {
             let day: NaiveDate = row.get(0);
             let hits: i64 = row.get(1);
             let misses: i64 = row.get(2);
-            json!({"day": day.to_string(), "hits": hits, "misses": misses})
+            LookupDay {
+                day: day.to_string(),
+                hits,
+                misses,
+            }
         })
         .collect::<Vec<_>>();
-    Ok(json!({
-        "repo": repo,
-        "manifests": manifests,
-        "manifest_bytes": manifest_bytes,
-        "blobs": blobs.get::<_, i64>(0),
-        "blob_bytes": blobs.get::<_, i64>(1),
-        "last_write_at": last_write_at.map(rfc3339),
-        "last_writer": last_writer,
-        "lookups": lookups,
-    }))
+    Ok(Summary {
+        repo: repo.to_string(),
+        manifests,
+        manifest_bytes,
+        blobs: blobs.get(0),
+        blob_bytes: blobs.get(1),
+        last_write_at: last_write_at.map(rfc3339),
+        last_writer,
+        lookups,
+    })
 }
 
 /// `GET /v1/cache/entries?repo=&limit=&before=&target=`
@@ -261,7 +295,7 @@ pub async fn entries(app: &App, headers: &Headers<'_>) -> Reply {
     };
     let after = match param(&pairs, "before").filter(|text| !text.is_empty()) {
         None => None,
-        Some(text) => match Cursor::decode(text).filter(|c| c.created_at().is_some()) {
+        Some(text) => match Cursor::parse(text) {
             Some(cursor) => Some(cursor),
             None => return Reply::error(400, "before is not a cursor this server issued"),
         },
@@ -278,7 +312,9 @@ struct Row {
     created_at: DateTime<Utc>,
 }
 
-async fn read_entries(
+/// A page of at most `limit` entries after `after`, and the cursor for the
+/// next page. `target` is a case-insensitive substring filter.
+pub async fn read_entries(
     app: &App,
     repo: &str,
     limit: usize,

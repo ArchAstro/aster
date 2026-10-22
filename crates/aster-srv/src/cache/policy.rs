@@ -84,20 +84,18 @@ pub fn iap_reader(
     })
 }
 
-/// Whether an IAP viewer may browse the cache: the viewer domain rule, or
-/// an exact `ASTER_SRV_CACHE_ADMIN_EMAILS` entry, and a repository the
-/// server serves.
+/// Whether an IAP viewer may browse the cache: the viewer domain rule and
+/// a repository the server serves.
 pub fn iap_browser(
     iap: &IapVerifier,
     viewer: &Viewer,
     repo: &str,
-    config: &Config,
+    allowlist: &crate::config::RepositoryAllowlist,
 ) -> Result<(), &'static str> {
-    let email = viewer.email.to_ascii_lowercase();
-    if !iap.allows_email(&viewer.email) && !config.cache_admin_emails.contains(&email) {
+    if !iap.allows_email(&viewer.email) {
         return Err("this viewer may not browse the cache");
     }
-    if !config.repositories.allows(repo) {
+    if !allowlist.allows(repo) {
         return Err("this repository may not use the cache");
     }
     Ok(())
@@ -179,30 +177,17 @@ mod tests {
     }
 
     #[test]
-    fn browsing_allows_domain_viewers_and_exact_admin_emails_on_served_repos() {
-        let config = config(&[(
-            "ASTER_SRV_CACHE_ADMIN_EMAILS",
-            "Admin@Svc.Example.org, other@svc.example.org",
-        )]);
+    fn browsing_allows_domain_viewers_on_served_repos() {
+        let config = config(&[]);
         let iap = IapVerifier::new(&config);
         let viewer = |email: &str| Viewer {
             email: email.into(),
         };
         let repo = "ArchAstro/firstlanding";
-        assert!(iap_browser(&iap, &viewer("ada@example.com"), repo, &config).is_ok());
-        assert!(iap_browser(&iap, &viewer("admin@svc.example.org"), repo, &config).is_ok());
-        assert!(iap_browser(&iap, &viewer("ADMIN@svc.example.org"), repo, &config).is_ok());
-        assert!(iap_browser(&iap, &viewer("eve@other.test"), repo, &config).is_err());
-        assert!(iap_browser(&iap, &viewer("evil-admin@svc.example.org"), repo, &config).is_err());
-        assert!(iap_browser(&iap, &viewer("admin@svc.example.org"), "evil/x", &config).is_err());
-        // An admin email does not become a writer or a viewer for lookups.
-        assert!(iap_reader(
-            &iap,
-            &viewer("admin@svc.example.org"),
-            repo,
-            &config.repositories
-        )
-        .is_err());
+        let allow = &config.repositories;
+        assert!(iap_browser(&iap, &viewer("ada@example.com"), repo, allow).is_ok());
+        assert!(iap_browser(&iap, &viewer("eve@other.test"), repo, allow).is_err());
+        assert!(iap_browser(&iap, &viewer("ada@example.com"), "evil/x", allow).is_err());
     }
 
     #[test]

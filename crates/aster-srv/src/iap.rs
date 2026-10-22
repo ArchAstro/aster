@@ -122,28 +122,13 @@ impl IapVerifier {
     /// Check the `x-goog-iap-jwt-assertion` header value. Callers check
     /// [`Self::enabled`] first.
     pub async fn verify(&self, assertion: Option<&str>) -> Result<Viewer, ViewerError> {
-        let viewer = self.verify_unrestricted(assertion).await?;
-        self.allow(viewer.email)
-    }
-
-    /// Like [`Self::verify`] but without the `ASTER_SRV_UI_EMAIL_DOMAINS`
-    /// rule. The caller decides which emails are let in, as the cache
-    /// browsing routes do with `ASTER_SRV_CACHE_ADMIN_EMAILS`.
-    pub async fn verify_unrestricted(
-        &self,
-        assertion: Option<&str>,
-    ) -> Result<Viewer, ViewerError> {
         let audience = match &self.mode {
             Mode::Disabled => {
                 return Err(ViewerError::Unauthenticated(
                     "the dashboard is disabled".into(),
                 ))
             }
-            Mode::Dev(email) => {
-                return Ok(Viewer {
-                    email: email.clone(),
-                })
-            }
+            Mode::Dev(email) => return self.allow(email.clone()),
             Mode::Iap(audience) => audience,
         };
         let token = assertion
@@ -177,7 +162,7 @@ impl IapVerifier {
             .email
             .filter(|email| !email.is_empty())
             .ok_or_else(|| invalid("the assertion names no email".into()))?;
-        Ok(Viewer { email })
+        self.allow(email)
     }
 
     fn allow(&self, email: String) -> Result<Viewer, ViewerError> {
