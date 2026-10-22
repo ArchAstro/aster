@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "aster"
-version = "0.23.0"
+version = "0.23.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
