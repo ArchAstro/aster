@@ -4,7 +4,8 @@
 //! Credentials `signBlob` as the pod's own service account. No key file is
 //! stored or loaded. Tests inject a signer that records the payload and
 //! returns a fixed signature, so the suite can prove the URL expires and
-//! names no key.
+//! names no key. `tests` checks the canonical request and signed URL against
+//! Google's published V4 vectors with a real RSA key.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -137,6 +138,8 @@ pub async fn signed_url(
     let canonical_headers = "host:storage.googleapis.com\n";
     let signed_headers = "host";
     let canonical_query = canonical_query(&credential, &datetime, expires, signed_headers);
+    // The URL path and the signed path are the same bytes. GCS verifies the
+    // signature against the path it receives.
     let encoded_object = canonical_object(object);
     let canonical_request = format!(
         "{method}\n/{bucket}/{encoded_object}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD",
@@ -146,18 +149,21 @@ pub async fn signed_url(
     let string_to_sign = format!("GOOG4-RSA-SHA256\n{datetime}\n{credential_scope}\n{hash}");
     let signature = hex_encode(&signer.sign(string_to_sign.as_bytes()).await?);
     Ok(format!(
-        "https://storage.googleapis.com/{bucket}/{object}?{canonical_query}&X-Goog-Signature={signature}"
+        "https://storage.googleapis.com/{bucket}/{encoded_object}?{canonical_query}&X-Goog-Signature={signature}"
     ))
 }
 
+/// The object name as it appears in both the URL path and the canonical
+/// request: percent-encoded except for `/` (and the unreserved characters),
+/// the way Google's reference signer does `quote(name, safe="/~")`. Encoding
+/// `/` as `%2F` signs a path the client never requests, so GCS answers
+/// `SignatureDoesNotMatch`.
 fn canonical_object(object: &str) -> String {
-    // GCS hashes each path segment, then joins them with `%2F`. The URL
-    // itself keeps the slashes; only the string to sign encodes them.
     object
         .split('/')
         .map(percent_encode)
         .collect::<Vec<_>>()
-        .join("%2F")
+        .join("/")
 }
 
 fn canonical_query(credential: &str, datetime: &str, expires: u64, signed_headers: &str) -> String {
@@ -306,5 +312,138 @@ impl Signer for FixedSigner {
 
     fn service_account_email(&self) -> &str {
         &self.email
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Google's published V4 signing vectors
+    //! (`googleapis/conformance-tests`, `storage/v1/v4_signatures.json`),
+    //! restricted to this feature set: path-style URL, GET or PUT, only
+    //! `host` signed, `UNSIGNED-PAYLOAD`, no extra query parameters.
+
+    use super::*;
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        client_email: String,
+        private_key: String,
+        tests: Vec<Vector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Vector {
+        description: String,
+        bucket: String,
+        object: String,
+        method: String,
+        expiration: u64,
+        timestamp: String,
+        expected_url: String,
+        expected_canonical_request: String,
+        expected_string_to_sign: String,
+    }
+
+    /// Signs with the vector's RSA key and records what it was asked to sign.
+    struct LocalRsaSigner {
+        email: String,
+        key: RsaKeyPair,
+        payloads: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Signer for LocalRsaSigner {
+        fn sign<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                self.payloads.lock().unwrap().push(payload.to_vec());
+                let mut signature = vec![0; self.key.public_modulus_len()];
+                self.key
+                    .sign(
+                        &RSA_PKCS1_SHA256,
+                        &SystemRandom::new(),
+                        payload,
+                        &mut signature,
+                    )
+                    .map_err(|_| anyhow::anyhow!("RSA signing failed"))?;
+                Ok(signature)
+            })
+        }
+
+        fn service_account_email(&self) -> &str {
+            &self.email
+        }
+    }
+
+    fn local_signer(fixture: &Fixture) -> LocalRsaSigner {
+        let body: String = fixture
+            .private_key
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("PEM body is base64");
+        LocalRsaSigner {
+            email: fixture.client_email.clone(),
+            key: RsaKeyPair::from_pkcs8(&der).expect("vector key parses"),
+            payloads: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_googles_v4_signing_vectors() {
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../tests/fixtures/gcs-v4-conformance.json"))
+                .expect("fixture parses");
+        assert!(fixture.tests.len() >= 4);
+        for vector in &fixture.tests {
+            let signer = local_signer(&fixture);
+            let method = match vector.method.as_str() {
+                "GET" => Method::Get,
+                "PUT" => Method::Put,
+                other => panic!("unsupported method {other}"),
+            };
+            let now = parse_datetime(&vector.timestamp.replace(['-', ':'], ""))
+                .expect("timestamp parses");
+            let url = signed_url(
+                &signer,
+                &vector.bucket,
+                &vector.object,
+                method,
+                now,
+                Duration::from_secs(vector.expiration),
+            )
+            .await
+            .unwrap();
+            let payloads = signer.payloads.lock().unwrap();
+            let payload = String::from_utf8(payloads[0].clone()).unwrap();
+            assert_eq!(
+                payload, vector.expected_string_to_sign,
+                "string to sign: {}",
+                vector.description
+            );
+            // Google's canonical request hashes to the vector's string to
+            // sign, so the string to sign above proves our canonical request.
+            let hash = vector.expected_string_to_sign.rsplit('\n').next().unwrap();
+            assert_eq!(
+                sha256_hex(vector.expected_canonical_request.as_bytes()),
+                hash,
+                "vector is self-consistent: {}",
+                vector.description
+            );
+            assert_eq!(
+                url, vector.expected_url,
+                "signed URL: {}",
+                vector.description
+            );
+        }
+    }
+
+    #[test]
+    fn object_slashes_stay_literal_and_the_rest_is_encoded() {
+        assert_eq!(canonical_object("cas/abc"), "cas/abc");
+        assert_eq!(canonical_object("a b/c&d~"), "a%20b/c%26d~");
     }
 }
