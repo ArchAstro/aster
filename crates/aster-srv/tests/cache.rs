@@ -350,7 +350,7 @@ async fn lookup_omits_a_blob_missing_from_gcs() {
 }
 
 #[tokio::test]
-async fn policy_matrix_pr_oidc_forbidden_iap_reads_only() {
+async fn policy_matrix_pr_oidc_forbidden_person_reads_only() {
     let Some((server, _)) = server().await else {
         return;
     };
@@ -407,43 +407,43 @@ async fn policy_matrix_pr_oidc_forbidden_iap_reads_only() {
         .await;
     assert_eq!(status, 200);
 
-    let viewer = common::iap_assertion("ada@example.com");
+    let viewer = common::person_bearer(&server, "ada@example.com");
     let (status, looked) = server
         .post_json(
             "/v1/cache/lookup",
             &json!({"repo": REPO, "keys": ["k"]}),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 200, "{looked}");
     let (status, denied) = server
-        .post_json("/v1/cache/upload", &body, None, Some(&viewer))
+        .post_json("/v1/cache/upload", &body, Some(&viewer), None)
         .await;
     assert_eq!(status, 403, "{denied}");
     let (status, denied) = server
-        .post_json("/v1/cache/commit", &commit, None, Some(&viewer))
+        .post_json("/v1/cache/commit", &commit, Some(&viewer), None)
         .await;
     assert_eq!(status, 403, "{denied}");
 
-    let outsider = common::iap_assertion("ada@other.test");
+    let outsider = common::person_bearer(&server, "ada@other.test");
     let (status, _) = server
         .post_json(
             "/v1/cache/lookup",
             &json!({"repo": REPO, "keys": ["k"]}),
-            None,
             Some(&outsider),
+            None,
         )
         .await;
     assert_eq!(status, 403);
 
-    // A viewer may not look up a repository the server does not serve.
+    // A person may not look up a repository the server does not serve.
     let (status, _) = server
         .post_json(
             "/v1/cache/lookup",
             &json!({"repo": "evil/other", "keys": ["k"]}),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 403);
@@ -685,13 +685,13 @@ async fn a_viewer_reads_back_what_ci_wrote_and_how_lookups_fared() {
     // The stats write runs after the reply.
     assert_eq!(wait_for_stats(&server.client().await, 1, 1).await, (1, 1));
 
-    // Phase 3: a viewer inside the allowed domain reads through IAP.
-    let viewer = common::iap_assertion(VIEWER);
+    // Phase 3: a signed-in person inside the allowed domain reads with their token.
+    let viewer = common::person_bearer(&server, VIEWER);
     let (status, summary) = server
         .get_json(
             &format!("/v1/cache/summary?repo={REPO}"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 200, "{summary}");
@@ -719,8 +719,8 @@ async fn a_viewer_reads_back_what_ci_wrote_and_how_lookups_fared() {
     let (status, page) = server
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 200, "{page}");
@@ -751,8 +751,8 @@ async fn a_viewer_reads_back_what_ci_wrote_and_how_lookups_fared() {
         .post_json(
             "/v1/cache/commit",
             &json!({"repo": REPO, "key": "viewer-key", "manifest": manifest}),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 403);
@@ -772,12 +772,16 @@ async fn browsing_routes_authorize_viewers_and_ci() {
         assert_eq!(status, 401, "{path}");
         // A domain viewer may read.
         let (status, body) = server
-            .get_json(path, None, Some(&common::iap_assertion(VIEWER)))
+            .get_json(path, Some(&common::person_bearer(&server, VIEWER)), None)
             .await;
         assert_eq!(status, 200, "{body}");
         // An email outside the viewer domains.
         let (status, _) = server
-            .get_json(path, None, Some(&common::iap_assertion("eve@other.test")))
+            .get_json(
+                path,
+                Some(&common::person_bearer(&server, "eve@other.test")),
+                None,
+            )
             .await;
         assert_eq!(status, 403);
         // CI reads its own repository, from any ref.
@@ -789,10 +793,10 @@ async fn browsing_routes_authorize_viewers_and_ci() {
             .get_json(path, Some(&bearer("ArchAstro/other", None)), None)
             .await;
         assert_eq!(status, 403);
-        // An IAP viewer may not browse a repository the server does not serve.
+        // A person may not browse a repository the server does not serve.
         let other = path.replace(REPO, "evil/other");
         let (status, _) = server
-            .get_json(&other, None, Some(&common::iap_assertion(VIEWER)))
+            .get_json(&other, Some(&common::person_bearer(&server, VIEWER)), None)
             .await;
         assert_eq!(status, 403);
         // Bad bearer token.
@@ -805,8 +809,8 @@ async fn browsing_routes_authorize_viewers_and_ci() {
     let (status, _) = server
         .get_json(
             "/v1/cache/entries",
+            Some(&common::person_bearer(&server, VIEWER)),
             None,
-            Some(&common::iap_assertion(VIEWER)),
         )
         .await;
     assert_eq!(status, 400);
@@ -831,7 +835,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let Some((server, _)) = server().await else {
         return;
     };
-    let viewer = common::iap_assertion(VIEWER);
+    let viewer = common::person_bearer(&server, VIEWER);
     let client = server.client().await;
     // Five rows; b and c share a created_at to exercise the key tie-break.
     let base = Utc::now();
@@ -865,8 +869,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
         let (status, page) = server
             .get_json(
                 &format!("/v1/cache/entries?repo={REPO}&limit=2&before={before}"),
-                None,
                 Some(&viewer),
+                None,
             )
             .await;
         assert_eq!(status, 200, "{page}");
@@ -884,8 +888,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let (_, page) = server
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     let bad = page["entries"]
@@ -906,8 +910,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let (status, filtered) = server
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}&target=X%3A&limit=1"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 200, "{filtered}");
@@ -916,8 +920,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let (_, filtered) = server
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}&target=x:&limit=5"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     let keys: Vec<&str> = filtered["entries"]
@@ -934,8 +938,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
         let (status, _) = server
             .get_json(
                 &format!("/v1/cache/entries?repo={REPO}&{query}"),
-                None,
                 Some(&viewer),
+                None,
             )
             .await;
         assert_eq!(status, 400, "{query}");
@@ -944,8 +948,8 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let (_, empty) = server
         .get_json(
             "/v1/cache/entries?repo=ArchAstro/other",
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(empty["entries"], json!([]));
@@ -1297,12 +1301,12 @@ async fn insert_entry(
 }
 
 async fn entry_targets(server: &common::Server, query: &str) -> (Vec<String>, Option<String>) {
-    let viewer = common::iap_assertion(VIEWER);
+    let viewer = common::person_bearer(server, VIEWER);
     let (status, page) = server
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}&{query}"),
-            None,
             Some(&viewer),
+            None,
         )
         .await;
     assert_eq!(status, 200, "{page}");

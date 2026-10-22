@@ -102,6 +102,33 @@ pub struct Config {
     /// `ASTER_SRV_CACHE_WRITERS`: `repo=ref` patterns that may upload and
     /// commit. Default `*=refs/heads/<default branch>`.
     pub cache_writers: CacheWriters,
+    /// `ASTER_SRV_PUBLIC_URL`: the URL people reach this server at, the
+    /// `iss` of the tokens `aster cache login` hands out. Unset turns
+    /// person login off.
+    pub public_url: Option<String>,
+    /// `ASTER_SRV_CLI_TOKEN_KEYS`: `kid:secret` pairs, comma-separated. The
+    /// first signs person tokens; every one verifies them, so a key is
+    /// rotated out by dropping its pair. Unset turns person login off.
+    pub cli_token_keys: Vec<CliTokenKey>,
+    /// `ASTER_SRV_CLI_TOKEN_TTL`: seconds a person token lives, 60 to
+    /// 604800. Default 43200 (12 hours).
+    pub cli_token_ttl: u64,
+}
+
+/// One HS256 key for person tokens.
+#[derive(Clone)]
+pub struct CliTokenKey {
+    pub kid: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for CliTokenKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliTokenKey")
+            .field("kid", &self.kid)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
 }
 
 /// When tests enter and leave quarantine.
@@ -251,6 +278,31 @@ impl Config {
         }
         let cache_writers =
             CacheWriters::parse(var("ASTER_SRV_CACHE_WRITERS").as_deref(), &default_branch)?;
+        let public_url = match var("ASTER_SRV_PUBLIC_URL") {
+            Some(url) => {
+                let url = url.trim().trim_end_matches('/').to_string();
+                if !(url.starts_with("https://") || url.starts_with("http://"))
+                    || url.contains(['?', '#'])
+                {
+                    bail!("ASTER_SRV_PUBLIC_URL must be an http(s) URL such as https://aster-srv.example.com");
+                }
+                Some(url)
+            }
+            None => None,
+        };
+        let cli_token_keys = match var("ASTER_SRV_CLI_TOKEN_KEYS") {
+            Some(value) => parse_cli_token_keys(&value)?,
+            None => Vec::new(),
+        };
+        let cli_token_ttl = match var("ASTER_SRV_CLI_TOKEN_TTL") {
+            Some(value) => value
+                .trim()
+                .parse()
+                .ok()
+                .filter(|seconds| (60..=604_800).contains(seconds))
+                .context("ASTER_SRV_CLI_TOKEN_TTL must be a number of seconds from 60 to 604800")?,
+            None => 12 * 60 * 60,
+        };
         Ok(Self {
             listen,
             database_url,
@@ -272,8 +324,44 @@ impl Config {
             cache_signer,
             cache_days,
             cache_writers,
+            public_url,
+            cli_token_keys,
+            cli_token_ttl,
         })
     }
+}
+
+/// `kid:secret` pairs. A kid is letters, digits, `-`, `_` or `.`; a secret
+/// is at least 32 characters.
+fn parse_cli_token_keys(value: &str) -> Result<Vec<CliTokenKey>> {
+    let mut keys: Vec<CliTokenKey> = Vec::new();
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (kid, secret) = entry
+            .split_once(':')
+            .context("ASTER_SRV_CLI_TOKEN_KEYS entries are kid:secret")?;
+        let (kid, secret) = (kid.trim(), secret.trim());
+        if kid.is_empty()
+            || !kid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            bail!("ASTER_SRV_CLI_TOKEN_KEYS key ids use letters, digits, '-', '_' and '.'");
+        }
+        if secret.len() < 32 {
+            bail!("ASTER_SRV_CLI_TOKEN_KEYS secrets must be at least 32 characters");
+        }
+        if keys.iter().any(|key| key.kid == kid) {
+            bail!("ASTER_SRV_CLI_TOKEN_KEYS names key id '{kid}' twice");
+        }
+        keys.push(CliTokenKey {
+            kid: kid.to_string(),
+            secret: secret.to_string(),
+        });
+    }
+    if keys.is_empty() {
+        bail!("ASTER_SRV_CLI_TOKEN_KEYS lists no key");
+    }
+    Ok(keys)
 }
 
 /// Repositories allowed to use the server.
@@ -461,6 +549,62 @@ mod tests {
             .cache_writers
             .allows("ArchAstro/aster", Some("refs/pull/7/merge")));
         assert!(!config.cache_writers.allows("ArchAstro/aster", None));
+        // Person sign-in is off until configured.
+        assert!(config.public_url.is_none());
+        assert!(config.cli_token_keys.is_empty());
+        assert_eq!(config.cli_token_ttl, 12 * 60 * 60);
+    }
+
+    #[test]
+    fn reads_sign_in_settings() {
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.extend_from_slice(extra);
+            Config::from_env(env_of(&pairs))
+        };
+        let secret = "0123456789abcdef0123456789abcdef";
+        let config = with(&[
+            ("ASTER_SRV_PUBLIC_URL", "https://aster-srv.example.com/"),
+            (
+                "ASTER_SRV_CLI_TOKEN_KEYS",
+                &format!("k2:{secret}, k1:{secret}x"),
+            ),
+            ("ASTER_SRV_CLI_TOKEN_TTL", "3600"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://aster-srv.example.com")
+        );
+        let kids: Vec<_> = config
+            .cli_token_keys
+            .iter()
+            .map(|k| k.kid.as_str())
+            .collect();
+        assert_eq!(kids, ["k2", "k1"], "the first key signs");
+        assert_eq!(config.cli_token_ttl, 3600);
+        // Secrets stay out of debug output.
+        assert!(!format!("{:?}", config.cli_token_keys).contains(secret));
+
+        for (name, value) in [
+            ("ASTER_SRV_PUBLIC_URL", "aster-srv.example.com"),
+            ("ASTER_SRV_PUBLIC_URL", "https://x.example.com/?a=b"),
+            ("ASTER_SRV_CLI_TOKEN_KEYS", "k1:short"),
+            ("ASTER_SRV_CLI_TOKEN_KEYS", "no-colon"),
+            (
+                "ASTER_SRV_CLI_TOKEN_KEYS",
+                "bad kid:0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "ASTER_SRV_CLI_TOKEN_KEYS",
+                "k:0123456789abcdef0123456789abcdef,k:fedcba9876543210fedcba9876543210",
+            ),
+            ("ASTER_SRV_CLI_TOKEN_TTL", "30"),
+            ("ASTER_SRV_CLI_TOKEN_TTL", "999999999"),
+            ("ASTER_SRV_CLI_TOKEN_TTL", "12h"),
+        ] {
+            assert!(with(&[(name, value)]).is_err(), "{name}={value}");
+        }
     }
 
     #[test]

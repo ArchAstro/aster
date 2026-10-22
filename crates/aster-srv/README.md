@@ -331,8 +331,11 @@ repository can upload only its own results.
 
 ### Behind Google IAP
 
-To keep the server off the open internet, put it behind Identity-Aware Proxy
-and let CI pass IAP with Workload Identity Federation:
+`/v1/*` authenticates every request itself (a CI OIDC token, or a person's
+token, below), so it can be served without IAP in front of it; `/`, `/ui`,
+`/cli-auth` and `/healthz` are for browsers and stay behind IAP. A deployment
+that still puts IAP in front of `/v1` can let CI pass it with Workload
+Identity Federation. The server ignores `Proxy-Authorization`:
 
 1. CI exchanges its GitHub OIDC token for a Google service account
    (`google-github-actions/auth`) that holds `roles/iap.httpsResourceAccessor`
@@ -409,6 +412,9 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
+| `ASTER_SRV_PUBLIC_URL` | unset | The URL people reach the server at (`https://aster-srv.example.com`); the `iss` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). |
+| `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated; secrets at least 32 characters. The first signs person tokens and form MACs; all verify. Required for sign-in. Keep it in a secret store. |
+| `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 604800. |
 
 Logs are one JSON object per line, with `severity` and `message`.
 
@@ -468,16 +474,44 @@ and adds the request's hits and misses to today's row in
 `cache.lookup_stats`. Counting is best effort: a failure is logged and the
 lookup still answers. Keys repeated in one request count once.
 
-Reads accept any authenticated CI token for the repository, and an IAP viewer
-whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. The two `GET` browsing routes
-answer `401` without an identity and `403` for a viewer outside those domains,
-a repository the server does not serve, or a CI token for another repository.
-People browse the same data on the dashboard at `/ui/cache`. There is no
-separate allow-list for browsing: whoever may view the dashboard may browse
-the cache. Writes accept a static
-development token, or a CI token whose `ref` matches `ASTER_SRV_CACHE_WRITERS`
-(default the repository's default branch, `refs/heads/main`). A pull-request
-ref is refused with `403`, so a branch cannot poison the cache.
+Every route needs a bearer token; an IAP assertion alone is never accepted
+here, so a request with neither answers `401`. Reads accept any authenticated
+CI token for the repository, and a person's token (see
+[Laptop sign-in](#laptop-sign-in)) whose email `ASTER_SRV_UI_EMAIL_DOMAINS`
+allows, for any repository on `ASTER_SRV_REPOSITORIES`. The two `GET` browsing
+routes answer `401` without a token and `403` for a person outside those
+domains, a repository the server does not serve, or a CI token for another
+repository. People browse the same data on the dashboard at `/ui/cache`.
+Writes accept a static development token, or a CI token whose `ref` matches
+`ASTER_SRV_CACHE_WRITERS` (default the repository's default branch,
+`refs/heads/main`). A pull-request ref is refused with `403`, so a branch
+cannot poison the cache, and so is a person's token. A person's token is
+refused on every test-result route.
+
+## Laptop sign-in
+
+`aster cache login` signs a person in so a laptop can read the cache. It is
+an authorization-code flow with PKCE against the CLI's loopback port.
+
+| Route | |
+|---|---|
+| `GET /cli-auth?port=&challenge=&state=` | Behind IAP. Needs a valid IAP assertion from an allowed domain. Renders "Authorize aster CLI as `email`?" with a form that carries a MAC over the email, challenge, port, state and an expiry (10 minutes), so a page rendered for one person cannot be submitted for another. `port` is 1024 to 65535, `challenge` a 43-character base64url SHA-256, `state` 1 to 128 base64url characters. |
+| `POST /cli-auth` | Behind IAP. Re-verifies the assertion and the MAC, stores the SHA-256 of a new 256-bit code (`auth.cli_codes`, 60 seconds), and answers `302 http://127.0.0.1:<port>/callback?code=&state=`: loopback only, never another host. |
+| `POST /v1/auth/token` | `{code, verifier, port}` → `{token, expires_at, email}`. Not behind IAP: the code and the PKCE verifier are the credential. One `DELETE ... RETURNING` spends the code, so it works once even across replicas. Every refusal (unknown, spent or expired code, wrong verifier or port, malformed body) is the same `400 {"error":"invalid_grant"}`. |
+
+A person's token is an HS256 JWT signed by this server: `iss` is
+`ASTER_SRV_PUBLIC_URL`, `aud` is `aster-cli`, `sub` is the email IAP verified,
+`scope` is `cache:read`, with `iat`, `exp` and `jti`, and a `kid` header. There
+are no refresh tokens. `/v1/*` reads the token's `alg`: HS256 goes to these
+keys only and RS256 to the GitHub OIDC verifier only; any other algorithm is
+`401`. The domain rule is applied again on every request, so narrowing
+`ASTER_SRV_UI_EMAIL_DOMAINS` takes effect on tokens already issued.
+
+Sign-in is off, failing closed, unless both `ASTER_SRV_CLI_TOKEN_KEYS` and
+`ASTER_SRV_PUBLIC_URL` are set and IAP (`ASTER_SRV_IAP_AUDIENCE`) is
+configured: `/cli-auth` and `/v1/auth/token` answer `404` and person tokens are
+refused. Rotate keys by adding a new first pair, waiting out the token
+lifetime, then dropping the old pair.
 
 Every six hours one replica drops manifests unused for `ASTER_SRV_CACHE_DAYS`
 (default 14) and blobs no remaining manifest names, and deletes those objects.
@@ -485,7 +519,7 @@ It also deletes `cas/` objects no commit recorded once they are older than
 the same cutoff: signed PUTs whose commit never came. The pod needs
 `storage.objects.list` on the bucket for this. The same pass drops
 `cache.lookup_stats` days older than the longer of 30 days and
-`ASTER_SRV_CACHE_DAYS`.
+`ASTER_SRV_CACHE_DAYS`, and sign-in codes nobody redeemed (`auth.cli_codes`).
 
 A lookup answers before its day's `cache.lookup_stats` row is written: that
 write runs afterwards with a 3 second limit, and a failure is logged and the

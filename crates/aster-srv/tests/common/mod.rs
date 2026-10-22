@@ -20,6 +20,9 @@ const PUBLIC: &[u8] = include_bytes!("../fixtures/test-oidc-key.pub.pem");
 /// The audience dashboard tests configure and sign for.
 pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
 pub const REPO: &str = "ArchAstro/firstlanding";
+/// What the test server answers to, and how it signs person tokens.
+pub const PUBLIC_URL: &str = "https://aster-srv.test";
+pub const CLI_TOKEN_KEYS: &str = "t1:test-signing-secret-0123456789abcdef";
 
 /// A P-256 key pair made for this test process, so no private key is
 /// checked in: `(signing key as PKCS#8, public key as an uncompressed point)`.
@@ -42,6 +45,11 @@ pub struct Server {
     pub url: String,
     admin_url: String,
     database: String,
+    database_url: String,
+    /// The settings it started with, which [`Server::second`] repeats.
+    env: Vec<(String, String)>,
+    /// False for a [`Server::second`] on another server's database.
+    owns_database: bool,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -51,6 +59,9 @@ impl Server {
             let _ = shutdown.send(());
         }
         self.app.pool.close();
+        if !self.owns_database {
+            return;
+        }
         let (admin, connection) = tokio_postgres::connect(&self.admin_url, tokio_postgres::NoTls)
             .await
             .unwrap();
@@ -119,13 +130,41 @@ pub async fn start_with(
     let (base, _) = admin_url.rsplit_once('/').unwrap();
     let database_url = format!("{base}/{database}");
 
+    let (app, url, shutdown) = launch(&database_url, env, cache_store).await;
+    Some(Server {
+        app,
+        url,
+        admin_url,
+        database,
+        database_url,
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        owns_database: true,
+        shutdown: Some(shutdown),
+    })
+}
+
+/// Build the app on `database_url` and serve it on a free port.
+async fn launch(
+    database_url: &str,
+    env: &[(&str, &str)],
+    cache_store: Option<aster_srv::cache::BlobStore>,
+) -> (Arc<App>, String, tokio::sync::oneshot::Sender<()>) {
     let config = Config::from_env(|name| match name {
-        "ASTER_SRV_DATABASE_URL" => Some(database_url.clone()),
+        "ASTER_SRV_DATABASE_URL" => Some(database_url.to_string()),
         "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
         other => env
             .iter()
             .find(|(key, _)| *key == other)
-            .map(|(_, value)| value.to_string()),
+            .map(|(_, value)| value.to_string())
+            // Person sign-in is on unless a test sets either to "" (unset).
+            .or_else(|| match other {
+                "ASTER_SRV_PUBLIC_URL" => Some(PUBLIC_URL.into()),
+                "ASTER_SRV_CLI_TOKEN_KEYS" => Some(CLI_TOKEN_KEYS.into()),
+                _ => None,
+            }),
     })
     .unwrap();
     let verifier =
@@ -147,13 +186,29 @@ pub async fn start_with(
     tokio::spawn(aster_srv::serve(Arc::clone(&app), listener, async {
         let _ = stopped.await;
     }));
-    Some(Server {
-        app,
-        url,
-        admin_url,
-        database,
-        shutdown: Some(shutdown),
-    })
+    (app, url, shutdown)
+}
+
+impl Server {
+    /// Another server process's worth of app on this server's database: a
+    /// second replica, or the same server after a configuration change.
+    /// `changes` override the settings this server started with. It does
+    /// not own the database; stop the first server last.
+    pub async fn second(&self, changes: &[(&str, &str)]) -> Server {
+        let mut env: Vec<(&str, &str)> = changes.to_vec();
+        env.extend(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let (app, url, shutdown) = launch(&self.database_url, &env, None).await;
+        Server {
+            app,
+            url,
+            admin_url: self.admin_url.clone(),
+            database: self.database.clone(),
+            database_url: self.database_url.clone(),
+            env: self.env.clone(),
+            owns_database: false,
+            shutdown: Some(shutdown),
+        }
+    }
 }
 
 impl Server {
@@ -228,6 +283,17 @@ impl Server {
         let headers = response.headers().clone();
         (status, headers, response.text().await.unwrap())
     }
+}
+
+/// An `Authorization` value holding a person token for `email`, as
+/// `aster cache login` would have fetched it.
+pub fn person_bearer(server: &Server, email: &str) -> String {
+    let issuer = server
+        .app
+        .person_tokens
+        .as_ref()
+        .expect("person sign-in is configured");
+    format!("Bearer {}", issuer.issue(email).unwrap().token)
 }
 
 /// An IAP assertion for `email`, signed with the fixture key.

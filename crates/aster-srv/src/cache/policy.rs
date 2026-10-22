@@ -1,21 +1,34 @@
 //! Who may read and write the cache.
 //!
-//! Reads: any authenticated CI token for the repository, and an IAP viewer
-//! whose email domain is allowed. Writes: a static development token, or a CI
+//! Reads: any authenticated CI token for the repository, and a signed-in
+//! person (`aster cache login`) whose email domain is allowed, for any
+//! repository the server serves. Writes: a static development token, or a CI
 //! token whose `ref` claim matches `ASTER_SRV_CACHE_WRITERS`. A pull-request
 //! ref does not match the default, so a branch cannot poison the cache.
+//! People never write.
 
 use crate::auth::Identity;
 use crate::config::Config;
-use crate::iap::{IapVerifier, Viewer};
+use crate::iap::IapVerifier;
+use crate::person::Person;
 
 /// A caller allowed to look up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reader {
     pub repository: String,
     pub may_write: bool,
-    /// Recorded on a commit. Empty for an IAP viewer, who cannot write.
+    /// Recorded on a commit. Empty for a person, who cannot write.
     pub writer: Writer,
+    pub caller: Caller,
+}
+
+/// Which kind of token the reader holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// A CI token: confined to its own repository.
+    Ci,
+    /// A signed-in person: names the repository in the request.
+    Person,
 }
 
 /// Who wrote a manifest, from the verified OIDC claims.
@@ -60,19 +73,21 @@ pub fn ci_reader(config: &Config, identity: &Identity) -> Reader {
                 .cache_writers
                 .allows(&identity.repository, identity.git_ref.as_deref()),
         writer: Writer::from_identity(identity),
+        caller: Caller::Ci,
     }
 }
 
-/// An IAP viewer may look up `repo`. Viewers never write. The verifier has
-/// already applied `ASTER_SRV_UI_EMAIL_DOMAINS`.
-pub fn iap_reader(
+/// A signed-in person may look up `repo`. People never write. The domain
+/// rule is applied again here, so narrowing `ASTER_SRV_UI_EMAIL_DOMAINS`
+/// takes effect on tokens already issued.
+pub fn person_reader(
     iap: &IapVerifier,
-    viewer: &Viewer,
+    person: &Person,
     repo: &str,
     allowlist: &crate::config::RepositoryAllowlist,
 ) -> Result<Reader, &'static str> {
-    if !iap.allows_email(&viewer.email) {
-        return Err("this viewer may not read the cache");
+    if !iap.allows_email(&person.email) {
+        return Err("this person may not read the cache");
     }
     if !allowlist.allows(repo) {
         return Err("this repository may not use the cache");
@@ -81,19 +96,20 @@ pub fn iap_reader(
         repository: repo.to_string(),
         may_write: false,
         writer: Writer::default(),
+        caller: Caller::Person,
     })
 }
 
-/// Whether an IAP viewer may browse the cache: the viewer domain rule and
+/// Whether a signed-in person may browse the cache: the domain rule and
 /// a repository the server serves.
-pub fn iap_browser(
+pub fn person_browser(
     iap: &IapVerifier,
-    viewer: &Viewer,
+    person: &Person,
     repo: &str,
     allowlist: &crate::config::RepositoryAllowlist,
 ) -> Result<(), &'static str> {
-    if !iap.allows_email(&viewer.email) {
-        return Err("this viewer may not browse the cache");
+    if !iap.allows_email(&person.email) {
+        return Err("this person may not browse the cache");
     }
     if !allowlist.allows(repo) {
         return Err("this repository may not use the cache");
@@ -177,17 +193,22 @@ mod tests {
     }
 
     #[test]
-    fn browsing_allows_domain_viewers_on_served_repos() {
+    fn people_read_and_browse_served_repos_in_allowed_domains_and_never_write() {
         let config = config(&[]);
         let iap = IapVerifier::new(&config);
-        let viewer = |email: &str| Viewer {
+        let person = |email: &str| Person {
             email: email.into(),
         };
         let repo = "ArchAstro/firstlanding";
         let allow = &config.repositories;
-        assert!(iap_browser(&iap, &viewer("ada@example.com"), repo, allow).is_ok());
-        assert!(iap_browser(&iap, &viewer("eve@other.test"), repo, allow).is_err());
-        assert!(iap_browser(&iap, &viewer("ada@example.com"), "evil/x", allow).is_err());
+        assert!(person_browser(&iap, &person("ada@example.com"), repo, allow).is_ok());
+        assert!(person_browser(&iap, &person("eve@other.test"), repo, allow).is_err());
+        assert!(person_browser(&iap, &person("ada@example.com"), "evil/x", allow).is_err());
+        let reader = person_reader(&iap, &person("ada@example.com"), repo, allow).unwrap();
+        assert!(!reader.may_write);
+        assert_eq!(reader.caller, Caller::Person);
+        assert!(person_reader(&iap, &person("eve@other.test"), repo, allow).is_err());
+        assert!(person_reader(&iap, &person("ada@example.com"), "evil/x", allow).is_err());
     }
 
     #[test]

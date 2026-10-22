@@ -1,8 +1,8 @@
 //! Read-only browsing of the cache: `GET /v1/cache/summary` and
 //! `GET /v1/cache/entries`.
 //!
-//! Callers are an IAP-verified viewer (the `ASTER_SRV_UI_EMAIL_DOMAINS` rule)
-//! or a CI token for its own repository. The repository must pass the
+//! Callers are a signed-in person (the `ASTER_SRV_UI_EMAIL_DOMAINS` rule) or
+//! a CI token for its own repository, each with a bearer token. The repository must pass the
 //! server's allowlist. The dashboard's `/ui/cache` page reads through
 //! [`read_summary`] and [`read_entries`].
 
@@ -13,8 +13,7 @@ use serde_json::{json, Value};
 
 use super::policy;
 use super::routes::{db_error, Headers};
-use crate::auth::AuthError;
-use crate::iap::ViewerError;
+use crate::auth::Principal;
 use crate::test_results::query::parse_query;
 use crate::App;
 use crate::Reply;
@@ -119,26 +118,19 @@ fn rfc3339(at: DateTime<Utc>) -> String {
 
 /// Check the caller may browse `repo`'s cache.
 async fn authorize(app: &App, headers: &Headers<'_>, repo: &str) -> Result<(), Reply> {
-    if let Some(authorization) = headers.authorization {
-        let identity = match app.verifier.verify(Some(authorization)).await {
-            Ok(identity) => identity,
-            Err(error @ AuthError::Forbidden(_)) => {
-                return Err(Reply::error(403, error.to_string()))
-            }
-            Err(error) => return Err(Reply::error(401, error.to_string())),
-        };
-        return policy::ci_browser(&identity, repo).map_err(|message| Reply::error(403, message));
+    match app
+        .principal(headers.authorization)
+        .await
+        .map_err(|error| error.into_reply())?
+    {
+        Principal::Ci(identity) => {
+            policy::ci_browser(&identity, repo).map_err(|message| Reply::error(403, message))
+        }
+        Principal::Person(person) => {
+            policy::person_browser(&app.iap, &person, repo, &app.config.repositories)
+                .map_err(|message| Reply::error(403, message))
+        }
     }
-    if !app.iap.enabled() {
-        return Err(Reply::error(401, "send a bearer token"));
-    }
-    let viewer = match app.iap.verify(headers.iap_assertion).await {
-        Ok(viewer) => viewer,
-        Err(error @ ViewerError::Forbidden(_)) => return Err(Reply::error(403, error.to_string())),
-        Err(error) => return Err(Reply::error(401, error.to_string())),
-    };
-    policy::iap_browser(&app.iap, &viewer, repo, &app.config.repositories)
-        .map_err(|message| Reply::error(403, message))
 }
 
 /// The query's pairs, or the 400 to send.

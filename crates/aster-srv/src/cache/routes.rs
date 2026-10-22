@@ -10,9 +10,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::browse;
-use super::policy::{self, Reader, Writer};
+use super::policy::{self, Caller, Reader, Writer};
 use super::signing::Method;
-use crate::auth::AuthError;
+use crate::auth::Principal;
 use crate::App;
 use crate::Reply;
 
@@ -43,7 +43,6 @@ struct CommitRequest {
 /// The headers a cache route needs.
 pub struct Headers<'a> {
     pub authorization: Option<&'a str>,
-    pub iap_assertion: Option<&'a str>,
     /// The raw query string, for the read-only browsing routes.
     pub query: Option<&'a str>,
 }
@@ -144,7 +143,7 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         Ok(reader) => reader,
         Err(reply) => return reply,
     };
-    if let Err(reply) = same_repo(&reader, &request.repo, headers) {
+    if let Err(reply) = same_repo(&reader, &request.repo) {
         return reply;
     }
     match lookup_hits(app, &reader.repository, &request.keys).await {
@@ -272,7 +271,7 @@ async fn upload(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         Ok(reader) => reader,
         Err(reply) => return reply,
     };
-    if let Err(reply) = same_repo(&reader, &request.repo, headers) {
+    if let Err(reply) = same_repo(&reader, &request.repo) {
         return reply;
     }
     if !app.cache_store.enabled() {
@@ -311,7 +310,7 @@ async fn commit(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         Ok(reader) => reader,
         Err(reply) => return reply,
     };
-    if let Err(reply) = same_repo(&reader, &request.repo, headers) {
+    if let Err(reply) = same_repo(&reader, &request.repo) {
         return reply;
     }
     let manifest = match base64::engine::general_purpose::STANDARD.decode(request.manifest.trim()) {
@@ -523,10 +522,10 @@ fn is_sha256(value: &str) -> bool {
     value.len() == SHA256_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn same_repo(reader: &Reader, repo: &str, headers: &Headers<'_>) -> Result<(), Reply> {
-    // An IAP viewer names the repository in the body; a CI token may only
-    // touch its own.
-    if headers.authorization.is_some() && repo != reader.repository {
+fn same_repo(reader: &Reader, repo: &str) -> Result<(), Reply> {
+    // A person names the repository in the body; a CI token may only touch
+    // its own.
+    if reader.caller == Caller::Ci && repo != reader.repository {
         return Err(Reply::error(403, "the token is for a different repository"));
     }
     Ok(())
@@ -538,40 +537,25 @@ async fn reader_for(
     repo: &str,
     write: bool,
 ) -> Result<Reader, Reply> {
-    if let Some(authorization) = headers.authorization {
-        let identity = match app.verifier.verify(Some(authorization)).await {
-            Ok(identity) => identity,
-            Err(error @ AuthError::Forbidden(_)) => {
-                return Err(Reply::error(403, error.to_string()))
-            }
-            Err(error) => return Err(Reply::error(401, error.to_string())),
-        };
-        let reader = policy::ci_reader(&app.config, &identity);
-        if write {
-            if let Err(error) = policy::require_writer(&reader) {
-                return Err(Reply::error(403, error.to_string()));
-            }
-        }
-        return Ok(reader);
-    }
-    if !app.iap.enabled() {
-        return Err(Reply::error(401, "send a bearer token"));
-    }
-    let viewer = match app.iap.verify(headers.iap_assertion).await {
-        Ok(viewer) => viewer,
-        Err(error) => {
-            let status = match error {
-                crate::iap::ViewerError::Forbidden(_) => 403,
-                crate::iap::ViewerError::Unauthenticated(_) => 401,
-            };
-            return Err(Reply::error(status, error.to_string()));
+    // Every /v1 request carries its own bearer token. There is no fallback
+    // to an IAP assertion: the route is served without IAP in front of it.
+    let principal = app
+        .principal(headers.authorization)
+        .await
+        .map_err(|error| error.into_reply())?;
+    let reader = match principal {
+        Principal::Ci(identity) => policy::ci_reader(&app.config, &identity),
+        Principal::Person(person) => {
+            policy::person_reader(&app.iap, &person, repo, &app.config.repositories)
+                .map_err(|message| Reply::error(403, message))?
         }
     };
-    match policy::iap_reader(&app.iap, &viewer, repo, &app.config.repositories) {
-        Ok(_) if write => Err(Reply::error(403, "this caller may not write the cache")),
-        Ok(reader) => Ok(reader),
-        Err(message) => Err(Reply::error(403, message)),
+    if write {
+        if let Err(error) = policy::require_writer(&reader) {
+            return Err(Reply::error(403, error.to_string()));
+        }
     }
+    Ok(reader)
 }
 
 pub(super) fn db_error(error: anyhow::Error) -> Reply {

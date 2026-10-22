@@ -4,15 +4,19 @@
 //! feature is CI test results (`/v1/test-results/...`, the `test_results`
 //! schema); the shared artifact cache (`/v1/cache/...`, the `cache` schema)
 //! sits beside it. Both share the core: configuration, GitHub Actions
-//! OIDC authentication, migrations and the HTTP server.
+//! OIDC authentication, migrations and the HTTP server. People sign in
+//! from a laptop with `aster cache login` (`/cli-auth`, [`cli_auth`]) and
+//! hold a token that reads the cache ([`person`]).
 
 pub mod auth;
 pub mod cache;
+pub mod cli_auth;
 pub mod config;
 pub mod db;
 mod http;
 pub mod iap;
 pub mod log;
+pub mod person;
 pub mod raw_store;
 pub mod test_results;
 mod ui;
@@ -67,6 +71,10 @@ pub struct App {
     pub pool: deadpool_postgres::Pool,
     pub verifier: auth::Verifier,
     pub iap: iap::IapVerifier,
+    /// Mints and checks person tokens. `None` when
+    /// `ASTER_SRV_CLI_TOKEN_KEYS` or `ASTER_SRV_PUBLIC_URL` is unset: sign-in
+    /// is then off and person tokens are refused.
+    pub person_tokens: Option<person::TokenIssuer>,
     pub raw_store: raw_store::RawStore,
     /// Blobs for the shared artifact cache. Disabled when no bucket is set.
     pub cache_store: cache::BlobStore,
@@ -102,6 +110,7 @@ pub fn migrations() -> Vec<&'static db::Migration> {
         .iter()
         .chain(webhooks::MIGRATIONS)
         .chain(cache::MIGRATIONS)
+        .chain(cli_auth::MIGRATIONS)
         .collect()
 }
 
@@ -165,6 +174,7 @@ impl App {
         cache_store: Option<cache::BlobStore>,
     ) -> Result<Arc<Self>> {
         let pool = db::pool(&config.database_url)?;
+        let person_tokens = person::TokenIssuer::from_config(&config);
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
         let cache_store = cache_store.unwrap_or_else(|| {
@@ -175,12 +185,21 @@ impl App {
             pool,
             verifier,
             iap,
+            person_tokens,
             raw_store,
             cache_store,
             durations: Default::default(),
             schema_ready: AtomicBool::new(false),
             migration_failure: Default::default(),
         }))
+    }
+
+    /// Who a bearer token names: a CI job or a signed-in person.
+    pub async fn principal(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<auth::Principal, auth::AuthError> {
+        auth::authenticate(&self.verifier, self.person_tokens.as_ref(), authorization).await
     }
 
     /// Apply every migration not yet applied, then mark the schema ready.

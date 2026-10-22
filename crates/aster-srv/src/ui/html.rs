@@ -175,14 +175,18 @@ fn section_path(section: Section) -> &'static str {
 
 /// A bare page for errors raised before there is a viewer or a repository.
 pub fn message_page(title: &str, message: &str) -> String {
+    bare_page(title, &format!("<p>{}</p>", escape(message)))
+}
+
+/// [`message_page`] around `body`, which the caller has already escaped.
+pub fn bare_page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
          <title>{title} - Aster</title><style>{CSS}</style></head><body>\
-         <main><h1>{title}</h1><p>{message}</p></main></body></html>\n",
+         <main><h1>{title}</h1>{body}</main></body></html>\n",
         title = escape(title),
-        message = escape(message),
     )
 }
 

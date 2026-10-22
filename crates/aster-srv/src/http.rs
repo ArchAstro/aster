@@ -17,7 +17,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use crate::auth::{AuthError, Identity};
+use crate::auth::{Identity, Principal};
 use crate::test_results::ingest::{self, Upload};
 use crate::test_results::{durations, query};
 use crate::App;
@@ -37,6 +37,8 @@ pub enum Body {
     Html(String),
     /// Raw bytes, as a signed blob GET returns them.
     Bytes(Bytes),
+    /// A `302` to this URL, with no body.
+    Redirect(String),
 }
 
 impl Reply {
@@ -61,21 +63,41 @@ impl Reply {
         }
     }
 
+    pub fn redirect(location: String) -> Self {
+        Self {
+            status: 302,
+            body: Body::Redirect(location),
+        }
+    }
+
     pub fn error(status: u16, message: impl Into<String>) -> Self {
         Self::json(status, json!({"error": message.into()}))
     }
 
     fn into_response(self) -> Response<Full<Bytes>> {
+        let mut location = None;
         let (content_type, body, is_html) = match self.body {
             Body::Json(body) => ("application/json", Bytes::from(body.to_string()), false),
             Body::Html(page) => ("text/html; charset=utf-8", Bytes::from(page), true),
             Body::Bytes(body) => ("application/octet-stream", body, false),
+            Body::Redirect(url) => {
+                location = Some(url);
+                ("text/plain; charset=utf-8", Bytes::new(), false)
+            }
         };
         let mut response = Response::new(Full::new(body));
         *response.status_mut() =
             StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let headers = response.headers_mut();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        // Sign-in pages, codes and tokens must not be stored by a cache.
+        headers.insert(
+            hyper::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        if let Some(url) = location.and_then(|url| HeaderValue::from_str(&url).ok()) {
+            headers.insert(hyper::header::LOCATION, url);
+        }
         if is_html {
             for (name, value) in crate::ui::SECURITY_HEADERS {
                 headers.insert(
@@ -145,6 +167,25 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             Ok(()) => Reply::json(200, json!({"ok": true})),
             Err(error) => Reply::error(503, format!("the database is unavailable: {error}")),
         },
+        (&Method::GET, "/cli-auth") => {
+            let assertion = header_name(&request, crate::iap::IAP_HEADER);
+            crate::cli_auth::confirm(app, assertion.as_deref(), request.uri().query()).await
+        }
+        (&Method::POST, "/cli-auth") => {
+            let assertion = header_name(&request, crate::iap::IAP_HEADER);
+            let body = match read_body(request, crate::cli_auth::MAX_FORM_BYTES).await {
+                Ok(body) => body,
+                Err(reply) => return reply,
+            };
+            crate::cli_auth::authorize(app, assertion.as_deref(), &body).await
+        }
+        (&Method::POST, "/v1/auth/token") => {
+            let body = match read_body(request, crate::cli_auth::MAX_FORM_BYTES).await {
+                Ok(body) => body,
+                Err(reply) => return reply,
+            };
+            crate::cli_auth::exchange(app, &body).await
+        }
         (&Method::POST, "/v1/test-results/runs") => {
             let identity = match authenticate(app, &request).await {
                 Ok(identity) => identity,
@@ -198,22 +239,40 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
                 .map(str::to_string);
             crate::ui::handle(app, method, path, request.uri().query(), assertion).await
         }
-        (_, "/healthz" | "/readyz" | "/v1/test-results/runs" | "/v1/test-results/durations") => {
-            Reply::error(405, "method not allowed")
-        }
+        (
+            _,
+            "/healthz"
+            | "/readyz"
+            | "/cli-auth"
+            | "/v1/auth/token"
+            | "/v1/test-results/runs"
+            | "/v1/test-results/durations",
+        ) => Reply::error(405, "method not allowed"),
         (_, path) if query::parse_route(path).is_some() => Reply::error(405, "method not allowed"),
         _ => Reply::error(404, "not found"),
     }
 }
 
-/// Who is calling, from the bearer token; the error is the reply to send.
+/// Which CI job is calling, from the bearer token; the error is the reply
+/// to send. A person's token is valid but is for reading the cache only.
 async fn authenticate(app: &App, request: &Request<Incoming>) -> Result<Identity, Reply> {
     let authorization = header(request, AUTHORIZATION);
-    match app.verifier.verify(authorization.as_deref()).await {
-        Ok(identity) => Ok(identity),
-        Err(error @ AuthError::Forbidden(_)) => Err(Reply::error(403, error.to_string())),
-        Err(error) => Err(Reply::error(401, error.to_string())),
+    match app.principal(authorization.as_deref()).await {
+        Ok(Principal::Ci(identity)) => Ok(identity),
+        Ok(Principal::Person(_)) => Err(Reply::error(
+            403,
+            "a person's token may only read the cache",
+        )),
+        Err(error) => Err(error.into_reply()),
     }
+}
+
+fn header_name(request: &Request<Incoming>, name: &str) -> Option<String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 fn header(request: &Request<Incoming>, name: hyper::header::HeaderName) -> Option<String> {
@@ -226,11 +285,6 @@ fn header(request: &Request<Incoming>, name: hyper::header::HeaderName) -> Optio
 
 async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path: &str) -> Reply {
     let authorization = header(&request, AUTHORIZATION);
-    let iap_assertion = request
-        .headers()
-        .get(crate::iap::IAP_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
     let query = request.uri().query().map(str::to_string);
     // JSON cache routes carry a small body. The rewritten blob GET does not,
     // and waiting for one stalls the client until its request timeout.
@@ -248,7 +302,6 @@ async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path
         path,
         &crate::cache::Headers {
             authorization: authorization.as_deref(),
-            iap_assertion: iap_assertion.as_deref(),
             query: query.as_deref(),
         },
         body,
