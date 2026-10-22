@@ -430,6 +430,16 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
             &[&cutoff],
         )
         .await?;
+    // Lookup counts only feed a 14-day view; keep a month, or the cache's own
+    // retention if that is longer, so the table does not grow without bound.
+    let stats_days = i64::from(app.config.cache_days.max(30));
+    let stats_cutoff = (now - chrono::Duration::days(stats_days)).date_naive();
+    transaction
+        .execute(
+            "DELETE FROM cache.lookup_stats WHERE day < $1",
+            &[&stats_cutoff],
+        )
+        .await?;
     let named = transaction
         .query("SELECT manifest FROM cache.manifests", &[])
         .await?;

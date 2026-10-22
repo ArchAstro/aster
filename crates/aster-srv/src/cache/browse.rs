@@ -24,12 +24,6 @@ pub const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 /// Days of lookup counts in a summary.
 pub const LOOKUP_DAYS: i64 = 14;
-/// With a `target` filter the substring is matched here, not in SQL (a
-/// stored manifest need not be valid JSON), so a page reads rows in batches
-/// and stops after this many. `next` then resumes from the last row read.
-const SCAN_BATCH: i64 = 200;
-const SCAN_CAP: usize = 2000;
-
 /// Who wrote a manifest. Each field is null for a static token.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct WriterOut {
@@ -307,13 +301,22 @@ pub async fn entries(app: &App, headers: &Headers<'_>) -> Reply {
     }
 }
 
-struct Row {
-    entry: Entry,
-    created_at: DateTime<Utc>,
+/// `text` as a literal inside a `LIKE` pattern: `\`, `%` and `_` escaped.
+fn like_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A page of at most `limit` entries after `after`, and the cursor for the
-/// next page. `target` is a case-insensitive substring filter.
+/// next page. `target` is a case-insensitive substring filter, matched in SQL
+/// against the `target` column commit fills, so a page is full whenever more
+/// entries match.
 pub async fn read_entries(
     app: &App,
     repo: &str,
@@ -322,100 +325,91 @@ pub async fn read_entries(
     target: Option<&str>,
 ) -> anyhow::Result<(Vec<Entry>, Option<String>)> {
     let client = app.pool.get().await?;
-    let needle = target.map(str::to_lowercase);
-    let batch = if needle.is_some() {
-        SCAN_BATCH
-    } else {
-        limit as i64 + 1
-    };
-    let mut cursor = after;
-    let mut out: Vec<Entry> = Vec::new();
-    let mut last_returned: Option<Cursor> = None;
-    let mut scanned = 0;
-    loop {
-        let rows = fetch_page(&client, repo, cursor.as_ref(), batch).await?;
-        let exhausted = (rows.len() as i64) < batch;
-        for row in rows {
-            let here = Cursor::new(row.created_at, &row.entry.key);
-            scanned += 1;
-            let matches = needle
-                .as_deref()
-                .is_none_or(|needle| row.entry.target.to_lowercase().contains(needle));
-            if matches {
-                if out.len() == limit {
-                    // One more match exists past the page.
-                    return Ok((out, last_returned.map(|c| c.encode())));
-                }
-                last_returned = Some(here.clone());
-                out.push(row.entry);
-            }
-            cursor = Some(here);
-            if scanned >= SCAN_CAP {
-                // Stop reading; `next` resumes after the last row read.
-                return Ok((out, cursor.map(|c| c.encode())));
-            }
-        }
-        if exhausted {
-            return Ok((out, None));
-        }
-    }
-}
-
-async fn fetch_page(
-    client: &deadpool_postgres::Client,
-    repo: &str,
-    after: Option<&Cursor>,
-    batch: i64,
-) -> anyhow::Result<Vec<Row>> {
-    let (at, key) = match after {
+    let (at, key) = match &after {
         Some(cursor) => (cursor.created_at(), Some(cursor.k.as_str())),
         None => (None, None),
     };
+    let pattern = target.map(|target| format!("%{}%", like_literal(target)));
+    // One row past the page says whether another page exists.
     let rows = client
         .query(
-            "SELECT key, manifest, size_bytes, created_at, last_used_at, hits, last_hit_at, \
+            "SELECT key, target, output_files, exit_code, duration_ms, aster_version, \
+                    size_bytes, created_at, last_used_at, hits, last_hit_at, \
                     writer_ref, writer_run_id, writer_sha, writer_workflow \
              FROM cache.manifests \
              WHERE repo = $1 \
                AND ($2::timestamptz IS NULL \
                     OR created_at < $2 OR (created_at = $2 AND key > $3)) \
+               AND ($4::text IS NULL OR target ILIKE $4) \
              ORDER BY created_at DESC, key \
-             LIMIT $4",
-            &[&repo, &at, &key, &batch],
+             LIMIT $5",
+            &[&repo, &at, &key, &pattern, &(limit as i64 + 1)],
         )
         .await?;
-    Ok(rows
+    let mut entries: Vec<(DateTime<Utc>, Entry)> = rows
         .iter()
         .map(|row| {
-            let manifest: Vec<u8> = row.get(1);
-            let created_at: DateTime<Utc> = row.get(3);
-            let last_used_at: DateTime<Utc> = row.get(4);
-            let last_hit_at: Option<DateTime<Utc>> = row.get(6);
-            let decoded = decode_manifest(&manifest);
-            Row {
+            let created_at: DateTime<Utc> = row.get(7);
+            let last_used_at: DateTime<Utc> = row.get(8);
+            let last_hit_at: Option<DateTime<Utc>> = row.get(10);
+            let output_files: i32 = row.get(2);
+            let exit_code: i32 = row.get(3);
+            let duration_ms: i64 = row.get(4);
+            (
                 created_at,
-                entry: Entry {
+                Entry {
                     key: row.get(0),
-                    target: decoded.target,
-                    size_bytes: row.get(2),
-                    output_files: decoded.output_files,
-                    exit_code: decoded.exit_code,
-                    duration_ms: decoded.duration_ms,
-                    aster_version: decoded.aster_version,
+                    target: row.get(1),
+                    size_bytes: row.get(6),
+                    output_files: output_files.max(0) as u64,
+                    exit_code: i64::from(exit_code),
+                    duration_ms: duration_ms.max(0) as u64,
+                    aster_version: row.get(5),
                     created_at: rfc3339(created_at),
                     last_used_at: rfc3339(last_used_at),
-                    hits: row.get(5),
+                    hits: row.get(9),
                     last_hit_at: last_hit_at.map(rfc3339),
                     writer: WriterOut {
-                        git_ref: row.get(7),
-                        run_id: row.get(8),
-                        sha: row.get(9),
-                        workflow: row.get(10),
+                        git_ref: row.get(11),
+                        run_id: row.get(12),
+                        sha: row.get(13),
+                        workflow: row.get(14),
                     },
                 },
-            }
+            )
         })
-        .collect())
+        .collect();
+    let more = entries.len() > limit;
+    entries.truncate(limit);
+    let next = match entries.last() {
+        Some((created_at, entry)) if more => Some(Cursor::new(*created_at, &entry.key).encode()),
+        _ => None,
+    };
+    Ok((entries.into_iter().map(|(_, entry)| entry).collect(), next))
+}
+
+/// The columns commit stores beside a manifest, so browsing never reads the
+/// manifest bytes. They are read field by field, so one odd value does not
+/// blank the rest, and a number that does not fit its column becomes zero.
+pub(super) struct ManifestColumns {
+    pub target: String,
+    pub output_files: i32,
+    pub exit_code: i32,
+    pub duration_ms: i64,
+    pub aster_version: String,
+}
+
+impl ManifestColumns {
+    pub fn of(manifest: &[u8]) -> Self {
+        let decoded = decode_manifest(manifest);
+        Self {
+            target: decoded.target,
+            output_files: i32::try_from(decoded.output_files).unwrap_or(0),
+            exit_code: i32::try_from(decoded.exit_code).unwrap_or(0),
+            duration_ms: i64::try_from(decoded.duration_ms).unwrap_or(0),
+            aster_version: decoded.aster_version,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -427,7 +421,7 @@ struct Decoded {
     aster_version: String,
 }
 
-/// The fields a page shows, read field by field so one odd value does not
+/// The fields browsing shows, read field by field so one odd value does not
 /// blank the rest. Anything that is not a JSON object decodes to zeros.
 fn decode_manifest(bytes: &[u8]) -> Decoded {
     let Ok(Value::Object(manifest)) = serde_json::from_slice::<Value>(bytes) else {

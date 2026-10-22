@@ -149,55 +149,68 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     }
     match lookup_hits(app, &reader.repository, &request.keys).await {
         Ok(hits) => {
-            // Counting is best effort: a failure here must not turn a
-            // served lookup into an error.
-            let found: Vec<String> = hits.keys().cloned().collect();
             let requested = request
                 .keys
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len();
-            if let Err(error) = record_lookup(app, &reader.repository, &found, requested).await {
-                crate::log::warn(
-                    "cache lookup stats not recorded",
-                    json!({"error": format!("{error:#}"), "repo": reader.repository}),
-                );
-            }
+            record_lookup(app, &reader.repository, hits.len(), requested);
             Reply::json(200, json!({"hits": hits}))
         }
         Err(error) => db_error(error),
     }
 }
 
-/// Count one lookup request: each found key gets a hit, and today's (UTC)
-/// `cache.lookup_stats` row for the repository takes the request's hit and
-/// miss totals. One statement, so the two never disagree.
-pub(super) async fn record_lookup(
-    app: &App,
-    repo: &str,
-    found: &[String],
-    requested: usize,
-) -> anyhow::Result<()> {
+/// How long the stats write may wait, lock waits included, before it gives up.
+const STATS_TIMEOUT_MS: u32 = 3000;
+
+/// Add one lookup request to today's (UTC) `cache.lookup_stats` row for the
+/// repository: `found` hits and the rest of `requested` as misses. The
+/// per-manifest hit counts were already bumped by the lookup's own UPDATE.
+///
+/// The write runs on its own task so it never delays or fails the reply. A
+/// failure or timeout is logged and the counts for that request are lost.
+fn record_lookup(app: &App, repo: &str, found: usize, requested: usize) {
     if requested == 0 {
-        return Ok(());
+        return;
     }
-    let hits = found.len() as i64;
+    let hits = found as i64;
     let misses = requested as i64 - hits;
-    let client = app.pool.get().await?;
-    client
+    let pool = app.pool.clone();
+    let repo = repo.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = write_stats(&pool, &repo, hits, misses).await {
+            crate::log::warn(
+                "cache lookup stats not recorded",
+                json!({"error": format!("{error:#}"), "repo": repo}),
+            );
+        }
+    });
+}
+
+async fn write_stats(
+    pool: &deadpool_postgres::Pool,
+    repo: &str,
+    hits: i64,
+    misses: i64,
+) -> anyhow::Result<()> {
+    let mut client = pool.get().await?;
+    let transaction = client.transaction().await?;
+    // Local to this transaction, so the pooled connection is left clean.
+    transaction
+        .batch_execute(&format!("SET LOCAL statement_timeout = {STATS_TIMEOUT_MS}"))
+        .await?;
+    transaction
         .execute(
-            "WITH bumped AS ( \
-                 UPDATE cache.manifests SET hits = hits + 1, last_hit_at = now() \
-                 WHERE repo = $1 AND key = ANY($2) RETURNING 1 \
-             ) \
-             INSERT INTO cache.lookup_stats (repo, day, hits, misses) \
-             VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $3, $4) \
+            "INSERT INTO cache.lookup_stats (repo, day, hits, misses) \
+             VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2, $3) \
              ON CONFLICT (repo, day) DO UPDATE SET \
                  hits = cache.lookup_stats.hits + EXCLUDED.hits, \
                  misses = cache.lookup_stats.misses + EXCLUDED.misses",
-            &[&repo, &found, &hits, &misses],
+            &[&repo, &hits, &misses],
         )
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -209,7 +222,8 @@ async fn lookup_hits(
     let client = app.pool.get().await?;
     let rows = client
         .query(
-            "UPDATE cache.manifests SET last_used_at = now() \
+            "UPDATE cache.manifests \
+             SET last_used_at = now(), hits = hits + 1, last_hit_at = now() \
              WHERE repo = $1 AND key = ANY($2) \
              RETURNING key, manifest",
             &[&repo, &keys],
@@ -356,6 +370,7 @@ async fn commit_manifest(
     digests: &[String],
     writer: &Writer,
 ) -> anyhow::Result<Committed> {
+    let summary = browse::ManifestColumns::of(manifest);
     let mut client = app.pool.get().await?;
     let transaction = client.transaction().await?;
     transaction
@@ -368,8 +383,9 @@ async fn commit_manifest(
         .execute(
             "INSERT INTO cache.manifests \
                  (repo, key, manifest, size_bytes, \
-                  writer_ref, writer_run_id, writer_sha, writer_workflow) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                  writer_ref, writer_run_id, writer_sha, writer_workflow, \
+                  target, output_files, exit_code, duration_ms, aster_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT (repo, key) DO NOTHING",
             &[
                 &repo,
@@ -380,6 +396,11 @@ async fn commit_manifest(
                 &writer.run_id,
                 &writer.sha,
                 &writer.workflow,
+                &summary.target,
+                &summary.output_files,
+                &summary.exit_code,
+                &summary.duration_ms,
+                &summary.aster_version,
             ],
         )
         .await?;
