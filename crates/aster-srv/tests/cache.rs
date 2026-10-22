@@ -1419,6 +1419,10 @@ async fn migration_v3_backfills_rows_written_before_it() {
             br#"{"target":5,"outputs":"x","exit_code":"1","duration_ms":-3,"aster_version":[]}"#
                 .to_vec(),
         ),
+        (
+            "non-numeric-strings",
+            br#"{"target":"//s:t","exit_code":"abc","duration_ms":"1e999x"}"#.to_vec(),
+        ),
         ("huge", br#"{"target":"//h:t","exit_code":99999999999,"duration_ms":1.5}"#.to_vec()),
     ];
     for (key, manifest) in &rows {
@@ -1464,6 +1468,10 @@ async fn migration_v3_backfills_rows_written_before_it() {
     assert_eq!(read("nul-escape").await, defaults);
     assert_eq!(read("array").await, defaults);
     assert_eq!(read("wrong-types").await, defaults);
+    assert_eq!(
+        read("non-numeric-strings").await,
+        ("//s:t".into(), 0, 0, 0, String::new())
+    );
     assert_eq!(read("huge").await, ("//h:t".into(), 0, 0, 0, String::new()));
     // The browse page reads the backfilled rows.
     assert_eq!(

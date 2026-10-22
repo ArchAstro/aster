@@ -97,14 +97,19 @@ UPDATE cache.manifests m SET
     target = CASE WHEN jsonb_typeof(j->'target') = 'string' THEN j->>'target' ELSE '' END,
     output_files = CASE WHEN jsonb_typeof(j->'outputs') = 'array'
         THEN least(jsonb_array_length(j->'outputs'), 2147483647) ELSE 0 END,
-    exit_code = CASE WHEN jsonb_typeof(j->'exit_code') = 'number'
-            AND (j->>'exit_code')::numeric = trunc((j->>'exit_code')::numeric)
-            AND (j->>'exit_code')::numeric BETWEEN -2147483648 AND 2147483647
-        THEN (j->>'exit_code')::numeric::int ELSE 0 END,
-    duration_ms = CASE WHEN jsonb_typeof(j->'duration_ms') = 'number'
-            AND (j->>'duration_ms')::numeric = trunc((j->>'duration_ms')::numeric)
-            AND (j->>'duration_ms')::numeric BETWEEN 0 AND 9223372036854775807
-        THEN (j->>'duration_ms')::numeric::bigint ELSE 0 END,
+    -- Postgres does not order the operands of AND, so the casts sit in nested
+    -- CASEs: a value is cast to numeric only once it is known to be a number,
+    -- and to the column type only once it is known to fit.
+    exit_code = CASE WHEN jsonb_typeof(j->'exit_code') = 'number' THEN
+            CASE WHEN (j->>'exit_code')::numeric = trunc((j->>'exit_code')::numeric)
+                    AND (j->>'exit_code')::numeric BETWEEN -2147483648 AND 2147483647
+                THEN (j->>'exit_code')::numeric::int ELSE 0 END
+        ELSE 0 END,
+    duration_ms = CASE WHEN jsonb_typeof(j->'duration_ms') = 'number' THEN
+            CASE WHEN (j->>'duration_ms')::numeric = trunc((j->>'duration_ms')::numeric)
+                    AND (j->>'duration_ms')::numeric BETWEEN 0 AND 9223372036854775807
+                THEN (j->>'duration_ms')::numeric::bigint ELSE 0 END
+        ELSE 0 END,
     aster_version = CASE WHEN jsonb_typeof(j->'aster_version') = 'string'
         THEN j->>'aster_version' ELSE '' END
 FROM (SELECT repo, key, cache.manifest_json(manifest) AS j FROM cache.manifests) parsed
