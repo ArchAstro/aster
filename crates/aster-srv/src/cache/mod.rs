@@ -70,4 +70,50 @@ CREATE TABLE cache.lookup_stats (
 );
 "#,
     },
+    Migration {
+        feature: "cache",
+        version: 3,
+        sql: r#"
+ALTER TABLE cache.manifests
+    ADD COLUMN target text NOT NULL DEFAULT '',
+    ADD COLUMN output_files int NOT NULL DEFAULT 0,
+    ADD COLUMN exit_code int NOT NULL DEFAULT 0,
+    ADD COLUMN duration_ms bigint NOT NULL DEFAULT 0,
+    ADD COLUMN aster_version text NOT NULL DEFAULT '';
+
+-- A manifest that is not UTF-8 JSON gives NULL, so its row keeps the defaults.
+CREATE FUNCTION cache.manifest_json(bytes bytea) RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN convert_from(bytes, 'UTF8')::jsonb;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END
+$$;
+
+-- Each field is taken only when it has the type the browse page reads, and
+-- the number fits its column, as when a commit fills it.
+UPDATE cache.manifests m SET
+    target = CASE WHEN jsonb_typeof(j->'target') = 'string' THEN j->>'target' ELSE '' END,
+    output_files = CASE WHEN jsonb_typeof(j->'outputs') = 'array'
+        THEN least(jsonb_array_length(j->'outputs'), 2147483647) ELSE 0 END,
+    exit_code = CASE WHEN jsonb_typeof(j->'exit_code') = 'number'
+            AND (j->>'exit_code')::numeric = trunc((j->>'exit_code')::numeric)
+            AND (j->>'exit_code')::numeric BETWEEN -2147483648 AND 2147483647
+        THEN (j->>'exit_code')::numeric::int ELSE 0 END,
+    duration_ms = CASE WHEN jsonb_typeof(j->'duration_ms') = 'number'
+            AND (j->>'duration_ms')::numeric = trunc((j->>'duration_ms')::numeric)
+            AND (j->>'duration_ms')::numeric BETWEEN 0 AND 9223372036854775807
+        THEN (j->>'duration_ms')::numeric::bigint ELSE 0 END,
+    aster_version = CASE WHEN jsonb_typeof(j->'aster_version') = 'string'
+        THEN j->>'aster_version' ELSE '' END
+FROM (SELECT repo, key, cache.manifest_json(manifest) AS j FROM cache.manifests) parsed
+WHERE parsed.repo = m.repo AND parsed.key = m.key
+    AND jsonb_typeof(parsed.j) = 'object';
+
+DROP FUNCTION cache.manifest_json(bytea);
+
+CREATE INDEX manifests_browse ON cache.manifests (repo, created_at DESC, key);
+"#,
+    },
 ];

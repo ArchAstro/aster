@@ -683,6 +683,8 @@ async fn a_viewer_reads_back_what_ci_wrote_and_how_lookups_fared() {
         .await;
     assert_eq!(status, 200, "{looked}");
     assert_eq!(looked["hits"].as_object().unwrap().len(), 1);
+    // The stats write runs after the reply.
+    assert_eq!(wait_for_stats(&server.client().await, 1, 1).await, (1, 1));
 
     // Phase 3: a viewer inside the allowed domain reads through IAP.
     let viewer = common::iap_assertion(VIEWER);
@@ -834,23 +836,25 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let client = server.client().await;
     // Five rows; b and c share a created_at to exercise the key tie-break.
     let base = Utc::now();
-    for (key, offset, manifest) in [
-        ("a", 5, b"{\"target\":\"//x:one\"}".to_vec()),
-        ("b", 4, b"{\"target\":\"//x:two\"}".to_vec()),
-        ("c", 4, b"{\"target\":\"//y:three\"}".to_vec()),
-        ("d", 3, b"\xff\xfe not json".to_vec()),
-        ("e", 2, b"{\"target\":\"//x:five\"}".to_vec()),
+    for (key, offset, target, manifest) in [
+        ("a", 5, "//x:one", b"{\"target\":\"//x:one\"}".to_vec()),
+        ("b", 4, "//x:two", b"{\"target\":\"//x:two\"}".to_vec()),
+        ("c", 4, "//y:three", b"{\"target\":\"//y:three\"}".to_vec()),
+        // A manifest that does not decode keeps the column defaults.
+        ("d", 3, "", b"\xff\xfe not json".to_vec()),
+        ("e", 2, "//x:five", b"{\"target\":\"//x:five\"}".to_vec()),
     ] {
         client
             .execute(
-                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at, target) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &REPO,
                     &key,
                     &manifest,
                     &(manifest.len() as i64),
                     &(base - Duration::minutes(offset)),
+                    &target,
                 ],
             )
             .await
@@ -949,6 +953,29 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     server.stop().await;
 }
 
+/// The repository's lookup totals once they reach `(hits, misses)`, or what
+/// they are after five seconds.
+async fn wait_for_stats(client: &deadpool_postgres::Client, hits: i64, misses: i64) -> (i64, i64) {
+    let mut seen = (0, 0);
+    for _ in 0..100 {
+        if let Some(row) = client
+            .query_opt(
+                "SELECT hits, misses FROM cache.lookup_stats WHERE repo = $1",
+                &[&REPO],
+            )
+            .await
+            .unwrap()
+        {
+            seen = (row.get(0), row.get(1));
+        }
+        if seen == (hits, misses) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    seen
+}
+
 /// Lookups add to today's row across requests, count each distinct key once,
 /// and keep serving when the stats table cannot be written.
 #[tokio::test]
@@ -979,14 +1006,8 @@ async fn lookup_stats_accumulate_per_day_and_never_fail_a_lookup() {
     // An empty lookup records nothing.
     assert_eq!(lookup(vec![]).await.0, 200);
     let client = server.client().await;
-    let row = client
-        .query_one(
-            "SELECT hits, misses FROM cache.lookup_stats WHERE repo = $1",
-            &[&REPO],
-        )
-        .await
-        .unwrap();
-    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (2, 3));
+    // The stats write runs after the reply, so wait for it.
+    assert_eq!(wait_for_stats(&client, 2, 3).await, (2, 3));
     let manifest = client
         .query_one(
             "SELECT hits, last_hit_at IS NOT NULL FROM cache.manifests WHERE key = 'k1'",
@@ -1077,6 +1098,7 @@ async fn the_cache_page_shows_what_ci_wrote_hit_rates_filter_and_paging() {
         )
         .await;
     assert_eq!(status, 200, "{looked}");
+    assert_eq!(wait_for_stats(&server.client().await, 1, 1).await, (1, 1));
 
     // Phase 3: fifty older manifests push the entries past one page of 50.
     let client = server.client().await;
@@ -1085,14 +1107,15 @@ async fn the_cache_page_shows_what_ci_wrote_hit_rates_filter_and_paging() {
         let manifest = format!("{{\"target\":\"//bulk:t{index:02}\"}}").into_bytes();
         client
             .execute(
-                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at, target) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &REPO,
                     &format!("bulk-{index:02}"),
                     &manifest,
                     &(manifest.len() as i64),
                     &(base - Duration::minutes(index)),
+                    &format!("//bulk:t{index:02}"),
                 ],
             )
             .await
@@ -1159,5 +1182,362 @@ async fn the_cache_page_shows_what_ci_wrote_hit_rates_filter_and_paging() {
         .get_page(&format!("{path}&before=garbage"), Some(&viewer))
         .await;
     assert_eq!(status, 400);
+    server.stop().await;
+}
+
+/// The stats row is a single hot row per repository. While another
+/// transaction holds it, a lookup still answers at once with its hits, and the
+/// blocked write does not hold the lookup back or fail it.
+#[tokio::test]
+async fn a_lookup_answers_quickly_while_the_stats_row_is_locked() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    commit_as(&server, &writer, "k1", "//a:b").await;
+    let mut locker = server.client().await;
+    // Create today's row, then keep it locked in an open transaction.
+    locker
+        .execute(
+            "INSERT INTO cache.lookup_stats (repo, day, hits, misses) \
+             VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 0, 0)",
+            &[&REPO],
+        )
+        .await
+        .unwrap();
+    let hold = locker.transaction().await.unwrap();
+    hold.execute(
+        "UPDATE cache.lookup_stats SET hits = hits WHERE repo = $1",
+        &[&REPO],
+    )
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    for _ in 0..3 {
+        let (status, body) = server
+            .post_json(
+                "/v1/cache/lookup",
+                &json!({"repo": REPO, "keys": ["k1", "missing"]}),
+                Some(&writer),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["hits"].as_object().unwrap().len(), 1);
+    }
+    let took = started.elapsed();
+    // The stats write waits up to its own timeout (3s); the lookups must not.
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+
+    // Once the lock is released the queued writes land.
+    hold.rollback().await.unwrap();
+    drop(locker);
+    let client = server.client().await;
+    assert_eq!(wait_for_stats(&client, 3, 3).await, (3, 3));
+    server.stop().await;
+}
+
+/// A lookup bumps `last_used_at`, `hits` and `last_hit_at` in one UPDATE, so
+/// a repeated key in the request still counts one hit.
+#[tokio::test]
+async fn a_lookup_counts_one_hit_per_distinct_key() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    commit_as(&server, &writer, "k1", "//a:b").await;
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k1", "k1", "k1"]}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let client = server.client().await;
+    let row = client
+        .query_one(
+            "SELECT hits, last_hit_at IS NOT NULL, last_used_at >= created_at \
+             FROM cache.manifests WHERE key = 'k1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert!(row.get::<_, bool>(1) && row.get::<_, bool>(2));
+    assert_eq!(wait_for_stats(&client, 1, 0).await, (1, 0));
+    server.stop().await;
+}
+
+async fn insert_entry(
+    client: &deadpool_postgres::Client,
+    key: &str,
+    target: &str,
+    created_at: chrono::DateTime<Utc>,
+) {
+    let manifest = serde_json::to_vec(&json!({"target": target})).unwrap();
+    client
+        .execute(
+            "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at, target) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &REPO,
+                &key,
+                &manifest,
+                &(manifest.len() as i64),
+                &created_at,
+                &target,
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+async fn entry_targets(server: &common::Server, query: &str) -> (Vec<String>, Option<String>) {
+    let viewer = common::iap_assertion(VIEWER);
+    let (status, page) = server
+        .get_json(
+            &format!("/v1/cache/entries?repo={REPO}&{query}"),
+            None,
+            Some(&viewer),
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    let targets = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["target"].as_str().unwrap().to_string())
+        .collect();
+    (targets, page["next"].as_str().map(str::to_string))
+}
+
+/// The target filter is a literal, case-insensitive substring: `%`, `_` and
+/// `\` match themselves, and a page of matches is full even when most rows
+/// in between do not match.
+#[tokio::test]
+async fn the_target_filter_matches_literally_and_fills_pages() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let client = server.client().await;
+    let base = Utc::now();
+    for (index, target) in [
+        "//a:100%",
+        "//a:1000",
+        "//b_c",
+        "//bxc",
+        "//d\\e",
+        "//dxe",
+        "//Mixed:Case",
+    ]
+    .iter()
+    .enumerate()
+    {
+        insert_entry(
+            &client,
+            &format!("lit-{index}"),
+            target,
+            base - Duration::minutes(index as i64),
+        )
+        .await;
+    }
+    assert_eq!(entry_targets(&server, "target=%25").await.0, ["//a:100%"]);
+    assert_eq!(entry_targets(&server, "target=_").await.0, ["//b_c"]);
+    assert_eq!(entry_targets(&server, "target=%5C").await.0, ["//d\\e"]);
+    assert_eq!(entry_targets(&server, "target=b_c").await.0, ["//b_c"]);
+    assert_eq!(
+        entry_targets(&server, "target=mixed%3Acase").await.0,
+        ["//Mixed:Case"]
+    );
+
+    // Ten matches among thirty rows that do not match, interleaved.
+    for index in 0..40 {
+        let target = if index % 4 == 0 {
+            format!("//want:{index:02}")
+        } else {
+            format!("//other:{index:02}")
+        };
+        insert_entry(
+            &client,
+            &format!("fill-{index:02}"),
+            &target,
+            base + Duration::minutes(10 + index),
+        )
+        .await;
+    }
+    let mut sizes = Vec::new();
+    let mut before = String::new();
+    loop {
+        let (targets, next) =
+            entry_targets(&server, &format!("target=want&limit=3&before={before}")).await;
+        sizes.push(targets.len());
+        match next {
+            Some(next) => before = next,
+            None => break,
+        }
+    }
+    assert_eq!(sizes, [3, 3, 3, 1]);
+    server.stop().await;
+}
+
+/// Rows written before the denormalized columns existed are filled from their
+/// manifest JSON by the v3 migration, and a manifest that does not decode keeps
+/// the defaults.
+#[tokio::test]
+async fn migration_v3_backfills_rows_written_before_it() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let client = server.client().await;
+    // Put the table back as v2 left it.
+    client
+        .batch_execute(
+            "DROP INDEX cache.manifests_browse; \
+             ALTER TABLE cache.manifests DROP COLUMN target, DROP COLUMN output_files, \
+                 DROP COLUMN exit_code, DROP COLUMN duration_ms, DROP COLUMN aster_version",
+        )
+        .await
+        .unwrap();
+    let full = serde_json::to_vec(&json!({
+        "target": "//apps/web:build", "exit_code": -1, "duration_ms": 42,
+        "aster_version": "0.22.0", "outputs": [{"path": "x"}, {"path": "y"}],
+    }))
+    .unwrap();
+    let rows: Vec<(&str, Vec<u8>)> =
+        vec![
+        ("full", full),
+        ("not-utf8", b"\xff\xfe not json".to_vec()),
+        ("nul-escape", br#"{"target":"a\u0000b","duration_ms":7}"#.to_vec()),
+        ("array", b"[1,2]".to_vec()),
+        (
+            "wrong-types",
+            br#"{"target":5,"outputs":"x","exit_code":"1","duration_ms":-3,"aster_version":[]}"#
+                .to_vec(),
+        ),
+        ("huge", br#"{"target":"//h:t","exit_code":99999999999,"duration_ms":1.5}"#.to_vec()),
+    ];
+    for (key, manifest) in &rows {
+        client
+            .execute(
+                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes) \
+                 VALUES ($1, $2, $3, $4)",
+                &[&REPO, key, manifest, &(manifest.len() as i64)],
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .batch_execute(aster_srv::cache::MIGRATIONS[2].sql)
+        .await
+        .unwrap();
+    let read = |key: &'static str| {
+        let client = &client;
+        async move {
+            let row = client
+                .query_one(
+                    "SELECT target, output_files, exit_code, duration_ms, aster_version \
+                     FROM cache.manifests WHERE key = $1",
+                    &[&key],
+                )
+                .await
+                .unwrap();
+            (
+                row.get::<_, String>(0),
+                row.get::<_, i32>(1),
+                row.get::<_, i32>(2),
+                row.get::<_, i64>(3),
+                row.get::<_, String>(4),
+            )
+        }
+    };
+    assert_eq!(
+        read("full").await,
+        ("//apps/web:build".into(), 2, -1, 42, "0.22.0".into())
+    );
+    let defaults = (String::new(), 0, 0, 0, String::new());
+    assert_eq!(read("not-utf8").await, defaults);
+    assert_eq!(read("nul-escape").await, defaults);
+    assert_eq!(read("array").await, defaults);
+    assert_eq!(read("wrong-types").await, defaults);
+    assert_eq!(read("huge").await, ("//h:t".into(), 0, 0, 0, String::new()));
+    // The browse page reads the backfilled rows.
+    assert_eq!(
+        entry_targets(&server, "target=apps").await.0,
+        ["//apps/web:build"]
+    );
+    server.stop().await;
+}
+
+/// Commit stores the columns the browse page reads, from the decoded manifest.
+#[tokio::test]
+async fn commit_fills_the_browse_columns() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    commit_as(
+        &server,
+        &bearer(REPO, Some("refs/heads/main")),
+        "k1",
+        "//apps/web:build",
+    )
+    .await;
+    let row = server
+        .client()
+        .await
+        .query_one(
+            "SELECT target, output_files, exit_code, duration_ms, aster_version \
+             FROM cache.manifests WHERE key = 'k1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "//apps/web:build");
+    assert_eq!(row.get::<_, i32>(1), 1);
+    assert_eq!(row.get::<_, i32>(2), 0);
+    assert_eq!(row.get::<_, i64>(3), 1500);
+    assert_eq!(row.get::<_, String>(4), "0.22.0");
+    server.stop().await;
+}
+
+/// Retention keeps lookup counts for the longer of 30 days and the cache's
+/// own retention, and drops older days.
+#[tokio::test]
+async fn retention_prunes_old_lookup_stats() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let client = server.client().await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO cache.lookup_stats (repo, day, hits, misses) VALUES \
+             ('{REPO}', (now() AT TIME ZONE 'UTC')::date - 45, 1, 1), \
+             ('{REPO}', (now() AT TIME ZONE 'UTC')::date - 31, 1, 1), \
+             ('{REPO}', (now() AT TIME ZONE 'UTC')::date - 20, 1, 1), \
+             ('{REPO}', (now() AT TIME ZONE 'UTC')::date, 1, 1)"
+        ))
+        .await
+        .unwrap();
+    aster_srv::cache::run_retention(&server.app, Utc::now())
+        .await
+        .unwrap()
+        .expect("this replica holds the lock");
+    let left: Vec<i32> = client
+        .query(
+            "SELECT ((now() AT TIME ZONE 'UTC')::date - day)::int FROM cache.lookup_stats \
+             ORDER BY day",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(left, [20, 0]);
     server.stop().await;
 }

@@ -461,7 +461,7 @@ signs them with IAM Credentials `signBlob` as its own service account
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
 | `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists, and records the writer's `ref`, `run_id`, `sha` and `workflow_ref` claims (null for a static token). A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
 | `GET /v1/cache/summary?repo=<owner/name>` | `{repo, manifests, manifest_bytes, blobs, blob_bytes, last_write_at, last_writer: {ref, run_id, sha, workflow} or null, lookups: [{day, hits, misses}]}`. `lookups` are the last 14 UTC days that had a lookup, newest first. `blobs` and `blob_bytes` are global: blobs are content-addressed and shared across repositories. |
-| `GET /v1/cache/entries?repo=<owner/name>&limit=<1..200, default 50>&before=<cursor>&target=<substring>` | `{entries: [{key, target, size_bytes, output_files, exit_code, duration_ms, aster_version, created_at, last_used_at, hits, last_hit_at, writer: {ref, run_id, sha, workflow}}], next}` ordered by `created_at` descending, then key. `next` is an opaque cursor to pass as `before`, or null on the last page. `target` is a case-insensitive substring filter, applied while reading at most 2000 rows per request; a page can then hold fewer than `limit` entries and still carry a `next`. A manifest that does not decode is listed with an empty `target` and zeroed fields. |
+| `GET /v1/cache/entries?repo=<owner/name>&limit=<1..200, default 50>&before=<cursor>&target=<substring>` | `{entries: [{key, target, size_bytes, output_files, exit_code, duration_ms, aster_version, created_at, last_used_at, hits, last_hit_at, writer: {ref, run_id, sha, workflow}}], next}` ordered by `created_at` descending, then key. `next` is an opaque cursor to pass as `before`, or null on the last page. `target` is a case-insensitive literal substring filter (`%`, `_` and `\` match themselves), applied in SQL, so a page holds `limit` entries whenever more match. Commit stores `target`, `output_files`, `exit_code`, `duration_ms` and `aster_version` beside the manifest, so paging never reads manifest bytes. A manifest that does not decode is listed with an empty `target` and zeroed fields. |
 
 A lookup counts one hit per stored key (`hits`, `last_hit_at` on the manifest)
 and adds the request's hits and misses to today's row in
@@ -483,4 +483,11 @@ Every six hours one replica drops manifests unused for `ASTER_SRV_CACHE_DAYS`
 (default 14) and blobs no remaining manifest names, and deletes those objects.
 It also deletes `cas/` objects no commit recorded once they are older than
 the same cutoff: signed PUTs whose commit never came. The pod needs
-`storage.objects.list` on the bucket for this.
+`storage.objects.list` on the bucket for this. The same pass drops
+`cache.lookup_stats` days older than the longer of 30 days and
+`ASTER_SRV_CACHE_DAYS`.
+
+A lookup answers before its day's `cache.lookup_stats` row is written: that
+write runs afterwards with a 3 second limit, and a failure is logged and the
+request's counts are lost. The counts are lookup requests (each distinct key
+counts once), not successful restores.
