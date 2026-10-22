@@ -218,7 +218,10 @@ mod tests {
     fn parses_targets_and_day() {
         let identity = Identity {
             repository: "ArchAstro/firstlanding".into(),
-            workflow_ref: None,
+            git_ref: None,
+            run_id: None,
+            sha: None,
+            workflow: None,
             static_token: false,
         };
         let (targets, day) = parse(

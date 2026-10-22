@@ -21,9 +21,17 @@ use crate::config::{Config, RepositoryAllowlist, StaticToken};
 pub struct Identity {
     /// `owner/name`.
     pub repository: String,
-    /// GitHub Actions `ref` (`refs/heads/main`, `refs/pull/7/merge`).
+    /// GitHub Actions `ref` claim (`refs/heads/main`, `refs/pull/7/merge`):
+    /// the git ref, not the workflow file. Cache writer patterns match it.
     /// `None` for a static token, which may write the cache.
-    pub workflow_ref: Option<String>,
+    pub git_ref: Option<String>,
+    /// The `run_id` claim. `None` for a static token.
+    pub run_id: Option<String>,
+    /// The `sha` claim. `None` for a static token.
+    pub sha: Option<String>,
+    /// The `workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@refs/heads/main`):
+    /// the workflow file. `None` for a static token.
+    pub workflow: Option<String>,
     /// A configured static token, not an OIDC token.
     pub static_token: bool,
 }
@@ -55,7 +63,32 @@ struct Claims {
     repository: String,
     #[serde(default)]
     #[serde(rename = "ref")]
-    workflow_ref: Option<String>,
+    git_ref: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number")]
+    run_id: Option<String>,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "workflow_ref")]
+    workflow: Option<String>,
+}
+
+/// GitHub sends `run_id` as a string; accept a number too rather than
+/// refuse the token over a claim that only labels cache writes.
+fn string_or_number<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+            _ => None,
+        },
+    )
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }
 
 const REFETCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -118,7 +151,10 @@ impl Verifier {
         {
             return Ok(Identity {
                 repository: found.repository.clone(),
-                workflow_ref: None,
+                git_ref: None,
+                run_id: None,
+                sha: None,
+                workflow: None,
                 static_token: true,
             });
         }
@@ -146,7 +182,10 @@ impl Verifier {
         }
         Ok(Identity {
             repository: claims.repository,
-            workflow_ref: claims.workflow_ref.filter(|r| !r.is_empty()),
+            git_ref: non_empty(claims.git_ref),
+            run_id: non_empty(claims.run_id),
+            sha: non_empty(claims.sha),
+            workflow: non_empty(claims.workflow),
             static_token: false,
         })
     }
@@ -295,5 +334,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(identity.repository, "ArchAstro/dev");
+    }
+
+    #[tokio::test]
+    async fn identity_carries_the_ref_and_the_writer_claims_separately() {
+        let mut full = claims("ArchAstro/firstlanding");
+        full["ref"] = json!("refs/heads/main");
+        full["run_id"] = json!("12345");
+        full["sha"] = json!("abc123");
+        full["workflow_ref"] =
+            json!("ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main");
+        let bearer = format!("Bearer {}", token(full.clone(), "k1"));
+        let identity = verifier().verify(Some(&bearer)).await.unwrap();
+        assert_eq!(identity.git_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(identity.run_id.as_deref(), Some("12345"));
+        assert_eq!(identity.sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            identity.workflow.as_deref(),
+            Some("ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main")
+        );
+
+        // A numeric run_id is kept; empty claims become None.
+        full["run_id"] = json!(678);
+        full["sha"] = json!("");
+        let bearer = format!("Bearer {}", token(full, "k1"));
+        let identity = verifier().verify(Some(&bearer)).await.unwrap();
+        assert_eq!(identity.run_id.as_deref(), Some("678"));
+        assert_eq!(identity.sha, None);
+
+        // Static tokens carry none of them.
+        let identity = verifier()
+            .verify(Some("Bearer dev-token-0123456789"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                identity.git_ref,
+                identity.run_id,
+                identity.sha,
+                identity.workflow
+            ),
+            (None, None, None, None)
+        );
     }
 }

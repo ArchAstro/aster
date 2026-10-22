@@ -176,6 +176,9 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
         (&Method::POST, path) if path.starts_with("/v1/cache/") => {
             cache_request(app, request, "POST", path).await
         }
+        (&Method::GET, "/v1/cache/summary" | "/v1/cache/entries") => {
+            cache_request(app, request, "GET", &path).await
+        }
         // A rewritten signed blob URL: `PUT|GET /<bucket>/cas/<sha256>`.
         // Only the in-memory store answers it. A GCS-backed server, which is
         // every production deploy, falls through to 404.
@@ -228,6 +231,7 @@ async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path
         .get(crate::iap::IAP_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let query = request.uri().query().map(str::to_string);
     // JSON cache routes carry a small body. The rewritten blob GET does not,
     // and waiting for one stalls the client until its request timeout.
     let body = if method == "GET" {
@@ -245,6 +249,7 @@ async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path
         &crate::cache::Headers {
             authorization: authorization.as_deref(),
             iap_assertion: iap_assertion.as_deref(),
+            query: query.as_deref(),
         },
         body,
     )

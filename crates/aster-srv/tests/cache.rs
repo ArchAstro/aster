@@ -64,6 +64,11 @@ async fn server() -> Option<(common::Server, Arc<FixedSigner>)> {
                 "/projects/123456/global/backendServices/",
             ),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
+            // A service account outside the viewer domain, as the admin site uses.
+            (
+                "ASTER_SRV_CACHE_ADMIN_EMAILS",
+                "archdev-admin@archastro.iam.gserviceaccount.com",
+            ),
             (
                 "ASTER_SRV_STATIC_TOKENS",
                 "ArchAstro/firstlanding=dev-token-0123456789",
@@ -595,5 +600,466 @@ async fn retention_drops_expired_rows_and_objects() {
     assert_eq!(left, 1);
     let blobs = server.app.cache_store.objects().await;
     assert_eq!(blobs, vec![OTHER.to_string(), pending.to_string()]);
+    server.stop().await;
+}
+
+const ADMIN: &str = "archdev-admin@archastro.iam.gserviceaccount.com";
+
+fn manifest_for(key: &str, target: &str, digests: &[&str]) -> (String, usize) {
+    let outputs: Vec<Value> = digests
+        .iter()
+        .enumerate()
+        .map(|(index, digest)| {
+            json!({"path": format!("out/{index}.bin"), "kind": "file", "digest": digest, "mode": 420})
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&json!({
+        "schema": 1,
+        "key": key,
+        "target": target,
+        "exit_code": 0,
+        "duration_ms": 1500,
+        "aster_version": "0.22.0",
+        "outputs": outputs,
+    }))
+    .unwrap();
+    let size = bytes.len();
+    (
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        size,
+    )
+}
+
+fn ci_writer(run_id: &str, sha: &str) -> String {
+    format!(
+        "Bearer {}",
+        common::token_with_claims(
+            REPO,
+            json!({
+                "ref": "refs/heads/main",
+                "run_id": run_id,
+                "sha": sha,
+                "workflow_ref": format!("{REPO}/.github/workflows/ci.yml@refs/heads/main"),
+            }),
+        )
+    )
+}
+
+async fn commit_as(server: &common::Server, writer: &str, key: &str, target: &str) -> usize {
+    let (manifest, size) = manifest_for(key, target, &[DIGEST]);
+    let (status, body) = server
+        .post_json(
+            "/v1/cache/commit",
+            &json!({"repo": REPO, "key": key, "manifest": manifest}),
+            Some(writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    size
+}
+
+/// An operator checks that the shared cache works: two CI runs on main write
+/// entries, one lookup hits one key and misses another, and the admin site's
+/// service account reads the counts, sizes, writers and hit totals back.
+#[tokio::test]
+async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+
+    // Phase 1: two CI runs on main commit one manifest each. The blob is
+    // already in the store, so commit verifies and records it.
+    put_blob(&server, DIGEST).await;
+    let first = ci_writer("1001", "aaaa111");
+    let second = ci_writer("1002", "bbbb222");
+    let size_one = commit_as(&server, &first, "key-one", "//apps/web:build").await;
+    let size_two = commit_as(&server, &second, "key-two", "//apps/api:test").await;
+
+    // Phase 2: a CI lookup of one stored key and one unknown key counts one
+    // hit and one miss.
+    let (status, looked) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["key-one", "never-stored"]}),
+            Some(&first),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{looked}");
+    assert_eq!(looked["hits"].as_object().unwrap().len(), 1);
+
+    // Phase 3: the admin site reads through IAP as a service account whose
+    // domain the viewer rule does not allow.
+    let admin = common::iap_assertion(ADMIN);
+    let (status, summary) = server
+        .get_json(
+            &format!("/v1/cache/summary?repo={REPO}"),
+            None,
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, 200, "{summary}");
+    assert_eq!(summary["repo"], REPO);
+    assert_eq!(summary["manifests"], 2);
+    assert_eq!(summary["manifest_bytes"], (size_one + size_two) as i64);
+    assert_eq!(summary["blobs"], 1);
+    assert_eq!(summary["blob_bytes"], 4);
+    assert!(summary["last_write_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        summary["last_writer"],
+        json!({
+            "ref": "refs/heads/main",
+            "run_id": "1002",
+            "sha": "bbbb222",
+            "workflow": format!("{REPO}/.github/workflows/ci.yml@refs/heads/main"),
+        })
+    );
+    let today = Utc::now().date_naive().to_string();
+    assert_eq!(
+        summary["lookups"],
+        json!([{"day": today, "hits": 1, "misses": 1}])
+    );
+
+    let (status, page) = server
+        .get_json(
+            &format!("/v1/cache/entries?repo={REPO}"),
+            None,
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["next"], Value::Null);
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    // Newest write first.
+    let (newest, oldest) = (&entries[0], &entries[1]);
+    assert_eq!(newest["key"], "key-two");
+    assert_eq!(newest["target"], "//apps/api:test");
+    assert_eq!(newest["size_bytes"], size_two as i64);
+    assert_eq!(newest["output_files"], 1);
+    assert_eq!(newest["exit_code"], 0);
+    assert_eq!(newest["duration_ms"], 1500);
+    assert_eq!(newest["aster_version"], "0.22.0");
+    assert_eq!(newest["hits"], 0);
+    assert_eq!(newest["last_hit_at"], Value::Null);
+    assert_eq!(newest["writer"]["run_id"], "1002");
+    assert_eq!(oldest["key"], "key-one");
+    assert_eq!(oldest["hits"], 1);
+    assert!(oldest["last_hit_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(oldest["writer"]["sha"], "aaaa111");
+    assert_eq!(oldest["writer"]["ref"], "refs/heads/main");
+
+    // The service account may browse but not look up or write.
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["key-one"]}),
+            None,
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, 403);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn browsing_routes_authorize_viewers_admins_and_ci() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let path = format!("/v1/cache/summary?repo={REPO}");
+    let entries = format!("/v1/cache/entries?repo={REPO}");
+    for path in [&path, &entries] {
+        // No identity at all.
+        let (status, _) = server.get_json(path, None, None).await;
+        assert_eq!(status, 401, "{path}");
+        // A domain viewer and the listed admin email may read.
+        for email in ["ada@example.com", ADMIN] {
+            let (status, body) = server
+                .get_json(path, None, Some(&common::iap_assertion(email)))
+                .await;
+            assert_eq!(status, 200, "{email} {body}");
+        }
+        // An email that is neither.
+        let (status, _) = server
+            .get_json(path, None, Some(&common::iap_assertion("eve@other.test")))
+            .await;
+        assert_eq!(status, 403);
+        // Admin email match is exact, not a domain or substring rule.
+        let (status, _) = server
+            .get_json(
+                path,
+                None,
+                Some(&common::iap_assertion(
+                    "x-archdev-admin@archastro.iam.gserviceaccount.com",
+                )),
+            )
+            .await;
+        assert_eq!(status, 403);
+        // CI reads its own repository, from any ref.
+        let (status, _) = server
+            .get_json(path, Some(&bearer(REPO, Some("refs/pull/9/merge"))), None)
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .get_json(path, Some(&bearer("ArchAstro/other", None)), None)
+            .await;
+        assert_eq!(status, 403);
+        // An IAP viewer may not browse a repository the server does not serve.
+        let other = path.replace(REPO, "evil/other");
+        let (status, _) = server
+            .get_json(&other, None, Some(&common::iap_assertion(ADMIN)))
+            .await;
+        assert_eq!(status, 403);
+        // Bad bearer token.
+        let (status, _) = server.get_json(path, Some("Bearer nope"), None).await;
+        assert_eq!(status, 401);
+    }
+    // No repo and no identity is still 401; with identity it is 400.
+    let (status, _) = server.get_json("/v1/cache/summary", None, None).await;
+    assert_eq!(status, 401);
+    let (status, _) = server
+        .get_json(
+            "/v1/cache/entries",
+            None,
+            Some(&common::iap_assertion(ADMIN)),
+        )
+        .await;
+    assert_eq!(status, 400);
+    // The routes are read-only.
+    let (status, _) = server
+        .post_json(
+            &path,
+            &json!({}),
+            Some(&bearer(REPO, Some("refs/heads/main"))),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    server.stop().await;
+}
+
+/// Entries page by an opaque cursor over `created_at DESC, key`, including
+/// rows that share a timestamp, a target filter, a manifest that does not
+/// decode, and a static-token writer with no claims.
+#[tokio::test]
+async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let admin = common::iap_assertion(ADMIN);
+    let client = server.client().await;
+    // Five rows; b and c share a created_at to exercise the key tie-break.
+    let base = Utc::now();
+    for (key, offset, manifest) in [
+        ("a", 5, b"{\"target\":\"//x:one\"}".to_vec()),
+        ("b", 4, b"{\"target\":\"//x:two\"}".to_vec()),
+        ("c", 4, b"{\"target\":\"//y:three\"}".to_vec()),
+        ("d", 3, b"\xff\xfe not json".to_vec()),
+        ("e", 2, b"{\"target\":\"//x:five\"}".to_vec()),
+    ] {
+        client
+            .execute(
+                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &REPO,
+                    &key,
+                    &manifest,
+                    &(manifest.len() as i64),
+                    &(base - Duration::minutes(offset)),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    let mut before = String::new();
+    loop {
+        let (status, page) = server
+            .get_json(
+                &format!("/v1/cache/entries?repo={REPO}&limit=2&before={before}"),
+                None,
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200, "{page}");
+        for entry in page["entries"].as_array().unwrap() {
+            seen.push(entry["key"].as_str().unwrap().to_string());
+        }
+        match page["next"].as_str() {
+            Some(next) => before = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["e", "d", "b", "c", "a"]);
+
+    // The undecodable manifest is listed with zeroed fields.
+    let (_, page) = server
+        .get_json(
+            &format!("/v1/cache/entries?repo={REPO}"),
+            None,
+            Some(&admin),
+        )
+        .await;
+    let bad = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "d")
+        .unwrap();
+    assert_eq!(bad["target"], "");
+    assert_eq!(bad["output_files"], 0);
+    assert_eq!(bad["duration_ms"], 0);
+    assert_eq!(
+        bad["writer"],
+        json!({"ref": null, "run_id": null, "sha": null, "workflow": null})
+    );
+
+    // A target substring filter, paged.
+    let (status, filtered) = server
+        .get_json(
+            &format!("/v1/cache/entries?repo={REPO}&target=%3Ax&limit=1"),
+            None,
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, 200, "{filtered}");
+    assert_eq!(filtered["entries"][0]["key"], "e");
+    assert!(filtered["next"].is_string());
+    let (_, filtered) = server
+        .get_json(
+            &format!("/v1/cache/entries?repo={REPO}&target=x:&limit=5"),
+            None,
+            Some(&admin),
+        )
+        .await;
+    let keys: Vec<&str> = filtered["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["e", "b", "a"]);
+    assert_eq!(filtered["next"], Value::Null);
+
+    // Bad parameters.
+    for query in ["limit=0", "limit=201", "limit=x", "before=garbage"] {
+        let (status, _) = server
+            .get_json(
+                &format!("/v1/cache/entries?repo={REPO}&{query}"),
+                None,
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 400, "{query}");
+    }
+    // Another repository's entries are not mixed in.
+    let (_, empty) = server
+        .get_json("/v1/cache/entries?repo=ArchAstro/other", None, Some(&admin))
+        .await;
+    assert_eq!(empty["entries"], json!([]));
+    server.stop().await;
+}
+
+/// Lookups add to today's row across requests, count each distinct key once,
+/// and keep serving when the stats table cannot be written.
+#[tokio::test]
+async fn lookup_stats_accumulate_per_day_and_never_fail_a_lookup() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    commit_as(&server, &writer, "k1", "//a:b").await;
+    let lookup = |keys: Vec<&'static str>| {
+        let writer = writer.clone();
+        let server = &server;
+        async move {
+            server
+                .post_json(
+                    "/v1/cache/lookup",
+                    &json!({"repo": REPO, "keys": keys}),
+                    Some(&writer),
+                    None,
+                )
+                .await
+        }
+    };
+    // Duplicate keys in one request count once.
+    assert_eq!(lookup(vec!["k1", "k1", "m1"]).await.0, 200);
+    assert_eq!(lookup(vec!["k1", "m1", "m2"]).await.0, 200);
+    // An empty lookup records nothing.
+    assert_eq!(lookup(vec![]).await.0, 200);
+    let client = server.client().await;
+    let row = client
+        .query_one(
+            "SELECT hits, misses FROM cache.lookup_stats WHERE repo = $1",
+            &[&REPO],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (2, 3));
+    let manifest = client
+        .query_one(
+            "SELECT hits, last_hit_at IS NOT NULL FROM cache.manifests WHERE key = 'k1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifest.get::<_, i64>(0), 2);
+    assert!(manifest.get::<_, bool>(1));
+
+    // Recording is best effort: with the table gone the lookup still answers.
+    client
+        .batch_execute("DROP TABLE cache.lookup_stats")
+        .await
+        .unwrap();
+    let (status, body) = lookup(vec!["k1"]).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"].as_object().unwrap().len(), 1);
+    drop(client);
+    server.stop().await;
+}
+
+/// A commit records the OIDC claims of its writer; a static token has none.
+#[tokio::test]
+async fn commit_records_the_writer_claims() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    commit_as(&server, &ci_writer("77", "cafe"), "from-ci", "//a:b").await;
+    commit_as(
+        &server,
+        "Bearer dev-token-0123456789",
+        "from-static",
+        "//a:b",
+    )
+    .await;
+    let client = server.client().await;
+    let rows = client
+        .query(
+            "SELECT key, writer_ref, writer_run_id, writer_sha, writer_workflow \
+             FROM cache.manifests ORDER BY key",
+            &[],
+        )
+        .await
+        .unwrap();
+    let ci = &rows[0];
+    assert_eq!(ci.get::<_, String>(0), "from-ci");
+    assert_eq!(
+        ci.get::<_, Option<String>>(1).as_deref(),
+        Some("refs/heads/main")
+    );
+    assert_eq!(ci.get::<_, Option<String>>(2).as_deref(), Some("77"));
+    assert_eq!(ci.get::<_, Option<String>>(3).as_deref(), Some("cafe"));
+    assert!(ci.get::<_, Option<String>>(4).unwrap().contains("ci.yml"));
+    let static_row = &rows[1];
+    for column in 1..5 {
+        assert_eq!(static_row.get::<_, Option<String>>(column), None);
+    }
+    drop(client);
     server.stop().await;
 }

@@ -9,7 +9,8 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::policy::{self, Reader};
+use super::browse;
+use super::policy::{self, Reader, Writer};
 use super::signing::Method;
 use crate::auth::AuthError;
 use crate::App;
@@ -43,6 +44,8 @@ struct CommitRequest {
 pub struct Headers<'a> {
     pub authorization: Option<&'a str>,
     pub iap_assertion: Option<&'a str>,
+    /// The raw query string, for the read-only browsing routes.
+    pub query: Option<&'a str>,
 }
 
 /// Handle one `/v1/cache/...` request. The caller has already matched the path.
@@ -62,6 +65,13 @@ pub async fn handle(
         if let Some(digest) = test_blob_digest(path) {
             return test_blob(app, method, digest, body).await;
         }
+    }
+    if method == "GET" {
+        return match path {
+            "/v1/cache/summary" => browse::summary(app, headers).await,
+            "/v1/cache/entries" => browse::entries(app, headers).await,
+            _ => Reply::error(405, "method not allowed"),
+        };
     }
     if method != "POST" {
         return Reply::error(405, "method not allowed");
@@ -138,12 +148,64 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         return reply;
     }
     match lookup_hits(app, &reader.repository, &request.keys).await {
-        Ok(hits) => Reply::json(200, json!({"hits": hits})),
+        Ok(hits) => {
+            // Counting is best effort: a failure here must not turn a
+            // served lookup into an error.
+            let found: Vec<String> = hits.keys().cloned().collect();
+            let requested = request
+                .keys
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            if let Err(error) = record_lookup(app, &reader.repository, &found, requested).await {
+                crate::log::warn(
+                    "cache lookup stats not recorded",
+                    json!({"error": format!("{error:#}"), "repo": reader.repository}),
+                );
+            }
+            Reply::json(200, json!({"hits": hits}))
+        }
         Err(error) => db_error(error),
     }
 }
 
-async fn lookup_hits(app: &App, repo: &str, keys: &[String]) -> anyhow::Result<Value> {
+/// Count one lookup request: each found key gets a hit, and today's (UTC)
+/// `cache.lookup_stats` row for the repository takes the request's hit and
+/// miss totals. One statement, so the two never disagree.
+pub(super) async fn record_lookup(
+    app: &App,
+    repo: &str,
+    found: &[String],
+    requested: usize,
+) -> anyhow::Result<()> {
+    if requested == 0 {
+        return Ok(());
+    }
+    let hits = found.len() as i64;
+    let misses = requested as i64 - hits;
+    let client = app.pool.get().await?;
+    client
+        .execute(
+            "WITH bumped AS ( \
+                 UPDATE cache.manifests SET hits = hits + 1, last_hit_at = now() \
+                 WHERE repo = $1 AND key = ANY($2) RETURNING 1 \
+             ) \
+             INSERT INTO cache.lookup_stats (repo, day, hits, misses) \
+             VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $3, $4) \
+             ON CONFLICT (repo, day) DO UPDATE SET \
+                 hits = cache.lookup_stats.hits + EXCLUDED.hits, \
+                 misses = cache.lookup_stats.misses + EXCLUDED.misses",
+            &[&repo, &found, &hits, &misses],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn lookup_hits(
+    app: &App,
+    repo: &str,
+    keys: &[String],
+) -> anyhow::Result<serde_json::Map<String, Value>> {
     let client = app.pool.get().await?;
     let rows = client
         .query(
@@ -181,7 +243,7 @@ async fn lookup_hits(app: &App, repo: &str, keys: &[String]) -> anyhow::Result<V
             }),
         );
     }
-    Ok(Value::Object(hits))
+    Ok(hits)
 }
 
 async fn upload(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
@@ -249,7 +311,16 @@ async fn commit(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         return Reply::error(400, "the manifest is not valid");
     }
     let digests = blob_refs(&manifest);
-    match commit_manifest(app, &reader.repository, &request.key, &manifest, &digests).await {
+    match commit_manifest(
+        app,
+        &reader.repository,
+        &request.key,
+        &manifest,
+        &digests,
+        &reader.writer,
+    )
+    .await
+    {
         Ok(Committed::Stored) => Reply::json(201, json!({"stored": true})),
         Ok(Committed::Exists) => Reply::error(409, "the key is already stored"),
         Ok(Committed::Missing(missing)) => Reply::json(
@@ -283,6 +354,7 @@ async fn commit_manifest(
     key: &str,
     manifest: &[u8],
     digests: &[String],
+    writer: &Writer,
 ) -> anyhow::Result<Committed> {
     let mut client = app.pool.get().await?;
     let transaction = client.transaction().await?;
@@ -294,10 +366,21 @@ async fn commit_manifest(
         .await?;
     let inserted = transaction
         .execute(
-            "INSERT INTO cache.manifests (repo, key, manifest, size_bytes) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO cache.manifests \
+                 (repo, key, manifest, size_bytes, \
+                  writer_ref, writer_run_id, writer_sha, writer_workflow) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (repo, key) DO NOTHING",
-            &[&repo, &key, &manifest, &(manifest.len() as i64)],
+            &[
+                &repo,
+                &key,
+                &manifest,
+                &(manifest.len() as i64),
+                &writer.git_ref,
+                &writer.run_id,
+                &writer.sha,
+                &writer.workflow,
+            ],
         )
         .await?;
     if inserted == 0 {
@@ -470,7 +553,7 @@ async fn reader_for(
     }
 }
 
-fn db_error(error: anyhow::Error) -> Reply {
+pub(super) fn db_error(error: anyhow::Error) -> Reply {
     crate::log::error(
         "cache request failed",
         json!({"error": format!("{error:#}")}),
