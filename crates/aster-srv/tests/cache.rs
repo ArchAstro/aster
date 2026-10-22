@@ -920,7 +920,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     // A target substring filter, paged.
     let (status, filtered) = server
         .get_json(
-            &format!("/v1/cache/entries?repo={REPO}&target=%3Ax&limit=1"),
+            &format!("/v1/cache/entries?repo={REPO}&target=X%3A&limit=1"),
             None,
             Some(&admin),
         )
