@@ -1,18 +1,21 @@
 //! aster-srv cache client.
 //!
 //! Speaks `POST /v1/cache/lookup`, `/upload`, and `/commit`. Blob bytes move
-//! through the signed URLs those return. Credentials are the ones test-result
-//! uploads already use: GitHub OIDC in Actions, `ASTER_SRV_TOKEN` elsewhere,
-//! and `ASTER_SRV_PROXY_TOKEN` as `Proxy-Authorization` behind IAP.
+//! through the signed URLs those return. CI credentials are the ones
+//! test-result uploads already use: GitHub OIDC in Actions, `ASTER_SRV_TOKEN`
+//! elsewhere, and `ASTER_SRV_PROXY_TOKEN` as `Proxy-Authorization` (still sent
+//! for deployments that keep an identity-aware proxy in front). With no CI
+//! credential, a person uses the token `aster cache login` stored; with
+//! neither, the remote is skipped with one line and the build stays local.
+//! A person's token reads only, so writes are never attempted with it.
 //!
 //! A 403 on upload or commit means this identity cannot write (a pull-request
-//! branch, or a person reading). The backend then answers writes as a no-op
-//! for the rest of the process. Network errors are returned so [`TieredCache`]
-//! can disable the remote after repeated failures. Tokens are never logged.
+//! branch). The backend then answers writes as a no-op for the rest of the
+//! process. Network errors are returned so [`TieredCache`] can disable the
+//! remote after repeated failures. Tokens are never logged.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -29,7 +32,7 @@ use super::backend::CacheBackend;
 use super::hasher::encode_hex;
 use crate::test_results::upload::{proxy_token_from_env, Credentials};
 
-use super::iap::{self, IapChallenge};
+use super::login;
 
 /// A remote failure that should stop further attempts this run.
 ///
@@ -81,22 +84,17 @@ struct State {
     read_only: bool,
 }
 
-/// Test stand-in for `gcloud auth print-identity-token`.
-type IdentityMinter = Box<dyn FnMut(&str) -> Result<String> + Send>;
-
 /// [`CacheBackend`] for an aster-srv gateway.
 pub struct AsterSrvBackend {
     base_url: String,
     repo: String,
-    /// CI credential. Absent for a person reading through IAP.
+    /// CI credential. Absent for a person reading with a stored sign-in.
     credentials: Option<Credentials>,
+    /// Sent as `Proxy-Authorization` when set, whatever else is used.
     proxy_token: Option<String>,
-    /// `<workspace>/.aster/iap-token.json`.
-    token_path: PathBuf,
-    /// `ASTER_SRV_IAP_CLIENT_ID`, when set. A challenge can supply it instead.
-    iap_client_id: Mutex<Option<String>>,
-    /// Stands in for `gcloud` in tests. `None` runs gcloud.
-    minter: Mutex<Option<IdentityMinter>>,
+    /// The token `aster cache login` stored, used when there is no CI
+    /// credential. Reads only.
+    person_token: Option<String>,
     /// When set, blob URLs on `storage.googleapis.com` are fetched here
     /// instead. Tests only; production is `None`.
     gcs_base: Option<String>,
@@ -104,27 +102,30 @@ pub struct AsterSrvBackend {
     blob_agent: ureq::Agent,
     state: Mutex<State>,
     logged_read_only: AtomicBool,
-    /// Set after a failed personal login. Further calls stay local.
-    iap_disabled: AtomicBool,
 }
 
 impl AsterSrvBackend {
     /// Build a backend when `ASTER_SRV_URL` is set.
     ///
-    /// CI uses `ASTER_SRV_TOKEN` or GitHub OIDC. A laptop has neither: an IAP
-    /// viewer is the credential, so a URL and a repo are enough. The proxy
-    /// token is minted later, on a challenge, from the person's gcloud login.
-    /// `None` when the URL or repo is empty.
+    /// CI uses `ASTER_SRV_TOKEN` or GitHub OIDC. A laptop has neither: it
+    /// uses the token `aster cache login` stored for this server, and with
+    /// no unexpired token the remote is skipped. `None` when the URL or repo
+    /// is empty.
     pub fn from_env(url: Option<&str>, repo: Option<&str>) -> Option<Self> {
         let env = |name: &str| std::env::var(name).ok();
-        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let credentials = Credentials::from_env(&env);
+        let person_token = match (&credentials, url) {
+            (None, Some(url)) => {
+                login::stored_token(url, SystemTime::now()).map(|stored| stored.token)
+            }
+            _ => None,
+        };
         let backend = Self::from_parts(
             url,
             repo,
-            Credentials::from_env(&env),
+            credentials,
             proxy_token_from_env(&env),
-            iap::token_path(&workspace),
-            env(iap::IAP_CLIENT_ID_ENV),
+            person_token,
         )?;
         if let Some(notice) = signature_exclusion_notice(super::signature::signing_key().is_some())
         {
@@ -138,8 +139,7 @@ impl AsterSrvBackend {
         repo: Option<&str>,
         credentials: Option<Credentials>,
         proxy_token: Option<String>,
-        token_path: PathBuf,
-        iap_client_id: Option<String>,
+        person_token: Option<String>,
     ) -> Option<Self> {
         let base_url = non_empty(url)?;
         let repo = non_empty(repo)?;
@@ -148,8 +148,7 @@ impl AsterSrvBackend {
             repo,
             credentials,
             proxy_token,
-            token_path,
-            iap_client_id,
+            person_token,
         ))
     }
 
@@ -171,27 +170,25 @@ impl AsterSrvBackend {
         repo: String,
         credentials: Option<Credentials>,
         proxy_token: Option<String>,
-        token_path: PathBuf,
-        iap_client_id: Option<String>,
+        person_token: Option<String>,
     ) -> Self {
+        // A person's token reads only; do not ask for upload URLs it cannot get.
+        let person_only = credentials.is_none() && person_token.is_some();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             repo,
             credentials,
             proxy_token,
-            token_path,
-            iap_client_id: Mutex::new(iap_client_id),
-            minter: Mutex::new(None),
+            person_token,
             gcs_base: None,
             agent: build_agent(REQUEST_TIMEOUT),
             blob_agent: build_agent(BLOB_TIMEOUT),
             state: Mutex::new(State {
                 hits: HashMap::new(),
                 upload_urls: HashMap::new(),
-                read_only: false,
+                read_only: person_only,
             }),
             logged_read_only: AtomicBool::new(false),
-            iap_disabled: AtomicBool::new(false),
         }
     }
 
@@ -251,30 +248,20 @@ impl AsterSrvBackend {
     }
 
     fn post(&self, path: &str, body: &Value, write: bool) -> Result<Value> {
-        if self.iap_disabled.load(Ordering::Acquire) {
-            return Err(
-                DisablingFailure(anyhow::anyhow!("remote cache skipped; not signed in")).into(),
-            );
-        }
         let payload = serde_json::to_vec(body).context("encode cache request")?;
         let url = format!("{}{path}", self.base_url);
-        let bearer = match &self.credentials {
-            Some(credentials) => Some(
-                crate::test_results::upload::bearer(&self.agent, credentials)
-                    .context("cannot authenticate to the remote cache")?,
-            ),
-            None => None,
+        let bearer = match (&self.credentials, &self.person_token) {
+            (Some(credentials), _) => crate::test_results::upload::bearer(&self.agent, credentials)
+                .context("cannot authenticate to the remote cache")?,
+            (None, Some(token)) => token.clone(),
+            (None, None) => return Err(signed_out()),
         };
-        let proxy = self.proxy_header()?;
-        let response = self.send_post(&url, &payload, bearer.as_deref(), proxy.as_deref())?;
-        let status = response.status().as_u16();
-        if self.should_mint(&response, proxy.is_some()) {
-            let headers = response_headers(&response);
-            let challenge = iap::challenge_from(status, &header_refs(&headers));
-            self.mint_from_challenge(challenge)?;
-            let proxy = self.proxy_header()?;
-            let response = self.send_post(&url, &payload, bearer.as_deref(), proxy.as_deref())?;
-            return self.decode_post(path, response, write);
+        let response =
+            self.send_post(&url, &payload, Some(&bearer), self.proxy_token.as_deref())?;
+        // A stored sign-in the server no longer accepts (expired early, key
+        // rotated, access removed) is the same as none.
+        if response.status().as_u16() == 401 && self.credentials.is_none() {
+            return Err(signed_out());
         }
         self.decode_post(path, response, write)
     }
@@ -308,57 +295,6 @@ impl AsterSrvBackend {
         })
     }
 
-    fn should_mint(&self, response: &ureq::http::Response<ureq::Body>, had_proxy: bool) -> bool {
-        if had_proxy {
-            return false;
-        }
-        let status = response.status().as_u16();
-        let headers = response_headers(response);
-        iap::challenge_from(status, &header_refs(&headers)).is_some()
-    }
-
-    fn mint_from_challenge(&self, challenge: Option<IapChallenge>) -> Result<()> {
-        let configured = self
-            .iap_client_id
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let audience = iap::audience_from(configured.as_deref(), challenge.as_ref());
-        let Some(audience) = audience else {
-            self.disable_iap();
-            return Err(DisablingFailure(anyhow::anyhow!(
-                "remote cache is behind IAP and {} is unset",
-                iap::IAP_CLIENT_ID_ENV
-            ))
-            .into());
-        };
-        if let Ok(mut slot) = self.iap_client_id.lock() {
-            if slot.is_none() {
-                *slot = Some(audience.clone());
-            }
-        }
-        let minted = {
-            let mut minter = self.minter.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(minter) = minter.as_mut() {
-                iap::token_for(&self.token_path, &audience, SystemTime::now(), minter)
-            } else {
-                iap::token_for(
-                    &self.token_path,
-                    &audience,
-                    SystemTime::now(),
-                    &mut iap::gcloud_mint,
-                )
-            }
-        };
-        match minted {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                self.disable_iap();
-                Err(DisablingFailure(error).into())
-            }
-        }
-    }
-
     fn decode_post(
         &self,
         path: &str,
@@ -385,40 +321,6 @@ impl AsterSrvBackend {
             return Ok(Value::Null);
         }
         serde_json::from_str(&text).context("parse remote cache response")
-    }
-
-    /// Proxy token for this call: the env token, a cached login, or a mint.
-    ///
-    /// `Ok(None)` means no token yet. The first response may be the challenge
-    /// that names the audience. A mint failure disables the remote.
-    fn proxy_header(&self) -> Result<Option<String>> {
-        if let Some(token) = &self.proxy_token {
-            return Ok(Some(token.clone()));
-        }
-        let audience = self
-            .iap_client_id
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let Some(audience) = audience else {
-            return Ok(None);
-        };
-        if iap::load_token(&self.token_path, &audience, SystemTime::now()).is_some() {
-            return Ok(
-                iap::load_token(&self.token_path, &audience, SystemTime::now()).map(|t| t.token),
-            );
-        }
-        Ok(None)
-    }
-
-    fn disable_iap(&self) {
-        if self
-            .iap_disabled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            eprintln!("{}", iap::SIGNED_OUT_MESSAGE);
-        }
     }
 
     fn become_read_only(&self) {
@@ -677,24 +579,12 @@ fn decode_hit(entry: &Value) -> Result<Option<Hit>> {
     Ok(Some(Hit { manifest, blobs }))
 }
 
-fn response_headers(response: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)> {
-    response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-fn header_refs(headers: &[(String, String)]) -> Vec<(&str, &str)> {
-    headers
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect()
+/// The remote is skipped: say so once per process, since the executor builds
+/// a backend per target, and stop asking.
+fn signed_out() -> anyhow::Error {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| eprintln!("{}", login::SIGNED_OUT_MESSAGE));
+    DisablingFailure(anyhow::anyhow!("remote cache skipped; not signed in")).into()
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -747,7 +637,7 @@ fn brief(body: &str) -> String {
     message.replace('\n', " ")
 }
 
-fn build_agent(timeout: Duration) -> ureq::Agent {
+pub(super) fn build_agent(timeout: Duration) -> ureq::Agent {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
@@ -775,7 +665,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Cursor};
     use std::net::TcpListener;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
@@ -809,9 +698,11 @@ mod tests {
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         manifests: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         commit_status: Arc<Mutex<u16>>,
-        /// When set, a lookup without Proxy-Authorization is an IAP challenge.
-        challenge: Arc<AtomicBool>,
+        /// When set, every cache call is refused with 401.
+        refuse: Arc<AtomicBool>,
         proxy_seen: Arc<Mutex<Vec<String>>>,
+        /// The `Authorization` header of each cache call (lowercased).
+        auth_seen: Arc<Mutex<Vec<String>>>,
         shutdown: Arc<AtomicBool>,
     }
 
@@ -826,8 +717,9 @@ mod tests {
             let manifests: Arc<Mutex<HashMap<String, Vec<u8>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let commit_status = Arc::new(Mutex::new(201_u16));
-            let challenge = Arc::new(AtomicBool::new(false));
+            let refuse = Arc::new(AtomicBool::new(false));
             let proxy_seen = Arc::new(Mutex::new(Vec::new()));
+            let auth_seen = Arc::new(Mutex::new(Vec::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
             let base = url.clone();
             let lookups_c = Arc::clone(&lookups);
@@ -836,8 +728,9 @@ mod tests {
             let objects_c = Arc::clone(&objects);
             let manifests_c = Arc::clone(&manifests);
             let status_c = Arc::clone(&commit_status);
-            let challenge_c = Arc::clone(&challenge);
+            let refuse_c = Arc::clone(&refuse);
             let proxy_seen_c = Arc::clone(&proxy_seen);
+            let auth_seen_c = Arc::clone(&auth_seen);
             let shutdown_c = Arc::clone(&shutdown);
             thread::spawn(move || {
                 listener.set_nonblocking(false).ok();
@@ -854,6 +747,7 @@ mod tests {
                     }
                     let mut content_length = 0usize;
                     let mut proxy_auth = String::new();
+                    let mut auth = String::new();
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty()
@@ -866,6 +760,9 @@ mod tests {
                         }
                         if let Some(value) = lower.strip_prefix("proxy-authorization:") {
                             proxy_auth = value.trim().to_string();
+                        }
+                        if let Some(value) = lower.strip_prefix("authorization:") {
+                            auth = value.trim().to_string();
                         }
                     }
                     let mut body = vec![0_u8; content_length];
@@ -907,6 +804,17 @@ mod tests {
                         continue;
                     }
                     proxy_seen_c.lock().unwrap().push(proxy_auth.clone());
+                    auth_seen_c.lock().unwrap().push(auth);
+                    if refuse_c.load(Ordering::Relaxed) {
+                        let payload = br#"{"error":"the token is not valid"}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(payload);
+                        continue;
+                    }
                     let (status, payload, extra_headers) = route(
                         path,
                         &body,
@@ -917,8 +825,6 @@ mod tests {
                         &objects_c,
                         &manifests_c,
                         &status_c,
-                        &proxy_auth,
-                        challenge_c.load(Ordering::Relaxed),
                     );
                     let response = format!(
                         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -936,8 +842,9 @@ mod tests {
                 objects,
                 manifests,
                 commit_status,
-                challenge,
+                refuse,
                 proxy_seen,
+                auth_seen,
                 shutdown,
             }
         }
@@ -960,17 +867,8 @@ mod tests {
         objects: &Mutex<HashMap<String, Vec<u8>>>,
         manifests: &Mutex<HashMap<String, Vec<u8>>>,
         commit_status: &Mutex<u16>,
-        proxy_auth: &str,
-        challenge: bool,
     ) -> (u16, Vec<u8>, String) {
         let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        if challenge && proxy_auth.is_empty() {
-            return (
-                401,
-                br#"{"error":"sign in"}"#.to_vec(),
-                "Proxy-Authenticate: Bearer realm=\"https://accounts.google.com/\", client_id=\"123.apps.googleusercontent.com\"\r\n".to_string(),
-            );
-        }
         match path {
             "/v1/cache/lookup" => {
                 lookups.fetch_add(1, Ordering::Relaxed);
@@ -1054,7 +952,6 @@ mod tests {
             Some("acme/app"),
             Some(Credentials::Static("test-token".to_string())),
             None,
-            std::path::PathBuf::from("/tmp/unused-iap-token.json"),
             None,
         )
         .unwrap()
@@ -1143,38 +1040,30 @@ mod tests {
     }
 
     #[test]
-    fn from_env_is_none_without_a_url_or_token() {
-        let path = std::path::PathBuf::from("/tmp/unused-iap-token.json");
-        assert!(AsterSrvBackend::from_parts(
-            None,
-            Some("acme/app"),
-            None,
-            None,
-            path.clone(),
-            None
-        )
-        .is_none());
+    fn from_env_is_none_without_a_url_or_repo() {
+        assert!(AsterSrvBackend::from_parts(None, Some("acme/app"), None, None, None).is_none());
         assert!(
             AsterSrvBackend::from_parts(
                 Some("http://127.0.0.1:9"),
                 Some("acme/app"),
                 None,
                 None,
-                path.clone(),
-                None,
+                None
             )
             .is_some(),
-            "a person with no CI token can still read through IAP"
+            "a person with no CI token still gets a backend, which stays local until signed in"
         );
         assert!(AsterSrvBackend::from_parts(
             Some("  "),
             Some("acme/app"),
             Some(Credentials::Static("t".into())),
             None,
-            path,
             None,
         )
         .is_none());
+        assert!(
+            AsterSrvBackend::from_parts(Some("http://x"), Some(" "), None, None, None).is_none()
+        );
     }
 
     #[test]
@@ -1188,90 +1077,99 @@ mod tests {
         assert!(text.contains("?redacted"), "{text}");
     }
 
-    #[test]
-    fn iap_challenge_mints_a_token_and_restores_a_hit() {
-        let fake = Fake::spawn();
-        fake.challenge.store(true, Ordering::Relaxed);
-        let digest = Digest::of_bytes(b"blob");
-        let stored = manifest(&"ab".repeat(32), &digest);
-        // A writer with a proxy token stores the artifact the laptop will read.
-        let writer = AsterSrvBackend::from_parts(
+    fn reader(fake: &Fake, person_token: Option<&str>) -> AsterSrvBackend {
+        AsterSrvBackend::from_parts(
             Some(&fake.url),
             Some("acme/app"),
-            Some(Credentials::Static("ci".into())),
-            Some("ci-proxy".into()),
-            std::path::PathBuf::from("/tmp/unused-writer-iap.json"),
             None,
+            None,
+            person_token.map(str::to_string),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn a_signed_in_person_reads_with_their_token_and_never_asks_to_write() {
+        let fake = Fake::spawn();
+        let digest = Digest::of_bytes(b"blob");
+        let stored = manifest(&"ab".repeat(32), &digest);
+        // CI stores the artifact the laptop will read.
+        let writer = backend(&fake);
         writer.find_missing(std::slice::from_ref(&digest)).unwrap();
         writer
             .put_blob(&digest, &mut Cursor::new(b"blob".to_vec()))
             .unwrap();
         writer.put_manifest(&stored).unwrap();
+        let before = fake.uploads.load(Ordering::Relaxed);
+        let commits = fake.commits.load(Ordering::Relaxed);
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("iap-token.json");
-        let reader = AsterSrvBackend::from_parts(
-            Some(&fake.url),
-            Some("acme/app"),
-            None,
-            None,
-            path.clone(),
-            None,
-        )
-        .unwrap();
-        let minted = Arc::new(AtomicUsize::new(0));
-        let minted_c = Arc::clone(&minted);
-        *reader.minter.lock().unwrap() = Some(Box::new(move |_audience| {
-            minted_c.fetch_add(1, Ordering::Relaxed);
-            Ok("person-token".to_string())
-        }));
-
-        let hit = reader.get_manifest(&stored.key).unwrap().unwrap();
+        let person = reader(&fake, Some("person-token"));
+        let hit = person.get_manifest(&stored.key).unwrap().unwrap();
         assert_eq!(hit, stored);
-        assert_eq!(minted.load(Ordering::Relaxed), 1);
-        let seen = fake.proxy_seen.lock().unwrap().clone();
-        assert!(
-            seen.iter().any(|header| header == "bearer person-token"),
-            "retry must send the minted token, saw {seen:?}"
-        );
-        // A second read uses the cached token and does not mint again.
-        let again = reader.get_manifest(&stored.key).unwrap().unwrap();
-        assert_eq!(again.key, stored.key);
-        assert_eq!(minted.load(Ordering::Relaxed), 1);
-        let cached = std::fs::read_to_string(&path).unwrap();
-        assert!(cached.contains("person-token"));
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "cached token must be user-only, got {mode:o}");
+        let seen = fake.auth_seen.lock().unwrap().clone();
+        assert_eq!(seen.last().map(String::as_str), Some("bearer person-token"));
+
+        // The token reads only: no upload or commit request is sent.
+        assert!(person
+            .find_missing(std::slice::from_ref(&digest))
+            .unwrap()
+            .is_empty());
+        person.put_manifest(&stored).unwrap();
+        assert_eq!(fake.uploads.load(Ordering::Relaxed), before);
+        assert_eq!(fake.commits.load(Ordering::Relaxed), commits);
     }
 
     #[test]
-    fn signed_out_disables_the_remote_with_one_line() {
+    fn a_ci_credential_wins_over_a_stored_person_token_and_the_proxy_header_still_goes() {
         let fake = Fake::spawn();
-        fake.challenge.store(true, Ordering::Relaxed);
-        let dir = tempfile::tempdir().unwrap();
-        let reader = AsterSrvBackend::from_parts(
+        let ci = AsterSrvBackend::from_parts(
             Some(&fake.url),
             Some("acme/app"),
-            None,
-            None,
-            dir.path().join("iap-token.json"),
-            Some("123.apps.googleusercontent.com".into()),
+            Some(Credentials::Static("ci-token".into())),
+            Some("ci-proxy".into()),
+            Some("person-token".into()),
         )
         .unwrap();
-        *reader.minter.lock().unwrap() = Some(Box::new(|_audience| {
-            anyhow::bail!("gcloud is not installed")
-        }));
-        let error = reader.get_manifest("anything").unwrap_err();
-        assert!(
-            format!("{error:#}").contains("gcloud auth login"),
-            "{error:#}"
+        ci.get_manifest("anything").unwrap();
+        assert_eq!(
+            fake.auth_seen.lock().unwrap().last().map(String::as_str),
+            Some("bearer ci-token")
         );
-        assert!(reader.iap_disabled.load(Ordering::Relaxed));
-        // A later call does not ask gcloud again.
-        let again = reader.get_manifest("anything").unwrap_err();
-        assert!(again.to_string().contains("not signed in"), "{again:#}");
+        assert_eq!(
+            fake.proxy_seen.lock().unwrap().last().map(String::as_str),
+            Some("bearer ci-proxy")
+        );
+        // A CI backend is not read-only up front.
+        assert!(!ci.read_only());
+    }
+
+    #[test]
+    fn without_a_sign_in_the_remote_is_skipped_and_nothing_is_sent() {
+        let fake = Fake::spawn();
+        let signed_out = reader(&fake, None);
+        let error = signed_out.get_manifest("anything").unwrap_err();
+        assert!(disables(&error), "{error:#}");
+        assert_eq!(fake.lookups.load(Ordering::Relaxed), 0);
+        assert!(fake.auth_seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_token_the_server_refuses_is_the_same_as_none() {
+        let fake = Fake::spawn();
+        fake.refuse.store(true, Ordering::Relaxed);
+        let person = reader(&fake, Some("stale-token"));
+        let error = person.get_manifest("anything").unwrap_err();
+        assert!(disables(&error), "{error:#}");
+        // A refused CI credential is an ordinary failure, not a sign-out.
+        let ci = backend(&fake);
+        let error = ci.get_manifest("anything").unwrap_err();
+        assert!(!disables(&error), "{error:#}");
+    }
+
+    fn disables(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<DisablingFailure>().is_some())
     }
 
     #[test]

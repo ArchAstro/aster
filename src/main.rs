@@ -276,32 +276,51 @@ fn run() -> Result<()> {
         };
     }
 
-    // Login only needs the workspace root (the token file lives under
-    // `.aster/`) and gcloud. It must not wait on project discovery.
+    // Login talks to the server and the user's config directory. It must not
+    // wait on project discovery.
     if let Commands::Cache {
-        command: CacheCommands::Login { audience },
+        command: CacheCommands::Login { no_browser },
     } = &command
     {
-        let audience = audience
-            .clone()
-            .or_else(|| std::env::var(aster::cache::IAP_CLIENT_ID_ENV).ok())
+        let server = std::env::var(aster::cache::ASTER_SRV_URL_ENV)
+            .ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "set {env} to the IAP OAuth client id, or pass --audience. Then: {hint}",
-                    env = aster::cache::IAP_CLIENT_ID_ENV,
-                    hint = aster::cache::GCLOUD_LOGIN_HINT
+                    "set {} to your aster-srv URL, then run aster cache login again",
+                    aster::cache::ASTER_SRV_URL_ENV
                 )
             })?;
-        return match aster::cache::iap_login(&workspace_root, &audience) {
-            Ok(message) => {
-                if output_mode != OutputMode::Quiet {
-                    println!("{message}");
-                }
-                Ok(())
-            }
-            Err(error) => Err(error),
+        let options = aster::cache::LoginOptions {
+            open_browser: !no_browser,
+            timeout: aster::cache::LOGIN_TIMEOUT,
         };
+        let signed_in = aster::cache::login(&server, &options, &mut |url| {
+            if output_mode != OutputMode::Quiet {
+                if options.open_browser {
+                    println!("Opening your browser to sign in. If it does not open, visit:");
+                } else {
+                    println!("Open this URL in a browser to sign in:");
+                }
+                println!("{url}");
+                println!("Waiting for the browser (Ctrl-C to cancel)...");
+            }
+        })?;
+        if output_mode != OutputMode::Quiet {
+            let who = signed_in
+                .email
+                .as_deref()
+                .map(|email| format!(" as {email}"))
+                .unwrap_or_default();
+            let until = chrono::DateTime::from_timestamp(signed_in.expires_at as i64, 0)
+                .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "it expires".to_string());
+            println!(
+                "Signed in{who}. Token stored at {} until {until}.",
+                signed_in.path.display()
+            );
+        }
+        return Ok(());
     }
 
     if output_mode == OutputMode::Verbose {
