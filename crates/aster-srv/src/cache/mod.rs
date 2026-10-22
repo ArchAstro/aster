@@ -8,8 +8,11 @@
 //! |---|---|
 //! | `POST /v1/cache/lookup` | Hits for the named keys, each with a signed GET per blob that exists. An unknown key is a miss, not an error. |
 //! | `POST /v1/cache/upload` | Signed PUT URLs for blobs not yet in the bucket. Writers only. |
-//! | `POST /v1/cache/commit` | Store a manifest once every blob it names exists. `409` if the key is already stored; `422` if a blob is missing. Writers only. |
+//! | `POST /v1/cache/commit` | Store a manifest once every blob it names exists, and record who wrote it. `409` if the key is already stored; `422` if a blob is missing. Writers only. |
+//! | `GET /v1/cache/summary` | Counts, sizes, last writer and 14 days of lookups for one repository. Read-only. |
+//! | `GET /v1/cache/entries` | A page of manifests with their writer and hit counts. Read-only. |
 
+mod browse;
 mod policy;
 mod routes;
 mod signing;
@@ -21,10 +24,11 @@ pub use routes::{handle, Headers};
 pub use signing::{expires_at, FixedSigner, Signer, URL_TTL};
 pub use store::{run_retention, spawn, BlobStore, Report};
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    feature: "cache",
-    version: 1,
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        feature: "cache",
+        version: 1,
+        sql: r#"
 CREATE SCHEMA IF NOT EXISTS cache;
 
 CREATE TABLE cache.manifests (
@@ -44,4 +48,26 @@ CREATE TABLE cache.blobs (
     last_used_at timestamptz NOT NULL DEFAULT now()
 );
 "#,
-}];
+    },
+    Migration {
+        feature: "cache",
+        version: 2,
+        sql: r#"
+ALTER TABLE cache.manifests
+    ADD COLUMN writer_ref text NULL,
+    ADD COLUMN writer_run_id text NULL,
+    ADD COLUMN writer_sha text NULL,
+    ADD COLUMN writer_workflow text NULL,
+    ADD COLUMN hits bigint NOT NULL DEFAULT 0,
+    ADD COLUMN last_hit_at timestamptz NULL;
+
+CREATE TABLE cache.lookup_stats (
+    repo text NOT NULL,
+    day date NOT NULL,
+    hits bigint NOT NULL DEFAULT 0,
+    misses bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (repo, day)
+);
+"#,
+    },
+];

@@ -184,6 +184,31 @@ impl Server {
 }
 
 impl Server {
+    /// `GET path` returning JSON. `bearer` is an `Authorization` value
+    /// including `Bearer `; `iap` is an IAP assertion.
+    pub async fn get_json(
+        &self,
+        path: &str,
+        bearer: Option<&str>,
+        iap: Option<&str>,
+    ) -> (u16, Value) {
+        let mut request = aster_srv::http_client()
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.url));
+        if let Some(bearer) = bearer {
+            request = request.header("Authorization", bearer);
+        }
+        if let Some(iap) = iap {
+            request = request.header("x-goog-iap-jwt-assertion", iap);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(json!(null)))
+    }
+}
+
+impl Server {
     /// `GET path` as a browser behind IAP: the status, the headers and the
     /// page. `assertion` is the `x-goog-iap-jwt-assertion` value, if any.
     pub async fn get_page(
@@ -239,6 +264,28 @@ pub fn token_with_ref(repository: &str, workflow_ref: Option<&str>) -> String {
     });
     if let Some(workflow_ref) = workflow_ref {
         claims["ref"] = json!(workflow_ref);
+    }
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(PRIVATE).unwrap(),
+    )
+    .unwrap()
+}
+
+/// An OIDC token for `repository` with extra claims merged in, such as
+/// `ref`, `run_id`, `sha` and `workflow_ref`.
+pub fn token_with_claims(repository: &str, extra: Value) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test".into());
+    let mut claims = json!({
+        "iss": "https://token.actions.githubusercontent.com",
+        "aud": "aster-srv",
+        "exp": Utc::now().timestamp() + 300,
+        "repository": repository,
+    });
+    for (name, value) in extra.as_object().expect("claims are an object") {
+        claims[name] = value.clone();
     }
     encode(
         &header,

@@ -407,7 +407,8 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_BUCKET` | unset | The GCS bucket for cache blobs (`cas/<sha256>`). Unset disables the cache. The pod's Workload Identity needs `storage.objects.*` on the bucket and `iam.serviceAccounts.signBlob` on itself. |
 | `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
-| `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. |
+| `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
+| `ASTER_SRV_CACHE_ADMIN_EMAILS` | unset | Comma-separated emails (matched exactly, case-insensitively) that may call the read-only `GET /v1/cache/summary` and `GET /v1/cache/entries` through IAP even when `ASTER_SRV_UI_EMAIL_DOMAINS` does not allow their domain, such as a service account. They cannot look up or write. |
 
 Logs are one JSON object per line, with `severity` and `message`.
 
@@ -458,10 +459,20 @@ signs them with IAM Credentials `signBlob` as its own service account
 |---|---|
 | `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A lookup updates `last_used_at`. |
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
-| `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists. A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
+| `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists, and records the writer's `ref`, `run_id`, `sha` and `workflow_ref` claims (null for a static token). A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
+| `GET /v1/cache/summary?repo=<owner/name>` | `{repo, manifests, manifest_bytes, blobs, blob_bytes, last_write_at, last_writer: {ref, run_id, sha, workflow} or null, lookups: [{day, hits, misses}]}`. `lookups` are the last 14 UTC days that had a lookup, newest first. `blobs` and `blob_bytes` are global: blobs are content-addressed and shared across repositories. |
+| `GET /v1/cache/entries?repo=<owner/name>&limit=<1..200, default 50>&before=<cursor>&target=<substring>` | `{entries: [{key, target, size_bytes, output_files, exit_code, duration_ms, aster_version, created_at, last_used_at, hits, last_hit_at, writer: {ref, run_id, sha, workflow}}], next}` ordered by `created_at` descending, then key. `next` is an opaque cursor to pass as `before`, or null on the last page. `target` is a case-insensitive substring filter, applied while reading at most 2000 rows per request; a page can then hold fewer than `limit` entries and still carry a `next`. A manifest that does not decode is listed with an empty `target` and zeroed fields. |
+
+A lookup counts one hit per stored key (`hits`, `last_hit_at` on the manifest)
+and adds the request's hits and misses to today's row in
+`cache.lookup_stats`. Counting is best effort: a failure is logged and the
+lookup still answers. Keys repeated in one request count once.
 
 Reads accept any authenticated CI token for the repository, and an IAP viewer
-whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. Writes accept a static
+whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. The two `GET` browsing routes
+also accept an IAP caller listed in `ASTER_SRV_CACHE_ADMIN_EMAILS`; they answer
+`401` without an identity and `403` for a caller that is not allowed, a
+repository the server does not serve, or a CI token for another repository. Writes accept a static
 development token, or a CI token whose `ref` matches `ASTER_SRV_CACHE_WRITERS`
 (default the repository's default branch, `refs/heads/main`). A pull-request
 ref is refused with `403`, so a branch cannot poison the cache.
