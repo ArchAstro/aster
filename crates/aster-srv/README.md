@@ -412,6 +412,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
+| `ASTER_SRV_CACHE_WRITER_WORKFLOWS` | unset | Comma-separated prefixes of the token's `job_workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@`; each must contain `@`). When set, a CI token writes the cache or uploads test results only from a matching workflow, in addition to the ref rule. Unset applies no workflow limit, so existing deployments keep working until it is set. Static tokens are exempt. |
 | `ASTER_SRV_PUBLIC_URL` | unset | The URL people reach the server at (`https://aster-srv.example.com`); the `iss` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). |
 | `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated; secrets at least 32 characters. The first signs person tokens and form MACs; all verify. Required for sign-in. Keep it in a secret store. |
 | `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 604800. |
@@ -484,9 +485,11 @@ domains, a repository the server does not serve, or a CI token for another
 repository. People browse the same data on the dashboard at `/ui/cache`.
 Writes accept a static development token, or a CI token whose `ref` matches
 `ASTER_SRV_CACHE_WRITERS` (default the repository's default branch,
-`refs/heads/main`). A pull-request ref is refused with `403`, so a branch
-cannot poison the cache, and so is a person's token. A person's token is
-refused on every test-result route.
+`refs/heads/main`) and, when `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set, whose
+`job_workflow_ref` (else `workflow_ref`) starts with one of its prefixes. A
+pull-request ref is refused with `403`, so a branch cannot poison the cache,
+and so is a person's token. Test-result uploads follow the same workflow
+rule; a person's token is refused on every test-result route.
 
 ## Laptop sign-in
 

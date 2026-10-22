@@ -20,6 +20,7 @@ mod store;
 
 use crate::db::Migration;
 
+pub use policy::workflow_allowed;
 pub use routes::{handle, Headers};
 pub use signing::{expires_at, FixedSigner, Signer, URL_TTL};
 pub use store::{run_retention, spawn, BlobStore, Report};

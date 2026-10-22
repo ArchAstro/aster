@@ -222,6 +222,7 @@ mod tests {
             run_id: None,
             sha: None,
             workflow: None,
+            job_workflow: None,
             static_token: false,
         };
         let (targets, day) = parse(

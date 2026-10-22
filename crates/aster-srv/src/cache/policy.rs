@@ -3,9 +3,10 @@
 //! Reads: any authenticated CI token for the repository, and a signed-in
 //! person (`aster cache login`) whose email domain is allowed, for any
 //! repository the server serves. Writes: a static development token, or a CI
-//! token whose `ref` claim matches `ASTER_SRV_CACHE_WRITERS`. A pull-request
-//! ref does not match the default, so a branch cannot poison the cache.
-//! People never write.
+//! token whose `ref` claim matches `ASTER_SRV_CACHE_WRITERS` and, when
+//! `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set, whose `job_workflow_ref`
+//! matches one of its prefixes. A pull-request ref does not match the
+//! default, so a branch cannot poison the cache. People never write.
 
 use crate::auth::Identity;
 use crate::config::Config;
@@ -63,15 +64,28 @@ impl std::fmt::Display for WriteDenied {
     }
 }
 
+/// Whether the job's workflow may write: always when no workflow prefix is
+/// configured (and for static tokens), otherwise only on a prefix match.
+pub fn workflow_allowed(config: &Config, identity: &Identity) -> bool {
+    identity.static_token
+        || config.writer_workflows.as_ref().is_none_or(|workflows| {
+            identity
+                .job_workflow
+                .as_deref()
+                .is_some_and(|workflow| workflows.allows(workflow))
+        })
+}
+
 /// A CI caller. Static tokens may write; OIDC tokens write only when their
-/// ref matches the writer patterns.
+/// ref matches the writer patterns and their workflow is allowed.
 pub fn ci_reader(config: &Config, identity: &Identity) -> Reader {
     Reader {
         repository: identity.repository.clone(),
         may_write: identity.static_token
-            || config
+            || (config
                 .cache_writers
-                .allows(&identity.repository, identity.git_ref.as_deref()),
+                .allows(&identity.repository, identity.git_ref.as_deref())
+                && workflow_allowed(config, identity)),
         writer: Writer::from_identity(identity),
         caller: Caller::Ci,
     }
@@ -159,8 +173,38 @@ mod tests {
             run_id: Some("9".into()),
             sha: Some("abc".into()),
             workflow: Some("wf".into()),
+            job_workflow: Some(
+                "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main".into(),
+            ),
             static_token: false,
         }
+    }
+
+    #[test]
+    fn writer_workflows_limit_who_may_write_and_unset_limits_nobody() {
+        let main = identity(Some("refs/heads/main"));
+        // Unset: today's behavior, any workflow on the right ref may write.
+        assert!(ci_reader(&config(&[]), &main).may_write);
+        let limited = config(&[(
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+            "ArchAstro/firstlanding/.github/workflows/ci.yml@",
+        )]);
+        assert!(ci_reader(&limited, &main).may_write);
+        let mut other = identity(Some("refs/heads/main"));
+        other.job_workflow =
+            Some("ArchAstro/firstlanding/.github/workflows/evil.yml@refs/heads/main".into());
+        assert!(!ci_reader(&limited, &other).may_write);
+        // A token without the claim cannot satisfy a configured restriction.
+        other.job_workflow = None;
+        assert!(!ci_reader(&limited, &other).may_write);
+        // The right workflow on a pull-request ref still cannot write.
+        assert!(!ci_reader(&limited, &identity(Some("refs/pull/7/merge"))).may_write);
+        // A static development token is not an Actions job and is exempt.
+        let mut dev = identity(Some("refs/heads/main"));
+        dev.static_token = true;
+        dev.job_workflow = None;
+        assert!(ci_reader(&limited, &dev).may_write);
+        assert!(workflow_allowed(&limited, &dev));
     }
 
     #[test]

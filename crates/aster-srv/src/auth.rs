@@ -86,6 +86,11 @@ pub struct Identity {
     /// The `workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@refs/heads/main`):
     /// the workflow file. `None` for a static token.
     pub workflow: Option<String>,
+    /// The `job_workflow_ref` claim: the workflow that runs the job (the
+    /// reusable workflow when one is called), falling back to
+    /// `workflow_ref` when the claim is absent. Writer workflow prefixes
+    /// match it. `None` for a static token.
+    pub job_workflow: Option<String>,
     /// A configured static token, not an OIDC token.
     pub static_token: bool,
 }
@@ -138,6 +143,8 @@ struct Claims {
     #[serde(default)]
     #[serde(rename = "workflow_ref")]
     workflow: Option<String>,
+    #[serde(default)]
+    job_workflow_ref: Option<String>,
 }
 
 /// GitHub sends `run_id` as a string; accept a number too rather than
@@ -224,6 +231,7 @@ impl Verifier {
                 run_id: None,
                 sha: None,
                 workflow: None,
+                job_workflow: None,
                 static_token: true,
             });
         }
@@ -249,12 +257,14 @@ impl Verifier {
         if !self.allowlist.allows(&claims.repository) {
             return Err(AuthError::Forbidden(claims.repository));
         }
+        let workflow = non_empty(claims.workflow);
         Ok(Identity {
             repository: claims.repository,
             git_ref: non_empty(claims.git_ref),
             run_id: non_empty(claims.run_id),
             sha: non_empty(claims.sha),
-            workflow: non_empty(claims.workflow),
+            job_workflow: non_empty(claims.job_workflow_ref).or_else(|| workflow.clone()),
+            workflow,
             static_token: false,
         })
     }
@@ -629,6 +639,32 @@ mod tests {
                 "{name} must be refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn job_workflow_ref_wins_over_workflow_ref_and_falls_back_to_it() {
+        let mut both = claims("ArchAstro/firstlanding");
+        both["workflow_ref"] =
+            json!("ArchAstro/firstlanding/.github/workflows/caller.yml@refs/heads/main");
+        both["job_workflow_ref"] =
+            json!("ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main");
+        let identity = verifier()
+            .verify(Some(&format!("Bearer {}", token(both.clone(), "k1"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            identity.job_workflow.as_deref(),
+            Some("ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main")
+        );
+        both.as_object_mut().unwrap().remove("job_workflow_ref");
+        let identity = verifier()
+            .verify(Some(&format!("Bearer {}", token(both, "k1"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            identity.job_workflow.as_deref(),
+            Some("ArchAstro/firstlanding/.github/workflows/caller.yml@refs/heads/main")
+        );
     }
 
     /// The test OIDC key as a JWK, served by a stub that answers slowly.

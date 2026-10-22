@@ -892,6 +892,163 @@ fn ci(git_ref: &str, job_workflow: Option<&str>) -> String {
     format!("Bearer {}", token_with_claims(REPO, claims))
 }
 
+async fn upload_results(server: &Server, bearer: &str) -> u16 {
+    use aster_results_model::{to_ndjson, Record, RunRecord};
+    let body = to_ndjson(&[Record::Run(RunRecord {
+        run_id: "run-1".into(),
+        repo: REPO.into(),
+        sha: "9f1c".into(),
+        branch: Some("main".into()),
+        pr: None,
+        workflow: Some("CI".into()),
+        job: Some("test".into()),
+        attempt: Some(1),
+        lane: None,
+        runner: None,
+        aster_version: "0.24.0".into(),
+        started_at: "2026-10-13T17:02:11Z".into(),
+    })]);
+    browser()
+        .post(format!("{}/v1/test-results/runs", server.url))
+        .header("authorization", bearer)
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn ci_may_write_only_from_the_default_branch_and_the_named_workflow() {
+    let Some(server) = start_with(&[(
+        "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+        "ArchAstro/firstlanding/.github/workflows/ci.yml@",
+    )])
+    .await
+    else {
+        return;
+    };
+    let write = |bearer: String, key: &'static str| {
+        let server = &server;
+        async move {
+            server
+                .post_json("/v1/cache/commit", &manifest_body(key), Some(&bearer), None)
+                .await
+                .0
+        }
+    };
+    let pr = "refs/pull/7/merge";
+    let main = "refs/heads/main";
+    assert_eq!(
+        write(ci(main, Some(CI_WORKFLOW)), "k-main").await,
+        201,
+        "main from ci.yml"
+    );
+    assert_eq!(
+        write(ci(pr, Some(CI_WORKFLOW)), "k-pr").await,
+        403,
+        "a PR ref from ci.yml"
+    );
+    assert_eq!(
+        write(
+            ci(
+                main,
+                Some("ArchAstro/firstlanding/.github/workflows/evil.yml@refs/heads/main")
+            ),
+            "k-evil"
+        )
+        .await,
+        403,
+        "main from another workflow"
+    );
+    assert_eq!(
+        write(
+            ci(
+                main,
+                Some("ArchAstro/firstlanding/.github/workflows/ci.yml.evil@refs/heads/main")
+            ),
+            "k-lookalike"
+        )
+        .await,
+        403,
+        "a workflow whose path only starts like the allowed one"
+    );
+    assert_eq!(
+        write(ci(main, None), "k-none").await,
+        403,
+        "main with no workflow claim"
+    );
+    // Reads are not limited by workflow.
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k-main"]}),
+            Some(&ci(pr, Some("x/y/.github/workflows/z.yml@r"))),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // Test-results uploads follow the same workflow rule (any ref).
+    assert_eq!(
+        upload_results(&server, &ci(main, Some(CI_WORKFLOW))).await,
+        201
+    );
+    assert_eq!(
+        upload_results(&server, &ci(pr, Some(CI_WORKFLOW))).await,
+        200,
+        "a replayed run"
+    );
+    assert_eq!(
+        upload_results(
+            &server,
+            &ci(
+                main,
+                Some("ArchAstro/firstlanding/.github/workflows/evil.yml@refs/heads/main")
+            )
+        )
+        .await,
+        403
+    );
+    assert_eq!(upload_results(&server, &ci(main, None)).await, 403);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn without_writer_workflows_configured_any_workflow_on_the_default_branch_writes() {
+    let Some(server) = start().await else {
+        return;
+    };
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/commit",
+            &manifest_body("k-any"),
+            Some(&ci(
+                "refs/heads/main",
+                Some("ArchAstro/other/.github/workflows/x.yml@r"),
+            )),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201);
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/commit",
+            &manifest_body("k-none"),
+            Some(&ci("refs/heads/main", None)),
+            None,
+        )
+        .await;
+    assert_eq!(status, 201, "a token with no workflow claim keeps working");
+    assert_eq!(
+        upload_results(&server, &ci("refs/heads/main", None)).await,
+        201
+    );
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn an_older_ci_client_with_a_proxy_header_still_reads_and_writes() {
     let Some(server) = start().await else {
