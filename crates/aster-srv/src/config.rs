@@ -102,6 +102,12 @@ pub struct Config {
     /// `ASTER_SRV_CACHE_WRITERS`: `repo=ref` patterns that may upload and
     /// commit. Default `*=refs/heads/<default branch>`.
     pub cache_writers: CacheWriters,
+    /// `ASTER_SRV_CACHE_WRITER_WORKFLOWS`: comma-separated prefixes of the
+    /// `job_workflow_ref` claim (for example
+    /// `ArchAstro/firstlanding/.github/workflows/ci.yml@`). When set, a CI
+    /// token may write the cache or upload test results only from a job
+    /// whose workflow matches one. Unset applies no workflow restriction.
+    pub writer_workflows: Option<WriterWorkflows>,
     /// `ASTER_SRV_PUBLIC_URL`: the URL people reach this server at, the
     /// `iss` of the tokens `aster cache login` hands out. Unset turns
     /// person login off.
@@ -278,6 +284,10 @@ impl Config {
         }
         let cache_writers =
             CacheWriters::parse(var("ASTER_SRV_CACHE_WRITERS").as_deref(), &default_branch)?;
+        let writer_workflows = match var("ASTER_SRV_CACHE_WRITER_WORKFLOWS") {
+            Some(value) => Some(WriterWorkflows::parse(&value)?),
+            None => None,
+        };
         let public_url = match var("ASTER_SRV_PUBLIC_URL") {
             Some(url) => {
                 let url = url.trim().trim_end_matches('/').to_string();
@@ -324,6 +334,7 @@ impl Config {
             cache_signer,
             cache_days,
             cache_writers,
+            writer_workflows,
             public_url,
             cli_token_keys,
             cli_token_ttl,
@@ -362,6 +373,37 @@ fn parse_cli_token_keys(value: &str) -> Result<Vec<CliTokenKey>> {
         bail!("ASTER_SRV_CLI_TOKEN_KEYS lists no key");
     }
     Ok(keys)
+}
+
+/// Prefixes of the `job_workflow_ref` claim that may write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterWorkflows(Vec<String>);
+
+impl WriterWorkflows {
+    pub fn parse(value: &str) -> Result<Self> {
+        let prefixes: Vec<String> = value
+            .split(',')
+            .map(|prefix| prefix.trim().to_string())
+            .filter(|prefix| !prefix.is_empty())
+            .collect();
+        if prefixes.is_empty() {
+            bail!("ASTER_SRV_CACHE_WRITER_WORKFLOWS lists no workflow");
+        }
+        // Without an `@` the prefix `owner/repo/.github/workflows/ci.yml`
+        // would also match `ci.yml.evil@...`.
+        if let Some(bad) = prefixes.iter().find(|prefix| !prefix.contains('@')) {
+            bail!(
+                "ASTER_SRV_CACHE_WRITER_WORKFLOWS entry '{bad}' must end its workflow path with '@', \
+                 such as owner/repo/.github/workflows/ci.yml@"
+            );
+        }
+        Ok(Self(prefixes))
+    }
+
+    /// Whether `workflow` (a `job_workflow_ref`) starts with a prefix.
+    pub fn allows(&self, workflow: &str) -> bool {
+        self.0.iter().any(|prefix| workflow.starts_with(prefix))
+    }
 }
 
 /// Repositories allowed to use the server.
@@ -549,14 +591,15 @@ mod tests {
             .cache_writers
             .allows("ArchAstro/aster", Some("refs/pull/7/merge")));
         assert!(!config.cache_writers.allows("ArchAstro/aster", None));
-        // Person sign-in is off until configured.
+        // Person sign-in and the workflow limit are off until configured.
+        assert!(config.writer_workflows.is_none());
         assert!(config.public_url.is_none());
         assert!(config.cli_token_keys.is_empty());
         assert_eq!(config.cli_token_ttl, 12 * 60 * 60);
     }
 
     #[test]
-    fn reads_sign_in_settings() {
+    fn reads_sign_in_and_writer_workflow_settings() {
         let with = |extra: &[(&str, &str)]| {
             let mut pairs = REQUIRED.to_vec();
             pairs.extend_from_slice(extra);
@@ -570,6 +613,10 @@ mod tests {
                 &format!("k2:{secret}, k1:{secret}x"),
             ),
             ("ASTER_SRV_CLI_TOKEN_TTL", "3600"),
+            (
+                "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+                "A/b/.github/workflows/ci.yml@, A/c/.github/workflows/x.yml@refs/heads/main",
+            ),
         ])
         .unwrap();
         assert_eq!(
@@ -583,6 +630,11 @@ mod tests {
             .collect();
         assert_eq!(kids, ["k2", "k1"], "the first key signs");
         assert_eq!(config.cli_token_ttl, 3600);
+        let workflows = config.writer_workflows.unwrap();
+        assert!(workflows.allows("A/b/.github/workflows/ci.yml@refs/heads/main"));
+        assert!(workflows.allows("A/c/.github/workflows/x.yml@refs/heads/main"));
+        assert!(!workflows.allows("A/b/.github/workflows/ci.yml.evil@refs/heads/main"));
+        assert!(!workflows.allows("A/c/.github/workflows/x.yml@refs/heads/dev"));
         // Secrets stay out of debug output.
         assert!(!format!("{:?}", config.cli_token_keys).contains(secret));
 
@@ -602,6 +654,10 @@ mod tests {
             ("ASTER_SRV_CLI_TOKEN_TTL", "30"),
             ("ASTER_SRV_CLI_TOKEN_TTL", "999999999"),
             ("ASTER_SRV_CLI_TOKEN_TTL", "12h"),
+            (
+                "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+                "A/b/.github/workflows/ci.yml",
+            ),
         ] {
             assert!(with(&[(name, value)]).is_err(), "{name}={value}");
         }

@@ -191,6 +191,10 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
                 Ok(identity) => identity,
                 Err(reply) => return reply,
             };
+            // Uploads, like cache writes, may be limited to named workflows.
+            if !crate::cache::workflow_allowed(&app.config, &identity) {
+                return Reply::error(403, "this workflow may not upload test results");
+            }
             let gzip =
                 header(&request, CONTENT_ENCODING).is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
             let body = match read_body(request, app.config.max_body_bytes).await {
