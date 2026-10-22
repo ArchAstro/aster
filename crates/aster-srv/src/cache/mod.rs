@@ -12,7 +12,7 @@
 //! | `GET /v1/cache/summary` | Counts, sizes, last writer and 14 days of lookups for one repository. Read-only. |
 //! | `GET /v1/cache/entries` | A page of manifests with their writer and hit counts. Read-only. |
 
-mod browse;
+pub(crate) mod browse;
 mod policy;
 mod routes;
 mod signing;

@@ -322,3 +322,18 @@ async fn the_dashboard_is_off_without_an_audience_and_trusts_the_dev_viewer_when
     assert!(body.contains("dev@example.com"));
     dev.stop().await;
 }
+
+#[tokio::test]
+async fn the_cache_page_says_so_when_the_server_has_no_cache_bucket() {
+    let Some(server) = seeded().await else {
+        return;
+    };
+    let (status, body) = page(&server, "/ui/cache?repo=ArchAstro%2Ffirstlanding").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("The artifact cache is off") && body.contains("ASTER_SRV_CACHE_BUCKET"));
+    // The nav carries the page and keeps the repository.
+    assert!(body.contains("href=\"/ui/cache?repo=ArchAstro%2Ffirstlanding\" aria-current=\"page\""));
+    let (status, _) = page(&server, "/ui/cache?repo=evil%2Fx").await;
+    assert_eq!(status, 403);
+    server.stop().await;
+}

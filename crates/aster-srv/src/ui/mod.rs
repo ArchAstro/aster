@@ -5,6 +5,7 @@
 //! - `/ui/tests/:test_id`: one test's state and history
 //! - `/ui/clusters`: failures grouped by failure hash
 //! - `/ui/quarantine`: the quarantine list and its recent changes
+//! - `/ui/cache`: the artifact cache's size, lookups and entries
 //!
 //! `?repo=owner/name` picks the repository; without it the one with the
 //! newest run is shown. Any repository on the allowlist can be viewed. The
@@ -18,6 +19,7 @@ use chrono::Utc;
 use hyper::Method;
 use serde_json::json;
 
+use crate::cache::browse;
 use crate::iap::ViewerError;
 use crate::test_results::query::{parse_query, percent_decode};
 use crate::{App, Reply};
@@ -43,6 +45,7 @@ pub enum Route {
     Test(String),
     Clusters,
     Quarantine,
+    Cache,
 }
 
 /// Whether `path` belongs to the dashboard.
@@ -58,6 +61,7 @@ pub fn parse_route(path: &str) -> Option<Route> {
         "" | "/" => return Some(Route::Flaky),
         "/clusters" | "/clusters/" => return Some(Route::Clusters),
         "/quarantine" | "/quarantine/" => return Some(Route::Quarantine),
+        "/cache" | "/cache/" => return Some(Route::Cache),
         _ => {}
     }
     match rest.strip_prefix("/tests/")?.trim_end_matches('/') {
@@ -92,17 +96,14 @@ pub async fn handle(
     let Some(pairs) = parse_query(query) else {
         return failure(400, "Bad request", "The query is not valid.");
     };
-    let requested = pairs
-        .into_iter()
-        .find(|(key, _)| key == "repo")
-        .map(|(_, value)| value);
+    let requested = param(&pairs, "repo").map(str::to_string);
     if let Some(repo) = &requested {
         if !app.config.repositories.allows(repo) {
             return failure(403, "Not allowed", "That repository is not available here.");
         }
     }
 
-    match render(app, &viewer.email, route, requested).await {
+    match render(app, &viewer.email, route, requested, &pairs).await {
         Ok(reply) => reply,
         Err(error) => {
             crate::log::error(
@@ -118,6 +119,13 @@ pub async fn handle(
     }
 }
 
+fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
 fn failure(status: u16, title: &str, message: &str) -> Reply {
     Reply::html(status, html::message_page(title, message))
 }
@@ -127,6 +135,7 @@ async fn render(
     viewer: &str,
     route: Route,
     requested: Option<String>,
+    pairs: &[(String, String)],
 ) -> anyhow::Result<Reply> {
     let client = app.pool.get().await?;
     let repos: Vec<String> = data::repos(&client)
@@ -167,6 +176,7 @@ async fn render(
             Route::Flaky => ("Flaky tests", Section::Flaky),
             Route::Clusters => ("Failure clusters", Section::Clusters),
             Route::Quarantine => ("Quarantine", Section::Quarantine),
+            Route::Cache => ("Cache", Section::Cache),
             Route::Test(_) => ("Test", Section::Other),
         };
         let body = if route == Route::Quarantine {
@@ -203,6 +213,13 @@ async fn render(
                 &pages::quarantine(Some(repo_name), app.config.quarantine, &entries, &changes),
             )
         }
+        Route::Cache => {
+            let view = cache_view(app, repo_name, pairs).await?;
+            match view {
+                Ok(view) => make("Cache", Section::Cache, &pages::cache(&view)),
+                Err(reply) => reply,
+            }
+        }
         Route::Test(test_id) => {
             let Some(test) = data::test(&client, repo_name, &test_id).await? else {
                 let body = "<p class=\"empty\">No such test in this repository.</p>";
@@ -222,6 +239,56 @@ async fn render(
     })
 }
 
+/// What `/ui/cache` shows for `repo`, or the 400 for a bad `before`. With no
+/// cache bucket nothing is read.
+async fn cache_view(
+    app: &App,
+    repo: &str,
+    pairs: &[(String, String)],
+) -> anyhow::Result<Result<pages::CacheView, Reply>> {
+    let target = param(pairs, "target")
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_string);
+    let before = param(pairs, "before").filter(|text| !text.is_empty());
+    let after = match before {
+        None => None,
+        Some(text) => match browse::Cursor::parse(text) {
+            Some(cursor) => Some(cursor),
+            None => {
+                return Ok(Err(failure(
+                    400,
+                    "Bad request",
+                    "before is not a cursor this server issued.",
+                )))
+            }
+        },
+    };
+    let mut view = pages::CacheView {
+        repo: repo.to_string(),
+        enabled: app.config.cache_bucket.is_some(),
+        summary: None,
+        entries: Vec::new(),
+        next: None,
+        target,
+        paged: before.is_some(),
+    };
+    if view.enabled {
+        view.summary = Some(browse::read_summary(app, repo).await?);
+        let (entries, next) = browse::read_entries(
+            app,
+            repo,
+            browse::DEFAULT_LIMIT,
+            after,
+            view.target.as_deref(),
+        )
+        .await?;
+        view.entries = entries;
+        view.next = next;
+    }
+    Ok(Ok(view))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +299,8 @@ mod tests {
         assert_eq!(parse_route("/ui/"), Some(Route::Flaky));
         assert_eq!(parse_route("/ui/clusters"), Some(Route::Clusters));
         assert_eq!(parse_route("/ui/quarantine/"), Some(Route::Quarantine));
+        assert_eq!(parse_route("/ui/cache"), Some(Route::Cache));
+        assert_eq!(parse_route("/ui/cache/"), Some(Route::Cache));
         assert_eq!(
             parse_route("/ui/tests/a%2Fb%20c"),
             Some(Route::Test("a/b c".into()))

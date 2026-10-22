@@ -49,6 +49,21 @@ pub fn when_opt(at: Option<DateTime<Utc>>) -> String {
     at.map_or_else(|| "-".to_string(), when)
 }
 
+/// A byte count with a binary unit: `0 B`, `1.5 KiB`, `12.0 MiB`.
+pub fn bytes(count: i64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if count < 1024 {
+        return format!("{count} B");
+    }
+    let mut value = count as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// The first `len` characters of a commit sha.
 pub fn short_sha(sha: &str) -> &str {
     let end = sha
@@ -77,6 +92,7 @@ pub enum Section {
     Flaky,
     Clusters,
     Quarantine,
+    Cache,
     /// A test's page: no nav entry is current.
     Other,
 }
@@ -99,6 +115,7 @@ pub fn page(frame: &Frame<'_>, body: &str) -> String {
         (Section::Flaky, "/ui", "Flaky tests"),
         (Section::Clusters, "/ui/clusters", "Failure clusters"),
         (Section::Quarantine, "/ui/quarantine", "Quarantine"),
+        (Section::Cache, "/ui/cache", "Cache"),
     ] {
         let current = if frame.section == section {
             " aria-current=\"page\""
@@ -152,6 +169,7 @@ fn section_path(section: Section) -> &'static str {
         Section::Flaky | Section::Other => "/ui",
         Section::Clusters => "/ui/clusters",
         Section::Quarantine => "/ui/quarantine",
+        Section::Cache => "/ui/cache",
     }
 }
 
@@ -213,6 +231,9 @@ dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}\
 .cell{width:12px;height:22px;border-radius:2px;background:var(--skip)}\
 .cell.pass{background:var(--pass)}.cell.fail{background:var(--fail)}\
 .cell.error{background:var(--error)}\
+form{margin:8px 0}input[type=search]{font:inherit;padding:2px 6px;border:1px solid var(--line);\
+border-radius:6px;background:var(--bg);color:var(--fg)}\
+button{font:inherit;padding:2px 10px}\
 .legend{font-size:13px;color:var(--muted)}\
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 12px}\
 .legend i:first-child{margin-left:0}\
@@ -256,6 +277,15 @@ mod tests {
                 Some(text)
             );
         }
+    }
+
+    #[test]
+    fn formats_byte_counts() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(1023), "1023 B");
+        assert_eq!(bytes(1536), "1.5 KiB");
+        assert_eq!(bytes(12 * 1024 * 1024), "12.0 MiB");
+        assert_eq!(bytes(i64::MAX), "8192.0 PiB");
     }
 
     #[test]

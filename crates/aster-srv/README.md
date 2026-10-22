@@ -354,6 +354,7 @@ needs no JavaScript.
 | `/ui/tests/:test_id?repo=owner/name` | One test: state, a pass/fail strip (oldest to newest) and recent results with failure messages |
 | `/ui/clusters` | Failures of the last 7 days grouped by failure hash |
 | `/ui/quarantine` | The quarantine list, its rules and its recent changes |
+| `/ui/cache?repo=owner/name&target=<substring>` | The artifact cache: manifest and blob counts and sizes, the last write and its writer (ref, workflow, run linked to GitHub Actions, commit), 14 days of lookup hits, misses and hit rate, and the entries (target, key, size, output files, hits, last hit, created, last used, writer run) 50 per page with a filter and a next-page link. Says so when `ASTER_SRV_CACHE_BUCKET` is not set. See [Artifact cache](#artifact-cache). |
 
 `?repo=owner/name` picks the repository; without it the one with the newest
 run is shown. Any repository on `ASTER_SRV_REPOSITORIES` can be viewed.
@@ -408,7 +409,6 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
-| `ASTER_SRV_CACHE_ADMIN_EMAILS` | unset | Comma-separated emails (matched exactly, case-insensitively) that may call the read-only `GET /v1/cache/summary` and `GET /v1/cache/entries` through IAP even when `ASTER_SRV_UI_EMAIL_DOMAINS` does not allow their domain, such as a service account. They cannot look up or write. |
 
 Logs are one JSON object per line, with `severity` and `message`.
 
@@ -470,9 +470,11 @@ lookup still answers. Keys repeated in one request count once.
 
 Reads accept any authenticated CI token for the repository, and an IAP viewer
 whose email `ASTER_SRV_UI_EMAIL_DOMAINS` allows. The two `GET` browsing routes
-also accept an IAP caller listed in `ASTER_SRV_CACHE_ADMIN_EMAILS`; they answer
-`401` without an identity and `403` for a caller that is not allowed, a
-repository the server does not serve, or a CI token for another repository. Writes accept a static
+answer `401` without an identity and `403` for a viewer outside those domains,
+a repository the server does not serve, or a CI token for another repository.
+People browse the same data on the dashboard at `/ui/cache`. There is no
+separate allow-list for browsing: whoever may view the dashboard may browse
+the cache. Writes accept a static
 development token, or a CI token whose `ref` matches `ASTER_SRV_CACHE_WRITERS`
 (default the repository's default branch, `refs/heads/main`). A pull-request
 ref is refused with `403`, so a branch cannot poison the cache.

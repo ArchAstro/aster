@@ -102,11 +102,6 @@ pub struct Config {
     /// `ASTER_SRV_CACHE_WRITERS`: `repo=ref` patterns that may upload and
     /// commit. Default `*=refs/heads/<default branch>`.
     pub cache_writers: CacheWriters,
-    /// `ASTER_SRV_CACHE_ADMIN_EMAILS`: comma-separated emails, lowercased,
-    /// that may read the cache browsing routes through IAP whatever
-    /// `ASTER_SRV_UI_EMAIL_DOMAINS` says. For a service account such as
-    /// the admin site's, whose domain the viewer rule does not allow.
-    pub cache_admin_emails: Vec<String>,
 }
 
 /// When tests enter and leave quarantine.
@@ -256,18 +251,6 @@ impl Config {
         }
         let cache_writers =
             CacheWriters::parse(var("ASTER_SRV_CACHE_WRITERS").as_deref(), &default_branch)?;
-        let cache_admin_emails = var("ASTER_SRV_CACHE_ADMIN_EMAILS")
-            .map(|emails| {
-                emails
-                    .split(',')
-                    .map(|email| email.trim().to_ascii_lowercase())
-                    .filter(|email| !email.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if let Some(bad) = cache_admin_emails.iter().find(|email| !email.contains('@')) {
-            bail!("ASTER_SRV_CACHE_ADMIN_EMAILS entry '{bad}' is not an email");
-        }
         Ok(Self {
             listen,
             database_url,
@@ -289,7 +272,6 @@ impl Config {
             cache_signer,
             cache_days,
             cache_writers,
-            cache_admin_emails,
         })
     }
 }
@@ -638,22 +620,5 @@ mod tests {
         for bad in ["", "*/*", "owner", "a/b/c"] {
             assert!(RepositoryAllowlist::parse(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn cache_admin_emails_are_trimmed_lowercased_and_must_be_emails() {
-        let env = |value: &'static str| {
-            Config::from_env(move |name| match name {
-                "ASTER_SRV_DATABASE_URL" => Some("postgres://localhost/x".into()),
-                "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
-                "ASTER_SRV_CACHE_ADMIN_EMAILS" => Some(value.into()),
-                _ => None,
-            })
-        };
-        assert_eq!(
-            env(" A@x.org ,,b@y.org").unwrap().cache_admin_emails,
-            ["a@x.org", "b@y.org"]
-        );
-        assert!(env("not-an-email").is_err());
     }
 }

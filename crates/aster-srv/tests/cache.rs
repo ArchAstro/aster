@@ -64,11 +64,6 @@ async fn server() -> Option<(common::Server, Arc<FixedSigner>)> {
                 "/projects/123456/global/backendServices/",
             ),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
-            // A service account outside the viewer domain, as the admin site uses.
-            (
-                "ASTER_SRV_CACHE_ADMIN_EMAILS",
-                "archdev-admin@archastro.iam.gserviceaccount.com",
-            ),
             (
                 "ASTER_SRV_STATIC_TOKENS",
                 "ArchAstro/firstlanding=dev-token-0123456789",
@@ -603,7 +598,7 @@ async fn retention_drops_expired_rows_and_objects() {
     server.stop().await;
 }
 
-const ADMIN: &str = "archdev-admin@archastro.iam.gserviceaccount.com";
+const VIEWER: &str = "ada@example.com";
 
 fn manifest_for(key: &str, target: &str, digests: &[&str]) -> (String, usize) {
     let outputs: Vec<Value> = digests
@@ -660,10 +655,10 @@ async fn commit_as(server: &common::Server, writer: &str, key: &str, target: &st
 }
 
 /// An operator checks that the shared cache works: two CI runs on main write
-/// entries, one lookup hits one key and misses another, and the admin site's
-/// service account reads the counts, sizes, writers and hit totals back.
+/// entries, one lookup hits one key and misses another, and a domain viewer
+/// reads the counts, sizes, writers and hit totals back over the JSON routes.
 #[tokio::test]
-async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
+async fn a_viewer_reads_back_what_ci_wrote_and_how_lookups_fared() {
     let Some((server, _)) = server().await else {
         return;
     };
@@ -689,14 +684,13 @@ async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
     assert_eq!(status, 200, "{looked}");
     assert_eq!(looked["hits"].as_object().unwrap().len(), 1);
 
-    // Phase 3: the admin site reads through IAP as a service account whose
-    // domain the viewer rule does not allow.
-    let admin = common::iap_assertion(ADMIN);
+    // Phase 3: a viewer inside the allowed domain reads through IAP.
+    let viewer = common::iap_assertion(VIEWER);
     let (status, summary) = server
         .get_json(
             &format!("/v1/cache/summary?repo={REPO}"),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     assert_eq!(status, 200, "{summary}");
@@ -725,7 +719,7 @@ async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}"),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     assert_eq!(status, 200, "{page}");
@@ -750,13 +744,14 @@ async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
     assert_eq!(oldest["writer"]["sha"], "aaaa111");
     assert_eq!(oldest["writer"]["ref"], "refs/heads/main");
 
-    // The service account may browse but not look up or write.
+    // A viewer may browse but not write.
+    let (manifest, _) = manifest_for("viewer-key", "//x:y", &[DIGEST]);
     let (status, _) = server
         .post_json(
-            "/v1/cache/lookup",
-            &json!({"repo": REPO, "keys": ["key-one"]}),
+            "/v1/cache/commit",
+            &json!({"repo": REPO, "key": "viewer-key", "manifest": manifest}),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     assert_eq!(status, 403);
@@ -764,7 +759,7 @@ async fn admin_site_sees_what_ci_wrote_and_how_lookups_fared() {
 }
 
 #[tokio::test]
-async fn browsing_routes_authorize_viewers_admins_and_ci() {
+async fn browsing_routes_authorize_viewers_and_ci() {
     let Some((server, _)) = server().await else {
         return;
     };
@@ -774,27 +769,14 @@ async fn browsing_routes_authorize_viewers_admins_and_ci() {
         // No identity at all.
         let (status, _) = server.get_json(path, None, None).await;
         assert_eq!(status, 401, "{path}");
-        // A domain viewer and the listed admin email may read.
-        for email in ["ada@example.com", ADMIN] {
-            let (status, body) = server
-                .get_json(path, None, Some(&common::iap_assertion(email)))
-                .await;
-            assert_eq!(status, 200, "{email} {body}");
-        }
-        // An email that is neither.
+        // A domain viewer may read.
+        let (status, body) = server
+            .get_json(path, None, Some(&common::iap_assertion(VIEWER)))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        // An email outside the viewer domains.
         let (status, _) = server
             .get_json(path, None, Some(&common::iap_assertion("eve@other.test")))
-            .await;
-        assert_eq!(status, 403);
-        // Admin email match is exact, not a domain or substring rule.
-        let (status, _) = server
-            .get_json(
-                path,
-                None,
-                Some(&common::iap_assertion(
-                    "x-archdev-admin@archastro.iam.gserviceaccount.com",
-                )),
-            )
             .await;
         assert_eq!(status, 403);
         // CI reads its own repository, from any ref.
@@ -809,7 +791,7 @@ async fn browsing_routes_authorize_viewers_admins_and_ci() {
         // An IAP viewer may not browse a repository the server does not serve.
         let other = path.replace(REPO, "evil/other");
         let (status, _) = server
-            .get_json(&other, None, Some(&common::iap_assertion(ADMIN)))
+            .get_json(&other, None, Some(&common::iap_assertion(VIEWER)))
             .await;
         assert_eq!(status, 403);
         // Bad bearer token.
@@ -823,7 +805,7 @@ async fn browsing_routes_authorize_viewers_admins_and_ci() {
         .get_json(
             "/v1/cache/entries",
             None,
-            Some(&common::iap_assertion(ADMIN)),
+            Some(&common::iap_assertion(VIEWER)),
         )
         .await;
     assert_eq!(status, 400);
@@ -848,7 +830,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
     let Some((server, _)) = server().await else {
         return;
     };
-    let admin = common::iap_assertion(ADMIN);
+    let viewer = common::iap_assertion(VIEWER);
     let client = server.client().await;
     // Five rows; b and c share a created_at to exercise the key tie-break.
     let base = Utc::now();
@@ -881,7 +863,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
             .get_json(
                 &format!("/v1/cache/entries?repo={REPO}&limit=2&before={before}"),
                 None,
-                Some(&admin),
+                Some(&viewer),
             )
             .await;
         assert_eq!(status, 200, "{page}");
@@ -900,7 +882,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}"),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     let bad = page["entries"]
@@ -922,7 +904,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}&target=X%3A&limit=1"),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     assert_eq!(status, 200, "{filtered}");
@@ -932,7 +914,7 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
         .get_json(
             &format!("/v1/cache/entries?repo={REPO}&target=x:&limit=5"),
             None,
-            Some(&admin),
+            Some(&viewer),
         )
         .await;
     let keys: Vec<&str> = filtered["entries"]
@@ -950,14 +932,18 @@ async fn entries_page_by_cursor_filter_by_target_and_survive_a_bad_manifest() {
             .get_json(
                 &format!("/v1/cache/entries?repo={REPO}&{query}"),
                 None,
-                Some(&admin),
+                Some(&viewer),
             )
             .await;
         assert_eq!(status, 400, "{query}");
     }
     // Another repository's entries are not mixed in.
     let (_, empty) = server
-        .get_json("/v1/cache/entries?repo=ArchAstro/other", None, Some(&admin))
+        .get_json(
+            "/v1/cache/entries?repo=ArchAstro/other",
+            None,
+            Some(&viewer),
+        )
         .await;
     assert_eq!(empty["entries"], json!([]));
     server.stop().await;
@@ -1061,5 +1047,117 @@ async fn commit_records_the_writer_claims() {
         assert_eq!(static_row.get::<_, Option<String>>(column), None);
     }
     drop(client);
+    server.stop().await;
+}
+
+/// An engineer opens the cache page after CI has used the cache: two runs on
+/// main write entries, one lookup hits a key and misses another, fifty older
+/// entries fill the first page, and an IAP viewer reads the page in a browser.
+#[tokio::test]
+async fn the_cache_page_shows_what_ci_wrote_hit_rates_filter_and_paging() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+
+    // Phase 1: two CI runs on main commit one manifest each.
+    put_blob(&server, DIGEST).await;
+    let first = ci_writer("1001", "aaaa1111111111");
+    let second = ci_writer("1002", "bbbb2222222222");
+    commit_as(&server, &first, "key-one", "//apps/web:build").await;
+    commit_as(&server, &second, "key-two", "//apps/api:test").await;
+
+    // Phase 2: a lookup of one stored key and one unknown key counts one hit
+    // and one miss.
+    let (status, looked) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["key-one", "never-stored"]}),
+            Some(&first),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{looked}");
+
+    // Phase 3: fifty older manifests push the entries past one page of 50.
+    let client = server.client().await;
+    let base = Utc::now() - Duration::hours(1);
+    for index in 0..50 {
+        let manifest = format!("{{\"target\":\"//bulk:t{index:02}\"}}").into_bytes();
+        client
+            .execute(
+                "INSERT INTO cache.manifests (repo, key, manifest, size_bytes, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &REPO,
+                    &format!("bulk-{index:02}"),
+                    &manifest,
+                    &(manifest.len() as i64),
+                    &(base - Duration::minutes(index)),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    drop(client);
+
+    // Phase 4: a viewer inside the allowed domain opens the page.
+    let viewer = common::iap_assertion(VIEWER);
+    let path = format!("/ui/cache?repo={}", REPO.replace('/', "%2F"));
+    let (status, _, html) = server.get_page(&path, Some(&viewer)).await;
+    assert_eq!(status, 200, "{html}");
+    // Counts: 52 manifests, the one shared blob, and the 1 hit of 2 lookups.
+    assert!(html.contains("<dt>Manifests</dt><dd>52 ("), "{html}");
+    assert!(html.contains("<dt>Blobs, all repositories</dt><dd>1 (4 B)</dd>"));
+    assert!(html.contains("<td class=\"num\">50.0%</td>"), "{html}");
+    assert!(html.contains("<th>Total</th>"));
+    // The newest writer's run links to its GitHub Actions run.
+    let run = format!("https://github.com/{REPO}/actions/runs/1002");
+    assert!(
+        html.contains(&format!("<a href=\"{run}\">1002</a>")),
+        "{html}"
+    );
+    assert!(html.contains("<code>bbbb222222</code>"));
+    // An entry row: target, its hit, and the run that wrote it.
+    assert!(html.contains("<code>//apps/web:build</code>"));
+    assert!(html.contains(&format!("{REPO}/actions/runs/1001")));
+    assert!(html.contains("//apps/api:test"));
+
+    // The first page holds 50 of 52 entries and links to the next page.
+    assert!(html.contains("//bulk:t47") && !html.contains("//bulk:t48"));
+    let next = html
+        .split("<a href=\"")
+        .map(|part| part.split('"').next().unwrap_or(""))
+        .find(|href| href.contains("&amp;before="))
+        .expect("a next page link")
+        .replace("&amp;", "&");
+    let (status, _, second_page) = server.get_page(&next, Some(&viewer)).await;
+    assert_eq!(status, 200, "{second_page}");
+    assert!(second_page.contains("//bulk:t48") && second_page.contains("//bulk:t49"));
+    assert!(!second_page.contains("//apps/web:build") && !second_page.contains("Next page"));
+
+    // The target filter narrows the entries and drops the next page link.
+    let (status, _, filtered) = server
+        .get_page(&format!("{path}&target=API"), Some(&viewer))
+        .await;
+    assert_eq!(status, 200, "{filtered}");
+    assert!(filtered.contains("//apps/api:test"));
+    assert!(!filtered.contains("//apps/web:build") && !filtered.contains("//bulk:"));
+    assert!(!filtered.contains("Next page"));
+
+    // Phase 5: who may not read it.
+    let (status, _, _) = server
+        .get_page(&path, Some(&common::iap_assertion("eve@other.test")))
+        .await;
+    assert_eq!(status, 403);
+    let (status, _, _) = server.get_page(&path, None).await;
+    assert_eq!(status, 401);
+    let (status, _, _) = server
+        .get_page("/ui/cache?repo=evil%2Fother", Some(&viewer))
+        .await;
+    assert_eq!(status, 403);
+    let (status, _, _) = server
+        .get_page(&format!("{path}&before=garbage"), Some(&viewer))
+        .await;
+    assert_eq!(status, 400);
     server.stop().await;
 }
