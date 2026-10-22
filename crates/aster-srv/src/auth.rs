@@ -4,7 +4,8 @@
 //! An OIDC token is accepted when it is signed by the issuer's current key,
 //! is unexpired, names this server's audience, and comes from a repository
 //! on the allowlist. Keys are fetched from the issuer's JWKS and refetched
-//! when a token names a key not yet seen, at most once a minute.
+//! when a token names a key not yet seen, at most once a minute; callers
+//! that arrive during a fetch wait for it and share its keys.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -101,6 +102,8 @@ pub struct Verifier {
     /// Where keys come from; `None` uses only keys added with [`Self::with_key`].
     jwks_url: Option<String>,
     keys: RwLock<HashMap<String, DecodingKey>>,
+    /// When keys were last fetched. Held for the whole fetch, so a caller
+    /// that arrives mid-fetch waits and then finds the fetched keys.
     last_fetch: Mutex<Option<Instant>>,
     client: reqwest::Client,
 }
@@ -197,13 +200,17 @@ impl Verifier {
         let Some(url) = &self.jwks_url else {
             return Err(AuthError::Invalid(format!("unknown signing key {kid}")));
         };
-        {
-            let mut last = self.last_fetch.lock().await;
-            if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
-                return Err(AuthError::Invalid(format!("unknown signing key {kid}")));
-            }
-            *last = Some(Instant::now());
+        // One fetch at a time, with the lock held across it. Callers that
+        // queued behind a fetch look again once they hold the lock, so they
+        // get the key it fetched instead of failing while it was in flight.
+        let mut last = self.last_fetch.lock().await;
+        if let Some(key) = self.keys.read().await.get(kid) {
+            return Ok(key.clone());
         }
+        if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+            return Err(AuthError::Invalid(format!("unknown signing key {kid}")));
+        }
+        *last = Some(Instant::now());
         let set: JwkSet = self
             .client
             .get(url)
@@ -376,5 +383,80 @@ mod tests {
             ),
             (None, None, None, None)
         );
+    }
+
+    /// The test OIDC key as a JWK, served by a stub that answers slowly.
+    const JWKS_N: &str = "855qXNm0Qs-azcPsy_QGxBFH4BPpxL3czNPvP4XV1XRv3tCIbacibo4Vbkvop-Z-4G70ZP-KNgMx_ItXqNpWN1erdKh_JWl0OVPMZpeYJH5T1jV2beTiflxah3pAAvv2lPC0m5QZR9dc6mE2XKcwyPPdhVq1CBeHmksnC8gQjM8iiQkWDuEU4FKbPxzQ6bQ0sau-STvZfy9eP8wQk1kxXE6acJaJaLd45Qqy3rTHVTOjCt3P_gjAbxY_bHY_zFZyn3hBrpuxgJN0fkIsAWHjWPKQzcGNnfbr4UI0R0YKiC69GkbWBUy1Jv-6d5o9cecUSVACA9SdH3A0TobNMwWXmQ";
+
+    #[tokio::test]
+    async fn concurrent_requests_for_an_unseen_key_share_one_slow_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/.well-known/jwks", listener.local_addr().unwrap());
+        let body = json!({"keys": [{
+            "kty": "RSA", "kid": "slow", "use": "sig", "alg": "RS256",
+            "n": JWKS_N, "e": "AQAB",
+        }]})
+        .to_string();
+        tokio::spawn({
+            let fetches = Arc::clone(&fetches);
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 2048];
+                        let _ = stream.read(&mut buffer).await;
+                        // Slow enough that every caller below arrives mid-fetch.
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    });
+                }
+            }
+        });
+
+        let mut verifier = Verifier::new(&config());
+        verifier.jwks_url = Some(url);
+        let verifier = Arc::new(verifier);
+        let bearer = format!("Bearer {}", token(claims("ArchAstro/firstlanding"), "slow"));
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let (verifier, bearer) = (Arc::clone(&verifier), bearer.clone());
+            calls.spawn(async move { verifier.verify(Some(&bearer)).await });
+        }
+        while let Some(result) = calls.join_next().await {
+            let identity = result.unwrap();
+            assert!(
+                identity.is_ok(),
+                "a caller that arrived during the fetch must get the fetched key: {identity:?}"
+            );
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "one fetch serves them all"
+        );
+
+        // A key the issuer really does not have still fails, and does not refetch within a minute.
+        let unknown = format!("Bearer {}", token(claims("ArchAstro/firstlanding"), "nope"));
+        assert!(matches!(
+            verifier.verify(Some(&unknown)).await,
+            Err(AuthError::Invalid(reason)) if reason.contains("unknown signing key")
+        ));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
 }
