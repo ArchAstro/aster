@@ -12,26 +12,42 @@
 //! a skip says nothing, and a cached target replays old results instead of
 //! running anything. Runs are ordered by `received_at`, then `run_id`.
 //!
-//! Definite flake events (`kind = 'definite'`), one per test and run:
+//! An event belongs to the run that *failed* (`run_id`; `prev_run_id` is
+//! the passing run it was compared with) and is observed when that run was
+//! received. One failure is one event however many passes it is compared
+//! with: a pass, a failure and a pass with one input hash is a single
+//! flake, not two.
+//!
+//! Definite flake events (`kind = 'definite'`), one per test and failing
+//! run:
 //!
 //! 1. `retry`: the run's final attempt passed and an earlier attempt of the
-//!    same test failed or errored.
+//!    same test failed or errored. The run is the failing one.
 //! 2. `input_hash`: the test has a final outcome in this run and in an
 //!    earlier run within the retention period, both with the same target
-//!    `input_hash`, and one passed while the other failed or errored. The
-//!    event is for the later run, compared with the nearest earlier run of
-//!    that hash, so a test that keeps flipping keeps producing events but a
-//!    steady one does not.
+//!    `input_hash`, and one passed while the other failed or errored. Each
+//!    run is compared with the nearest earlier run of that hash, so a test
+//!    that keeps flipping keeps producing events but a steady one does not.
 //!
 //! Likely flake events (`kind = 'likely'`), only when the run is on the
 //! default branch (`ASTER_SRV_DEFAULT_BRANCH`):
 //!
 //! 3. `next_main_run`: the final outcome is a pass and the test's previous
 //!    default-branch run failed, whatever the input hash, unless that failure
-//!    ended a broken streak (so fixing a broken test is not a flake) or the
-//!    run already has a definite event for the test. Whether the diff between
-//!    the two runs touched the test is not knowable here; same-hash cases are
-//!    rule 2.
+//!    ended a broken streak (so fixing a broken test is not a flake). The
+//!    event is for the failed run; a definite event for that run replaces
+//!    it, whichever is found first. Whether the diff between the two runs
+//!    touched the test is not knowable here; same-hash cases are rule 2.
+//!
+//! Incidents: a target run whose tests fail together failed for one shared
+//! cause (a crashed shard, a dead database, a harness process that died),
+//! not because each test is flaky. A non-cached target run is an incident
+//! when its failing tests (any attempt failed) number at least
+//! [`INCIDENT_FAILURES`], or at least [`INCIDENT_SHARE_MIN`] and half its
+//! tests, or when [`INCIDENT_SHARED_HASH`] of its final failures share one
+//! failure hash. It is one row in `target_incidents`, and its failures make
+//! no flake events of either kind. They still count toward broken streaks:
+//! a change that breaks many tests at once is still broken.
 //!
 //! Confidence: definite events use every result, `partial` targets included
 //! (a flip is a flip, however the results were captured). Likely events and
@@ -98,6 +114,17 @@ const CHUNK: chrono::Duration = chrono::Duration::hours(6);
 /// Days of events that count toward the score.
 const SCORE_DAYS: i64 = 7;
 
+/// A target run with this many failing tests is an incident.
+pub const INCIDENT_FAILURES: i64 = 20;
+
+/// A target run with this many failing tests, at least half of those it
+/// ran, is an incident.
+pub const INCIDENT_SHARE_MIN: i64 = 5;
+
+/// A target run with this many final failures sharing one failure hash is
+/// an incident.
+pub const INCIDENT_SHARED_HASH: i64 = 10;
+
 /// What a pass did; `None` when another replica held the lock.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -105,6 +132,8 @@ pub struct Report {
     pub results: u64,
     /// New events written.
     pub events: u64,
+    /// New incidents recorded.
+    pub incidents: u64,
     /// `tests` rows whose state changed.
     pub tests_updated: u64,
     /// Quarantine entries and exits.
@@ -123,6 +152,7 @@ pub async fn run_once(app: &App, now: DateTime<Utc>) -> Result<Option<Report>> {
         };
         report.results += chunk.results;
         report.events += chunk.events;
+        report.incidents += chunk.incidents;
         report.tests_updated += chunk.tests_updated;
         report.quarantine.quarantined += chunk.quarantine.quarantined;
         report.quarantine.released += chunk.quarantine.released;
@@ -145,6 +175,7 @@ pub fn spawn(app: std::sync::Arc<App>) {
                     json!({
                         "results": report.results,
                         "events": report.events,
+                        "incidents": report.incidents,
                         "tests_updated": report.tests_updated,
                         "quarantined": report.quarantine.quarantined,
                         "released": report.quarantine.released,
@@ -389,6 +420,49 @@ async fn classify(
     let history = day(window.history_from);
     let mut events = 0;
 
+    // Incidents: the window's target runs whose tests failed together. A run
+    // is read whole in one window (its results arrive in one upload), so an
+    // incident is decided once; a later pass re-reading it finds the same.
+    let incidents = transaction
+        .execute(
+            &format!(
+                "WITH runs AS ( \
+                     SELECT repo, run_id, target, min(received_on) AS received_on, \
+                            min(received_at) AS received_at, min(input_hash) AS input_hash, \
+                            count(*) FILTER (WHERE is_fail OR retried)::int AS failures, \
+                            count(*)::int AS tests \
+                     FROM cls_win GROUP BY repo, run_id, target), \
+                 hashes AS ( \
+                     SELECT DISTINCT ON (run_id, target) run_id, target, failure_hash, \
+                            count(*)::int AS shared \
+                     FROM cls_win WHERE is_fail AND failure_hash IS NOT NULL \
+                     GROUP BY run_id, target, failure_hash \
+                     ORDER BY run_id, target, count(*) DESC, failure_hash) \
+                 INSERT INTO test_results.target_incidents \
+                     (repo, run_id, target, received_on, received_at, input_hash, \
+                      failures, tests, failure_hash, shared) \
+                 SELECT c.repo, c.run_id, c.target, c.received_on, c.received_at, c.input_hash, \
+                        c.failures, c.tests, h.failure_hash, COALESCE(h.shared, 0) \
+                 FROM runs c LEFT JOIN hashes h USING (run_id, target) \
+                 WHERE c.failures >= {INCIDENT_FAILURES} \
+                    OR (c.failures >= {INCIDENT_SHARE_MIN} AND c.failures * 2 >= c.tests) \
+                    OR COALESCE(h.shared, 0) >= {INCIDENT_SHARED_HASH} \
+                 ON CONFLICT (run_id, target) DO NOTHING"
+            ),
+            &[],
+        )
+        .await?;
+    // Whether the failure of `test` in run `run` (received on `day`) was
+    // part of an incident.
+    let in_incident = |run: &str, test: &str, day: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM test_results.test_results ir \
+                     JOIN test_results.target_incidents i \
+                          ON i.run_id = ir.run_id AND i.target = ir.target \
+                     WHERE ir.run_id = {run} AND ir.test_id = {test} AND ir.received_on = {day})"
+        )
+    };
+
     // Rule 1: a later attempt passed after an earlier one failed.
     events += transaction
         .execute(
@@ -397,6 +471,8 @@ async fn classify(
                  SELECT w.received_on, w.repo, w.test_id, 'definite', 'retry', w.run_id, \
                         NULL, w.target, w.input_hash, w.received_at \
                  FROM cls_win w WHERE w.retried \
+                   AND NOT EXISTS (SELECT 1 FROM test_results.target_incidents i \
+                                   WHERE i.run_id = w.run_id AND i.target = w.target) \
                  ON CONFLICT {EVENT_KEY} DO NOTHING"
             ),
             &[],
@@ -434,13 +510,17 @@ async fn classify(
         )
         .await?;
     transaction.batch_execute("ANALYZE cls_hash").await?;
+    // The event is the failed run's, whichever of the two runs that was, so
+    // a pass, a failure and a pass with one hash make one event: the second
+    // comparison finds the first one's key.
     events += transaction
         .execute(
             &format!(
                 "WITH earlier AS MATERIALIZED ( \
                      SELECT DISTINCT ON (tr.run_id, tr.test_id) \
                             tr.repo, tr.test_id, h.address, h.input_hash, tr.run_id, \
-                            h.received_at, tr.outcome IN ('fail', 'error') AS is_fail \
+                            h.received_at, h.received_on, \
+                            tr.outcome IN ('fail', 'error') AS is_fail \
                      FROM cls_hash h \
                      JOIN test_results.test_results tr \
                           ON tr.run_id = h.run_id AND tr.received_on = h.received_on \
@@ -449,19 +529,42 @@ async fn classify(
                      ORDER BY tr.run_id, tr.test_id, tr.attempt DESC), \
                  nearest AS ( \
                      SELECT DISTINCT ON (w.run_id, w.test_id) w.*, \
-                            p.run_id AS prev_run_id, p.is_fail AS prev_is_fail \
+                            p.run_id AS prev_run_id, p.is_fail AS prev_is_fail, \
+                            p.received_at AS prev_received_at, p.received_on AS prev_received_on \
                      FROM cls_win w \
                      JOIN earlier p \
                           ON p.repo = w.repo AND p.test_id = w.test_id \
                          AND p.address = w.target AND p.input_hash = w.input_hash \
                          AND (p.received_at, p.run_id) < (w.received_at, w.run_id) \
-                     ORDER BY w.run_id, w.test_id, p.received_at DESC, p.run_id DESC) \
+                     ORDER BY w.run_id, w.test_id, p.received_at DESC, p.run_id DESC), \
+                 flips AS ( \
+                     SELECT repo, test_id, target, input_hash, \
+                            CASE WHEN is_fail THEN run_id ELSE prev_run_id END AS failed_run, \
+                            CASE WHEN is_fail THEN prev_run_id ELSE run_id END AS passed_run, \
+                            CASE WHEN is_fail THEN received_on ELSE prev_received_on END AS failed_on, \
+                            CASE WHEN is_fail THEN received_at ELSE prev_received_at END AS failed_at \
+                     FROM nearest WHERE prev_is_fail <> is_fail) \
                  INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
-                 SELECT received_on, repo, test_id, 'definite', 'input_hash', run_id, \
-                        prev_run_id, target, input_hash, received_at \
-                 FROM nearest WHERE prev_is_fail <> is_fail \
+                 SELECT f.failed_on, f.repo, f.test_id, 'definite', 'input_hash', f.failed_run, \
+                        f.passed_run, f.target, f.input_hash, f.failed_at \
+                 FROM flips f \
+                 WHERE NOT EXISTS (SELECT 1 FROM test_results.target_incidents i \
+                                   WHERE i.run_id = f.failed_run AND i.target = f.target) \
                  ON CONFLICT {EVENT_KEY} DO NOTHING"
             ),
+            &[],
+        )
+        .await?;
+    // A definite event replaces a likely one for the same failed run, which
+    // an earlier pass may have written before this hash's other run came.
+    transaction
+        .execute(
+            "DELETE FROM test_results.test_flake_events l \
+             USING test_results.test_flake_events d \
+             WHERE l.kind = 'likely' AND d.kind = 'definite' \
+               AND d.repo = l.repo AND d.test_id = l.test_id AND d.run_id = l.run_id \
+               AND d.observed_on = l.observed_on \
+               AND (l.repo, l.test_id) IN (SELECT repo, test_id FROM cls_win)",
             &[],
         )
         .await?;
@@ -496,25 +599,36 @@ async fn classify(
     transaction.batch_execute("ANALYZE cls_main").await?;
 
     // Rule 3: a default-branch pass right after a default-branch failure
-    // that did not end a broken streak.
+    // that did not end a broken streak. The event is the failed run's,
+    // unless that run already has a definite one.
     events += transaction
         .execute(
             &format!(
                 "INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
-                 SELECT w.received_on, w.repo, w.test_id, 'likely', 'next_main_run', w.run_id, \
-                        m.prev_run_id, w.target, w.input_hash, w.received_at \
+                 SELECT m.prev_received_on, w.repo, w.test_id, 'likely', 'next_main_run', \
+                        m.prev_run_id, w.run_id, f.target, t.input_hash, m.prev_received_at \
                  FROM cls_win w \
                  JOIN cls_main m \
                       ON m.repo = w.repo AND m.test_id = w.test_id AND m.run_id = w.run_id \
                      AND NOT m.is_seed \
+                 JOIN LATERAL ( \
+                     SELECT fr.target FROM test_results.test_results fr \
+                     WHERE fr.run_id = m.prev_run_id AND fr.test_id = w.test_id \
+                       AND fr.received_on = m.prev_received_on \
+                     ORDER BY fr.attempt DESC LIMIT 1) f ON true \
+                 LEFT JOIN test_results.target_runs t \
+                      ON t.run_id = m.prev_run_id AND t.address = f.target \
+                     AND t.received_on = m.prev_received_on \
                  WHERE w.on_default AND NOT w.partial AND NOT w.is_fail \
                    AND m.prev_is_fail AND m.prev_streak < {k} \
                    AND NOT EXISTS (SELECT 1 FROM test_results.test_flake_events e \
                                    WHERE e.repo = w.repo AND e.test_id = w.test_id \
-                                     AND e.run_id = w.run_id AND e.kind = 'definite' \
-                                     AND e.observed_on = w.received_on) \
+                                     AND e.run_id = m.prev_run_id AND e.kind = 'definite' \
+                                     AND e.observed_on = m.prev_received_on) \
+                   AND NOT {incident} \
                  ON CONFLICT {EVENT_KEY} DO NOTHING",
                 k = window.broken_runs,
+                incident = in_incident("m.prev_run_id", "w.test_id", "m.prev_received_on"),
             ),
             &[],
         )
@@ -620,6 +734,7 @@ async fn classify(
     Ok(Report {
         results,
         events,
+        incidents,
         tests_updated: tests_updated.len() as u64,
         quarantine,
         deliveries,
@@ -664,6 +779,8 @@ fn streaks(rows: &str) -> String {
           SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, failure_hash, \
                  is_seed, streak, since, \
                  lag(run_id) OVER k AS prev_run_id, lag(is_fail) OVER k AS prev_is_fail, \
+                 lag(received_at) OVER k AS prev_received_at, \
+                 lag(received_on) OVER k AS prev_received_on, \
                  lag(streak) OVER k AS prev_streak, \
                  row_number() OVER (PARTITION BY repo, test_id \
                                     ORDER BY received_at DESC, run_id DESC) = 1 AS is_last \

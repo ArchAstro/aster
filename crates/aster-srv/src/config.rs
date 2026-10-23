@@ -188,6 +188,10 @@ pub struct QuarantineRules {
     /// `ASTER_SRV_QUARANTINE_DAYS`: the longest a test stays quarantined,
     /// at most the retention period. Default 30.
     pub days: u32,
+    /// `ASTER_SRV_QUARANTINE_RUN_CAP`: a run holding definite flakes of more
+    /// tests than this counts toward none of them, so one bad run cannot
+    /// quarantine a crowd. Default 10.
+    pub run_cap: u32,
 }
 
 /// A fixed bearer token standing in for one repository.
@@ -297,6 +301,7 @@ impl Config {
                 1,
                 retention_days,
             )?,
+            run_cap: number("ASTER_SRV_QUARANTINE_RUN_CAP", 10, 1, 100_000)?,
         };
         let webhooks = match var("ASTER_SRV_WEBHOOKS") {
             Some(value) => crate::webhooks::Endpoint::parse_all(&value)?,
@@ -760,7 +765,8 @@ mod tests {
             QuarantineRules {
                 runs: 2,
                 release_passes: 20,
-                days: 30
+                days: 30,
+                run_cap: 10
             }
         );
         assert!(config.webhooks.is_empty());
@@ -1029,13 +1035,15 @@ mod tests {
         pairs.push(("ASTER_SRV_QUARANTINE_RUNS", "0"));
         pairs.push(("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "5"));
         pairs.push(("ASTER_SRV_QUARANTINE_DAYS", "14"));
+        pairs.push(("ASTER_SRV_QUARANTINE_RUN_CAP", "3"));
         let config = Config::from_env(env_of(&pairs)).unwrap();
         assert_eq!(
             config.quarantine,
             QuarantineRules {
                 runs: 0,
                 release_passes: 5,
-                days: 14
+                days: 14,
+                run_cap: 3
             }
         );
         // Quarantine never outlives the results that justify it.
@@ -1051,6 +1059,7 @@ mod tests {
             ("ASTER_SRV_QUARANTINE_RUNS", "-1"),
             ("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "0"),
             ("ASTER_SRV_QUARANTINE_DAYS", "0"),
+            ("ASTER_SRV_QUARANTINE_RUN_CAP", "0"),
         ] {
             let mut pairs = REQUIRED.to_vec();
             pairs.push((name, bad));

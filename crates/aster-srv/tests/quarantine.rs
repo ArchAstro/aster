@@ -562,3 +562,47 @@ async fn a_pass_behind_the_committed_watermark_changes_and_announces_nothing() {
     );
     server.stop().await;
 }
+
+#[tokio::test]
+async fn a_run_flaking_more_tests_than_the_cap_quarantines_none_of_them() {
+    // Three tests flake in the same two runs. Below the incident thresholds
+    // (three failures of ten tests), so each is a definite flake.
+    let tests = ["a", "b", "c"];
+    let run = |id: &'static str, at| {
+        let mut seeded = Run::new(id, "pr-1", at);
+        for test in tests {
+            seeded = seeded
+                .attempt(test, "fail", 1, Some("f1"))
+                .attempt(test, "pass", 2, None);
+        }
+        for test in ["d", "e", "f", "g", "h", "i", "j"] {
+            seeded = seeded.result(test, "pass", None);
+        }
+        seeded
+    };
+    for (cap, want) in [("2", vec![]), ("3", vec!["a", "b", "c"])] {
+        let Some(server) = start(&[("ASTER_SRV_QUARANTINE_RUN_CAP", cap)]).await else {
+            return;
+        };
+        let now = Utc::now();
+        seed(&server, &run("r1", ago(now, 20))).await;
+        seed(&server, &run("r2", ago(now, 10))).await;
+        classify(&server, now).await;
+        let mut got = quarantined(&feed(&server).await);
+        got.sort();
+        assert_eq!(got, want, "cap {cap}");
+        // Either way each test is still reported flaky.
+        let flaky = server
+            .client()
+            .await
+            .query_one(
+                "SELECT count(*) FROM test_results.tests WHERE flake_score = 6",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(flaky, 3, "cap {cap}");
+        server.stop().await;
+    }
+}

@@ -610,7 +610,9 @@ async fn reports_the_failures_of_a_github_run() {
     server.stop().await;
 }
 
-/// 20,000 tests in each of 10 runs over three days: 200,000 results.
+/// 20,000 tests in each of 10 runs over three days: 200,000 results. Tests
+/// sit in targets of 50, one failing per target run, so each failure is an
+/// ordinary flake rather than part of an incident.
 async fn seed_large(server: &Server, now: DateTime<Utc>) {
     let client = server.client().await;
     for age in 0..4 {
@@ -626,16 +628,16 @@ async fn seed_large(server: &Server, now: DateTime<Utc>) {
                     now() - (r || ' hours')::interval * 7, now() - (r || ' hours')::interval * 7 \
              FROM generate_series(1, 10) r; \
              INSERT INTO test_results.target_runs (received_on, run_id, repo, address, input_hash, status, cached, duration_ms, confidence) \
-             SELECT (received_at AT TIME ZONE 'UTC')::date, run_id, repo, '//big:test', 'same', 'passed', false, 1, 'complete' \
-             FROM test_results.runs; \
+             SELECT (received_at AT TIME ZONE 'UTC')::date, run_id, repo, '//big:t' || b, 'same', 'passed', false, 1, 'complete' \
+             FROM test_results.runs CROSS JOIN generate_series(0, 400) b; \
              INSERT INTO test_results.test_results (received_on, run_id, repo, target, test_id, outcome, attempt, duration_ms, failure_hash, message) \
-             SELECT (r.received_at AT TIME ZONE 'UTC')::date, r.run_id, r.repo, '//big:test', 'test-' || lpad(i::text, 6, '0'), \
+             SELECT (r.received_at AT TIME ZONE 'UTC')::date, r.run_id, r.repo, '//big:t' || (i / 50), 'test-' || lpad(i::text, 6, '0'), \
                     CASE WHEN i % 50 = substr(r.run_id, 5)::int THEN 'fail' ELSE 'pass' END, 1, 5, \
                     CASE WHEN i % 50 = substr(r.run_id, 5)::int THEN 'hash-' || (i % 50) END, \
                     CASE WHEN i % 50 = substr(r.run_id, 5)::int THEN 'it broke' END \
              FROM test_results.runs r CROSS JOIN generate_series(1, 20000) i; \
              INSERT INTO test_results.tests (repo, test_id, target, file, name, first_seen, last_seen) \
-             SELECT '{REPO}', 'test-' || lpad(i::text, 6, '0'), '//big:test', 'f.exs', 'test ' || i, now(), now() \
+             SELECT '{REPO}', 'test-' || lpad(i::text, 6, '0'), '//big:t' || (i / 50), 'f.exs', 'test ' || i, now(), now() \
              FROM generate_series(1, 20000) i; \
              ANALYZE test_results.test_results; ANALYZE test_results.tests; \
              ANALYZE test_results.runs; ANALYZE test_results.target_runs;"
@@ -682,8 +684,9 @@ async fn queries_stay_fast_over_two_hundred_thousand_results() {
 
     let list = quick(&server, "/v1/test-results/tests?limit=100").await;
     assert_eq!(list["tests"].as_array().unwrap().len(), 100);
-    // Failing on main in the middle of the sequence: two flips and a likely.
-    assert_eq!(list["tests"][0]["flake_score"], 7);
+    // Failing once between passes on its inputs: one definite flake (3),
+    // which also stands for the likely one on main.
+    assert_eq!(list["tests"][0]["flake_score"], 3);
     let cursor = list["next_cursor"].as_str().unwrap();
     quick(
         &server,

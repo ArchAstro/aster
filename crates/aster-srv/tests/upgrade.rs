@@ -186,3 +186,102 @@ async fn a_migration_deadlocked_with_the_old_release_is_tried_again() {
         .await
         .unwrap();
 }
+
+/// Runs received before incidents existed are judged when the table is
+/// made: a shard that crashed last week is an incident, so a pass on its
+/// inputs after the upgrade does not make its failures flakes.
+#[tokio::test]
+async fn the_incidents_migration_finds_earlier_crashed_shards() {
+    let Ok(admin_url) = std::env::var("ASTER_SRV_TEST_DATABASE_URL") else {
+        eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let database = format!("aster_srv_test_incidents_{}", std::process::id());
+    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await
+        .unwrap();
+    let (base, _) = admin_url.rsplit_once('/').unwrap();
+    let pool = aster_srv::db::pool(&format!("{base}/{database}")).unwrap();
+    let all = aster_srv::migrations();
+    assert_eq!(all[5].version, 6, "test_results migrations come first");
+    aster_srv::db::migrate(&pool, &all[..5]).await.unwrap();
+
+    // Before the upgrade: shard 6 crashed (40 of 100 failed, all with one
+    // hash; one test failed only on its first attempt); shard 2 had one
+    // ordinary failure; a cached replay of the crash is not a run of it.
+    let client = pool.get().await.unwrap();
+    let day = Utc::now().date_naive();
+    aster_srv::test_results::ensure_partitions(&client, day)
+        .await
+        .unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO test_results.runs (run_id, repo, sha, branch, aster_version, started_at, received_at) \
+                 VALUES ('crash', 'o/r', 'a', 'main', '0', now(), now() - interval '2 days'), \
+                        ('replay', 'o/r', 'b', 'main', '0', now(), now() - interval '1 day'); \
+             INSERT INTO test_results.target_runs (received_on, run_id, repo, address, input_hash, status, cached, duration_ms, confidence) \
+                 VALUES (current_date, 'crash', 'o/r', '//c:shard-6', 'h6', 'failed', false, 1, 'complete'), \
+                        (current_date, 'crash', 'o/r', '//c:shard-2', 'h2', 'failed', false, 1, 'complete'), \
+                        (current_date, 'replay', 'o/r', '//c:shard-6', 'h6', 'failed', true, 1, 'complete'); \
+             INSERT INTO test_results.test_results (received_on, run_id, repo, target, test_id, outcome, attempt, failure_hash) \
+                 SELECT current_date, r, 'o/r', '//c:shard-6', 't' || i, \
+                        CASE WHEN i <= 40 THEN 'error' ELSE 'pass' END, 1, \
+                        CASE WHEN i <= 40 THEN 'already_shared' END \
+                 FROM generate_series(1, 100) i, unnest(ARRAY['crash', 'replay']) r; \
+             INSERT INTO test_results.test_results (received_on, run_id, repo, target, test_id, outcome, attempt, failure_hash) \
+                 VALUES (current_date, 'crash', 'o/r', '//c:shard-6', 't100', 'fail', 0, 'x'); \
+             INSERT INTO test_results.test_results (received_on, run_id, repo, target, test_id, outcome, attempt, failure_hash) \
+                 SELECT current_date, 'crash', 'o/r', '//c:shard-2', 's' || i, \
+                        CASE WHEN i = 1 THEN 'fail' ELSE 'pass' END, 1, CASE WHEN i = 1 THEN 'y' END \
+                 FROM generate_series(1, 100) i;",
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    aster_srv::db::migrate(&pool, &all).await.unwrap();
+    let rows = pool
+        .get()
+        .await
+        .unwrap()
+        .query(
+            "SELECT run_id, target, failures, tests, failure_hash, shared, \
+                    received_at < now() - interval '1 day' AS received_then \
+             FROM test_results.target_incidents",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.get::<_, String>("run_id"), "crash");
+    assert_eq!(row.get::<_, String>("target"), "//c:shard-6");
+    // t100 failed on an earlier attempt and passed: it failed, but its
+    // final result shares no hash.
+    assert_eq!(row.get::<_, i32>("failures"), 41);
+    assert_eq!(row.get::<_, i32>("tests"), 100);
+    assert_eq!(
+        row.get::<_, Option<String>>("failure_hash").as_deref(),
+        Some("already_shared")
+    );
+    assert_eq!(row.get::<_, i32>("shared"), 40);
+    assert!(
+        row.get::<_, bool>("received_then"),
+        "kept the run's received_at"
+    );
+
+    pool.close();
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+}

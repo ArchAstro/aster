@@ -1,7 +1,8 @@
 //! The classifier against a model of its rules, on random histories.
 //!
 //! Each case seeds a few days of runs (branches, reused input hashes,
-//! retries, skips, cached and partial targets, failure streaks), classifies
+//! retries, skips, cached and partial targets, failure streaks, runs where
+//! every test fails at once), classifies
 //! them in passes at random times, and compares every flake event and test
 //! state with what [`Model`] derives from the whole history at once. The
 //! incremental SQL must agree with the rules however the passes fall.
@@ -10,7 +11,9 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aster_srv::test_results::classifier;
+use aster_srv::test_results::classifier::{
+    self, INCIDENT_FAILURES, INCIDENT_SHARED_HASH, INCIDENT_SHARE_MIN,
+};
 use chrono::{DateTime, Duration, Utc};
 use common::{seed, start, Run, Server};
 
@@ -94,7 +97,13 @@ fn generate(seed: u64, runs: usize, end: DateTime<Utc>) -> Vec<GenRun> {
             at = out.last().map(|r: &GenRun| r.at).unwrap();
         }
         let mut attempts = Vec::new();
+        // Now and then a run where everything fails for one cause.
+        let mass = rng.chance(6);
         for test in TESTS {
+            if mass {
+                attempts.push((*test, "error", 1, Some("boom")));
+                continue;
+            }
             if *test == "skippy" && rng.chance(40) {
                 attempts.push((*test, "skip", 1, None));
                 continue;
@@ -139,6 +148,37 @@ struct Final {
     retried: bool,
 }
 
+/// Whether a run's target is an incident: its tests failed together.
+fn incident(run: &GenRun) -> bool {
+    if run.cached {
+        return false;
+    }
+    let mut tests = 0i64;
+    let mut failures = 0i64;
+    let mut shared: BTreeMap<&str, i64> = BTreeMap::new();
+    for test in TESTS {
+        let tried: Vec<&Attempt> = run
+            .attempts
+            .iter()
+            .filter(|a| a.0 == *test && a.1 != "skip")
+            .collect();
+        let Some(last) = tried.iter().max_by_key(|a| a.2) else {
+            continue;
+        };
+        tests += 1;
+        if tried.iter().any(|a| a.1 != "pass") {
+            failures += 1;
+        }
+        if let (true, Some(hash)) = (last.1 != "pass", last.3) {
+            *shared.entry(hash).or_default() += 1;
+        }
+    }
+    let most = shared.values().copied().max().unwrap_or(0);
+    failures >= INCIDENT_FAILURES
+        || (failures >= INCIDENT_SHARE_MIN && failures * 2 >= tests)
+        || most >= INCIDENT_SHARED_HASH
+}
+
 /// The rules (see the classifier's module docs), applied to the whole
 /// history at once.
 struct Model {
@@ -146,10 +186,17 @@ struct Model {
     events: BTreeSet<(String, String, String, String)>,
     /// test → (state, score, since_sha, failure_hash).
     states: BTreeMap<String, (String, i32, Option<String>, Option<String>)>,
+    /// Runs whose target is an incident.
+    incidents: BTreeSet<String>,
 }
 
 impl Model {
     fn new(runs: &[GenRun]) -> Self {
+        let incidents: BTreeSet<String> = runs
+            .iter()
+            .filter(|r| incident(r))
+            .map(|r| r.run_id.clone())
+            .collect();
         let mut finals: BTreeMap<&str, Vec<Final>> = BTreeMap::new();
         for run in runs.iter().filter(|r| !r.cached) {
             for test in TESTS {
@@ -191,20 +238,24 @@ impl Model {
                     f.key.1.clone(),
                 )
             };
+            // Every event is the failed run's, and an incident's failures
+            // make none.
             let mut definite = BTreeSet::new();
             for (i, f) in list.iter().enumerate() {
-                // One definite event per test and run: a retry flip is
-                // recorded first, so it is the one kept.
+                if f.retried && !incidents.contains(&f.key.1) {
+                    events.insert(event("definite", "retry", f));
+                    definite.insert(f.key.1.clone());
+                }
                 let earlier = list[..i]
                     .iter()
                     .rev()
                     .find(|p| p.input_hash == f.input_hash);
-                if f.retried {
-                    events.insert(event("definite", "retry", f));
-                    definite.insert(f.key.1.clone());
-                } else if earlier.is_some_and(|p| p.is_fail != f.is_fail) {
-                    events.insert(event("definite", "input_hash", f));
-                    definite.insert(f.key.1.clone());
+                if let Some(p) = earlier.filter(|p| p.is_fail != f.is_fail) {
+                    let failed = if f.is_fail { f } else { p };
+                    if !incidents.contains(&failed.key.1) {
+                        events.insert(event("definite", "input_hash", failed));
+                        definite.insert(failed.key.1.clone());
+                    }
                 }
             }
             // The default-branch, not-partial sequence decides likely
@@ -229,9 +280,10 @@ impl Model {
                 if !f.is_fail
                     && p.is_fail
                     && streak_at(i - 1).0 < BROKEN_RUNS
-                    && !definite.contains(&f.key.1)
+                    && !definite.contains(&p.key.1)
+                    && !incidents.contains(&p.key.1)
                 {
-                    events.insert(event("likely", "next_main_run", f));
+                    events.insert(event("likely", "next_main_run", p));
                 }
             }
             let score: i32 = events
@@ -262,7 +314,11 @@ impl Model {
                 ),
             );
         }
-        Self { events, states }
+        Self {
+            events,
+            states,
+            incidents,
+        }
     }
 }
 
@@ -299,7 +355,18 @@ async fn observed(server: &Server) -> Model {
         .iter()
         .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4))))
         .collect();
-    Model { events, states }
+    let incidents = client
+        .query("SELECT run_id FROM test_results.target_incidents", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    Model {
+        events,
+        states,
+        incidents,
+    }
 }
 
 /// Seed `runs` in order, classifying in passes at random times between
@@ -343,6 +410,14 @@ async fn incremental_passes_agree_with_the_rules_on_random_histories() {
             got.events.difference(&want.events).collect::<Vec<_>>(),
         );
         assert_eq!(got.states, want.states, "case {case}: states differ");
+        assert_eq!(
+            got.incidents, want.incidents,
+            "case {case}: incidents differ"
+        );
+        assert!(
+            !want.incidents.is_empty(),
+            "case {case}: no incident to check"
+        );
         server.stop().await;
     }
 }
@@ -368,6 +443,14 @@ async fn one_pass_over_everything_agrees_with_the_rules() {
         let want = Model::new(&runs);
         assert_eq!(got.events, want.events, "case {case}: events differ");
         assert_eq!(got.states, want.states, "case {case}: states differ");
+        assert_eq!(
+            got.incidents, want.incidents,
+            "case {case}: incidents differ"
+        );
+        assert!(
+            !want.incidents.is_empty(),
+            "case {case}: no incident to check"
+        );
         server.stop().await;
     }
 }

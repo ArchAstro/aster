@@ -45,11 +45,26 @@ A test's result in a run is its final attempt. Skipped tests and cached
 targets are ignored (a cached target replays old results). Runs are ordered by
 `received_at`.
 
+An event belongs to the run that **failed** (`run_id`; `prev_run_id` is the
+passing run it was compared with) and is observed when that run was received.
+One failure is one event, however many passes it is compared with: a pass, a
+failure and a pass on one input hash score 3, not 6.
+
 | Event | Rule |
 |---|---|
 | definite, `retry` | The final attempt passed and an earlier attempt of the test in the same run failed or errored. |
-| definite, `input_hash` | In an earlier run within the retention period, with the same target `input_hash`, the test's outcome (pass against fail or error) differs from this run's. Compared with the nearest earlier run of that hash, on any branch. |
-| likely, `next_main_run` | On the default branch the test passed and its previous default-branch run failed, with any hash, unless the run already has a definite event for the test or that failure ended a broken streak (so fixing a broken test is not flaking). Whether the change between the two runs touched the test is not knowable here. |
+| definite, `input_hash` | In an earlier run within the retention period, with the same target `input_hash`, the test's outcome (pass against fail or error) differs from this run's. Compared with the nearest earlier run of that hash, on any branch. The event is for whichever of the two runs failed. |
+| likely, `next_main_run` | On the default branch the test passed and its previous default-branch run failed, with any hash, unless that failure ended a broken streak (so fixing a broken test is not flaking). The event is for the failed run; a definite event for that run replaces it. Whether the change between the two runs touched the test is not knowable here. |
+
+**Incidents**: a target run whose tests failed together failed for one shared
+cause (a crashed shard, a dead database, a test-harness process that died),
+not because each test is flaky. A non-cached target run is an incident when
+20 or more of its tests failed (in any attempt), or 5 or more that are at least
+half of its tests, or 10 or more of its final failures share one
+`failure_hash`. It is one row in `test_results.target_incidents` (run, target,
+input hash, failures, tests, its most shared failure hash and how many share
+it), and its failures make no flake events of either kind. They still count
+toward broken streaks: a change that breaks many tests at once is broken.
 
 `partial`-confidence targets count toward definite events, since a flip is a
 flip however it was captured. They are left out of likely events and broken
@@ -86,9 +101,15 @@ the classifier updates `test_results.quarantine`, in this order:
    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` (default 20) consecutive passes is
    **released**. Any failure resets the count.
 4. A test that is not broken **enters** once definite flake events from
-   `ASTER_SRV_QUARANTINE_RUNS` (default 2) different runs fall within the last
-   7 days. Only events after it last left count, so a released or expired
-   test is judged afresh. `0` turns automatic quarantine off.
+   `ASTER_SRV_QUARANTINE_RUNS` (default 2) different failing runs fall within
+   the last 7 days. Only events after it last left count, so a released or
+   expired test is judged afresh. `0` turns automatic quarantine off. A run
+   holding definite events of more than `ASTER_SRV_QUARANTINE_RUN_CAP`
+   (default 10) tests in those days counts toward none of them: many tests
+   flaking in one run point at the run. The cap counts the events found so far: a run
+   whose flakes are found over several passes can cross it after it has
+   already helped quarantine a test, and that entry stays until it is
+   released or expires.
 
 Every change is a row in `test_results.quarantine_log` (`quarantined`,
 `released`, `expired` or `broken`, with details), kept for the retention
@@ -403,9 +424,10 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts, exact or a prefix ending in `/`. Unset turns the dashboard off. See [Dashboard](#dashboard). |
 | `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
 | `ASTER_SRV_UI_DEV_EMAIL` | unset | The viewer to trust when no IAP audience is set. Development only. |
-| `ASTER_SRV_QUARANTINE_RUNS` | `2` | Different runs with a definite flake in 7 days that quarantine a test; `0` turns automatic quarantine off. |
+| `ASTER_SRV_QUARANTINE_RUNS` | `2` | Different failing runs with a definite flake in 7 days that quarantine a test; `0` turns automatic quarantine off. |
 | `ASTER_SRV_QUARANTINE_RELEASE_PASSES` | `20` | Consecutive passes that release a quarantined test. |
 | `ASTER_SRV_QUARANTINE_DAYS` | `30` | The longest a test stays quarantined; at most `ASTER_SRV_RETENTION_DAYS`. |
+| `ASTER_SRV_QUARANTINE_RUN_CAP` | `10` | A run with definite flakes of more tests than this in 7 days counts toward quarantining none of them. |
 | `ASTER_SRV_WEBHOOKS` | unset | Webhook endpoints, as JSON. See [Webhooks](#webhooks). |
 | `ASTER_SRV_STATIC_TOKENS` | unset | `owner/name=token` pairs accepted instead of OIDC tokens. Development only. They may write the artifact cache. |
 | `ASTER_SRV_CACHE_BUCKET` | unset | The GCS bucket for cache blobs (`cas/<sha256>`). Unset disables the cache. The pod's Workload Identity needs `storage.objects.*` on the bucket and `iam.serviceAccounts.signBlob` on itself. |
@@ -504,6 +526,7 @@ Monitoring with a log-based metric on
 | Classification stalls | `SELECT watermark FROM test_results.classifier_state` should be minutes old; `classifier pass failed` in the logs | A pass is safe to rerun; restarting a pod starts one at once. |
 | A real regression is being let through | `/ui/quarantine`, the test's page | In CI set `ASTER_QUARANTINE=off` for the job to fail it at once. On the server, delete its row: `DELETE FROM test_results.quarantine WHERE repo = '…' AND test_id = '…'` (it can re-enter on new flakes after now). Set `ASTER_SRV_QUARANTINE_RUNS=0` to stop new entries. |
 | Too many or too few tests quarantined | `SELECT action, count(*) FROM test_results.quarantine_log WHERE at > now() - interval '1 day' GROUP BY 1` | Tune `ASTER_SRV_QUARANTINE_RUNS` and `ASTER_SRV_QUARANTINE_RELEASE_PASSES`; they apply from the next pass. |
+| Many tests flaked at once | `SELECT run_id, target, failures, tests, failure_hash, shared FROM test_results.target_incidents ORDER BY received_at DESC LIMIT 20` | An incident is one shared cause in one target run: find it from the run's log and the shared failure hash. Its tests are not scored or quarantined. |
 | Webhooks not arriving | `SELECT endpoint, event, attempts, last_status, last_error FROM webhooks.deliveries WHERE delivered_at IS NULL ORDER BY id DESC LIMIT 20` | Abandoned rows have `abandoned_at`; to resend, `UPDATE webhooks.deliveries SET abandoned_at = NULL, attempts = 0, next_attempt_at = now() WHERE id = …`. |
 | A deploy waits at startup | `migration waiting for table locks` in the logs | Expected while the old release holds the tables. The server listens meanwhile: `/healthz` is 200, `/readyz` and every other route are 503, and migrations retry every few seconds until they apply. `/readyz`'s `migration.state` is `waiting_for_locks` for this case. |
 | A deploy never becomes ready | `/readyz` body: `migration.state`, `waiting_seconds`, `error`; `migrations failed; retrying` at `"severity":"ERROR"` | `failing` means waiting will not fix it (a bad migration, credentials, an unreachable database): the pod stays live and retries forever, so alert on unready time rather than restarts, fix the cause or roll back. `waiting_for_locks` past 10 minutes also logs at `ERROR`: find the holder in `pg_locks`. |

@@ -211,7 +211,8 @@ async fn a_main_failure_followed_by_a_main_pass_is_a_likely_flake() {
 
     assert_eq!(
         events(&server).await,
-        vec![event("blip", "likely", "next_main_run", "m2")]
+        // The event is the failed run's.
+        vec![event("blip", "likely", "next_main_run", "m1")]
     );
     let blip = state(&server, "blip").await;
     assert_eq!((blip.state.as_str(), blip.score), ("flaky", 1));
@@ -257,7 +258,7 @@ async fn a_default_branch_setting_chooses_the_branch() {
     classify(&server, now).await;
     assert_eq!(
         events(&server).await,
-        vec![event("x", "likely", "next_main_run", "t2")]
+        vec![event("x", "likely", "next_main_run", "t1")]
     );
     server.stop().await;
 }
@@ -468,7 +469,7 @@ async fn the_score_counts_seven_days_and_decays() {
         events(&server).await,
         vec![
             event("t", "definite", "input_hash", "r2"),
-            event("t", "likely", "next_main_run", "m2"),
+            event("t", "likely", "next_main_run", "m1"),
         ]
     );
     // r2 (fail, h1) vs r1 (pass, h1) is definite; m1 (fail, h=a) is the
@@ -481,8 +482,9 @@ async fn the_score_counts_seven_days_and_decays() {
     let still = state(&server, "t").await;
     assert_eq!((still.state.as_str(), still.score), ("flaky", 4));
 
-    // After seven days the definite event ages out first, then the rest.
-    let later = now + Duration::days(7) - Duration::minutes(30);
+    // Seven days after each failure its event ages out: r2's (40 minutes
+    // ago) first, then m1's (30 minutes ago).
+    let later = now + Duration::days(7) - Duration::minutes(35);
     classify(&server, later).await;
     assert_eq!(state(&server, "t").await.score, 1);
     let later = now + Duration::days(8);
@@ -571,4 +573,143 @@ async fn failure_clusters_group_failures_by_hash() {
     assert!(rows[0].3.as_deref().unwrap().starts_with("boom in"));
     assert_eq!((rows[1].0.as_str(), rows[1].1, rows[1].2), ("f2", 1, 1));
     server.stop().await;
+}
+
+#[tokio::test]
+async fn one_failure_between_two_passes_is_one_flake_and_two_failures_are_two() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // Pass, fail, pass on one hash: comparing each run with the one before
+    // finds the failure twice; it is still one failure.
+    for (run, at, outcome) in [("a1", 50, "pass"), ("a2", 40, "fail"), ("a3", 30, "pass")] {
+        let failure = (outcome == "fail").then_some("f1");
+        seed(
+            &server,
+            &Run::new(run, "pr-1", ago(now, at)).result("once", outcome, failure),
+        )
+        .await;
+    }
+    // Fail, pass, fail: two failures, two events.
+    for (run, at, outcome) in [("b1", 45, "fail"), ("b2", 35, "pass"), ("b3", 25, "fail")] {
+        let failure = (outcome == "fail").then_some("f1");
+        seed(
+            &server,
+            &Run::new(run, "pr-2", ago(now, at))
+                .hash("h2")
+                .result("twice", outcome, failure),
+        )
+        .await;
+    }
+    classify(&server, now).await;
+    assert_eq!(
+        events(&server).await,
+        vec![
+            event("once", "definite", "input_hash", "a2"),
+            event("twice", "definite", "input_hash", "b1"),
+            event("twice", "definite", "input_hash", "b3"),
+        ]
+    );
+    assert_eq!(state(&server, "once").await.score, 3);
+    assert_eq!(state(&server, "twice").await.score, 6);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_definite_event_found_later_replaces_the_likely_one() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // A main failure, then a main pass on other inputs: likely, for m1.
+    seed(
+        &server,
+        &Run::new("m1", "main", ago(now, 50))
+            .hash("a")
+            .result("t", "fail", Some("f1")),
+    )
+    .await;
+    seed(
+        &server,
+        &Run::new("m2", "main", ago(now, 40))
+            .hash("b")
+            .result("t", "pass", None),
+    )
+    .await;
+    classify(&server, ago(now, 35)).await;
+    assert_eq!(
+        events(&server).await,
+        vec![event("t", "likely", "next_main_run", "m1")]
+    );
+    assert_eq!(state(&server, "t").await.score, 1);
+    // A later run on m1's inputs passes: m1's failure is now proven a
+    // flake, and it is still one failure.
+    seed(
+        &server,
+        &Run::new("p1", "pr-1", ago(now, 20))
+            .hash("a")
+            .result("t", "pass", None),
+    )
+    .await;
+    classify(&server, now).await;
+    assert_eq!(
+        events(&server).await,
+        vec![event("t", "definite", "input_hash", "m1")]
+    );
+    assert_eq!(state(&server, "t").await.score, 3);
+    server.stop().await;
+}
+
+/// A run of `tests` tests whose first `failing` fail with one shared
+/// failure hash and the rest pass.
+fn shared_failure<'a>(
+    run: &'a str,
+    at: DateTime<Utc>,
+    names: &'a [String],
+    failing: usize,
+) -> Run<'a> {
+    let mut seeded = Run::new(run, "pr-1", at);
+    for (i, name) in names.iter().enumerate() {
+        seeded = if i < failing {
+            seeded.result(name, "fail", Some("db down"))
+        } else {
+            seeded.result(name, "pass", None)
+        };
+    }
+    seeded
+}
+
+#[tokio::test]
+async fn ten_failures_sharing_one_hash_are_an_incident_and_nine_are_flakes() {
+    let names: Vec<String> = (0..100).map(|i| format!("t{i:02}")).collect();
+    for (failing, incident) in [(10, true), (9, false)] {
+        let Some(server) = start(&[]).await else {
+            return;
+        };
+        let now = Utc::now();
+        seed(&server, &shared_failure("r1", ago(now, 30), &names, 0)).await;
+        seed(
+            &server,
+            &shared_failure("r2", ago(now, 20), &names, failing),
+        )
+        .await;
+        let report = classify(&server, now).await;
+        let flaky = server
+            .client()
+            .await
+            .query_one(
+                "SELECT count(*) FROM test_results.tests WHERE state = 'flaky'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        if incident {
+            assert_eq!((report.incidents, report.events, flaky), (1, 0, 0));
+        } else {
+            assert_eq!((report.incidents, report.events, flaky), (0, 9, 9));
+        }
+        server.stop().await;
+    }
 }

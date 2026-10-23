@@ -12,9 +12,14 @@
 //!    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` consecutive passes is released.
 //!    Skips and cached targets' replayed results do not count.
 //! 4. A test that is not broken enters when definite flake events from
-//!    `ASTER_SRV_QUARANTINE_RUNS` different runs fall in the last 7 days.
-//!    Only events after the test last left count, so a released or expired
-//!    test is judged afresh.
+//!    `ASTER_SRV_QUARANTINE_RUNS` different failing runs fall in the last 7
+//!    days. Only events after the test last left count, so a released or
+//!    expired test is judged afresh. A run holding definite events of more
+//!    than `ASTER_SRV_QUARANTINE_RUN_CAP` tests in those days counts for
+//!    none: many tests flaking in one run point at the run, not the tests.
+//!    (Incidents, which hold no events at all, catch most such runs first.)
+//!    The cap counts the events found so far; entering is not undone when a
+//!    run crosses it later.
 //!
 //! Every change is a row in `quarantine_log`, kept for the retention period.
 //! The newest log id of a repository is its quarantine list's version.
@@ -218,15 +223,23 @@ pub(super) async fn update(
                     "WITH left_at AS ( \
                          SELECT repo, test_id, max(at) AS at FROM test_results.quarantine_log \
                          WHERE action <> 'quarantined' GROUP BY repo, test_id), \
+                     recent AS ( \
+                         SELECT e.repo, e.test_id, e.run_id, e.observed_at \
+                         FROM test_results.test_flake_events e \
+                         WHERE e.kind = 'definite' AND e.observed_on >= '{from_day}'::date \
+                           AND e.observed_at > {to} - {ENTRY_DAYS} * interval '24 hours' \
+                           AND e.observed_at <= {to}), \
+                     crowded AS ( \
+                         SELECT repo, run_id FROM recent GROUP BY repo, run_id \
+                         HAVING count(DISTINCT test_id) > {cap}), \
                      proven AS ( \
                          SELECT e.repo, e.test_id, count(DISTINCT e.run_id)::int AS runs, \
                                 count(*)::int AS events \
-                         FROM test_results.test_flake_events e \
+                         FROM recent e \
                          LEFT JOIN left_at l ON l.repo = e.repo AND l.test_id = e.test_id \
-                         WHERE e.kind = 'definite' AND e.observed_on >= '{from_day}'::date \
-                           AND e.observed_at > {to} - {ENTRY_DAYS} * interval '24 hours' \
-                           AND e.observed_at <= {to} \
-                           AND (l.at IS NULL OR e.observed_at > l.at) \
+                         WHERE (l.at IS NULL OR e.observed_at > l.at) \
+                           AND NOT EXISTS (SELECT 1 FROM crowded c \
+                                           WHERE c.repo = e.repo AND c.run_id = e.run_id) \
                          GROUP BY e.repo, e.test_id \
                          HAVING count(DISTINCT e.run_id) >= {runs}), \
                      entered AS ( \
@@ -247,6 +260,7 @@ pub(super) async fn update(
                      FROM entered n JOIN proven p USING (repo, test_id) RETURNING id",
                     runs = rules.runs,
                     days = rules.days,
+                    cap = rules.run_cap,
                 ),
                 &[],
             )
