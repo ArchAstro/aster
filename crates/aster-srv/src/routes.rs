@@ -377,6 +377,7 @@ pub fn identity_for(principal: Principal, repo: Option<&str>) -> Result<Identity
                 repository: repo.to_string(),
                 git_ref: None,
                 run_id: None,
+                run_attempt: None,
                 sha: None,
                 workflow: None,
                 job_workflow: None,
