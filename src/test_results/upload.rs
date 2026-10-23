@@ -60,11 +60,18 @@ impl Credentials {
 }
 
 /// An HTTP agent whose requests give up after `timeout`.
-pub(super) fn agent(timeout: Duration) -> ureq::Agent {
+///
+/// `origin` is the server's origin (through `checked_origin`): the agent is
+/// https only unless it is this machine, and follows no redirect that could
+/// downgrade.
+pub(super) fn agent(origin: &str, timeout: Duration) -> ureq::Agent {
+    let (https_only, max_redirects) = crate::srv_url::scheme_policy(origin);
     // ureq is built without its own crypto provider; use the aws-lc-rs one
     // the rest of Aster uses. Installing twice is harmless.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     ureq::Agent::config_builder()
+        .https_only(https_only)
+        .max_redirects(max_redirects)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(timeout))
         .user_agent(concat!("aster/", env!("CARGO_PKG_VERSION")))
@@ -123,7 +130,8 @@ pub fn upload(
     encoder.write_all(&ndjson)?;
     let body = encoder.finish()?;
 
-    let agent = agent(Duration::from_secs(60));
+    let origin = crate::srv_url::checked_origin(server_url)?;
+    let agent = agent(&origin, Duration::from_secs(60));
     let token = bearer(&agent, credentials)?;
     let url = format!("{}/v1/test-results/runs", server_url.trim_end_matches('/'));
     let mut last_error = None;
@@ -358,6 +366,71 @@ mod tests {
         assert!(
             !seen[1].to_ascii_lowercase().contains("proxy-authorization"),
             "no proxy token, no proxy header"
+        );
+    }
+
+    #[test]
+    fn upload_refuses_cleartext_to_another_host_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.ndjson");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let error = upload(
+            "http://aster-srv.example.com",
+            &path,
+            &Credentials::Static("secret".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must be https"), "{error:#}");
+        assert!(!format!("{error:#}").contains("cannot reach"), "{error:#}");
+    }
+
+    #[test]
+    fn a_loopback_http_agent_does_not_follow_a_redirect_to_another_server() {
+        // `a` answers 302 to `b`; the agent must stop at the 302.
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        b.set_nonblocking(true).unwrap();
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_url = format!("http://{}", a.local_addr().unwrap());
+        let location = format!("http://{}/stolen", b.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = a.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() <= 2 {
+                    break;
+                }
+            }
+            use std::io::Write;
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let origin = crate::srv_url::checked_origin(&a_url).unwrap();
+        let response = agent(&origin, Duration::from_secs(5))
+            .get(&format!("{a_url}/x"))
+            .header("Authorization", "Bearer secret")
+            .call()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        assert!(b.accept().is_err(), "the redirect target was contacted");
+    }
+
+    #[test]
+    fn an_https_agent_refuses_plain_http() {
+        let origin = crate::srv_url::checked_origin("https://aster-srv.example.com").unwrap();
+        let error = agent(&origin, Duration::from_secs(1))
+            .get("http://127.0.0.1:1/")
+            .call()
+            .unwrap_err();
+        assert!(
+            format!("{error}").to_lowercase().contains("https"),
+            "{error}"
         );
     }
 }

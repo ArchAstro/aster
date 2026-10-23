@@ -63,6 +63,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::srv_url::{checked_origin, is_secure_origin, server_origin};
+
 /// How close to expiry a stored token is treated as already expired.
 const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 
@@ -82,39 +84,6 @@ pub struct StoredToken {
     pub expires_at: u64,
     #[serde(default)]
     pub email: Option<String>,
-}
-
-/// `scheme://authority` of `url`, with the path dropped and the host
-/// lowercased. `None` unless the scheme is http or https.
-fn server_origin(url: &str) -> Option<String> {
-    let url = url.trim();
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    Some(format!("{scheme}://{authority}"))
-}
-
-/// Whether `origin` (as [`server_origin`] returns it) may carry a sign-in:
-/// https, or http to this machine. A code, a verifier and a bearer token
-/// over plain http to another host could be read by anyone on the path.
-fn is_secure_origin(origin: &str) -> bool {
-    let Some((scheme, authority)) = origin.split_once("://") else {
-        return false;
-    };
-    if scheme == "https" {
-        return true;
-    }
-    let host = match authority.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
 /// Where to keep sign-ins: `$XDG_CONFIG_HOME/aster`, else `~/.config/aster`
@@ -495,7 +464,7 @@ fn logout_in(config_dir: &Path, server_url: &str) -> Result<SignedOut> {
 }
 
 fn revoke(origin: &str, token: &str) -> std::result::Result<(), String> {
-    let agent = super::aster_srv::build_agent(Duration::from_secs(15));
+    let agent = super::aster_srv::build_agent(origin, Duration::from_secs(15));
     let response = agent
         .post(&format!("{origin}/v1/auth/revoke"))
         .header("Authorization", &format!("Bearer {token}"))
@@ -529,19 +498,6 @@ fn read_pasted_code(input: &mut dyn BufRead) -> Result<String> {
         bail!("that is not a sign-in code; copy the code shown on the page and run aster cache login again");
     }
     Ok(code.to_string())
-}
-
-/// A normal origin for `server_url`, or why it cannot be used.
-fn checked_origin(server_url: &str) -> Result<String> {
-    let origin = server_origin(server_url)
-        .with_context(|| format!("ASTER_SRV_URL must be an http(s) URL, not '{server_url}'"))?;
-    if !is_secure_origin(&origin) {
-        bail!(
-            "ASTER_SRV_URL must be https (plain http is only for this machine); \
-             '{origin}' would send the sign-in in the clear"
-        );
-    }
-    Ok(origin)
 }
 
 /// Eight characters of the server's user-code alphabet (5 bits each).
@@ -691,7 +647,7 @@ fn exchange(
     user_code: &str,
     port: Option<u16>,
 ) -> Result<Exchanged> {
-    let agent = super::aster_srv::build_agent(Duration::from_secs(15));
+    let agent = super::aster_srv::build_agent(origin, Duration::from_secs(15));
     let mut response = agent
         .post(&format!("{origin}/v1/auth/token"))
         .header("Content-Type", "application/json")

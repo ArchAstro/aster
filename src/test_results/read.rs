@@ -90,7 +90,7 @@ pub fn get(
         None => {
             let stored = stored_token(url, now).ok_or_else(|| anyhow!(SIGNED_OUT_MESSAGE))?;
             (
-                Server::with_token(url, stored.token, proxy_token, TIMEOUT),
+                Server::with_token(url, stored.token, proxy_token, TIMEOUT)?,
                 true,
             )
         }
@@ -170,5 +170,18 @@ mod tests {
         );
         let missing = get(&url, "/v1/absent", &env, now).unwrap_err().to_string();
         assert!(missing.contains("not found"), "{missing}");
+    }
+
+    #[test]
+    fn a_cleartext_server_on_another_host_is_refused_for_reads() {
+        let env = |name: &str| (name == "ASTER_SRV_TOKEN").then(|| "secret".to_string());
+        let error = get(
+            "http://aster-srv.example.com",
+            "/v1/test-results/tests",
+            &env,
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must be https"), "{error:#}");
     }
 }
