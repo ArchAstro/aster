@@ -22,7 +22,8 @@ pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
 pub const REPO: &str = "ArchAstro/firstlanding";
 /// What the test server answers to, and how it signs person tokens.
 pub const PUBLIC_URL: &str = "https://aster-srv.test";
-pub const CLI_TOKEN_KEYS: &str = "t1:test-signing-secret-0123456789abcdef";
+/// 32 random bytes as base64 (generated once for these tests).
+pub const CLI_TOKEN_KEYS: &str = "t1:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=";
 
 /// A P-256 key pair made for this test process, so no private key is
 /// checked in: `(signing key as PKCS#8, public key as an uncompressed point)`.
@@ -43,6 +44,8 @@ fn iap_key_pair() -> &'static (Vec<u8>, Vec<u8>) {
 pub struct Server {
     pub app: Arc<App>,
     pub url: String,
+    /// The `/v1`-only listener, when `ASTER_SRV_API_ADDR` was set.
+    pub api_url: Option<String>,
     admin_url: String,
     database: String,
     database_url: String,
@@ -50,13 +53,13 @@ pub struct Server {
     env: Vec<(String, String)>,
     /// False for a [`Server::second`] on another server's database.
     owns_database: bool,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Server {
     pub async fn stop(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(true);
         }
         self.app.pool.close();
         if !self.owns_database {
@@ -130,10 +133,11 @@ pub async fn start_with(
     let (base, _) = admin_url.rsplit_once('/').unwrap();
     let database_url = format!("{base}/{database}");
 
-    let (app, url, shutdown) = launch(&database_url, env, cache_store).await;
+    let (app, url, api_url, shutdown) = launch(&database_url, env, cache_store).await;
     Some(Server {
         app,
         url,
+        api_url,
         admin_url,
         database,
         database_url,
@@ -151,7 +155,16 @@ async fn launch(
     database_url: &str,
     env: &[(&str, &str)],
     cache_store: Option<aster_srv::cache::BlobStore>,
-) -> (Arc<App>, String, tokio::sync::oneshot::Sender<()>) {
+) -> (
+    Arc<App>,
+    String,
+    Option<String>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let has = |name: &str| {
+        env.iter()
+            .any(|(key, value)| *key == name && !value.is_empty())
+    };
     let config = Config::from_env(|name| match name {
         "ASTER_SRV_DATABASE_URL" => Some(database_url.to_string()),
         "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
@@ -162,7 +175,12 @@ async fn launch(
             // Person sign-in is on unless a test sets either to "" (unset).
             .or_else(|| match other {
                 "ASTER_SRV_PUBLIC_URL" => Some(PUBLIC_URL.into()),
-                "ASTER_SRV_CLI_TOKEN_KEYS" => Some(CLI_TOKEN_KEYS.into()),
+                // Sign-in needs IAP and a domain allowlist to start at all.
+                "ASTER_SRV_CLI_TOKEN_KEYS"
+                    if has("ASTER_SRV_IAP_AUDIENCE") && has("ASTER_SRV_UI_EMAIL_DOMAINS") =>
+                {
+                    Some(CLI_TOKEN_KEYS.into())
+                }
                 _ => None,
             }),
     })
@@ -182,11 +200,28 @@ async fn launch(
     .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(aster_srv::serve(Arc::clone(&app), listener, async {
-        let _ = stopped.await;
-    }));
-    (app, url, shutdown)
+    let (shutdown, stopped) = tokio::sync::watch::channel(false);
+    let wait = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    };
+    tokio::spawn(aster_srv::serve(
+        Arc::clone(&app),
+        listener,
+        wait(stopped.clone()),
+    ));
+    let api_url = if app.config.api_listen.is_some() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(aster_srv::serve_api(
+            Arc::clone(&app),
+            listener,
+            wait(stopped),
+        ));
+        Some(api_url)
+    } else {
+        None
+    };
+    (app, url, api_url, shutdown)
 }
 
 impl Server {
@@ -197,10 +232,11 @@ impl Server {
     pub async fn second(&self, changes: &[(&str, &str)]) -> Server {
         let mut env: Vec<(&str, &str)> = changes.to_vec();
         env.extend(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let (app, url, shutdown) = launch(&self.database_url, &env, None).await;
+        let (app, url, api_url, shutdown) = launch(&self.database_url, &env, None).await;
         Server {
             app,
             url,
+            api_url,
             admin_url: self.admin_url.clone(),
             database: self.database.clone(),
             database_url: self.database_url.clone(),
@@ -293,7 +329,23 @@ pub fn person_bearer(server: &Server, email: &str) -> String {
         .person_tokens
         .as_ref()
         .expect("person sign-in is configured");
-    format!("Bearer {}", issuer.issue(email).unwrap().token)
+    format!(
+        "Bearer {}",
+        issuer.issue(&iap_subject(email), email).unwrap().token
+    )
+}
+
+/// The stable IAP subject the fixtures give `email`.
+pub fn iap_subject(email: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(email.as_bytes());
+    format!(
+        "accounts.google.com:{}",
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
 }
 
 /// An IAP assertion for `email`, signed with the fixture key.
@@ -303,6 +355,20 @@ pub fn iap_assertion(email: &str) -> String {
 
 /// [`iap_assertion`] addressed to `audience`.
 pub fn iap_assertion_for(email: &str, audience: &str) -> String {
+    iap_assertion_full(email, Some(&iap_subject(email)), audience)
+}
+
+/// An assertion with no `sub` claim at all.
+pub fn iap_assertion_without_subject(email: &str) -> String {
+    iap_assertion_full(email, None, &format!("{IAP_AUDIENCE}4242"))
+}
+
+/// An assertion for a chosen subject, as when an account's email changes.
+pub fn iap_assertion_with_subject(email: &str, subject: &str) -> String {
+    iap_assertion_full(email, Some(subject), &format!("{IAP_AUDIENCE}4242"))
+}
+
+fn iap_assertion_full(email: &str, subject: Option<&str>, audience: &str) -> String {
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some("iap".into());
     encode(
@@ -312,6 +378,7 @@ pub fn iap_assertion_for(email: &str, audience: &str) -> String {
             "aud": audience,
             "exp": Utc::now().timestamp() + 300,
             "email": email,
+            "sub": subject,
         }),
         &EncodingKey::from_ec_der(&iap_key_pair().0),
     )

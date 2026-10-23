@@ -25,6 +25,13 @@ pub struct Migration {
 /// certificate is not verified: Cloud SQL's private-IP certificates do not
 /// name the address the server dials.
 pub fn pool(url: &str) -> Result<Pool> {
+    pool_sized(url, 16, std::time::Duration::from_secs(5))
+}
+
+/// [`pool`] with a chosen size. A request that cannot get a connection within
+/// `wait` fails (a 500 to the caller) instead of queueing without bound, and
+/// opening or recycling a connection is capped too.
+pub fn pool_sized(url: &str, size: usize, wait: std::time::Duration) -> Result<Pool> {
     let config: tokio_postgres::Config = url.parse().context("cannot read the database URL")?;
     let manager_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
@@ -35,7 +42,11 @@ pub fn pool(url: &str) -> Result<Pool> {
         Manager::from_config(config, encrypting_connector()?, manager_config)
     };
     Pool::builder(manager)
-        .max_size(16)
+        .max_size(size)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .wait_timeout(Some(wait))
+        .create_timeout(Some(wait.max(std::time::Duration::from_secs(10))))
+        .recycle_timeout(Some(wait))
         .build()
         .context("cannot build the database pool")
 }

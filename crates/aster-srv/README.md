@@ -413,11 +413,88 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
 | `ASTER_SRV_CACHE_WRITER_WORKFLOWS` | unset | Comma-separated prefixes of the token's `job_workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@`; each must contain `@`). When set, a CI token writes the cache or uploads test results only from a matching workflow, in addition to the ref rule. Unset applies no workflow limit, so existing deployments keep working until it is set. Static tokens are exempt. |
-| `ASTER_SRV_PUBLIC_URL` | unset | The URL people reach the server at (`https://aster-srv.example.com`); the `iss` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). |
-| `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated; secrets at least 32 characters. The first signs person tokens and form MACs; all verify. Required for sign-in. Keep it in a secret store. |
-| `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 604800. |
+| `ASTER_SRV_PUBLIC_URL` | unset | The https URL people reach the server at (`https://aster-srv.example.com`); the `iss` and `aud` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). With an https URL every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains`. An `http://` URL is refused at startup unless `ASTER_SRV_ALLOW_HTTP_PUBLIC_URL=1` (development and tests only). |
+| `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated. A secret is hex (64+ digits) or base64 (43+ characters) for at least 32 random bytes, as `openssl rand -base64 32` makes; passphrases, short keys and patterned keys (one byte repeated, a repeated block, a counting run, fewer than 16 distinct bytes) stop startup. The first signs person tokens and form MACs; all verify. Setting it also requires `ASTER_SRV_IAP_AUDIENCE` and `ASTER_SRV_UI_EMAIL_DOMAINS`, and forbids `ASTER_SRV_UI_DEV_EMAIL`. Keep it in a secret store. |
+| `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 43200 (12 hours; verification enforces the same cap). |
+| `ASTER_SRV_API_ADDR` | unset | A second listener, such as `0.0.0.0:8081`, that serves only `/v1/*`. See [Hardening](#hardening-the-v1-channel). |
+| `ASTER_SRV_TRUSTED_PROXY_HOPS` | `1` | `X-Forwarded-For` entries from the right that infrastructure appended. See [Client IP](#client-ip-and-rate-limits). |
+| `ASTER_SRV_RATE_TOKEN_IP_PER_MIN` | `10` | `POST /v1/auth/token` per client IP per minute, per replica. |
+| `ASTER_SRV_RATE_API_IP_PER_MIN` | `1200` | All `/v1/*` per client IP per minute, per replica. |
+| `ASTER_SRV_RATE_API_SUBJECT_PER_MIN` | `3000` | Authenticated `/v1/*` per subject (a person, or a CI repository) per minute, per replica. |
+| `ASTER_SRV_HEADER_TIMEOUT_SECS` | `20` | Time to send request headers; also how long an idle connection lives. |
+| `ASTER_SRV_BODY_TIMEOUT_SECS` | `60` | Time for a request body to arrive in full (`408`). |
+| `ASTER_SRV_HANDLER_TIMEOUT_SECS` | `120` | Time from the end of the headers to the reply, body included (`504`). |
+| `ASTER_SRV_MAX_CONNECTIONS` | `1024` | Open connections per listener; more wait in the accept queue. |
+| `ASTER_SRV_DB_WAIT_SECS` | `5` | How long a request waits for a database connection before failing. |
 
 Logs are one JSON object per line, with `severity` and `message`.
+
+## Hardening the /v1 channel
+
+`/v1/*` is the channel that does not sit behind IAP: callers carry their own
+bearer tokens (CI OIDC tokens, person tokens) and `POST /v1/auth/token` carries
+none. Everything below applies to it.
+
+**Separate listener.** With `ASTER_SRV_API_ADDR` set, a second port serves only
+`/v1/*`. `/ui`, `/cli-auth`, `/healthz`, `/readyz`, `/metrics` and anything else
+answer `404` there, whatever the load balancer's URL map says, so a routing
+mistake cannot expose the dashboard or sign-in pages without IAP. The main
+port is unchanged and still answers `/v1/*`. Give the non-IAP backend service
+the API port; keep IAP on the main port. The API port's backend health check
+uses `GET /v1/healthz`, which answers `200 ok` and nothing else, is not
+authenticated (a health check carries no credentials) and reveals only that
+the process is up. It is not served on the main port.
+
+**Client IP and rate limits.** Limits are in-memory token buckets, per
+replica: with N replicas an attacker gets N times the rate. Cloud Armor on the
+load balancer is the global, cross-replica limit; these limits protect each
+replica and add per-subject limits Cloud Armor cannot. Over a limit the
+server answers `429` with `Retry-After`.
+
+| Limit | Key | Default |
+|---|---|---|
+| `POST /v1/auth/token` | client IP | 10 per minute |
+| all `/v1/*` | client IP | 1200 per minute |
+| authenticated `/v1/*` | person `sub`, or CI repository | 3000 per minute |
+| concurrent exchanges | the replica | 4 (more get `503`, `Retry-After: 1`) |
+
+Google's load balancer sets `X-Forwarded-For` to `<client-supplied>, <client
+IP>, <load balancer IP>`. Everything left of the last two entries is under the
+caller's control, so the server counts from the right, skips
+`ASTER_SRV_TRUSTED_PROXY_HOPS` entries (default 1, the balancer's own
+address) and takes the next: the right-most address that is not ours. With too
+few entries, or an unparsable one, it uses the TCP peer; with hops 0 it
+ignores the header. IPv6 clients share a limit per /64. This holds only while
+pods are reachable through the balancer alone; a caller reaching a pod
+directly could write the whole header (network policy must prevent it).
+
+**Size, time and connection limits.** `POST /cli-auth` and `/v1/auth/token`
+take at most 8 KiB, uploads and cache writes `ASTER_SRV_MAX_BODY_BYTES`, and
+every other route takes no body (`413`, decided from `Content-Length` before
+reading and while reading chunked bodies). Header, body and whole-request
+times are capped (`408`, `504`), and each listener serves at most
+`ASTER_SRV_MAX_CONNECTIONS` connections. Database connections are capped too:
+the shared pool waits `ASTER_SRV_DB_WAIT_SECS` and fails, and
+`POST /v1/auth/token` has its own 2-connection pool so a flood of sign-in
+attempts cannot take connections from CI commits and uploads.
+
+**Audit log.** Structured lines with `"audit": true` and an `event`:
+`token_mint` (a code issued at `/cli-auth`), `token_exchange` (`outcome` and
+`reason`), `token_revoke` (`audit::token_revoke`, called by the revoke
+endpoint), `auth_failure` (every 401 and 403: `route`, `client_ip`, `subject`
+when known, `reason`) and `rate_limited`. Tokens, codes, verifiers and IAP
+assertions are never fields, and the logger redacts credential-named fields
+and JWT-shaped text anyway.
+
+**Metrics.** `GET /metrics` on the main port, for callers that reach the pod
+directly (a request through the load balancer carries `X-Forwarded-For` and
+IAP's header and gets `404`); never on the API port.
+`aster_srv_auth_failures_total{route,reason}`,
+`aster_srv_person_tokens_issued_total`, `aster_srv_rate_limited_total{route,scope}`.
+Alert on a spike in failures, in PromQL
+`sum(rate(aster_srv_auth_failures_total[5m])) > 1` for 10 minutes, or in Cloud
+Monitoring with a log-based metric on
+`jsonPayload.audit=true AND jsonPayload.event="auth_failure"`.
 
 ## Runbook
 
@@ -503,8 +580,12 @@ an authorization-code flow with PKCE against the CLI's loopback port.
 | `POST /v1/auth/token` | `{code, verifier, port}` → `{token, expires_at, email}`. Not behind IAP: the code and the PKCE verifier are the credential. One `DELETE ... RETURNING` spends the code, so it works once even across replicas. Every refusal (unknown, spent or expired code, wrong verifier or port, malformed body) is the same `400 {"error":"invalid_grant"}`. |
 
 A person's token is an HS256 JWT signed by this server: `iss` is
-`ASTER_SRV_PUBLIC_URL`, `aud` is `aster-cli`, `sub` is the email IAP verified,
-`scope` is `cache:read`, with `iat`, `exp` and `jti`, and a `kid` header. There
+`ASTER_SRV_PUBLIC_URL`, `aud` is the same URL, `sub` is IAP's stable subject
+(`accounts.google.com:<id>`), `email` is the email IAP verified, `scope` is
+`cache:read`, with `iat`, `nbf`, `exp` (at most 12 hours after `iat`) and
+`jti`, and a `kid` header. Verification pins HS256, requires every claim, and
+allows 30 seconds of clock skew. Tokens issued before `sub`, `nbf` and `email`
+were required are refused; those people sign in once more. There
 are no refresh tokens. `/v1/*` reads the token's `alg`: HS256 goes to these
 keys only and RS256 to the GitHub OIDC verifier only; any other algorithm is
 `401`. The domain rule is applied again on every request, so narrowing

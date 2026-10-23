@@ -33,7 +33,7 @@ const REPO: &str = "acme/app";
 const PERSON: &str = "ada@example.com";
 const CI_WORKFLOW: &str = "acme/app/.github/workflows/ci.yml@refs/heads/main";
 const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
-const CLI_KEY: &str = "e2e1:cli-e2e-signing-secret-0123456789abcdef";
+const CLI_KEY: &str = "e2e1:Rm7vKq2LxT9bYc4nWz8PdJ3hSeA6UgF1oIiNtXuMvB0";
 
 struct Running {
     url: String,
@@ -75,6 +75,7 @@ impl Running {
                 "aud": format!("{IAP_AUDIENCE}4242"),
                 "exp": chrono::Utc::now().timestamp() + 300,
                 "email": email,
+                "sub": "accounts.google.com:e2e-1001",
             }),
             &EncodingKey::from_ec_der(&self.iap_signing_key),
         )
@@ -119,6 +120,8 @@ async fn start() -> Option<Running> {
         "ASTER_SRV_IAP_AUDIENCE" => Some(IAP_AUDIENCE.into()),
         "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
         "ASTER_SRV_PUBLIC_URL" => Some(url.clone()),
+        // The e2e server listens on loopback http.
+        "ASTER_SRV_ALLOW_HTTP_PUBLIC_URL" => Some("1".into()),
         "ASTER_SRV_CLI_TOKEN_KEYS" => Some(CLI_KEY.into()),
         "ASTER_SRV_CACHE_WRITER_WORKFLOWS" => Some("acme/app/.github/workflows/ci.yml@".into()),
         _ => None,

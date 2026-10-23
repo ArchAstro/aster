@@ -8,6 +8,7 @@
 //! from a laptop with `aster cache login` (`/cli-auth`, [`cli_auth`]) and
 //! hold a token that reads the cache ([`person`]).
 
+pub mod audit;
 pub mod auth;
 pub mod cache;
 pub mod cli_auth;
@@ -15,7 +16,9 @@ pub mod config;
 pub mod db;
 mod http;
 pub mod iap;
+pub mod limits;
 pub mod log;
+pub mod metrics;
 pub mod person;
 pub mod raw_store;
 pub mod test_results;
@@ -36,7 +39,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use config::Config;
-pub use http::{serve, Body, Reply};
+pub use http::{serve, serve_api, Body, Reply, Surface};
 
 /// How [`App::migrate_until_ready`] paces and escalates its retries.
 pub struct RetryPolicy {
@@ -69,6 +72,12 @@ pub enum Severity {
 pub struct App {
     pub config: Config,
     pub pool: deadpool_postgres::Pool,
+    /// A small pool only `POST /v1/auth/token` uses. That route is
+    /// unauthenticated, so a flood of it can exhaust this pool and nothing
+    /// else: CI commits and ingest keep [`Self::pool`].
+    pub auth_pool: deadpool_postgres::Pool,
+    pub limits: limits::Limits,
+    pub metrics: Arc<metrics::Metrics>,
     pub verifier: auth::Verifier,
     pub iap: iap::IapVerifier,
     /// Mints and checks person tokens. `None` when
@@ -173,7 +182,10 @@ impl App {
         raw_store: Option<raw_store::RawStore>,
         cache_store: Option<cache::BlobStore>,
     ) -> Result<Arc<Self>> {
-        let pool = db::pool(&config.database_url)?;
+        let pool = db::pool_sized(&config.database_url, 16, config.db_wait)?;
+        let auth_pool =
+            db::pool_sized(&config.database_url, limits::AUTH_POOL_SIZE, config.db_wait)?;
+        let limits = limits::Limits::new(&config);
         let person_tokens = person::TokenIssuer::from_config(&config);
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
@@ -183,6 +195,9 @@ impl App {
         Ok(Arc::new(Self {
             config,
             pool,
+            auth_pool,
+            limits,
+            metrics: Default::default(),
             verifier,
             iap,
             person_tokens,

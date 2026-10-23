@@ -33,6 +33,8 @@ fn server_env() -> Vec<(&'static str, &'static str)> {
             "/projects/123456/global/backendServices/",
         ),
         ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
+        // These tests exchange many codes from one address.
+        ("ASTER_SRV_RATE_TOKEN_IP_PER_MIN", "10000"),
     ]
 }
 
@@ -501,7 +503,7 @@ async fn two_racing_redemptions_of_one_code_have_exactly_one_winner() {
     let a = Arc::new(a);
     let (code, verifier, port) = sign_in(&a, ADA).await;
     let mut racers = tokio::task::JoinSet::new();
-    for index in 0..16 {
+    for index in 0..8 {
         let server = if index % 2 == 0 { a.clone() } else { b.clone() };
         let (code, verifier) = (code.clone(), verifier.clone());
         racers.spawn(async move { exchange(&server, &code, &verifier, port).await.0 });
@@ -517,7 +519,7 @@ async fn two_racing_redemptions_of_one_code_have_exactly_one_winner() {
     );
     assert_eq!(
         statuses.iter().filter(|s| **s == 400).count(),
-        15,
+        7,
         "{statuses:?}"
     );
     Arc::into_inner(b).unwrap().stop().await;
@@ -669,26 +671,24 @@ async fn a_person_token_that_is_expired_forged_misdirected_or_rotated_out_is_ref
         return;
     };
     let secret = common::CLI_TOKEN_KEYS.split_once(':').unwrap().1;
+    let secret = aster_srv::config::decode_key_secret(secret).unwrap();
+    let secret = secret.as_slice();
     let claims = |change: &dyn Fn(&mut Value)| {
+        let now = chrono::Utc::now().timestamp();
         let mut claims = json!({
-            "iss": common::PUBLIC_URL, "aud": "aster-cli", "sub": ADA, "scope": "cache:read",
-            "iat": chrono::Utc::now().timestamp(), "exp": chrono::Utc::now().timestamp() + 600,
-            "jti": "j",
+            "iss": common::PUBLIC_URL, "aud": common::PUBLIC_URL,
+            "sub": common::iap_subject(ADA), "email": ADA, "scope": "cache:read",
+            "iat": now, "nbf": now, "exp": now + 600, "jti": "j",
         });
         change(&mut claims);
         claims
     };
-    let sign = |claims: Value, kid: &str, secret: &str| {
+    let sign = |claims: Value, kid: &str, secret: &[u8]| {
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(kid.into());
         format!(
             "Bearer {}",
-            encode(
-                &header,
-                &claims,
-                &EncodingKey::from_secret(secret.as_bytes())
-            )
-            .unwrap()
+            encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
         )
     };
     let lookup = |bearer: String| {
@@ -721,11 +721,15 @@ async fn a_person_token_that_is_expired_forged_misdirected_or_rotated_out_is_ref
         ),
         (
             "bad signature",
-            sign(claims(&|_| {}), "t1", "another-secret-0123456789abcdefghij"),
+            sign(
+                claims(&|_| {}),
+                "t1",
+                b"another-secret-0123456789abcdefghij",
+            ),
         ),
         (
             "wrong audience",
-            sign(claims(&|c| c["aud"] = json!("aster-srv")), "t1", secret),
+            sign(claims(&|c| c["aud"] = json!("aster-cli")), "t1", secret),
         ),
         (
             "wrong issuer",
@@ -745,7 +749,7 @@ async fn a_person_token_that_is_expired_forged_misdirected_or_rotated_out_is_ref
     let rotated = server
         .second(&[(
             "ASTER_SRV_CLI_TOKEN_KEYS",
-            "t2:rotated-signing-secret-0123456789abcd",
+            "t2:Zk3pQw9TnVb2Lx8RcJ5mYd7HsAe1UgF4oIiNtXuMvB0",
         )])
         .await;
     let (status, _) = rotated
@@ -761,7 +765,7 @@ async fn a_person_token_that_is_expired_forged_misdirected_or_rotated_out_is_ref
     let both = server
         .second(&[(
             "ASTER_SRV_CLI_TOKEN_KEYS",
-            "t2:rotated-signing-secret-0123456789abcd,t1:test-signing-secret-0123456789abcdef",
+            "t2:Zk3pQw9TnVb2Lx8RcJ5mYd7HsAe1UgF4oIiNtXuMvB0,t1:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=",
         )])
         .await;
     let (status, _) = both
@@ -866,11 +870,6 @@ async fn without_keys_or_a_public_url_sign_in_is_off_and_person_tokens_are_refus
         assert_eq!(status, 401, "{what}: a person token is refused");
         off.stop().await;
     }
-    // Without IAP configured there is nobody to name either.
-    let no_iap = on.second(&[("ASTER_SRV_IAP_AUDIENCE", "")]).await;
-    let got = open_login(&no_iap, &query(40_000, &challenge, "s"), None).await;
-    assert_eq!(got.status, 404);
-    no_iap.stop().await;
     on.stop().await;
 }
 

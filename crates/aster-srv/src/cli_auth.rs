@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::audit;
 use crate::db::Migration;
 use crate::iap::{Viewer, ViewerError};
 use crate::person::random_token;
@@ -35,10 +36,11 @@ use crate::test_results::query::parse_query;
 use crate::ui::html::{bare_page, escape};
 use crate::{App, Reply};
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    feature: "auth",
-    version: 1,
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        feature: "auth",
+        version: 1,
+        sql: r#"
 CREATE SCHEMA IF NOT EXISTS auth;
 
 -- Only the SHA-256 of a code is stored: a database read cannot redeem one.
@@ -52,7 +54,15 @@ CREATE TABLE auth.cli_codes (
 
 CREATE INDEX cli_codes_expires_at ON auth.cli_codes (expires_at);
 "#,
-}];
+    },
+    // Person tokens carry the stable IAP subject, so a code remembers it.
+    // A code minted before this column has none and is refused at exchange.
+    Migration {
+        feature: "auth",
+        version: 2,
+        sql: "ALTER TABLE auth.cli_codes ADD COLUMN subject text;",
+    },
+];
 
 /// How long a code can be redeemed.
 const CODE_SECONDS: i64 = 60;
@@ -128,9 +138,18 @@ fn enabled(app: &App) -> bool {
 async fn viewer(app: &App, assertion: Option<&str>) -> Result<Viewer, Reply> {
     match app.iap.verify(assertion).await {
         Ok(viewer) if !viewer.email.contains('\0') => Ok(viewer),
-        Ok(_) => Err(page(401, "Sign in", "The sign-in assertion is not valid.")),
-        Err(error @ ViewerError::Forbidden(_)) => Err(page(403, "Not allowed", &error.to_string())),
-        Err(error) => Err(page(401, "Sign in", &error.to_string())),
+        Ok(_) => {
+            audit::auth_failure(None, "iap_invalid", "the viewer's email holds a NUL");
+            Err(page(401, "Sign in", "The sign-in assertion is not valid."))
+        }
+        Err(error @ ViewerError::Forbidden(_)) => {
+            audit::auth_failure(None, "iap_forbidden", "the viewer's domain is not allowed");
+            Err(page(403, "Not allowed", &error.to_string()))
+        }
+        Err(error) => {
+            audit::auth_failure(None, "iap_invalid", &error.to_string());
+            Err(page(401, "Sign in", &error.to_string()))
+        }
     }
 }
 
@@ -235,29 +254,36 @@ pub async fn authorize(app: &App, assertion: Option<&str>, body: &[u8]) -> Reply
             mac,
         )
     {
+        audit::auth_failure(
+            Some(&viewer.subject),
+            "bad_confirmation",
+            "the confirmation form's MAC or expiry is not valid",
+        );
         return expired();
     }
-    let code = match mint_code(app, &viewer.email, &request).await {
+    let code = match mint_code(app, &viewer, &request).await {
         Ok(code) => code,
         Err(error) => return unavailable(error),
     };
+    audit::token_mint(&viewer.subject, &viewer.email, request.port);
     Reply::redirect(format!(
         "http://127.0.0.1:{}/callback?code={code}&state={}",
         request.port, request.state
     ))
 }
 
-async fn mint_code(app: &App, email: &str, request: &Request) -> anyhow::Result<String> {
+async fn mint_code(app: &App, viewer: &Viewer, request: &Request) -> anyhow::Result<String> {
     let code = random_token(32)?;
     let client = app.pool.get().await?;
     purge_expired_with(&client).await?;
     client
         .execute(
-            "INSERT INTO auth.cli_codes (code_hash, email, challenge, port, expires_at) \
-             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::double precision))",
+            "INSERT INTO auth.cli_codes (code_hash, email, subject, challenge, port, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6::double precision))",
             &[
                 &hash(&code).as_slice(),
-                &email,
+                &viewer.email,
+                &viewer.subject,
                 &request.challenge,
                 &(request.port as i32),
                 &(CODE_SECONDS as f64),
@@ -299,31 +325,49 @@ fn invalid_grant() -> Reply {
     Reply::json(400, json!({"error": "invalid_grant"}))
 }
 
+/// The client sees one `invalid_grant`; the audit log and the failure
+/// counter get the real reason.
+fn refuse(subject: Option<&str>, reason: &'static str) -> Reply {
+    audit::exchange_failed(subject, reason);
+    invalid_grant()
+}
+
+/// Whether `text` is `len` base64url characters, the shape of a code
+/// (`random_token(32)`) and of a PKCE challenge.
+fn is_base64url_of(text: &str, len: usize) -> bool {
+    text.len() == len && url_safe(text)
+}
+
 /// `POST /v1/auth/token`: trade a code and its PKCE verifier for a token.
+///
+/// The route is unauthenticated and reaches the database, so everything that
+/// can be refused from the request alone is refused before a connection is
+/// taken, and the query runs on the small [`App::auth_pool`].
 pub async fn exchange(app: &App, body: &[u8]) -> Reply {
     let Some(tokens) = app.person_tokens.as_ref().filter(|_| enabled(app)) else {
         return Reply::error(404, "not found");
     };
     let Ok(request) = serde_json::from_slice::<Exchange>(body) else {
-        return invalid_grant();
+        return refuse(None, "malformed_request");
     };
-    // RFC 7636: a verifier is 43 to 128 unreserved characters.
+    // RFC 7636: a verifier is 43 to 128 unreserved characters. A code is
+    // exactly what `mint_code` makes, so any other shape cannot be one.
     let verifier_ok = (43..=128).contains(&request.verifier.len())
         && request
             .verifier
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
-    if !verifier_ok || request.code.len() > 128 {
-        return invalid_grant();
+    if !verifier_ok || !is_base64url_of(&request.code, 43) || request.port < MIN_PORT {
+        return refuse(None, "malformed_request");
     }
     let row = async {
-        let client = app.pool.get().await?;
+        let client = app.auth_pool.get().await?;
         // One statement reads and spends the code, so of two racing
         // redemptions, on any replicas, exactly one gets the row.
         client
             .query_opt(
                 "DELETE FROM auth.cli_codes WHERE code_hash = $1 AND expires_at > now() \
-                 RETURNING email, challenge, port",
+                 RETURNING email, subject, challenge, port",
                 &[&hash(&request.code).as_slice()],
             )
             .await
@@ -332,28 +376,39 @@ pub async fn exchange(app: &App, body: &[u8]) -> Reply {
     .await;
     let row = match row {
         Ok(Some(row)) => row,
-        Ok(None) => return invalid_grant(),
+        Ok(None) => return refuse(None, "unknown_or_expired_code"),
         Err(error) => return unavailable(error),
     };
-    let (email, challenge, port): (String, String, i32) = (row.get(0), row.get(1), row.get(2));
+    let (email, subject, challenge, port): (String, Option<String>, String, i32) =
+        (row.get(0), row.get(1), row.get(2), row.get(3));
+    let Some(subject) = subject.filter(|subject| !subject.is_empty()) else {
+        return refuse(None, "code_without_subject");
+    };
     let derived = {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(request.verifier.as_bytes()))
     };
-    let verified = crate::auth::constant_time_eq(derived.as_bytes(), challenge.as_bytes());
-    if !verified || port != i32::from(request.port) {
-        return invalid_grant();
+    // Constant time: the challenge is the credential's other half.
+    if !crate::auth::constant_time_eq(derived.as_bytes(), challenge.as_bytes()) {
+        return refuse(Some(&subject), "pkce_mismatch");
     }
-    match tokens.issue(&email) {
-        Ok(issued) => Reply::json(
-            200,
-            json!({
-                "token": issued.token,
-                "expires_at": issued.expires_at,
-                "email": email,
-            }),
-        ),
+    if port != i32::from(request.port) {
+        return refuse(Some(&subject), "port_mismatch");
+    }
+    match tokens.issue(&subject, &email) {
+        Ok(issued) => {
+            app.metrics.person_token_issued();
+            audit::exchange_succeeded(&subject);
+            Reply::json(
+                200,
+                json!({
+                    "token": issued.token,
+                    "expires_at": issued.expires_at,
+                    "email": email,
+                }),
+            )
+        }
         Err(error) => unavailable(error),
     }
 }

@@ -95,7 +95,7 @@ pub struct Identity {
     pub static_token: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// No bearer token: 401.
     Missing,
@@ -106,6 +106,17 @@ pub enum AuthError {
 }
 
 impl AuthError {
+    /// A fixed code for logs and metric labels (a small closed set).
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            AuthError::Missing => "missing_token",
+            AuthError::Forbidden(_) => "forbidden_repository",
+            AuthError::Invalid(reason) if reason.contains("Expired") => "expired_token",
+            AuthError::Invalid(reason) if reason.contains("InvalidSignature") => "bad_signature",
+            AuthError::Invalid(_) => "invalid_token",
+        }
+    }
+
     /// The reply to send: 403 for a valid token that may not use the
     /// server, 401 for everything else.
     pub fn into_reply(self) -> crate::Reply {
@@ -274,7 +285,7 @@ impl Verifier {
             return Ok(key.clone());
         }
         let Some(url) = &self.jwks_url else {
-            return Err(AuthError::Invalid(format!("unknown signing key {kid}")));
+            return Err(AuthError::Invalid("unknown signing key".to_string()));
         };
         // One fetch at a time, with the lock held across it. Callers that
         // queued behind a fetch look again once they hold the lock, so they
@@ -284,7 +295,7 @@ impl Verifier {
             return Ok(key.clone());
         }
         if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
-            return Err(AuthError::Invalid(format!("unknown signing key {kid}")));
+            return Err(AuthError::Invalid("unknown signing key".to_string()));
         }
         *last = Some(Instant::now());
         let set: JwkSet = self
@@ -305,15 +316,20 @@ impl Verifier {
         }
         keys.get(kid)
             .cloned()
-            .ok_or_else(|| AuthError::Invalid(format!("unknown signing key {kid}")))
+            .ok_or_else(|| AuthError::Invalid("unknown signing key".to_string()))
     }
 }
 
+/// Compare two secrets without leaking where they differ or how long either
+/// is: both are hashed to 32 bytes first, and the digests are compared with
+/// an OR-fold over every byte.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
@@ -461,9 +477,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secrets_compare_equal_only_when_identical_whatever_their_length() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abc", b""));
+        assert!(!constant_time_eq(&[0u8; 32], &[0u8; 33]));
+    }
+
     // ---- person tokens and the algorithm switch ----
 
-    const K1: &str = "k1:0123456789abcdef0123456789abcdef";
+    const K1: &str = "k1:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=";
+
+    fn k1_secret() -> Vec<u8> {
+        crate::config::decode_key_secret(K1.split_once(':').unwrap().1).unwrap()
+    }
 
     fn person_config(keys: &str) -> Config {
         let keys = keys.to_string();
@@ -472,6 +502,8 @@ mod tests {
             "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
             "ASTER_SRV_STATIC_TOKENS" => Some("ArchAstro/dev=dev-token-0123456789".into()),
             "ASTER_SRV_PUBLIC_URL" => Some("https://aster-srv.example.com".into()),
+            "ASTER_SRV_IAP_AUDIENCE" => Some("/projects/1/global/backendServices/".into()),
+            "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
             "ASTER_SRV_CLI_TOKEN_KEYS" => Some(keys.clone()),
             _ => None,
         })
@@ -491,10 +523,12 @@ mod tests {
     fn person_claims() -> serde_json::Value {
         json!({
             "iss": "https://aster-srv.example.com",
-            "aud": "aster-cli",
-            "sub": "ada@example.com",
+            "aud": "https://aster-srv.example.com",
+            "sub": "accounts.google.com:1",
+            "email": "ada@example.com",
             "scope": "cache:read",
             "iat": chrono::Utc::now().timestamp(),
+            "nbf": chrono::Utc::now().timestamp(),
             "exp": chrono::Utc::now().timestamp() + 300,
             "jti": "x",
         })
@@ -507,10 +541,14 @@ mod tests {
     #[tokio::test]
     async fn the_algorithm_picks_the_verifier_and_neither_accepts_the_others_tokens() {
         let issuer = issuer();
-        let person = issuer.issue("ada@example.com").unwrap().token;
+        let person = issuer
+            .issue("accounts.google.com:1", "ada@example.com")
+            .unwrap()
+            .token;
         assert_eq!(
             principal(Some(&issuer), &person).await,
             Ok(Principal::Person(crate::person::Person {
+                subject: "accounts.google.com:1".into(),
                 email: "ada@example.com".into()
             }))
         );
@@ -585,7 +623,7 @@ mod tests {
         let hs512 = encode(
             &header,
             &person_claims(),
-            &EncodingKey::from_secret(K1.split_once(':').unwrap().1.as_bytes()),
+            &EncodingKey::from_secret(&k1_secret()),
         )
         .unwrap();
         assert!(matches!(
@@ -597,7 +635,8 @@ mod tests {
     #[tokio::test]
     async fn a_person_token_must_be_current_signed_by_a_known_key_for_this_server() {
         let issuer = issuer();
-        let secret = K1.split_once(':').unwrap().1.as_bytes();
+        let secret = k1_secret();
+        let secret = secret.as_slice();
         let good = hs256(person_claims(), Some("k1"), secret);
         assert!(principal(Some(&issuer), &good).await.is_ok());
         let tampered = |change: &dyn Fn(&mut serde_json::Value)| {
@@ -612,7 +651,7 @@ mod tests {
             ),
             (
                 "wrong audience",
-                tampered(&|c| c["aud"] = json!("aster-srv")),
+                tampered(&|c| c["aud"] = json!("aster-cli")),
             ),
             (
                 "wrong issuer",
