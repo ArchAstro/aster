@@ -168,6 +168,13 @@ pub struct Config {
     /// the TCP peer is the client, it also caps open connections from one
     /// peer. Default 128.
     pub max_connections_per_ip: usize,
+    /// `ASTER_SRV_LOG_SAMPLE_FIRST`: failure audit lines logged per
+    /// `(event, reason, route, client_ip)` in each window before the rest
+    /// are only counted and summarised. Default 5.
+    pub log_sample_first: u32,
+    /// `ASTER_SRV_LOG_SAMPLE_WINDOW_SECS`: the length of that window, and
+    /// how often a summary line is written. Default 60.
+    pub log_sample_window: Duration,
     /// `ASTER_SRV_HANDLER_TIMEOUT_SECS`: how long a request may run from the
     /// end of its headers to its reply, body read included. Default 120.
     pub handler_timeout: Duration,
@@ -462,6 +469,9 @@ impl Config {
         let unauth_body_timeout =
             Duration::from_secs(number("ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS", 8, 1..=60)?)
                 .min(body_timeout);
+        let log_sample_first = number("ASTER_SRV_LOG_SAMPLE_FIRST", 5, 1..=1000)? as u32;
+        let log_sample_window =
+            Duration::from_secs(number("ASTER_SRV_LOG_SAMPLE_WINDOW_SECS", 60, 1..=3600)?);
         let max_connections_per_ip =
             number("ASTER_SRV_MAX_CONNECTIONS_PER_IP", 128, 1..=1_000_000)? as usize;
         let handler_timeout =
@@ -578,6 +588,8 @@ impl Config {
             body_timeout,
             unauth_body_timeout,
             max_connections_per_ip,
+            log_sample_first,
+            log_sample_window,
             handler_timeout,
             header_timeout,
             max_connections,
