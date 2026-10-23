@@ -272,8 +272,11 @@ At start Aster prints the list it will use, for example:
 ```
 
 **The server** quarantines a test that is not broken once definite flakes
-from 2 different failing runs fall within 7 days. A run that flaked more than
-10 tests counts toward none of them, and an incident's failures never count. It releases the test after 20
+from 2 different failing runs fall within 7 days, counting only flakes whose
+runs are both default-branch runs by their credentials (a push, dispatch or
+schedule of the default branch): a pull request job's results score flakes
+but never quarantine. A run that flaked more than 10 tests counts toward none
+of them, and an incident's failures never count. It releases the test after 20
 consecutive passes, when it breaks, or after 30 days; a released test starts
 afresh. The list is fetched at start and cached in `.aster/quarantine.json`.
 If the server cannot be reached, a cache younger than 24 hours stands in;

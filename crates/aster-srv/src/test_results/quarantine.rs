@@ -11,9 +11,12 @@
 //! 3. A test whose final results since it entered end in
 //!    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` consecutive passes is released.
 //!    Skips and cached targets' replayed results do not count.
-//! 4. A test that is not broken enters when definite flake events from
-//!    `ASTER_SRV_QUARANTINE_RUNS` different failing runs fall in the last 7
-//!    days. Only events after the test last left count, so a released or
+//! 4. A test that is not broken enters when trusted definite flake events
+//!    from `ASTER_SRV_QUARANTINE_RUNS` different failing runs fall in the
+//!    last 7 days. An event is trusted when both its runs are default-branch
+//!    runs whose source is known (see `Window::trusted`): pull request jobs
+//!    run their author's code, so their results still score flakes but
+//!    never hide a failure. Only events after the test last left count, so a released or
 //!    expired test is judged afresh. A run holding definite events of more
 //!    than `ASTER_SRV_QUARANTINE_RUN_CAP` tests in those days counts for
 //!    none: many tests flaking in one run point at the run, not the tests.
@@ -226,7 +229,8 @@ pub(super) async fn update(
                      recent AS ( \
                          SELECT e.repo, e.test_id, e.run_id, e.observed_at \
                          FROM test_results.test_flake_events e \
-                         WHERE e.kind = 'definite' AND e.observed_on >= '{from_day}'::date \
+                         WHERE e.kind = 'definite' AND e.trusted \
+                           AND e.observed_on >= '{from_day}'::date \
                            AND e.observed_at > {to} - {ENTRY_DAYS} * interval '24 hours' \
                            AND e.observed_at <= {to}), \
                      crowded AS ( \

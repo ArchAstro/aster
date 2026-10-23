@@ -465,6 +465,12 @@ pub struct Run<'a> {
     pub lane: Option<&'a str>,
     /// The CI attempt.
     pub attempt: Option<i32>,
+    /// Who uploaded it: `static` (the default, judged by `branch`) or
+    /// `oidc` with `git_ref` and `event_name`; `None` for a run stored
+    /// before sources were recorded.
+    pub source: Option<&'a str>,
+    pub git_ref: Option<&'a str>,
+    pub event_name: Option<&'a str>,
     /// `(test_id, outcome, attempt, failure_hash)`.
     pub results: Vec<(&'a str, &'a str, i32, Option<&'a str>)>,
 }
@@ -483,8 +489,19 @@ impl<'a> Run<'a> {
             job: None,
             lane: None,
             attempt: None,
+            source: Some("static"),
+            git_ref: None,
+            event_name: None,
             results: Vec::new(),
         }
+    }
+
+    /// Uploaded with an OIDC token for `git_ref` and `event_name`.
+    pub fn oidc(mut self, git_ref: &'a str, event_name: &'a str) -> Self {
+        self.source = Some("oidc");
+        self.git_ref = Some(git_ref);
+        self.event_name = Some(event_name);
+        self
     }
 
     pub fn hash(mut self, input_hash: &'a str) -> Self {
@@ -529,8 +546,8 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
         .execute(
             "INSERT INTO test_results.runs \
              (run_id, repo, sha, branch, job, lane, attempt, runner, aster_version, \
-              started_at, received_at) \
-             VALUES ($1, $2, $3, $4, $6, $7, $8, $9, '0', $5, $5)",
+              started_at, received_at, source, git_ref, event_name) \
+             VALUES ($1, $2, $3, $4, $6, $7, $8, $9, '0', $5, $5, $10, $11, $12)",
             &[
                 &run.run_id,
                 &run.repo,
@@ -541,6 +558,9 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
                 &run.lane,
                 &run.attempt,
                 &runner,
+                &run.source,
+                &run.git_ref,
+                &run.event_name,
             ],
         )
         .await

@@ -26,7 +26,7 @@ async fn classify(server: &Server, now: DateTime<Utc>) -> classifier::Report {
 /// A run in which `test` failed and then passed on its retry: one definite
 /// flake event.
 fn retried<'a>(run: &'a str, test: &'a str, at: DateTime<Utc>) -> Run<'a> {
-    Run::new(run, "pr-1", at)
+    Run::new(run, "main", at)
         .attempt(test, "fail", 1, Some("f1"))
         .attempt(test, "pass", 2, None)
 }
@@ -77,12 +77,12 @@ async fn definite_flakes_in_two_runs_quarantine_a_test() {
     // Two definite events, but from one run.
     seed(
         &server,
-        &Run::new("r3", "pr-2", ago(now, 45)).result("once", "pass", None),
+        &Run::new("r3", "main", ago(now, 45)).result("once", "pass", None),
     )
     .await;
     seed(
         &server,
-        &Run::new("r4", "pr-2", ago(now, 40))
+        &Run::new("r4", "main", ago(now, 40))
             .attempt("once", "fail", 1, Some("f1"))
             .attempt("once", "pass", 2, None),
     )
@@ -230,7 +230,7 @@ async fn consecutive_passes_release_and_a_release_starts_afresh() {
         let failure = (outcome == "fail").then_some("f9");
         seed(
             &server,
-            &Run::new(run, "pr-9", ago(now, minutes))
+            &Run::new(run, "main", ago(now, minutes))
                 .hash(run)
                 .result("t", outcome, failure),
         )
@@ -241,7 +241,7 @@ async fn consecutive_passes_release_and_a_release_starts_afresh() {
 
     seed(
         &server,
-        &Run::new("p6", "pr-9", ago(now, 40))
+        &Run::new("p6", "main", ago(now, 40))
             .hash("p6")
             .result("t", "pass", None),
     )
@@ -281,7 +281,7 @@ async fn replayed_passes_from_cached_targets_do_not_release() {
     assert_eq!(quarantined(&feed(&server).await), vec!["t"]);
 
     for (run, minutes) in [("c1", 70), ("c2", 65)] {
-        let mut replayed = Run::new(run, "pr-9", ago(now, minutes)).result("t", "pass", None);
+        let mut replayed = Run::new(run, "main", ago(now, minutes)).result("t", "pass", None);
         replayed.cached = true;
         seed(&server, &replayed).await;
     }
@@ -291,7 +291,7 @@ async fn replayed_passes_from_cached_targets_do_not_release() {
     for (run, minutes) in [("p1", 55), ("p2", 50)] {
         seed(
             &server,
-            &Run::new(run, "pr-9", ago(now, minutes)).result("t", "pass", None),
+            &Run::new(run, "main", ago(now, minutes)).result("t", "pass", None),
         )
         .await;
     }
@@ -569,7 +569,7 @@ async fn a_run_flaking_more_tests_than_the_cap_quarantines_none_of_them() {
     // (three failures of ten tests), so each is a definite flake.
     let tests = ["a", "b", "c"];
     let run = |id: &'static str, at| {
-        let mut seeded = Run::new(id, "pr-1", at);
+        let mut seeded = Run::new(id, "main", at);
         for test in tests {
             seeded = seeded
                 .attempt(test, "fail", 1, Some("f1"))
@@ -605,4 +605,131 @@ async fn a_run_flaking_more_tests_than_the_cap_quarantines_none_of_them() {
         assert_eq!(flaky, 3, "cap {cap}");
         server.stop().await;
     }
+}
+
+/// Flaky score and quarantine state of `test`.
+async fn score_and_quarantine(server: &Server, test: &str) -> (i32, bool) {
+    let score = server
+        .client()
+        .await
+        .query_one(
+            "SELECT flake_score FROM test_results.tests WHERE test_id = $1",
+            &[&test],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let held = quarantined(&feed(server).await).contains(&test.to_string());
+    (score, held)
+}
+
+#[tokio::test]
+async fn pull_request_evidence_scores_flakes_but_never_quarantines() {
+    // Two retried flakes per test, each from a different kind of job. A
+    // pull request job runs its author's code: its token proves where the
+    // results came from, not that they are true.
+    // (test, how its job uploads, whether its flakes may quarantine it)
+    type Job = (&'static str, fn(Run<'static>) -> Run<'static>, bool);
+    let jobs: [Job; 5] = [
+        ("pushed", |r| r.oidc("refs/heads/main", "push"), true),
+        (
+            "dispatched",
+            |r| r.oidc("refs/heads/main", "workflow_dispatch"),
+            true,
+        ),
+        // Its record says main; its ref says pull request 7.
+        ("pr", |r| r.oidc("refs/pull/7/merge", "pull_request"), false),
+        // The default branch's ref, but run for a pull request.
+        (
+            "pr-target",
+            |r| r.oidc("refs/heads/main", "pull_request_target"),
+            false,
+        ),
+        // A static token's runs go by branch.
+        (
+            "static-branch",
+            |r| Run {
+                branch: "feature/x",
+                ..r
+            },
+            false,
+        ),
+    ];
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // Run ids live as long as the runs that borrow them.
+    let leak = |id: String| -> &'static str { Box::leak(id.into_boxed_str()) };
+    for (test, job, _) in &jobs {
+        let (first, second) = (leak(format!("{test}-1")), leak(format!("{test}-2")));
+        seed(&server, &job(retried(first, test, ago(now, 20)))).await;
+        seed(&server, &job(retried(second, test, ago(now, 10)))).await;
+    }
+    classify(&server, now).await;
+    for (test, _, held) in jobs {
+        assert_eq!(
+            score_and_quarantine(&server, test).await,
+            (6, held),
+            "{test}"
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_forged_pass_cannot_make_a_real_main_failure_quarantinable() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    let main = |id: &'static str, at, outcome: &'static str| {
+        Run::new(id, "main", at)
+            .oidc("refs/heads/main", "push")
+            .result("real", outcome, (outcome == "fail").then_some("f1"))
+    };
+    let pr = |id: &'static str, at| {
+        Run::new(id, "main", at)
+            .oidc("refs/pull/7/merge", "pull_request")
+            .result("real", "pass", None)
+    };
+    // The test really fails on main twice. A pull request job uploads a
+    // pass on the same inputs after each failure: both failures now look
+    // like flakes, but only on the forger's word.
+    seed(&server, &main("m1", ago(now, 60), "fail")).await;
+    seed(&server, &pr("p1", ago(now, 55))).await;
+    seed(&server, &main("m2", ago(now, 50), "fail")).await;
+    seed(&server, &pr("p2", ago(now, 45))).await;
+    classify(&server, ago(now, 40)).await;
+    assert_eq!(score_and_quarantine(&server, "real").await, (6, false));
+
+    // A main run passes on those inputs: m2's failure is now a flake on
+    // main's own word. One trusted failing run is not two.
+    seed(&server, &main("t1", ago(now, 30), "pass")).await;
+    classify(&server, ago(now, 25)).await;
+    assert!(!score_and_quarantine(&server, "real").await.1);
+    let trusted: Vec<(String, bool)> = server
+        .client()
+        .await
+        .query(
+            "SELECT run_id, trusted FROM test_results.test_flake_events \
+             WHERE kind = 'definite' ORDER BY run_id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        trusted,
+        vec![("m1".to_string(), false), ("m2".to_string(), true)]
+    );
+
+    // A second failure and pass on main: two trusted failing runs.
+    seed(&server, &main("m3", ago(now, 20), "fail")).await;
+    seed(&server, &main("t2", ago(now, 10), "pass")).await;
+    classify(&server, now).await;
+    assert!(score_and_quarantine(&server, "real").await.1);
+    server.stop().await;
 }
