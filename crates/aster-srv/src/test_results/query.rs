@@ -561,13 +561,11 @@ async fn run_failures(
     else {
         return Err(Reply::error(404, "no such run").into());
     };
+    // Another repository's run is indistinguishable from a missing one: the
+    // reply must not say that the id exists, or whose it is.
     let repo: String = run.get("repo");
     if !repo.eq_ignore_ascii_case(&identity.repository) {
-        return Err(Reply::error(
-            403,
-            format!("the run belongs to {repo}, not {}", identity.repository),
-        )
-        .into());
+        return Err(Reply::error(404, "no such run").into());
     }
     let received_on: chrono::NaiveDate = run.get("received_on");
     let after = params.cursor.clone().unwrap_or_default();

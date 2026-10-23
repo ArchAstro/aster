@@ -399,22 +399,23 @@ async fn reports_a_runs_failures_with_their_state() {
 
     // Errors.
     assert_eq!(server.get(&path, None).await.0, 401);
-    assert_eq!(
-        server
-            .get("/v1/test-results/runs/nope/failures", Some(REPO))
-            .await
-            .0,
-        404
-    );
+    let missing = server
+        .get("/v1/test-results/runs/nope/failures", Some(REPO))
+        .await;
+    assert_eq!(missing.0, 404);
     let mut foreign = Run::new("o1", "main", ago(now, 5)).result("t", "fail", Some("x"));
     foreign.repo = OTHER;
     seed(&server, &foreign).await;
-    assert_eq!(
-        server
-            .get("/v1/test-results/runs/o1/failures", Some(REPO))
-            .await
-            .0,
-        403
+    // N10: another repository's run answers exactly what a missing run does,
+    // so the id leaks neither its existence nor its owner.
+    let foreign_reply = server
+        .get("/v1/test-results/runs/o1/failures", Some(REPO))
+        .await;
+    assert_eq!(foreign_reply, missing);
+    assert!(
+        !foreign_reply.1.to_string().contains(OTHER),
+        "{}",
+        foreign_reply.1
     );
     assert_eq!(
         server
