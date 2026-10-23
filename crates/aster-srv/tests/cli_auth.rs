@@ -1113,7 +1113,9 @@ fn manifest_body(key: &str) -> Value {
 }
 
 fn ci(git_ref: &str, job_workflow: Option<&str>) -> String {
-    let mut claims = json!({"ref": git_ref});
+    // One GitHub run (1, attempt 1) of commit 9f1c, which the uploads below
+    // name.
+    let mut claims = json!({"ref": git_ref, "run_id": "1", "run_attempt": "1", "sha": "9f1c"});
     if let Some(workflow) = job_workflow {
         claims["job_workflow_ref"] = json!(workflow);
     }
@@ -1123,7 +1125,7 @@ fn ci(git_ref: &str, job_workflow: Option<&str>) -> String {
 async fn upload_results(server: &Server, bearer: &str) -> u16 {
     use aster_results_model::{to_ndjson, Record, RunRecord};
     let body = to_ndjson(&[Record::Run(RunRecord {
-        run_id: "run-1".into(),
+        run_id: format!("gh:{REPO}:1:1:test:-"),
         repo: REPO.into(),
         sha: "9f1c".into(),
         branch: Some("main".into()),
