@@ -566,16 +566,22 @@ signs them with IAM Credentials `signBlob` as its own service account
 
 | Route | |
 |---|---|
-| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A key whose blobs the server could not resolve (over the blob cap, past the time budget, or GCS or IAM failed or was busy) is also absent, so the client treats it as a miss and rebuilds. See [Lookup bounds](#lookup-bounds). A lookup updates `last_used_at`. |
+| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A key whose blobs the server could not resolve (over the blob cap, past the time budget, or GCS or IAM failed or was busy) is also absent, so the client treats it as a miss and rebuilds. See [Lookup bounds](#lookup-bounds). A writer CI token's lookup updates `last_used_at`; see below. |
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
 | `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists, and records the writer's `ref`, `run_id`, `sha` and `workflow_ref` claims (null for a static token). A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
 | `GET /v1/cache/summary?repo=<owner/name>` | `{repo, manifests, manifest_bytes, blobs, blob_bytes, last_write_at, last_writer: {ref, run_id, sha, workflow} or null, lookups: [{day, hits, misses}]}`. `lookups` are the last 14 UTC days that had a lookup, newest first. `blobs` and `blob_bytes` are global: blobs are content-addressed and shared across repositories. |
 | `GET /v1/cache/entries?repo=<owner/name>&limit=<1..200, default 50>&before=<cursor>&target=<substring>` | `{entries: [{key, target, size_bytes, output_files, exit_code, duration_ms, aster_version, created_at, last_used_at, hits, last_hit_at, writer: {ref, run_id, sha, workflow}}], next}` ordered by `created_at` descending, then key. `next` is an opaque cursor to pass as `before`, or null on the last page. `target` is a case-insensitive literal substring filter (`%`, `_` and `\` match themselves), applied in SQL, so a page holds `limit` entries whenever more match. Commit stores `target`, `output_files`, `exit_code`, `duration_ms` and `aster_version` beside the manifest, so paging never reads manifest bytes. A manifest that does not decode is listed with an empty `target` and zeroed fields. |
 
-A lookup counts one hit per stored key (`hits`, `last_hit_at` on the manifest)
-and adds the request's hits and misses to today's row in
-`cache.lookup_stats`. Counting is best effort: a failure is logged and the
-lookup still answers. Keys repeated in one request count once.
+A lookup by a CI token that may write the cache (the same writer rules as
+commit: allowed repository and owner id, writer ref, `push` event, writer
+workflow) counts one hit per stored key it serves (`hits`, `last_hit_at` on
+the manifest) and refreshes `last_used_at` on the manifest and its blobs,
+which keeps them past retention. A pull-request or other non-writer CI
+token's lookup, and a person's, changes none of these, so it cannot hold an
+entry in the cache. Every CI lookup, writer or not, adds the request's hits
+and misses to today's row in `cache.lookup_stats`; that write is best effort:
+a failure is logged and the lookup still answers. Keys repeated in one
+request count once.
 
 ### Lookup bounds
 
@@ -628,7 +634,7 @@ a `/v1/` path the table does not list is `401` without a valid token.
 |---|---|---|
 | `Public` | `GET /healthz`, `GET /readyz`, `POST /v1/auth/token` | anyone; the exchange needs a valid code |
 | `Iap` | `/cli-auth`, `/ui/*` | a person behind IAP |
-| `CiOrPerson` | `GET /v1/test-results/{tests,tests/:id,failures,quarantine,clusters,durations,runs/:id/failures}`, `GET /v1/cache/{summary,entries}`, `POST /v1/cache/lookup` | a CI token for its own repository, or a person's token for any served repository named with `?repo=` (read-only; a person's lookups do not count hits) |
+| `CiOrPerson` | `GET /v1/test-results/{tests,tests/:id,failures,quarantine,clusters,durations,runs/:id/failures}`, `GET /v1/cache/{summary,entries}`, `POST /v1/cache/lookup` | a CI token for its own repository, or a person's token for any served repository named with `?repo=` (read-only; only a writer CI token's lookups count hits) |
 | `CiWriter` | `POST /v1/test-results/runs`, `POST /v1/cache/{upload,commit}` | a CI token only, then the writer rules |
 
 A lookup or upload request body is capped at 1 MiB and read only after the

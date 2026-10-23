@@ -1555,7 +1555,8 @@ async fn retention_prunes_old_lookup_stats() {
 
 /// N13. A pull-request CI token may read the cache, but its lookups must not
 /// bump `hits`, `last_hit_at` or `last_used_at`: any PR author could otherwise
-/// keep an entry alive forever. A main push (writer-eligible) still counts.
+/// keep an entry alive forever. A person's lookup does not count either. A
+/// main push (writer-eligible) still counts.
 #[tokio::test]
 async fn a_pull_request_lookup_does_not_count_but_a_main_push_does() {
     let Some((server, _)) = server().await else {
@@ -1612,7 +1613,20 @@ async fn a_pull_request_lookup_does_not_count_but_a_main_push_does() {
     };
     assert_eq!(state(server.client().await).await, (0, false, used_before));
 
-    // Phase 3: a main push looks it up and is counted.
+    // Phase 3: a signed-in person looks it up. People never count either.
+    let (status, body) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k1"]}),
+            Some(&common::person_bearer(&server, VIEWER)),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["hits"]["k1"].is_object(), "{body}");
+    assert_eq!(state(server.client().await).await, (0, false, used_before));
+
+    // Phase 4: a main push looks it up and is counted.
     let (status, _) = server
         .post_json(
             "/v1/cache/lookup",
