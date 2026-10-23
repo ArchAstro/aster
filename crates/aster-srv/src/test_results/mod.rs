@@ -272,12 +272,16 @@ ON CONFLICT (run_id, target) DO NOTHING;
         // Where each run came from, from the token that uploaded it rather
         // than the run record: `source` (`oidc` or `static`) and the OIDC
         // `ref` and `event_name` claims. Nullable columns on a small table;
-        // runs stored before have none and are never trusted.
+        // runs stored before have none and are never trusted. Each flake
+        // event says whether both of its runs are trusted, which
+        // quarantine requires; a constant default, so no rewrite.
         sql: r#"
 ALTER TABLE test_results.runs
     ADD COLUMN source text,
     ADD COLUMN git_ref text,
     ADD COLUMN event_name text;
+ALTER TABLE test_results.test_flake_events
+    ADD COLUMN trusted boolean NOT NULL DEFAULT false;
 "#,
     },
 ];

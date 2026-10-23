@@ -259,6 +259,33 @@ impl Window {
         )
     }
 
+    /// Whether the run `r` (an alias of `test_results.runs`) is on the
+    /// default branch. An OIDC upload's `ref` and `event_name` claims say
+    /// so, not its record: a push, dispatch or schedule of the default
+    /// branch's own workflow. A pull request's ref is `refs/pull/...`
+    /// whatever branch its record names, and `pull_request_target` runs on
+    /// the default branch's ref but for a pull request. A static token's
+    /// runs, and runs stored before sources were recorded, go by `branch`.
+    pub(super) fn on_default(&self, r: &str) -> String {
+        format!(
+            "(CASE WHEN {r}.source = 'oidc' \
+                   THEN COALESCE({r}.git_ref = {git_ref} \
+                                 AND {r}.event_name IN ('push', 'workflow_dispatch', 'schedule'), \
+                                 false) \
+                   ELSE COALESCE({branch}, false) END)",
+            git_ref = text(&format!("refs/heads/{}", self.on_default)),
+            branch = self.branch_is_default(&format!("{r}.branch")),
+        )
+    }
+
+    /// Whether the run `r` is evidence quarantine may act on: a
+    /// default-branch run whose source is known. A pull request job runs
+    /// its author's code, so its token proves where the results came from
+    /// but not that they are true.
+    pub(super) fn trusted(&self, r: &str) -> String {
+        format!("({r}.source IS NOT NULL AND {})", self.on_default(r))
+    }
+
     /// Each run's final result of one test: `filter` picks the test and
     /// bounds the runs. `strict` leaves out `partial` targets.
     pub(super) fn finals(&self, filter: &str, strict: bool) -> String {
@@ -369,7 +396,7 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
 }
 
 const EVENT_COLUMNS: &str = "observed_on, repo, test_id, kind, reason, run_id, prev_run_id, \
-                             target, input_hash, observed_at";
+                             target, input_hash, observed_at, trusted";
 const EVENT_KEY: &str = "(repo, test_id, kind, run_id, observed_on)";
 
 async fn classify(
@@ -388,7 +415,8 @@ async fn classify(
                  WITH attempts AS ( \
                      SELECT tr.repo, tr.run_id, tr.test_id, tr.target, tr.outcome, \
                             tr.failure_hash, tr.received_on, r.received_at, r.sha, \
-                            {on_default} AS on_default, t.input_hash, t.confidence, \
+                            {on_default} AS on_default, {trusted} AS trusted, \
+                            t.input_hash, t.confidence, \
                             row_number() OVER w AS rn, \
                             bool_or(tr.outcome IN ('fail', 'error')) OVER (\
                                 PARTITION BY tr.run_id, tr.test_id) AS any_fail \
@@ -402,11 +430,12 @@ async fn classify(
                        AND tr.outcome <> 'skip' AND NOT t.cached \
                      WINDOW w AS (PARTITION BY tr.run_id, tr.test_id ORDER BY tr.attempt DESC)) \
                  SELECT repo, run_id, test_id, target, outcome IN ('fail', 'error') AS is_fail, \
-                        failure_hash, received_on, received_at, sha, on_default, input_hash, \
-                        confidence IS NOT DISTINCT FROM 'partial' AS partial, \
+                        failure_hash, received_on, received_at, sha, on_default, trusted, \
+                        input_hash, confidence IS NOT DISTINCT FROM 'partial' AS partial, \
                         any_fail AND outcome = 'pass' AS retried \
                  FROM attempts WHERE rn = 1",
-                on_default = window.branch_is_default("r.branch"),
+                on_default = window.on_default("r"),
+                trusted = window.trusted("r"),
                 from = at(window.from),
                 to = at(window.to),
                 from_day = day(from_day),
@@ -469,7 +498,7 @@ async fn classify(
             &format!(
                 "INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
                  SELECT w.received_on, w.repo, w.test_id, 'definite', 'retry', w.run_id, \
-                        NULL, w.target, w.input_hash, w.received_at \
+                        NULL, w.target, w.input_hash, w.received_at, w.trusted \
                  FROM cls_win w WHERE w.retried \
                    AND NOT EXISTS (SELECT 1 FROM test_results.target_incidents i \
                                    WHERE i.run_id = w.run_id AND i.target = w.target) \
@@ -495,7 +524,8 @@ async fn classify(
         .execute(
             &format!(
                 "CREATE TEMP TABLE cls_hash ON COMMIT DROP AS \
-                 SELECT t.repo, t.address, t.input_hash, t.run_id, t.received_on, r.received_at \
+                 SELECT t.repo, t.address, t.input_hash, t.run_id, t.received_on, r.received_at, \
+                        {trusted} AS trusted \
                  FROM (SELECT repo, target, input_hash, max(received_on) AS until \
                        FROM cls_win WHERE input_hash IS NOT NULL \
                        GROUP BY repo, target, input_hash) k \
@@ -504,7 +534,8 @@ async fn classify(
                      AND t.input_hash = k.input_hash \
                      AND t.received_on BETWEEN {history} AND k.until \
                  JOIN test_results.runs r ON r.run_id = t.run_id \
-                 WHERE NOT t.cached"
+                 WHERE NOT t.cached",
+                trusted = window.trusted("r"),
             ),
             &[],
         )
@@ -512,14 +543,18 @@ async fn classify(
     transaction.batch_execute("ANALYZE cls_hash").await?;
     // The event is the failed run's, whichever of the two runs that was, so
     // a pass, a failure and a pass with one hash make one event: the second
-    // comparison finds the first one's key.
+    // comparison finds the first one's key. A trusted run is also compared
+    // with the nearest earlier trusted run of its hash, so pull request runs
+    // in between cannot hide a flake main saw for itself; the event is
+    // trusted when both its runs are, and a trusted comparison found later
+    // upgrades one found first.
     events += transaction
         .execute(
             &format!(
                 "WITH earlier AS MATERIALIZED ( \
                      SELECT DISTINCT ON (tr.run_id, tr.test_id) \
                             tr.repo, tr.test_id, h.address, h.input_hash, tr.run_id, \
-                            h.received_at, h.received_on, \
+                            h.received_at, h.received_on, h.trusted, \
                             tr.outcome IN ('fail', 'error') AS is_fail \
                      FROM cls_hash h \
                      JOIN test_results.test_results tr \
@@ -530,27 +565,47 @@ async fn classify(
                  nearest AS ( \
                      SELECT DISTINCT ON (w.run_id, w.test_id) w.*, \
                             p.run_id AS prev_run_id, p.is_fail AS prev_is_fail, \
-                            p.received_at AS prev_received_at, p.received_on AS prev_received_on \
+                            p.received_at AS prev_received_at, p.received_on AS prev_received_on, \
+                            p.trusted AS prev_trusted \
                      FROM cls_win w \
                      JOIN earlier p \
                           ON p.repo = w.repo AND p.test_id = w.test_id \
                          AND p.address = w.target AND p.input_hash = w.input_hash \
                          AND (p.received_at, p.run_id) < (w.received_at, w.run_id) \
                      ORDER BY w.run_id, w.test_id, p.received_at DESC, p.run_id DESC), \
+                 nearest_trusted AS ( \
+                     SELECT DISTINCT ON (w.run_id, w.test_id) w.*, \
+                            p.run_id AS prev_run_id, p.is_fail AS prev_is_fail, \
+                            p.received_at AS prev_received_at, p.received_on AS prev_received_on, \
+                            p.trusted AS prev_trusted \
+                     FROM cls_win w \
+                     JOIN earlier p \
+                          ON p.repo = w.repo AND p.test_id = w.test_id \
+                         AND p.address = w.target AND p.input_hash = w.input_hash \
+                         AND (p.received_at, p.run_id) < (w.received_at, w.run_id) \
+                     WHERE w.trusted AND p.trusted \
+                     ORDER BY w.run_id, w.test_id, p.received_at DESC, p.run_id DESC), \
                  flips AS ( \
                      SELECT repo, test_id, target, input_hash, \
                             CASE WHEN is_fail THEN run_id ELSE prev_run_id END AS failed_run, \
                             CASE WHEN is_fail THEN prev_run_id ELSE run_id END AS passed_run, \
                             CASE WHEN is_fail THEN received_on ELSE prev_received_on END AS failed_on, \
-                            CASE WHEN is_fail THEN received_at ELSE prev_received_at END AS failed_at \
-                     FROM nearest WHERE prev_is_fail <> is_fail) \
+                            CASE WHEN is_fail THEN received_at ELSE prev_received_at END AS failed_at, \
+                            trusted AND prev_trusted AS trusted \
+                     FROM (SELECT * FROM nearest UNION ALL SELECT * FROM nearest_trusted) n \
+                     WHERE prev_is_fail <> is_fail), \
+                 kept AS ( \
+                     SELECT DISTINCT ON (repo, test_id, failed_run, failed_on) * FROM flips f \
+                     WHERE NOT EXISTS (SELECT 1 FROM test_results.target_incidents i \
+                                       WHERE i.run_id = f.failed_run AND i.target = f.target) \
+                     ORDER BY repo, test_id, failed_run, failed_on, trusted DESC, passed_run) \
                  INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
                  SELECT f.failed_on, f.repo, f.test_id, 'definite', 'input_hash', f.failed_run, \
-                        f.passed_run, f.target, f.input_hash, f.failed_at \
-                 FROM flips f \
-                 WHERE NOT EXISTS (SELECT 1 FROM test_results.target_incidents i \
-                                   WHERE i.run_id = f.failed_run AND i.target = f.target) \
-                 ON CONFLICT {EVENT_KEY} DO NOTHING"
+                        f.passed_run, f.target, f.input_hash, f.failed_at, f.trusted \
+                 FROM kept f \
+                 ON CONFLICT {EVENT_KEY} DO UPDATE \
+                     SET trusted = true, prev_run_id = EXCLUDED.prev_run_id \
+                     WHERE EXCLUDED.trusted AND NOT test_results.test_flake_events.trusted"
             ),
             &[],
         )
@@ -606,7 +661,7 @@ async fn classify(
             &format!(
                 "INSERT INTO test_results.test_flake_events ({EVENT_COLUMNS}) \
                  SELECT m.prev_received_on, w.repo, w.test_id, 'likely', 'next_main_run', \
-                        m.prev_run_id, w.run_id, f.target, t.input_hash, m.prev_received_at \
+                        m.prev_run_id, w.run_id, f.target, t.input_hash, m.prev_received_at, false \
                  FROM cls_win w \
                  JOIN cls_main m \
                       ON m.repo = w.repo AND m.test_id = w.test_id AND m.run_id = w.run_id \
@@ -815,7 +870,7 @@ async fn rebuild_main(
         history = day(window.history_from),
         through_day = day(window.from.date_naive()),
         through = at(window.from),
-        main = window.branch_is_default("r.branch"),
+        main = window.on_default("r"),
     );
     transaction
         .execute(

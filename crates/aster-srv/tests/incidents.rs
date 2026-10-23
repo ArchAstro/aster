@@ -329,20 +329,24 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
     // even though two passes on its inputs surround it: score 3, not 6.
     let events = client
         .query(
-            "SELECT test_id, kind, run_id FROM test_results.test_flake_events",
+            "SELECT test_id, kind, run_id, prev_run_id, trusted FROM test_results.test_flake_events",
             &[],
         )
         .await
         .unwrap()
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2)))
-        .collect::<Vec<(String, String, String)>>();
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect::<Vec<(String, String, String, String, bool)>>();
+    // It was first found against the pull request's pass (untrusted), then
+    // against main's own pass: the trusted comparison wins.
     assert_eq!(
         events,
         vec![(
             format!("{SHARD_2}#7"),
             "definite".to_string(),
-            CRASH_RUN.run_id()
+            CRASH_RUN.run_id(),
+            PASS_RUN.run_id(),
+            true
         )]
     );
     let flaky = client
