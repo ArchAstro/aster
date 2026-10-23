@@ -609,7 +609,8 @@ pub async fn exchange(app: &App, body: &[u8]) -> Reply {
         client
             .query_opt(
                 "DELETE FROM auth.cli_codes WHERE code_hash = $1 AND expires_at > now() \
-                 RETURNING email, subject, challenge, port, user_code",
+                 RETURNING email, subject, challenge, port, user_code, \
+                 floor(extract(epoch FROM now()))::bigint",
                 &[&hash(&request.code).as_slice()],
             )
             .await
@@ -626,6 +627,8 @@ pub async fn exchange(app: &App, body: &[u8]) -> Reply {
     let (email, subject, challenge, port): (String, Option<String>, String, i32) =
         (row.get(0), row.get(1), row.get(2), row.get(3));
     let user_code: Option<String> = row.get(4);
+    // Issue on the database clock, which logout cutoffs also use.
+    let issued_at: i64 = row.get(5);
     let Some(subject) = subject.filter(|subject| !subject.is_empty()) else {
         return refuse(None, "code_without_subject");
     };
@@ -650,7 +653,7 @@ pub async fn exchange(app: &App, body: &[u8]) -> Reply {
     if port != i32::from(request.port) {
         return refuse(Some(&subject), "port_mismatch");
     }
-    match tokens.issue(&subject, &email) {
+    match tokens.issue_at(&subject, &email, issued_at) {
         Ok(issued) => {
             app.metrics.person_token_issued();
             audit::exchange_succeeded(&subject);
