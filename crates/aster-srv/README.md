@@ -566,7 +566,7 @@ signs them with IAM Credentials `signBlob` as its own service account
 
 | Route | |
 |---|---|
-| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A lookup updates `last_used_at`. |
+| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A key whose blobs the server could not resolve (over the blob cap, past the time budget, or GCS or IAM failed or was busy) is also absent, so the client treats it as a miss and rebuilds. See [Lookup bounds](#lookup-bounds). A lookup updates `last_used_at`. |
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
 | `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists, and records the writer's `ref`, `run_id`, `sha` and `workflow_ref` claims (null for a static token). A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
 | `GET /v1/cache/summary?repo=<owner/name>` | `{repo, manifests, manifest_bytes, blobs, blob_bytes, last_write_at, last_writer: {ref, run_id, sha, workflow} or null, lookups: [{day, hits, misses}]}`. `lookups` are the last 14 UTC days that had a lookup, newest first. `blobs` and `blob_bytes` are global: blobs are content-addressed and shared across repositories. |
@@ -576,6 +576,28 @@ A lookup counts one hit per stored key (`hits`, `last_hit_at` on the manifest)
 and adds the request's hits and misses to today's row in
 `cache.lookup_stats`. Counting is best effort: a failure is logged and the
 lookup still answers. Keys repeated in one request count once.
+
+### Lookup bounds
+
+One lookup's GCS and IAM work is bounded, so a wide or cold lookup answers
+inside the client's 5s request timeout with fewer hits rather than timing out
+and losing them all:
+
+- **Blob cap.** One response names at most 4096 distinct blobs
+  (`MAX_LOOKUP_BLOBS`). Entries are admitted in the order the request lists
+  them; an entry whose blobs would push the total over the cap is absent
+  from `hits` (a miss) and is not counted.
+- **Time budget.** Blobs are resolved 16 at a time per request, for at most
+  3 seconds. An entry with a blob still unresolved then is a miss.
+- **Remembered answers.** A positive HEAD is remembered for an hour (blobs
+  are content-addressed and a blob a stored manifest names is not deleted by
+  retention); a miss is never remembered. A signed GET URL is reused while
+  at least 5 of its 15 minutes remain. Concurrent lookups of one blob share
+  one HEAD and one signature. This memory is per replica.
+- **IAM `signBlob` limit.** Per replica, at most 16 signatures in flight and
+  a token bucket of 200 per second with a burst of 512. A signature that
+  would wait more than 2 seconds fails with "signing is busy" and its entry
+  is a miss. HEADs are capped at 64 in flight per replica.
 
 Every route needs a bearer token; an IAP assertion alone is never accepted
 here, so a request with neither answers `401`. Reads accept any authenticated
