@@ -97,7 +97,7 @@ pub fn results_writer_allowed(config: &Config, identity: &Identity) -> bool {
 /// Whether a CI token may write the cache. Static tokens may; OIDC tokens
 /// only when their ref matches the writer patterns, their workflow is
 /// allowed and the run was triggered by a push. The route gate calls this
-/// before it reads a body, and [`ci_reader`] calls it again in the handler:
+/// before it reads a body, and `ci_reader` calls it again in the handler:
 /// this is the one implementation.
 pub fn cache_writer_allowed(config: &Config, identity: &Identity) -> bool {
     identity.static_token
