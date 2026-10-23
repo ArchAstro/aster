@@ -133,7 +133,7 @@ pub struct Config {
     /// rotated out by dropping its pair. Unset turns person login off.
     pub cli_token_keys: Vec<CliTokenKey>,
     /// `ASTER_SRV_CLI_TOKEN_TTL`: seconds a person token lives, 60 to
-    /// 604800. Default 43200 (12 hours).
+    /// 43200 ([`crate::person::MAX_TTL_SECONDS`]). Default 43200 (12 hours).
     pub cli_token_ttl: u64,
     /// `ASTER_SRV_API_ADDR`: a second listener that serves only `/v1/*`, for
     /// the load balancer backend that has no IAP in front of it. Unset
