@@ -119,6 +119,96 @@ impl Signer for IamSigner {
     }
 }
 
+/// Bounds on `signBlob` calls, which share one IAM quota for the whole
+/// project. Callers wait for a slot and a token; one that would wait longer
+/// than `max_wait` fails with "signing is busy" instead of queueing without
+/// bound, and the lookup route turns that into a miss.
+#[derive(Debug, Clone, Copy)]
+pub struct SignLimits {
+    /// `signBlob` calls in flight at once.
+    pub concurrency: usize,
+    /// Calls per second once the burst is spent.
+    pub per_second: f64,
+    /// Calls that may go back to back.
+    pub burst: f64,
+    /// Longest a call waits for a token.
+    pub max_wait: Duration,
+}
+
+impl Default for SignLimits {
+    fn default() -> Self {
+        Self {
+            concurrency: 16,
+            per_second: 100.0,
+            burst: 200.0,
+            max_wait: Duration::from_secs(2),
+        }
+    }
+}
+
+/// A semaphore plus a token bucket over [`SignLimits`].
+pub struct SignLimiter {
+    limits: SignLimits,
+    slots: tokio::sync::Semaphore,
+    bucket: std::sync::Mutex<(f64, std::time::Instant)>,
+}
+
+impl SignLimiter {
+    pub fn new(limits: SignLimits) -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(limits.concurrency.max(1)),
+            bucket: std::sync::Mutex::new((limits.burst.max(1.0), std::time::Instant::now())),
+            limits,
+        }
+    }
+
+    /// Take one token, waiting up to `max_wait` for it.
+    async fn take_token(&self) -> Result<()> {
+        loop {
+            let wait = {
+                let mut bucket = self.bucket.lock().expect("sign bucket lock");
+                let now = std::time::Instant::now();
+                let refill = now.duration_since(bucket.1).as_secs_f64() * self.limits.per_second;
+                bucket.0 = (bucket.0 + refill).min(self.limits.burst.max(1.0));
+                bucket.1 = now;
+                if bucket.0 >= 1.0 {
+                    bucket.0 -= 1.0;
+                    return Ok(());
+                }
+                Duration::from_secs_f64((1.0 - bucket.0) / self.limits.per_second.max(0.001))
+            };
+            if wait > self.limits.max_wait {
+                anyhow::bail!("signing is busy");
+            }
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// A [`Signer`] that goes through a [`SignLimiter`].
+pub struct Limited<'a> {
+    pub inner: &'a dyn Signer,
+    pub limiter: &'a SignLimiter,
+}
+
+impl Signer for Limited<'_> {
+    fn sign<'a>(&'a self, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let _slot =
+                tokio::time::timeout(self.limiter.limits.max_wait, self.limiter.slots.acquire())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("signing is busy"))?
+                    .map_err(|_| anyhow::anyhow!("signing is closed"))?;
+            self.limiter.take_token().await?;
+            self.inner.sign(payload).await
+        })
+    }
+
+    fn service_account_email(&self) -> &str {
+        self.inner.service_account_email()
+    }
+}
+
 /// A URL the client uses directly against GCS.
 pub async fn signed_url(
     signer: &dyn Signer,
@@ -312,6 +402,111 @@ impl Signer for FixedSigner {
 
     fn service_account_email(&self) -> &str {
         &self.email
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Slow {
+        running: AtomicUsize,
+        peak: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl Signer for Slow {
+        fn sign<'a>(&'a self, _: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![1])
+            })
+        }
+        fn service_account_email(&self) -> &str {
+            "a@b.iam.gserviceaccount.com"
+        }
+    }
+
+    fn slow() -> Arc<Slow> {
+        Arc::new(Slow {
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_signatures_never_exceed_the_limit() {
+        let inner = slow();
+        let limiter = Arc::new(SignLimiter::new(SignLimits {
+            concurrency: 3,
+            per_second: 10_000.0,
+            burst: 10_000.0,
+            max_wait: Duration::from_secs(5),
+        }));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let (inner, limiter) = (inner.clone(), limiter.clone());
+            tasks.push(tokio::spawn(async move {
+                let limited = Limited {
+                    inner: inner.as_ref(),
+                    limiter: &limiter,
+                };
+                limited.sign(b"x").await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 12);
+        assert!(inner.peak.load(Ordering::SeqCst) <= 3);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_bucket_fails_fast_instead_of_queueing() {
+        let inner = slow();
+        let limiter = SignLimiter::new(SignLimits {
+            concurrency: 4,
+            per_second: 0.5,
+            burst: 2.0,
+            max_wait: Duration::from_millis(100),
+        });
+        let limited = Limited {
+            inner: inner.as_ref(),
+            limiter: &limiter,
+        };
+        limited.sign(b"x").await.unwrap();
+        limited.sign(b"x").await.unwrap();
+        let started = std::time::Instant::now();
+        let error = limited.sign(b"x").await.unwrap_err();
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_bucket_refills_over_time() {
+        let inner = slow();
+        let limiter = SignLimiter::new(SignLimits {
+            concurrency: 4,
+            per_second: 100.0,
+            burst: 1.0,
+            max_wait: Duration::from_secs(1),
+        });
+        let limited = Limited {
+            inner: inner.as_ref(),
+            limiter: &limiter,
+        };
+        // The second call waits about 10ms for a token rather than failing.
+        limited.sign(b"x").await.unwrap();
+        limited.sign(b"x").await.unwrap();
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
     }
 }
 
