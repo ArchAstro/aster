@@ -185,8 +185,18 @@ async fn a_wide_lookup_finishes_in_bounded_time_and_a_repeat_is_free() {
 /// order, and only the entries served are counted.
 #[tokio::test]
 async fn entries_over_the_blob_cap_are_misses_and_are_not_counted() {
-    let Some((server, _)) = server(FanoutConfig::default(), Duration::ZERO, Duration::ZERO).await
-    else {
+    // Only the cap is under test: lift the signing rate and the time budget,
+    // which would otherwise cut 4000 cold signatures short first.
+    let config = FanoutConfig {
+        lookup_budget: Duration::from_secs(60),
+        sign: SignLimits {
+            per_second: 1e9,
+            burst: 1e9,
+            ..SignLimits::default()
+        },
+        ..FanoutConfig::default()
+    };
+    let Some((server, _)) = server(config, Duration::ZERO, Duration::ZERO).await else {
         return;
     };
     // Five entries of 1000 distinct blobs: the first four (4000) fit in 4096.
@@ -283,5 +293,55 @@ async fn a_blob_deleted_from_gcs_drops_out_after_the_remembered_answer_expires()
     // delete forgets the digest at once; a stale positive would need the TTL.
     let (_, second, _) = lookup(&server, &keys).await;
     assert_eq!(second["hits"]["k"]["blobs"].as_object().unwrap().len(), 1);
+    server.stop().await;
+}
+
+/// A lookup that cannot resolve every blob within its time budget answers on
+/// time with the entries it did resolve; the rest are misses and are not
+/// counted. Before the budget, a slow GCS made the whole batch outlive the
+/// client's 5s timeout and every hit in it was lost. A repeat finds the
+/// resolved blobs remembered and serves more.
+#[tokio::test]
+async fn a_slow_lookup_answers_within_its_budget_and_the_rest_are_misses() {
+    // 128 one-blob entries at 200ms per HEAD, 16 at a time: 1.6s of work
+    // against a 300ms budget.
+    let config = FanoutConfig {
+        lookup_budget: Duration::from_millis(300),
+        ..FanoutConfig::default()
+    };
+    let Some((server, _)) = server(config, Duration::from_millis(200), Duration::ZERO).await else {
+        return;
+    };
+    let keys: Vec<String> = (0..128).map(|index| format!("slow{index}")).collect();
+    for (index, key) in keys.iter().enumerate() {
+        let blobs = vec![digest(index)];
+        put(&server, &blobs).await;
+        seed(&server, key, &blobs).await;
+    }
+
+    // The cold lookup stops at the budget: some entries hit, the rest miss.
+    let (status, body, cold) = lookup(&server, &keys).await;
+    assert_eq!(status, 200, "{body}");
+    let first = body["hits"].as_object().unwrap().len();
+    eprintln!("lookup_fanout: 128 keys, HEAD 200ms, budget 300ms: {first} hits in {cold:?}");
+    assert!(cold < Duration::from_secs(1), "cold lookup took {cold:?}");
+    assert!(first > 0 && first < keys.len(), "{first} hits");
+    for hit in body["hits"].as_object().unwrap().values() {
+        assert_eq!(hit["blobs"].as_object().unwrap().len(), 1, "{hit}");
+    }
+    // Only the entries served were counted.
+    let counted: i64 = server
+        .client()
+        .await
+        .query_one("SELECT sum(hits)::bigint FROM cache.manifests", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(counted, first as i64);
+
+    // The repeat reuses what the first lookup resolved and gets further.
+    let (status, again, _) = lookup(&server, &keys).await;
+    assert_eq!(status, 200);
+    assert!(again["hits"].as_object().unwrap().len() > first, "{again}");
     server.stop().await;
 }
