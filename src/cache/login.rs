@@ -71,6 +71,12 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// How long `aster cache login` waits for the browser to come back.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// Printed before the paste prompt. A code someone else minted signs this
+/// terminal in as them, and a social-engineering attacker asks for exactly
+/// that paste.
+pub const PASTE_WARNING: &str = "Only paste a code you got from this browser yourself. \
+Never paste a code someone sent you; it would sign this terminal in as them.";
+
 /// The one line printed when there is no usable sign-in.
 pub const SIGNED_OUT_MESSAGE: &str = "[aster] not signed in; run aster cache login";
 
@@ -1146,5 +1152,10 @@ mod tests {
         let out = logout_in(dir.path(), &server).unwrap();
         assert!(out.revoked.is_err());
         assert!(!path.exists(), "the local token is gone either way");
+    }
+    #[test]
+    fn the_paste_prompt_warns_against_a_code_someone_sent() {
+        assert!(PASTE_WARNING.contains("Only paste a code you got from this browser yourself"));
+        assert!(PASTE_WARNING.contains("Never paste a code someone sent you"));
     }
 }

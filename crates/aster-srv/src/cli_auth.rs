@@ -349,6 +349,12 @@ fn assertion_is_recent(assertion: Option<&str>) -> bool {
     iat.is_some_and(|iat| iat <= now + 60 && now - iat <= IAP_MAX_AGE_SECONDS)
 }
 
+/// Shown on the confirm page in copy mode, where the next page hands the
+/// person a code to type into a terminal.
+const COPY_CONFIRM_WARNING: &str = "<p><strong>Only continue if you started this command \
+    yourself, in a terminal you are using right now.</strong> A code from this page signs that \
+    terminal in as you.</p>";
+
 /// `GET /cli-auth`: ask the person to confirm.
 pub async fn confirm(app: &App, browser: &Browser, query: Option<&str>) -> Reply {
     let Some(tokens) = app.person_tokens.as_ref().filter(|_| enabled(app)) else {
@@ -385,9 +391,18 @@ pub async fn confirm(app: &App, browser: &Browser, query: Option<&str>) -> Reply
     };
     let origin_details = format!(
         "<ul>{}{}{}<li>Request: <code>{}</code></li></ul>",
-        detail("From address", Some(browser.client_ip.to_string())),
-        detail("Browser", short_user_agent(browser.user_agent.as_deref())),
-        detail("Command run on", request.host.clone()),
+        detail(
+            "Your browser's address (seen by this server)",
+            Some(browser.client_ip.to_string()),
+        ),
+        detail(
+            "Your browser (as it describes itself)",
+            short_user_agent(browser.user_agent.as_deref()),
+        ),
+        detail(
+            "Device name (reported by the requesting computer, not verified)",
+            request.host.clone(),
+        ),
         escape(request_id(&request.state)),
     );
     let mut fields = vec![
@@ -410,11 +425,18 @@ pub async fn confirm(app: &App, browser: &Browser, query: Option<&str>) -> Reply
          {origin_details}\
          <p class=\"muted\">It can read cache entries only, and the sign-in ends after a \
          few hours. If you did not just run <code>aster cache login</code>, or these details \
-         are not yours, close this tab.</p>\
+         are not yours, close this tab. The device name comes from the command that sent you \
+         here, so anyone can make it say anything. Trust the code above, not the name.</p>\
+         {copy_warning}\
          <form method=\"post\" action=\"/cli-auth\">{fields}\
          <button type=\"submit\">Authorize</button></form>",
         user_code = escape(&display_user_code(&request.user_code)),
         email = escape(&viewer.email),
+        copy_warning = if request.mode == Mode::Copy {
+            COPY_CONFIRM_WARNING
+        } else {
+            ""
+        },
         fields = fields.concat(),
     );
     Reply::html(200, bare_page("Authorize aster CLI", &body))
@@ -496,6 +518,8 @@ pub async fn authorize(app: &App, browser: &Browser, body: &[u8]) -> Reply {
                     "<p>Paste this code into the terminal where you ran \
                      <code>aster cache login</code> (request <code>{id}</code>):</p>\
                      <pre><code>{code}</code></pre>\
+                     <p><strong>Never send this code to anyone.</strong> Whoever has it can \
+                     sign in as you until it expires. Paste it only into your own terminal.</p>\
                      <p class=\"muted\">It works once and expires in {CODE_SECONDS} seconds. \
                      It is not your token and gives nothing without that terminal.</p>",
                     id = escape(request_id(&request.state)),
