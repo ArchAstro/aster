@@ -38,6 +38,7 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     let listen = config.listen;
+    let api_listen = config.api_listen;
     let app = App::connect(config)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     log::info(
@@ -66,7 +67,34 @@ async fn run() -> anyhow::Result<()> {
             .await;
         }
     });
-    aster_srv::serve(app, listener, shutdown_signal()).await?;
+    // One shutdown signal stops both listeners.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let wait = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    };
+    let api = match api_listen {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            log::info(
+                "aster-srv serving /v1 only",
+                json!({"address": addr.to_string()}),
+            );
+            Some(tokio::spawn(aster_srv::serve_api(
+                app.clone(),
+                listener,
+                wait(stopped.clone()),
+            )))
+        }
+        None => None,
+    };
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    aster_srv::serve(app, listener, wait(stopped)).await?;
+    if let Some(api) = api {
+        api.await??;
+    }
     log::info("aster-srv stopped", json!({}));
     Ok(())
 }

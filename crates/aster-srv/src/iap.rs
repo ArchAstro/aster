@@ -30,6 +30,10 @@ const REFETCH_INTERVAL: Duration = Duration::from_secs(60);
 /// Who is viewing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
+    /// IAP's stable subject, `accounts.google.com:<id>`. Unlike the email it
+    /// survives a rename, so person tokens are bound to it. Development
+    /// viewers (no IAP) get `dev:<email>`.
+    pub subject: String,
     pub email: String,
 }
 
@@ -53,6 +57,7 @@ impl std::fmt::Display for ViewerError {
 #[derive(Deserialize)]
 struct Claims {
     aud: String,
+    sub: Option<String>,
     email: Option<String>,
 }
 
@@ -128,7 +133,7 @@ impl IapVerifier {
                     "the dashboard is disabled".into(),
                 ))
             }
-            Mode::Dev(email) => return self.allow(email.clone()),
+            Mode::Dev(email) => return self.allow(format!("dev:{email}"), email.clone()),
             Mode::Iap(audience) => audience,
         };
         let token = assertion
@@ -162,13 +167,17 @@ impl IapVerifier {
             .email
             .filter(|email| !email.is_empty())
             .ok_or_else(|| invalid("the assertion names no email".into()))?;
-        self.allow(email)
+        let subject = claims
+            .sub
+            .filter(|sub| !sub.is_empty() && sub.len() <= 256 && !sub.contains(char::is_control))
+            .ok_or_else(|| invalid("the assertion names no subject".into()))?;
+        self.allow(subject, email)
     }
 
-    fn allow(&self, email: String) -> Result<Viewer, ViewerError> {
+    fn allow(&self, subject: String, email: String) -> Result<Viewer, ViewerError> {
         match &self.domains {
             Some(domains) if !domains.allows(&email) => Err(ViewerError::Forbidden(email)),
-            _ => Ok(Viewer { email }),
+            _ => Ok(Viewer { subject, email }),
         }
     }
 
@@ -176,7 +185,7 @@ impl IapVerifier {
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
-        let unknown = || format!("unknown signing key {kid}");
+        let unknown = || "unknown signing key".to_string();
         let Some(url) = &self.jwks_url else {
             return Err(unknown());
         };
@@ -281,6 +290,7 @@ mod tests {
             "iss": IAP_ISSUER,
             "aud": "/projects/123456/global/backendServices/987",
             "exp": chrono::Utc::now().timestamp() + 300,
+            "sub": "accounts.google.com:1234",
             "email": "ann@example.com",
         })
     }
@@ -351,6 +361,24 @@ mod tests {
         ));
         assert!(v.verify(Some("not-a-jwt")).await.is_err());
         assert!(v.verify(Some("  ")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_viewer_carries_the_stable_subject_and_an_assertion_without_one_is_refused() {
+        let v = verifier(&[("ASTER_SRV_IAP_AUDIENCE", AUDIENCE)]);
+        let viewer = v.verify(Some(&token(claims(), "k1"))).await.unwrap();
+        assert_eq!(viewer.subject, "accounts.google.com:1234");
+        let mut nameless = claims();
+        nameless.as_object_mut().unwrap().remove("sub");
+        assert!(v.verify(Some(&token(nameless, "k1"))).await.is_err());
+        let mut empty = claims();
+        empty["sub"] = json!("");
+        assert!(v.verify(Some(&token(empty, "k1"))).await.is_err());
+        let dev = IapVerifier::new(&config(&[("ASTER_SRV_UI_DEV_EMAIL", "me@example.com")]));
+        assert_eq!(
+            dev.verify(None).await.unwrap().subject,
+            "dev:me@example.com"
+        );
     }
 
     #[tokio::test]

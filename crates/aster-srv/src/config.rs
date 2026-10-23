@@ -1,6 +1,7 @@
 //! Configuration from the environment.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -119,13 +120,50 @@ pub struct Config {
     /// `ASTER_SRV_CLI_TOKEN_TTL`: seconds a person token lives, 60 to
     /// 604800. Default 43200 (12 hours).
     pub cli_token_ttl: u64,
+    /// `ASTER_SRV_API_ADDR`: a second listener that serves only `/v1/*`, for
+    /// the load balancer backend that has no IAP in front of it. Unset
+    /// (default) leaves it off. See [`crate::http::Surface`].
+    pub api_listen: Option<SocketAddr>,
+    /// `ASTER_SRV_TRUSTED_PROXY_HOPS`: how many right-most `X-Forwarded-For`
+    /// entries were appended by infrastructure we trust. Default 1: the
+    /// Google load balancer appends `<client ip>, <forwarding rule ip>`, so
+    /// the client is the second entry from the right. 0 ignores the header.
+    /// See [`crate::limits::client_ip`].
+    pub trusted_proxy_hops: usize,
+    /// `ASTER_SRV_RATE_TOKEN_IP_PER_MIN`: `POST /v1/auth/token` requests per
+    /// minute from one client IP, per replica. Default 10.
+    pub rate_token_ip_per_min: u32,
+    /// `ASTER_SRV_RATE_API_IP_PER_MIN`: `/v1/*` requests per minute from one
+    /// client IP, per replica. Default 1200.
+    pub rate_api_ip_per_min: u32,
+    /// `ASTER_SRV_RATE_API_SUBJECT_PER_MIN`: authenticated `/v1/*` requests
+    /// per minute for one subject (a person, or a CI repository), per
+    /// replica. Default 3000.
+    pub rate_api_subject_per_min: u32,
+    /// `ASTER_SRV_BODY_TIMEOUT_SECS`: how long a request body may take to
+    /// arrive in full. Default 60.
+    pub body_timeout: Duration,
+    /// `ASTER_SRV_HANDLER_TIMEOUT_SECS`: how long a request may run from the
+    /// end of its headers to its reply, body read included. Default 120.
+    pub handler_timeout: Duration,
+    /// `ASTER_SRV_HEADER_TIMEOUT_SECS`: how long a client may take to send a
+    /// request's headers, and how long an idle connection is kept between
+    /// requests. Default 20.
+    pub header_timeout: Duration,
+    /// `ASTER_SRV_MAX_CONNECTIONS`: open connections per listener; further
+    /// ones wait in the kernel's accept queue. Default 1024.
+    pub max_connections: usize,
+    /// `ASTER_SRV_DB_WAIT_SECS`: how long a request waits for a database
+    /// connection before failing. Default 5.
+    pub db_wait: Duration,
 }
 
 /// One HS256 key for person tokens.
 #[derive(Clone)]
 pub struct CliTokenKey {
     pub kid: String,
-    pub secret: String,
+    /// The decoded key: at least 32 bytes ([`MIN_KEY_BYTES`]).
+    pub secret: Vec<u8>,
 }
 
 impl std::fmt::Debug for CliTokenKey {
@@ -288,13 +326,23 @@ impl Config {
             Some(value) => Some(WriterWorkflows::parse(&value)?),
             None => None,
         };
+        let allow_http_public_url = var("ASTER_SRV_ALLOW_HTTP_PUBLIC_URL").as_deref() == Some("1");
         let public_url = match var("ASTER_SRV_PUBLIC_URL") {
             Some(url) => {
                 let url = url.trim().trim_end_matches('/').to_string();
                 if !(url.starts_with("https://") || url.starts_with("http://"))
                     || url.contains(['?', '#'])
                 {
-                    bail!("ASTER_SRV_PUBLIC_URL must be an http(s) URL such as https://aster-srv.example.com");
+                    bail!("ASTER_SRV_PUBLIC_URL must be an https URL such as https://aster-srv.example.com");
+                }
+                // Person tokens name this URL as issuer and audience and
+                // travel to it; over http they would cross the network in
+                // clear. Only a development or test server opts out.
+                if url.starts_with("http://") && !allow_http_public_url {
+                    bail!(
+                        "ASTER_SRV_PUBLIC_URL must be https; set ASTER_SRV_ALLOW_HTTP_PUBLIC_URL=1 \
+                         only on a development or test server"
+                    );
                 }
                 Some(url)
             }
@@ -309,10 +357,74 @@ impl Config {
                 .trim()
                 .parse()
                 .ok()
-                .filter(|seconds| (60..=604_800).contains(seconds))
-                .context("ASTER_SRV_CLI_TOKEN_TTL must be a number of seconds from 60 to 604800")?,
+                .filter(|seconds| (60..=crate::person::MAX_TTL_SECONDS).contains(seconds))
+                .context("ASTER_SRV_CLI_TOKEN_TTL must be a number of seconds from 60 to 43200")?,
             None => 12 * 60 * 60,
         };
+        let api_listen: Option<SocketAddr> = match var("ASTER_SRV_API_ADDR") {
+            Some(addr) => Some(
+                addr.trim()
+                    .parse()
+                    .context("ASTER_SRV_API_ADDR must be host:port")?,
+            ),
+            None => None,
+        };
+        if api_listen.is_some_and(|api| api.port() != 0 && api == listen) {
+            bail!("ASTER_SRV_API_ADDR must differ from ASTER_SRV_LISTEN");
+        }
+        let number =
+            |name: &str, default: u64, range: std::ops::RangeInclusive<u64>| match var(name) {
+                Some(value) => value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|number| range.contains(number))
+                    .with_context(|| {
+                        format!(
+                            "{name} must be a number from {} to {}",
+                            range.start(),
+                            range.end()
+                        )
+                    }),
+                None => Ok(default),
+            };
+        let trusted_proxy_hops = number("ASTER_SRV_TRUSTED_PROXY_HOPS", 1, 0..=8)? as usize;
+        let rate_token_ip_per_min =
+            number("ASTER_SRV_RATE_TOKEN_IP_PER_MIN", 10, 1..=100_000)? as u32;
+        let rate_api_ip_per_min =
+            number("ASTER_SRV_RATE_API_IP_PER_MIN", 1200, 1..=1_000_000)? as u32;
+        let rate_api_subject_per_min =
+            number("ASTER_SRV_RATE_API_SUBJECT_PER_MIN", 3000, 1..=1_000_000)? as u32;
+        let max_connections = number("ASTER_SRV_MAX_CONNECTIONS", 1024, 1..=1_000_000)? as usize;
+        let db_wait = Duration::from_secs(number("ASTER_SRV_DB_WAIT_SECS", 5, 1..=300)?);
+        let header_timeout =
+            Duration::from_secs(number("ASTER_SRV_HEADER_TIMEOUT_SECS", 20, 1..=300)?);
+        let body_timeout =
+            Duration::from_secs(number("ASTER_SRV_BODY_TIMEOUT_SECS", 60, 1..=3600)?);
+        let handler_timeout =
+            Duration::from_secs(number("ASTER_SRV_HANDLER_TIMEOUT_SECS", 120, 1..=3600)?);
+        // Sign-in hands out tokens to whoever IAP names, so it needs IAP to be
+        // real and the dashboard's domain allowlist to be set. Without them a
+        // development viewer (no IAP) or any Google identity would get one.
+        if !cli_token_keys.is_empty() {
+            if iap_audience.is_none() {
+                bail!(
+                    "ASTER_SRV_CLI_TOKEN_KEYS needs ASTER_SRV_IAP_AUDIENCE: person tokens are only \
+                     issued to identities IAP verified"
+                );
+            }
+            if ui_email_domains.is_none() {
+                bail!(
+                    "ASTER_SRV_CLI_TOKEN_KEYS needs ASTER_SRV_UI_EMAIL_DOMAINS: without it any \
+                     identity that passes IAP gets a token"
+                );
+            }
+            if var("ASTER_SRV_UI_DEV_EMAIL").is_some() {
+                bail!(
+                    "ASTER_SRV_UI_DEV_EMAIL must not be set together with ASTER_SRV_CLI_TOKEN_KEYS"
+                );
+            }
+        }
         Ok(Self {
             listen,
             database_url,
@@ -338,12 +450,85 @@ impl Config {
             public_url,
             cli_token_keys,
             cli_token_ttl,
+            api_listen,
+            trusted_proxy_hops,
+            rate_token_ip_per_min,
+            rate_api_ip_per_min,
+            rate_api_subject_per_min,
+            body_timeout,
+            handler_timeout,
+            header_timeout,
+            max_connections,
+            db_wait,
         })
     }
 }
 
+/// The least key material HS256 should have: the size of its hash (RFC 7518
+/// section 3.2 requires a key at least as long as the hash output).
+pub const MIN_KEY_BYTES: usize = 32;
+
+/// Decode a key secret to its bytes and check it carries 256 bits.
+///
+/// A secret is written as hex (64 or more digits) or base64 / base64url (43
+/// or more characters), such as the output of `openssl rand -base64 32` or
+/// `openssl rand -hex 32`. A passphrase is refused: its characters carry far
+/// fewer than 8 bits each, so its length proves nothing about its strength.
+/// As a guard against a pasted placeholder, the decoded bytes must also hold
+/// at least 16 distinct values (random 32 bytes hold about 28).
+pub fn decode_key_secret(secret: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let hex = secret.len() & 1 == 0 && secret.bytes().all(|b| b.is_ascii_hexdigit());
+    let bytes = if hex {
+        (0..secret.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&secret[i..i + 2], 16).expect("hex digits checked"))
+            .collect::<Vec<u8>>()
+    } else {
+        let trimmed = secret.trim_end_matches('=');
+        [
+            base64::engine::general_purpose::STANDARD_NO_PAD,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ]
+        .iter()
+        .find_map(|engine| engine.decode(trimmed).ok())
+        .context(
+            "ASTER_SRV_CLI_TOKEN_KEYS secrets must be hex or base64, such as `openssl rand -base64 32`",
+        )?
+    };
+    if bytes.len() < MIN_KEY_BYTES {
+        bail!(
+            "ASTER_SRV_CLI_TOKEN_KEYS secrets must decode to at least {MIN_KEY_BYTES} bytes (256 bits); \
+             this one decodes to {}",
+            bytes.len()
+        );
+    }
+    let distinct = bytes
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    // A short block repeated (`abababab...`, `0123456789abcdef` twice)
+    // has the length of a key and the strength of its block.
+    let repeats = (1..=bytes.len() / 2)
+        .filter(|period| bytes.len() % period == 0 || *period <= 16)
+        .any(|period| {
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == bytes[i % period])
+        });
+    // A run that steps by a constant (`01 02 03 ...`) is as guessable.
+    let stepped = bytes
+        .windows(2)
+        .all(|pair| pair[1].wrapping_sub(pair[0]) == bytes[1].wrapping_sub(bytes[0]));
+    if distinct < 16 || repeats || stepped {
+        bail!("ASTER_SRV_CLI_TOKEN_KEYS secret looks like a placeholder, not random bytes");
+    }
+    Ok(bytes)
+}
+
 /// `kid:secret` pairs. A kid is letters, digits, `-`, `_` or `.`; a secret
-/// is at least 32 characters.
+/// is hex or base64 for at least 32 random bytes ([`decode_key_secret`]).
 fn parse_cli_token_keys(value: &str) -> Result<Vec<CliTokenKey>> {
     let mut keys: Vec<CliTokenKey> = Vec::new();
     for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
@@ -358,15 +543,13 @@ fn parse_cli_token_keys(value: &str) -> Result<Vec<CliTokenKey>> {
         {
             bail!("ASTER_SRV_CLI_TOKEN_KEYS key ids use letters, digits, '-', '_' and '.'");
         }
-        if secret.len() < 32 {
-            bail!("ASTER_SRV_CLI_TOKEN_KEYS secrets must be at least 32 characters");
-        }
+        let secret = decode_key_secret(secret)?;
         if keys.iter().any(|key| key.kid == kid) {
             bail!("ASTER_SRV_CLI_TOKEN_KEYS names key id '{kid}' twice");
         }
         keys.push(CliTokenKey {
             kid: kid.to_string(),
-            secret: secret.to_string(),
+            secret,
         });
     }
     if keys.is_empty() {
@@ -605,12 +788,18 @@ mod tests {
             pairs.extend_from_slice(extra);
             Config::from_env(env_of(&pairs))
         };
-        let secret = "0123456789abcdef0123456789abcdef";
+        let secret = "q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=";
+        let secret2 = "Zk3pQw9TnVb2Lx8RcJ5mYd7HsAe1UgF4oIiNtXuMvB0";
         let config = with(&[
+            (
+                "ASTER_SRV_IAP_AUDIENCE",
+                "/projects/1/global/backendServices/",
+            ),
+            ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
             ("ASTER_SRV_PUBLIC_URL", "https://aster-srv.example.com/"),
             (
                 "ASTER_SRV_CLI_TOKEN_KEYS",
-                &format!("k2:{secret}, k1:{secret}x"),
+                &format!("k2:{secret}, k1:{secret2}"),
             ),
             ("ASTER_SRV_CLI_TOKEN_TTL", "3600"),
             (
@@ -637,6 +826,7 @@ mod tests {
         assert!(!workflows.allows("A/c/.github/workflows/x.yml@refs/heads/dev"));
         // Secrets stay out of debug output.
         assert!(!format!("{:?}", config.cli_token_keys).contains(secret));
+        assert_eq!(config.cli_token_keys[0].secret.len(), 32);
 
         for (name, value) in [
             ("ASTER_SRV_PUBLIC_URL", "aster-srv.example.com"),
@@ -645,14 +835,15 @@ mod tests {
             ("ASTER_SRV_CLI_TOKEN_KEYS", "no-colon"),
             (
                 "ASTER_SRV_CLI_TOKEN_KEYS",
-                "bad kid:0123456789abcdef0123456789abcdef",
+                "bad kid:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=",
             ),
             (
                 "ASTER_SRV_CLI_TOKEN_KEYS",
-                "k:0123456789abcdef0123456789abcdef,k:fedcba9876543210fedcba9876543210",
+                "k:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=,k:Zk3pQw9TnVb2Lx8RcJ5mYd7HsAe1UgF4oIiNtXuMvB0",
             ),
             ("ASTER_SRV_CLI_TOKEN_TTL", "30"),
             ("ASTER_SRV_CLI_TOKEN_TTL", "999999999"),
+            ("ASTER_SRV_CLI_TOKEN_TTL", "43201"),
             ("ASTER_SRV_CLI_TOKEN_TTL", "12h"),
             (
                 "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
@@ -660,6 +851,175 @@ mod tests {
             ),
         ] {
             assert!(with(&[(name, value)]).is_err(), "{name}={value}");
+        }
+    }
+
+    const GOOD_KEY: &str = "q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=";
+    const SIGN_IN: [(&str, &str); 4] = [
+        ("ASTER_SRV_PUBLIC_URL", "https://aster-srv.example.com"),
+        (
+            "ASTER_SRV_IAP_AUDIENCE",
+            "/projects/1/global/backendServices/",
+        ),
+        ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
+        (
+            "ASTER_SRV_CLI_TOKEN_KEYS",
+            "k1:q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNtE=",
+        ),
+    ];
+
+    fn with_sign_in(drop: &[&str], extra: &[(&str, &str)]) -> Result<Config> {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.extend(SIGN_IN.iter().filter(|(name, _)| !drop.contains(name)));
+        pairs.extend_from_slice(extra);
+        Config::from_env(env_of(&pairs))
+    }
+
+    #[test]
+    fn token_keys_need_256_bits_of_hex_or_base64_that_look_random() {
+        let hex64 = "9f3a1c7be24d805ae6c1b94f7d20a3e85c6b1f4d9a07e2c38b5d6f1a4c9e0b72";
+        let bytes = decode_key_secret(hex64).unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 0x9f);
+        assert_eq!(decode_key_secret(GOOD_KEY).unwrap().len(), 32);
+        // Unpadded and url-safe forms are the same key material.
+        assert_eq!(
+            decode_key_secret(GOOD_KEY.trim_end_matches('=')).unwrap(),
+            decode_key_secret(GOOD_KEY).unwrap()
+        );
+        for (why, secret) in [
+            ("a passphrase", "correct horse battery staple correct horse"),
+            (
+                "31 bytes of base64",
+                "q3Xv8mR2nLzK0wYb7Pj4cT1sUe9HdAfG5oIiMxVuNt",
+            ),
+            ("hex for 31 bytes", &hex64[..62]),
+            ("one repeated byte", &"ab".repeat(32)),
+            ("a repeated block", &"0123456789abcdef".repeat(4)),
+            (
+                "counting up",
+                &(0u8..32).map(|b| format!("{b:02x}")).collect::<String>(),
+            ),
+            ("all zeros", &"00".repeat(32)),
+            (
+                "the old placeholder",
+                "test-signing-secret-0123456789abcdef",
+            ),
+            ("empty", ""),
+        ] {
+            assert!(decode_key_secret(secret).is_err(), "{why}: {secret}");
+        }
+    }
+
+    #[test]
+    fn a_weak_key_stops_the_server_from_starting() {
+        let err = with_sign_in(
+            &["ASTER_SRV_CLI_TOKEN_KEYS"],
+            &[(
+                "ASTER_SRV_CLI_TOKEN_KEYS",
+                "k1:0123456789abcdef0123456789abcdef",
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("256 bits") || format!("{err:#}").contains("placeholder"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_public_url_must_be_https_unless_a_development_flag_says_otherwise() {
+        let http = ("ASTER_SRV_PUBLIC_URL", "http://127.0.0.1:8080");
+        let err = with_sign_in(&["ASTER_SRV_PUBLIC_URL"], &[http]).unwrap_err();
+        assert!(format!("{err:#}").contains("https"), "{err:#}");
+        let config = with_sign_in(
+            &["ASTER_SRV_PUBLIC_URL"],
+            &[http, ("ASTER_SRV_ALLOW_HTTP_PUBLIC_URL", "1")],
+        )
+        .unwrap();
+        assert_eq!(config.public_url.as_deref(), Some("http://127.0.0.1:8080"));
+        // Only the exact value `1` opts out.
+        assert!(with_sign_in(
+            &["ASTER_SRV_PUBLIC_URL"],
+            &[http, ("ASTER_SRV_ALLOW_HTTP_PUBLIC_URL", "true")]
+        )
+        .is_err());
+        assert!(with_sign_in(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn sign_in_refuses_to_start_without_real_iap_a_domain_allowlist_and_no_dev_viewer() {
+        // Dev viewer without IAP: anyone could mint a token as that email.
+        let err = with_sign_in(
+            &["ASTER_SRV_IAP_AUDIENCE"],
+            &[("ASTER_SRV_UI_DEV_EMAIL", "me@example.com")],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ASTER_SRV_IAP_AUDIENCE"),
+            "{err:#}"
+        );
+        // No IAP at all.
+        assert!(with_sign_in(&["ASTER_SRV_IAP_AUDIENCE"], &[]).is_err());
+        // Any IAP identity would get a token.
+        let err = with_sign_in(&["ASTER_SRV_UI_EMAIL_DOMAINS"], &[]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ASTER_SRV_UI_EMAIL_DOMAINS"),
+            "{err:#}"
+        );
+        // A dev viewer next to real IAP is ignored by the dashboard, but with
+        // sign-in on it is a misconfiguration worth stopping for.
+        let err = with_sign_in(&[], &[("ASTER_SRV_UI_DEV_EMAIL", "me@example.com")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ASTER_SRV_UI_DEV_EMAIL"),
+            "{err:#}"
+        );
+        // Sign-in off: the dashboard's own modes are unchanged.
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_UI_DEV_EMAIL", "me@example.com"));
+        assert!(Config::from_env(env_of(&pairs)).is_ok());
+    }
+
+    #[test]
+    fn reads_the_listener_limit_and_timeout_settings() {
+        let config = Config::from_env(env_of(&REQUIRED)).unwrap();
+        assert_eq!(config.api_listen, None);
+        assert_eq!(config.trusted_proxy_hops, 1);
+        assert_eq!(config.rate_token_ip_per_min, 10);
+        assert_eq!(config.rate_api_ip_per_min, 1200);
+        assert_eq!(config.rate_api_subject_per_min, 3000);
+        assert_eq!(config.body_timeout, Duration::from_secs(60));
+        assert_eq!(config.handler_timeout, Duration::from_secs(120));
+        assert_eq!(config.max_connections, 1024);
+        assert_eq!(config.header_timeout, Duration::from_secs(20));
+        assert_eq!(config.db_wait, Duration::from_secs(5));
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.extend_from_slice(extra);
+            Config::from_env(env_of(&pairs))
+        };
+        let config = with(&[
+            ("ASTER_SRV_API_ADDR", "0.0.0.0:8081"),
+            ("ASTER_SRV_TRUSTED_PROXY_HOPS", "2"),
+            ("ASTER_SRV_RATE_TOKEN_IP_PER_MIN", "5"),
+            ("ASTER_SRV_MAX_CONNECTIONS", "50"),
+        ])
+        .unwrap();
+        assert_eq!(config.api_listen.unwrap().port(), 8081);
+        assert_eq!(config.trusted_proxy_hops, 2);
+        assert_eq!(config.rate_token_ip_per_min, 5);
+        assert_eq!(config.max_connections, 50);
+        for (name, bad) in [
+            ("ASTER_SRV_API_ADDR", "8081"),
+            ("ASTER_SRV_API_ADDR", "0.0.0.0:8080"),
+            ("ASTER_SRV_TRUSTED_PROXY_HOPS", "9"),
+            ("ASTER_SRV_RATE_TOKEN_IP_PER_MIN", "0"),
+            ("ASTER_SRV_BODY_TIMEOUT_SECS", "0"),
+            ("ASTER_SRV_HANDLER_TIMEOUT_SECS", "99999"),
+            ("ASTER_SRV_MAX_CONNECTIONS", "0"),
+            ("ASTER_SRV_DB_WAIT_SECS", "soon"),
+        ] {
+            assert!(with(&[(name, bad)]).is_err(), "{name}={bad}");
         }
     }
 

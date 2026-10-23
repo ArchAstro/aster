@@ -241,6 +241,7 @@ mod tests {
         let config = config(&[]);
         let iap = IapVerifier::new(&config);
         let person = |email: &str| Person {
+            subject: "accounts.google.com:1".into(),
             email: email.into(),
         };
         let repo = "ArchAstro/firstlanding";
