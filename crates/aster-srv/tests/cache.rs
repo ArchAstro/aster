@@ -1552,3 +1552,78 @@ async fn retention_prunes_old_lookup_stats() {
     assert_eq!(left, [20, 0]);
     server.stop().await;
 }
+
+/// N13. A pull-request CI token may read the cache, but its lookups must not
+/// bump `hits`, `last_hit_at` or `last_used_at`: any PR author could otherwise
+/// keep an entry alive forever. A main push (writer-eligible) still counts.
+#[tokio::test]
+async fn a_pull_request_lookup_does_not_count_but_a_main_push_does() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    // Phase 1: main commits one entry.
+    put_blob(&server, DIGEST).await;
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    commit_as(&server, &writer, "k1", "//a:b").await;
+    let used_before: chrono::DateTime<Utc> = server
+        .client()
+        .await
+        .query_one(
+            "SELECT last_used_at FROM cache.manifests WHERE key = 'k1'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    // Phase 2: a pull_request token looks the key up. It hits, but nothing is
+    // counted in the manifest row.
+    let pull_request = format!(
+        "Bearer {}",
+        common::token_with_claims(
+            REPO,
+            json!({"event_name": "pull_request", "ref": "refs/pull/7/merge"}),
+        )
+    );
+    let (status, body) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k1"]}),
+            Some(&pull_request),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(body["hits"]["k1"].is_object(), "{body}");
+    let state = |client: deadpool_postgres::Client| async move {
+        let row = client
+            .query_one(
+                "SELECT hits, last_hit_at IS NOT NULL, last_used_at FROM cache.manifests \
+                 WHERE key = 'k1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        (
+            row.get::<_, i64>(0),
+            row.get::<_, bool>(1),
+            row.get::<_, chrono::DateTime<Utc>>(2),
+        )
+    };
+    assert_eq!(state(server.client().await).await, (0, false, used_before));
+
+    // Phase 3: a main push looks it up and is counted.
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k1"]}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (hits, hit_at, used) = state(server.client().await).await;
+    assert_eq!((hits, hit_at), (1, true));
+    assert!(used >= used_before);
+    server.stop().await;
+}
