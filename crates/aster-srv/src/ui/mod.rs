@@ -31,7 +31,7 @@ use html::{Frame, Section};
 pub const SECURITY_HEADERS: [(&str, &str); 4] = [
     (
         "content-security-policy",
-        "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'",
     ),
     ("x-content-type-options", "nosniff"),
     ("referrer-policy", "same-origin"),

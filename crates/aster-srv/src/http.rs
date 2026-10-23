@@ -398,10 +398,10 @@ async fn guarded(
             },
         );
     }
-    route(app, request).await
+    route(app, client, request).await
 }
 
-async fn route(app: &App, request: Request<Incoming>) -> Reply {
+async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) -> Reply {
     // Until the migrations are applied the tables may not match what the
     // handlers query. `/healthz` stays up so the process is not killed while
     // it waits for locks; `/readyz` reports the wait.
@@ -449,11 +449,11 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             }
         },
         Handler::CliAuthConfirm => {
-            let assertion = header_name(&request, crate::iap::IAP_HEADER);
-            crate::cli_auth::confirm(app, assertion.as_deref(), request.uri().query()).await
+            let browser = cli_browser(&request, client);
+            crate::cli_auth::confirm(app, &browser, request.uri().query()).await
         }
         Handler::CliAuthAuthorize => {
-            let assertion = header_name(&request, crate::iap::IAP_HEADER);
+            let browser = cli_browser(&request, client);
             let body = match read_body(
                 request,
                 crate::cli_auth::MAX_FORM_BYTES,
@@ -464,8 +464,14 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
                 Ok(body) => body,
                 Err(reply) => return reply,
             };
-            crate::cli_auth::authorize(app, assertion.as_deref(), &body).await
+            crate::cli_auth::authorize(app, &browser, &body).await
         }
+        // The gate has already checked the bearer: a signed-in person, never
+        // a CI token. The route takes no body.
+        Handler::TokenRevoke => match principal {
+            Some(Principal::Person(person)) => crate::cli_auth::revoke(app, &person).await,
+            _ => Reply::error(403, "only a signed-in person can sign out"),
+        },
         Handler::TokenExchange => {
             let body = match read_body(
                 request,
@@ -583,6 +589,17 @@ fn read_identity(
         return routes::identity_for(principal, repo);
     }
     routes::identity_for(principal, None)
+}
+
+/// What `/cli-auth` reads from a browser request.
+fn cli_browser(request: &Request<Incoming>, client: std::net::IpAddr) -> crate::cli_auth::Browser {
+    crate::cli_auth::Browser {
+        assertion: header_name(request, crate::iap::IAP_HEADER),
+        origin: header_name(request, "origin"),
+        referer: header_name(request, "referer"),
+        client_ip: client,
+        user_agent: header_name(request, "user-agent"),
+    }
 }
 
 fn header_name(request: &Request<Incoming>, name: &str) -> Option<String> {

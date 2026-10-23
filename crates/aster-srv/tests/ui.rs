@@ -87,7 +87,7 @@ async fn the_leaderboard_lists_flaky_and_broken_tests_for_the_newest_repository(
     assert_eq!(headers["content-type"], "text/html; charset=utf-8");
     assert_eq!(
         headers["content-security-policy"],
-        "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'"
     );
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(headers["referrer-policy"], "same-origin");

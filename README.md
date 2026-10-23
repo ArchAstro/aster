@@ -308,7 +308,9 @@ cache after one `aster cache login`: it opens your browser, you sign in with
 your company account and confirm, and Aster stores a read-only token under
 `$XDG_CONFIG_HOME/aster` (else `~/.config/aster`) until it expires. Signed
 out, Aster prints one line (`not signed in; run aster cache login`) and
-continues with the local cache. See
+continues with the local cache. Over SSH or on a devbox, where the browser
+cannot reach the CLI, it prints a URL and you paste back a one-time code;
+`aster cache logout` signs out everywhere. See
 [Reading the cache from a laptop](docs/test-tracking.md#reading-the-cache-from-a-laptop).
 The same sign-in reads the flaky, broken, cluster and quarantine data the
 dashboard shows: `aster srv flaky`, `aster srv clusters`, `aster srv get <path>`

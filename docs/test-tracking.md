@@ -127,25 +127,70 @@ export ASTER_SRV_URL=https://aster-srv.example.com
 aster cache login
 ```
 
-1. `aster cache login` listens on a random port on `127.0.0.1` and opens
-   `$ASTER_SRV_URL/cli-auth` in your browser. It prints the URL as well.
+`ASTER_SRV_URL` must be `https://`; plain `http://` is accepted only for
+`127.0.0.1`, `::1` and `localhost`, because the code, verifier and token would
+cross the network in the clear.
+
+1. `aster cache login` makes a PKCE verifier and a short **user code**
+   (`ABCD-EFGH`), prints the code, and opens
+   `$ASTER_SRV_URL/cli-auth` in your browser.
 2. You sign in there with your company Google account (the server's
-   identity-aware proxy asks) and click **Authorize**.
+   identity-aware proxy asks). The page shows the user code, your address and
+   browser. Click **Authorize** only if the code matches your terminal.
 3. The server redirects the browser to `http://127.0.0.1:<port>/callback`
-   with a single-use code (valid 60 seconds). Aster trades the code, plus a
-   PKCE verifier only it knows, for a token.
+   with a single-use code (valid 60 seconds). Aster trades the code, plus the
+   PKCE verifier and user code, for a token.
 4. The token is stored in `$XDG_CONFIG_HOME/aster/cache-tokens/<server host>.json`
    (else `~/.config/aster/...`; `%APPDATA%\aster\...` on Windows), mode `0600` in
-   a `0700` directory. It is never printed, and it lives outside the
-   repository. It lasts 12 hours by default (`ASTER_SRV_CLI_TOKEN_TTL` on the
-   server); then run `aster cache login` again.
+   a `0700` directory (on Windows an ACL naming only you; if Aster cannot set
+   it, it does not store the token). Aster ignores a token file that group or
+   others can read and tells you to log in again. The token is never printed,
+   and it lives outside the repository. It lasts 12 hours by default
+   (`ASTER_SRV_CLI_TOKEN_TTL` on the server); then run `aster cache login`
+   again.
 
 The next `aster run` with `ASTER_SRV_URL` set sends the token as a bearer
 token and restores a cached target. Nothing else needs configuring.
 
-On a machine with no browser, run `aster cache login --no-browser`, open the
-printed URL on a computer where you are signed in, and forward the port it
-names to the machine (`ssh -R PORT:127.0.0.1:PORT`).
+### Over SSH or on a devbox
+
+A browser on your laptop cannot reach `127.0.0.1` on the remote machine, so
+Aster uses a pasted code there. It picks that flow by itself when
+`SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY` is set, when a Linux shell has
+neither `DISPLAY` nor `WAYLAND_DISPLAY`, or when the system browser fails to
+start. `aster cache login --no-browser` asks for it explicitly:
+
+```console
+$ aster cache login
+This looks like a remote shell, so Aster will ask for a code instead of a redirect.
+Open this URL in a browser on any computer and sign in:
+https://aster-srv.example.com/cli-auth?mode=copy&challenge=...&state=...&user_code=K7QM2XWD
+Confirm only if the page shows this code: K7QM-2XWD
+Request id: Xb3kP9aQ
+Paste the code the page shows, then press Enter: <paste here>
+Signed in as ada@example.com. Token stored at ...
+```
+
+1. Open the printed URL in a browser on any computer. Confirm the page shows
+   the same user code and your own address.
+2. Click **Authorize**. The page shows a one-time code (never a token) and
+   the request id.
+3. Paste the code into the terminal. It works once and expires after 60
+   seconds, like the loopback code; the PKCE verifier stays on the remote
+   machine, so the code alone signs nobody in.
+
+`--loopback` forces the browser redirect, for example with
+`ssh -R PORT:127.0.0.1:PORT` forwarding (add `--no-browser` to print the URL
+instead of opening one).
+
+### Signing out
+
+`aster cache logout` deletes the stored token and asks the server to refuse
+every token issued to you before now, on every machine. If the server cannot
+be reached the local file is still deleted and the command fails, so run it
+again later. Operators can turn person sign-in off for everyone with
+`ASTER_SRV_PERSON_TOKENS=off` on the server: `/cli-auth` answers 404 and every
+person token is refused.
 
 Signed out, or with an expired or refused token, `aster run` prints one line
 (`not signed in; run aster cache login`) and builds from the local cache. It

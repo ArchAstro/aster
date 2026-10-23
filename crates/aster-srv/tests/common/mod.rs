@@ -356,20 +356,25 @@ pub fn iap_assertion(email: &str) -> String {
 
 /// [`iap_assertion`] addressed to `audience`.
 pub fn iap_assertion_for(email: &str, audience: &str) -> String {
-    iap_assertion_full(email, Some(&iap_subject(email)), audience)
+    iap_assertion_issued(email, audience, Utc::now().timestamp())
+}
+
+/// [`iap_assertion_for`] issued at `iat` (Unix seconds).
+pub fn iap_assertion_issued(email: &str, audience: &str, iat: i64) -> String {
+    iap_assertion_full(email, Some(&iap_subject(email)), audience, iat)
 }
 
 /// An assertion with no `sub` claim at all.
 pub fn iap_assertion_without_subject(email: &str) -> String {
-    iap_assertion_full(email, None, IAP_AUDIENCE)
+    iap_assertion_full(email, None, IAP_AUDIENCE, Utc::now().timestamp())
 }
 
 /// An assertion for a chosen subject, as when an account's email changes.
 pub fn iap_assertion_with_subject(email: &str, subject: &str) -> String {
-    iap_assertion_full(email, Some(subject), IAP_AUDIENCE)
+    iap_assertion_full(email, Some(subject), IAP_AUDIENCE, Utc::now().timestamp())
 }
 
-fn iap_assertion_full(email: &str, subject: Option<&str>, audience: &str) -> String {
+fn iap_assertion_full(email: &str, subject: Option<&str>, audience: &str, iat: i64) -> String {
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some("iap".into());
     encode(
@@ -377,6 +382,7 @@ fn iap_assertion_full(email: &str, subject: Option<&str>, audience: &str) -> Str
         &json!({
             "iss": "https://cloud.google.com/iap",
             "aud": audience,
+            "iat": iat,
             "exp": Utc::now().timestamp() + 300,
             "email": email,
             "sub": subject,

@@ -64,6 +64,8 @@ pub struct Person {
     /// The stable IAP subject.
     pub subject: String,
     pub email: String,
+    /// Unix seconds the token was issued, checked against revocations.
+    pub issued_at: i64,
 }
 
 /// A token and when it stops working.
@@ -97,6 +99,9 @@ pub struct TokenIssuer {
 
 impl TokenIssuer {
     pub fn from_config(config: &Config) -> Option<Self> {
+        if !config.person_tokens_enabled {
+            return None;
+        }
         let issuer = config.public_url.clone()?;
         if config.cli_token_keys.is_empty() {
             return None;
@@ -197,6 +202,7 @@ impl TokenIssuer {
         Ok(Person {
             subject: claims.sub,
             email: claims.email,
+            issued_at: claims.iat,
         })
     }
 
@@ -219,6 +225,36 @@ impl TokenIssuer {
             hmac::verify(&key, &input, &tag).is_ok()
         })
     }
+}
+
+/// Whether `person`'s token was issued before the person last signed out
+/// everywhere (`aster cache logout`). The cutoff is rounded up to the next
+/// whole second, because `iat` has second resolution: a token minted in the
+/// same second as the logout is refused too, never kept.
+pub async fn is_revoked(pool: &deadpool_postgres::Pool, person: &Person) -> anyhow::Result<bool> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT ceil(extract(epoch FROM not_before))::bigint \
+             FROM auth.revocations WHERE subject = $1",
+            &[&person.subject],
+        )
+        .await?;
+    Ok(row.is_some_and(|row| person.issued_at < row.get::<_, i64>(0)))
+}
+
+/// Refuse every token issued to `subject` (the stable IAP subject, not the
+/// email) before now.
+pub async fn revoke_all(pool: &deadpool_postgres::Pool, subject: &str) -> anyhow::Result<()> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "INSERT INTO auth.revocations (subject, not_before) VALUES ($1, now()) \
+             ON CONFLICT (subject) DO UPDATE SET not_before = greatest(auth.revocations.not_before, now())",
+            &[&subject],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Fields joined by NUL under a fixed prefix. A JWT signing input starts
@@ -299,7 +335,18 @@ mod tests {
         Person {
             subject: SUB.into(),
             email: "ada@example.com".into(),
+            issued_at: 0,
         }
+    }
+
+    /// `person` with its issue time cleared, to compare with [`ada`].
+    fn untimed(mut person: Person) -> Person {
+        assert!(
+            (Utc::now().timestamp() - person.issued_at).abs() <= 5,
+            "issued_at is the token's iat"
+        );
+        person.issued_at = 0;
+        person
     }
 
     fn refused(issuer: &TokenIssuer, token: &str) -> String {
@@ -313,7 +360,7 @@ mod tests {
     fn a_token_round_trips_with_every_claim_and_a_12_hour_life() {
         let issuer = issuer_for(&k1());
         let issued = issuer.issue(SUB, "ada@example.com").unwrap();
-        assert_eq!(issuer.verify(&issued.token).unwrap(), ada());
+        assert_eq!(untimed(issuer.verify(&issued.token).unwrap()), ada());
         let lifetime = issued.expires_at - Utc::now().timestamp();
         assert!(
             (12 * 3600 - 10..=12 * 3600).contains(&lifetime),
@@ -354,7 +401,7 @@ mod tests {
     #[test]
     fn tokens_without_sub_nbf_email_iat_or_jti_are_refused() {
         let issuer = issuer_for(&k1());
-        assert_eq!(issuer.verify(&hs256(&claims())).unwrap(), ada());
+        assert_eq!(untimed(issuer.verify(&hs256(&claims())).unwrap()), ada());
         for missing in [
             "sub", "nbf", "email", "iat", "jti", "scope", "exp", "iss", "aud",
         ] {
@@ -481,16 +528,16 @@ mod tests {
             .token;
         // Both listed, new first: k2 signs, k1 still verifies.
         let rotating = issuer_for(&format!("{},{}", k2(), k1()));
-        assert_eq!(rotating.verify(&old).unwrap(), ada());
+        assert_eq!(untimed(rotating.verify(&old).unwrap()), ada());
         let fresh = rotating.issue(SUB, "ada@example.com").unwrap().token;
         assert_eq!(decode_header(&fresh).unwrap().kid.as_deref(), Some("k2"));
-        assert_eq!(rotating.verify(&fresh).unwrap(), ada());
+        assert_eq!(untimed(rotating.verify(&fresh).unwrap()), ada());
         // A replica still on the old config accepts neither new tokens...
         assert!(issuer_for(&k1()).verify(&fresh).is_err());
         // ...and with the previous key dropped, its tokens stop working.
         let rotated = issuer_for(&k2());
         assert!(rotated.verify(&old).is_err());
-        assert_eq!(rotated.verify(&fresh).unwrap(), ada());
+        assert_eq!(untimed(rotated.verify(&fresh).unwrap()), ada());
     }
 
     #[test]

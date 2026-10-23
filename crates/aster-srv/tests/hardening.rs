@@ -25,6 +25,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const REPO: &str = "ArchAstro/firstlanding";
+/// What the CLI would print and send; the confirm page shows it.
+const USER_CODE: &str = "ABCD2345";
 const HSTS: &str = "max-age=31536000; includeSubDomains";
 
 async fn start_with(extra: &[(&str, &str)]) -> Option<Server> {
@@ -73,7 +75,7 @@ async fn browser_login(main_url: &str, assertion: &str) -> (String, String) {
     let http = client();
     let form = http
         .get(format!(
-            "{main_url}/cli-auth?port=40123&challenge={challenge}&state=s1"
+            "{main_url}/cli-auth?port=40123&user_code={USER_CODE}&challenge={challenge}&state=s1"
         ))
         .header("x-goog-iap-jwt-assertion", assertion)
         .send()
@@ -93,6 +95,8 @@ async fn browser_login(main_url: &str, assertion: &str) -> (String, String) {
     let done = http
         .post(format!("{main_url}/cli-auth"))
         .header("content-type", "application/x-www-form-urlencoded")
+        // A browser sends its own page's origin with a form POST.
+        .header("origin", common::PUBLIC_URL)
         .header("x-goog-iap-jwt-assertion", assertion)
         .body(body)
         .send()
@@ -113,7 +117,7 @@ async fn browser_login(main_url: &str, assertion: &str) -> (String, String) {
 async fn redeem(url: &str, code: &str, verifier: &str) -> (u16, Value) {
     let response = client()
         .post(format!("{url}/v1/auth/token"))
-        .json(&json!({"code": code, "verifier": verifier, "port": 40123}))
+        .json(&json!({"code": code, "verifier": verifier, "port": 40123, "user_code": USER_CODE}))
         .send()
         .await
         .unwrap();
@@ -128,7 +132,7 @@ async fn bad_exchange(url: &str, forwarded_for: Option<&str>) -> reqwest::Respon
     let (verifier, _) = pkce();
     let mut request = client()
         .post(format!("{url}/v1/auth/token"))
-        .json(&json!({"code": BASE64URL.encode([7u8; 32]), "verifier": verifier, "port": 40123}));
+        .json(&json!({"code": BASE64URL.encode([7u8; 32]), "verifier": verifier, "port": 40123, "user_code": USER_CODE}));
     if let Some(forwarded_for) = forwarded_for {
         request = request.header("x-forwarded-for", forwarded_for);
     }
@@ -241,7 +245,7 @@ async fn api_listener_serves_only_v1_while_the_main_port_is_unchanged() {
         "/ui/cache?repo=ArchAstro%2Ffirstlanding",
         "/ui/tests",
         "/cli-auth",
-        "/cli-auth?port=40123&challenge=x&state=s",
+        "/cli-auth?port=40123&user_code=ABCD2345&challenge=x&state=s",
         "/healthz",
         "/readyz",
         "/metrics",
@@ -692,7 +696,7 @@ async fn a_flood_of_exchanges_cannot_starve_the_shared_pool_and_a_starved_pool_f
     assert!(started.elapsed() < Duration::from_millis(900));
     let malformed = client()
         .post(format!("{url}/v1/auth/token"))
-        .json(&json!({"code": "short", "verifier": "short", "port": 1}))
+        .json(&json!({"code": "short", "verifier": "short", "port": 1, "user_code": USER_CODE}))
         .send()
         .await
         .unwrap();
@@ -926,7 +930,7 @@ async fn auth_failures_are_audited_and_counted_and_no_token_reaches_a_log_or_an_
     for assertion in [forged_iap, wrong_aud_iap.as_str()] {
         let response = http
             .get(format!(
-                "{url}/cli-auth?port=40123&challenge={}&state=s",
+                "{url}/cli-auth?port=40123&user_code={USER_CODE}&challenge={}&state=s",
                 pkce().1
             ))
             .header("x-goog-iap-jwt-assertion", assertion)
@@ -1086,7 +1090,7 @@ async fn sign_in_binds_the_stable_iap_subject_not_the_email() {
     let nameless = common::iap_assertion_without_subject("ada@example.com");
     let got = client()
         .get(format!(
-            "{url}/cli-auth?port=40123&challenge={}&state=s",
+            "{url}/cli-auth?port=40123&user_code={USER_CODE}&challenge={}&state=s",
             pkce().1
         ))
         .header("x-goog-iap-jwt-assertion", &nameless)
@@ -1139,7 +1143,7 @@ async fn https_deployments_send_hsts_on_every_response_and_auth_responses_are_ne
         (
             "token success",
             http.post(format!("{api}/v1/auth/token"))
-                .json(&json!({"code": code, "verifier": verifier, "port": 40123}))
+                .json(&json!({"code": code, "verifier": verifier, "port": 40123, "user_code": USER_CODE}))
                 .send()
                 .await
                 .unwrap(),
@@ -1189,7 +1193,7 @@ async fn https_deployments_send_hsts_on_every_response_and_auth_responses_are_ne
         (
             "login page",
             http.get(format!(
-                "{}/cli-auth?port=40123&challenge={}&state=s",
+                "{}/cli-auth?port=40123&user_code={USER_CODE}&challenge={}&state=s",
                 server.url,
                 pkce().1
             ))
@@ -1201,7 +1205,7 @@ async fn https_deployments_send_hsts_on_every_response_and_auth_responses_are_ne
         (
             "login without IAP",
             http.get(format!(
-                "{}/cli-auth?port=40123&challenge={}&state=s",
+                "{}/cli-auth?port=40123&user_code={USER_CODE}&challenge={}&state=s",
                 server.url,
                 pkce().1
             ))

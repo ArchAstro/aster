@@ -10,6 +10,7 @@
 //! | `Public` | anyone: health checks and the sign-in code exchange |
 //! | `Iap` | a person behind Google IAP (the dashboard and `/cli-auth`); the handler verifies the IAP assertion |
 //! | `SignedUrl` | the test-only stand-in for a signed blob URL; only the in-memory store answers it |
+//! | `Person` | a signed-in person's token only (sign out); a CI token is refused. With person sign-in switched off (`ASTER_SRV_PERSON_TOKENS=off`) the route answers 404 before any token is read |
 //! | `Ci` | a CI token (GitHub OIDC or a development static token); a person's token is refused |
 //! | `CiOrPerson` | a CI token for its own repository, or a signed-in person for any served repository: the read-only routes |
 //! | `CiWriter` | a CI token only; the handler also checks the writer rules (ref, workflow, event) |
@@ -25,6 +26,7 @@ pub enum Auth {
     Public,
     Iap,
     SignedUrl,
+    Person,
     Ci,
     CiOrPerson,
     CiWriter,
@@ -38,6 +40,7 @@ pub enum Handler {
     CliAuthConfirm,
     CliAuthAuthorize,
     TokenExchange,
+    TokenRevoke,
     ResultsUpload,
     Durations,
     ResultsRead,
@@ -78,6 +81,14 @@ pub const ROUTES: &[Route] = &[
         "/v1/auth/token",
         Auth::Public,
         Handler::TokenExchange,
+    ),
+    // Sign out everywhere: the bearer is the credential, there is no IAP
+    // session on this route.
+    route(
+        "POST",
+        "/v1/auth/revoke",
+        Auth::Person,
+        Handler::TokenRevoke,
     ),
     route(
         "POST",
@@ -220,6 +231,7 @@ pub fn label(method: &str, path: &str) -> &'static str {
         Some(Handler::Readyz) => "/readyz",
         Some(Handler::CliAuthConfirm | Handler::CliAuthAuthorize) => "/cli-auth",
         Some(Handler::TokenExchange) => "/v1/auth/token",
+        Some(Handler::TokenRevoke) => "/v1/auth/revoke",
         Some(Handler::ResultsUpload) => "/v1/test-results/runs",
         Some(Handler::Durations) => "/v1/test-results/durations",
         Some(Handler::ResultsRead) => "/v1/test-results/query",
@@ -256,7 +268,12 @@ pub async fn gate(
     let class = route.map_or(Auth::CiOrPerson, |route| route.auth);
     match class {
         Auth::Public | Auth::Iap | Auth::SignedUrl => Ok(None),
-        Auth::Ci | Auth::CiWriter | Auth::CiOrPerson => {
+        Auth::Person | Auth::Ci | Auth::CiWriter | Auth::CiOrPerson => {
+            // The kill switch: a server with person sign-in off has no
+            // sign-out to offer, whoever asks.
+            if class == Auth::Person && app.person_tokens.is_none() {
+                return Err(Reply::error(404, "not found"));
+            }
             let principal = match app.principal(authorization).await {
                 Ok(principal) => principal,
                 Err(error) => {
@@ -285,6 +302,14 @@ pub async fn gate(
                     "a person's token is read-only",
                 );
                 return Err(Reply::error(403, "a person's token is read-only"));
+            }
+            if class == Auth::Person && matches!(principal, Principal::Ci(_)) {
+                audit::auth_failure(
+                    Some(&person_subject(&principal)),
+                    "ci_token_not_allowed",
+                    "only a signed-in person can sign out",
+                );
+                return Err(Reply::error(403, "only a signed-in person can sign out"));
             }
             Ok(Some(principal))
         }

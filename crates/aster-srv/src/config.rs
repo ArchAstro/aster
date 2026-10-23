@@ -166,6 +166,9 @@ pub struct Config {
     /// `ASTER_SRV_DB_WAIT_SECS`: how long a request waits for a database
     /// connection before failing. Default 5.
     pub db_wait: Duration,
+    /// `ASTER_SRV_PERSON_TOKENS=off`: the kill switch. Every person token is
+    /// refused and `/cli-auth` answers 404, whatever else is configured.
+    pub person_tokens_enabled: bool,
 }
 
 /// One HS256 key for person tokens.
@@ -382,6 +385,14 @@ impl Config {
             Some(value) => parse_cli_token_keys(&value)?,
             None => Vec::new(),
         };
+        let person_tokens_enabled = match var("ASTER_SRV_PERSON_TOKENS")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("" | "on") => true,
+            Some("off") => false,
+            Some(_) => bail!("ASTER_SRV_PERSON_TOKENS must be on or off"),
+        };
         let cli_token_ttl = match var("ASTER_SRV_CLI_TOKEN_TTL") {
             Some(value) => value
                 .trim()
@@ -492,6 +503,7 @@ impl Config {
             header_timeout,
             max_connections,
             db_wait,
+            person_tokens_enabled,
         })
     }
 }
@@ -858,6 +870,23 @@ mod tests {
         assert!(config.public_url.is_none());
         assert!(config.cli_token_keys.is_empty());
         assert_eq!(config.cli_token_ttl, 12 * 60 * 60);
+        assert!(config.person_tokens_enabled);
+    }
+
+    #[test]
+    fn the_person_token_kill_switch_is_on_or_off() {
+        let with = |value: &'static str| {
+            Config::from_env(|name| match name {
+                "ASTER_SRV_DATABASE_URL" => Some("postgres://x/y".into()),
+                "ASTER_SRV_REPOSITORIES" => Some("a/*".into()),
+                "ASTER_SRV_PERSON_TOKENS" => Some(value.into()),
+                _ => None,
+            })
+        };
+        assert!(!with("off").unwrap().person_tokens_enabled);
+        assert!(!with(" OFF ").unwrap().person_tokens_enabled);
+        assert!(with("on").unwrap().person_tokens_enabled);
+        assert!(with("maybe").is_err());
     }
 
     #[test]

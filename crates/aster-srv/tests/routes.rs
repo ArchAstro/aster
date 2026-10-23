@@ -90,6 +90,8 @@ async fn send(
     let client = aster_srv::http_client().build().unwrap();
     let url = format!("{}{path}", server.url);
     let mut request = match method {
+        // Sign-out takes no body, and the server refuses one before the gate.
+        "POST" if path.starts_with("/v1/auth/revoke") => client.post(url),
         "POST" => client.post(url).body("{}"),
         "PUT" => client.put(url).body("{}"),
         "DELETE" => client.delete(url),
@@ -347,7 +349,8 @@ async fn a_person_reaches_only_the_read_allowlist_and_every_other_route_is_403()
     let person = person_bearer(&server, "ada@example.com");
     let mut checked = 0;
     for route in ROUTES.iter().filter(|r| r.pattern.starts_with("/v1/")) {
-        if route.auth == Auth::Public {
+        // Sign-out takes a person's token by design; its own test is below.
+        if matches!(route.auth, Auth::Public | Auth::Person) {
             continue;
         }
         let path = path_of(route);
@@ -380,6 +383,46 @@ async fn a_person_reaches_only_the_read_allowlist_and_every_other_route_is_403()
         checked += 1;
     }
     assert!(checked >= 13, "the walk covered {checked} routes");
+    server.stop().await;
+}
+
+/// The routes only a person's token may call: spelled out, so a new route
+/// classed `Person` is a decision made here too.
+const PERSON_ONLY: [(&str, &str); 1] = [("POST", "/v1/auth/revoke")];
+
+#[tokio::test]
+async fn sign_out_takes_a_person_only_and_is_404_when_person_sign_in_is_off() {
+    let Some(server) = start().await else {
+        return;
+    };
+    let person_routes: Vec<(&str, &str)> = ROUTES
+        .iter()
+        .filter(|route| route.auth == Auth::Person)
+        .map(|route| (route.method, route.pattern))
+        .collect();
+    assert_eq!(
+        person_routes,
+        PERSON_ONLY.to_vec(),
+        "the person-only routes changed"
+    );
+
+    let ci = format!("Bearer {}", common::token(REPO));
+    let off = server.second(&[("ASTER_SRV_PERSON_TOKENS", "off")]).await;
+    let person = person_bearer(&server, "ada@example.com");
+    for (method, path) in PERSON_ONLY {
+        // A CI token is valid but is not a person: 403.
+        let (status, _) = send(&server, method, path, &[("authorization", &ci)]).await;
+        assert_eq!(status, 403, "{method} {path} with a CI token");
+        // With sign-in switched off the route does not exist, token or not.
+        for headers in [vec![], vec![("authorization", person.as_str())]] {
+            let (status, _) = send(&off, method, path, &headers).await;
+            assert_eq!(status, 404, "{method} {path} with the kill switch");
+        }
+        // A person signs out.
+        let (status, body) = send(&server, method, path, &[("authorization", &person)]).await;
+        assert_eq!(status, 200, "{method} {path}: {body}");
+    }
+    off.stop().await;
     server.stop().await;
 }
 

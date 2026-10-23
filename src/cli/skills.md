@@ -366,8 +366,11 @@ removes one address. Blobs stay until `aster cache prune`.
 writes it.
 
 `aster cache login` signs a laptop or devbox in to the aster-srv named by
-`ASTER_SRV_URL`. It opens your browser (`--no-browser` prints the URL
-instead), you sign in and confirm, and Aster stores a read-only token under
+`ASTER_SRV_URL`. It opens your browser, you sign in and confirm only if the
+page shows the code the terminal printed. In a remote shell (SSH, a devbox;
+`--no-browser`, or chosen automatically) it prints a URL and you paste back
+the one-time code the page shows. `aster cache logout` signs out everywhere.
+Aster stores a read-only token under
 `$XDG_CONFIG_HOME/aster` (else `~/.config/aster`, mode 0600) until it
 expires. A later `aster run` with `ASTER_SRV_URL` set then reads the remote
 cache with no extra variable. Signed out, the run prints

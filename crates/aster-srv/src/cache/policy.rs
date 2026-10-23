@@ -265,6 +265,7 @@ mod tests {
         let person = |email: &str| Person {
             subject: "accounts.google.com:1".into(),
             email: email.into(),
+            issued_at: 0,
         };
         let repo = "ArchAstro/firstlanding";
         let allow = &config.repositories;

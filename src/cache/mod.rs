@@ -36,7 +36,8 @@ pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial,
 pub use http::{HttpCache, REMOTE_CACHE_TOKEN_ENV, REMOTE_CACHE_URL_ENV};
 pub use local::{LocalStore, PruneStats};
 pub use login::{
-    login, stored_token, LoginOptions, SignedIn, StoredToken, LOGIN_TIMEOUT, SIGNED_OUT_MESSAGE,
+    login, logout, remote_session, stored_token, Announcement, CodeReason, Flow, LoginMode,
+    LoginOptions, SignedIn, SignedOut, LOGIN_TIMEOUT, SIGNED_OUT_MESSAGE,
 };
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
