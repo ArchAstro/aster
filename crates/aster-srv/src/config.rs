@@ -907,7 +907,7 @@ mod tests {
             ),
             ("empty", ""),
         ] {
-            assert!(decode_key_secret(secret).is_err(), "{why}: {secret}");
+            assert!(decode_key_secret(secret).is_err(), "{why} was accepted");
         }
     }
 

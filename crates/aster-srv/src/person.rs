@@ -309,7 +309,7 @@ mod tests {
         let lifetime = issued.expires_at - Utc::now().timestamp();
         assert!(
             (12 * 3600 - 10..=12 * 3600).contains(&lifetime),
-            "{lifetime}"
+            "lifetime out of range"
         );
         // Decode the payload as an attacker would see it.
         let payload = issued.token.split('.').nth(1).unwrap();
