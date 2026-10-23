@@ -102,6 +102,60 @@ impl RateLimiter {
     }
 }
 
+/// How many things one key may hold at once: a client IP's in-flight
+/// requests or open connections. A held slot is a [`SlotGuard`]; the table
+/// holds only keys with a live slot, so it is as small as the open work.
+pub struct Concurrency {
+    max: usize,
+    held: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Concurrency {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            held: Arc::default(),
+        }
+    }
+
+    /// A slot for `key`, or `None` when it already holds the maximum.
+    pub fn try_acquire(&self, key: &str) -> Option<SlotGuard> {
+        let mut held = self.held.lock().unwrap();
+        let count = held.entry(key.to_string()).or_default();
+        if *count >= self.max {
+            return None;
+        }
+        *count += 1;
+        Some(SlotGuard {
+            key: key.to_string(),
+            held: Arc::clone(&self.held),
+        })
+    }
+
+    #[cfg(test)]
+    fn keys(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+}
+
+/// One slot of a [`Concurrency`], released on drop.
+pub struct SlotGuard {
+    key: String,
+    held: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().unwrap();
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Every limit one replica applies.
 pub struct Limits {
     /// `POST /v1/auth/token`, per client IP.
@@ -115,6 +169,8 @@ pub struct Limits {
     /// Large request bodies (a cache commit, a test-results upload) read at
     /// once: each can weigh `ASTER_SRV_MAX_BODY_BYTES` in memory.
     pub large_bodies: Arc<Semaphore>,
+    /// Requests in flight, per client IP ([`ip_key`]).
+    pub requests_per_ip: Concurrency,
     pub trusted_proxy_hops: usize,
 }
 
@@ -126,6 +182,7 @@ impl Limits {
             api_subject: RateLimiter::new(config.rate_api_subject_per_min),
             exchanges: Arc::new(Semaphore::new(MAX_CONCURRENT_EXCHANGES)),
             large_bodies: Arc::new(Semaphore::new(config.max_large_bodies)),
+            requests_per_ip: Concurrency::new(config.max_connections_per_ip),
             trusted_proxy_hops: config.trusted_proxy_hops,
         }
     }
@@ -240,6 +297,21 @@ mod tests {
             client_ip(Some("::ffff:203.0.113.7, 34.8.0.1"), peer, 1),
             ip("203.0.113.7")
         );
+    }
+
+    #[test]
+    fn a_key_holds_at_most_its_cap_and_a_dropped_slot_frees_it() {
+        let slots = Concurrency::new(2);
+        let a = slots.try_acquire("a").unwrap();
+        let _a2 = slots.try_acquire("a").unwrap();
+        assert!(slots.try_acquire("a").is_none());
+        // Another key is untouched.
+        let b = slots.try_acquire("b").unwrap();
+        drop(a);
+        assert!(slots.try_acquire("a").is_some());
+        // The table keeps only keys with a live slot.
+        drop(b);
+        assert_eq!(slots.keys(), 1);
     }
 
     #[test]

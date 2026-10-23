@@ -1256,3 +1256,202 @@ async fn https_deployments_send_hsts_on_every_response_and_auth_responses_are_ne
     assert_eq!(response.headers()["cache-control"], "no-store");
     dev.stop().await;
 }
+
+// ------------------------------------------------- N3: unauthenticated slowloris
+
+/// A POST that declares 100 body bytes and sends one, from the client the
+/// load balancer would report as `client` (`X-Forwarded-For` is
+/// `<spoofed>, <client>, <balancer>`). The stream stays open, holding the
+/// request in flight.
+async fn stalled_post(url: &str, path: &str, client: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nx-forwarded-for: 6.6.6.6, {client}, 34.8.0.1\r\n\
+                 Content-Length: 100\r\n\r\n{{"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream
+}
+
+/// N3: an unauthenticated body gets its own short deadline, well under the
+/// global body timeout that authenticated uploads keep.
+#[tokio::test]
+async fn unauthenticated_bodies_time_out_in_seconds_while_authenticated_ones_keep_the_long_timeout()
+{
+    let Some(server) = start_with(&[
+        ("ASTER_SRV_API_ADDR", "127.0.0.1:0"),
+        ("ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS", "1"),
+        ("ASTER_SRV_BODY_TIMEOUT_SECS", "30"),
+    ])
+    .await
+    else {
+        return;
+    };
+    for url in [&server.url, server.api_url.as_ref().unwrap()] {
+        for path in ["/v1/auth/token", "/cli-auth"] {
+            let stalled =
+                format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{{");
+            let started = Instant::now();
+            let reply = raw(url, stalled.as_bytes(), Duration::from_secs(10)).await;
+            if path == "/cli-auth" && url != &server.url {
+                // Not served on the API port at all.
+                assert_eq!(status_of(&reply), Some(404), "{reply}");
+                continue;
+            }
+            assert_eq!(status_of(&reply), Some(408), "{url}{path}: {reply}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{url}{path}: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+    // A CI upload with a valid token is still waited for: no reply in 3s.
+    let stalled = format!(
+        "POST /v1/test-results/runs HTTP/1.1\r\nHost: x\r\nauthorization: {}\r\n\
+         Content-Length: 100\r\n\r\n{{",
+        ci_bearer()
+    );
+    let started = Instant::now();
+    let reply = raw(&server.url, stalled.as_bytes(), Duration::from_secs(3)).await;
+    assert_eq!(reply, "", "an authenticated body keeps the long timeout");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    server.stop().await;
+}
+
+/// N3: `header_read_timeout` also bounds an idle keep-alive connection: after
+/// a completed request the connection is closed once no next request's
+/// headers arrive in time.
+#[tokio::test]
+async fn an_idle_keep_alive_connection_is_closed_after_the_header_timeout() {
+    let Some(server) = start_with(&[("ASTER_SRV_HEADER_TIMEOUT_SECS", "1")]).await else {
+        return;
+    };
+    let mut stream = tokio::net::TcpStream::connect(server.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buffer = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+        .await
+        .expect("answered")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("HTTP/1.1 200"));
+    // Keep-alive: the connection stays open for the next request, then goes.
+    let started = Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+        .await
+        .expect("an idle connection must not stay open");
+    assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "idle for {:?}",
+        started.elapsed()
+    );
+    server.stop().await;
+}
+
+/// N3: behind the balancer one client IP, as `client_ip` resolves it, holds
+/// at most `ASTER_SRV_MAX_CONNECTIONS_PER_IP` requests open; a spoofed
+/// `X-Forwarded-For` prefix does not make a second client of it, and another
+/// client is unaffected.
+#[tokio::test]
+async fn one_client_ip_cannot_hold_more_than_its_share_of_requests_open() {
+    let Some(server) = start_with(&[
+        ("ASTER_SRV_MAX_CONNECTIONS_PER_IP", "2"),
+        ("ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS", "30"),
+        ("ASTER_SRV_BODY_TIMEOUT_SECS", "30"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let url = &server.url;
+    let first = stalled_post(url, "/v1/auth/token", "203.0.113.7").await;
+    let _second = stalled_post(url, "/v1/auth/token", "203.0.113.7").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The third from the same client, whatever it prefixes, is turned away.
+    let third = format!(
+        "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         x-forwarded-for: 1.2.3.4, 203.0.113.7, 34.8.0.1\r\n\r\n"
+    );
+    let reply = raw(url, third.as_bytes(), Duration::from_secs(5)).await;
+    assert_eq!(status_of(&reply), Some(429), "{reply}");
+    assert!(reply.to_lowercase().contains("retry-after"), "{reply}");
+    // Another client address is served.
+    let other = "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         x-forwarded-for: 1.2.3.4, 203.0.113.8, 34.8.0.1\r\n\r\n";
+    let reply = raw(url, other.as_bytes(), Duration::from_secs(5)).await;
+    assert_eq!(status_of(&reply), Some(200), "{reply}");
+    // The first slot frees when its request ends.
+    drop(first);
+    let mut status = None;
+    for _ in 0..50 {
+        let reply = raw(url, third.as_bytes(), Duration::from_secs(5)).await;
+        status = status_of(&reply);
+        if status == Some(200) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, Some(200));
+    let metrics = server.app.metrics.render();
+    assert!(metrics.contains("scope=\"ip_concurrency\""), "{metrics}");
+    server.stop().await;
+}
+
+/// N3: with no trusted proxy the TCP peer is the client, so its open
+/// connections are capped at accept: the extra one is closed unserved.
+#[tokio::test]
+async fn without_a_proxy_one_peer_cannot_hold_more_connections_than_its_share() {
+    let Some(server) = start_with(&[
+        ("ASTER_SRV_TRUSTED_PROXY_HOPS", "0"),
+        ("ASTER_SRV_MAX_CONNECTIONS_PER_IP", "2"),
+        ("ASTER_SRV_HEADER_TIMEOUT_SECS", "60"),
+    ])
+    .await
+    else {
+        return;
+    };
+    let address = server.url.trim_start_matches("http://").to_string();
+    let first = tokio::net::TcpStream::connect(&address).await.unwrap();
+    let _second = tokio::net::TcpStream::connect(&address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reply = raw(
+        &server.url,
+        b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        reply, "",
+        "a third connection from the peer is closed unserved"
+    );
+    drop(first);
+    let mut served = false;
+    for _ in 0..50 {
+        let reply = raw(
+            &server.url,
+            b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(5),
+        )
+        .await;
+        if status_of(&reply) == Some(200) {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "a slot frees when a connection closes");
+    server.stop().await;
+}
