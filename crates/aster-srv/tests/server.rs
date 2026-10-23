@@ -107,6 +107,11 @@ async fn start(retention_days: u32) -> Option<Server> {
 }
 
 fn token(repository: &str) -> String {
+    job_token(repository, "16161", "9f1c")
+}
+
+/// The OIDC token of a job in GitHub run `run` (attempt 1) at `sha`.
+fn job_token(repository: &str, run: &str, sha: &str) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test".into());
     encode(
@@ -116,10 +121,23 @@ fn token(repository: &str) -> String {
             "aud": "aster-srv",
             "exp": Utc::now().timestamp() + 300,
             "repository": repository,
+            // The job that uploads: pull request 16161's merge commit 9f1c,
+            // GitHub run 16161 attempt 1. Its run ids start
+            // `gh:<repo>:16161:1:` (see `stream`).
+            "run_id": run,
+            "run_attempt": "1",
+            "sha": sha,
+            "ref": "refs/pull/16161/merge",
+            "event_name": "pull_request",
         }),
         &EncodingKey::from_rsa_pem(PRIVATE).unwrap(),
     )
     .unwrap()
+}
+
+/// The Aster run id `name` in the uploading job's GitHub run.
+fn gh(name: &str) -> String {
+    format!("gh:{REPO}:16161:1:{name}")
 }
 
 fn stream(run_id: &str, repo: &str, tests: usize) -> Vec<Record> {
@@ -204,13 +222,13 @@ async fn stores_a_run_once_and_keeps_the_raw_upload() {
     let Some(server) = start(30).await else {
         return;
     };
-    let body = gzip(&to_ndjson(&stream("run-1", REPO, 3)));
+    let body = gzip(&to_ndjson(&stream(&gh("run-1"), REPO, 3)));
 
     let (status, reply) = upload(&server, Some(&token(REPO)), body.clone()).await;
     assert_eq!(status, 201, "{reply}");
     assert_eq!(
         reply,
-        json!({"run_id": "run-1", "duplicate": false, "targets": 1, "tests": 3})
+        json!({"run_id": gh("run-1"), "duplicate": false, "targets": 1, "tests": 3})
     );
 
     assert_eq!(
@@ -283,11 +301,75 @@ async fn stores_a_run_once_and_keeps_the_raw_upload() {
 }
 
 #[tokio::test]
+async fn a_job_files_results_only_under_its_own_run_commit_and_repository() {
+    let Some(server) = start(30).await else {
+        return;
+    };
+    // Setup: GitHub run 16162 has not uploaded yet. A job of run 16161
+    // tries to take its run id first, which would make the real upload a
+    // "duplicate" and drop its results.
+    let next_run = format!("gh:{REPO}:16162:1:test-ci:-:ab");
+    let body = gzip(&to_ndjson(&stream(&next_run, REPO, 2)));
+    let (status, reply) = upload(&server, Some(&token(REPO)), body.clone()).await;
+    assert_eq!(status, 403, "{reply}");
+
+    // The real job of run 16162 uploads its results and they are stored.
+    let real = job_token(REPO, "16162", "9f1c");
+    let (status, reply) = upload(&server, Some(&real), body).await;
+    assert_eq!(status, 201, "{reply}");
+    assert_eq!(reply["duplicate"], false);
+
+    // A job cannot file results under a commit it did not run.
+    let other_commit = gzip(&to_ndjson(&stream(&gh("other-commit"), REPO, 1)));
+    let (status, _) = upload(
+        &server,
+        Some(&job_token(REPO, "16161", "dead")),
+        other_commit,
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    // Another allowed repository cannot use this repository's run ids,
+    // with its own name in the record or this one's.
+    let theirs = format!("gh:{REPO}:16161:1:theirs");
+    for repo in ["ArchAstro/aster", REPO] {
+        let body = gzip(&to_ndjson(&stream(&theirs, repo, 1)));
+        let (status, _) = upload(&server, Some(&token("ArchAstro/aster")), body).await;
+        assert_eq!(status, 403, "{repo}");
+    }
+    assert_eq!(
+        count(&server, "SELECT count(*) FROM test_results.runs").await,
+        1,
+        "only the real job's run is stored"
+    );
+    let source: (String, String, String) = {
+        let client = server.app.pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT source, git_ref, event_name FROM test_results.runs",
+                &[],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
+    };
+    assert_eq!(
+        source,
+        (
+            "oidc".to_string(),
+            "refs/pull/16161/merge".to_string(),
+            "pull_request".to_string()
+        )
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn refuses_missing_bad_and_mismatched_credentials() {
     let Some(server) = start(30).await else {
         return;
     };
-    let body = gzip(&to_ndjson(&stream("run-2", REPO, 1)));
+    let body = gzip(&to_ndjson(&stream(&gh("run-2"), REPO, 1)));
     assert_eq!(upload(&server, None, body.clone()).await.0, 401);
     assert_eq!(
         upload(&server, Some("not-a-token"), body.clone()).await.0,
@@ -321,7 +403,7 @@ async fn rejects_malformed_uploads() {
         reply["error"].as_str().unwrap().contains("line 1"),
         "{reply}"
     );
-    let targets_first = to_ndjson(&stream("run-3", REPO, 1)[1..]);
+    let targets_first = to_ndjson(&stream(&gh("run-3"), REPO, 1)[1..]);
     assert_eq!(
         upload(&server, Some(&bearer), gzip(&targets_first)).await.0,
         400
@@ -352,7 +434,7 @@ async fn ingests_fifty_thousand_tests_quickly() {
     let Some(server) = start(30).await else {
         return;
     };
-    let body = gzip(&to_ndjson(&stream("run-big", REPO, 50_000)));
+    let body = gzip(&to_ndjson(&stream(&gh("run-big"), REPO, 50_000)));
     let started = Instant::now();
     let (status, reply) = upload(&server, Some(&token(REPO)), body).await;
     let took = started.elapsed();

@@ -47,18 +47,13 @@ pub async fn handle(app: &App, identity: &Identity, upload: Upload) -> Reply {
         Ok(parts) => parts,
         Err(message) => return Reply::error(400, message),
     };
-    if !run.repo.eq_ignore_ascii_case(&identity.repository) {
-        return Reply::error(
-            403,
-            format!(
-                "the token is for {} but the results are for {}",
-                identity.repository, run.repo
-            ),
-        );
-    }
+    let (run, source) = match bind(identity, run) {
+        Ok(bound) => bound,
+        Err(message) => return Reply::error(403, message),
+    };
 
     let received_at = Utc::now();
-    let stored = match store(app, &run, &targets, &tests, received_at).await {
+    let stored = match store(app, &run, &source, &targets, &tests, received_at).await {
         Ok(stored) => stored,
         Err(error) => {
             crate::log::error(
@@ -125,6 +120,119 @@ fn decode(upload: &Upload, limit: usize) -> Result<String, Reply> {
     String::from_utf8(bytes).map_err(|_| Reply::error(400, "the results are not UTF-8"))
 }
 
+/// Where a run came from, as its token says. The classifier trusts these
+/// columns, never the run record's own `branch`, to tell default-branch
+/// runs from the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// `oidc` or `static`.
+    pub kind: &'static str,
+    /// The OIDC `ref` claim.
+    pub git_ref: Option<String>,
+    /// The OIDC `event_name` claim.
+    pub event_name: Option<String>,
+}
+
+/// Check a run record against the token that uploaded it, and replace what
+/// the token knows better. The record's fields are the client's to choose,
+/// so without this one job could file results under another job's run id
+/// (taking it first, so the real upload is a duplicate), another repository's
+/// id, or a commit and branch it never ran.
+///
+/// - An OIDC token's run id must be `gh:<repo>:<run_id>:<run_attempt>:...`
+///   for the token's own repository, run and attempt (what Aster's client
+///   builds in GitHub Actions); its `sha` must be the token's; `branch`,
+///   `pr` and `attempt` come from the `ref` and `run_attempt` claims.
+/// - A static token's run id names its repository: a `gh:` id must be
+///   `gh:<its repo>:...`, and any other id is stored as
+///   `static:<its repo>:<id>`.
+///
+/// Repositories compare without case, as GitHub's do. So no two
+/// repositories' run ids can collide.
+pub fn bind(identity: &Identity, mut run: RunRecord) -> Result<(RunRecord, Source), String> {
+    if !run.repo.eq_ignore_ascii_case(&identity.repository) {
+        return Err(format!(
+            "the token is for {} but the results are for {}",
+            identity.repository, run.repo
+        ));
+    }
+    let starts_with = |id: &str, prefix: &str| {
+        id.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let repo_prefix = format!("gh:{}:", identity.repository);
+    if identity.static_token {
+        if starts_with(&run.run_id, "gh:") {
+            if !starts_with(&run.run_id, &repo_prefix) {
+                return Err(format!(
+                    "the run id {} is not one of {}'s",
+                    run.run_id, identity.repository
+                ));
+            }
+        } else {
+            run.run_id = format!("static:{}:{}", identity.repository, run.run_id);
+        }
+        return Ok((
+            run,
+            Source {
+                kind: "static",
+                git_ref: None,
+                event_name: None,
+            },
+        ));
+    }
+
+    let Some(github_run) = identity.run_id.as_deref() else {
+        return Err("the token has no run_id claim".into());
+    };
+    let prefix = match identity.run_attempt.as_deref() {
+        Some(attempt) => format!("{repo_prefix}{github_run}:{attempt}:"),
+        None => format!("{repo_prefix}{github_run}:"),
+    };
+    if !starts_with(&run.run_id, &prefix) {
+        return Err(format!(
+            "the run id {} is not this job's: it must start with {prefix}",
+            run.run_id
+        ));
+    }
+    if let Some(sha) = identity.sha.as_deref() {
+        if run.sha != sha {
+            return Err(format!(
+                "the results are for commit {} but the token is for {sha}",
+                run.sha
+            ));
+        }
+    }
+    if let Some(attempt) = identity.run_attempt.as_deref() {
+        run.attempt = attempt.parse().ok();
+    }
+    if let Some(git_ref) = identity.git_ref.as_deref() {
+        run.pr = pull_request(git_ref);
+        if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
+            run.branch = Some(branch.to_string());
+        }
+    }
+    Ok((
+        run,
+        Source {
+            kind: "oidc",
+            git_ref: identity.git_ref.clone(),
+            event_name: identity.event_name.clone(),
+        },
+    ))
+}
+
+/// The pull request a ref belongs to: `refs/pull/123/merge`, or a merge
+/// queue branch `refs/heads/gh-readonly-queue/main/pr-123-<sha>`.
+fn pull_request(reference: &str) -> Option<u64> {
+    if let Some(rest) = reference.strip_prefix("refs/pull/") {
+        return rest.split('/').next()?.parse().ok();
+    }
+    let queue = reference.strip_prefix("refs/heads/gh-readonly-queue/")?;
+    let entry = queue.rsplit('/').next()?;
+    entry.strip_prefix("pr-")?.split('-').next()?.parse().ok()
+}
+
 type Parts = (RunRecord, Vec<TargetRecord>, Vec<TestRecord>);
 
 /// The run record (first and only one), then its targets and tests.
@@ -160,6 +268,7 @@ fn enum_text<T: serde::Serialize>(value: &T) -> String {
 pub async fn store(
     app: &App,
     run: &RunRecord,
+    source: &Source,
     targets: &[TargetRecord],
     tests: &[TestRecord],
     received_at: DateTime<Utc>,
@@ -177,8 +286,9 @@ pub async fn store(
     let inserted = transaction
         .execute(
             "INSERT INTO test_results.runs (run_id, repo, sha, branch, pr, workflow, job, \
-             attempt, lane, runner, aster_version, started_at, received_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             attempt, lane, runner, aster_version, started_at, received_at, \
+             source, git_ref, event_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (run_id) DO NOTHING",
             &[
                 &run.run_id,
@@ -194,6 +304,9 @@ pub async fn store(
                 &run.aster_version,
                 &started_at,
                 &received_at,
+                &source.kind,
+                &source.git_ref,
+                &source.event_name,
             ],
         )
         .await?;
@@ -383,6 +496,104 @@ mod tests {
             aster_version: "0.18.0".into(),
             started_at: "2026-10-13T00:00:00Z".into(),
         }
+    }
+
+    fn oidc(git_ref: &str, event: &str) -> Identity {
+        Identity {
+            repository: "ArchAstro/firstlanding".into(),
+            git_ref: Some(git_ref.into()),
+            run_id: Some("1".into()),
+            run_attempt: Some("1".into()),
+            sha: Some("abc".into()),
+            workflow: None,
+            job_workflow: None,
+            event_name: Some(event.into()),
+            static_token: false,
+        }
+    }
+
+    #[test]
+    fn an_oidc_upload_is_bound_to_its_own_run_commit_and_ref() {
+        // A pull request job: its branch and number come from `ref`, not the
+        // record, which claims to be main.
+        let mut claimed = run();
+        claimed.branch = Some("main".into());
+        claimed.pr = Some(999);
+        let (bound, source) = bind(&oidc("refs/pull/7/merge", "pull_request"), claimed).unwrap();
+        assert_eq!(bound.pr, Some(7));
+        assert_eq!(bound.attempt, Some(1));
+        assert_eq!(
+            source,
+            Source {
+                kind: "oidc",
+                git_ref: Some("refs/pull/7/merge".into()),
+                event_name: Some("pull_request".into()),
+            }
+        );
+        // A push: the branch is the ref's.
+        let (bound, _) = bind(&oidc("refs/heads/main", "push"), run()).unwrap();
+        assert_eq!((bound.branch.as_deref(), bound.pr), (Some("main"), None));
+        // Repository case does not matter.
+        let mut lower = run();
+        lower.run_id = "gh:archastro/FIRSTLANDING:1:1:x".into();
+        assert!(bind(&oidc("refs/heads/main", "push"), lower).is_ok());
+    }
+
+    #[test]
+    fn an_oidc_upload_cannot_take_another_runs_id_or_commit() {
+        let job = oidc("refs/pull/7/merge", "pull_request");
+        for (run_id, why) in [
+            // A later run of the repository: taking it first would make the
+            // real upload a duplicate.
+            ("gh:ArchAstro/firstlanding:2:1:test-ci:x", "another run"),
+            ("gh:ArchAstro/firstlanding:1:2:test-ci:x", "another attempt"),
+            (
+                "gh:ArchAstro/firstlanding:12:1:test-ci:x",
+                "a run id it prefixes",
+            ),
+            ("gh:ArchAstro/other:1:1:test-ci:x", "another repository"),
+            ("static:ArchAstro/firstlanding:x", "a static token's"),
+            ("local:test:ab", "not a GitHub run"),
+        ] {
+            let mut forged = run();
+            forged.run_id = run_id.into();
+            assert!(bind(&job, forged).is_err(), "{why}");
+        }
+        let mut other_commit = run();
+        other_commit.sha = "def".into();
+        assert!(bind(&job, other_commit).is_err());
+        let mut no_run = job.clone();
+        no_run.run_id = None;
+        assert!(bind(&no_run, run()).is_err());
+        let mut other_repo = run();
+        other_repo.repo = "ArchAstro/other".into();
+        assert!(bind(&job, other_repo).is_err());
+    }
+
+    #[test]
+    fn a_static_tokens_run_ids_name_its_repository() {
+        let token = Identity {
+            repository: "ArchAstro/dev".into(),
+            git_ref: None,
+            run_id: None,
+            run_attempt: None,
+            sha: None,
+            workflow: None,
+            job_workflow: None,
+            event_name: None,
+            static_token: true,
+        };
+        let mut local = run();
+        local.repo = "ArchAstro/dev".into();
+        local.run_id = "local:test:ab".into();
+        let (bound, source) = bind(&token, local.clone()).unwrap();
+        assert_eq!(bound.run_id, "static:ArchAstro/dev:local:test:ab");
+        assert_eq!(source.kind, "static");
+        // Its own repository's GitHub ids pass; another's do not.
+        local.run_id = "gh:ArchAstro/dev:5:1:x".into();
+        assert_eq!(bind(&token, local.clone()).unwrap().0.run_id, local.run_id);
+        local.run_id = "gh:ArchAstro/firstlanding:5:1:x".into();
+        assert!(bind(&token, local).is_err());
     }
 
     #[test]
