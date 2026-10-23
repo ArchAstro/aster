@@ -158,6 +158,16 @@ pub struct Config {
     /// `ASTER_SRV_BODY_TIMEOUT_SECS`: how long a request body may take to
     /// arrive in full. Default 60.
     pub body_timeout: Duration,
+    /// `ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS`: how long the body of an
+    /// unauthenticated route (`POST /v1/auth/token`, `POST /cli-auth`, both
+    /// at most 8 KiB) may take to arrive, at most `body_timeout`. Default 8.
+    pub unauth_body_timeout: Duration,
+    /// `ASTER_SRV_MAX_CONNECTIONS_PER_IP`: requests in flight at once from
+    /// one client IP (as [`crate::limits::client_ip`] resolves it; IPv6 by
+    /// /64), per replica; more get `429`. With `trusted_proxy_hops` 0, where
+    /// the TCP peer is the client, it also caps open connections from one
+    /// peer. Default 128.
+    pub max_connections_per_ip: usize,
     /// `ASTER_SRV_HANDLER_TIMEOUT_SECS`: how long a request may run from the
     /// end of its headers to its reply, body read included. Default 120.
     pub handler_timeout: Duration,
@@ -448,6 +458,11 @@ impl Config {
             Duration::from_secs(number("ASTER_SRV_HEADER_TIMEOUT_SECS", 20, 1..=300)?);
         let body_timeout =
             Duration::from_secs(number("ASTER_SRV_BODY_TIMEOUT_SECS", 60, 1..=3600)?);
+        let unauth_body_timeout =
+            Duration::from_secs(number("ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS", 8, 1..=60)?)
+                .min(body_timeout);
+        let max_connections_per_ip =
+            number("ASTER_SRV_MAX_CONNECTIONS_PER_IP", 128, 1..=1_000_000)? as usize;
         let handler_timeout =
             Duration::from_secs(number("ASTER_SRV_HANDLER_TIMEOUT_SECS", 120, 1..=3600)?);
         // Sign-in hands out tokens to whoever IAP names, so it needs IAP to be
@@ -506,6 +521,8 @@ impl Config {
             rate_api_ip_per_min,
             rate_api_subject_per_min,
             body_timeout,
+            unauth_body_timeout,
+            max_connections_per_ip,
             handler_timeout,
             header_timeout,
             max_connections,

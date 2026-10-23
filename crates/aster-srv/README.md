@@ -448,6 +448,8 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_RATE_API_SUBJECT_PER_MIN` | `3000` | Authenticated `/v1/*` per subject (a person, or a CI repository) per minute, per replica. |
 | `ASTER_SRV_HEADER_TIMEOUT_SECS` | `20` | Time to send request headers; also how long an idle connection lives. |
 | `ASTER_SRV_BODY_TIMEOUT_SECS` | `60` | Time for a request body to arrive in full (`408`). |
+| `ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS` | `8` | Time for the body of an unauthenticated route (`POST /v1/auth/token`, `POST /cli-auth`, 8 KiB at most) to arrive (`408`); never more than `ASTER_SRV_BODY_TIMEOUT_SECS`, which the authenticated uploads keep. |
+| `ASTER_SRV_MAX_CONNECTIONS_PER_IP` | `128` | Requests in flight from one client IP (resolved as in [Client IP](#client-ip-and-rate-limits); IPv6 by /64), per replica; more get `429`. With `ASTER_SRV_TRUSTED_PROXY_HOPS=0` the peer is the client, so it also caps that peer's open connections (extra ones are closed unserved). |
 | `ASTER_SRV_HANDLER_TIMEOUT_SECS` | `120` | Time from the end of the headers to the reply, body included (`504`). |
 | `ASTER_SRV_MAX_CONNECTIONS` | `1024` | Open connections per listener; more wait in the accept queue. |
 | `ASTER_SRV_DB_WAIT_SECS` | `5` | How long a request waits for a database connection before failing. |
@@ -481,6 +483,7 @@ server answers `429` with `Retry-After`.
 | `POST /v1/auth/token` | client IP | 10 per minute |
 | all `/v1/*` | client IP | 1200 per minute |
 | authenticated `/v1/*` | person `sub`, or CI repository | 3000 per minute |
+| requests in flight | client IP | 128 (more get `429`) |
 | concurrent exchanges | the replica | 4 (more get `503`, `Retry-After: 1`) |
 | concurrent large bodies (cache commit, test-results upload) | the replica | 8, `ASTER_SRV_MAX_LARGE_BODIES` (more get `503`, `Retry-After: 1`) |
 
@@ -510,8 +513,12 @@ body.
 take at most 8 KiB, uploads and cache writes `ASTER_SRV_MAX_BODY_BYTES`, and
 every other route takes no body (`413`, decided from `Content-Length` before
 reading and while reading chunked bodies). Header, body and whole-request
-times are capped (`408`, `504`), and each listener serves at most
-`ASTER_SRV_MAX_CONNECTIONS` connections. Database connections are capped too:
+times are capped (`408`, `504`); the unauthenticated bodies get the short
+`ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS`. The header timeout also closes an idle
+keep-alive connection. Each listener serves at most
+`ASTER_SRV_MAX_CONNECTIONS` connections and one client IP holds at most
+`ASTER_SRV_MAX_CONNECTIONS_PER_IP` requests open, so a few addresses
+trickling bodies cannot take every slot. Database connections are capped too:
 the shared pool waits `ASTER_SRV_DB_WAIT_SECS` and fails, and
 `POST /v1/auth/token` has its own 2-connection pool so a flood of sign-in
 attempts cannot take connections from CI commits and uploads.

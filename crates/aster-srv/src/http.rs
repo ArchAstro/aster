@@ -213,6 +213,7 @@ async fn serve_surface(
     // One permit per open connection: past the cap, new ones wait in the
     // kernel's accept queue instead of costing a task and a socket each.
     let connections = Arc::new(Semaphore::new(app.config.max_connections));
+    let per_peer = limits::Concurrency::new(app.config.max_connections_per_ip);
     let hsts = app
         .config
         .public_url
@@ -233,6 +234,21 @@ async fn serve_surface(
                         continue;
                     }
                 };
+                // With no trusted proxy the peer is the client, so its open
+                // connections can be capped here. Behind a load balancer the
+                // peer is the balancer; the per-client cap is on in-flight
+                // requests in `handle`, by the forwarded address.
+                let connection_slot = if app.config.trusted_proxy_hops == 0 {
+                    match per_peer.try_acquire(&limits::ip_key(peer.ip().to_canonical())) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            app.metrics.rate_limited("other", "connections_per_ip");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let header_timeout = app.config.header_timeout;
                 let app = Arc::clone(&app);
                 let service = service_fn(move |request| {
@@ -250,6 +266,7 @@ async fn serve_surface(
                 let connection = graceful.watch(connection);
                 tokio::spawn(async move {
                     let _ = connection.await;
+                    drop(connection_slot);
                     drop(permit);
                 });
             }
@@ -287,6 +304,16 @@ async fn handle(
         Arc::clone(&app.metrics),
     );
     audit::scope(ctx, async {
+        // A client IP holds only so many requests open at once, so slow
+        // bodies from one address cannot take every connection slot.
+        let Some(_slot) = app
+            .limits
+            .requests_per_ip
+            .try_acquire(&limits::ip_key(client))
+        else {
+            audit::rate_limited("ip_concurrency", None);
+            return Reply::too_many(1);
+        };
         let work = guarded(app, surface, client, request);
         let reply = tokio::time::timeout(app.config.handler_timeout, work)
             .await
@@ -457,7 +484,7 @@ async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) 
             let body = match read_body(
                 request,
                 crate::cli_auth::MAX_FORM_BYTES,
-                app.config.body_timeout,
+                app.config.unauth_body_timeout,
             )
             .await
             {
@@ -476,7 +503,7 @@ async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) 
             let body = match read_body(
                 request,
                 crate::cli_auth::MAX_FORM_BYTES,
-                app.config.body_timeout,
+                app.config.unauth_body_timeout,
             )
             .await
             {
