@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use super::upload::{agent, bearer, Credentials};
+use crate::srv_url::checked_origin;
 
 /// The most pages `failures_for_github_run` follows.
 const MAX_PAGES: usize = 200;
@@ -37,7 +38,8 @@ impl Server {
         proxy_token: Option<String>,
         timeout: Duration,
     ) -> Result<Self> {
-        let agent = agent(timeout);
+        let origin = checked_origin(url)?;
+        let agent = agent(&origin, timeout);
         let token = bearer(&agent, credentials)?;
         Ok(Self {
             agent,
@@ -88,13 +90,14 @@ impl Server {
         token: String,
         proxy_token: Option<String>,
         timeout: Duration,
-    ) -> Self {
-        Self {
-            agent: agent(timeout),
+    ) -> Result<Self> {
+        let origin = checked_origin(url)?;
+        Ok(Self {
+            agent: agent(&origin, timeout),
             base: url.trim_end_matches('/').to_string(),
             token,
             proxy_token,
-        }
+        })
     }
 
     /// `GET path` (with its query): the status and the JSON body, `Null`
@@ -328,5 +331,24 @@ mod tests {
             .failures_for_github_run("1", None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_cleartext_server_on_another_host_is_refused_before_any_request() {
+        let static_token = Credentials::Static("secret".into());
+        for url in ["http://aster-srv.example.com", "http://10.0.0.5:8080/x"] {
+            let error = Server::connect(url, &static_token, None).err().unwrap();
+            assert!(format!("{error:#}").contains("must be https"), "{error:#}");
+            let error = Server::with_token(url, "t".into(), None, Duration::from_secs(1))
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains("must be https"), "{error:#}");
+        }
+        // https and this machine are fine; a static token needs no request.
+        assert!(Server::connect("https://aster-srv.example.com/", &static_token, None).is_ok());
+        assert!(Server::connect("http://127.0.0.1:1", &static_token, None).is_ok());
+        assert!(
+            Server::with_token("http://[::1]:1", "t".into(), None, Duration::from_secs(1)).is_ok()
+        );
     }
 }
