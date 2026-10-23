@@ -1314,16 +1314,13 @@ async fn unauthenticated_bodies_time_out_in_seconds_while_authenticated_ones_kee
         }
     }
     // A CI upload with a valid token is still waited for: no reply in 3s.
+    let token = common::token_with_claims(
+        REPO,
+        json!({"job_workflow_ref": "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main"}),
+    );
     let stalled = format!(
-        "POST /v1/test-results/runs HTTP/1.1\r\nHost: x\r\nauthorization: {}\r\n\
-         Content-Length: 100\r\n\r\n{{",
-        format!(
-            "Bearer {}",
-            common::token_with_claims(
-                REPO,
-                json!({"job_workflow_ref": "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main"})
-            )
-        )
+        "POST /v1/test-results/runs HTTP/1.1\r\nHost: x\r\nauthorization: Bearer {token}\r\n\
+         Content-Length: 100\r\n\r\n{{"
     );
     let started = Instant::now();
     let reply = raw(&server.url, stalled.as_bytes(), Duration::from_secs(3)).await;
@@ -1387,10 +1384,8 @@ async fn one_client_ip_cannot_hold_more_than_its_share_of_requests_open() {
     let _second = stalled_post(url, "/v1/auth/token", "203.0.113.7").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     // The third from the same client, whatever it prefixes, is turned away.
-    let third = format!(
-        "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
-         x-forwarded-for: 1.2.3.4, 203.0.113.7, 34.8.0.1\r\n\r\n"
-    );
+    let third = "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         x-forwarded-for: 1.2.3.4, 203.0.113.7, 34.8.0.1\r\n\r\n";
     let reply = raw(url, third.as_bytes(), Duration::from_secs(5)).await;
     assert_eq!(status_of(&reply), Some(429), "{reply}");
     assert!(reply.to_lowercase().contains("retry-after"), "{reply}");
