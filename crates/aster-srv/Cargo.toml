@@ -15,6 +15,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 deadpool-postgres = "0.14"
 flate2 = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }

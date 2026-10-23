@@ -139,8 +139,8 @@ impl Default for SignLimits {
     fn default() -> Self {
         Self {
             concurrency: 16,
-            per_second: 100.0,
-            burst: 200.0,
+            per_second: 200.0,
+            burst: 512.0,
             max_wait: Duration::from_secs(2),
         }
     }

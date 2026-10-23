@@ -223,44 +223,107 @@ async fn write_stats(
     Ok(())
 }
 
+/// Blobs one lookup response may name, across all its hits. An entry whose
+/// blobs would not fit is answered as a miss, so the client rebuilds that
+/// target instead of the server doing unbounded GCS and IAM work. An entry
+/// that alone names more than this is never served from the cache. Entries are
+/// admitted in the order the client asked for them.
+pub const MAX_LOOKUP_BLOBS: usize = 4096;
+
+/// Blobs resolved (HEAD and signature) at once for one lookup. The store
+/// bounds the same work across all requests.
+const LOOKUP_CONCURRENCY: usize = 16;
+
+/// What resolving one digest gave.
+enum Resolved {
+    Url(String),
+    /// Not in GCS: the blob is left out and the client uploads it again.
+    Absent,
+    /// GCS or signing failed or was busy: the entry is answered as a miss.
+    Failed,
+}
+
 async fn lookup_hits(
     app: &App,
     repo: &str,
     keys: &[String],
     counts: bool,
 ) -> anyhow::Result<serde_json::Map<String, Value>> {
+    use futures_util::stream::{self, StreamExt};
     let client = app.pool.get().await?;
-    let sql = if counts {
-        "UPDATE cache.manifests \
-         SET last_used_at = now(), hits = hits + 1, last_hit_at = now() \
-         WHERE repo = $1 AND key = ANY($2) \
-         RETURNING key, manifest"
-    } else {
-        "SELECT key, manifest FROM cache.manifests WHERE repo = $1 AND key = ANY($2)"
-    };
-    let rows = client.query(sql, &[&repo, &keys]).await?;
-    let mut hits = serde_json::Map::new();
-    for row in rows {
-        let key: String = row.get(0);
-        let manifest: Vec<u8> = row.get(1);
-        let mut blobs = serde_json::Map::new();
-        for digest in blob_refs(&manifest) {
-            if !app.cache_store.exists(&digest).await? {
-                continue;
-            }
-            if counts {
-                client
-                    .execute(
-                        "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
-                        &[&digest],
-                    )
-                    .await?;
-            }
-            blobs.insert(
-                digest.clone(),
-                Value::String(app.cache_store.signed_url(&digest, Method::Get).await?),
+    let rows = client
+        .query(
+            "SELECT key, manifest FROM cache.manifests WHERE repo = $1 AND key = ANY($2)",
+            &[&repo, &keys],
+        )
+        .await?;
+    let mut found: std::collections::HashMap<String, Vec<u8>> = rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, Vec<u8>>(1)))
+        .collect();
+
+    // Admit entries in request order until the blob budget is spent.
+    let mut admitted: Vec<(String, Vec<u8>, Vec<String>)> = Vec::new();
+    let mut digests: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for key in keys {
+        let Some(manifest) = found.remove(key) else {
+            continue;
+        };
+        let refs = blob_refs(&manifest);
+        let new = refs.iter().filter(|digest| !seen.contains(*digest)).count();
+        if digests.len() + new > MAX_LOOKUP_BLOBS {
+            crate::log::warn(
+                "cache lookup over the blob cap; answered as a miss",
+                json!({"repo": repo, "key": key, "blobs": refs.len(), "cap": MAX_LOOKUP_BLOBS}),
             );
+            continue;
         }
+        for digest in &refs {
+            if seen.insert(digest.clone()) {
+                digests.push(digest.clone());
+            }
+        }
+        admitted.push((key.clone(), manifest, refs));
+    }
+
+    let resolved: std::collections::HashMap<String, Resolved> = stream::iter(digests)
+        .map(|digest| async move {
+            let result = match app.cache_store.readable_url(&digest).await {
+                Ok(Some(url)) => Resolved::Url(url),
+                Ok(None) => Resolved::Absent,
+                Err(error) => {
+                    crate::log::warn(
+                        "cache lookup could not resolve a blob",
+                        json!({"error": format!("{error:#}"), "digest": digest}),
+                    );
+                    Resolved::Failed
+                }
+            };
+            (digest, result)
+        })
+        .buffer_unordered(LOOKUP_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut hits = serde_json::Map::new();
+    let mut served_keys: Vec<String> = Vec::new();
+    let mut served_blobs: Vec<String> = Vec::new();
+    for (key, manifest, refs) in admitted {
+        if refs
+            .iter()
+            .any(|digest| matches!(resolved.get(digest), Some(Resolved::Failed)))
+        {
+            continue;
+        }
+        let mut blobs = serde_json::Map::new();
+        for digest in refs {
+            if let Some(Resolved::Url(url)) = resolved.get(&digest) {
+                blobs.insert(digest.clone(), Value::String(url.clone()));
+                served_blobs.push(digest);
+            }
+        }
+        served_keys.push(key.clone());
         hits.insert(
             key,
             json!({
@@ -268,6 +331,25 @@ async fn lookup_hits(
                 "blobs": blobs,
             }),
         );
+    }
+    if counts && !served_keys.is_empty() {
+        // Only what the response serves counts and is kept alive.
+        client
+            .execute(
+                "UPDATE cache.manifests \
+                 SET last_used_at = now(), hits = hits + 1, last_hit_at = now() \
+                 WHERE repo = $1 AND key = ANY($2)",
+                &[&repo, &served_keys],
+            )
+            .await?;
+        served_blobs.sort();
+        served_blobs.dedup();
+        client
+            .execute(
+                "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = ANY($1)",
+                &[&served_blobs],
+            )
+            .await?;
     }
     Ok(hits)
 }
