@@ -285,18 +285,14 @@ async fn handle(
     peer: std::net::IpAddr,
     request: Request<Incoming>,
 ) -> Reply {
-    let forwarded = request
-        .headers()
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect::<Vec<_>>()
-        .join(",");
-    let client = limits::client_ip(
-        Some(forwarded.as_str()).filter(|f| !f.is_empty()),
-        peer,
-        app.limits.trusted_proxy_hops,
+    let forwarded = limits::forwarded_for(
+        request
+            .headers()
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
     );
+    let client = limits::client_ip(forwarded.as_deref(), peer, app.limits.trusted_proxy_hops);
     let path = request.uri().path().to_string();
     let ctx = RequestCtx::new(
         routes::label(request.method().as_str(), &path),
