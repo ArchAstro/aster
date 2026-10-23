@@ -452,6 +452,38 @@ async fn every_refused_exchange_is_the_same_invalid_grant() {
         (400, invalid_grant())
     );
 
+    // Minted before the `subject` column existed (auth migration 2): such a
+    // code has no subject to put in a token, so it is refused, and spent.
+    for legacy in ["NULL", "''"] {
+        let (code, verifier, port) = sign_in(&server, ADA).await;
+        server
+            .client()
+            .await
+            .execute(
+                &format!("UPDATE auth.cli_codes SET subject = {legacy}"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange(&server, &code, &verifier, port).await,
+            (400, invalid_grant()),
+            "subject {legacy}"
+        );
+        let left: i64 = server
+            .client()
+            .await
+            .query_one(
+                "SELECT count(*) FROM auth.cli_codes \
+                 WHERE code_hash = sha256(convert_to($1, 'UTF8'))",
+                &[&code],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0, "a refused legacy code is spent, subject {legacy}");
+    }
+
     // Never issued, malformed, short verifier, wrong types.
     let (_, verifier) = pkce();
     for body in [
