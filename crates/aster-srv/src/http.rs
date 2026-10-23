@@ -496,10 +496,11 @@ async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) 
             let Some(Principal::Ci(identity)) = principal else {
                 return Reply::error(403, "a person's token is read-only");
             };
-            // Uploads, like cache writes, may be limited to named workflows.
-            if !crate::cache::results_writer_allowed(&app.config, &identity) {
-                return Reply::error(403, "this workflow may not upload test results");
-            }
+            // The gate has applied the results writer rule (named workflows,
+            // no `pull_request_target`) before this point.
+            let Some(_large) = large_body_permit(app) else {
+                return busy();
+            };
             let gzip =
                 header(&request, CONTENT_ENCODING).is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
             let body = match read_body(request, app.config.max_body_bytes, app.config.body_timeout)
@@ -528,6 +529,16 @@ async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) 
             query::handle(app, &identity, route, request.uri().query()).await
         }
         Handler::CacheRead | Handler::CacheLookup | Handler::CacheWrite => {
+            // A commit carries a manifest of up to the body cap; only a few
+            // run at once. The permit is held until the reply is built.
+            let _large = if route.handler == Handler::CacheWrite && path == "/v1/cache/commit" {
+                match large_body_permit(app) {
+                    Some(permit) => Some(permit),
+                    None => return busy(),
+                }
+            } else {
+                None
+            };
             cache_request(
                 app,
                 request,
@@ -562,6 +573,23 @@ async fn route(app: &App, client: std::net::IpAddr, request: Request<Incoming>) 
             crate::ui::handle(app, &http_method, &path, request.uri().query(), assertion).await
         }
     }
+}
+
+/// A permit to read one large body (a commit's manifest or a test-results
+/// upload), or `None` when [`crate::Config::max_large_bodies`] are already
+/// running. Held for the rest of the request.
+fn large_body_permit(app: &App) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = Arc::clone(&app.limits.large_bodies)
+        .try_acquire_owned()
+        .ok();
+    if permit.is_none() {
+        audit::rate_limited("large_body", None);
+    }
+    permit
+}
+
+fn busy() -> Reply {
+    Reply::error(503, "busy; retry shortly").with_header("retry-after", "1".into())
 }
 
 /// Who is reading, for the GET routes over test results. A CI token reads

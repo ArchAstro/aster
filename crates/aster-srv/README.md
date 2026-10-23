@@ -420,6 +420,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_DEFAULT_BRANCH` | `main` | The branch whose runs decide broken and likely-flaky tests. |
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
+| `ASTER_SRV_MAX_LARGE_BODIES` | `8` | Large request bodies (a cache commit's manifest, a test-results upload) one replica reads at once, 1 to 1024. Past it a request gets `503` with `Retry-After: 1`. |
 | `ASTER_SRV_RAW_BUCKET` | unset | A GCS bucket that keeps each upload as sent, using the pod's Workload Identity. Give the bucket a lifecycle rule that deletes objects after the retention period. |
 | `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts: exactly `/projects/NUMBER/global/backendServices/ID`. A project-wide prefix is refused at startup, since it would accept an assertion for any other backend service of the project. Unset turns the dashboard off. See [Dashboard](#dashboard). |
 | `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
@@ -481,6 +482,7 @@ server answers `429` with `Retry-After`.
 | all `/v1/*` | client IP | 1200 per minute |
 | authenticated `/v1/*` | person `sub`, or CI repository | 3000 per minute |
 | concurrent exchanges | the replica | 4 (more get `503`, `Retry-After: 1`) |
+| concurrent large bodies (cache commit, test-results upload) | the replica | 8, `ASTER_SRV_MAX_LARGE_BODIES` (more get `503`, `Retry-After: 1`) |
 
 Google's load balancer sets `X-Forwarded-For` to `<client-supplied>, <client
 IP>, <load balancer IP>`. Everything left of the last two entries is under the
@@ -491,6 +493,18 @@ few entries, or an unparsable one, it uses the TCP peer; with hops 0 it
 ignores the header. IPv6 clients share a limit per /64. This holds only while
 pods are reachable through the balancer alone; a caller reaching a pod
 directly could write the whole header (network policy must prevent it).
+
+**Writers are checked before the body.** The route gate holds a CI token to
+the route's writer rule before reading any body: for `/v1/cache/upload` and
+`/v1/cache/commit` the cache rule (ref from `ASTER_SRV_CACHE_WRITERS`, a
+`push` event, a `job_workflow_ref` prefix from
+`ASTER_SRV_CACHE_WRITER_WORKFLOWS`), so a pull-request job's token gets `403`
+without the server reading up to 64 MiB first. `POST /v1/test-results/runs`
+still accepts pull-request runs (a retry that passes there is the flake
+signal) and refuses `pull_request_target` and foreign workflows; only the
+large-body limit applies to it beyond that. The repository allowlist and
+owner-id pin are applied when the token is verified, which is also before any
+body.
 
 **Size, time and connection limits.** `POST /cli-auth` and `/v1/auth/token`
 take at most 8 KiB, uploads and cache writes `ASTER_SRV_MAX_BODY_BYTES`, and

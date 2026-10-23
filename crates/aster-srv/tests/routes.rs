@@ -23,33 +23,35 @@ const PRIVATE_KEY: &[u8] = include_bytes!("fixtures/test-oidc-key.pem");
 const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 async fn start() -> Option<Server> {
+    start_with(&[]).await
+}
+
+async fn start_with(extra: &[(&str, &str)]) -> Option<Server> {
     let signer = Arc::new(FixedSigner {
         email: "cache-test@example.iam.gserviceaccount.com".into(),
         signature: b"test-signature".to_vec(),
         signed: Default::default(),
     });
     let store = BlobStore::memory("aster-cache-test", signer as Arc<dyn Signer>);
-    common::start_with(
-        &[
-            ("ASTER_SRV_CACHE_BUCKET", "aster-cache-test"),
-            (
-                "ASTER_SRV_CACHE_SIGNER",
-                "cache-test@example.iam.gserviceaccount.com",
-            ),
-            (
-                "ASTER_SRV_IAP_AUDIENCE",
-                "/projects/123456/global/backendServices/4242",
-            ),
-            ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
-            (
-                "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
-                "ArchAstro/firstlanding/.github/workflows/ci.yml@",
-            ),
-            ("ASTER_SRV_REPOSITORY_OWNER_IDS", "ArchAstro/*=4242"),
-        ],
-        Some(store),
-    )
-    .await
+    let mut env = vec![
+        ("ASTER_SRV_CACHE_BUCKET", "aster-cache-test"),
+        (
+            "ASTER_SRV_CACHE_SIGNER",
+            "cache-test@example.iam.gserviceaccount.com",
+        ),
+        (
+            "ASTER_SRV_IAP_AUDIENCE",
+            "/projects/123456/global/backendServices/4242",
+        ),
+        ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
+        (
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+            "ArchAstro/firstlanding/.github/workflows/ci.yml@",
+        ),
+        ("ASTER_SRV_REPOSITORY_OWNER_IDS", "ArchAstro/*=4242"),
+    ];
+    env.extend_from_slice(extra);
+    common::start_with(&env, Some(store)).await
 }
 
 /// A route's pattern with each `:name` filled in.
@@ -738,5 +740,208 @@ async fn the_signed_blob_stand_in_exists_only_when_the_dev_flag_is_set() {
             "{method} without the flag, even on a memory store"
         );
     }
+    server.stop().await;
+}
+
+/// POST `path` with `token`, declare `declared` body bytes, send only `{`,
+/// and report what the server answers within `wait`: `Some(status line)` if
+/// it replied while the body was still unsent, `None` if it kept waiting.
+/// The stream is returned so the caller can keep the body open.
+async fn post_with_unsent_body(
+    server: &Server,
+    path: &str,
+    token: &str,
+    wait: std::time::Duration,
+) -> (Option<String>, tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(server.url.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+                 content-type: application/json\r\ncontent-length: 1000\r\n\r\n{{"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buffer = [0u8; 256];
+    let reply = match tokio::time::timeout(wait, stream.read(&mut buffer)).await {
+        Ok(Ok(n)) if n > 0 => Some(
+            String::from_utf8_lossy(&buffer[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ => None,
+    };
+    (reply, stream)
+}
+
+fn ci_token(change: Value) -> String {
+    let mut claims = json!({
+        "repository_owner_id": "4242",
+        "job_workflow_ref": CI_WORKFLOW,
+        "ref": "refs/heads/main",
+        "event_name": "push",
+    });
+    for (name, value) in change.as_object().unwrap() {
+        claims[name] = value.clone();
+    }
+    token_with_claims(REPO, claims)
+}
+
+/// N1: the gate holds a CI token to the cache writer rule (ref, push event,
+/// workflow prefix) before any body is read. The body is declared and never
+/// sent, so a server that read it first would not answer within the wait.
+#[tokio::test]
+async fn a_non_writer_ci_token_is_refused_before_its_body_is_read() {
+    let Some(server) = start().await else {
+        return;
+    };
+    let wait = std::time::Duration::from_secs(5);
+    let refused = [
+        (
+            "a pull-request ref",
+            ci_token(json!({"ref": "refs/pull/7/merge"})),
+        ),
+        (
+            "a pull_request event on the default branch",
+            ci_token(json!({"event_name": "pull_request"})),
+        ),
+        (
+            "another workflow",
+            ci_token(
+                json!({"job_workflow_ref": "ArchAstro/firstlanding/.github/workflows/evil.yml@refs/heads/main"}),
+            ),
+        ),
+        ("no ref claim", ci_token(json!({"ref": null}))),
+    ];
+    for path in ["/v1/cache/commit", "/v1/cache/upload"] {
+        for (what, token) in &refused {
+            let (reply, _stream) = post_with_unsent_body(&server, path, token, wait).await;
+            let reply = reply.unwrap_or_else(|| panic!("{path} with {what}: waited for the body"));
+            assert!(
+                reply.starts_with("HTTP/1.1 403"),
+                "{path} with {what}: {reply}"
+            );
+        }
+        // A token for a repository off the allowlist, or with the wrong
+        // owner id, is refused at verification, still before the body.
+        for (what, token) in [
+            (
+                "an unlisted repository",
+                token_with_claims("evil/fork", json!({"repository_owner_id": "4242"})),
+            ),
+            (
+                "a wrong owner id",
+                ci_token(json!({"repository_owner_id": "1"})),
+            ),
+        ] {
+            let (reply, _stream) = post_with_unsent_body(&server, path, &token, wait).await;
+            let reply = reply.unwrap_or_else(|| panic!("{path} with {what}: waited for the body"));
+            assert!(
+                reply.starts_with("HTTP/1.1 403"),
+                "{path} with {what}: {reply}"
+            );
+        }
+        // A real writer is let through to read its body: no early reply.
+        let (reply, _stream) = post_with_unsent_body(
+            &server,
+            path,
+            &ci_token(json!({})),
+            std::time::Duration::from_millis(700),
+        )
+        .await;
+        assert_eq!(reply, None, "{path}: a writer's body is awaited");
+    }
+    // Test-results upload deliberately accepts pull requests (accepted
+    // risk): a pull_request token is read, not refused early. Only
+    // pull_request_target and a foreign workflow are.
+    let short = std::time::Duration::from_millis(700);
+    let (reply, _stream) = post_with_unsent_body(
+        &server,
+        "/v1/test-results/runs",
+        &ci_token(json!({"ref": "refs/pull/7/merge", "event_name": "pull_request"})),
+        short,
+    )
+    .await;
+    assert_eq!(reply, None, "a pull_request upload's body is awaited");
+    let (reply, _stream) = post_with_unsent_body(
+        &server,
+        "/v1/test-results/runs",
+        &ci_token(json!({"event_name": "pull_request_target"})),
+        wait,
+    )
+    .await;
+    assert!(reply.unwrap().starts_with("HTTP/1.1 403"));
+    server.stop().await;
+}
+
+/// N1: only `ASTER_SRV_MAX_LARGE_BODIES` large bodies (a commit's manifest,
+/// a test-results upload) are read at once; the rest get 503 with
+/// `Retry-After`, and small routes are unaffected. A slot frees when the
+/// request that held it ends.
+#[tokio::test]
+async fn the_large_body_semaphore_bounds_concurrent_commits_and_uploads() {
+    let Some(server) = start_with(&[("ASTER_SRV_MAX_LARGE_BODIES", "1")]).await else {
+        return;
+    };
+    let token = ci_token(json!({}));
+    let wait = std::time::Duration::from_millis(500);
+    // The first commit holds the only slot, its body half sent.
+    let (reply, first) = post_with_unsent_body(&server, "/v1/cache/commit", &token, wait).await;
+    assert_eq!(reply, None);
+    // A second commit and an upload of results are both turned away.
+    for path in ["/v1/cache/commit", "/v1/test-results/runs"] {
+        let (reply, _stream) = post_with_unsent_body(&server, path, &token, wait).await;
+        let reply = reply.unwrap_or_else(|| panic!("{path}: queued instead of refused"));
+        assert!(reply.starts_with("HTTP/1.1 503"), "{path}: {reply}");
+    }
+    let client = aster_srv::http_client().build().unwrap();
+    let refused = client
+        .post(format!("{}/v1/cache/commit", server.url))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    assert_eq!(refused.headers()["retry-after"], "1");
+    // Lookups carry small bodies and do not use the slot.
+    let (status, _) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": ["k"]}),
+            Some(&format!("Bearer {token}")),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    // When the first request ends, its slot is free again.
+    drop(first);
+    let mut status = 503;
+    for _ in 0..50 {
+        status = client
+            .post(format!("{}/v1/cache/commit", server.url))
+            .bearer_auth(&token)
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        if status != 503 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        status, 400,
+        "the manifest is not valid JSON, but it was read"
+    );
     server.stop().await;
 }

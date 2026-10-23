@@ -13,7 +13,7 @@
 //! | `Person` | a signed-in person's token only (sign out); a CI token is refused. With person sign-in switched off (`ASTER_SRV_PERSON_TOKENS=off`) the route answers 404 before any token is read |
 //! | `Ci` | a CI token (GitHub OIDC or a development static token); a person's token is refused |
 //! | `CiOrPerson` | a CI token for its own repository, or a signed-in person for any served repository: the read-only routes |
-//! | `CiWriter` | a CI token only; the handler also checks the writer rules (ref, workflow, event) |
+//! | `CiWriter` | a CI token only, held at the gate to the route's writer rule before any body is read: the cache's (ref, workflow, push event) for cache writes, the results rule for test-results upload |
 
 use crate::audit;
 use crate::auth::{AuthError, Identity, Principal};
@@ -303,6 +303,21 @@ pub async fn gate(
                 );
                 return Err(Reply::error(403, "a person's token is read-only"));
             }
+            // A CI token that is not allowed to write is refused here, before
+            // any body is read: a pull-request job's token must not make the
+            // server read and parse up to 64 MiB only to refuse it.
+            if class == Auth::CiWriter {
+                if let (Some(route), Principal::Ci(identity)) = (route, &principal) {
+                    if let Some(message) = writer_refusal(app, route.handler, identity) {
+                        audit::auth_failure(
+                            Some(&identity.repository),
+                            "writer_not_allowed",
+                            message,
+                        );
+                        return Err(Reply::error(403, message));
+                    }
+                }
+            }
             if class == Auth::Person && matches!(principal, Principal::Ci(_)) {
                 audit::auth_failure(
                     Some(&person_subject(&principal)),
@@ -313,6 +328,24 @@ pub async fn gate(
             }
             Ok(Some(principal))
         }
+    }
+}
+
+/// Why a CI token may not call a `CiWriter` route, or `None` when it may.
+/// The cache writes use the cache's own writer rule (ref, event, workflow).
+/// Test-results upload deliberately accepts pull-request runs (a retry that
+/// passes there is the flake signal), so it applies only the results rule.
+/// The repository allowlist and the owner-id pin were applied when the token
+/// was verified, before this runs.
+fn writer_refusal(app: &App, handler: Handler, identity: &Identity) -> Option<&'static str> {
+    match handler {
+        Handler::CacheWrite if !crate::cache::cache_writer_allowed(&app.config, identity) => {
+            Some("this caller may not write the cache")
+        }
+        Handler::ResultsUpload if !crate::cache::results_writer_allowed(&app.config, identity) => {
+            Some("this workflow may not upload test results")
+        }
+        _ => None,
     }
 }
 
