@@ -20,7 +20,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{Config, RepositoryAllowlist, StaticToken};
+use crate::config::{Config, OwnerIds, RepositoryAllowlist, StaticToken};
 use crate::person::{Person, TokenIssuer};
 
 /// Who a bearer token names.
@@ -45,7 +45,8 @@ pub async fn authenticate(
     if verifier.is_static(token) {
         return verifier.verify(authorization).await.map(Principal::Ci);
     }
-    let header = decode_header(token).map_err(|e| AuthError::Invalid(e.to_string()))?;
+    let header =
+        decode_header(token).map_err(|_| AuthError::Invalid("the token is malformed".into()))?;
     match header.alg {
         Algorithm::HS256 => match tokens {
             Some(tokens) => tokens.verify(token).map(Principal::Person),
@@ -91,6 +92,10 @@ pub struct Identity {
     /// `workflow_ref` when the claim is absent. Writer workflow prefixes
     /// match it. `None` for a static token.
     pub job_workflow: Option<String>,
+    /// The `event_name` claim (`push`, `pull_request`, `workflow_dispatch`,
+    /// `merge_group`...): what triggered the run. Cache writes need `push`.
+    /// `None` for a static token.
+    pub event_name: Option<String>,
     /// A configured static token, not an OIDC token.
     pub static_token: bool,
 }
@@ -119,12 +124,18 @@ impl AuthError {
 
     /// The reply to send: 403 for a valid token that may not use the
     /// server, 401 for everything else.
+    ///
+    /// The reply says only that the token is not valid. The reason, which
+    /// never contains the token, goes to the log.
     pub fn into_reply(self) -> crate::Reply {
         let status = if matches!(self, AuthError::Forbidden(_)) {
             403
         } else {
             401
         };
+        if let AuthError::Invalid(reason) = &self {
+            crate::log::warn("token refused", serde_json::json!({"reason": reason}));
+        }
         crate::Reply::error(status, self.to_string())
     }
 }
@@ -133,7 +144,7 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthError::Missing => write!(f, "send a bearer token"),
-            AuthError::Invalid(reason) => write!(f, "the token is not valid: {reason}"),
+            AuthError::Invalid(_) => write!(f, "the token is not valid"),
             AuthError::Forbidden(repository) => {
                 write!(f, "{repository} may not use this server")
             }
@@ -156,6 +167,10 @@ struct Claims {
     workflow: Option<String>,
     #[serde(default)]
     job_workflow_ref: Option<String>,
+    #[serde(default)]
+    event_name: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number")]
+    repository_owner_id: Option<String>,
 }
 
 /// GitHub sends `run_id` as a string; accept a number too rather than
@@ -182,6 +197,7 @@ pub struct Verifier {
     audience: String,
     issuer: String,
     allowlist: RepositoryAllowlist,
+    owner_ids: OwnerIds,
     static_tokens: Vec<StaticToken>,
     /// Where keys come from; `None` uses only keys added with [`Self::with_key`].
     jwks_url: Option<String>,
@@ -198,6 +214,7 @@ impl Verifier {
             audience: config.audience.clone(),
             issuer: config.issuer.clone(),
             allowlist: config.repositories.clone(),
+            owner_ids: config.owner_ids.clone(),
             static_tokens: config.static_tokens.clone(),
             jwks_url: Some(format!(
                 "{}/.well-known/jwks",
@@ -243,11 +260,13 @@ impl Verifier {
                 sha: None,
                 workflow: None,
                 job_workflow: None,
+                event_name: None,
                 static_token: true,
             });
         }
 
-        let header = decode_header(token).map_err(|e| AuthError::Invalid(e.to_string()))?;
+        let header = decode_header(token)
+            .map_err(|_| AuthError::Invalid("the token is malformed".into()))?;
         if header.alg != Algorithm::RS256 {
             return Err(AuthError::Invalid(
                 "tokens must be signed with RS256".into(),
@@ -262,10 +281,16 @@ impl Verifier {
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
         validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+        validation.validate_nbf = true;
+        validation.leeway = 5;
         let claims = decode::<Claims>(token, &key, &validation)
-            .map_err(|e| AuthError::Invalid(e.to_string()))?
+            .map_err(|e| AuthError::Invalid(format!("verification failed: {:?}", e.kind())))?
             .claims;
-        if !self.allowlist.allows(&claims.repository) {
+        if !self.allowlist.allows(&claims.repository)
+            || !self
+                .owner_ids
+                .accepts(&claims.repository, claims.repository_owner_id.as_deref())
+        {
             return Err(AuthError::Forbidden(claims.repository));
         }
         let workflow = non_empty(claims.workflow);
@@ -276,6 +301,7 @@ impl Verifier {
             sha: non_empty(claims.sha),
             job_workflow: non_empty(claims.job_workflow_ref).or_else(|| workflow.clone()),
             workflow,
+            event_name: non_empty(claims.event_name),
             static_token: false,
         })
     }
@@ -308,12 +334,16 @@ impl Verifier {
             .json()
             .await
             .map_err(|e| AuthError::Invalid(format!("cannot read signing keys: {e}")))?;
-        let mut keys = self.keys.write().await;
+        // The fetched set replaces the old one: the map stays as small as the
+        // issuer's set, and a key the issuer withdrew stops verifying.
+        let mut fetched = HashMap::new();
         for jwk in &set.keys {
             if let (Some(id), Ok(key)) = (&jwk.common.key_id, DecodingKey::from_jwk(jwk)) {
-                keys.insert(id.clone(), key);
+                fetched.insert(id.clone(), key);
             }
         }
+        let mut keys = self.keys.write().await;
+        *keys = fetched;
         keys.get(kid)
             .cloned()
             .ok_or_else(|| AuthError::Invalid("unknown signing key".to_string()))
@@ -502,7 +532,7 @@ mod tests {
             "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
             "ASTER_SRV_STATIC_TOKENS" => Some("ArchAstro/dev=dev-token-0123456789".into()),
             "ASTER_SRV_PUBLIC_URL" => Some("https://aster-srv.example.com".into()),
-            "ASTER_SRV_IAP_AUDIENCE" => Some("/projects/1/global/backendServices/".into()),
+            "ASTER_SRV_IAP_AUDIENCE" => Some("/projects/1/global/backendServices/4242".into()),
             "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
             "ASTER_SRV_CLI_TOKEN_KEYS" => Some(keys.clone()),
             _ => None,
@@ -752,6 +782,11 @@ mod tests {
 
         let mut verifier = Verifier::new(&config());
         verifier.jwks_url = Some(url);
+        // A key the issuer no longer lists, held from an earlier fetch.
+        verifier
+            .keys
+            .get_mut()
+            .insert("withdrawn".into(), DecodingKey::from_secret(b"x"));
         let verifier = Arc::new(verifier);
         let bearer = format!("Bearer {}", token(claims("ArchAstro/firstlanding"), "slow"));
         let mut calls = tokio::task::JoinSet::new();
@@ -770,6 +805,10 @@ mod tests {
             fetches.load(Ordering::SeqCst),
             1,
             "one fetch serves them all"
+        );
+        assert!(
+            !verifier.keys.read().await.contains_key("withdrawn"),
+            "a refetch drops keys the issuer withdrew"
         );
 
         // A key the issuer really does not have still fails, and does not refetch within a minute.

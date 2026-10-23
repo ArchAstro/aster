@@ -21,6 +21,7 @@ pub mod log;
 pub mod metrics;
 pub mod person;
 pub mod raw_store;
+pub mod routes;
 pub mod test_results;
 mod ui;
 pub mod webhooks;

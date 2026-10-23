@@ -18,7 +18,7 @@ use aster::cli::{
     build_execution_output, build_execution_output_with_cache, check_reserved_target,
     expand_selection, output_json, parse_run_args, print_summary, select_projects, CacheCommands,
     CiCommands, Cli, Commands, GraphOutput, OutputMode, ProjectCommands, ProjectInfo,
-    ResultsCommands, ServicesCommands, ServicesDaemonCommands, TlsCommands, WhyOutput,
+    ResultsCommands, ServicesCommands, ServicesDaemonCommands, SrvCommands, TlsCommands, WhyOutput,
     SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
@@ -98,6 +98,9 @@ fn run() -> Result<()> {
     }
     if let Commands::Results { command } = &command {
         return handle_results(command, output_mode);
+    }
+    if let Commands::Srv { command } = &command {
+        return handle_srv(command);
     }
     if let Commands::Services {
         command: ServicesCommands::Daemon { command },
@@ -342,6 +345,7 @@ fn run() -> Result<()> {
     match command {
         Commands::Init => unreachable!("Init handled above"),
         Commands::Results { .. } => unreachable!("results handled above"),
+        Commands::Srv { .. } => unreachable!("srv handled above"),
         Commands::List { path, lang } => {
             validate_lang_filter(&lang)?;
 
@@ -1851,6 +1855,39 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
             Ok(())
         }
     }
+}
+
+/// `aster srv ...`: print one dashboard dataset as JSON.
+fn handle_srv(command: &SrvCommands) -> Result<()> {
+    use aster::test_results::read::{self, Dataset};
+    let (path, target) = match command {
+        SrvCommands::Get { path, target } => {
+            if !path.starts_with('/') {
+                anyhow::bail!("the path must start with /, for example /v1/cache/summary");
+            }
+            (path.clone(), target)
+        }
+        SrvCommands::Cache { target } => (Dataset::CacheSummary.path(), target),
+        SrvCommands::Flaky { target } => (Dataset::Flaky.path(), target),
+        SrvCommands::Broken { target } => (Dataset::Broken.path(), target),
+        SrvCommands::Quarantine { target } => (Dataset::Quarantine.path(), target),
+        SrvCommands::Clusters { target } => (Dataset::Clusters.path(), target),
+        SrvCommands::Test { id, target } => (Dataset::Test(id.clone()).path(), target),
+    };
+    let url = srv_url(target.url.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("give --url or set ASTER_SRV_URL to your aster-srv URL"))?;
+    let cwd = env::current_dir().context("Failed to get current directory")?;
+    let root = find_workspace_root(&cwd).unwrap_or(cwd);
+    let env_var = |name: &str| env::var(name).ok();
+    let repo = read::default_repo(target.repo.as_deref(), &root, &env_var);
+    let body = read::get(
+        &url,
+        &read::with_repo(&path, repo.as_deref()),
+        &env_var,
+        std::time::SystemTime::now(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
 }
 
 /// The quarantine for a run, loaded once per invocation (a run over

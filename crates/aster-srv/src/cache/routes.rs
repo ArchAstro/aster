@@ -60,7 +60,7 @@ pub async fn handle(
     // end-to-end test rewrites that host to this server and keeps the signed
     // path, so `PUT /<bucket>/cas/<sha256>` stores the bytes commit later hashes.
     // A GCS-backed server does not answer this path at all.
-    if app.cache_store.is_memory() {
+    if app.config.dev_blob_route && app.cache_store.is_memory() {
         if let Some(digest) = test_blob_digest(path) {
             return test_blob(app, method, digest, body).await;
         }
@@ -146,14 +146,19 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     if let Err(reply) = same_repo(&reader, &request.repo) {
         return reply;
     }
-    match lookup_hits(app, &reader.repository, &request.keys).await {
+    // Only CI's lookups count and keep entries alive; a person reading must
+    // not be able to hold an entry in the cache by asking for it.
+    let counts = reader.caller == Caller::Ci;
+    match lookup_hits(app, &reader.repository, &request.keys, counts).await {
         Ok(hits) => {
             let requested = request
                 .keys
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len();
-            record_lookup(app, &reader.repository, hits.len(), requested);
+            if counts {
+                record_lookup(app, &reader.repository, hits.len(), requested);
+            }
             Reply::json(200, json!({"hits": hits}))
         }
         Err(error) => db_error(error),
@@ -217,17 +222,18 @@ async fn lookup_hits(
     app: &App,
     repo: &str,
     keys: &[String],
+    counts: bool,
 ) -> anyhow::Result<serde_json::Map<String, Value>> {
     let client = app.pool.get().await?;
-    let rows = client
-        .query(
-            "UPDATE cache.manifests \
-             SET last_used_at = now(), hits = hits + 1, last_hit_at = now() \
-             WHERE repo = $1 AND key = ANY($2) \
-             RETURNING key, manifest",
-            &[&repo, &keys],
-        )
-        .await?;
+    let sql = if counts {
+        "UPDATE cache.manifests \
+         SET last_used_at = now(), hits = hits + 1, last_hit_at = now() \
+         WHERE repo = $1 AND key = ANY($2) \
+         RETURNING key, manifest"
+    } else {
+        "SELECT key, manifest FROM cache.manifests WHERE repo = $1 AND key = ANY($2)"
+    };
+    let rows = client.query(sql, &[&repo, &keys]).await?;
     let mut hits = serde_json::Map::new();
     for row in rows {
         let key: String = row.get(0);
@@ -237,12 +243,14 @@ async fn lookup_hits(
             if !app.cache_store.exists(&digest).await? {
                 continue;
             }
-            client
-                .execute(
-                    "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
-                    &[&digest],
-                )
-                .await?;
+            if counts {
+                client
+                    .execute(
+                        "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
+                        &[&digest],
+                    )
+                    .await?;
+            }
             blobs.insert(
                 digest.clone(),
                 Value::String(app.cache_store.signed_url(&digest, Method::Get).await?),

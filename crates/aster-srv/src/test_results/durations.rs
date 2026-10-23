@@ -223,6 +223,7 @@ mod tests {
             sha: None,
             workflow: None,
             job_workflow: None,
+            event_name: None,
             static_token: false,
         };
         let (targets, day) = parse(

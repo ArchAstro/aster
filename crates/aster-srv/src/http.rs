@@ -24,9 +24,14 @@ use tokio::sync::Semaphore;
 use crate::audit::{self, RequestCtx};
 use crate::auth::{Identity, Principal};
 use crate::limits;
+use crate::routes::{self, Handler};
 use crate::test_results::ingest::{self, Upload};
 use crate::test_results::{durations, query};
 use crate::App;
+
+/// The most a cache lookup or upload request may send after it is
+/// authenticated: a list of up to 1,024 digests is about 100 KiB.
+const SMALL_BODY_BYTES: usize = 1 << 20;
 
 /// A response before it is sent.
 #[derive(Debug)]
@@ -98,7 +103,7 @@ impl Reply {
     }
 
     /// `429` with how many seconds to wait.
-    fn too_many(seconds: u64) -> Self {
+    pub(crate) fn too_many(seconds: u64) -> Self {
         Self::error(429, "too many requests; slow down")
             .with_header("retry-after", limits::retry_after(seconds))
     }
@@ -277,7 +282,7 @@ async fn handle(
     );
     let path = request.uri().path().to_string();
     let ctx = RequestCtx::new(
-        audit::route_label(request.method(), &path),
+        routes::label(request.method().as_str(), &path),
         client.to_string(),
         Arc::clone(&app.metrics),
     );
@@ -301,13 +306,21 @@ async fn handle(
 }
 
 /// What the request body may weigh on this route; 0 means it takes none.
-fn body_limit(app: &App, method: &Method, path: &str) -> usize {
-    match (method.as_str(), path) {
-        ("POST", "/cli-auth" | "/v1/auth/token") => crate::cli_auth::MAX_FORM_BYTES,
-        ("POST", "/v1/test-results/runs") => app.config.max_body_bytes,
-        ("POST" | "PUT", path) if path.starts_with("/v1/cache/") => app.config.max_body_bytes,
-        // The in-memory blob store's rewritten signed URL.
-        ("PUT", path) if path.split('/').nth(2) == Some("cas") => app.config.max_body_bytes,
+/// Each handler names its own cap, so a route added to the table with a
+/// handler that reads a body must state one here.
+fn body_limit(app: &App, route: Option<&routes::Route>, path: &str) -> usize {
+    let Some(route) = route else { return 0 };
+    match route.handler {
+        Handler::CliAuthAuthorize | Handler::TokenExchange => crate::cli_auth::MAX_FORM_BYTES,
+        Handler::ResultsUpload => app.config.max_body_bytes,
+        // A lookup or upload request is a list of keys or digests; only a
+        // commit carries a manifest.
+        Handler::CacheLookup | Handler::CacheWrite if path != "/v1/cache/commit" => {
+            SMALL_BODY_BYTES.min(app.config.max_body_bytes)
+        }
+        Handler::CacheWrite => app.config.max_body_bytes,
+        // The in-memory blob store's rewritten signed URL takes an upload.
+        Handler::SignedBlob if route.method == "PUT" => app.config.max_body_bytes,
         _ => 0,
     }
 }
@@ -322,7 +335,13 @@ async fn guarded(
     let is_get = request.method() == Method::GET;
     if surface == Surface::Api {
         // Only /v1/*. Checked before anything else, including readiness.
-        if !path.starts_with("/v1/") {
+        // The router and the auth gate are the main surface's, unchanged: a
+        // `/v1/` route is gated the same on both listeners. A route that
+        // relies on IAP, which this listener has none of, is not served.
+        if !path.starts_with("/v1/")
+            || routes::lookup(request.method().as_str(), &path)
+                .is_some_and(|route| route.auth == routes::Auth::Iap)
+        {
             return Reply::error(404, "not found");
         }
         // A bare liveness answer for the load balancer's health check: it
@@ -358,14 +377,18 @@ async fn guarded(
         }
     }
     // Refuse an oversized or unexpected body before reading any of it.
-    let limit = body_limit(app, request.method(), &path);
+    let matched = routes::lookup(request.method().as_str(), &path);
+    let limit = body_limit(app, matched, &path);
     let declared = request
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
     let chunked = request.headers().contains_key(TRANSFER_ENCODING);
-    if declared.is_some_and(|length| length > limit) || (limit == 0 && chunked) {
+    // A known path with the wrong method is a 405 whatever it declares: no
+    // handler runs and no body is read.
+    let wrong_method = matched.is_none() && routes::path_known(&path);
+    if !wrong_method && (declared.is_some_and(|length| length > limit) || (limit == 0 && chunked)) {
         return Reply::error(
             413,
             if limit == 0 {
@@ -376,44 +399,6 @@ async fn guarded(
         );
     }
     route(app, request).await
-}
-
-/// Whether `method path` is a `/v1` route that authenticates a bearer token.
-fn is_v1_authed(method: &Method, path: &str) -> bool {
-    match (method.as_str(), path) {
-        ("POST", "/v1/test-results/runs") | ("GET", "/v1/test-results/durations") => true,
-        ("GET", "/v1/cache/summary" | "/v1/cache/entries") => true,
-        ("POST", path) if path.starts_with("/v1/cache/") => true,
-        ("GET", path) => query::parse_route(path).is_some(),
-        _ => false,
-    }
-}
-
-/// Authenticate once, up front, on every `/v1` route that takes a token: a
-/// bad token is audited and counted here whichever handler it was for, and a
-/// good one is charged to its subject's rate limit. Handlers verify again
-/// for their own policy; the check is a signature, not a query.
-async fn preauth(app: &App, request: &Request<Incoming>) -> Result<(), Reply> {
-    let authorization = header(request, AUTHORIZATION);
-    let principal = match app.principal(authorization.as_deref()).await {
-        Ok(principal) => principal,
-        Err(error) => {
-            let subject = match &error {
-                crate::auth::AuthError::Forbidden(repository) => Some(repository.as_str()),
-                _ => None,
-            };
-            audit::auth_failure(subject, error.reason_code(), &error.to_string());
-            return Err(error.into_reply());
-        }
-    };
-    let subject = match &principal {
-        Principal::Ci(identity) => format!("ci:{}", identity.repository),
-        Principal::Person(person) => format!("person:{}", person.subject),
-    };
-    app.limits.api_subject.check(&subject).map_err(|seconds| {
-        audit::rate_limited("subject", Some(&subject));
-        Reply::too_many(seconds)
-    })
 }
 
 async fn route(app: &App, request: Request<Incoming>) -> Reply {
@@ -429,15 +414,29 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
         }
         return Reply::json(503, body);
     }
-    if is_v1_authed(request.method(), request.uri().path()) {
-        if let Err(reply) = preauth(app, &request).await {
-            return reply;
-        }
-    }
     let path = request.uri().path().to_string();
-    match (request.method(), path.as_str()) {
-        (&Method::GET, "/healthz") => Reply::json(200, json!({"ok": true})),
-        (&Method::GET, "/readyz") => match ready(app).await {
+    let method = request.method().as_str().to_string();
+    let route = routes::lookup(&method, &path);
+    // Authenticate before anything else runs or any body is read.
+    let principal = if routes::needs_gate(route, &path) {
+        let authorization = header(&request, AUTHORIZATION);
+        match routes::gate(app, route, authorization.as_deref()).await {
+            Ok(principal) => principal,
+            Err(reply) => return reply,
+        }
+    } else {
+        None
+    };
+    let Some(route) = route else {
+        return if routes::path_known(&path) {
+            Reply::error(405, "method not allowed")
+        } else {
+            Reply::error(404, "not found")
+        };
+    };
+    match route.handler {
+        Handler::Healthz => Reply::json(200, json!({"ok": true})),
+        Handler::Readyz => match ready(app).await {
             Ok(()) => Reply::json(200, json!({"ok": true})),
             Err(error) => {
                 // The error can carry connection and schema details; this
@@ -449,11 +448,11 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
                 Reply::error(503, "the database is unavailable")
             }
         },
-        (&Method::GET, "/cli-auth") => {
+        Handler::CliAuthConfirm => {
             let assertion = header_name(&request, crate::iap::IAP_HEADER);
             crate::cli_auth::confirm(app, assertion.as_deref(), request.uri().query()).await
         }
-        (&Method::POST, "/cli-auth") => {
+        Handler::CliAuthAuthorize => {
             let assertion = header_name(&request, crate::iap::IAP_HEADER);
             let body = match read_body(
                 request,
@@ -467,7 +466,7 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             crate::cli_auth::authorize(app, assertion.as_deref(), &body).await
         }
-        (&Method::POST, "/v1/auth/token") => {
+        Handler::TokenExchange => {
             let body = match read_body(
                 request,
                 crate::cli_auth::MAX_FORM_BYTES,
@@ -487,13 +486,12 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             crate::cli_auth::exchange(app, &body).await
         }
-        (&Method::POST, "/v1/test-results/runs") => {
-            let identity = match authenticate(app, &request).await {
-                Ok(identity) => identity,
-                Err(reply) => return reply,
+        Handler::ResultsUpload => {
+            let Some(Principal::Ci(identity)) = principal else {
+                return Reply::error(403, "a person's token is read-only");
             };
             // Uploads, like cache writes, may be limited to named workflows.
-            if !crate::cache::workflow_allowed(&app.config, &identity) {
+            if !crate::cache::results_writer_allowed(&app.config, &identity) {
                 return Reply::error(403, "this workflow may not upload test results");
             }
             let gzip =
@@ -506,79 +504,85 @@ async fn route(app: &App, request: Request<Incoming>) -> Reply {
             };
             ingest::handle(app, &identity, Upload { body, gzip }).await
         }
-        (&Method::GET, "/v1/test-results/durations") => {
-            let identity = match authenticate(app, &request).await {
+        Handler::Durations => {
+            let identity = match read_identity(app, principal, &request) {
                 Ok(identity) => identity,
                 Err(reply) => return reply,
             };
             durations::handle(app, &identity, request.uri().query()).await
         }
-        (&Method::GET, path) if query::parse_route(path).is_some() => {
-            let identity = match authenticate(app, &request).await {
+        Handler::ResultsRead => {
+            let identity = match read_identity(app, principal, &request) {
                 Ok(identity) => identity,
                 Err(reply) => return reply,
             };
-            let route = query::parse_route(path).expect("checked above");
+            let Some(route) = query::parse_route(&path) else {
+                return Reply::error(404, "not found");
+            };
             query::handle(app, &identity, route, request.uri().query()).await
         }
-        (&Method::POST, path) if path.starts_with("/v1/cache/") => {
-            cache_request(app, request, "POST", path).await
+        Handler::CacheRead | Handler::CacheLookup | Handler::CacheWrite => {
+            cache_request(
+                app,
+                request,
+                &method,
+                &path,
+                body_limit(app, Some(route), &path),
+            )
+            .await
         }
-        (&Method::GET, "/v1/cache/summary" | "/v1/cache/entries") => {
-            cache_request(app, request, "GET", &path).await
+        // Only the in-memory store answers a rewritten signed blob URL. A
+        // GCS-backed server, which is every production deploy, has none.
+        Handler::SignedBlob => {
+            if app.config.dev_blob_route
+                && app.cache_store.is_memory()
+                && path.split('/').nth(2) == Some("cas")
+            {
+                cache_request(
+                    app,
+                    request,
+                    &method,
+                    &path,
+                    body_limit(app, Some(route), &path),
+                )
+                .await
+            } else {
+                Reply::error(404, "not found")
+            }
         }
-        // A rewritten signed blob URL: `PUT|GET /<bucket>/cas/<sha256>`.
-        // Only the in-memory store answers it. A GCS-backed server, which is
-        // every production deploy, falls through to 404.
-        (method, path)
-            if app.cache_store.is_memory()
-                && matches!(method, &Method::PUT | &Method::GET)
-                && path.split('/').nth(2) == Some("cas") =>
-        {
-            let method = method.as_str().to_string();
-            cache_request(app, request, &method, path).await
+        Handler::Ui => {
+            let assertion = header_name(&request, crate::iap::IAP_HEADER);
+            let http_method = request.method().clone();
+            crate::ui::handle(app, &http_method, &path, request.uri().query(), assertion).await
         }
-        (method, path) if crate::ui::is_ui_path(path) => {
-            let assertion = request
-                .headers()
-                .get(crate::iap::IAP_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            crate::ui::handle(app, method, path, request.uri().query(), assertion).await
-        }
-        (
-            _,
-            "/healthz"
-            | "/readyz"
-            | "/cli-auth"
-            | "/v1/auth/token"
-            | "/v1/test-results/runs"
-            | "/v1/test-results/durations",
-        ) => Reply::error(405, "method not allowed"),
-        (_, path) if query::parse_route(path).is_some() => Reply::error(405, "method not allowed"),
-        _ => Reply::error(404, "not found"),
     }
 }
 
-/// Which CI job is calling, from the bearer token; the error is the reply
-/// to send. A person's token is valid but is for reading the cache only.
-async fn authenticate(app: &App, request: &Request<Incoming>) -> Result<Identity, Reply> {
-    let authorization = header(request, AUTHORIZATION);
-    match app.principal(authorization.as_deref()).await {
-        Ok(Principal::Ci(identity)) => Ok(identity),
-        Ok(Principal::Person(person)) => {
-            audit::auth_failure(
-                Some(&person.subject),
-                "person_token_not_allowed",
-                "a person's token may only read the cache",
-            );
-            Err(Reply::error(
-                403,
-                "a person's token may only read the cache",
-            ))
+/// Who is reading, for the GET routes over test results. A CI token reads
+/// its own repository. A signed-in person reads any repository on the
+/// allowlist, named by `?repo=owner/name`, so the identity returned for them
+/// is one for that repository and the handlers apply their usual
+/// own-repository rule to it.
+fn read_identity(
+    app: &App,
+    principal: Option<Principal>,
+    request: &Request<Incoming>,
+) -> Result<Identity, Reply> {
+    let principal = principal.ok_or_else(|| Reply::error(401, "send a bearer token"))?;
+    if let Principal::Person(person) = &principal {
+        let pairs = query::parse_query(request.uri().query())
+            .ok_or_else(|| Reply::error(400, "the query is not valid"))?;
+        let repo = pairs
+            .iter()
+            .find(|(key, _)| key == "repo")
+            .map(|(_, value)| value.as_str());
+        if let Some(repo) = repo {
+            crate::cache::person_may_browse(app, person, repo)
+                .map_err(|message| Reply::error(403, message))?;
         }
-        Err(error) => Err(error.into_reply()),
+        return routes::identity_for(principal, repo);
     }
+    routes::identity_for(principal, None)
 }
 
 fn header_name(request: &Request<Incoming>, name: &str) -> Option<String> {
@@ -597,7 +601,13 @@ fn header(request: &Request<Incoming>, name: hyper::header::HeaderName) -> Optio
         .map(str::to_string)
 }
 
-async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path: &str) -> Reply {
+async fn cache_request(
+    app: &App,
+    request: Request<Incoming>,
+    method: &str,
+    path: &str,
+    limit: usize,
+) -> Reply {
     let authorization = header(&request, AUTHORIZATION);
     let query = request.uri().query().map(str::to_string);
     // JSON cache routes carry a small body. The rewritten blob GET does not,
@@ -605,7 +615,7 @@ async fn cache_request(app: &App, request: Request<Incoming>, method: &str, path
     let body = if method == "GET" {
         Bytes::new()
     } else {
-        match read_body(request, app.config.max_body_bytes, app.config.body_timeout).await {
+        match read_body(request, limit, app.config.body_timeout).await {
             Ok(body) => body,
             Err(reply) => return reply,
         }

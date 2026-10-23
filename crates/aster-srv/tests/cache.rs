@@ -61,7 +61,7 @@ async fn server() -> Option<(common::Server, Arc<FixedSigner>)> {
             ("ASTER_SRV_CACHE_DAYS", "14"),
             (
                 "ASTER_SRV_IAP_AUDIENCE",
-                "/projects/123456/global/backendServices/",
+                "/projects/123456/global/backendServices/4242",
             ),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
             (
@@ -823,7 +823,7 @@ async fn browsing_routes_authorize_viewers_and_ci() {
             None,
         )
         .await;
-    assert_eq!(status, 404);
+    assert_eq!(status, 405);
     server.stop().await;
 }
 

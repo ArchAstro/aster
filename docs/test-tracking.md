@@ -152,10 +152,31 @@ Signed out, or with an expired or refused token, `aster run` prints one line
 does not fail. If the server has not enabled sign-in, `aster cache login`
 says the server refused it.
 
-A person's token reads the cache and nothing else: it cannot upload or commit
-(the server answers `403`), cannot use test-result routes, and Aster never
-asks to write with it. Entries CI writes carry the CI runner's platform in
-their key, so a macOS laptop mostly misses entries written on Linux CI.
+A person's token reads and never writes: it cannot upload or commit (the
+server answers `403`), cannot upload test results, and Aster never asks to
+write with it. Entries CI writes carry the CI runner's platform in their key,
+so a macOS laptop mostly misses entries written on Linux CI.
+
+### Reading the dashboard's data
+
+The same token reads every dataset the `/ui` pages show, as JSON, for any
+repository the server serves. `aster srv` prints it; the repository defaults to
+`GITHUB_REPOSITORY`, else the checkout's `origin` (`--repo owner/name`
+overrides).
+
+| `/ui` page | Command | Route |
+|---|---|---|
+| Cache | `aster srv cache` | `GET /v1/cache/summary`, `/v1/cache/entries?target=` |
+| Flaky tests | `aster srv flaky` | `GET /v1/test-results/tests?state=flaky` |
+| Flaky tests (broken list) | `aster srv broken` | `GET /v1/test-results/tests?state=broken` |
+| Failure clusters | `aster srv clusters` | `GET /v1/test-results/clusters` |
+| Quarantine | `aster srv quarantine` | `GET /v1/test-results/quarantine` |
+| A test | `aster srv test <id>` | `GET /v1/test-results/tests/<id>` |
+| Anything else | `aster srv get '<path>'` | any `GET /v1/...` route, such as `/v1/test-results/durations?...` or `/v1/test-results/runs/<id>/failures` |
+
+With CI credentials in the environment (`ASTER_SRV_TOKEN`, GitHub OIDC) the CI
+token is used and reads its own repository. Not signed in, or a refused token,
+exits non-zero with the reason.
 
 ## 4. Flaky and broken
 

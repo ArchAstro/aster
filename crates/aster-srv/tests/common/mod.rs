@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 const PRIVATE: &[u8] = include_bytes!("../fixtures/test-oidc-key.pem");
 const PUBLIC: &[u8] = include_bytes!("../fixtures/test-oidc-key.pub.pem");
 /// The audience dashboard tests configure and sign for.
-pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
+pub const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/4242";
 pub const REPO: &str = "ArchAstro/firstlanding";
 /// What the test server answers to, and how it signs person tokens.
 pub const PUBLIC_URL: &str = "https://aster-srv.test";
@@ -181,6 +181,7 @@ async fn launch(
                 {
                     Some(CLI_TOKEN_KEYS.into())
                 }
+                "ASTER_SRV_DEV_BLOB_ROUTE" => Some("1".into()),
                 _ => None,
             }),
     })
@@ -350,7 +351,7 @@ pub fn iap_subject(email: &str) -> String {
 
 /// An IAP assertion for `email`, signed with the fixture key.
 pub fn iap_assertion(email: &str) -> String {
-    iap_assertion_for(email, &format!("{IAP_AUDIENCE}4242"))
+    iap_assertion_for(email, IAP_AUDIENCE)
 }
 
 /// [`iap_assertion`] addressed to `audience`.
@@ -360,12 +361,12 @@ pub fn iap_assertion_for(email: &str, audience: &str) -> String {
 
 /// An assertion with no `sub` claim at all.
 pub fn iap_assertion_without_subject(email: &str) -> String {
-    iap_assertion_full(email, None, &format!("{IAP_AUDIENCE}4242"))
+    iap_assertion_full(email, None, IAP_AUDIENCE)
 }
 
 /// An assertion for a chosen subject, as when an account's email changes.
 pub fn iap_assertion_with_subject(email: &str, subject: &str) -> String {
-    iap_assertion_full(email, Some(subject), &format!("{IAP_AUDIENCE}4242"))
+    iap_assertion_full(email, Some(subject), IAP_AUDIENCE)
 }
 
 fn iap_assertion_full(email: &str, subject: Option<&str>, audience: &str) -> String {
@@ -394,6 +395,7 @@ pub fn token_with_ref(repository: &str, workflow_ref: Option<&str>) -> String {
         "aud": "aster-srv",
         "exp": Utc::now().timestamp() + 300,
         "repository": repository,
+        "event_name": "push",
     });
     if let Some(workflow_ref) = workflow_ref {
         claims["ref"] = json!(workflow_ref);
@@ -416,6 +418,7 @@ pub fn token_with_claims(repository: &str, extra: Value) -> String {
         "aud": "aster-srv",
         "exp": Utc::now().timestamp() + 300,
         "repository": repository,
+        "event_name": "push",
     });
     for (name, value) in extra.as_object().expect("claims are an object") {
         claims[name] = value.clone();

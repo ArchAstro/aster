@@ -20,7 +20,17 @@ mod store;
 
 use crate::db::Migration;
 
-pub use policy::workflow_allowed;
+pub use policy::{results_writer_allowed, workflow_allowed};
+
+/// Whether a signed-in person may read `repo`'s data: their email domain is
+/// allowed and the server serves the repository.
+pub fn person_may_browse(
+    app: &crate::App,
+    person: &crate::person::Person,
+    repo: &str,
+) -> Result<(), &'static str> {
+    policy::person_browser(&app.iap, person, repo, &app.config.repositories)
+}
 pub use routes::{handle, Headers};
 pub use signing::{expires_at, FixedSigner, Signer, URL_TTL};
 pub use store::{run_retention, spawn, BlobStore, Report};

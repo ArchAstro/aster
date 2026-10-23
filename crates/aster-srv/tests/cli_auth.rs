@@ -30,7 +30,7 @@ fn server_env() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "ASTER_SRV_IAP_AUDIENCE",
-            "/projects/123456/global/backendServices/",
+            "/projects/123456/global/backendServices/4242",
         ),
         ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
         // These tests exchange many codes from one address.
@@ -671,26 +671,193 @@ async fn a_person_reads_the_cache_and_nothing_else() {
         )
         .await;
     assert_eq!(status, 403);
-    // Test results are CI's, not people's.
-    for (method, path) in [
-        ("POST", "/v1/test-results/runs"),
-        ("GET", "/v1/test-results/durations?target=%2F%2Fa%3Ab"),
-        ("GET", "/v1/test-results/tests"),
-        ("GET", "/v1/test-results/quarantine"),
+    // A person without a repository named has nothing to read.
+    assert_eq!(get("/v1/test-results/tests").await, 400);
+    // Uploading results is CI's.
+    let response = browser()
+        .post(format!("{}/v1/test-results/runs", server.url))
+        .header("authorization", &person)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    server.stop().await;
+}
+
+/// What `/ui` shows, as JSON: dataset, path, and the proof it is real.
+#[tokio::test]
+async fn a_person_reads_every_dashboard_dataset_and_writes_nothing() {
+    use chrono::{Duration, Utc};
+    use common::{seed, Run};
+
+    let Some(server) = start().await else {
+        return;
+    };
+    let now = Utc::now();
+    let hours = |h: i64| now - Duration::hours(h);
+    seed(
+        &server,
+        &Run::new("r1", "main", hours(30))
+            .result("flaky one", "pass", None)
+            .result("broken one", "fail", Some("hash-b")),
+    )
+    .await;
+    seed(
+        &server,
+        &Run::new("r2", "main", hours(20))
+            .attempt("flaky one", "fail", 1, Some("hash-a"))
+            .attempt("flaky one", "pass", 2, None)
+            .result("broken one", "fail", Some("hash-b")),
+    )
+    .await;
+    // Another repository's data, which a person names only by asking for it.
+    let mut other = Run::new("o1", "main", hours(1)).result("z", "pass", None);
+    other.repo = "ArchAstro/other";
+    seed(&server, &other).await;
+    server
+        .client()
+        .await
+        .batch_execute(&format!(
+            "UPDATE test_results.tests SET state = 'flaky', flake_score = 5 \
+                 WHERE repo = '{REPO}' AND test_id = 'flaky one'; \
+             UPDATE test_results.tests SET state = 'broken', broken_since_sha = 'r1' \
+                 WHERE repo = '{REPO}' AND test_id = 'broken one'; \
+             INSERT INTO test_results.quarantine (repo, test_id, entered_at, expires_at, runs) \
+                 VALUES ('{REPO}', 'flaky one', now(), now() + interval '30 days', 2)"
+        ))
+        .await
+        .unwrap();
+
+    let person = person_bearer(&server, ADA);
+    let q = "repo=ArchAstro%2Ffirstlanding";
+    let ci = format!("Bearer {}", common::token(REPO));
+    let day = Utc::now().date_naive();
+    // (dataset, path, a check on what the person reads)
+    type Check = fn(&Value) -> bool;
+    let datasets: Vec<(&str, String, Check)> = vec![
+        (
+            "flaky tests",
+            format!("/v1/test-results/tests?state=flaky&{q}"),
+            |b| b["tests"][0]["test_id"] == "flaky one",
+        ),
+        (
+            "broken tests",
+            format!("/v1/test-results/tests?state=broken&{q}"),
+            |b| b["tests"][0]["test_id"] == "broken one",
+        ),
+        (
+            "failure clusters",
+            format!("/v1/test-results/clusters?{q}"),
+            |b| b["clusters"][0]["failure_hash"] == "hash-b" && b["clusters"][0]["failures"] == 2,
+        ),
+        (
+            "quarantine",
+            format!("/v1/test-results/quarantine?{q}"),
+            |b| b["tests"][0]["test_id"] == "flaky one",
+        ),
+        (
+            "one test's history",
+            format!("/v1/test-results/tests/flaky%20one?{q}"),
+            |b| b["test"]["test_id"] == "flaky one",
+        ),
+        (
+            "a run's failures",
+            format!("/v1/test-results/runs/r2/failures?{q}"),
+            |b| b["failures"].is_array(),
+        ),
+        (
+            "durations",
+            format!("/v1/test-results/durations?target=%2F%2Fa%3Atest&day={day}&{q}"),
+            |b| b["files"].is_array(),
+        ),
+        ("cache summary", format!("/v1/cache/summary?{q}"), |b| {
+            b["repo"] == REPO
+        }),
+        (
+            "cache entries",
+            format!("/v1/cache/entries?{q}&target=%2F%2Fa%3Ab"),
+            |b| b["entries"].is_array(),
+        ),
+    ];
+    for (dataset, path, check) in &datasets {
+        let (status, body) = server.get_json(path, Some(&person), None).await;
+        assert_eq!(status, 200, "{dataset}: {body}");
+        assert!(check(&body), "{dataset}: {body}");
+    }
+    // A CI token reads its own repository's data, with or without `repo`.
+    let (status, body) = server
+        .get_json("/v1/test-results/clusters", Some(&ci), None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["clusters"][0]["failure_hash"], "hash-b");
+    let (status, _) = server
+        .get_json(
+            "/v1/test-results/tests?repo=ArchAstro/other",
+            Some(&ci),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "a CI token still reads only its own repository"
+    );
+
+    // The person's repository is the one named, and only a served one.
+    let (_, theirs) = server
+        .get_json(
+            "/v1/test-results/tests?repo=ArchAstro/other",
+            Some(&person),
+            None,
+        )
+        .await;
+    assert_eq!(theirs["tests"][0]["test_id"], "z");
+    for path in [
+        "/v1/test-results/tests?repo=evil/x",
+        "/v1/test-results/clusters?repo=evil/x",
+        "/v1/test-results/quarantine?repo=evil/x",
     ] {
-        let client = browser();
-        let url = format!("{}{path}", server.url);
-        let request = if method == "POST" {
-            client.post(url).body("{}")
-        } else {
-            client.get(url)
-        };
-        let response = request
-            .header("authorization", &person)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status().as_u16(), 403, "{method} {path}");
+        assert_eq!(server.get_json(path, Some(&person), None).await.0, 403);
+    }
+    // Another domain's person, whose token this server issued earlier.
+    let outsider = person_bearer(&server, "eve@other.test");
+    for (dataset, path, _) in &datasets {
+        let (status, _) = server.get_json(path, Some(&outsider), None).await;
+        assert_eq!(status, 403, "{dataset}");
+    }
+    // No token at all.
+    for (dataset, path, _) in &datasets {
+        assert_eq!(server.get_json(path, None, None).await.0, 401, "{dataset}");
+    }
+    // Writes are refused whatever the person names.
+    let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let manifest = BASE64STD.encode(
+        serde_json::to_vec(&json!({"schema": 1, "key": "k", "target": "//a:b", "outputs": []}))
+            .unwrap(),
+    );
+    for (path, body) in [
+        ("/v1/test-results/runs", json!({})),
+        (
+            "/v1/cache/upload",
+            json!({"repo": REPO, "digests": [digest]}),
+        ),
+        (
+            "/v1/cache/commit",
+            json!({"repo": REPO, "key": "k", "manifest": manifest}),
+        ),
+    ] {
+        let (status, response) = server.post_json(path, &body, Some(&person), None).await;
+        assert_eq!(status, 403, "POST {path}: {response}");
+    }
+    for path in [
+        format!("/v1/test-results/tests?{q}"),
+        format!("/v1/test-results/clusters?{q}"),
+        format!("/v1/test-results/quarantine?{q}"),
+    ] {
+        let (status, _) = server
+            .post_json(&path, &json!({}), Some(&person), None)
+            .await;
+        assert_eq!(status, 405, "POST {path}");
     }
     server.stop().await;
 }
@@ -740,9 +907,18 @@ async fn a_person_token_that_is_expired_forged_misdirected_or_rotated_out_is_ref
     assert_eq!(
         lookup(sign(claims(&|_| {}), "t1", secret)).await,
         200,
-        "control"
+        "control: the scope earlier releases minted"
+    );
+    assert_eq!(
+        lookup(sign(claims(&|c| c["scope"] = json!("read")), "t1", secret)).await,
+        200,
+        "the scope this release mints"
     );
     for (what, bearer) in [
+        (
+            "another scope",
+            sign(claims(&|c| c["scope"] = json!("write")), "t1", secret),
+        ),
         (
             "expired",
             sign(

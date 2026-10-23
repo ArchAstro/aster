@@ -32,7 +32,7 @@ const OIDC_PUBLIC: &[u8] = include_bytes!("fixtures/test-oidc-key.pub.pem");
 const REPO: &str = "acme/app";
 const PERSON: &str = "ada@example.com";
 const CI_WORKFLOW: &str = "acme/app/.github/workflows/ci.yml@refs/heads/main";
-const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/";
+const IAP_AUDIENCE: &str = "/projects/123456/global/backendServices/4242";
 const CLI_KEY: &str = "e2e1:Rm7vKq2LxT9bYc4nWz8PdJ3hSeA6UgF1oIiNtXuMvB0";
 
 struct Running {
@@ -72,7 +72,7 @@ impl Running {
             &header,
             &json!({
                 "iss": "https://cloud.google.com/iap",
-                "aud": format!("{IAP_AUDIENCE}4242"),
+                "aud": IAP_AUDIENCE,
                 "exp": chrono::Utc::now().timestamp() + 300,
                 "email": email,
                 "sub": "accounts.google.com:e2e-1001",
@@ -88,9 +88,11 @@ async fn start() -> Option<Running> {
         eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
         return None;
     };
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let database = format!(
-        "aster_login_e2e_{}_{}",
+        "aster_login_e2e_{}_{}_{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -118,6 +120,7 @@ async fn start() -> Option<Running> {
         "ASTER_SRV_CACHE_BUCKET" => Some("aster-cache-e2e".into()),
         "ASTER_SRV_CACHE_SIGNER" => Some("cache-e2e@example.iam.gserviceaccount.com".into()),
         "ASTER_SRV_IAP_AUDIENCE" => Some(IAP_AUDIENCE.into()),
+        "ASTER_SRV_DEV_BLOB_ROUTE" => Some("1".into()),
         "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
         "ASTER_SRV_PUBLIC_URL" => Some(url.clone()),
         // The e2e server listens on loopback http.
@@ -179,6 +182,7 @@ fn github_oidc_endpoint(stop: Arc<AtomicBool>) -> String {
             "ref": "refs/heads/main",
             "sha": "0123abc",
             "run_id": "7001",
+            "event_name": "push",
             "workflow_ref": CI_WORKFLOW,
             "job_workflow_ref": CI_WORKFLOW,
         }),
@@ -371,6 +375,58 @@ fn login_with(
     (status, reader.join().unwrap())
 }
 
+/// `aster cache login` against the real server, with the scripted browser
+/// playing a person behind IAP: GET the page, confirm, and follow the
+/// server's redirect to the CLI's loopback listener.
+async fn sign_in(
+    server: &Running,
+    dir: &Path,
+    config_home: &Path,
+) -> (std::process::ExitStatus, Vec<String>) {
+    let url = server.url.clone();
+    let assertion = server.iap_assertion(PERSON);
+    tokio::task::spawn_blocking({
+        let (dir, url, config) = (dir.to_path_buf(), url, config_home.to_path_buf());
+        move || {
+            login_with(&dir, &url, &config, |sign_in_url| {
+                let agent = browser();
+                // The confirmation page names who is signing in.
+                let page = reply(
+                    agent
+                        .get(sign_in_url)
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .call()
+                        .expect("GET /cli-auth"),
+                );
+                assert_eq!(page.status, 200, "{}", page.body);
+                assert!(page.body.contains(PERSON), "{}", page.body);
+                // The person clicks Authorize.
+                let confirmed = reply(
+                    agent
+                        .post(format!("{url}/cli-auth"))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .send(form_body(&page.body))
+                        .expect("POST /cli-auth"),
+                );
+                assert_eq!(confirmed.status, 302, "{}", confirmed.body);
+                let callback = confirmed.location.expect("a redirect");
+                assert!(
+                    callback.starts_with("http://127.0.0.1:")
+                        && callback.contains("/callback?code="),
+                    "the redirect goes to the loopback listener only: {callback}"
+                );
+                // The browser lands on the CLI's listener, with no IAP header.
+                let landed = reply(agent.get(&callback).call().expect("GET /callback"));
+                assert_eq!(landed.status, 200, "{}", landed.body);
+                assert!(landed.body.contains("close this tab"), "{}", landed.body);
+            })
+        }
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_laptop_signs_in_through_aster_srv_and_restores_what_ci_wrote() {
     let Some(server) = start().await else {
@@ -443,47 +499,7 @@ async fn a_laptop_signs_in_through_aster_srv_and_restores_what_ci_wrote() {
     // Phase 3: `aster cache login` against the real server. The scripted
     // browser is a person behind IAP: GET the page, confirm, and follow the
     // server's redirect to the CLI's loopback listener.
-    let assertion = server.iap_assertion(PERSON);
-    let (status, lines) = tokio::task::spawn_blocking({
-        let (dir, url, config) = (laptop.clone(), url.clone(), config_home.clone());
-        move || {
-            login_with(&dir, &url, &config, |sign_in_url| {
-                let agent = browser();
-                // The confirmation page names who is signing in.
-                let page = reply(
-                    agent
-                        .get(sign_in_url)
-                        .header("x-goog-iap-jwt-assertion", &assertion)
-                        .call()
-                        .expect("GET /cli-auth"),
-                );
-                assert_eq!(page.status, 200, "{}", page.body);
-                assert!(page.body.contains(PERSON), "{}", page.body);
-                // The person clicks Authorize.
-                let confirmed = reply(
-                    agent
-                        .post(format!("{url}/cli-auth"))
-                        .header("content-type", "application/x-www-form-urlencoded")
-                        .header("x-goog-iap-jwt-assertion", &assertion)
-                        .send(form_body(&page.body))
-                        .expect("POST /cli-auth"),
-                );
-                assert_eq!(confirmed.status, 302, "{}", confirmed.body);
-                let callback = confirmed.location.expect("a redirect");
-                assert!(
-                    callback.starts_with("http://127.0.0.1:")
-                        && callback.contains("/callback?code="),
-                    "the redirect goes to the loopback listener only: {callback}"
-                );
-                // The browser lands on the CLI's listener, with no IAP header.
-                let landed = reply(agent.get(&callback).call().expect("GET /callback"));
-                assert_eq!(landed.status, 200, "{}", landed.body);
-                assert!(landed.body.contains("close this tab"), "{}", landed.body);
-            })
-        }
-    })
-    .await
-    .unwrap();
+    let (status, lines) = sign_in(&server, &laptop, &config_home).await;
     let transcript = lines.join("\n");
     assert!(status.success(), "login failed: {transcript}");
     assert!(
@@ -559,6 +575,236 @@ async fn a_laptop_signs_in_through_aster_srv_and_restores_what_ci_wrote() {
     .await
     .unwrap();
     assert_eq!(write.status, 403, "{}", write.body);
+
+    server.stop().await;
+}
+
+/// What `aster srv <args>` printed and how it exited.
+async fn srv(dir: &Path, url: &str, config_home: &Path, args: &[&str]) -> (bool, Value, String) {
+    let output = tokio::task::spawn_blocking({
+        let (dir, url, config) = (
+            dir.to_path_buf(),
+            url.to_string(),
+            config_home.to_path_buf(),
+        );
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        move || {
+            aster(&dir)
+                .arg("srv")
+                .args(args)
+                .env("ASTER_SRV_URL", url)
+                .env("XDG_CONFIG_HOME", config)
+                .output()
+                .expect("spawn aster srv")
+        }
+    })
+    .await
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    (
+        output.status.success(),
+        serde_json::from_str(&stdout).unwrap_or(Value::Null),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// One CI run of `//app:test`, as `--test-results` writes it: `flaky_test`
+/// fails and then passes on retry, `broken_test` fails on every attempt.
+fn ci_results(run: usize) -> String {
+    let record = |value: Value| format!("{value}\n");
+    let test = |id: &str, outcome: &str, attempt: u32, hash: Option<&str>| {
+        record(json!({
+            "type": "test", "target": "//app:test", "test_id": id, "file": "app/t.exs",
+            "name": id, "outcome": outcome, "attempt": attempt, "duration_ms": 5,
+            "failure_hash": hash, "message": hash.map(|_| format!("boom in {id}")),
+        }))
+    };
+    [
+        record(json!({
+            "type": "run", "run_id": format!("e2e-run-{run}"), "repo": REPO,
+            "sha": format!("{run:040}"), "branch": "main", "aster_version": "0.0.0",
+            "started_at": chrono::Utc::now().to_rfc3339(),
+        })),
+        record(json!({
+            "type": "target", "address": "//app:test", "input_hash": format!("h{run}"),
+            "status": "failed", "cached": false, "duration_ms": 10, "confidence": "complete",
+        })),
+        test("flaky_test", "fail", 1, Some("flake-hash")),
+        test("flaky_test", "pass", 2, None),
+        test("broken_test", "fail", 1, Some("broken-hash")),
+    ]
+    .concat()
+}
+
+/// A person who signed in with `aster cache login` can read every dataset the
+/// dashboard shows through `aster srv`, from data CI uploaded, and the server
+/// refuses their writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
+    let Some(server) = start().await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let ci_checkout = root.path().join("ci").join("workspace");
+    let laptop = root.path().join("laptop").join("workspace");
+    let config_home = root.path().join("laptop-config");
+    for dir in [&ci_checkout, &laptop] {
+        checkout(dir);
+    }
+    let url = server.url.clone();
+
+    // Phase 1: CI uploads three runs of a suite with a flaky test and a broken
+    // one, with the job's OIDC token, through `aster results upload`.
+    let stop_oidc = Arc::new(AtomicBool::new(false));
+    let oidc_url = github_oidc_endpoint(stop_oidc.clone());
+    for run in 1..=3 {
+        let file = root.path().join(format!("results-{run}.ndjson"));
+        fs::write(&file, ci_results(run)).unwrap();
+        let uploaded = tokio::task::spawn_blocking({
+            let (dir, url, oidc_url) = (ci_checkout.clone(), url.clone(), oidc_url.clone());
+            move || {
+                aster(&dir)
+                    .args(["results", "upload", "--strict"])
+                    .arg(&file)
+                    .env("ASTER_SRV_URL", &url)
+                    .env("ACTIONS_ID_TOKEN_REQUEST_URL", oidc_url)
+                    .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token")
+                    .output()
+                    .expect("spawn aster results upload")
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            uploaded.status.success(),
+            "upload {run}: {}",
+            String::from_utf8_lossy(&uploaded.stderr)
+        );
+    }
+    stop_oidc.store(true, Ordering::Relaxed);
+    // The server's classifier decides flaky, broken and quarantined; run its
+    // pass now instead of waiting for the schedule.
+    aster_srv::test_results::classifier::run_once(
+        &server.app,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap()
+    .expect("the classifier lock is free");
+
+    // Phase 2: before signing in, the laptop is told how, and prints no JSON.
+    let (ok, body, stderr) = srv(&laptop, &url, &config_home, &["flaky"]).await;
+    assert!(!ok && body.is_null(), "{body}");
+    assert!(
+        stderr.contains("not signed in; run aster cache login"),
+        "{stderr}"
+    );
+
+    // Phase 3: sign in, as in the cache test.
+    let (status, lines) = sign_in(&server, &laptop, &config_home).await;
+    assert!(status.success(), "login failed: {}", lines.join("\n"));
+
+    // Phase 4: one read per dataset. The repository is the checkout's
+    // (GITHUB_REPOSITORY), which the person never typed.
+    let today = chrono::Utc::now().date_naive().to_string();
+    let durations = format!("/v1/test-results/durations?target=%2F%2Fapp%3Atest&day={today}");
+    let ids = |body: &Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|entry| entry["test_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let read = |args: &'static [&'static str]| {
+        let (laptop, url, config_home) = (laptop.clone(), url.clone(), config_home.clone());
+        async move {
+            let (ok, body, stderr) = srv(&laptop, &url, &config_home, args).await;
+            assert!(ok, "aster srv {args:?}: {stderr}");
+            assert_eq!(body["repo"], REPO, "aster srv {args:?}: {body}");
+            body
+        }
+    };
+    assert!(read(&["cache"]).await["entries"].is_null());
+    assert_eq!(ids(&read(&["flaky"]).await, "tests"), ["flaky_test"]);
+    assert_eq!(ids(&read(&["broken"]).await, "tests"), ["broken_test"]);
+    let quarantine = read(&["quarantine"]).await;
+    assert_eq!(ids(&quarantine, "tests"), ["flaky_test"], "{quarantine}");
+    let clusters = read(&["clusters"]).await;
+    let hashes: Vec<&str> = clusters["clusters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|cluster| cluster["failure_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(hashes.len(), 2, "{clusters}");
+    assert!(hashes.contains(&"flake-hash") && hashes.contains(&"broken-hash"));
+    let history = read(&["test", "flaky_test"]).await;
+    assert_eq!(history["test"]["state"], "flaky", "{history}");
+    assert_eq!(history["history"].as_array().unwrap().len(), 6, "{history}");
+    let by_path = {
+        let (ok, body, stderr) = srv(
+            &laptop,
+            &url,
+            &config_home,
+            &["get", "/v1/test-results/runs/e2e-run-1/failures"],
+        )
+        .await;
+        assert!(ok, "{stderr}");
+        body
+    };
+    assert_eq!(by_path["run"]["repo"], REPO, "{by_path}");
+    let (ok, durations_body, stderr) = srv(&laptop, &url, &config_home, &["get", &durations]).await;
+    assert!(ok, "{stderr}");
+    assert!(durations_body["files"].is_array(), "{durations_body}");
+
+    // Phase 5: a repository the server does not serve, and writes, are 403.
+    let (ok, body, stderr) = srv(
+        &laptop,
+        &url,
+        &config_home,
+        &["flaky", "--repo", "evil/other"],
+    )
+    .await;
+    assert!(!ok && body.is_null(), "{body}");
+    assert!(stderr.contains("403"), "{stderr}");
+    let stored: Value = serde_json::from_str(
+        &fs::read_to_string(config_home.join("aster/cache-tokens").join(format!(
+            "{}.json",
+            url.trim_start_matches("http://").replace(':', "_")
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    let token = stored["token"].as_str().unwrap().to_string();
+    for (path, body) in [
+        ("/v1/test-results/runs", "{}".to_string()),
+        (
+            "/v1/cache/upload",
+            json!({"repo": REPO, "digests": ["0".repeat(64)]}).to_string(),
+        ),
+        (
+            "/v1/cache/commit",
+            json!({"repo": REPO, "key": "k", "manifest": ""}).to_string(),
+        ),
+    ] {
+        let write = tokio::task::spawn_blocking({
+            let (url, token) = (url.clone(), token.clone());
+            move || {
+                reply(
+                    browser()
+                        .post(format!("{url}{path}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .send(body)
+                        .expect("POST"),
+                )
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(write.status, 403, "POST {path}: {}", write.body);
+    }
 
     server.stop().await;
 }

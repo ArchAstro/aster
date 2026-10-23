@@ -11,7 +11,7 @@
 //! newest run is shown. Any repository on the allowlist can be viewed. The
 //! pages only read; there is no state-changing route.
 
-mod data;
+pub(crate) mod data;
 pub(crate) mod html;
 mod pages;
 
@@ -46,11 +46,6 @@ pub enum Route {
     Clusters,
     Quarantine,
     Cache,
-}
-
-/// Whether `path` belongs to the dashboard.
-pub fn is_ui_path(path: &str) -> bool {
-    path == "/ui" || path.starts_with("/ui/")
 }
 
 /// The page for a request path, with the test id percent-decoded (it may
@@ -317,11 +312,5 @@ mod tests {
         ] {
             assert_eq!(parse_route(bad), None, "{bad}");
         }
-    }
-
-    #[test]
-    fn recognizes_dashboard_paths() {
-        assert!(is_ui_path("/ui") && is_ui_path("/ui/") && is_ui_path("/ui/x"));
-        assert!(!is_ui_path("/uix") && !is_ui_path("/v1/ui"));
     }
 }

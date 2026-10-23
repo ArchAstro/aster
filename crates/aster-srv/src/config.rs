@@ -9,8 +9,8 @@ use anyhow::{bail, Context, Result};
 pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// A Google IAP audience, `/projects/NUMBER/global/backendServices/ID`, or
-/// with the ID left off (a trailing `/`) to stand for any backend service of
-/// the project. Both NUMBER and ID are nonempty runs of digits.
+/// with the ID left off (a trailing `/`), which parses but is not accepted
+/// as a configured audience. Both NUMBER and ID are nonempty runs of digits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IapAudience<'a> {
     pub project: &'a str,
@@ -73,10 +73,10 @@ pub struct Config {
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
     /// `ASTER_SRV_IAP_AUDIENCE`: the Google IAP audience the dashboard (`/ui`)
-    /// accepts, `/projects/NUMBER/global/backendServices/ID` (or, for GKE
-    /// ingress, which assigns the ID, a prefix ending in `/` such as
-    /// `/projects/NUMBER/global/backendServices/`). Unset disables the
-    /// dashboard unless `ASTER_SRV_UI_DEV_EMAIL` is set.
+    /// accepts: exactly `/projects/NUMBER/global/backendServices/ID`. A
+    /// project-wide prefix is refused at startup, since it would accept an
+    /// assertion for any other backend service of the project. Unset
+    /// disables the dashboard unless `ASTER_SRV_UI_DEV_EMAIL` is set.
     pub iap_audience: Option<String>,
     /// `ASTER_SRV_UI_EMAIL_DOMAINS`: comma-separated domains (`example.com`,
     /// or `*.example.com` for subdomains) whose emails may view the
@@ -109,6 +109,16 @@ pub struct Config {
     /// token may write the cache or upload test results only from a job
     /// whose workflow matches one. Unset applies no workflow restriction.
     pub writer_workflows: Option<WriterWorkflows>,
+    /// `ASTER_SRV_REPOSITORY_OWNER_IDS`: comma-separated `owner/name=id` or
+    /// `owner/*=id`. A token for a matching repository must carry that
+    /// `repository_owner_id` claim, so a repository recreated under the same
+    /// name by someone else is refused. Unset pins nothing.
+    pub owner_ids: OwnerIds,
+    /// `ASTER_SRV_DEV_BLOB_ROUTE=1`: answer `PUT|GET /<bucket>/cas/<sha>`
+    /// from the in-memory blob store, the stand-in for a signed GCS URL.
+    /// For tests and local development only; unset in every deploy, which
+    /// uses GCS and has no such route.
+    pub dev_blob_route: bool,
     /// `ASTER_SRV_PUBLIC_URL`: the URL people reach this server at, the
     /// `iss` of the tokens `aster cache login` hands out. Unset turns
     /// person login off.
@@ -272,13 +282,16 @@ impl Config {
         };
         let iap_audience =
             var("ASTER_SRV_IAP_AUDIENCE").map(|audience| audience.trim().to_string());
+        // Exactly one backend service: a prefix would accept an assertion IAP
+        // issued for another backend service of the project.
         if iap_audience
             .as_deref()
-            .is_some_and(|a| IapAudience::parse(a).is_none())
+            .is_none_or(|a| IapAudience::parse(a).is_none_or(|a| a.backend_service.is_none()))
+            && iap_audience.is_some()
         {
             bail!(
-                "ASTER_SRV_IAP_AUDIENCE must look like /projects/NUMBER/global/backendServices/ID \
-                 (or end in / to match any backend service of a project)"
+                "ASTER_SRV_IAP_AUDIENCE must be the full backend-service audience, \
+                 /projects/NUMBER/global/backendServices/ID"
             );
         }
         let number = |name: &str, default: u32, min: u32, max: u32| -> Result<u32> {
@@ -332,6 +345,18 @@ impl Config {
             None => None,
         };
         let allow_http_public_url = var("ASTER_SRV_ALLOW_HTTP_PUBLIC_URL").as_deref() == Some("1");
+        // Naming who may write without naming the workflow lets any workflow
+        // in the repository on that ref write. Say so, or opt out loudly.
+        if var("ASTER_SRV_CACHE_WRITERS").is_some()
+            && writer_workflows.is_none()
+            && var("ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW").as_deref() != Some("1")
+        {
+            bail!(
+                "ASTER_SRV_CACHE_WRITERS needs ASTER_SRV_CACHE_WRITER_WORKFLOWS (the workflows \
+                 that may write); set ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW=1 only in development"
+            );
+        }
+        let owner_ids = OwnerIds::parse(var("ASTER_SRV_REPOSITORY_OWNER_IDS").as_deref())?;
         let public_url = match var("ASTER_SRV_PUBLIC_URL") {
             Some(url) => {
                 let url = url.trim().trim_end_matches('/').to_string();
@@ -452,6 +477,8 @@ impl Config {
             cache_days,
             cache_writers,
             writer_workflows,
+            owner_ids,
+            dev_blob_route: var("ASTER_SRV_DEV_BLOB_ROUTE").as_deref() == Some("1"),
             public_url,
             cli_token_keys,
             cli_token_ttl,
@@ -634,6 +661,52 @@ impl RepositoryAllowlist {
     }
 }
 
+/// `repository_owner_id` pins: `owner/name` or `owner/*` to a GitHub id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerIds(Vec<(String, String)>);
+
+impl OwnerIds {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        let mut pins = Vec::new();
+        for entry in value
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            let (repo, id) = entry.split_once('=').with_context(|| {
+                format!("ASTER_SRV_REPOSITORY_OWNER_IDS entry '{entry}' must be repo=id")
+            })?;
+            let repo = repo.trim().to_ascii_lowercase();
+            let id = id.trim();
+            if repo
+                .split_once('/')
+                .is_none_or(|(o, n)| o.is_empty() || n.is_empty())
+                || id.is_empty()
+                || !id.bytes().all(|b| b.is_ascii_digit())
+            {
+                bail!("ASTER_SRV_REPOSITORY_OWNER_IDS entry '{entry}' must be owner/name=digits or owner/*=digits");
+            }
+            pins.push((repo, id.to_string()));
+        }
+        Ok(Self(pins))
+    }
+
+    /// Whether `repository` with this `repository_owner_id` claim is
+    /// acceptable: no pin covers it, or the claim equals the pin.
+    pub fn accepts(&self, repository: &str, claim: Option<&str>) -> bool {
+        let repository = repository.to_ascii_lowercase();
+        let owner = repository.split_once('/').map(|(owner, _)| owner);
+        self.0
+            .iter()
+            .filter(|(pattern, _)| {
+                *pattern == repository
+                    || pattern.strip_suffix("/*").is_some_and(|o| Some(o) == owner)
+            })
+            .all(|(_, id)| claim == Some(id.as_str()))
+    }
+}
+
 /// `repo=ref` patterns that may write the cache. `*` matches any repository.
 /// A ref pattern matches exactly, or as a prefix when it ends in `*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,7 +872,7 @@ mod tests {
         let config = with(&[
             (
                 "ASTER_SRV_IAP_AUDIENCE",
-                "/projects/1/global/backendServices/",
+                "/projects/1/global/backendServices/4242",
             ),
             ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
             ("ASTER_SRV_PUBLIC_URL", "https://aster-srv.example.com/"),
@@ -865,7 +938,7 @@ mod tests {
         ("ASTER_SRV_PUBLIC_URL", "https://aster-srv.example.com"),
         (
             "ASTER_SRV_IAP_AUDIENCE",
-            "/projects/1/global/backendServices/",
+            "/projects/1/global/backendServices/4242",
         ),
         ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
         (
@@ -1072,14 +1145,14 @@ mod tests {
         let mut pairs = REQUIRED.to_vec();
         pairs.push((
             "ASTER_SRV_IAP_AUDIENCE",
-            "/projects/123456/global/backendServices/",
+            "/projects/123456/global/backendServices/987",
         ));
         pairs.push(("ASTER_SRV_UI_EMAIL_DOMAINS", "Example.com, *.corp.example"));
         pairs.push(("ASTER_SRV_UI_DEV_EMAIL", "me@example.com"));
         let config = Config::from_env(env_of(&pairs)).unwrap();
         assert_eq!(
             config.iap_audience.as_deref(),
-            Some("/projects/123456/global/backendServices/")
+            Some("/projects/123456/global/backendServices/987")
         );
         let domains = config.ui_email_domains.unwrap();
         assert!(domains.allows("a@example.com"));
@@ -1087,6 +1160,11 @@ mod tests {
 
         for (name, bad) in [
             ("ASTER_SRV_IAP_AUDIENCE", "no-slash"),
+            // The project-wide prefix would accept another backend's assertion.
+            (
+                "ASTER_SRV_IAP_AUDIENCE",
+                "/projects/123456/global/backendServices/",
+            ),
             ("ASTER_SRV_IAP_AUDIENCE", "/"),
             ("ASTER_SRV_IAP_AUDIENCE", "/projects/"),
             ("ASTER_SRV_IAP_AUDIENCE", "/projects/123456/"),
@@ -1108,6 +1186,31 @@ mod tests {
             let mut pairs = REQUIRED.to_vec();
             pairs.push((name, bad));
             assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn writers_need_workflows_and_owner_ids_pin_repositories() {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_CACHE_WRITERS", "*=refs/heads/main"));
+        assert!(Config::from_env(env_of(&pairs)).is_err());
+        pairs.push(("ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW", "1"));
+        assert!(Config::from_env(env_of(&pairs)).is_ok());
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_CACHE_WRITERS", "*=refs/heads/main"));
+        pairs.push((
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+            "ArchAstro/firstlanding/.github/workflows/ci.yml@",
+        ));
+        assert!(Config::from_env(env_of(&pairs)).is_ok());
+
+        let pins = OwnerIds::parse(Some("ArchAstro/*=123, other/x=9")).unwrap();
+        assert!(pins.accepts("archastro/firstlanding", Some("123")));
+        assert!(!pins.accepts("ArchAstro/firstlanding", Some("124")));
+        assert!(!pins.accepts("ArchAstro/firstlanding", None));
+        assert!(pins.accepts("unpinned/repo", None));
+        for bad in ["a/b", "a/b=x", "ab=1", "=1", "a/*="] {
+            assert!(OwnerIds::parse(Some(bad)).is_err(), "{bad}");
         }
     }
 
