@@ -9,10 +9,48 @@
 use std::path::Path;
 
 use super::related_tests::{js_runner, js_script, Argv, Delegated};
+use crate::config::{ReportConfig, ReportConfigFormat};
 use crate::test_results::{exunit, nodetest};
 use crate::test_results::{
-    Confidence, OutputRewrite, ReportContext, ReportFiles, ReportFormat, ReportPlan,
+    Confidence, OutputRewrite, ReportContext, ReportFiles, ReportFormat, ReportPlan, REPORT_DIR_ENV,
 };
+
+/// Plan for a target that declares its report in aster.toml. The command
+/// runs as written, with [`REPORT_DIR_ENV`] naming the context's empty
+/// report directory, and the declared files are read afterwards: the globs
+/// under the project directory, or everything in the report directory.
+pub(crate) fn declared(report: &ReportConfig, ctx: &ReportContext) -> ReportPlan {
+    let (format, confidence) = match report.format {
+        ReportConfigFormat::Junit => (ReportFormat::JUnitXml, Confidence::Complete),
+        ReportConfigFormat::GoJson => (ReportFormat::GoTestJson, Confidence::Complete),
+        ReportConfigFormat::JestJson => (ReportFormat::JestJson, Confidence::Complete),
+        ReportConfigFormat::Libtest => (ReportFormat::LibtestText, Confidence::Partial),
+    };
+    let files = if report.files.is_empty() {
+        ReportFiles::Globs {
+            root: ctx.report_dir.to_path_buf(),
+            patterns: vec!["**/*".to_string()],
+        }
+    } else {
+        ReportFiles::Globs {
+            root: ctx.project_dir.to_path_buf(),
+            patterns: report.files.clone(),
+        }
+    };
+    ReportPlan {
+        command: ctx.command.to_string(),
+        env: vec![(
+            REPORT_DIR_ENV.to_string(),
+            ctx.report_dir.to_string_lossy().into_owned(),
+        )],
+        files,
+        format,
+        confidence,
+        rewrite: None,
+        relative_to: Some(ctx.project_dir.to_path_buf()),
+        declared: true,
+    }
+}
 
 /// Plan for a test command whatever the project's language: the runners
 /// that are recognised by their command alone (`mix test`, `go test`,
@@ -96,6 +134,7 @@ pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
             std::fs::canonicalize(ctx.working_dir)
                 .unwrap_or_else(|_| ctx.working_dir.to_path_buf()),
         ),
+        declared: false,
     })
 }
 
@@ -141,6 +180,7 @@ pub(super) fn cargo(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Partial,
         rewrite: None,
         relative_to: None,
+        declared: false,
     };
     match rest.as_slice() {
         ["test", ..] => Some(base),
@@ -276,6 +316,7 @@ fn js_flags(
         confidence: Confidence::Complete,
         rewrite: None,
         relative_to: Some(ctx.working_dir.to_path_buf()),
+        declared: false,
     };
     match runner {
         JsRunner::Vitest => {
@@ -407,6 +448,7 @@ pub(super) fn mix(ctx: &ReportContext) -> Option<ReportPlan> {
             confidence: Confidence::Partial,
             rewrite: None,
             relative_to: None,
+            declared: false,
         });
     }
 
@@ -442,6 +484,7 @@ pub(super) fn mix(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Complete,
         rewrite: None,
         relative_to: None,
+        declared: false,
     })
 }
 
@@ -486,6 +529,7 @@ pub(super) fn pytest(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Complete,
         rewrite: None,
         relative_to: None,
+        declared: false,
     };
 
     let mut end = argv.parts.len();
@@ -546,6 +590,7 @@ pub(super) fn go(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Complete,
         rewrite,
         relative_to: None,
+        declared: false,
     };
     if flag("json") {
         return Some(plan(ctx.command.to_string(), None));
@@ -571,6 +616,7 @@ pub(super) fn gradle(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Complete,
         rewrite: None,
         relative_to: None,
+        declared: false,
     })
 }
 
@@ -591,6 +637,7 @@ pub(super) fn maven(ctx: &ReportContext) -> Option<ReportPlan> {
         confidence: Confidence::Complete,
         rewrite: None,
         relative_to: None,
+        declared: false,
     })
 }
 
@@ -1040,6 +1087,67 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             "node --test",
         ] {
             assert!(js(&context(&f, "test", command)).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_declared_report_runs_the_command_as_written_and_names_the_report_dir() {
+        let f = fixture();
+        let ctx = context(&f, "test", "bash tools/cargo-test.sh");
+        let into_dir = ReportConfig {
+            format: ReportConfigFormat::Junit,
+            files: Vec::new(),
+        };
+        let plan = declared(&into_dir, &ctx);
+        assert_eq!(plan.command, "bash tools/cargo-test.sh");
+        assert_eq!(
+            plan.env,
+            vec![(
+                REPORT_DIR_ENV.to_string(),
+                "/tmp/aster-reports/1".to_string()
+            )]
+        );
+        assert_eq!(
+            plan.files,
+            ReportFiles::Globs {
+                root: f.report_dir.clone(),
+                patterns: vec!["**/*".to_string()],
+            }
+        );
+        assert_eq!(
+            (plan.format, plan.confidence),
+            (ReportFormat::JUnitXml, Confidence::Complete)
+        );
+
+        let in_project = ReportConfig {
+            format: ReportConfigFormat::Libtest,
+            files: vec!["target/test-output.txt".to_string()],
+        };
+        let plan = declared(&in_project, &ctx);
+        assert_eq!(
+            plan.files,
+            ReportFiles::Globs {
+                root: f.project.clone(),
+                patterns: vec!["target/test-output.txt".to_string()],
+            }
+        );
+        // Console output can miss tests.
+        assert_eq!(
+            (plan.format, plan.confidence),
+            (ReportFormat::LibtestText, Confidence::Partial)
+        );
+        for (format, want) in [
+            (ReportConfigFormat::GoJson, ReportFormat::GoTestJson),
+            (ReportConfigFormat::JestJson, ReportFormat::JestJson),
+        ] {
+            let plan = declared(
+                &ReportConfig {
+                    format,
+                    files: Vec::new(),
+                },
+                &ctx,
+            );
+            assert_eq!((plan.format, plan.confidence), (want, Confidence::Complete));
         }
     }
 

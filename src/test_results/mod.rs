@@ -156,6 +156,18 @@ impl ReportFormat {
         }
     }
 
+    /// The capture name of a report the target declared.
+    pub fn declared_capture_name(self) -> &'static str {
+        match self {
+            ReportFormat::JUnitXml => "declared-junit",
+            ReportFormat::GoTestJson => "declared-go-json",
+            ReportFormat::ExUnit => "declared-exunit",
+            ReportFormat::JestJson => "declared-jest-json",
+            ReportFormat::LibtestText => "declared-libtest",
+            ReportFormat::NodeTest => "declared-node-test",
+        }
+    }
+
     /// Whether reading the report also needs the command's console output.
     pub fn reads_console(self) -> bool {
         matches!(self, ReportFormat::ExUnit)
@@ -208,7 +220,15 @@ pub struct ReportPlan {
     /// Test files the report names under this directory are recorded
     /// relative to it (Jest names them by absolute path).
     pub relative_to: Option<PathBuf>,
+    /// The target declared this report in aster.toml: Aster did not see
+    /// the runner, so it cannot read the command's exit code as the
+    /// runner's, and the capture is recorded as `declared-<format>`.
+    pub declared: bool,
 }
+
+/// The variable that names a declared report's directory to the command:
+/// an empty directory the command may write its report into.
+pub const REPORT_DIR_ENV: &str = "ASTER_TEST_REPORT_DIR";
 
 /// What a plugin is told when asked for a [`ReportPlan`].
 #[derive(Debug, Clone, Copy)]
@@ -391,6 +411,7 @@ mod tests {
             confidence: Confidence::Complete,
             rewrite: None,
             relative_to: None,
+            declared: false,
         }
     }
 

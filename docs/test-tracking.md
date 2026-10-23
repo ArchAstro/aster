@@ -38,6 +38,44 @@ invocation: a run record, a record per target, and one per test attempt.
 `partial` means some tests may be missing. Partial results are still uploaded
 and classified, but they never let a quarantined failure pass.
 
+`cargo nextest run` writes JUnit only when the repository's nextest config
+gives the profile a `junit.path`; without it nothing is recorded.
+
+### Declared reports
+
+Aster recognises a runner in the target's command, directly or as the last
+command of a `sh -c` one-liner. A command that runs a script (`bash
+tools/cargo-test.sh`, `node scripts/related-tests.mjs`) hides its runner, and
+the target records no tests. Such a target declares its report instead:
+
+```toml
+[targets.test]
+command = "bash tools/cargo-test.sh"
+
+[targets.test.report]
+format = "junit"   # junit, go-json, jest-json or libtest
+files = ["target/nextest/ci/junit.xml"]
+```
+
+The command runs as written, with `ASTER_TEST_REPORT_DIR` set to an empty
+directory outside the checkout. Without `files`, Aster reads every file the
+command writes there (`go test -json ./... > "$ASTER_TEST_REPORT_DIR/go.json"`).
+With `files`, it reads those globs under the project directory. Either way only
+files written while the command ran count, so an old report is never read as
+this run's. Prefer `ASTER_TEST_REPORT_DIR`: a fixed path can be read by
+another target that writes the same file, and when `--only-affected-files`
+splits a target into several commands only the last command's file is read
+(the results are then partial). `files` are relative to the project
+directory, not a target's `working_dir`. A declared report wins over
+recognising the command. `libtest` (saved `cargo test` console output) is
+partial; the others are complete, and the capture is recorded as
+`declared-<format>`.
+
+A declared report never lets a quarantined failure pass: Aster does not see
+the runner, so it cannot tell a test failure from a failed step of the script
+by the exit code. Nor does it make the target retryable: `--retry-failed`
+still needs a command Aster recognises.
+
 ## 2. Retry
 
 `--retry-failed[=N]` (or `ASTER_RETRY_FAILED=N`) reruns only the failing

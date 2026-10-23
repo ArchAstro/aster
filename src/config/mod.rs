@@ -3,7 +3,7 @@ pub mod workspace;
 
 pub use project::{
     find_aster_toml, parse_aster_toml, AliasTargetConfig, AsterToml, CacheConfig, ConsumesConfig,
-    RichTargetConfig, TargetConfig,
+    ReportConfig, ReportConfigFormat, RichTargetConfig, TargetConfig,
 };
 pub use workspace::{
     find_workspace_root, AffectedLaneConfig, AffectedWorkspaceConfig, CacheRetentionConfig,

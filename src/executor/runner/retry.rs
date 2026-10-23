@@ -65,8 +65,12 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
         };
         let mut captures = Vec::new();
         for command in &commands {
+            // A retry command selects tests with the runner's own flags, so
+            // Aster recognised the runner; its plan, not a declared one, reads
+            // the retry's results.
             captures.push(plan_captures(
                 job.plugin,
+                None,
                 job.project_dir,
                 job.working_dir,
                 job.target_name,

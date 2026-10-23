@@ -96,6 +96,7 @@ impl LanguagePlugin for GoPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -124,6 +125,7 @@ impl LanguagePlugin for GoPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -143,6 +145,7 @@ impl LanguagePlugin for GoPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -160,6 +163,7 @@ impl LanguagePlugin for GoPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -188,6 +192,7 @@ impl LanguagePlugin for GoPlugin {
                     working_dir: None,
                     exclusive_resources: vec![],
                     retry_setup: None,
+                    report: None,
                 },
             );
         }
@@ -339,6 +344,7 @@ impl LanguagePlugin for GoPlugin {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         })
     }
 }
