@@ -4,8 +4,9 @@
 //! An OIDC token is accepted when it is signed by the issuer's current key,
 //! is unexpired, names this server's audience, and comes from a repository
 //! on the allowlist. Keys are fetched from the issuer's JWKS and refetched
-//! when a token names a key not yet seen, at most once a minute; callers
-//! that arrive during a fetch wait for it and share its keys.
+//! when a token names a key not yet seen, at most once every ten seconds
+//! (see [`crate::keyfetch`] for the rules); callers that arrive during a
+//! fetch wait for it and share its keys.
 //!
 //! [`authenticate`] is the one entry point for `/v1/*`. It reads the
 //! token's `alg` and sends HS256 to the server's own person-token keys and
@@ -21,6 +22,7 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{Config, OwnerIds, RepositoryAllowlist, StaticToken};
+use crate::keyfetch::{RefetchPolicy, RefetchState};
 use crate::person::{Person, TokenIssuer};
 
 /// Who a bearer token names.
@@ -191,8 +193,6 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
-const REFETCH_INTERVAL: Duration = Duration::from_secs(60);
-
 pub struct Verifier {
     audience: String,
     issuer: String,
@@ -202,9 +202,11 @@ pub struct Verifier {
     /// Where keys come from; `None` uses only keys added with [`Self::with_key`].
     jwks_url: Option<String>,
     keys: RwLock<HashMap<String, DecodingKey>>,
-    /// When keys were last fetched. Held for the whole fetch, so a caller
-    /// that arrives mid-fetch waits and then finds the fetched keys.
-    last_fetch: Mutex<Option<Instant>>,
+    /// When keys may be refetched (see [`crate::keyfetch`]). Held for the
+    /// whole fetch, so a caller that arrives mid-fetch waits and then finds
+    /// the fetched keys.
+    refetch: Mutex<RefetchState>,
+    refetch_policy: RefetchPolicy,
     client: reqwest::Client,
 }
 
@@ -221,7 +223,8 @@ impl Verifier {
                 config.issuer.trim_end_matches('/')
             )),
             keys: RwLock::new(HashMap::new()),
-            last_fetch: Mutex::new(None),
+            refetch: Mutex::new(RefetchState::default()),
+            refetch_policy: RefetchPolicy::default(),
             client: crate::http_client()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -233,6 +236,14 @@ impl Verifier {
     pub fn with_key(mut self, kid: &str, key: DecodingKey) -> Self {
         self.jwks_url = None;
         self.keys.get_mut().insert(kid.to_string(), key);
+        self
+    }
+
+    /// Fetch keys from `url` instead of the issuer's, spacing refetches by
+    /// `policy`. For tests.
+    pub fn with_jwks(mut self, url: &str, policy: RefetchPolicy) -> Self {
+        self.jwks_url = Some(url.to_string());
+        self.refetch_policy = policy;
         self
     }
 
@@ -316,14 +327,14 @@ impl Verifier {
         // One fetch at a time, with the lock held across it. Callers that
         // queued behind a fetch look again once they hold the lock, so they
         // get the key it fetched instead of failing while it was in flight.
-        let mut last = self.last_fetch.lock().await;
+        let mut refetch = self.refetch.lock().await;
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
-        if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+        if !refetch.may_fetch(kid, Instant::now(), self.refetch_policy) {
             return Err(AuthError::Invalid("unknown signing key".to_string()));
         }
-        *last = Some(Instant::now());
+        refetch.attempted(Instant::now());
         let set: JwkSet = self
             .client
             .get(url)
@@ -344,9 +355,16 @@ impl Verifier {
         }
         let mut keys = self.keys.write().await;
         *keys = fetched;
-        keys.get(kid)
-            .cloned()
-            .ok_or_else(|| AuthError::Invalid("unknown signing key".to_string()))
+        match keys.get(kid).cloned() {
+            Some(key) => {
+                refetch.found(kid);
+                Ok(key)
+            }
+            None => {
+                refetch.missing(kid, Instant::now());
+                Err(AuthError::Invalid("unknown signing key".to_string()))
+            }
+        }
     }
 }
 

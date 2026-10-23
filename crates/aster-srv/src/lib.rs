@@ -16,6 +16,7 @@ pub mod config;
 pub mod db;
 mod http;
 pub mod iap;
+pub mod keyfetch;
 pub mod limits;
 pub mod log;
 pub mod metrics;
