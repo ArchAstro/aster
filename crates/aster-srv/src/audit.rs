@@ -11,7 +11,7 @@
 //! | `auth_failure` | any 401 or 403 | `subject` if known, `reason`, `detail` |
 //! | `rate_limited` | a limit refused the request | `scope`, `subject` if known |
 //!
-//! Each carries `route` (a fixed template, see [`route_label`]) and
+//! Each carries `route` (a fixed template, see [`crate::routes::label`]) and
 //! `client_ip` from the request. Tokens, codes, verifiers and assertions are
 //! never fields: callers pass reasons and subjects only, and [`crate::log`]
 //! redacts token-shaped text as a second line of defence.
@@ -66,31 +66,6 @@ pub async fn scope<F: Future>(ctx: RequestCtx, future: F) -> F::Output {
 pub fn was_audited() -> bool {
     CTX.try_with(|ctx| ctx.audited.load(Ordering::Relaxed))
         .unwrap_or(false)
-}
-
-/// The templated route of a request, a bounded set safe as a metric label.
-pub fn route_label(method: &hyper::Method, path: &str) -> &'static str {
-    use crate::test_results::query;
-    match path {
-        "/healthz" => "/healthz",
-        "/readyz" => "/readyz",
-        "/metrics" => "/metrics",
-        "/cli-auth" => "/cli-auth",
-        "/v1/healthz" => "/v1/healthz",
-        "/v1/auth/token" => "/v1/auth/token",
-        "/v1/test-results/runs" => "/v1/test-results/runs",
-        "/v1/test-results/durations" => "/v1/test-results/durations",
-        p if p == "/ui" || p.starts_with("/ui/") => "/ui",
-        p if p.starts_with("/v1/test-results/") && query::parse_route(p).is_some() => {
-            "/v1/test-results/query"
-        }
-        p if p.starts_with("/v1/cache/") => "/v1/cache",
-        p if p.starts_with("/v1/") => "/v1/other",
-        _ => {
-            let _ = method;
-            "other"
-        }
-    }
 }
 
 fn emit(event: &str, route: Option<&'static str>, fields: Value) {

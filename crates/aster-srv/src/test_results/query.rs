@@ -1,10 +1,11 @@
 //! The read API over test state: `GET /v1/test-results/tests`,
 //! `.../tests/:test_id`, `.../runs/:run_id/failures`,
 //! `.../failures?github_run=` (the failures of every Aster run in one GitHub
-//! Actions run) and `.../quarantine` (the tests Aster keeps from failing
-//! builds).
+//! Actions run), `.../clusters` (the last week's failures grouped by failure
+//! hash) and `.../quarantine` (the tests Aster keeps from failing builds).
 //!
-//! A caller reads only its own repository's data. Lists page with an opaque
+//! A CI caller reads only its own repository's data; a signed-in person
+//! names any served repository with `repo` (see `http::read_identity`). Lists page with an opaque
 //! keyset cursor (hex of the last row's sort key), so a page costs the same
 //! however deep it is.
 
@@ -15,6 +16,7 @@ use tokio_postgres::Row;
 
 use crate::auth::Identity;
 use crate::http::Reply;
+use crate::ui::data;
 use crate::App;
 
 const DEFAULT_LIMIT: i64 = 100;
@@ -33,6 +35,7 @@ pub enum Route {
     RunFailures(String),
     GithubFailures,
     Quarantine,
+    Clusters,
 }
 
 /// The route for a request path, with ids percent-decoded (a run id holds
@@ -44,6 +47,7 @@ pub fn parse_route(path: &str) -> Option<Route> {
         ["tests"] => Some(Route::Tests),
         ["failures"] => Some(Route::GithubFailures),
         ["quarantine"] => Some(Route::Quarantine),
+        ["clusters"] => Some(Route::Clusters),
         ["tests", id] if !id.is_empty() => Some(Route::Test(percent_decode(id)?)),
         ["runs", id, "failures"] if !id.is_empty() => Some(Route::RunFailures(percent_decode(id)?)),
         _ => None,
@@ -201,6 +205,7 @@ pub async fn handle(app: &App, identity: &Identity, route: Route, query: Option<
         Route::RunFailures(run_id) => run_failures(app, identity, &run_id, query).await,
         Route::GithubFailures => github_failures(app, identity, query).await,
         Route::Quarantine => quarantine_list(app, identity, query).await,
+        Route::Clusters => clusters(app, identity, query).await,
     };
     match result {
         Ok(reply) | Err(Failure::Reply(reply)) => reply,
@@ -339,6 +344,42 @@ async fn quarantine_list(app: &App, identity: &Identity, query: Option<&str>) ->
             "generated_at": time(Utc::now()),
             "tests": tests,
             "truncated": truncated,
+        }),
+    ))
+}
+
+/// `GET /v1/test-results/clusters`: the failures of the last
+/// [`data::CLUSTER_DAYS`] days grouped by failure hash, most frequent first;
+/// what `/ui/clusters` shows, from the same query.
+async fn clusters(app: &App, identity: &Identity, query: Option<&str>) -> Handled {
+    let params = params(identity, query, 1, 1, false)?;
+    if params.state.is_some() || params.cursor.is_some() || query.unwrap_or("").contains("limit") {
+        return Err(Reply::error(400, "this route takes only repo").into());
+    }
+    let since = Utc::now().date_naive() - chrono::Days::new(data::CLUSTER_DAYS);
+    let client = app.pool.get().await?;
+    let clusters = data::clusters(&client, &params.repo, since).await?;
+    let clusters: Vec<Value> = clusters
+        .iter()
+        .map(|cluster| {
+            json!({
+                "failure_hash": cluster.failure_hash,
+                "failures": cluster.failures,
+                "tests": cluster.tests,
+                "first_seen": cluster.first_seen.to_string(),
+                "last_seen": cluster.last_seen.to_string(),
+                "example_test_id": cluster.example_test_id,
+                "example_message": cluster.example_message,
+            })
+        })
+        .collect();
+    Ok(Reply::json(
+        200,
+        json!({
+            "repo": params.repo,
+            "since": since.to_string(),
+            "days": data::CLUSTER_DAYS,
+            "clusters": clusters,
         }),
     ))
 }

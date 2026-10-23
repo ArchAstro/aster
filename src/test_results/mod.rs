@@ -19,6 +19,7 @@ mod junit;
 mod libtest;
 pub(crate) mod nodetest;
 pub mod quarantine;
+pub mod read;
 pub(crate) mod stream;
 pub mod summary;
 pub mod upload;

@@ -354,6 +354,17 @@ pub enum Commands {
         command: ResultsCommands,
     },
 
+    /// Read aster-srv's dashboard data as JSON
+    ///
+    /// Prints what the dashboard pages show, from the server's read-only
+    /// `/v1` routes. Sign in once with `aster cache login`; CI credentials
+    /// (`ASTER_SRV_TOKEN`, GitHub OIDC) are used when present. Exits non-zero
+    /// with a message when you are not signed in or the server refuses.
+    Srv {
+        #[command(subcommand)]
+        command: SrvCommands,
+    },
+
     /// Watch targets and rerun them when their declared inputs change
     ///
     /// Pass one or more target addresses (//project:target) or bare projects
@@ -599,6 +610,64 @@ pub enum CacheCommands {
         /// Maximum age of a manifest, using mtime as last access (s/m/h/d)
         #[arg(long, value_name = "AGE")]
         max_age: Option<String>,
+    },
+}
+
+/// Which server and repository `aster srv` reads.
+#[derive(clap::Args, Clone)]
+pub struct SrvTarget {
+    /// The aster-srv URL [default: $ASTER_SRV_URL]
+    #[arg(long)]
+    pub url: Option<String>,
+    /// The repository, owner/name [default: $GITHUB_REPOSITORY, else the checkout's origin]
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+/// `aster srv` subcommands
+#[derive(Subcommand)]
+pub enum SrvCommands {
+    /// GET any aster-srv path and print the JSON
+    ///
+    /// For example `aster srv get '/v1/test-results/tests?state=flaky&limit=20'`.
+    /// A `/v1/` path that names no `repo` gets the default one.
+    Get {
+        /// The path and query, starting with /
+        path: String,
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// The cache's size, lookups and last writer (the Cache page)
+    Cache {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// Flaky tests, highest score first (the Flaky tests page)
+    Flaky {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// Broken tests (the Flaky tests page's broken list)
+    Broken {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// The quarantine list (the Quarantine page)
+    Quarantine {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// The last week's failures grouped by failure hash (the Failure clusters page)
+    Clusters {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// One test's state and recent results (a test's page)
+    Test {
+        /// The test id, as listed by `aster srv flaky`
+        id: String,
+        #[command(flatten)]
+        target: SrvTarget,
     },
 }
 

@@ -9,7 +9,7 @@
 //! | `aud`   | the same URL: the token is for this server only |
 //! | `sub`   | the stable IAP subject (`accounts.google.com:1234...`), which survives an email rename |
 //! | `email` | the email IAP verified at sign-in |
-//! | `scope` | `cache:read` |
+//! | `scope` | `read`: the cache and every dashboard dataset, never a write |
 //! | `iat`, `nbf`, `exp` | issue time, not-before, expiry; `exp - iat` is at most 12 hours |
 //! | `jti`   | 128 random bits, unique per token |
 //!
@@ -43,8 +43,12 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthError;
 use crate::config::{CliTokenKey, Config};
 
-/// The one scope a person token carries.
-pub const SCOPE: &str = "cache:read";
+/// The scope a person token carries: read the cache and every test-results
+/// dataset the dashboard shows. Never a write.
+pub const SCOPE: &str = "read";
+/// What tokens minted before `read` existed carry. It grants the same reads,
+/// so a token signed in the last 12 hours keeps working until it expires.
+pub const LEGACY_SCOPE: &str = "cache:read";
 /// The longest a token lives, `exp - iat`, enforced at verify time as well as
 /// at issue.
 pub const MAX_TTL_SECONDS: u64 = 12 * 60 * 60;
@@ -170,8 +174,12 @@ impl TokenIssuer {
             .claims;
         let now = Utc::now().timestamp();
         let leeway = LEEWAY_SECONDS as i64;
-        if !claims.scope.split_whitespace().any(|scope| scope == SCOPE) {
-            return Err(invalid("the token lacks the cache:read scope"));
+        if !claims
+            .scope
+            .split_whitespace()
+            .any(|scope| scope == SCOPE || scope == LEGACY_SCOPE)
+        {
+            return Err(invalid("the token lacks the read scope"));
         }
         if claims.sub.is_empty() || claims.email.is_empty() {
             return Err(invalid("the token names no person"));
@@ -249,7 +257,7 @@ mod tests {
             "ASTER_SRV_DATABASE_URL" => Some("postgres://localhost/x".into()),
             "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
             "ASTER_SRV_PUBLIC_URL" => Some(URL.into()),
-            "ASTER_SRV_IAP_AUDIENCE" => Some("/projects/1/global/backendServices/".into()),
+            "ASTER_SRV_IAP_AUDIENCE" => Some("/projects/1/global/backendServices/4242".into()),
             "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
             "ASTER_SRV_CLI_TOKEN_KEYS" => Some(keys.clone()),
             _ => None,
@@ -321,7 +329,7 @@ mod tests {
             "sub is the stable subject, not the email"
         );
         assert_eq!(payload["email"], "ada@example.com");
-        assert_eq!(payload["scope"], "cache:read");
+        assert_eq!(payload["scope"], "read");
         assert_eq!(payload["iat"], payload["nbf"]);
         assert!(payload["jti"].as_str().unwrap().len() >= 22);
         let header = decode_header(&issued.token).unwrap();

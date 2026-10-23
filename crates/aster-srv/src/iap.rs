@@ -76,6 +76,8 @@ pub struct IapVerifier {
     /// Where keys come from; `None` uses only keys added with [`Self::with_key`].
     jwks_url: Option<String>,
     keys: RwLock<HashMap<String, DecodingKey>>,
+    /// When keys were last fetched. Held for the whole fetch, so a caller
+    /// that arrives mid-fetch waits and then finds the fetched keys.
     last_fetch: Mutex<Option<Instant>>,
     client: reqwest::Client,
 }
@@ -143,7 +145,7 @@ impl IapVerifier {
         let invalid =
             |reason: String| ViewerError::Unauthenticated(format!("invalid assertion: {reason}"));
 
-        let header = decode_header(token).map_err(|e| invalid(e.to_string()))?;
+        let header = decode_header(token).map_err(|_| invalid("it is malformed".into()))?;
         if header.alg != Algorithm::ES256 {
             return Err(invalid("assertions must be signed with ES256".into()));
         }
@@ -153,12 +155,14 @@ impl IapVerifier {
         let key = self.key(&kid).await.map_err(invalid)?;
 
         let mut validation = Validation::new(Algorithm::ES256);
-        // The audience may be a prefix, so it is checked below.
+        // The audience is compared exactly below.
         validation.validate_aud = false;
         validation.set_issuer(&[IAP_ISSUER]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.validate_nbf = true;
+        validation.leeway = 5;
         let claims = decode::<Claims>(token, &key, &validation)
-            .map_err(|e| invalid(e.to_string()))?
+            .map_err(|_| invalid("it did not verify".into()))?
             .claims;
         if !audience_matches(audience, &claims.aud) {
             return Err(invalid("the assertion is for another audience".into()));
@@ -189,13 +193,17 @@ impl IapVerifier {
         let Some(url) = &self.jwks_url else {
             return Err(unknown());
         };
-        {
-            let mut last = self.last_fetch.lock().await;
-            if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
-                return Err(unknown());
-            }
-            *last = Some(Instant::now());
+        // One fetch at a time, with the lock held across it. Callers that
+        // queued behind a fetch look again once they hold the lock, so they
+        // get the key it fetched instead of failing while it was in flight.
+        let mut last = self.last_fetch.lock().await;
+        if let Some(key) = self.keys.read().await.get(kid) {
+            return Ok(key.clone());
         }
+        if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+            return Err(unknown());
+        }
+        *last = Some(Instant::now());
         let set: JwkSet = self
             .client
             .get(url)
@@ -206,28 +214,27 @@ impl IapVerifier {
             .json()
             .await
             .map_err(|e| format!("cannot read signing keys: {e}"))?;
-        let mut keys = self.keys.write().await;
+        // The fetched set replaces the old one: the map stays as small as the
+        // issuer's set, and a key the issuer withdrew stops verifying.
+        let mut fetched = HashMap::new();
         for jwk in &set.keys {
             if let (Some(id), Ok(key)) = (&jwk.common.key_id, DecodingKey::from_jwk(jwk)) {
-                keys.insert(id.clone(), key);
+                fetched.insert(id.clone(), key);
             }
         }
+        let mut keys = self.keys.write().await;
+        *keys = fetched;
         keys.get(kid).cloned().ok_or_else(unknown)
     }
 }
 
-/// `configured` names one backend service, matched exactly, or (ending in
-/// `/`) a project, matching any of its backend services. Both sides must
-/// have the full IAP audience shape, whatever configuration validation let
-/// through.
+/// The assertion's audience is exactly the configured backend service. A
+/// prefix match would accept an assertion IAP issued for another backend
+/// service of the same project.
 fn audience_matches(configured: &str, audience: &str) -> bool {
-    let (Some(want), Some(got)) = (IapAudience::parse(configured), IapAudience::parse(audience))
-    else {
-        return false;
-    };
-    match want.backend_service {
-        Some(_) => want == got,
-        None => want.project == got.project && got.backend_service.is_some(),
+    match (IapAudience::parse(configured), IapAudience::parse(audience)) {
+        (Some(want), Some(got)) => want.backend_service.is_some() && want == got,
+        _ => false,
     }
 }
 
@@ -237,7 +244,7 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
 
-    const AUDIENCE: &str = "/projects/123456/global/backendServices/";
+    const AUDIENCE: &str = "/projects/123456/global/backendServices/987";
 
     /// A P-256 key pair made for this test process, so no private key is
     /// checked in: `(signing key as PKCS#8, public key as an uncompressed point)`.
@@ -296,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_an_assertion_for_a_prefix_or_an_exact_audience() {
+    async fn accepts_an_assertion_for_the_configured_audience() {
         let prefix = verifier(&[("ASTER_SRV_IAP_AUDIENCE", AUDIENCE)]);
         let assertion = token(claims(), "k1");
         let viewer = prefix.verify(Some(&assertion)).await.unwrap();
@@ -317,6 +324,10 @@ mod tests {
             let v = &v;
             async move { v.verify(Some(&assertion)).await }
         };
+        // Another backend service of the same project is another audience.
+        let mut other_backend = claims();
+        other_backend["aud"] = json!("/projects/123456/global/backendServices/988");
+        assert!(check(other_backend, "k1").await.is_err());
         let mut other_project = claims();
         other_project["aud"] = json!("/projects/999/global/backendServices/987");
         assert!(matches!(
@@ -324,7 +335,7 @@ mod tests {
             Err(ViewerError::Unauthenticated(_))
         ));
         let mut bare_prefix = claims();
-        bare_prefix["aud"] = json!(AUDIENCE);
+        bare_prefix["aud"] = json!("/projects/123456/global/backendServices/");
         assert!(check(bare_prefix, "k1").await.is_err());
         let mut wrong_issuer = claims();
         wrong_issuer["iss"] = json!("https://accounts.google.com");
@@ -414,25 +425,99 @@ mod tests {
         assert!(both.verify(None).await.is_err());
     }
 
+    #[tokio::test]
+    async fn concurrent_assertions_for_an_unseen_key_share_one_slow_fetch() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The test key as a JWK: the uncompressed point is 0x04 || x || y.
+        let point = &iap_key_pair().1;
+        let body = json!({"keys": [{
+            "kty": "EC", "crv": "P-256", "kid": "slow", "use": "sig", "alg": "ES256",
+            "x": BASE64URL.encode(&point[1..33]), "y": BASE64URL.encode(&point[33..65]),
+        }]})
+        .to_string();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oauth2/v1/certs", listener.local_addr().unwrap());
+        tokio::spawn({
+            let fetches = Arc::clone(&fetches);
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 2048];
+                        let _ = stream.read(&mut buffer).await;
+                        // Slow enough that every caller below arrives mid-fetch.
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    });
+                }
+            }
+        });
+
+        let mut v = IapVerifier::new(&config(&[("ASTER_SRV_IAP_AUDIENCE", AUDIENCE)]));
+        v.jwks_url = Some(url);
+        v.keys
+            .get_mut()
+            .insert("withdrawn".into(), DecodingKey::from_secret(b"x"));
+        let v = Arc::new(v);
+        let assertion = token(claims(), "slow");
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let (v, assertion) = (Arc::clone(&v), assertion.clone());
+            calls.spawn(async move { v.verify(Some(&assertion)).await });
+        }
+        while let Some(result) = calls.join_next().await {
+            let viewer = result.unwrap();
+            assert!(
+                viewer.is_ok(),
+                "a caller that arrived during the fetch must get the fetched key: {viewer:?}"
+            );
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "one fetch serves them all"
+        );
+
+        // A key the issuer really does not have still fails, and does not refetch within a minute.
+        assert!(v.verify(Some(&token(claims(), "nope"))).await.is_err());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
-    fn audience_prefixes_need_a_trailing_slash() {
-        let p = "/projects/1/global/backendServices/";
-        assert!(audience_matches(p, "/projects/1/global/backendServices/2"));
-        assert!(!audience_matches(p, p));
-        assert!(!audience_matches(
-            p,
-            "/projects/12/global/backendServices/2"
-        ));
-        assert!(!audience_matches(
-            p,
-            "/projects/1/global/backendServices/2/x"
-        ));
+    fn the_audience_must_be_the_one_configured_backend_service() {
         let exact = "/projects/1/global/backendServices/2";
         assert!(audience_matches(exact, exact));
-        assert!(!audience_matches(
-            exact,
-            "/projects/1/global/backendServices/23"
-        ));
+        for other in [
+            "/projects/1/global/backendServices/3",
+            "/projects/1/global/backendServices/23",
+            "/projects/12/global/backendServices/2",
+            "/projects/1/global/backendServices/2/x",
+            "/projects/1/global/backendServices/",
+        ] {
+            assert!(!audience_matches(exact, other), "{other}");
+        }
+        // A project-wide prefix matches nothing, not even the backend
+        // services of that project: another backend's assertion is refused.
+        let prefix = "/projects/1/global/backendServices/";
+        assert!(!audience_matches(prefix, exact));
+        assert!(!audience_matches(prefix, prefix));
     }
 
     #[test]

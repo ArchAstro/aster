@@ -141,14 +141,19 @@ async fn lists_tests_by_score_with_a_cursor_and_filters() {
             .await;
         assert_eq!(status, 400, "{bad}: {body}");
     }
-    let response = aster_srv::http_client()
-        .build()
-        .unwrap()
-        .post(format!("{}/v1/test-results/tests", server.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status().as_u16(), 405);
+    let post = |token: Option<String>| {
+        let url = format!("{}/v1/test-results/tests", server.url);
+        async move {
+            let mut request = aster_srv::http_client().build().unwrap().post(url);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send().await.unwrap().status().as_u16()
+        }
+    };
+    // Auth comes first: no token is 401 even for a method the route lacks.
+    assert_eq!(post(None).await, 401);
+    assert_eq!(post(Some(common::token(REPO))).await, 405);
     server.stop().await;
 }
 

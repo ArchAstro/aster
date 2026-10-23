@@ -310,6 +310,9 @@ your company account and confirm, and Aster stores a read-only token under
 out, Aster prints one line (`not signed in; run aster cache login`) and
 continues with the local cache. See
 [Reading the cache from a laptop](docs/test-tracking.md#reading-the-cache-from-a-laptop).
+The same sign-in reads the flaky, broken, cluster and quarantine data the
+dashboard shows: `aster srv flaky`, `aster srv clusters`, `aster srv get <path>`
+print JSON ([details](docs/test-tracking.md#reading-the-dashboards-data)).
 
 A hit restores declared `outputs` from the artifact cache and skips execution.
 `aster cache status` reads that store's per-project index. `--json` prints

@@ -79,6 +79,7 @@ async fn start() -> Option<Running> {
         "ASTER_SRV_DATABASE_URL" => Some(database_url.clone()),
         "ASTER_SRV_REPOSITORIES" => Some("acme/*".into()),
         "ASTER_SRV_CACHE_BUCKET" => Some("aster-cache-e2e".into()),
+        "ASTER_SRV_DEV_BLOB_ROUTE" => Some("1".into()),
         "ASTER_SRV_CACHE_SIGNER" => Some("cache-e2e@example.iam.gserviceaccount.com".into()),
         "ASTER_SRV_STATIC_TOKENS" => Some(format!("{REPO}={TOKEN}")),
         _ => None,

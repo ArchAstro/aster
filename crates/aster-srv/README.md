@@ -400,7 +400,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
 | `ASTER_SRV_RAW_BUCKET` | unset | A GCS bucket that keeps each upload as sent, using the pod's Workload Identity. Give the bucket a lifecycle rule that deletes objects after the retention period. |
-| `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts, exact or a prefix ending in `/`. Unset turns the dashboard off. See [Dashboard](#dashboard). |
+| `ASTER_SRV_IAP_AUDIENCE` | unset | The Google IAP audience the dashboard accepts: exactly `/projects/NUMBER/global/backendServices/ID`. A project-wide prefix is refused at startup, since it would accept an assertion for any other backend service of the project. Unset turns the dashboard off. See [Dashboard](#dashboard). |
 | `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
 | `ASTER_SRV_UI_DEV_EMAIL` | unset | The viewer to trust when no IAP audience is set. Development only. |
 | `ASTER_SRV_QUARANTINE_RUNS` | `2` | Different runs with a definite flake in 7 days that quarantine a test; `0` turns automatic quarantine off. |
@@ -412,7 +412,9 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_CACHE_SIGNER` | unset | The pod's Workload Identity service account email. Required with `ASTER_SRV_CACHE_BUCKET`; blob URLs are signed as this account through `signBlob`. |
 | `ASTER_SRV_CACHE_DAYS` | `14` | Drop manifests unused this long, then blobs no remaining manifest names, and uncommitted uploads older than this. |
 | `ASTER_SRV_CACHE_WRITERS` | `*=refs/heads/<default branch>` | Comma-separated `owner/name=ref` or `*=ref` patterns that may upload and commit. A pattern ending in `*` matches that prefix. The pattern is compared with the token's `ref` claim. |
-| `ASTER_SRV_CACHE_WRITER_WORKFLOWS` | unset | Comma-separated prefixes of the token's `job_workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@`; each must contain `@`). When set, a CI token writes the cache or uploads test results only from a matching workflow, in addition to the ref rule. Unset applies no workflow limit, so existing deployments keep working until it is set. Static tokens are exempt. |
+| `ASTER_SRV_CACHE_WRITER_WORKFLOWS` | unset | Comma-separated prefixes of the token's `job_workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@`; each must contain `@`). When set, a CI token writes the cache or uploads test results only from a matching workflow, in addition to the ref rule. Required whenever `ASTER_SRV_CACHE_WRITERS` is set (startup fails otherwise unless `ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW=1`, a development escape hatch). Static tokens are exempt. |
+| `ASTER_SRV_REPOSITORY_OWNER_IDS` | unset | Comma-separated `owner/name=id` or `owner/*=id`. A token for a matching repository must carry that `repository_owner_id` claim, so a repository recreated under the same name by someone else is refused with `403`. |
+| `ASTER_SRV_DEV_BLOB_ROUTE` | unset | `1` makes the in-memory blob store answer `PUT\|GET /<bucket>/cas/<sha>`, the test stand-in for a signed GCS URL. Tests and local development only; no deploy sets it and the route does not exist without it. |
 | `ASTER_SRV_PUBLIC_URL` | unset | The https URL people reach the server at (`https://aster-srv.example.com`); the `iss` and `aud` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). With an https URL every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains`. An `http://` URL is refused at startup unless `ASTER_SRV_ALLOW_HTTP_PUBLIC_URL=1` (development and tests only). |
 | `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated. A secret is hex (64+ digits) or base64 (43+ characters) for at least 32 random bytes, as `openssl rand -base64 32` makes; passphrases, short keys and patterned keys (one byte repeated, a repeated block, a counting run, fewer than 16 distinct bytes) stop startup. The first signs person tokens and form MACs; all verify. Setting it also requires `ASTER_SRV_IAP_AUDIENCE` and `ASTER_SRV_UI_EMAIL_DOMAINS`, and forbids `ASTER_SRV_UI_DEV_EMAIL`. Keep it in a secret store. |
 | `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 43200 (12 hours; verification enforces the same cap). |
@@ -565,8 +567,27 @@ Writes accept a static development token, or a CI token whose `ref` matches
 `refs/heads/main`) and, when `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set, whose
 `job_workflow_ref` (else `workflow_ref`) starts with one of its prefixes. A
 pull-request ref is refused with `403`, so a branch cannot poison the cache,
-and so is a person's token. Test-result uploads follow the same workflow
-rule; a person's token is refused on every test-result route.
+and so is a person's token. Cache writes also need `event_name` `push`
+(pull requests, `pull_request_target`, `workflow_run`, merge queues, schedules
+and manual dispatches are `403` whatever ref they carry). Test-result uploads
+follow the workflow rule and refuse `pull_request_target`, but accept pull
+requests, since a retry that passes there is the flake signal.
+
+### Route table and who may call what
+
+`routes::ROUTES` is the one list of routes. Each has an auth class and the
+router checks it, from the headers, before it reads a body or runs a handler;
+a `/v1/` path the table does not list is `401` without a valid token.
+
+| Class | Routes | Who |
+|---|---|---|
+| `Public` | `GET /healthz`, `GET /readyz`, `POST /v1/auth/token` | anyone; the exchange needs a valid code |
+| `Iap` | `/cli-auth`, `/ui/*` | a person behind IAP |
+| `CiOrPerson` | `GET /v1/test-results/{tests,tests/:id,failures,quarantine,clusters,durations,runs/:id/failures}`, `GET /v1/cache/{summary,entries}`, `POST /v1/cache/lookup` | a CI token for its own repository, or a person's token for any served repository named with `?repo=` (read-only; a person's lookups do not count hits) |
+| `CiWriter` | `POST /v1/test-results/runs`, `POST /v1/cache/{upload,commit}` | a CI token only, then the writer rules |
+
+A lookup or upload request body is capped at 1 MiB and read only after the
+token is verified; a commit may be as large as `ASTER_SRV_MAX_BODY_BYTES`.
 
 ## Laptop sign-in
 
@@ -582,7 +603,7 @@ an authorization-code flow with PKCE against the CLI's loopback port.
 A person's token is an HS256 JWT signed by this server: `iss` is
 `ASTER_SRV_PUBLIC_URL`, `aud` is the same URL, `sub` is IAP's stable subject
 (`accounts.google.com:<id>`), `email` is the email IAP verified, `scope` is
-`cache:read`, with `iat`, `nbf`, `exp` (at most 12 hours after `iat`) and
+`read` (it covers the cache and every dashboard dataset), with `iat`, `nbf`, `exp` (at most 12 hours after `iat`) and
 `jti`, and a `kid` header. Verification pins HS256, requires every claim, and
 allows 30 seconds of clock skew. Tokens issued before `sub`, `nbf` and `email`
 were required are refused; those people sign in once more. There

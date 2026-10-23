@@ -81,6 +81,42 @@ impl Server {
             .context("cannot read the server's reply")
     }
 
+    /// A server that sends a signed-in person's token (`aster cache login`)
+    /// instead of a CI credential.
+    pub fn with_token(
+        url: &str,
+        token: String,
+        proxy_token: Option<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            agent: agent(timeout),
+            base: url.trim_end_matches('/').to_string(),
+            token,
+            proxy_token,
+        }
+    }
+
+    /// `GET path` (with its query): the status and the JSON body, `Null`
+    /// when the body is not JSON. Any status is an answer; only a network
+    /// failure is an error.
+    pub fn get_status(&self, path: &str) -> Result<(u16, Value)> {
+        let url = format!("{}{path}", self.base);
+        let mut request = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token));
+        if let Some(proxy) = &self.proxy_token {
+            request = request.header("Proxy-Authorization", &format!("Bearer {proxy}"));
+        }
+        let mut response = request
+            .call()
+            .with_context(|| format!("cannot reach {}", self.base))?;
+        let code = response.status().as_u16();
+        let body = response.body_mut().read_json().unwrap_or(Value::Null);
+        Ok((code, body))
+    }
+
     /// The server's record of one test, or `None` when it does not know it.
     pub fn test(&self, test_id: &str) -> Result<Option<Value>> {
         self.get_json(&format!(

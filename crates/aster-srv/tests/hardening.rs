@@ -43,7 +43,7 @@ async fn start_with(extra: &[(&str, &str)]) -> Option<Server> {
         ),
         (
             "ASTER_SRV_IAP_AUDIENCE",
-            "/projects/123456/global/backendServices/",
+            "/projects/123456/global/backendServices/4242",
         ),
         ("ASTER_SRV_UI_EMAIL_DOMAINS", "example.com"),
     ]);
@@ -208,7 +208,10 @@ async fn api_listener_serves_only_v1_while_the_main_port_is_unchanged() {
         "/metrics through IAP is hidden"
     );
     assert_eq!(get(format!("{main}/ui")).await.status(), 200);
-    assert_eq!(get(format!("{main}/v1/healthz")).await.status(), 404);
+    // The API listener's bare health check is not a route here. Any `/v1/`
+    // path outside the route table is behind the auth gate, so without a
+    // token the main port answers 401, not the API port's 200.
+    assert_eq!(get(format!("{main}/v1/healthz")).await.status(), 401);
 
     // Phase 2: a person signs in on the main port, the CLI redeems and uses
     // the token on the API port.
@@ -268,12 +271,14 @@ async fn api_listener_serves_only_v1_while_the_main_port_is_unchanged() {
             assert_eq!(hsts.unwrap(), HSTS);
         }
     }
-    // Paths that begin with /v1/ but name no API route are 404 as well.
-    for path in [
-        "/v1/../ui",
-        "/v1/../cli-auth",
-        "/v1/nothing",
-        "/v1/auth/other",
+    // Paths that begin with /v1/ but name no API route are behind the auth
+    // gate: 401 without a token (the IAP header is not a token), never a
+    // page. A client normalizes `/v1/../x` to `/x`, which is not /v1 at all.
+    for (path, status) in [
+        ("/v1/../ui", 404),
+        ("/v1/../cli-auth", 404),
+        ("/v1/nothing", 401),
+        ("/v1/auth/other", 401),
     ] {
         let response = http
             .get(format!("{api}{path}"))
@@ -281,7 +286,7 @@ async fn api_listener_serves_only_v1_while_the_main_port_is_unchanged() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 404, "{path}");
+        assert_eq!(response.status(), status, "{path}");
     }
     assert_eq!(
         http.post(format!("{api}/v1/healthz"))
@@ -289,7 +294,7 @@ async fn api_listener_serves_only_v1_while_the_main_port_is_unchanged() {
             .await
             .unwrap()
             .status(),
-        404
+        401
     );
     // The API port refuses a bad exchange like the main port does.
     assert_eq!(bad_exchange(&api, None).await.status(), 400);

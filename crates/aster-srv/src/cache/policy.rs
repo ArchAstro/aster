@@ -76,8 +76,27 @@ pub fn workflow_allowed(config: &Config, identity: &Identity) -> bool {
         })
 }
 
+/// Whether the run was triggered by a push. Pull requests (also from forks
+/// and `pull_request_target`), merge queues and manual dispatches are not
+/// trusted to write the cache, whatever ref they carry.
+fn pushed(identity: &Identity) -> bool {
+    identity.static_token || identity.event_name.as_deref() == Some("push")
+}
+
+/// Whether a CI token may upload test results. Results come from pull
+/// requests too (a retry that passes there is the flake signal), so unlike
+/// cache writes this does not require a push; it refuses only
+/// `pull_request_target`, which runs with the base repository's secrets
+/// against the pull request's code, and a workflow outside the configured
+/// writer workflows.
+pub fn results_writer_allowed(config: &Config, identity: &Identity) -> bool {
+    workflow_allowed(config, identity)
+        && (identity.static_token || identity.event_name.as_deref() != Some("pull_request_target"))
+}
+
 /// A CI caller. Static tokens may write; OIDC tokens write only when their
-/// ref matches the writer patterns and their workflow is allowed.
+/// ref matches the writer patterns, their workflow is allowed and the run
+/// was triggered by a push.
 pub fn ci_reader(config: &Config, identity: &Identity) -> Reader {
     Reader {
         repository: identity.repository.clone(),
@@ -85,7 +104,8 @@ pub fn ci_reader(config: &Config, identity: &Identity) -> Reader {
             || (config
                 .cache_writers
                 .allows(&identity.repository, identity.git_ref.as_deref())
-                && workflow_allowed(config, identity)),
+                && workflow_allowed(config, identity)
+                && pushed(identity)),
         writer: Writer::from_identity(identity),
         caller: Caller::Ci,
     }
@@ -158,6 +178,7 @@ mod tests {
             "ASTER_SRV_DATABASE_URL" => Some("postgres://localhost/x".into()),
             "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
             "ASTER_SRV_UI_EMAIL_DOMAINS" => Some("example.com".into()),
+            "ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW" => Some("1".into()),
             other => extra
                 .iter()
                 .find(|(key, _)| *key == other)
@@ -176,6 +197,7 @@ mod tests {
             job_workflow: Some(
                 "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main".into(),
             ),
+            event_name: Some("push".into()),
             static_token: false,
         }
     }

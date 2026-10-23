@@ -35,7 +35,9 @@ pub use gha::{client::GhaCacheClient, CacheSummary, GhaBackend};
 pub use hasher::{CacheHasher, DependencyHash, EnvInput, HashedFile, KeyMaterial, RuntimeInput};
 pub use http::{HttpCache, REMOTE_CACHE_TOKEN_ENV, REMOTE_CACHE_URL_ENV};
 pub use local::{LocalStore, PruneStats};
-pub use login::{login, LoginOptions, SignedIn, LOGIN_TIMEOUT, SIGNED_OUT_MESSAGE};
+pub use login::{
+    login, stored_token, LoginOptions, SignedIn, StoredToken, LOGIN_TIMEOUT, SIGNED_OUT_MESSAGE,
+};
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
 pub use prune::{prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE, DEFAULT_MAX_SIZE};
