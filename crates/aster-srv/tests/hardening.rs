@@ -1133,7 +1133,7 @@ async fn https_deployments_send_hsts_on_every_response_and_auth_responses_are_ne
     let mut responses = vec![
         (
             "token success",
-            http.post(format!("{}/v1/auth/token", api))
+            http.post(format!("{api}/v1/auth/token"))
                 .json(&json!({"code": code, "verifier": verifier, "port": 40123}))
                 .send()
                 .await
