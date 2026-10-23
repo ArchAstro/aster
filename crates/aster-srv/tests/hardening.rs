@@ -1571,3 +1571,100 @@ async fn a_401_flood_is_sampled_and_summarised_while_counters_and_the_success_tr
     );
     server.stop().await;
 }
+
+// ------------------------------------------------------------ N12: the client IP
+
+/// N12: the client IP the server rate-limits and audits is the one
+/// `limits::client_ip` picks from every `X-Forwarded-For` line together, for
+/// the configured number of trusted hops: repeated lines are one list, a
+/// spoofed prefix changes nothing, and more hops move the client left.
+/// Each case uses its own address, so the shared log capture cannot mix cases.
+#[tokio::test]
+async fn the_client_ip_comes_from_all_forwarded_for_lines_and_the_trusted_hops() {
+    // A failed sign-in exchange sent with `lines`; the audit trail must name
+    // `expected`. (An exchange, not a bad bearer: a bad bearer also writes a
+    // "token refused" warning, which the N15 test counts across this binary.)
+    async fn assert_audited_as(server: &Server, lines: &[&str], expected: &str) {
+        let headers: String = lines
+            .iter()
+            .map(|line| format!("x-forwarded-for: {line}\r\n"))
+            .collect();
+        let (verifier, _) = pkce();
+        let body = json!({
+            "code": BASE64URL.encode([7u8; 32]),
+            "verifier": verifier,
+            "port": 40123,
+            "user_code": USER_CODE,
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/auth/token HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{headers}\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let reply = raw(&server.url, request.as_bytes(), Duration::from_secs(5)).await;
+        assert_eq!(status_of(&reply), Some(400), "{reply}");
+        let named = aster_srv::log::captured()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|l| {
+                l["audit"] == true
+                    && l["event"] == "token_exchange"
+                    && l["outcome"] == "failure"
+                    && l["route"] == "/v1/auth/token"
+                    && l["client_ip"] == expected
+            });
+        assert!(named, "{lines:?} should be audited as {expected}");
+    }
+
+    // One trusted hop: the load balancer.
+    let Some(server) = start_with(&[("ASTER_SRV_LOG_SAMPLE_FIRST", "1000")]).await else {
+        return;
+    };
+    assert_audited_as(
+        &server,
+        &["6.6.6.6, 203.0.113.91, 34.8.0.1"],
+        "203.0.113.91",
+    )
+    .await;
+    assert_audited_as(
+        &server,
+        &["6.6.6.6, 203.0.113.93", "34.8.0.1"],
+        "203.0.113.93",
+    )
+    .await;
+    assert_audited_as(
+        &server,
+        &["9.9.9.9", "5.5.5.5, 203.0.113.94, 34.8.0.1"],
+        "203.0.113.94",
+    )
+    .await;
+    // Too few entries: the TCP peer, which is the test client. (Other tests
+    // also audit 127.0.0.1, so this only shows the request is served; the
+    // `limits` unit tests pin the fallback exactly.)
+    assert_audited_as(&server, &["34.8.0.1"], "127.0.0.1").await;
+    server.stop().await;
+
+    // Two trusted hops (a proxy in front of the balancer): one entry further left.
+    let Some(server) = start_with(&[
+        ("ASTER_SRV_TRUSTED_PROXY_HOPS", "2"),
+        ("ASTER_SRV_LOG_SAMPLE_FIRST", "1000"),
+    ])
+    .await
+    else {
+        return;
+    };
+    assert_audited_as(
+        &server,
+        &["6.6.6.6, 203.0.113.95, 10.0.0.5, 34.8.0.1"],
+        "203.0.113.95",
+    )
+    .await;
+    assert_audited_as(
+        &server,
+        &["6.6.6.6", "203.0.113.96", "10.0.0.5, 34.8.0.1"],
+        "203.0.113.96",
+    )
+    .await;
+    server.stop().await;
+}

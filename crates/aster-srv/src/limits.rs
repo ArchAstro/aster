@@ -233,6 +233,15 @@ impl Limits {
     }
 }
 
+/// The `X-Forwarded-For` value of a request: every header line of that name,
+/// in order, joined into one list (RFC 9110: repeated lines are one
+/// comma-separated list). A line that is not text is skipped. `None` when
+/// there is nothing to read.
+pub fn forwarded_for<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let joined = lines.into_iter().collect::<Vec<_>>().join(",");
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// The client address: see the module docs for the trust model.
 pub fn client_ip(forwarded_for: Option<&str>, peer: IpAddr, trusted_hops: usize) -> IpAddr {
     let from_header = || {
@@ -415,6 +424,62 @@ mod tests {
         // The table keeps only keys with a live slot.
         drop(b);
         assert_eq!(slots.keys(), 1);
+    }
+
+    /// N12: a client may send any number of `X-Forwarded-For` lines; they
+    /// are one list, in order, and the load balancer's entries are the last.
+    #[test]
+    fn repeated_forwarded_for_lines_are_one_list_and_cannot_move_the_client() {
+        let peer = ip("10.0.0.9");
+        let lb = "203.0.113.7, 34.8.0.1";
+        // The caller's own lines come before the balancer's.
+        let one_line = forwarded_for(["6.6.6.6, 7.7.7.7, 203.0.113.7, 34.8.0.1"]);
+        let two_lines = forwarded_for(["6.6.6.6", "7.7.7.7", lb]);
+        let spoof_first = forwarded_for(["6.6.6.6, 5.5.5.5", lb]);
+        for header in [&one_line, &two_lines, &spoof_first] {
+            assert_eq!(client_ip(header.as_deref(), peer, 1), ip("203.0.113.7"));
+        }
+        // Lines are joined in order, so hops walk across a line boundary.
+        assert_eq!(forwarded_for(["a", "b, c"]).as_deref(), Some("a,b, c"));
+        assert_eq!(
+            client_ip(
+                forwarded_for(["9.9.9.9", "203.0.113.7", "34.8.0.1"]).as_deref(),
+                peer,
+                1
+            ),
+            ip("203.0.113.7")
+        );
+        // No lines, or empty ones: the peer.
+        assert_eq!(forwarded_for([]), None);
+        assert_eq!(forwarded_for([""]), None);
+        assert_eq!(client_ip(forwarded_for([]).as_deref(), peer, 1), peer);
+        // A spoofed line added after the balancer's entries takes the
+        // trusted position: the balancer must be the last to append, which
+        // is why the pods must be reachable through it alone.
+        assert_eq!(
+            client_ip(forwarded_for([lb, "6.6.6.6"]).as_deref(), peer, 1),
+            ip("34.8.0.1")
+        );
+    }
+
+    /// N12: each trusted hop moves the client one entry left, and an entry
+    /// that is not an address, or a header too short for the hops, falls back
+    /// to the peer.
+    #[test]
+    fn the_client_moves_left_one_entry_per_trusted_hop() {
+        let peer = ip("10.0.0.9");
+        let header = forwarded_for(["1.1.1.1, 2.2.2.2, 3.3.3.3, 4.4.4.4"]);
+        let at = |hops| client_ip(header.as_deref(), peer, hops);
+        assert_eq!(at(0), peer);
+        assert_eq!(at(1), ip("3.3.3.3"));
+        assert_eq!(at(2), ip("2.2.2.2"));
+        assert_eq!(at(3), ip("1.1.1.1"));
+        assert_eq!(at(4), peer);
+        assert_eq!(
+            client_ip(Some("1.1.1.1, not-an-ip, 4.4.4.4"), peer, 1),
+            peer
+        );
+        assert_eq!(client_ip(Some("1.1.1.1,,4.4.4.4"), peer, 1), peer);
     }
 
     #[test]
