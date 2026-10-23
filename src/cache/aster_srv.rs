@@ -165,6 +165,14 @@ impl AsterSrvBackend {
         self
     }
 
+    /// Replace the per-call timeout. Tests shrink it so a slow fake gateway
+    /// reproduces a production timeout without a multi-second wait.
+    #[cfg(test)]
+    fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.agent = build_agent(timeout);
+        self
+    }
+
     fn new(
         base_url: String,
         repo: String,
@@ -533,6 +541,10 @@ impl CacheBackend for AsterSrvBackend {
         self.stream_put(&url, reader)
     }
 
+    fn writable(&self) -> bool {
+        !self.read_only()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -584,7 +596,16 @@ fn decode_hit(entry: &Value) -> Result<Option<Hit>> {
 fn signed_out() -> anyhow::Error {
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| eprintln!("{}", login::SIGNED_OUT_MESSAGE));
-    DisablingFailure(anyhow::anyhow!("remote cache skipped; not signed in")).into()
+    DisablingFailure(anyhow::anyhow!(SIGNED_OUT_REASON)).into()
+}
+
+const SIGNED_OUT_REASON: &str = "remote cache skipped; not signed in";
+
+/// Whether `error` is [`signed_out`], whose own warning is already printed.
+pub fn is_signed_out(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == SIGNED_OUT_REASON)
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -700,6 +721,10 @@ mod tests {
         commit_status: Arc<Mutex<u16>>,
         /// When set, every cache call is refused with 401.
         refuse: Arc<AtomicBool>,
+        /// Milliseconds a lookup waits per key it was asked about. The real
+        /// server signs and checks every blob of every hit one at a time, so
+        /// its lookup time grows with the batch.
+        lookup_ms_per_key: Arc<std::sync::atomic::AtomicU64>,
         proxy_seen: Arc<Mutex<Vec<String>>>,
         /// The `Authorization` header of each cache call (lowercased).
         auth_seen: Arc<Mutex<Vec<String>>>,
@@ -718,6 +743,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new()));
             let commit_status = Arc::new(Mutex::new(201_u16));
             let refuse = Arc::new(AtomicBool::new(false));
+            let lookup_ms_per_key = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let proxy_seen = Arc::new(Mutex::new(Vec::new()));
             let auth_seen = Arc::new(Mutex::new(Vec::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -729,6 +755,7 @@ mod tests {
             let manifests_c = Arc::clone(&manifests);
             let status_c = Arc::clone(&commit_status);
             let refuse_c = Arc::clone(&refuse);
+            let delay_c = Arc::clone(&lookup_ms_per_key);
             let proxy_seen_c = Arc::clone(&proxy_seen);
             let auth_seen_c = Arc::clone(&auth_seen);
             let shutdown_c = Arc::clone(&shutdown);
@@ -815,6 +842,15 @@ mod tests {
                         let _ = stream.write_all(payload);
                         continue;
                     }
+                    if path == "/v1/cache/lookup" {
+                        let asked = serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|request| request["keys"].as_array().map(Vec::len))
+                            .unwrap_or(0) as u64;
+                        thread::sleep(Duration::from_millis(
+                            asked * delay_c.load(Ordering::Relaxed),
+                        ));
+                    }
                     let (status, payload, extra_headers) = route(
                         path,
                         &body,
@@ -843,6 +879,7 @@ mod tests {
                 manifests,
                 commit_status,
                 refuse,
+                lookup_ms_per_key,
                 proxy_seen,
                 auth_seen,
                 shutdown,
@@ -1164,6 +1201,100 @@ mod tests {
         let ci = backend(&fake);
         let error = ci.get_manifest("anything").unwrap_err();
         assert!(!disables(&error), "{error:#}");
+    }
+
+    fn tier_over(
+        fake: &Fake,
+        timeout: Duration,
+        dir: &std::path::Path,
+    ) -> (
+        super::super::backend::TieredCache,
+        Arc<super::super::remote_stats::RemoteStats>,
+    ) {
+        let stats = Arc::new(super::super::remote_stats::RemoteStats::new());
+        let tier = super::super::backend::TieredCache::with_remote(
+            super::super::local::LocalStore::new(dir.to_path_buf()),
+            super::super::backend::CacheMode::ReadWrite,
+            Arc::new(backend(fake).with_request_timeout(timeout)),
+        )
+        .with_stats(Arc::clone(&stats));
+        (tier, stats)
+    }
+
+    fn publish(fake: &Fake, count: u8) -> Vec<String> {
+        let writer = backend(fake);
+        (0..count)
+            .map(|index| {
+                let bytes = format!("blob-{index}").into_bytes();
+                let digest = Digest::of_bytes(&bytes);
+                let key = format!("{index:02x}").repeat(32);
+                writer.find_missing(std::slice::from_ref(&digest)).unwrap();
+                writer.put_blob(&digest, &mut Cursor::new(bytes)).unwrap();
+                writer.put_manifest(&manifest(&key, &digest)).unwrap();
+                key
+            })
+            .collect()
+    }
+
+    /// P3. The reader's first batch lookup took longer than the request
+    /// timeout. Before, that disabled the remote for the whole run without a
+    /// word, so every target rebuilt. Now the batch is only a missed
+    /// optimisation: targets look themselves up one at a time and hit.
+    #[test]
+    fn a_batch_lookup_timeout_does_not_switch_the_remote_off_for_the_run() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 3);
+        // 3 keys take 1.5s, past the 1.2s timeout; one key takes 0.5s.
+        fake.lookup_ms_per_key.store(500, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_millis(1200), dir.path());
+
+        tier.prefetch(&keys);
+        assert!(tier.remote_enabled(), "a timed-out batch must not disable");
+        for key in &keys {
+            assert!(tier.lookup(key).unwrap().is_some(), "{key} must still hit");
+        }
+
+        let summary = stats.snapshot().unwrap();
+        assert_eq!((summary.hits, summary.misses, summary.failures), (3, 0, 1));
+        assert_eq!(summary.disabled, None, "{summary}");
+    }
+
+    /// A lookup of one target that times out still stops the run's remote
+    /// calls (a hung gateway is one wait), and now the summary says why.
+    #[test]
+    fn a_single_lookup_timeout_disables_the_remote_and_the_summary_names_it() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 1);
+        fake.lookup_ms_per_key.store(1500, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_millis(300), dir.path());
+
+        assert!(tier.lookup(&keys[0]).unwrap().is_none());
+        assert!(!tier.remote_enabled());
+        let line = stats.snapshot().unwrap().to_string();
+        assert!(
+            line.starts_with("remote: 0 hits / 0 misses / 0 uploads / 1 failures; disabled: "),
+            "{line}"
+        );
+        assert!(line.contains("timeout"), "{line}");
+    }
+
+    #[test]
+    fn a_read_only_identity_reports_read_only_and_no_uploads() {
+        let fake = Fake::spawn();
+        *fake.commit_status.lock().unwrap() = 403;
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_secs(5), dir.path());
+        let digest = Digest::of_bytes(b"pr-branch");
+        tier.local_store()
+            .put_blob(&digest, &b"pr-branch"[..])
+            .unwrap();
+        tier.store(&manifest(&"ee".repeat(32), &digest)).unwrap();
+        assert_eq!(
+            stats.snapshot().unwrap().to_string(),
+            "remote: 0 hits / 0 misses / 0 uploads (read-only)"
+        );
     }
 
     fn disables(error: &anyhow::Error) -> bool {
