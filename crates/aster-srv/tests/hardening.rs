@@ -1317,7 +1317,13 @@ async fn unauthenticated_bodies_time_out_in_seconds_while_authenticated_ones_kee
     let stalled = format!(
         "POST /v1/test-results/runs HTTP/1.1\r\nHost: x\r\nauthorization: {}\r\n\
          Content-Length: 100\r\n\r\n{{",
-        ci_bearer()
+        format!(
+            "Bearer {}",
+            common::token_with_claims(
+                REPO,
+                json!({"job_workflow_ref": "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main"})
+            )
+        )
     );
     let started = Instant::now();
     let reply = raw(&server.url, stalled.as_bytes(), Duration::from_secs(3)).await;
@@ -1453,5 +1459,30 @@ async fn without_a_proxy_one_peer_cannot_hold_more_connections_than_its_share() 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(served, "a slot frees when a connection closes");
+    server.stop().await;
+}
+
+/// N4: on a server with the API listener, a token whose `repository_owner_id`
+/// is not the pinned one, or is missing, is refused on both ports; the
+/// pinned owner passes. (Startup refuses an unpinned allowlist entry, so the
+/// fail-closed case itself is the `OwnerIds` unit test.)
+#[tokio::test]
+async fn the_api_listener_refuses_tokens_without_the_pinned_owner_id() {
+    let Some(server) = start_with(&[("ASTER_SRV_API_ADDR", "127.0.0.1:0")]).await else {
+        return;
+    };
+    let wrong = format!(
+        "Bearer {}",
+        common::token_with_claims(REPO, json!({"repository_owner_id": "1"}))
+    );
+    let missing = format!(
+        "Bearer {}",
+        common::token_with_claims(REPO, json!({"repository_owner_id": null}))
+    );
+    for url in [&server.url, server.api_url.as_ref().unwrap()] {
+        assert_eq!(lookup(url, &ci_bearer()).await.status(), 200);
+        assert_eq!(lookup(url, &wrong).await.status(), 403, "{url}");
+        assert_eq!(lookup(url, &missing).await.status(), 403, "{url}");
+    }
     server.stop().await;
 }
