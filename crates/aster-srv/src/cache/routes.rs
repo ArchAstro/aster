@@ -240,6 +240,8 @@ enum Resolved {
     /// Not in GCS: the blob is left out and the client uploads it again.
     Absent,
     /// GCS or signing failed or was busy: the entry is answered as a miss.
+    /// A blob still unresolved when the lookup budget runs out is treated
+    /// the same way.
     Failed,
 }
 
@@ -287,7 +289,17 @@ async fn lookup_hits(
         admitted.push((key.clone(), manifest, refs));
     }
 
-    let resolved: std::collections::HashMap<String, Resolved> = stream::iter(digests)
+    // Resolve at most LOOKUP_CONCURRENCY blobs at once, and stop at the
+    // store's lookup budget: a blob still unresolved then leaves its entry a
+    // miss, so the reply beats the client's request timeout. Without a
+    // bucket every blob resolves at once as absent and there is no budget:
+    // a zero one would race the stream and drop entries at random.
+    let budget = app
+        .cache_store
+        .lookup_budget()
+        .unwrap_or(std::time::Duration::MAX);
+    let wanted = digests.len();
+    let mut pending = stream::iter(digests)
         .map(|digest| async move {
             let result = match app.cache_store.readable_url(&digest).await {
                 Ok(Some(url)) => Resolved::Url(url),
@@ -302,18 +314,48 @@ async fn lookup_hits(
             };
             (digest, result)
         })
-        .buffer_unordered(LOOKUP_CONCURRENCY)
-        .collect()
-        .await;
+        .buffer_unordered(LOOKUP_CONCURRENCY);
+    let mut resolved: std::collections::HashMap<String, Resolved> =
+        std::collections::HashMap::with_capacity(wanted);
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            next = pending.next() => match next {
+                Some((digest, result)) => {
+                    resolved.insert(digest, result);
+                }
+                None => break,
+            },
+            () = &mut deadline => {
+                crate::log::warn(
+                    "cache lookup ran out of time; unresolved entries are misses",
+                    json!({
+                        "repo": repo,
+                        "budget_ms": budget.as_millis() as u64,
+                        "resolved": resolved.len(),
+                        "blobs": wanted,
+                    }),
+                );
+                break;
+            }
+        }
+    }
+    // Dropping the stream cancels the HEADs and signatures still in flight.
+    drop(pending);
 
     let mut hits = serde_json::Map::new();
     let mut served_keys: Vec<String> = Vec::new();
     let mut served_blobs: Vec<String> = Vec::new();
     for (key, manifest, refs) in admitted {
-        if refs
-            .iter()
-            .any(|digest| matches!(resolved.get(digest), Some(Resolved::Failed)))
-        {
+        // A blob that failed, or was not resolved within the budget, makes
+        // the whole entry a miss: the server cannot say whether it exists.
+        if refs.iter().any(|digest| {
+            !matches!(
+                resolved.get(digest),
+                Some(Resolved::Url(_) | Resolved::Absent)
+            )
+        }) {
             continue;
         }
         let mut blobs = serde_json::Map::new();

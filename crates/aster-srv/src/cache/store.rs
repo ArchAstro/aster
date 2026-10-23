@@ -41,6 +41,11 @@ pub struct FanoutConfig {
     pub head_concurrency: usize,
     /// Digests remembered; idle ones are dropped when this is exceeded.
     pub max_slots: usize,
+    /// Longest one lookup spends resolving blobs. An entry with a blob not
+    /// resolved by then is answered as a miss, so a cold or throttled lookup
+    /// still replies inside the client's request timeout (5s since 0.22)
+    /// instead of timing out and losing every hit in the batch.
+    pub lookup_budget: Duration,
     pub sign: SignLimits,
 }
 
@@ -51,6 +56,7 @@ impl Default for FanoutConfig {
             reuse_margin: Duration::from_secs(5 * 60),
             head_concurrency: 64,
             max_slots: 20_000,
+            lookup_budget: Duration::from_secs(3),
             sign: SignLimits::default(),
         }
     }
@@ -180,6 +186,12 @@ impl BlobStore {
             BlobStore::Disabled => None,
             BlobStore::Gcs { fanout, .. } | BlobStore::Memory { fanout, .. } => Some(fanout),
         }
+    }
+
+    /// How long one lookup may spend resolving blobs; see
+    /// [`FanoutConfig::lookup_budget`]. `None` without a bucket.
+    pub fn lookup_budget(&self) -> Option<Duration> {
+        self.fanout().map(|fanout| fanout.config.lookup_budget)
     }
 
     /// HEAD requests issued so far (cache hits excluded). For tests.
