@@ -19,13 +19,12 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{Config, EmailDomains, IapAudience};
+use crate::keyfetch::{RefetchPolicy, RefetchState};
 
 pub const IAP_ISSUER: &str = "https://cloud.google.com/iap";
 pub const IAP_JWKS_URL: &str = "https://www.gstatic.com/iap/verify/public_key-jwk";
 /// The header IAP puts its assertion in.
 pub const IAP_HEADER: &str = "x-goog-iap-jwt-assertion";
-
-const REFETCH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Who is viewing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,9 +75,11 @@ pub struct IapVerifier {
     /// Where keys come from; `None` uses only keys added with [`Self::with_key`].
     jwks_url: Option<String>,
     keys: RwLock<HashMap<String, DecodingKey>>,
-    /// When keys were last fetched. Held for the whole fetch, so a caller
-    /// that arrives mid-fetch waits and then finds the fetched keys.
-    last_fetch: Mutex<Option<Instant>>,
+    /// When keys may be refetched (see [`crate::keyfetch`]). Held for the
+    /// whole fetch, so a caller that arrives mid-fetch waits and then finds
+    /// the fetched keys.
+    refetch: Mutex<RefetchState>,
+    refetch_policy: RefetchPolicy,
     client: reqwest::Client,
 }
 
@@ -94,12 +95,21 @@ impl IapVerifier {
             domains: config.ui_email_domains.clone(),
             jwks_url: Some(IAP_JWKS_URL.to_string()),
             keys: RwLock::new(HashMap::new()),
-            last_fetch: Mutex::new(None),
+            refetch: Mutex::new(RefetchState::default()),
+            refetch_policy: RefetchPolicy::default(),
             client: crate::http_client()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP client builds"),
         }
+    }
+
+    /// Fetch keys from `url` instead of Google's, spacing refetches by
+    /// `policy`. For tests.
+    pub fn with_jwks(mut self, url: &str, policy: RefetchPolicy) -> Self {
+        self.jwks_url = Some(url.to_string());
+        self.refetch_policy = policy;
+        self
     }
 
     /// Trust one signing key and fetch no others. For tests.
@@ -196,14 +206,14 @@ impl IapVerifier {
         // One fetch at a time, with the lock held across it. Callers that
         // queued behind a fetch look again once they hold the lock, so they
         // get the key it fetched instead of failing while it was in flight.
-        let mut last = self.last_fetch.lock().await;
+        let mut refetch = self.refetch.lock().await;
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
-        if last.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+        if !refetch.may_fetch(kid, Instant::now(), self.refetch_policy) {
             return Err(unknown());
         }
-        *last = Some(Instant::now());
+        refetch.attempted(Instant::now());
         let set: JwkSet = self
             .client
             .get(url)
@@ -224,7 +234,16 @@ impl IapVerifier {
         }
         let mut keys = self.keys.write().await;
         *keys = fetched;
-        keys.get(kid).cloned().ok_or_else(unknown)
+        match keys.get(kid).cloned() {
+            Some(key) => {
+                refetch.found(kid);
+                Ok(key)
+            }
+            None => {
+                refetch.missing(kid, Instant::now());
+                Err(unknown())
+            }
+        }
     }
 }
 
