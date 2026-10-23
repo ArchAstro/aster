@@ -246,11 +246,21 @@ impl Model {
                     events.insert(event("definite", "retry", f));
                     definite.insert(f.key.1.clone());
                 }
+                // The nearest earlier run of the hash, and for a trusted
+                // (default-branch) run also the nearest earlier trusted one.
                 let earlier = list[..i]
                     .iter()
                     .rev()
                     .find(|p| p.input_hash == f.input_hash);
-                if let Some(p) = earlier.filter(|p| p.is_fail != f.is_fail) {
+                let earlier_trusted = list[..i]
+                    .iter()
+                    .rev()
+                    .find(|p| p.input_hash == f.input_hash && p.on_default)
+                    .filter(|_| f.on_default);
+                for p in [earlier, earlier_trusted].into_iter().flatten() {
+                    if p.is_fail == f.is_fail {
+                        continue;
+                    }
                     let failed = if f.is_fail { f } else { p };
                     if !incidents.contains(&failed.key.1) {
                         events.insert(event("definite", "input_hash", failed));

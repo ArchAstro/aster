@@ -100,9 +100,18 @@ the classifier updates `test_results.quarantine`, in this order:
 3. A test whose final results since it entered end in
    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` (default 20) consecutive passes is
    **released**. Any failure resets the count.
-4. A test that is not broken **enters** once definite flake events from
-   `ASTER_SRV_QUARANTINE_RUNS` (default 2) different failing runs fall within
-   the last 7 days. Only events after it last left count, so a released or
+4. A test that is not broken **enters** once **trusted** definite flake
+   events from `ASTER_SRV_QUARANTINE_RUNS` (default 2) different failing runs
+   fall within the last 7 days. An event is trusted when both of its runs are
+   default-branch runs by their upload's credentials: an OIDC token whose
+   `ref` is the default branch and whose `event_name` is `push`,
+   `workflow_dispatch` or `schedule`, or a static token's run on the default
+   branch. Pull request jobs run their author's code, so their token proves
+   where results came from, not that they are true: their flakes still score
+   (and show on `/ui`) but never quarantine a test, and a pull request's pass
+   cannot make a real main failure count. A trusted run is also compared
+   with the nearest earlier trusted run of its inputs, so pull request runs
+   in between do not hide a flake main saw itself. Only events after it last left count, so a released or
    expired test is judged afresh. `0` turns automatic quarantine off. A run
    holding definite events of more than `ASTER_SRV_QUARANTINE_RUN_CAP`
    (default 10) tests in those days counts toward none of them: many tests
