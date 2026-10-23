@@ -112,6 +112,9 @@ pub struct Limits {
     pub api_subject: RateLimiter,
     /// Exchanges allowed to run at once.
     pub exchanges: Arc<Semaphore>,
+    /// Large request bodies (a cache commit, a test-results upload) read at
+    /// once: each can weigh `ASTER_SRV_MAX_BODY_BYTES` in memory.
+    pub large_bodies: Arc<Semaphore>,
     pub trusted_proxy_hops: usize,
 }
 
@@ -122,6 +125,7 @@ impl Limits {
             api_ip: RateLimiter::new(config.rate_api_ip_per_min),
             api_subject: RateLimiter::new(config.rate_api_subject_per_min),
             exchanges: Arc::new(Semaphore::new(MAX_CONCURRENT_EXCHANGES)),
+            large_bodies: Arc::new(Semaphore::new(config.max_large_bodies)),
             trusted_proxy_hops: config.trusted_proxy_hops,
         }
     }
