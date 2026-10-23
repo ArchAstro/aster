@@ -80,6 +80,8 @@ pub struct App {
     pub auth_pool: deadpool_postgres::Pool,
     pub limits: limits::Limits,
     pub metrics: Arc<metrics::Metrics>,
+    /// Samples the failure audit lines; see [`audit`].
+    pub audit_sampler: Arc<audit::Sampler>,
     pub verifier: auth::Verifier,
     pub iap: iap::IapVerifier,
     /// Mints and checks person tokens. `None` when
@@ -188,6 +190,10 @@ impl App {
         let auth_pool =
             db::pool_sized(&config.database_url, limits::AUTH_POOL_SIZE, config.db_wait)?;
         let limits = limits::Limits::new(&config);
+        let audit_sampler = Arc::new(audit::Sampler::new(
+            config.log_sample_first,
+            config.log_sample_window,
+        ));
         let person_tokens = person::TokenIssuer::from_config(&config);
         let raw_store =
             raw_store.unwrap_or_else(|| raw_store::RawStore::new(config.raw_bucket.clone()));
@@ -200,6 +206,7 @@ impl App {
             auth_pool,
             limits,
             metrics: Default::default(),
+            audit_sampler,
             verifier,
             iap,
             person_tokens,

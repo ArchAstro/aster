@@ -40,6 +40,7 @@ async fn run() -> anyhow::Result<()> {
     let listen = config.listen;
     let api_listen = config.api_listen;
     let app = App::connect(config)?;
+    aster_srv::audit::Sampler::spawn_flush(&app.audit_sampler);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     log::info(
         "aster-srv listening",
@@ -91,10 +92,11 @@ async fn run() -> anyhow::Result<()> {
         shutdown_signal().await;
         let _ = stop.send(true);
     });
-    aster_srv::serve(app, listener, wait(stopped)).await?;
+    aster_srv::serve(app.clone(), listener, wait(stopped)).await?;
     if let Some(api) = api {
         api.await??;
     }
+    app.audit_sampler.flush_all();
     log::info("aster-srv stopped", json!({}));
     Ok(())
 }

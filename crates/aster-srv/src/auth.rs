@@ -135,8 +135,12 @@ impl AuthError {
         } else {
             401
         };
+        // Sampled with the audit lines: a flood of bad tokens is one line
+        // per client and reason per window, then a summary.
         if let AuthError::Invalid(reason) = &self {
-            crate::log::warn("token refused", serde_json::json!({"reason": reason}));
+            if crate::audit::admit("token_refused", self.reason_code()) {
+                crate::log::warn("token refused", serde_json::json!({"reason": reason}));
+            }
         }
         crate::Reply::error(status, self.to_string())
     }
