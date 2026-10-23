@@ -440,6 +440,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_DEV_BLOB_ROUTE` | unset | `1` makes the in-memory blob store answer `PUT\|GET /<bucket>/cas/<sha>`, the test stand-in for a signed GCS URL. Tests and local development only; no deploy sets it and the route does not exist without it. |
 | `ASTER_SRV_PUBLIC_URL` | unset | The https URL people reach the server at (`https://aster-srv.example.com`); the `iss` and `aud` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). With an https URL every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains`. An `http://` URL is refused at startup unless `ASTER_SRV_ALLOW_HTTP_PUBLIC_URL=1` (development and tests only). |
 | `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated. A secret is hex (64+ digits) or base64 (43+ characters) for at least 32 random bytes, as `openssl rand -base64 32` makes; passphrases, short keys and patterned keys (one byte repeated, a repeated block, a counting run, fewer than 16 distinct bytes) stop startup. The first signs person tokens and form MACs; all verify. Setting it also requires `ASTER_SRV_IAP_AUDIENCE` and `ASTER_SRV_UI_EMAIL_DOMAINS`, and forbids `ASTER_SRV_UI_DEV_EMAIL`. Keep it in a secret store. |
+| `ASTER_SRV_PERSON_TOKENS` | `on` | `off` is the kill switch for laptop sign-in: every person token is refused and `/cli-auth` and `/v1/auth/token` answer `404`, whatever else is set. CI tokens are unaffected. Any value but `on` or `off` stops startup. See [Rotating the signing keys](#rotating-the-signing-keys). |
 | `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 43200 (12 hours; verification enforces the same cap). |
 | `ASTER_SRV_API_ADDR` | unset | A second listener, such as `0.0.0.0:8081`, that serves only `/v1/*`. It refuses to start unless `ASTER_SRV_STATIC_TOKENS` and `ASTER_SRV_DEV_BLOB_ROUTE` are unset, `ASTER_SRV_REPOSITORY_OWNER_IDS` pins every `ASTER_SRV_REPOSITORIES` entry, `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set and `ASTER_SRV_TRUSTED_PROXY_HOPS` is at least 1. See [Hardening](#hardening-the-v1-channel). |
 | `ASTER_SRV_TRUSTED_PROXY_HOPS` | `1` | `X-Forwarded-For` entries from the right that infrastructure appended. See [Client IP](#client-ip-and-rate-limits). |
@@ -683,8 +684,7 @@ keys only and RS256 to the GitHub OIDC verifier only; any other algorithm is
 Sign-in is off, failing closed, unless both `ASTER_SRV_CLI_TOKEN_KEYS` and
 `ASTER_SRV_PUBLIC_URL` are set and IAP (`ASTER_SRV_IAP_AUDIENCE`) is
 configured: `/cli-auth` and `/v1/auth/token` answer `404` and person tokens are
-refused. Rotate keys by adding a new first pair, waiting out the token
-lifetime, then dropping the old pair.
+refused.
 
 Every six hours one replica drops manifests unused for `ASTER_SRV_CACHE_DAYS`
 (default 14) and blobs no remaining manifest names, and deletes those objects.
@@ -698,6 +698,40 @@ A lookup answers before its day's `cache.lookup_stats` row is written: that
 write runs afterwards with a 3 second limit, and a failure is logged and the
 request's counts are lost. The counts are lookup requests (each distinct key
 counts once), not successful restores.
+
+### Rotating the signing keys
+
+The deploying repository sets `ASTER_SRV_CLI_TOKEN_KEYS` from its secret store;
+these are the steps on the server's side.
+
+`ASTER_SRV_CLI_TOKEN_KEYS` is a comma-separated list of `kid:secret` pairs,
+such as `k2:<new secret>,k1:<old secret>`. The first pair signs new person
+tokens (its `kid` goes in the token header) and the `/cli-auth` form MACs;
+every pair verifies. Key ids use letters, digits, `-`, `_` and `.`, and may
+not repeat.
+
+A secret is at least 32 random bytes, written as base64 (43+ characters) or
+hex (64+ digits): `openssl rand -base64 32` or `openssl rand -hex 32`.
+Passphrases, short keys and patterned keys stop startup.
+
+Planned rotation, with nobody signed out:
+
+1. Generate a new secret and put its pair first: `k2:<new>,k1:<old>`. Deploy.
+   New tokens are signed with `k2`; tokens signed with `k1` still verify.
+2. Wait a little over 12 hours after every replica runs the new list (the
+   longest a token lives, whatever `ASTER_SRV_CLI_TOKEN_TTL` says, plus 30
+   seconds of clock skew), so every `k1` token has expired.
+3. Drop the old pair: `k2:<new>`. Deploy.
+
+Emergency rotation, when a secret leaked: replace the whole list with one new
+pair, `k3:<new>`, and deploy. Every token signed with an older key is refused
+at once, so everyone signs in again with `aster cache login`; a `/cli-auth`
+page open during the deploy fails its MAC and has to be reloaded.
+
+Kill switch: `ASTER_SRV_PERSON_TOKENS=off` refuses every person token and
+answers `404` on `/cli-auth` and `/v1/auth/token`, whatever the keys say. CI
+tokens are unaffected. Set it back to `on` (or unset it) to re-enable sign-in;
+tokens still within their lifetime and signed by a listed key work again.
 
 ### Revoking a departed person's tokens
 
