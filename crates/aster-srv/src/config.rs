@@ -72,6 +72,11 @@ pub struct Config {
     /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
+    /// `ASTER_SRV_MAX_LARGE_BODIES`: how many large request bodies (a cache
+    /// commit's manifest, a test-results upload) one replica reads at once.
+    /// Each can weigh `max_body_bytes`; past the limit a request gets `503`
+    /// with `Retry-After`. Default 8.
+    pub max_large_bodies: usize,
     /// `ASTER_SRV_IAP_AUDIENCE`: the Google IAP audience the dashboard (`/ui`)
     /// accepts: exactly `/projects/NUMBER/global/backendServices/ID`. A
     /// project-wide prefix is refused at startup, since it would accept an
@@ -437,6 +442,7 @@ impl Config {
         let rate_api_subject_per_min =
             number("ASTER_SRV_RATE_API_SUBJECT_PER_MIN", 3000, 1..=1_000_000)? as u32;
         let max_connections = number("ASTER_SRV_MAX_CONNECTIONS", 1024, 1..=1_000_000)? as usize;
+        let max_large_bodies = number("ASTER_SRV_MAX_LARGE_BODIES", 8, 1..=1024)? as usize;
         let db_wait = Duration::from_secs(number("ASTER_SRV_DB_WAIT_SECS", 5, 1..=300)?);
         let header_timeout =
             Duration::from_secs(number("ASTER_SRV_HEADER_TIMEOUT_SECS", 20, 1..=300)?);
@@ -478,6 +484,7 @@ impl Config {
             default_branch,
             broken_runs,
             max_body_bytes,
+            max_large_bodies,
             iap_audience,
             ui_email_domains,
             ui_dev_email: var("ASTER_SRV_UI_DEV_EMAIL").map(|email| email.trim().to_string()),

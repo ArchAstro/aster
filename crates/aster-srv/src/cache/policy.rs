@@ -94,18 +94,25 @@ pub fn results_writer_allowed(config: &Config, identity: &Identity) -> bool {
         && (identity.static_token || identity.event_name.as_deref() != Some("pull_request_target"))
 }
 
-/// A CI caller. Static tokens may write; OIDC tokens write only when their
-/// ref matches the writer patterns, their workflow is allowed and the run
-/// was triggered by a push.
+/// Whether a CI token may write the cache. Static tokens may; OIDC tokens
+/// only when their ref matches the writer patterns, their workflow is
+/// allowed and the run was triggered by a push. The route gate calls this
+/// before it reads a body, and [`ci_reader`] calls it again in the handler:
+/// this is the one implementation.
+pub fn cache_writer_allowed(config: &Config, identity: &Identity) -> bool {
+    identity.static_token
+        || (config
+            .cache_writers
+            .allows(&identity.repository, identity.git_ref.as_deref())
+            && workflow_allowed(config, identity)
+            && pushed(identity))
+}
+
+/// A CI caller, with `may_write` from [`cache_writer_allowed`].
 pub fn ci_reader(config: &Config, identity: &Identity) -> Reader {
     Reader {
         repository: identity.repository.clone(),
-        may_write: identity.static_token
-            || (config
-                .cache_writers
-                .allows(&identity.repository, identity.git_ref.as_deref())
-                && workflow_allowed(config, identity)
-                && pushed(identity)),
+        may_write: cache_writer_allowed(config, identity),
         writer: Writer::from_identity(identity),
         caller: Caller::Ci,
     }

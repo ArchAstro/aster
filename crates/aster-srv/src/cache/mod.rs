@@ -20,7 +20,7 @@ mod store;
 
 use crate::db::Migration;
 
-pub use policy::{results_writer_allowed, workflow_allowed};
+pub use policy::{cache_writer_allowed, results_writer_allowed, workflow_allowed};
 
 /// Whether a signed-in person may read `repo`'s data: their email domain is
 /// allowed and the server serves the repository.
