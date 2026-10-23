@@ -628,7 +628,7 @@ pub fn select_remote(
         .filter(|repo| !repo.is_empty())
         .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
         .filter(|repo| !repo.trim().is_empty());
-    match super::aster_srv::AsterSrvBackend::from_env(aster_srv_url, repo.as_deref()) {
+    match super::aster_srv::AsterSrvBackend::from_env(aster_srv_url, repo.as_deref())? {
         Some(backend) => {
             let backend = match std::env::var("ASTER_SRV_GCS_BASE") {
                 Ok(base) if !base.trim().is_empty() => backend.redirect_gcs_to(base),
@@ -1386,5 +1386,19 @@ mod tests {
             assert!(tier.lookup(&key).unwrap().is_none());
         }
         assert!(tier.remote_enabled());
+    }
+    #[test]
+    fn select_remote_refuses_a_cleartext_aster_srv_url_on_another_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = select_remote(
+            RemoteKind::AsterSrv,
+            Some("http://aster-srv.example.com"),
+            Some(dir.path()),
+            None,
+            None,
+        )
+        .err()
+        .expect("a cleartext url must be refused");
+        assert!(format!("{error:#}").contains("must be https"), "{error:#}");
     }
 }

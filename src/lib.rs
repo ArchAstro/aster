@@ -8,6 +8,7 @@ pub mod executor;
 pub mod git;
 pub mod graph;
 pub mod plugins;
+pub(crate) mod srv_url;
 pub mod targets;
 pub mod test_results;
 pub mod ui;

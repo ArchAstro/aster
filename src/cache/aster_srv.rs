@@ -30,6 +30,7 @@ use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use super::artifact::{Digest, Manifest};
 use super::backend::CacheBackend;
 use super::hasher::encode_hex;
+use crate::srv_url::{checked_origin, scheme_policy};
 use crate::test_results::upload::{proxy_token_from_env, Credentials};
 
 use super::login;
@@ -111,7 +112,10 @@ impl AsterSrvBackend {
     /// uses the token `aster cache login` stored for this server, and with
     /// no unexpired token the remote is skipped. `None` when the URL or repo
     /// is empty.
-    pub fn from_env(url: Option<&str>, repo: Option<&str>) -> Option<Self> {
+    ///
+    /// A URL that is plain http to another machine is an error: the
+    /// credentials would cross the network in the clear.
+    pub fn from_env(url: Option<&str>, repo: Option<&str>) -> Result<Option<Self>> {
         let env = |name: &str| std::env::var(name).ok();
         let credentials = Credentials::from_env(&env);
         let person_token = match (&credentials, url) {
@@ -120,18 +124,21 @@ impl AsterSrvBackend {
             }
             _ => None,
         };
-        let backend = Self::from_parts(
+        let Some(backend) = Self::from_parts(
             url,
             repo,
             credentials,
             proxy_token_from_env(&env),
             person_token,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         if let Some(notice) = signature_exclusion_notice(super::signature::signing_key().is_some())
         {
             eprintln!("{notice}");
         }
-        Some(backend)
+        Ok(Some(backend))
     }
 
     fn from_parts(
@@ -140,16 +147,11 @@ impl AsterSrvBackend {
         credentials: Option<Credentials>,
         proxy_token: Option<String>,
         person_token: Option<String>,
-    ) -> Option<Self> {
-        let base_url = non_empty(url)?;
-        let repo = non_empty(repo)?;
-        Some(Self::new(
-            base_url,
-            repo,
-            credentials,
-            proxy_token,
-            person_token,
-        ))
+    ) -> Result<Option<Self>> {
+        let (Some(base_url), Some(repo)) = (non_empty(url), non_empty(repo)) else {
+            return Ok(None);
+        };
+        Self::new(base_url, repo, credentials, proxy_token, person_token).map(Some)
     }
 
     /// Rewrite `https://storage.googleapis.com` blob URLs to `base`.
@@ -159,8 +161,15 @@ impl AsterSrvBackend {
     /// without changing the URL the server signs.
     pub fn redirect_gcs_to(mut self, base: impl Into<String>) -> Self {
         let base = base.into().trim_end_matches('/').to_string();
-        if !base.is_empty() {
-            self.gcs_base = Some(base);
+        if base.is_empty() {
+            return self;
+        }
+        match checked_origin(&base) {
+            Ok(origin) => {
+                self.blob_agent = build_agent(&origin, BLOB_TIMEOUT);
+                self.gcs_base = Some(base);
+            }
+            Err(error) => eprintln!("[aster] Warning: ignoring ASTER_SRV_GCS_BASE: {error:#}"),
         }
         self
     }
@@ -169,7 +178,8 @@ impl AsterSrvBackend {
     /// reproduces a production timeout without a multi-second wait.
     #[cfg(test)]
     fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.agent = build_agent(timeout);
+        let origin = checked_origin(&self.base_url).expect("checked in new");
+        self.agent = build_agent(&origin, timeout);
         self
     }
 
@@ -179,25 +189,28 @@ impl AsterSrvBackend {
         credentials: Option<Credentials>,
         proxy_token: Option<String>,
         person_token: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let origin = checked_origin(&base_url)?;
         // A person's token reads only; do not ask for upload URLs it cannot get.
         let person_only = credentials.is_none() && person_token.is_some();
-        Self {
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             repo,
             credentials,
             proxy_token,
             person_token,
             gcs_base: None,
-            agent: build_agent(REQUEST_TIMEOUT),
-            blob_agent: build_agent(BLOB_TIMEOUT),
+            agent: build_agent(&origin, REQUEST_TIMEOUT),
+            // Signed blob URLs come from the server's reply, so they get the
+            // server's policy: https only, unless the server is this machine.
+            blob_agent: build_agent(&origin, BLOB_TIMEOUT),
             state: Mutex::new(State {
                 hits: HashMap::new(),
                 upload_urls: HashMap::new(),
                 read_only: person_only,
             }),
             logged_read_only: AtomicBool::new(false),
-        }
+        })
     }
 
     /// Ask lookup for every `keys` entry that is not already cached.
@@ -658,7 +671,10 @@ fn brief(body: &str) -> String {
     message.replace('\n', " ")
 }
 
-pub(super) fn build_agent(timeout: Duration) -> ureq::Agent {
+/// An agent for `origin` (already through `checked_origin`): https only
+/// unless `origin` is this machine, and no redirect can downgrade.
+pub(crate) fn build_agent(origin: &str, timeout: Duration) -> ureq::Agent {
+    let (https_only, max_redirects) = scheme_policy(origin);
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
@@ -666,7 +682,8 @@ pub(super) fn build_agent(timeout: Duration) -> ureq::Agent {
         .root_certs(RootCerts::WebPki)
         .build();
     ureq::Agent::config_builder()
-        .https_only(false)
+        .https_only(https_only)
+        .max_redirects(max_redirects)
         .http_status_as_error(false)
         .tls_config(tls)
         .user_agent(USER_AGENT)
@@ -992,6 +1009,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -1078,7 +1096,11 @@ mod tests {
 
     #[test]
     fn from_env_is_none_without_a_url_or_repo() {
-        assert!(AsterSrvBackend::from_parts(None, Some("acme/app"), None, None, None).is_none());
+        assert!(
+            AsterSrvBackend::from_parts(None, Some("acme/app"), None, None, None)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             AsterSrvBackend::from_parts(
                 Some("http://127.0.0.1:9"),
@@ -1087,6 +1109,7 @@ mod tests {
                 None,
                 None
             )
+            .unwrap()
             .is_some(),
             "a person with no CI token still gets a backend, which stays local until signed in"
         );
@@ -1097,9 +1120,12 @@ mod tests {
             None,
             None,
         )
+        .unwrap()
         .is_none());
         assert!(
-            AsterSrvBackend::from_parts(Some("http://x"), Some(" "), None, None, None).is_none()
+            AsterSrvBackend::from_parts(Some("http://x"), Some(" "), None, None, None)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1122,6 +1148,7 @@ mod tests {
             None,
             person_token.map(str::to_string),
         )
+        .unwrap()
         .unwrap()
     }
 
@@ -1166,6 +1193,7 @@ mod tests {
             Some("ci-proxy".into()),
             Some("person-token".into()),
         )
+        .unwrap()
         .unwrap();
         ci.get_manifest("anything").unwrap();
         assert_eq!(
@@ -1349,5 +1377,58 @@ mod tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn a_cleartext_url_on_another_host_is_refused_and_https_and_loopback_are_not() {
+        for bad in [
+            "http://aster-srv.example.com",
+            "http://10.0.0.5:8080",
+            "ftp://x",
+        ] {
+            let error = AsterSrvBackend::from_parts(
+                Some(bad),
+                Some("acme/app"),
+                Some(Credentials::Static("t".into())),
+                None,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{bad} was accepted"));
+            assert!(format!("{error:#}").contains("ASTER_SRV_URL"), "{error:#}");
+        }
+        for ok in [
+            "https://aster-srv.example.com",
+            "http://127.0.0.1:9",
+            "http://localhost:9",
+        ] {
+            assert!(
+                AsterSrvBackend::from_parts(
+                    Some(ok),
+                    Some("acme/app"),
+                    Some(Credentials::Static("t".into())),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .is_some(),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleartext_blob_base_is_ignored() {
+        let backend = AsterSrvBackend::from_parts(
+            Some("https://aster-srv.example.com"),
+            Some("acme/app"),
+            Some(Credentials::Static("t".into())),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+        .redirect_gcs_to("http://blobs.example.com");
+        assert!(backend.gcs_base.is_none());
     }
 }
