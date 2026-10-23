@@ -374,7 +374,7 @@ impl Config {
                  that may write); set ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW=1 only in development"
             );
         }
-        let owner_ids = OwnerIds::parse(var("ASTER_SRV_REPOSITORY_OWNER_IDS").as_deref())?;
+        let mut owner_ids = OwnerIds::parse(var("ASTER_SRV_REPOSITORY_OWNER_IDS").as_deref())?;
         let public_url = match var("ASTER_SRV_PUBLIC_URL") {
             Some(url) => {
                 let url = url.trim().trim_end_matches('/').to_string();
@@ -428,6 +428,7 @@ impl Config {
         if api_listen.is_some_and(|api| api.port() != 0 && api == listen) {
             bail!("ASTER_SRV_API_ADDR must differ from ASTER_SRV_LISTEN");
         }
+        let dev_blob_route = var("ASTER_SRV_DEV_BLOB_ROUTE").as_deref() == Some("1");
         let number =
             |name: &str, default: u64, range: std::ops::RangeInclusive<u64>| match var(name) {
                 Some(value) => value
@@ -465,6 +466,60 @@ impl Config {
             number("ASTER_SRV_MAX_CONNECTIONS_PER_IP", 128, 1..=1_000_000)? as usize;
         let handler_timeout =
             Duration::from_secs(number("ASTER_SRV_HANDLER_TIMEOUT_SECS", 120, 1..=3600)?);
+        // The `/v1` listener is reachable without IAP. It starts only with the
+        // settings that make a CI token mean what it says, and says every
+        // missing one at once.
+        if api_listen.is_some() {
+            let mut missing: Vec<String> = Vec::new();
+            if !static_tokens.is_empty() {
+                missing.push(
+                    "ASTER_SRV_STATIC_TOKENS must be unset: a static token skips the OIDC claim \
+                     checks"
+                        .into(),
+                );
+            }
+            if dev_blob_route {
+                missing.push(
+                    "ASTER_SRV_DEV_BLOB_ROUTE must be unset: it serves unauthenticated blob \
+                     reads and writes"
+                        .into(),
+                );
+            }
+            let unpinned: Vec<&str> = repositories
+                .entries()
+                .iter()
+                .map(String::as_str)
+                .filter(|entry| !owner_ids.covers_entry(entry))
+                .collect();
+            if !unpinned.is_empty() {
+                missing.push(format!(
+                    "ASTER_SRV_REPOSITORY_OWNER_IDS must pin every ASTER_SRV_REPOSITORIES entry \
+                     (owner/name=id or owner/*=id); not pinned: {}",
+                    unpinned.join(", ")
+                ));
+            }
+            if writer_workflows.is_none() {
+                missing.push(
+                    "ASTER_SRV_CACHE_WRITER_WORKFLOWS must name the workflows that may write \
+                     (ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW does not apply here)"
+                        .into(),
+                );
+            }
+            if trusted_proxy_hops == 0 {
+                missing.push(
+                    "ASTER_SRV_TRUSTED_PROXY_HOPS must be at least 1: behind the load balancer \
+                     every client would share its address and its rate limits"
+                        .into(),
+                );
+            }
+            if !missing.is_empty() {
+                bail!(
+                    "ASTER_SRV_API_ADDR serves /v1 without IAP and needs:\n  - {}",
+                    missing.join("\n  - ")
+                );
+            }
+            owner_ids = owner_ids.failing_closed();
+        }
         // Sign-in hands out tokens to whoever IAP names, so it needs IAP to be
         // real and the dashboard's domain allowlist to be set. Without them a
         // development viewer (no IAP) or any Google identity would get one.
@@ -511,7 +566,7 @@ impl Config {
             cache_writers,
             writer_workflows,
             owner_ids,
-            dev_blob_route: var("ASTER_SRV_DEV_BLOB_ROUTE").as_deref() == Some("1"),
+            dev_blob_route,
             public_url,
             cli_token_keys,
             cli_token_ttl,
@@ -682,6 +737,11 @@ impl RepositoryAllowlist {
         Ok(Self(entries))
     }
 
+    /// The entries, lowercased: `owner/name` or `owner/*`.
+    pub fn entries(&self) -> &[String] {
+        &self.0
+    }
+
     /// Whether `repository` (`owner/name`, any case) is allowed.
     pub fn allows(&self, repository: &str) -> bool {
         let repository = repository.to_ascii_lowercase();
@@ -699,7 +759,13 @@ impl RepositoryAllowlist {
 
 /// `repository_owner_id` pins: `owner/name` or `owner/*` to a GitHub id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OwnerIds(Vec<(String, String)>);
+pub struct OwnerIds {
+    pins: Vec<(String, String)>,
+    /// A repository no pin covers is refused. Set when the `/v1` listener
+    /// (`ASTER_SRV_API_ADDR`) is on, so a gap in the pins cannot let a
+    /// recreated repository in.
+    require_pin: bool,
+}
 
 impl OwnerIds {
     pub fn parse(value: Option<&str>) -> Result<Self> {
@@ -725,21 +791,46 @@ impl OwnerIds {
             }
             pins.push((repo, id.to_string()));
         }
-        Ok(Self(pins))
+        Ok(Self {
+            pins,
+            require_pin: false,
+        })
+    }
+
+    /// The same pins, with a repository no pin covers refused.
+    pub fn failing_closed(mut self) -> Self {
+        self.require_pin = true;
+        self
     }
 
     /// Whether `repository` with this `repository_owner_id` claim is
-    /// acceptable: no pin covers it, or the claim equals the pin.
+    /// acceptable: the claim equals every pin that covers it, and some pin
+    /// covers it when pins are required.
     pub fn accepts(&self, repository: &str, claim: Option<&str>) -> bool {
         let repository = repository.to_ascii_lowercase();
         let owner = repository.split_once('/').map(|(owner, _)| owner);
-        self.0
+        let mut covering = self
+            .pins
             .iter()
             .filter(|(pattern, _)| {
                 *pattern == repository
                     || pattern.strip_suffix("/*").is_some_and(|o| Some(o) == owner)
             })
-            .all(|(_, id)| claim == Some(id.as_str()))
+            .peekable();
+        if covering.peek().is_none() {
+            return !self.require_pin;
+        }
+        covering.all(|(_, id)| claim == Some(id.as_str()))
+    }
+
+    /// Whether an allowlist entry (`owner/name` or `owner/*`) is pinned for
+    /// every repository it names: an exact pin for `owner/name`, or an
+    /// `owner/*` pin for either form.
+    fn covers_entry(&self, entry: &str) -> bool {
+        let owner = entry.split_once('/').map(|(owner, _)| owner);
+        self.pins.iter().any(|(pattern, _)| {
+            pattern == entry || pattern.strip_suffix("/*").is_some_and(|o| Some(o) == owner)
+        })
     }
 }
 
@@ -1125,6 +1216,9 @@ mod tests {
         assert_eq!(config.max_connections, 1024);
         assert_eq!(config.header_timeout, Duration::from_secs(20));
         assert_eq!(config.db_wait, Duration::from_secs(5));
+        assert_eq!(config.unauth_body_timeout, Duration::from_secs(8));
+        assert_eq!(config.max_connections_per_ip, 128);
+        assert_eq!(config.max_large_bodies, 8);
         let with = |extra: &[(&str, &str)]| {
             let mut pairs = REQUIRED.to_vec();
             pairs.extend_from_slice(extra);
@@ -1132,6 +1226,11 @@ mod tests {
         };
         let config = with(&[
             ("ASTER_SRV_API_ADDR", "0.0.0.0:8081"),
+            ("ASTER_SRV_REPOSITORY_OWNER_IDS", "ArchAstro/*=4242"),
+            (
+                "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+                "ArchAstro/x/.github/workflows/ci.yml@",
+            ),
             ("ASTER_SRV_TRUSTED_PROXY_HOPS", "2"),
             ("ASTER_SRV_RATE_TOKEN_IP_PER_MIN", "5"),
             ("ASTER_SRV_MAX_CONNECTIONS", "50"),
@@ -1153,6 +1252,159 @@ mod tests {
         ] {
             assert!(with(&[(name, bad)]).is_err(), "{name}={bad}");
         }
+    }
+
+    /// Everything `ASTER_SRV_API_ADDR` needs, so a test can take one away.
+    const API_READY: [(&str, &str); 5] = [
+        ("ASTER_SRV_API_ADDR", "127.0.0.1:8081"),
+        ("ASTER_SRV_REPOSITORY_OWNER_IDS", "ArchAstro/*=4242"),
+        (
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+            "ArchAstro/firstlanding/.github/workflows/ci.yml@",
+        ),
+        ("ASTER_SRV_TRUSTED_PROXY_HOPS", "1"),
+        ("ASTER_SRV_REPOSITORIES", "ArchAstro/*"),
+    ];
+
+    fn api_config(without: &[&str], extra: &[(&str, &str)]) -> Result<Config> {
+        let mut pairs = vec![("ASTER_SRV_DATABASE_URL", "postgres://localhost/aster")];
+        pairs.extend(API_READY.iter().filter(|(name, _)| !without.contains(name)));
+        pairs.extend_from_slice(extra);
+        Config::from_env(env_of(&pairs))
+    }
+
+    /// N4: the listener that has no IAP in front of it starts only when
+    /// each of these holds, and one run names every missing one.
+    #[test]
+    fn the_api_listener_refuses_to_start_without_each_hardening_setting() {
+        let ok = api_config(&[], &[]).unwrap();
+        assert!(ok.api_listen.is_some());
+        let refused = |without: &[&str], extra: &[(&str, &str)], wanted: &str| {
+            let err = format!("{:#}", api_config(without, extra).unwrap_err());
+            assert!(err.contains(wanted), "{wanted}: {err}");
+            assert!(err.contains("ASTER_SRV_API_ADDR"), "{err}");
+        };
+        refused(
+            &[],
+            &[(
+                "ASTER_SRV_STATIC_TOKENS",
+                "ArchAstro/dev=dev-token-0123456789",
+            )],
+            "ASTER_SRV_STATIC_TOKENS",
+        );
+        refused(
+            &[],
+            &[("ASTER_SRV_DEV_BLOB_ROUTE", "1")],
+            "ASTER_SRV_DEV_BLOB_ROUTE",
+        );
+        refused(
+            &["ASTER_SRV_REPOSITORY_OWNER_IDS"],
+            &[],
+            "not pinned: archastro/*",
+        );
+        refused(
+            &["ASTER_SRV_CACHE_WRITER_WORKFLOWS"],
+            &[],
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+        );
+        // The development escape hatch does not apply to this listener.
+        refused(
+            &["ASTER_SRV_CACHE_WRITER_WORKFLOWS"],
+            &[("ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW", "1")],
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+        );
+        refused(
+            &["ASTER_SRV_TRUSTED_PROXY_HOPS"],
+            &[("ASTER_SRV_TRUSTED_PROXY_HOPS", "0")],
+            "ASTER_SRV_TRUSTED_PROXY_HOPS",
+        );
+        // Several at once are all listed.
+        let err = format!(
+            "{:#}",
+            api_config(
+                &[
+                    "ASTER_SRV_REPOSITORY_OWNER_IDS",
+                    "ASTER_SRV_CACHE_WRITER_WORKFLOWS"
+                ],
+                &[("ASTER_SRV_DEV_BLOB_ROUTE", "1")],
+            )
+            .unwrap_err()
+        );
+        for name in [
+            "ASTER_SRV_DEV_BLOB_ROUTE",
+            "ASTER_SRV_REPOSITORY_OWNER_IDS",
+            "ASTER_SRV_CACHE_WRITER_WORKFLOWS",
+        ] {
+            assert!(err.contains(name), "{name}: {err}");
+        }
+        // Without the listener none of this is required.
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push((
+            "ASTER_SRV_STATIC_TOKENS",
+            "ArchAstro/dev=dev-token-0123456789",
+        ));
+        pairs.push(("ASTER_SRV_DEV_BLOB_ROUTE", "1"));
+        pairs.push(("ASTER_SRV_TRUSTED_PROXY_HOPS", "0"));
+        assert!(Config::from_env(env_of(&pairs)).is_ok());
+    }
+
+    /// N4: every allowlist entry needs a pin that covers all it names: an
+    /// exact pin for `owner/name`, an `owner/*` pin for either form, and an
+    /// exact pin does not cover `owner/*`.
+    #[test]
+    fn every_allowlisted_repository_needs_an_owner_id_pin_when_the_api_listener_is_on() {
+        let with = |repositories: &str, pins: &str| {
+            api_config(
+                &["ASTER_SRV_REPOSITORIES", "ASTER_SRV_REPOSITORY_OWNER_IDS"],
+                &[
+                    ("ASTER_SRV_REPOSITORIES", repositories),
+                    ("ASTER_SRV_REPOSITORY_OWNER_IDS", pins),
+                ],
+            )
+        };
+        assert!(with("ArchAstro/a,ArchAstro/b", "ArchAstro/a=1,ArchAstro/b=1").is_ok());
+        assert!(with("ArchAstro/a,ArchAstro/b", "ArchAstro/*=1").is_ok());
+        assert!(with("ArchAstro/*", "ArchAstro/*=1").is_ok());
+        let err = format!(
+            "{:#}",
+            with("ArchAstro/a,ArchAstro/b", "ArchAstro/a=1").unwrap_err()
+        );
+        assert!(
+            err.contains("archastro/b") && !err.contains("archastro/a,"),
+            "{err}"
+        );
+        assert!(with("ArchAstro/*", "ArchAstro/a=1").is_err());
+        assert!(with("ArchAstro/a,Other/b", "ArchAstro/*=1").is_err());
+        // No pins at all.
+        assert!(api_config(&["ASTER_SRV_REPOSITORY_OWNER_IDS"], &[]).is_err());
+    }
+
+    /// N4: with the listener on, `OwnerIds::accepts` refuses a repository no
+    /// pin covers, instead of accepting any `repository_owner_id`.
+    #[test]
+    fn owner_ids_fail_closed_for_an_unpinned_repository_when_the_api_listener_is_on() {
+        let pins = OwnerIds::parse(Some("ArchAstro/a=1,Other/*=2")).unwrap();
+        // Unpinned servers keep today's behaviour.
+        assert!(pins.accepts("ArchAstro/b", None));
+        assert!(pins.accepts("ArchAstro/b", Some("9")));
+        let strict = pins.clone().failing_closed();
+        assert!(!strict.accepts("ArchAstro/b", None));
+        assert!(!strict.accepts("ArchAstro/b", Some("1")));
+        assert!(!strict.accepts("elsewhere/x", Some("1")));
+        // Pinned repositories behave as before, case-insensitively.
+        assert!(strict.accepts("archastro/A", Some("1")));
+        assert!(!strict.accepts("ArchAstro/a", Some("2")));
+        assert!(!strict.accepts("ArchAstro/a", None));
+        assert!(strict.accepts("Other/anything", Some("2")));
+        // The config applies it exactly when the listener is on.
+        assert!(!api_config(&[], &[])
+            .unwrap()
+            .owner_ids
+            .accepts("ArchAstro/x", None));
+        let mut pairs = REQUIRED.to_vec();
+        pairs.push(("ASTER_SRV_REPOSITORY_OWNER_IDS", "Other/*=2"));
+        let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert!(config.owner_ids.accepts("ArchAstro/x", None));
     }
 
     #[test]

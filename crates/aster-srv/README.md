@@ -441,7 +441,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_PUBLIC_URL` | unset | The https URL people reach the server at (`https://aster-srv.example.com`); the `iss` and `aud` of person tokens. Required for [Laptop sign-in](#laptop-sign-in). With an https URL every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains`. An `http://` URL is refused at startup unless `ASTER_SRV_ALLOW_HTTP_PUBLIC_URL=1` (development and tests only). |
 | `ASTER_SRV_CLI_TOKEN_KEYS` | unset | `kid:secret` pairs, comma-separated. A secret is hex (64+ digits) or base64 (43+ characters) for at least 32 random bytes, as `openssl rand -base64 32` makes; passphrases, short keys and patterned keys (one byte repeated, a repeated block, a counting run, fewer than 16 distinct bytes) stop startup. The first signs person tokens and form MACs; all verify. Setting it also requires `ASTER_SRV_IAP_AUDIENCE` and `ASTER_SRV_UI_EMAIL_DOMAINS`, and forbids `ASTER_SRV_UI_DEV_EMAIL`. Keep it in a secret store. |
 | `ASTER_SRV_CLI_TOKEN_TTL` | `43200` | Seconds a person token lives, 60 to 43200 (12 hours; verification enforces the same cap). |
-| `ASTER_SRV_API_ADDR` | unset | A second listener, such as `0.0.0.0:8081`, that serves only `/v1/*`. See [Hardening](#hardening-the-v1-channel). |
+| `ASTER_SRV_API_ADDR` | unset | A second listener, such as `0.0.0.0:8081`, that serves only `/v1/*`. It refuses to start unless `ASTER_SRV_STATIC_TOKENS` and `ASTER_SRV_DEV_BLOB_ROUTE` are unset, `ASTER_SRV_REPOSITORY_OWNER_IDS` pins every `ASTER_SRV_REPOSITORIES` entry, `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set and `ASTER_SRV_TRUSTED_PROXY_HOPS` is at least 1. See [Hardening](#hardening-the-v1-channel). |
 | `ASTER_SRV_TRUSTED_PROXY_HOPS` | `1` | `X-Forwarded-For` entries from the right that infrastructure appended. See [Client IP](#client-ip-and-rate-limits). |
 | `ASTER_SRV_RATE_TOKEN_IP_PER_MIN` | `10` | `POST /v1/auth/token` per client IP per minute, per replica. |
 | `ASTER_SRV_RATE_API_IP_PER_MIN` | `1200` | All `/v1/*` per client IP per minute, per replica. |
@@ -466,7 +466,16 @@ none. Everything below applies to it.
 `/v1/*`. `/ui`, `/cli-auth`, `/healthz`, `/readyz`, `/metrics` and anything else
 answer `404` there, whatever the load balancer's URL map says, so a routing
 mistake cannot expose the dashboard or sign-in pages without IAP. The main
-port is unchanged and still answers `/v1/*`. Give the non-IAP backend service
+port is unchanged and still answers `/v1/*`. The listener has no IAP in front of
+it, so it starts only with the settings that make a CI token mean what it
+says: no static tokens, no `ASTER_SRV_DEV_BLOB_ROUTE`, an owner-id pin
+(`ASTER_SRV_REPOSITORY_OWNER_IDS`) covering every `ASTER_SRV_REPOSITORIES`
+entry (`owner/*=id` covers `owner/*` and `owner/name`; `owner/name=id` covers
+only that repository), a writer-workflow list
+(`ASTER_SRV_CACHE_WRITER_WORKFLOWS`; `ASTER_SRV_ALLOW_ANY_WRITER_WORKFLOW`
+does not apply) and `ASTER_SRV_TRUSTED_PROXY_HOPS` of at least 1. Startup
+fails naming every missing one. With the listener on, a token for a
+repository no pin covers is refused too. Give the non-IAP backend service
 the API port; keep IAP on the main port. The API port's backend health check
 uses `GET /v1/healthz`, which answers `200 ok` and nothing else, is not
 authenticated (a health check carries no credentials) and reveals only that
