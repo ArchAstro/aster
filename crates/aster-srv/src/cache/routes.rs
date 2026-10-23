@@ -146,9 +146,14 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     if let Err(reply) = same_repo(&reader, &request.repo) {
         return reply;
     }
-    // Only CI's lookups count and keep entries alive; a person reading must
-    // not be able to hold an entry in the cache by asking for it.
-    let counts = reader.caller == Caller::Ci;
+    // Only a writer-eligible CI caller's lookups bump `hits`, `last_hit_at` and
+    // `last_used_at` and so keep entries alive. A person, and a pull-request
+    // or other non-push CI token (`Reader::may_write` is false, from
+    // `policy::ci_reader`), must not be able to hold an entry in the cache by
+    // asking for it. The same policy decides who may commit; it is not repeated.
+    let counts = reader.caller == Caller::Ci && reader.may_write;
+    // Aggregate lookup stats stay a hit-rate view over every CI lookup.
+    let records_stats = reader.caller == Caller::Ci;
     match lookup_hits(app, &reader.repository, &request.keys, counts).await {
         Ok(hits) => {
             let requested = request
@@ -156,7 +161,7 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len();
-            if counts {
+            if records_stats {
                 record_lookup(app, &reader.repository, hits.len(), requested);
             }
             Reply::json(200, json!({"hits": hits}))
