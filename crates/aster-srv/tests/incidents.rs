@@ -20,7 +20,7 @@ use aster_results_model::{
 };
 use aster_srv::test_results::classifier;
 use chrono::Utc;
-use common::{iap_assertion, start, token, Server, IAP_AUDIENCE, REPO};
+use common::{iap_assertion, start, token_with_claims, Server, IAP_AUDIENCE, REPO};
 use serde_json::{json, Value};
 
 const SHARD_6: &str = "//src/elixir/core-test-shard-6:test-ci";
@@ -196,8 +196,41 @@ fn upload_stream(
     to_ndjson(&records)
 }
 
+/// One CI job of that morning: its GitHub run, the ref and event that
+/// started it, and the Aster run id its client builds.
+struct Job {
+    github_run: &'static str,
+    git_ref: &'static str,
+    event: &'static str,
+}
+
+impl Job {
+    fn run_id(&self) -> String {
+        format!(
+            "gh:{REPO}:{}:1:test:test-ci:source-elixir-core-6:ab",
+            self.github_run
+        )
+    }
+}
+
+const PR_RUN: Job = Job {
+    github_run: "39000054301",
+    git_ref: "refs/pull/18740/merge",
+    event: "pull_request",
+};
+const CRASH_RUN: Job = Job {
+    github_run: "39000703969",
+    git_ref: "refs/heads/main",
+    event: "push",
+};
+const PASS_RUN: Job = Job {
+    github_run: "39002241971",
+    git_ref: "refs/heads/main",
+    event: "workflow_dispatch",
+};
+
 /// Upload a stream as CI does: gzipped NDJSON with the job's OIDC token.
-async fn upload(server: &Server, ndjson: &str) {
+async fn upload(server: &Server, job: &Job, ndjson: &str) {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     gz.write_all(ndjson.as_bytes()).unwrap();
     let response = aster_srv::http_client()
@@ -206,7 +239,16 @@ async fn upload(server: &Server, ndjson: &str) {
         .post(format!("{}/v1/test-results/runs", server.url))
         .header("Content-Type", "application/x-ndjson")
         .header("Content-Encoding", "gzip")
-        .bearer_auth(token(REPO))
+        .bearer_auth(token_with_claims(
+            REPO,
+            json!({
+                "run_id": job.github_run,
+                "run_attempt": "1",
+                "sha": "78d67670d",
+                "ref": job.git_ref,
+                "event_name": job.event,
+            }),
+        ))
         .body(gz.finish().unwrap())
         .send()
         .await
@@ -237,7 +279,8 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
     // an ordinary flake: it fails once, in the main run below.
     upload(
         &server,
-        &upload_stream("gh:pr:39000054301", "fix/pr", 0, false),
+        &PR_RUN,
+        &upload_stream(&PR_RUN.run_id(), "fix/pr", 0, false),
     )
     .await;
     classify(&server).await;
@@ -247,7 +290,8 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
     // the next upload, as the five-minute loop did that morning.
     upload(
         &server,
-        &upload_stream("gh:main:39000703969", "main", 644, true),
+        &CRASH_RUN,
+        &upload_stream(&CRASH_RUN.run_id(), "main", 644, true),
     )
     .await;
     let crash = classify(&server).await;
@@ -256,7 +300,8 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
     // 04:26Z, Stable CI on main again, same inputs: everything passes.
     upload(
         &server,
-        &upload_stream("gh:main:39002241971", "main", 0, false),
+        &PASS_RUN,
+        &upload_stream(&PASS_RUN.run_id(), "main", 0, false),
     )
     .await;
     classify(&server).await;
@@ -273,7 +318,7 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
         .unwrap();
     assert_eq!(incidents.len(), 1);
     let row = &incidents[0];
-    assert_eq!(row.get::<_, String>("run_id"), "gh:main:39000703969");
+    assert_eq!(row.get::<_, String>("run_id"), CRASH_RUN.run_id());
     assert_eq!(row.get::<_, String>("target"), SHARD_6);
     assert_eq!(row.get::<_, i32>("failures"), 644);
     assert_eq!(row.get::<_, i32>("tests"), SHARD_6_TESTS as i32);
@@ -297,7 +342,7 @@ async fn a_crashed_shard_on_unchanged_inputs_is_one_incident_and_quarantines_not
         vec![(
             format!("{SHARD_2}#7"),
             "definite".to_string(),
-            "gh:main:39000703969".to_string()
+            CRASH_RUN.run_id()
         )]
     );
     let flaky = client
