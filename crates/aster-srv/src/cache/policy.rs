@@ -192,6 +192,7 @@ mod tests {
             repository: "ArchAstro/firstlanding".into(),
             git_ref: git_ref.map(str::to_string),
             run_id: Some("9".into()),
+            run_attempt: Some("1".into()),
             sha: Some("abc".into()),
             workflow: Some("wf".into()),
             job_workflow: Some(

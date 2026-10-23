@@ -82,6 +82,8 @@ pub struct Identity {
     pub git_ref: Option<String>,
     /// The `run_id` claim. `None` for a static token.
     pub run_id: Option<String>,
+    /// The `run_attempt` claim. `None` for a static token.
+    pub run_attempt: Option<String>,
     /// The `sha` claim. `None` for a static token.
     pub sha: Option<String>,
     /// The `workflow_ref` claim (`owner/repo/.github/workflows/ci.yml@refs/heads/main`):
@@ -160,6 +162,8 @@ struct Claims {
     git_ref: Option<String>,
     #[serde(default, deserialize_with = "string_or_number")]
     run_id: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number")]
+    run_attempt: Option<String>,
     #[serde(default)]
     sha: Option<String>,
     #[serde(default)]
@@ -257,6 +261,7 @@ impl Verifier {
                 repository: found.repository.clone(),
                 git_ref: None,
                 run_id: None,
+                run_attempt: None,
                 sha: None,
                 workflow: None,
                 job_workflow: None,
@@ -298,6 +303,7 @@ impl Verifier {
             repository: claims.repository,
             git_ref: non_empty(claims.git_ref),
             run_id: non_empty(claims.run_id),
+            run_attempt: non_empty(claims.run_attempt),
             sha: non_empty(claims.sha),
             job_workflow: non_empty(claims.job_workflow_ref).or_else(|| workflow.clone()),
             workflow,
@@ -470,6 +476,7 @@ mod tests {
         let mut full = claims("ArchAstro/firstlanding");
         full["ref"] = json!("refs/heads/main");
         full["run_id"] = json!("12345");
+        full["run_attempt"] = json!("2");
         full["sha"] = json!("abc123");
         full["workflow_ref"] =
             json!("ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main");
@@ -477,6 +484,7 @@ mod tests {
         let identity = verifier().verify(Some(&bearer)).await.unwrap();
         assert_eq!(identity.git_ref.as_deref(), Some("refs/heads/main"));
         assert_eq!(identity.run_id.as_deref(), Some("12345"));
+        assert_eq!(identity.run_attempt.as_deref(), Some("2"));
         assert_eq!(identity.sha.as_deref(), Some("abc123"));
         assert_eq!(
             identity.workflow.as_deref(),
@@ -485,10 +493,12 @@ mod tests {
 
         // A numeric run_id is kept; empty claims become None.
         full["run_id"] = json!(678);
+        full["run_attempt"] = json!(3);
         full["sha"] = json!("");
         let bearer = format!("Bearer {}", token(full, "k1"));
         let identity = verifier().verify(Some(&bearer)).await.unwrap();
         assert_eq!(identity.run_id.as_deref(), Some("678"));
+        assert_eq!(identity.run_attempt.as_deref(), Some("3"));
         assert_eq!(identity.sha, None);
 
         // Static tokens carry none of them.

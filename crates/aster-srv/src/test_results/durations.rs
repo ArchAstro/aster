@@ -220,6 +220,7 @@ mod tests {
             repository: "ArchAstro/firstlanding".into(),
             git_ref: None,
             run_id: None,
+            run_attempt: None,
             sha: None,
             workflow: None,
             job_workflow: None,
