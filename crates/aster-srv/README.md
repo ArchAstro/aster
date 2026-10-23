@@ -698,3 +698,36 @@ A lookup answers before its day's `cache.lookup_stats` row is written: that
 write runs afterwards with a 3 second limit, and a failure is logged and the
 request's counts are lost. The counts are lookup requests (each distinct key
 counts once), not successful restores.
+
+### Revoking a departed person's tokens
+
+Removing someone from IAP stops new sign-ins, but a token they already hold
+works until it expires (up to 12 hours). `aster cache logout` revokes a
+person's own tokens; an operator does the same for someone else by writing
+their row in `auth.revocations` directly. There is no admin route for this.
+
+1. Remove their IAP access (or narrow `ASTER_SRV_UI_EMAIL_DOMAINS`), so they
+   cannot sign in again.
+2. Find the person's subject, IAP's stable `sub` (`accounts.google.com:<id>`),
+   not their email. Every sign-in writes an audit line with both:
+   `jsonPayload.audit=true AND jsonPayload.event="token_mint" AND
+   jsonPayload.email="ada@example.com"` in Cloud Logging, and read
+   `jsonPayload.subject`. (`auth.cli_codes` does not help: a code row is
+   deleted when it is redeemed and is only good for 60 seconds.) Revoke
+   every distinct subject the email shows.
+3. Connect to the server's database with `psql` as a role that can write the
+   `auth` schema (for Cloud SQL, through the Cloud SQL Auth Proxy or however
+   your deployment reaches the database) and run, with the subject from step 2:
+
+<!-- revoke-sql:start -->
+```sql
+\set subject 'accounts.google.com:1234567890'
+INSERT INTO auth.revocations (subject, not_before) VALUES (:'subject', now())
+ON CONFLICT (subject) DO UPDATE SET not_before = greatest(auth.revocations.not_before, now());
+```
+<!-- revoke-sql:end -->
+
+Every replica checks `auth.revocations` on each request, so the person's
+tokens issued up to that second get `401` from then on; nothing needs a
+restart. This write is not audited by the server: record who ran it
+and why. The `tests/operator_revoke.rs` test runs this snippet from this file.
