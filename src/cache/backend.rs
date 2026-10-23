@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::artifact::{Digest, Manifest};
 use super::gha::GhaBackend;
 use super::local::LocalStore;
+use super::remote_stats::RemoteStats;
 
 /// Consecutive remote failures before the remote is skipped for the run.
 pub const FAILURES_BEFORE_DISABLE: u32 = 3;
@@ -148,6 +149,13 @@ pub trait CacheBackend: Send + Sync + Any {
     /// Store the bytes from `reader` under `digest`.
     fn put_blob(&self, digest: &Digest, reader: &mut dyn Read) -> Result<()>;
 
+    /// Whether a manifest sent to [`Self::put_manifest`] is stored. A backend
+    /// the server refused writes from answers `false` and treats uploads as
+    /// no-ops, so the run summary does not count them.
+    fn writable(&self) -> bool {
+        true
+    }
+
     /// Downcast so a batch lookup can reach the aster-srv client.
     fn as_any(&self) -> &dyn Any;
 }
@@ -197,34 +205,45 @@ impl RemoteHandle {
         }
     }
 
-    /// Skip the remote for the rest of the run. The first error is still logged
-    /// by [`Self::fail`].
-    fn disable(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.disabled = true;
+    /// Skip the remote for the rest of the run. `true` when this call is the
+    /// one that disabled it.
+    fn disable(&self) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => !std::mem::replace(&mut state.disabled, true),
+            Err(_) => false,
         }
     }
 
-    /// Log the first error. Disable the remote once N consecutive failures
-    /// have been observed. A later success does not turn it back on.
-    fn fail(&self, error: &anyhow::Error) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        if state.disabled {
-            return;
-        }
+    /// Print `text` unless an earlier failure already printed a warning.
+    fn warn_once(&self, text: &str) {
         if self
             .logged
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            eprintln!("[aster] Warning: remote cache failed, continuing locally: {error:#}");
+            eprintln!("{text}");
         }
+    }
+
+    /// Log the first error. Disable the remote once N consecutive failures
+    /// have been observed. A later success does not turn it back on. `true`
+    /// when this failure disabled the remote.
+    fn fail(&self, error: &anyhow::Error) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.disabled {
+            return false;
+        }
+        self.warn_once(&format!(
+            "[aster] Warning: remote cache failed, continuing locally: {error:#}"
+        ));
         state.failures += 1;
         if state.failures >= FAILURES_BEFORE_DISABLE {
             state.disabled = true;
+            return true;
         }
+        false
     }
 }
 
@@ -244,6 +263,7 @@ pub struct TieredCache {
     local: LocalStore,
     mode: CacheMode,
     remote: Option<RemoteHandle>,
+    stats: Arc<RemoteStats>,
 }
 
 impl TieredCache {
@@ -253,6 +273,7 @@ impl TieredCache {
             local,
             mode: CacheMode::ReadWrite,
             remote: None,
+            stats: RemoteStats::global(),
         }
     }
 
@@ -263,11 +284,26 @@ impl TieredCache {
         } else {
             Some(RemoteHandle::new(remote))
         };
+        let stats = RemoteStats::global();
+        if remote.is_some() {
+            stats.configured();
+        }
         Self {
             local,
             mode,
             remote,
+            stats,
         }
+    }
+
+    /// Record this tier's remote activity in `stats` instead of the
+    /// process-wide counters. Tests use it to read one tier's numbers.
+    pub fn with_stats(mut self, stats: Arc<RemoteStats>) -> Self {
+        if self.remote.is_some() {
+            stats.configured();
+        }
+        self.stats = stats;
+        self
     }
 
     /// The local tier restore and pack already use.
@@ -284,8 +320,12 @@ impl TieredCache {
 
     /// Ask the remote for every `keys` entry before the executor runs them.
     ///
-    /// A failure is a miss for the batch: the remote is charged, and each
-    /// target still looks up locally. Backends that do not batch ignore this.
+    /// The batch is an optimisation. A failure, a timeout included, is a miss
+    /// for the keys it did not answer: it is counted and warned about once, the
+    /// remote stays on, and each target still looks itself up (locally, then
+    /// on the remote one key at a time). Only a lookup of one target can
+    /// disable the remote. A sign-in problem disables it here, since no later
+    /// lookup could succeed. Backends that do not batch ignore this.
     pub fn prefetch(&self, keys: &[String]) {
         if !self.mode.reads() {
             return;
@@ -300,7 +340,17 @@ impl TieredCache {
             return;
         };
         if let Err(error) = backend.prefetch(keys) {
-            self.note_remote_failure(&error);
+            if super::aster_srv::is_signed_out(&error) {
+                self.note_remote_failure(&error);
+                return;
+            }
+            self.stats.failure();
+            if let Some(handle) = &self.remote {
+                handle.warn_once(&format!(
+                    "[aster] Warning: remote cache batch lookup of {} keys failed, looking up each target on its own: {error:#}",
+                    keys.len()
+                ));
+            }
         }
     }
 
@@ -325,7 +375,14 @@ impl TieredCache {
             return Ok(None);
         };
         match self.download(remote, key) {
-            Ok(manifest) => Ok(manifest),
+            Ok(manifest) => {
+                if manifest.is_some() {
+                    self.stats.hit();
+                } else {
+                    self.stats.miss();
+                }
+                Ok(manifest)
+            }
             Err(DownloadError::Remote(error)) => {
                 self.note_remote_failure(&error);
                 Ok(None)
@@ -345,26 +402,41 @@ impl TieredCache {
         let Some(remote) = self.remote.as_ref().and_then(|remote| remote.active()) else {
             return Ok(());
         };
-        if let Err(error) = self.upload(remote, manifest) {
-            self.note_remote_failure(&error);
+        match self.upload(remote, manifest) {
+            Ok(()) if remote.writable() => self.stats.upload(),
+            Ok(()) => self.stats.read_only(),
+            Err(error) => self.note_remote_failure(&error),
         }
         Ok(())
     }
 
     /// Charge a remote failure. A [`super::aster_srv::DisablingFailure`] (a
     /// timeout) skips the remote immediately so a hung gateway is one wait,
-    /// not three.
+    /// not three. Either way the summary line names why the remote stopped.
     fn note_remote_failure(&self, error: &anyhow::Error) {
         let Some(handle) = &self.remote else {
             return;
         };
+        self.stats.failure();
+        let reason = reason_of(error);
         if disables_remote(error) {
-            // The aster-srv client already printed the one-line sign-in
-            // warning. Do not add a second "remote cache failed" line.
-            handle.disable();
+            if handle.disable() {
+                self.stats.disabled(&reason);
+                // The aster-srv client already printed the one-line sign-in
+                // warning. Do not add a second line for it.
+                if !super::aster_srv::is_signed_out(error) {
+                    eprintln!(
+                        "[aster] Warning: remote cache disabled for the rest of this run, continuing locally: {reason}"
+                    );
+                }
+            }
             return;
         }
-        handle.fail(error);
+        if handle.fail(error) {
+            self.stats.disabled(&format!(
+                "{FAILURES_BEFORE_DISABLE} consecutive failures, last: {reason}"
+            ));
+        }
     }
 
     fn local_has_blobs(&self, manifest: &Manifest) -> bool {
@@ -463,6 +535,11 @@ impl TieredCache {
         }
         Ok(())
     }
+}
+
+/// The error on one line, for the summary and warnings.
+fn reason_of(error: &anyhow::Error) -> String {
+    format!("{error:#}").replace('\n', " ")
 }
 
 fn disables_remote(error: &anyhow::Error) -> bool {
@@ -593,6 +670,7 @@ pub fn tier_from_env(cache_dir: impl AsRef<Path>, workspace_root: &Path) -> Resu
             local,
             mode,
             remote: None,
+            stats: RemoteStats::global(),
         }),
     }
 }
@@ -956,6 +1034,119 @@ mod tests {
         tier.store(&manifest(&"33".repeat(32), Some(&digest)))
             .unwrap();
         assert_eq!(remote.put_calls(), 0);
+    }
+
+    fn counted_tier(
+        dir: &std::path::Path,
+        mode: CacheMode,
+        remote: &InMemoryBackend,
+    ) -> (TieredCache, Arc<RemoteStats>) {
+        let stats = Arc::new(RemoteStats::new());
+        let tier = TieredCache::with_remote(
+            LocalStore::new(dir.to_path_buf()),
+            mode,
+            Arc::new(remote.clone()),
+        )
+        .with_stats(Arc::clone(&stats));
+        (tier, stats)
+    }
+
+    #[test]
+    fn summary_counts_remote_hits_misses_and_uploads_but_not_local_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "a1".repeat(32);
+        let (remote, _stored, _digest) = seeded_remote(&key, b"counted");
+        let (tier, stats) = counted_tier(tmp.path(), CacheMode::ReadWrite, &remote);
+
+        assert!(tier.lookup(&key).unwrap().is_some()); // remote hit
+        assert!(tier.lookup(&key).unwrap().is_some()); // now a local hit
+        assert!(tier.lookup(&"a2".repeat(32)).unwrap().is_none()); // miss
+        let digest = Digest::of_bytes(b"new");
+        tier.local_store().put_blob(&digest, &b"new"[..]).unwrap();
+        tier.store(&manifest(&"a3".repeat(32), Some(&digest)))
+            .unwrap();
+
+        assert_eq!(
+            stats.snapshot().unwrap().to_string(),
+            "remote: 1 hits / 1 misses / 1 uploads"
+        );
+    }
+
+    #[test]
+    fn summary_in_read_mode_counts_no_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = InMemoryBackend::new();
+        let (tier, stats) = counted_tier(tmp.path(), CacheMode::Read, &remote);
+        let digest = Digest::of_bytes(b"read-only");
+        tier.local_store()
+            .put_blob(&digest, &b"read-only"[..])
+            .unwrap();
+        tier.store(&manifest(&"b1".repeat(32), Some(&digest)))
+            .unwrap();
+        assert_eq!(stats.snapshot().unwrap().uploads, 0);
+    }
+
+    #[test]
+    fn summary_names_failures_and_why_the_remote_was_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = InMemoryBackend::new();
+        remote.fail_next(100);
+        let (tier, stats) = counted_tier(tmp.path(), CacheMode::ReadWrite, &remote);
+        for _ in 0..FAILURES_BEFORE_DISABLE {
+            tier.lookup(&"c1".repeat(32)).unwrap();
+        }
+        let summary = stats.snapshot().unwrap();
+        assert_eq!(summary.failures, u64::from(FAILURES_BEFORE_DISABLE));
+        assert_eq!((summary.hits, summary.misses), (0, 0));
+        let line = summary.to_string();
+        assert!(
+            line.contains(
+                "3 failures; disabled: 3 consecutive failures, last: injected remote failure"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_disables_the_remote_and_the_summary_says_so() {
+        struct TimesOut;
+        impl CacheBackend for TimesOut {
+            fn get_manifest(&self, _key: &str) -> Result<Option<Manifest>> {
+                Err(
+                    super::super::aster_srv::DisablingFailure(anyhow::anyhow!("timeout: global"))
+                        .into(),
+                )
+            }
+            fn put_manifest(&self, _manifest: &Manifest) -> Result<()> {
+                Ok(())
+            }
+            fn find_missing(&self, _digests: &[Digest]) -> Result<Vec<Digest>> {
+                Ok(Vec::new())
+            }
+            fn get_blob(&self, _digest: &Digest, _writer: &mut dyn Write) -> Result<bool> {
+                Ok(false)
+            }
+            fn put_blob(&self, _digest: &Digest, _reader: &mut dyn Read) -> Result<()> {
+                Ok(())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let stats = Arc::new(RemoteStats::new());
+        let tier = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(TimesOut),
+        )
+        .with_stats(Arc::clone(&stats));
+        assert!(tier.lookup(&"d1".repeat(32)).unwrap().is_none());
+        assert!(!tier.remote_enabled());
+        assert_eq!(
+            stats.snapshot().unwrap().to_string(),
+            "remote: 0 hits / 0 misses / 0 uploads / 1 failures; disabled: timeout: global"
+        );
     }
 
     #[test]

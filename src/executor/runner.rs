@@ -709,6 +709,8 @@ impl<'a> Executor<'a> {
                 }
                 let summary = backend.summary();
                 eprintln!("{summary}");
+            } else if let Some(summary) = crate::cache::RemoteStats::global().take() {
+                eprintln!("{summary}");
             }
         }
 

@@ -180,6 +180,17 @@ fn run_blocking(dir: &Path, server: &str) -> std::process::Output {
     output
 }
 
+/// The `remote: ...` line a run prints on stderr. Exactly one per run.
+fn summary_line(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("remote: "))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one summary line in: {stderr}");
+    lines[0].to_string()
+}
+
 fn runs(dir: &Path) -> usize {
     fs::read_to_string(dir.join("app/runs.txt"))
         .unwrap_or_default()
@@ -227,6 +238,14 @@ async fn remote_restore_across_checkouts_through_aster_srv() {
         "checkout A must run the target: {}",
         String::from_utf8_lossy(&first.stderr)
     );
+    // The run ends with one line saying what the remote did: A asked, found
+    // nothing, ran the target, and committed its manifest.
+    assert_eq!(
+        summary_line(&first),
+        "remote: 0 hits / 1 misses / 1 uploads",
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     let stored = tree(&a.join("app/out"));
     assert_eq!(stored, vec![("file.txt".into(), b"hi\n".to_vec())]);
     assert!(
@@ -244,6 +263,12 @@ async fn remote_restore_across_checkouts_through_aster_srv() {
     };
     let stderr = String::from_utf8_lossy(&restored.stderr);
     assert_eq!(runs(&b), 0, "checkout B must not run the target: {stderr}");
+    // B restored from the remote and had nothing to upload.
+    assert_eq!(
+        summary_line(&restored),
+        "remote: 1 hits / 0 misses / 0 uploads",
+        "{stderr}"
+    );
     assert_eq!(
         tree(&b.join("app/out")),
         stored,
@@ -255,4 +280,31 @@ async fn remote_restore_across_checkouts_through_aster_srv() {
     );
 
     server.stop().await;
+}
+
+/// A gateway that cannot be reached never fails the build, and the summary is
+/// where a person sees that the remote did nothing. No server is needed: the
+/// URL names a port nothing listens on.
+#[test]
+fn unreachable_remote_is_counted_in_the_summary_and_the_build_still_passes() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("workspace");
+    checkout(&dir);
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+
+    let output = run_blocking(&dir, &closed);
+
+    assert_eq!(runs(&dir), 1, "the target runs locally");
+    // The batch lookup, the target's own lookup and the store each failed
+    // once. Only the last two count toward the three it takes to disable the
+    // remote (a batch never disables), so there is no `disabled:` suffix.
+    assert_eq!(
+        summary_line(&output),
+        "remote: 0 hits / 0 misses / 0 uploads / 3 failures",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

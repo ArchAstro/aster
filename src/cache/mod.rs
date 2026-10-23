@@ -19,6 +19,7 @@ mod login;
 pub mod matcher;
 mod outputs;
 mod prune;
+mod remote_stats;
 mod runtime;
 mod signature;
 mod store;
@@ -38,6 +39,7 @@ pub use login::{login, LoginOptions, SignedIn, LOGIN_TIMEOUT, SIGNED_OUT_MESSAGE
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
 pub use prune::{prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE, DEFAULT_MAX_SIZE};
+pub use remote_stats::{RemoteStats, RemoteSummary};
 pub use runtime::RuntimeInputCache;
 pub use signature::SIGNATURE_KEY_ENV;
 pub use store::CacheStore;
