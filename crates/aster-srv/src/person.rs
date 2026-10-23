@@ -116,8 +116,15 @@ impl TokenIssuer {
     /// A token for the person IAP named `subject` and `email`, signed with
     /// the first key.
     pub fn issue(&self, subject: &str, email: &str) -> anyhow::Result<Issued> {
+        self.issue_at(subject, email, Utc::now().timestamp())
+    }
+
+    /// [`Self::issue`] at `now` (Unix seconds). The sign-in exchange passes
+    /// the database's clock, the same clock a logout's cutoff is taken from,
+    /// so a replica whose clock runs ahead cannot mint a token that outlives
+    /// a logout after it.
+    pub fn issue_at(&self, subject: &str, email: &str, now: i64) -> anyhow::Result<Issued> {
         let key = &self.keys[0];
-        let now = Utc::now().timestamp();
         let expires_at = now + self.ttl as i64;
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some(key.kid.clone());
@@ -228,14 +235,15 @@ impl TokenIssuer {
 }
 
 /// Whether `person`'s token was issued before the person last signed out
-/// everywhere (`aster cache logout`). The cutoff is rounded up to the next
-/// whole second, because `iat` has second resolution: a token minted in the
-/// same second as the logout is refused too, never kept.
+/// everywhere (`aster cache logout`). The cutoff is the whole second after
+/// the logout's, because `iat` has second resolution: a token minted in the
+/// same second as the logout is refused too, never kept, even when the
+/// logout fell exactly on a second boundary (where `ceil` would not round).
 pub async fn is_revoked(pool: &deadpool_postgres::Pool, person: &Person) -> anyhow::Result<bool> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "SELECT ceil(extract(epoch FROM not_before))::bigint \
+            "SELECT floor(extract(epoch FROM not_before))::bigint + 1 \
              FROM auth.revocations WHERE subject = $1",
             &[&person.subject],
         )
@@ -385,6 +393,15 @@ mod tests {
         // Every token has its own jti.
         let again = issuer.issue(SUB, "ada@example.com").unwrap();
         assert_ne!(issued.token, again.token);
+    }
+
+    #[test]
+    fn a_token_carries_the_issue_time_it_is_given() {
+        let issuer = issuer_for(&k1());
+        let at = Utc::now().timestamp() - 30;
+        let issued = issuer.issue_at(SUB, "ada@example.com", at).unwrap();
+        assert_eq!(issuer.verify(&issued.token).unwrap().issued_at, at);
+        assert_eq!(issued.expires_at, at + 12 * 3600);
     }
 
     #[test]
