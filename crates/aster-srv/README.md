@@ -518,6 +518,12 @@ large-body limit applies to it beyond that. The repository allowlist and
 owner-id pin are applied when the token is verified, which is also before any
 body.
 
+Each limiter tracks at most 100,000 keys. Past that, idle keys are dropped
+(at most once a second) and a newcomer shares one of 256 overflow buckets
+chosen by a keyed hash, so a flood of minted client IPs does not take a real
+client's whole allowance, and it never touches the per-subject limiter, which
+has its own table.
+
 **Size, time and connection limits.** `POST /cli-auth` and `/v1/auth/token`
 take at most 8 KiB, uploads and cache writes `ASTER_SRV_MAX_BODY_BYTES`, and
 every other route takes no body (`413`, decided from `Content-Length` before

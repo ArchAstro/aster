@@ -33,10 +33,17 @@ use tokio::sync::Semaphore;
 use crate::Config;
 
 /// Most keys a limiter tracks. Past it, idle keys are dropped, and if the
-/// table is still full the newcomer shares one overflow bucket: attackers
-/// that mint keys cannot grow memory, they only share a limit.
+/// table is still full the newcomer shares an overflow bucket: attackers
+/// that mint keys cannot grow memory, they only share limits.
 const MAX_KEYS: usize = 100_000;
-const OVERFLOW_KEY: &str = "*overflow*";
+/// How many overflow buckets a limiter has. A newcomer lands in one by a
+/// keyed hash (the seed is per limiter and per process, so a caller cannot
+/// aim at a bucket), so a flood of minted keys has to drain all of them to
+/// starve a real client, not one shared bucket.
+const OVERFLOW_SHARDS: u64 = 256;
+/// The table is swept for idle keys at most this often, so a flood of new
+/// keys against a full table cannot make every request scan 100,000 entries.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// Exchanges running at once. The exchange holds one of the auth pool's
 /// connections ([`AUTH_POOL_SIZE`]); a few more wait their turn.
 pub const MAX_CONCURRENT_EXCHANGES: usize = 4;
@@ -48,18 +55,41 @@ struct Bucket {
     last: Instant,
 }
 
+struct Table {
+    buckets: HashMap<String, Bucket>,
+    last_sweep: Option<Instant>,
+    #[cfg(test)]
+    sweeps: usize,
+}
+
 /// A token bucket per key: `per_minute` requests, refilled continuously.
+///
+/// Each limiter has its own table and its own overflow buckets, so keys
+/// minted against one (client IPs, before authentication) never spend
+/// another's (the authenticated subjects).
 pub struct RateLimiter {
     per_minute: u32,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    table: Mutex<Table>,
+    seed: std::collections::hash_map::RandomState,
 }
 
 impl RateLimiter {
     pub fn new(per_minute: u32) -> Self {
         Self {
             per_minute,
-            buckets: Mutex::new(HashMap::new()),
+            table: Mutex::new(Table {
+                buckets: HashMap::new(),
+                last_sweep: None,
+                #[cfg(test)]
+                sweeps: 0,
+            }),
+            seed: Default::default(),
         }
+    }
+
+    fn overflow_key(&self, key: &str) -> String {
+        use std::hash::BuildHasher;
+        format!("*overflow-{}*", self.seed.hash_one(key) % OVERFLOW_SHARDS)
     }
 
     /// Take one request from `key`'s bucket, or learn how many seconds
@@ -71,17 +101,27 @@ impl RateLimiter {
     pub fn check_at(&self, key: &str, now: Instant) -> Result<(), u64> {
         let capacity = f64::from(self.per_minute);
         let rate = capacity / 60.0;
-        let mut buckets = self.buckets.lock().unwrap();
-        let mut key = key;
-        if !buckets.contains_key(key) && buckets.len() >= MAX_KEYS {
-            buckets.retain(|_, b| {
-                b.tokens + now.saturating_duration_since(b.last).as_secs_f64() * rate < capacity
-            });
-            if buckets.len() >= MAX_KEYS {
-                key = OVERFLOW_KEY;
+        let mut table = self.table.lock().unwrap();
+        let mut key = key.to_string();
+        if !table.buckets.contains_key(&key) && table.buckets.len() >= MAX_KEYS {
+            let due = table
+                .last_sweep
+                .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_INTERVAL);
+            if due {
+                table.last_sweep = Some(now);
+                #[cfg(test)]
+                {
+                    table.sweeps += 1;
+                }
+                table.buckets.retain(|_, b| {
+                    b.tokens + now.saturating_duration_since(b.last).as_secs_f64() * rate < capacity
+                });
+            }
+            if table.buckets.len() >= MAX_KEYS {
+                key = self.overflow_key(&key);
             }
         }
-        let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
+        let bucket = table.buckets.entry(key).or_insert(Bucket {
             tokens: capacity,
             last: now,
         });
@@ -98,7 +138,12 @@ impl RateLimiter {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.buckets.lock().unwrap().len()
+        self.table.lock().unwrap().buckets.len()
+    }
+
+    #[cfg(test)]
+    fn sweeps(&self) -> usize {
+        self.table.lock().unwrap().sweeps
     }
 }
 
@@ -253,22 +298,80 @@ mod tests {
         assert_eq!(slow.check_at("x", start), Err(6));
     }
 
-    #[test]
-    fn the_table_is_bounded_and_overflow_keys_share_one_bucket() {
-        let limiter = RateLimiter::new(1);
-        let now = Instant::now();
+    /// A limiter whose table is full of spent buckets, none idle.
+    fn full_limiter(per_minute: u32, now: Instant) -> RateLimiter {
+        let limiter = RateLimiter::new(per_minute);
         for n in 0..MAX_KEYS {
-            limiter.check_at(&format!("k{n}"), now).unwrap();
+            for _ in 0..per_minute {
+                limiter.check_at(&format!("k{n}"), now).unwrap();
+            }
         }
         assert_eq!(limiter.len(), MAX_KEYS);
-        // Every bucket is spent, so none is idle to drop: newcomers share.
-        assert!(limiter.check_at("new-1", now).is_ok());
-        assert!(limiter.check_at("new-2", now).is_err());
-        assert_eq!(limiter.len(), MAX_KEYS + 1);
-        // Later, idle buckets are dropped and real keys come back.
+        limiter
+    }
+
+    /// N7: the table stays bounded, and a flood of minted keys that fills it
+    /// does not take a real newcomer's whole allowance: the overflow is many
+    /// buckets chosen by a keyed hash, not one shared bucket.
+    #[test]
+    fn a_flood_of_minted_keys_does_not_starve_a_real_newcomer() {
+        let now = Instant::now();
+        let limiter = full_limiter(60, now);
+        // 1,000 minted keys arrive at once. One shared bucket of 60 would be
+        // empty after 60 of them; 256 of them leave each about 4 spent.
+        for n in 0..1000 {
+            let _ = limiter.check_at(&format!("mint-{n}"), now);
+        }
+        assert!(limiter.len() <= MAX_KEYS + OVERFLOW_SHARDS as usize);
+        // A real client arriving now still has its allowance, and the same
+        // client lands in the same overflow bucket each time.
+        for _ in 0..40 {
+            assert!(limiter.check_at("real-client", now).is_ok());
+        }
+        // Another limiter's keys are never affected.
+        let other = RateLimiter::new(60);
+        assert!(other.check_at("real-client", now).is_ok());
+        // Later, idle buckets are dropped and real keys come back with a
+        // table of their own.
         let later = now + Duration::from_secs(120);
         assert!(limiter.check_at("new-3", later).is_ok());
         assert!(limiter.len() < 10);
+    }
+
+    /// N7: a full table is swept for idle keys at most once per interval,
+    /// however many new keys arrive, so a flood cannot make each request
+    /// scan the whole table.
+    #[test]
+    fn a_full_table_is_swept_at_most_once_per_interval() {
+        let now = Instant::now();
+        let limiter = full_limiter(1, now);
+        for n in 0..5000 {
+            let _ = limiter.check_at(&format!("mint-{n}"), now + Duration::from_millis(n % 900));
+        }
+        assert_eq!(limiter.sweeps(), 1);
+        let _ = limiter.check_at("later", now + Duration::from_millis(1500));
+        assert_eq!(limiter.sweeps(), 2);
+    }
+
+    /// N7: the subject limiter, keyed by verified subjects, is a different
+    /// table from the per-IP limiters minted keys fill, so an unauthenticated
+    /// flood cannot spend an authenticated subject's allowance.
+    #[test]
+    fn a_flood_against_the_ip_limiter_leaves_subjects_untouched() {
+        let config = crate::Config::from_env(|name| match name {
+            "ASTER_SRV_DATABASE_URL" => Some("postgres://localhost/x".into()),
+            "ASTER_SRV_REPOSITORIES" => Some("ArchAstro/*".into()),
+            _ => None,
+        })
+        .unwrap();
+        let limits = Limits::new(&config);
+        let now = Instant::now();
+        for n in 0..(MAX_KEYS + 5000) {
+            let _ = limits.api_ip.check_at(&format!("203.0.{n}"), now);
+        }
+        for _ in 0..100 {
+            assert!(limits.api_subject.check_at("ci:ArchAstro/x", now).is_ok());
+        }
     }
 
     #[test]
