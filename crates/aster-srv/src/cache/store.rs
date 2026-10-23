@@ -8,14 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, OnceCell};
 
-use super::signing::{self, Method, Signer};
+use super::signing::{self, Limited, Method, SignLimiter, SignLimits, Signer};
 
 const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const RETENTION_LOCK: i64 = 0x6173_7465_722d_6363; // "aster-cc"
@@ -24,6 +24,82 @@ const RETENTION_LOCK: i64 = 0x6173_7465_722d_6363; // "aster-cc"
 /// delete and deletes it. So a blob a commit has just checked cannot be
 /// deleted before the manifest naming it is visible.
 pub(crate) const BLOB_LOCK: i64 = 0x6173_7465_722d_6362; // "aster-cb"
+
+/// Tuning for the lookup fan-out: what the store remembers about a blob and
+/// how hard it may push GCS and IAM.
+#[derive(Debug, Clone, Copy)]
+pub struct FanoutConfig {
+    /// How long a successful HEAD is trusted. Blobs are content-addressed and
+    /// immutable, and a blob a manifest names is never retained away, so a
+    /// positive answer can be long-lived. Misses are never cached: a blob
+    /// that was just uploaded must be seen at once.
+    pub present_ttl: Duration,
+    /// A cached signed GET URL is handed out only while at least this much of
+    /// its [`signing::URL_TTL`] is left, so the client has time to download.
+    pub reuse_margin: Duration,
+    /// HEAD requests in flight at once, across all requests.
+    pub head_concurrency: usize,
+    /// Digests remembered; idle ones are dropped when this is exceeded.
+    pub max_slots: usize,
+    pub sign: SignLimits,
+}
+
+impl Default for FanoutConfig {
+    fn default() -> Self {
+        Self {
+            present_ttl: Duration::from_secs(60 * 60),
+            reuse_margin: Duration::from_secs(5 * 60),
+            head_concurrency: 64,
+            max_slots: 20_000,
+            sign: SignLimits::default(),
+        }
+    }
+}
+
+/// What is remembered about one digest. One async lock per digest also makes
+/// concurrent lookups of the same blob share a single HEAD and signature.
+#[derive(Default)]
+struct Slot {
+    present_until: Option<Instant>,
+    /// A signed GET URL and when it stops being valid.
+    url: Option<(String, Instant)>,
+}
+
+/// State shared by every request: the per-digest memory and the limits on
+/// calls to GCS and IAM.
+pub struct Fanout {
+    config: FanoutConfig,
+    slots: std::sync::Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
+    heads: tokio::sync::Semaphore,
+    signing: SignLimiter,
+    /// HEAD requests actually issued. For tests.
+    head_calls: std::sync::atomic::AtomicU64,
+}
+
+impl Fanout {
+    fn new(config: FanoutConfig) -> Self {
+        Self {
+            heads: tokio::sync::Semaphore::new(config.head_concurrency.max(1)),
+            signing: SignLimiter::new(config.sign),
+            slots: Default::default(),
+            head_calls: Default::default(),
+            config,
+        }
+    }
+
+    fn slot(&self, sha256: &str) -> Arc<Mutex<Slot>> {
+        let mut slots = self.slots.lock().expect("slot map lock");
+        if slots.len() >= self.config.max_slots && !slots.contains_key(sha256) {
+            // Drop what no request is using; they refill on demand.
+            slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        }
+        Arc::clone(slots.entry(sha256.to_string()).or_default())
+    }
+
+    fn forget(&self, sha256: &str) {
+        self.slots.lock().expect("slot map lock").remove(sha256);
+    }
+}
 
 /// What one retention pass removed. `None` from [`run_retention`] means
 /// another replica held the lock.
@@ -44,12 +120,16 @@ pub enum BlobStore {
         auth: OnceCell<Arc<dyn gcp_auth::TokenProvider>>,
         signer_email: String,
         signer: OnceCell<Arc<dyn Signer>>,
+        fanout: Fanout,
     },
     /// Objects in memory, signed by `signer`. For tests.
     Memory {
         bucket: String,
         objects: Mutex<HashMap<String, (Bytes, DateTime<Utc>)>>,
         signer: Arc<dyn Signer>,
+        fanout: Fanout,
+        /// Added to every HEAD, to stand in for GCS latency. For tests.
+        head_latency: Duration,
     },
 }
 
@@ -67,6 +147,7 @@ impl BlobStore {
                 auth: OnceCell::new(),
                 signer_email,
                 signer: OnceCell::new(),
+                fanout: Fanout::new(FanoutConfig::default()),
             },
             _ => BlobStore::Disabled,
         }
@@ -74,11 +155,38 @@ impl BlobStore {
 
     /// An in-memory bucket. For tests.
     pub fn memory(bucket: impl Into<String>, signer: Arc<dyn Signer>) -> Self {
+        Self::memory_with(bucket, signer, FanoutConfig::default(), Duration::ZERO)
+    }
+
+    /// An in-memory bucket with chosen fan-out limits, and `head_latency`
+    /// added to every HEAD. For tests.
+    pub fn memory_with(
+        bucket: impl Into<String>,
+        signer: Arc<dyn Signer>,
+        config: FanoutConfig,
+        head_latency: Duration,
+    ) -> Self {
         BlobStore::Memory {
             bucket: bucket.into(),
             objects: Mutex::new(HashMap::new()),
             signer,
+            fanout: Fanout::new(config),
+            head_latency,
         }
+    }
+
+    fn fanout(&self) -> Option<&Fanout> {
+        match self {
+            BlobStore::Disabled => None,
+            BlobStore::Gcs { fanout, .. } | BlobStore::Memory { fanout, .. } => Some(fanout),
+        }
+    }
+
+    /// HEAD requests issued so far (cache hits excluded). For tests.
+    pub fn head_calls(&self) -> u64 {
+        self.fanout().map_or(0, |fanout| {
+            fanout.head_calls.load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 
     /// Whether this is the in-memory store tests use in place of GCS.
@@ -197,11 +305,31 @@ impl BlobStore {
         !matches!(self, BlobStore::Disabled)
     }
 
-    /// Whether `cas/<sha256>` exists.
+    /// Whether `cas/<sha256>` exists, asked of GCS now.
     pub async fn exists(&self, sha256: &str) -> Result<bool> {
+        let Some(fanout) = self.fanout() else {
+            return Ok(false);
+        };
+        let _permit = fanout
+            .heads
+            .acquire()
+            .await
+            .context("HEAD limiter closed")?;
+        fanout
+            .head_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self {
             BlobStore::Disabled => Ok(false),
-            BlobStore::Memory { objects, .. } => Ok(objects.lock().await.contains_key(sha256)),
+            BlobStore::Memory {
+                objects,
+                head_latency,
+                ..
+            } => {
+                if !head_latency.is_zero() {
+                    tokio::time::sleep(*head_latency).await;
+                }
+                Ok(objects.lock().await.contains_key(sha256))
+            }
             BlobStore::Gcs { client, .. } => {
                 let (bucket, token) = self.gcs_auth().await?;
                 let response = client
@@ -219,6 +347,38 @@ impl BlobStore {
                 Ok(true)
             }
         }
+    }
+
+    /// A signed GET URL for `cas/<sha256>` when the object exists, else
+    /// `None`. For lookups: a positive HEAD is remembered for
+    /// [`FanoutConfig::present_ttl`] and a signed URL is reused while enough
+    /// of its lifetime is left, so a warm digest costs no GCS or IAM call.
+    /// Callers asking for the same digest at once share one HEAD and one
+    /// signature. Commit and upload keep using [`BlobStore::exists`].
+    pub async fn readable_url(&self, sha256: &str) -> Result<Option<String>> {
+        let Some(fanout) = self.fanout() else {
+            return Ok(None);
+        };
+        let slot = fanout.slot(sha256);
+        let mut slot = slot.lock().await;
+        let now = Instant::now();
+        if slot.present_until.is_none_or(|until| until <= now) {
+            slot.present_until = None;
+            slot.url = None;
+            if !self.exists(sha256).await? {
+                return Ok(None);
+            }
+            slot.present_until = Some(Instant::now() + fanout.config.present_ttl);
+        }
+        if let Some((url, valid_until)) = &slot.url {
+            if *valid_until > Instant::now() + fanout.config.reuse_margin {
+                return Ok(Some(url.clone()));
+            }
+        }
+        let signed_at = Instant::now();
+        let url = self.signed_url(sha256, Method::Get).await?;
+        slot.url = Some((url.clone(), signed_at + signing::URL_TTL));
+        Ok(Some(url))
     }
 
     /// The sha256 and length of `cas/<name>`'s bytes, or `None` when there
@@ -313,6 +473,9 @@ impl BlobStore {
 
     /// Delete `cas/<sha256>`. Missing is success.
     pub async fn delete(&self, sha256: &str) -> Result<()> {
+        if let Some(fanout) = self.fanout() {
+            fanout.forget(sha256);
+        }
         match self {
             BlobStore::Disabled => Ok(()),
             BlobStore::Memory { objects, .. } => {
@@ -341,8 +504,16 @@ impl BlobStore {
     /// A signed URL for `cas/<sha256>`, valid for [`signing::URL_TTL`].
     pub async fn signed_url(&self, sha256: &str, method: Method) -> Result<String> {
         let (bucket, signer) = self.signer().await?;
+        let limiter = &self
+            .fanout()
+            .context("no cache bucket is configured")?
+            .signing;
+        let limited = Limited {
+            inner: signer.as_ref(),
+            limiter,
+        };
         signing::signed_url(
-            signer.as_ref(),
+            &limited,
             &bucket,
             &object_name(sha256),
             method,
@@ -520,4 +691,144 @@ pub fn spawn(app: Arc<crate::App>) {
             tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::FixedSigner;
+
+    const A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn store(config: FanoutConfig, latency: Duration) -> (BlobStore, Arc<FixedSigner>) {
+        let signer = Arc::new(FixedSigner {
+            email: "t@example.iam.gserviceaccount.com".into(),
+            signature: b"sig".to_vec(),
+            signed: Default::default(),
+        });
+        let store = BlobStore::memory_with("bucket", signer.clone(), config, latency);
+        (store, signer)
+    }
+
+    fn signatures(signer: &FixedSigner) -> usize {
+        signer.signed.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_warm_digest_costs_no_head_and_no_signature() {
+        let (store, signer) = store(FanoutConfig::default(), Duration::ZERO);
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        let first = store.readable_url(A).await.unwrap().unwrap();
+        let second = store.readable_url(A).await.unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(store.head_calls(), 1);
+        assert_eq!(signatures(&signer), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_blob_is_never_cached() {
+        let (store, signer) = store(FanoutConfig::default(), Duration::ZERO);
+        assert_eq!(store.readable_url(A).await.unwrap(), None);
+        assert_eq!(store.readable_url(A).await.unwrap(), None);
+        assert_eq!(store.head_calls(), 2);
+        assert_eq!(signatures(&signer), 0);
+        // Uploaded after the miss, it is seen at once.
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(store.readable_url(A).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_url_without_enough_lifetime_left_is_signed_again() {
+        let config = FanoutConfig {
+            reuse_margin: signing::URL_TTL + Duration::from_secs(1),
+            ..FanoutConfig::default()
+        };
+        let (store, signer) = store(config, Duration::ZERO);
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        store.readable_url(A).await.unwrap().unwrap();
+        store.readable_url(A).await.unwrap().unwrap();
+        // The HEAD is still remembered; only the signature is redone.
+        assert_eq!(store.head_calls(), 1);
+        assert_eq!(signatures(&signer), 2);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_blob_is_asked_about_again_after_its_ttl() {
+        let config = FanoutConfig {
+            present_ttl: Duration::from_millis(30),
+            ..FanoutConfig::default()
+        };
+        let (store, _) = store(config, Duration::ZERO);
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(store.readable_url(A).await.unwrap().is_some());
+        if let BlobStore::Memory { objects, .. } = &store {
+            objects.lock().await.remove(A);
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(store.readable_url(A).await.unwrap(), None);
+        assert_eq!(store.head_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_forgets_a_remembered_blob() {
+        let (store, _) = store(FanoutConfig::default(), Duration::ZERO);
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(store.readable_url(A).await.unwrap().is_some());
+        store.delete(A).await.unwrap();
+        assert_eq!(store.readable_url(A).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookups_of_one_digest_share_one_head_and_signature() {
+        let (store, signer) = store(FanoutConfig::default(), Duration::from_millis(20));
+        store
+            .put_unrecorded(A, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        let store = Arc::new(store);
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move { store.readable_url(A).await }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().unwrap().is_some());
+        }
+        assert_eq!(store.head_calls(), 1);
+        assert_eq!(signatures(&signer), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_slots_are_dropped_past_the_cap() {
+        let config = FanoutConfig {
+            max_slots: 4,
+            ..FanoutConfig::default()
+        };
+        let (store, _) = store(config, Duration::ZERO);
+        for index in 0..20 {
+            let digest = format!("{index:064x}");
+            store
+                .put_unrecorded(&digest, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            store.readable_url(&digest).await.unwrap().unwrap();
+        }
+        let slots = store.fanout().unwrap().slots.lock().unwrap().len();
+        assert!(slots <= 4, "{slots} slots kept");
+    }
 }

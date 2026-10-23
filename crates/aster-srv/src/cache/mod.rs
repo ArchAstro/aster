@@ -32,8 +32,8 @@ pub fn person_may_browse(
     policy::person_browser(&app.iap, person, repo, &app.config.repositories)
 }
 pub use routes::{handle, Headers};
-pub use signing::{expires_at, FixedSigner, Signer, URL_TTL};
-pub use store::{run_retention, spawn, BlobStore, Report};
+pub use signing::{expires_at, FixedSigner, SignLimits, Signer, URL_TTL};
+pub use store::{run_retention, spawn, BlobStore, FanoutConfig, Report};
 
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
