@@ -67,10 +67,9 @@ impl RefetchState {
         {
             return false;
         }
-        !self
-            .absent
+        self.absent
             .get(kid)
-            .is_some_and(|at| since(*at) < policy.absent_for)
+            .is_none_or(|at| since(*at) >= policy.absent_for)
     }
 
     /// A fetch starts now. Recorded before the request so that a fetch that
