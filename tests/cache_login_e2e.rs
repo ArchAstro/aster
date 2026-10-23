@@ -171,6 +171,12 @@ async fn start() -> Option<Running> {
 /// A stand-in for GitHub's OIDC token endpoint: any GET gets a token that
 /// names `acme/app` on `main`, from the `ci.yml` workflow.
 fn github_oidc_endpoint(stop: Arc<AtomicBool>) -> String {
+    github_oidc_endpoint_for(stop, "7001", "0123abc")
+}
+
+/// [`github_oidc_endpoint`] for one GitHub run and commit: aster-srv binds
+/// uploaded test results to the token's `run_id`, `run_attempt` and `sha`.
+fn github_oidc_endpoint_for(stop: Arc<AtomicBool>, run_id: &str, sha: &str) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test".into());
     let jwt = encode(
@@ -181,8 +187,9 @@ fn github_oidc_endpoint(stop: Arc<AtomicBool>) -> String {
             "exp": chrono::Utc::now().timestamp() + 600,
             "repository": REPO,
             "ref": "refs/heads/main",
-            "sha": "0123abc",
-            "run_id": "7001",
+            "sha": sha,
+            "run_id": run_id,
+            "run_attempt": "1",
             "event_name": "push",
             "workflow_ref": CI_WORKFLOW,
             "job_workflow_ref": CI_WORKFLOW,
@@ -610,9 +617,20 @@ async fn srv(dir: &Path, url: &str, config_home: &Path, args: &[&str]) -> (bool,
     )
 }
 
+/// The GitHub run id, commit and Aster run id of CI run `run`. The run id has
+/// the `gh:<repo>:<run_id>:<run_attempt>:` shape aster-srv requires of an
+/// upload made with that run's OIDC token.
+fn ci_run(run: usize) -> (String, String, String) {
+    let github_run = format!("{}", 7000 + run);
+    let sha = format!("{run:040}");
+    let run_id = format!("gh:{REPO}:{github_run}:1:test");
+    (github_run, sha, run_id)
+}
+
 /// One CI run of `//app:test`, as `--test-results` writes it: `flaky_test`
 /// fails and then passes on retry, `broken_test` fails on every attempt.
 fn ci_results(run: usize) -> String {
+    let (_, sha, run_id) = ci_run(run);
     let record = |value: Value| format!("{value}\n");
     let test = |id: &str, outcome: &str, attempt: u32, hash: Option<&str>| {
         record(json!({
@@ -623,8 +641,8 @@ fn ci_results(run: usize) -> String {
     };
     [
         record(json!({
-            "type": "run", "run_id": format!("e2e-run-{run}"), "repo": REPO,
-            "sha": format!("{run:040}"), "branch": "main", "aster_version": "0.0.0",
+            "type": "run", "run_id": run_id, "repo": REPO,
+            "sha": sha, "branch": "main", "aster_version": "0.0.0",
             "started_at": chrono::Utc::now().to_rfc3339(),
         })),
         record(json!({
@@ -656,10 +674,12 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
     let url = server.url.clone();
 
     // Phase 1: CI uploads three runs of a suite with a flaky test and a broken
-    // one, with the job's OIDC token, through `aster results upload`.
+    // one, each with its own job's OIDC token (aster-srv binds a run to the
+    // token's run id and commit), through `aster results upload`.
     let stop_oidc = Arc::new(AtomicBool::new(false));
-    let oidc_url = github_oidc_endpoint(stop_oidc.clone());
     for run in 1..=3 {
+        let (github_run, sha, _) = ci_run(run);
+        let oidc_url = github_oidc_endpoint_for(stop_oidc.clone(), &github_run, &sha);
         let file = root.path().join(format!("results-{run}.ndjson"));
         fs::write(&file, ci_results(run)).unwrap();
         let uploaded = tokio::task::spawn_blocking({
@@ -749,7 +769,15 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
             &laptop,
             &url,
             &config_home,
-            &["get", "/v1/test-results/runs/e2e-run-1/failures"],
+            // The run id holds the repository's `/`, so it is percent-encoded
+            // to stay one path segment.
+            &[
+                "get",
+                &format!(
+                    "/v1/test-results/runs/{}/failures",
+                    ci_run(1).2.replace('/', "%2F")
+                ),
+            ],
         )
         .await;
         assert!(ok, "{stderr}");
