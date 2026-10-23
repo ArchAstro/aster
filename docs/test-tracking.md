@@ -161,8 +161,11 @@ their key, so a macOS laptop mostly misses entries written on Linux CI.
 
 The server classifies every run. A test is a **definite flake** when it failed
 and then passed on a retry in one run, or when two runs with the same target
-`input_hash` (the same inputs) disagree. It is **broken** when its last 3
-default-branch runs failed the same way; broken tests are never quarantined.
+`input_hash` (the same inputs) disagree. Each failing run counts once. When
+many of a target run's tests fail together (a crashed shard or a dead
+database), the server records one **incident** for the target run instead of
+a flake per test. A test is **broken** when its last 3 default-branch runs
+failed the same way; broken tests are never quarantined.
 The details are in the [server README](../crates/aster-srv/README.md#flaky-and-broken-tests).
 
 ## 5. Quarantine
@@ -203,7 +206,8 @@ At start Aster prints the list it will use, for example:
 ```
 
 **The server** quarantines a test that is not broken once definite flakes
-from 2 different runs fall within 7 days. It releases the test after 20
+from 2 different failing runs fall within 7 days. A run that flaked more than
+10 tests counts toward none of them, and an incident's failures never count. It releases the test after 20
 consecutive passes, when it breaks, or after 30 days; a released test starts
 afresh. The list is fetched at start and cached in `.aster/quarantine.json`.
 If the server cannot be reached, a cache younger than 24 hours stands in;

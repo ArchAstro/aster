@@ -285,9 +285,10 @@ fn rules_note(rules: QuarantineRules) -> String {
     } else {
         format!(
             "A test enters after definite flakes in {} different run{} within 7 days, unless it \
-             is broken.",
+             is broken. A run that flaked more than {} tests counts for none of them.",
             rules.runs,
-            if rules.runs == 1 { "" } else { "s" }
+            if rules.runs == 1 { "" } else { "s" },
+            rules.run_cap
         )
     };
     format!(
@@ -613,6 +614,7 @@ mod tests {
         runs: 2,
         release_passes: 20,
         days: 30,
+        run_cap: 10,
     };
 
     #[test]
@@ -620,6 +622,7 @@ mod tests {
         let html = quarantine(Some("o/r"), RULES, &[], &[]);
         assert!(html.contains("No tests are quarantined") && html.contains("id=\"quarantine\""));
         assert!(html.contains("2 different runs") && html.contains("20 consecutive passes"));
+        assert!(html.contains("more than 10 tests"));
         let off = quarantine(None, QuarantineRules { runs: 0, ..RULES }, &[], &[]);
         assert!(off.contains("Automatic quarantine is off"));
     }

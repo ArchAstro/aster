@@ -7,8 +7,9 @@
 //! received, so retention drops whole days. `tests` holds each test's
 //! identity, when it was first and last seen, and what the classifier
 //! concluded about it. `test_flake_events` (also day-partitioned) is the
-//! classifier's evidence. `quarantine` lists the tests held out of failing
-//! builds, and `quarantine_log` how that list changed.
+//! classifier's evidence, and `target_incidents` the target runs whose
+//! tests failed together for one cause. `quarantine` lists the tests held
+//! out of failing builds, and `quarantine_log` how that list changed.
 
 pub mod classifier;
 pub mod durations;
@@ -198,6 +199,73 @@ ALTER TABLE test_results.quarantine
     ADD COLUMN passes_through timestamptz;
 "#,
     },
+    Migration {
+        feature: "test_results",
+        version: 6,
+        // A new table, filled from the retained results with the classifier's
+        // rules (`classifier::INCIDENT_*`), so a later pass on an old crashed
+        // run's inputs finds it is an incident. Only target runs with five or
+        // more failing tests are read in full, a small share of the results.
+        // Flake events written before this belong to the later run of a pair;
+        // they age out of the score in seven days.
+        sql: r#"
+CREATE TABLE test_results.target_incidents (
+    repo text NOT NULL,
+    run_id text NOT NULL,
+    target text NOT NULL,
+    received_on date NOT NULL,
+    received_at timestamptz NOT NULL,
+    input_hash text,
+    failures integer NOT NULL,
+    tests integer NOT NULL,
+    failure_hash text,
+    shared integer NOT NULL,
+    PRIMARY KEY (run_id, target)
+);
+CREATE INDEX target_incidents_repo ON test_results.target_incidents (repo, received_at);
+
+WITH candidates AS (
+    SELECT run_id, target, received_on FROM test_results.test_results
+    WHERE outcome IN ('fail', 'error')
+    GROUP BY run_id, target, received_on
+    HAVING count(DISTINCT test_id) >= 5),
+per_test AS (
+    SELECT tr.repo, tr.run_id, tr.target, tr.test_id, tr.received_on,
+           bool_or(tr.outcome IN ('fail', 'error')) AS any_fail,
+           (array_agg(tr.outcome ORDER BY tr.attempt DESC))[1] IN ('fail', 'error') AS is_fail,
+           (array_agg(tr.failure_hash ORDER BY tr.attempt DESC))[1] AS failure_hash
+    FROM candidates c
+    JOIN test_results.test_results tr
+         ON tr.run_id = c.run_id AND tr.target = c.target AND tr.received_on = c.received_on
+    JOIN test_results.target_runs t
+         ON t.run_id = tr.run_id AND t.address = tr.target AND t.received_on = tr.received_on
+    WHERE tr.outcome <> 'skip' AND NOT t.cached
+    GROUP BY tr.repo, tr.run_id, tr.target, tr.test_id, tr.received_on),
+runs AS (
+    SELECT repo, run_id, target, received_on,
+           count(*) FILTER (WHERE any_fail)::int AS failures, count(*)::int AS tests
+    FROM per_test GROUP BY repo, run_id, target, received_on),
+hashes AS (
+    SELECT DISTINCT ON (run_id, target) run_id, target, failure_hash, count(*)::int AS shared
+    FROM per_test WHERE is_fail AND failure_hash IS NOT NULL
+    GROUP BY run_id, target, failure_hash
+    ORDER BY run_id, target, count(*) DESC, failure_hash)
+INSERT INTO test_results.target_incidents
+    (repo, run_id, target, received_on, received_at, input_hash,
+     failures, tests, failure_hash, shared)
+SELECT c.repo, c.run_id, c.target, c.received_on, r.received_at, t.input_hash,
+       c.failures, c.tests, h.failure_hash, COALESCE(h.shared, 0)
+FROM runs c
+JOIN test_results.runs r ON r.run_id = c.run_id
+JOIN test_results.target_runs t
+     ON t.run_id = c.run_id AND t.address = c.target AND t.received_on = c.received_on
+LEFT JOIN hashes h ON h.run_id = c.run_id AND h.target = c.target
+WHERE c.failures >= 20
+   OR (c.failures >= 5 AND c.failures * 2 >= c.tests)
+   OR COALESCE(h.shared, 0) >= 10
+ON CONFLICT (run_id, target) DO NOTHING;
+"#,
+    },
 ];
 
 /// The day-partitioned tables.
@@ -252,6 +320,24 @@ pub async fn ensure_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_incident_backfill_uses_the_classifiers_thresholds() {
+        use super::classifier::{INCIDENT_FAILURES, INCIDENT_SHARED_HASH, INCIDENT_SHARE_MIN};
+        let backfill = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 6)
+            .expect("migration 6")
+            .sql;
+        for rule in [
+            format!("c.failures >= {INCIDENT_FAILURES}\n"),
+            format!("(c.failures >= {INCIDENT_SHARE_MIN} AND c.failures * 2 >= c.tests)"),
+            format!("COALESCE(h.shared, 0) >= {INCIDENT_SHARED_HASH}\n"),
+            format!("HAVING count(DISTINCT test_id) >= {INCIDENT_SHARE_MIN})"),
+        ] {
+            assert!(backfill.contains(&rule), "{rule}");
+        }
+    }
 
     #[test]
     fn partition_names_round_trip() {
