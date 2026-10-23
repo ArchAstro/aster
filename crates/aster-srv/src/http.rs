@@ -302,6 +302,7 @@ async fn handle(
         routes::label(request.method().as_str(), &path),
         client.to_string(),
         Arc::clone(&app.metrics),
+        Arc::clone(&app.audit_sampler),
     );
     audit::scope(ctx, async {
         // A client IP holds only so many requests open at once, so slow

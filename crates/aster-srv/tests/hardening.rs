@@ -1486,3 +1486,88 @@ async fn the_api_listener_refuses_tokens_without_the_pinned_owner_id() {
     }
     server.stop().await;
 }
+
+// ------------------------------------------------------ N15: sampled 401 logs
+
+/// N15: a flood of failures from one client logs the first few lines and a
+/// summary, the counters stay exact, and the audit trail of successful
+/// mints, exchanges and revokes is complete however many there are.
+#[tokio::test]
+async fn a_401_flood_is_sampled_and_summarised_while_counters_and_the_success_trail_stay_exact() {
+    let Some(server) = start_with(&[("ASTER_SRV_LOG_SAMPLE_FIRST", "5")]).await else {
+        return;
+    };
+    let url = server.url.clone();
+    let flooder = "198.51.100.77";
+    // 200 bad bearer tokens from one client IP (a spoofed prefix is ignored).
+    for n in 0..200 {
+        let response = client()
+            .post(format!("{url}/v1/cache/lookup"))
+            .header("authorization", format!("Bearer flood-{n}-not-a-token"))
+            .header("x-forwarded-for", format!("6.6.6.6, {flooder}, 34.8.0.1"))
+            .json(&json!({"repo": REPO, "keys": ["k"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    // Eight complete sign-ins, more than the sample size, then eight revokes.
+    let who = "n15-ada@example.com";
+    let subject = iap_subject(who);
+    for _ in 0..8 {
+        let (code, verifier) = browser_login(&url, &iap_assertion(who)).await;
+        let (status, _) = redeem(&url, &code, &verifier).await;
+        assert_eq!(status, 200);
+        aster_srv::audit::token_revoke(&subject, "operator");
+    }
+    server.app.audit_sampler.flush_all();
+
+    let lines: Vec<Value> = aster_srv::log::captured()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let audit = |event: &str, f: &dyn Fn(&Value) -> bool| {
+        lines
+            .iter()
+            .filter(|l| l["audit"] == true && l["event"] == event && f(l))
+            .count()
+    };
+    // Sampled: at most 5 failure lines for the flooder, the rest summarised.
+    let from_flooder = |l: &Value| l["client_ip"] == flooder && l["route"] == "/v1/cache";
+    assert_eq!(audit("auth_failure", &from_flooder), 5);
+    let summary: Vec<_> = lines
+        .iter()
+        .filter(|l| {
+            l["event"] == "audit_summary" && l["client_ip"] == flooder && l["of"] == "auth_failure"
+        })
+        .collect();
+    assert_eq!(summary.len(), 1, "{summary:?}");
+    assert_eq!(summary[0]["suppressed"], 195);
+    assert_eq!(summary[0]["reason"], "invalid_token");
+    // The server's own "token refused" warnings are sampled the same way.
+    let refused = lines
+        .iter()
+        .filter(|l| l["message"] == "token refused")
+        .count();
+    assert!(refused <= 5 + 8, "{refused} token refused lines");
+    // Counters are exact.
+    let metrics = server.app.metrics.render();
+    let expected =
+        "aster_srv_auth_failures_total{route=\"/v1/cache\",reason=\"invalid_token\"} 200";
+    assert!(metrics.contains(expected), "{expected}\n{metrics}");
+    // The success trail is complete: every mint, exchange and revoke.
+    assert_eq!(
+        audit("token_mint", &|l| l["subject"] == subject.as_str()),
+        8
+    );
+    assert_eq!(
+        audit("token_exchange", &|l| l["outcome"] == "success"
+            && l["subject"] == subject.as_str()),
+        8
+    );
+    assert_eq!(
+        audit("token_revoke", &|l| l["subject"] == subject.as_str()),
+        8
+    );
+    server.stop().await;
+}

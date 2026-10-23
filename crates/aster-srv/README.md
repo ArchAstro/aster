@@ -450,6 +450,8 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_BODY_TIMEOUT_SECS` | `60` | Time for a request body to arrive in full (`408`). |
 | `ASTER_SRV_UNAUTH_BODY_TIMEOUT_SECS` | `8` | Time for the body of an unauthenticated route (`POST /v1/auth/token`, `POST /cli-auth`, 8 KiB at most) to arrive (`408`); never more than `ASTER_SRV_BODY_TIMEOUT_SECS`, which the authenticated uploads keep. |
 | `ASTER_SRV_MAX_CONNECTIONS_PER_IP` | `128` | Requests in flight from one client IP (resolved as in [Client IP](#client-ip-and-rate-limits); IPv6 by /64), per replica; more get `429`. With `ASTER_SRV_TRUSTED_PROXY_HOPS=0` the peer is the client, so it also caps that peer's open connections (extra ones are closed unserved). |
+| `ASTER_SRV_LOG_SAMPLE_FIRST` | `5` | Failure audit lines (`auth_failure`, `rate_limited`, a failed `token_exchange`) logged per event, reason, route and client IP in each window; the rest are counted and summarised. |
+| `ASTER_SRV_LOG_SAMPLE_WINDOW_SECS` | `60` | The sampling window, and how often `audit_summary` lines are written. |
 | `ASTER_SRV_HANDLER_TIMEOUT_SECS` | `120` | Time from the end of the headers to the reply, body included (`504`). |
 | `ASTER_SRV_MAX_CONNECTIONS` | `1024` | Open connections per listener; more wait in the accept queue. |
 | `ASTER_SRV_DB_WAIT_SECS` | `5` | How long a request waits for a database connection before failing. |
@@ -542,7 +544,14 @@ attempts cannot take connections from CI commits and uploads.
 `token_mint` (a code issued at `/cli-auth`), `token_exchange` (`outcome` and
 `reason`), `token_revoke` (`audit::token_revoke`, called by the revoke
 endpoint), `auth_failure` (every 401 and 403: `route`, `client_ip`, `subject`
-when known, `reason`) and `rate_limited`. Tokens, codes, verifiers and IAP
+when known, `reason`) and `rate_limited`. The three failure events are
+sampled so a flood of 401s does not become a flood of log lines: the first
+`ASTER_SRV_LOG_SAMPLE_FIRST` (5) per event, reason, route and client IP in each
+`ASTER_SRV_LOG_SAMPLE_WINDOW_SECS` (60) window are logged, then one
+`audit_summary` line (`of`, `reason`, `route`, `client_ip`, `suppressed`)
+when the window ends. The counters below stay exact, and `token_mint`, a
+successful `token_exchange` and `token_revoke` are never sampled. Alert on
+the counters, not on line counts. Tokens, codes, verifiers and IAP
 assertions are never fields, and the logger redacts credential-named fields
 and JWT-shaped text anyway.
 
