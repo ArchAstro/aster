@@ -577,21 +577,36 @@ pub enum CacheCommands {
     /// Sign in to the shared remote cache from this machine
     ///
     /// Opens `$ASTER_SRV_URL/cli-auth` in your browser. Sign in there with
-    /// the company account the server's proxy uses and confirm. Aster
-    /// receives the answer on a one-shot listener on 127.0.0.1 and stores a
-    /// read-only token under your config directory ($XDG_CONFIG_HOME/aster,
-    /// else ~/.config/aster), readable only by you, until it expires (hours).
+    /// the company account the server's proxy uses and confirm only if the
+    /// page shows the code this command printed. Aster receives the answer
+    /// on a one-shot listener on 127.0.0.1 and stores a read-only token
+    /// under your config directory ($XDG_CONFIG_HOME/aster, else
+    /// ~/.config/aster), readable only by you, until it expires (hours).
     /// Later `aster run`s with `ASTER_SRV_URL` set restore from the shared
     /// cache; without a sign-in they print one line and use the local cache.
     ///
-    /// On a machine with no browser (a remote shell), pass `--no-browser`,
-    /// open the printed URL on a computer that is signed in, and forward the
-    /// port it names (`ssh -R PORT:127.0.0.1:PORT`).
+    /// On a remote shell (SSH, a devbox) the browser cannot reach that
+    /// listener, so Aster prints a URL instead: open it in any browser,
+    /// confirm, and paste the one-time code the page shows back into the
+    /// terminal. That happens with `--no-browser`, and automatically when
+    /// SSH_CONNECTION, SSH_CLIENT or SSH_TTY is set, when a Linux shell has
+    /// neither DISPLAY nor WAYLAND_DISPLAY, or when the browser fails to
+    /// open. `--loopback` forces the browser redirect.
     Login {
-        /// Print the sign-in URL instead of opening a browser
+        /// Do not open a browser: print a URL and paste back the code
         #[arg(long)]
         no_browser: bool,
+        /// Always use the browser redirect to 127.0.0.1 (with --no-browser:
+        /// print the URL, and forward the port with `ssh -R`)
+        #[arg(long)]
+        loopback: bool,
     },
+
+    /// Sign out of the shared remote cache
+    ///
+    /// Deletes the stored token and asks the server to refuse every token
+    /// issued to you so far, on every machine.
+    Logout,
 
     /// Evict old and least-recently-used artifact cache entries
     ///

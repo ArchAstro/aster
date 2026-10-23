@@ -282,7 +282,7 @@ fn run() -> Result<()> {
     // Login talks to the server and the user's config directory. It must not
     // wait on project discovery.
     if let Commands::Cache {
-        command: CacheCommands::Login { no_browser },
+        command: CacheCommands::Login { .. } | CacheCommands::Logout,
     } = &command
     {
         let server = std::env::var(aster::cache::ASTER_SRV_URL_ENV)
@@ -294,22 +294,90 @@ fn run() -> Result<()> {
                     aster::cache::ASTER_SRV_URL_ENV
                 )
             })?;
+        let Commands::Cache {
+            command:
+                CacheCommands::Login {
+                    no_browser,
+                    loopback,
+                },
+        } = &command
+        else {
+            let signed_out = aster::cache::logout(&server)?;
+            if let Some(path) = &signed_out.deleted {
+                println!("Deleted {}.", path.display());
+            }
+            return match signed_out.revoked {
+                Ok(()) => {
+                    println!(
+                        "Signed out: the server refuses every token issued to you before now."
+                    );
+                    Ok(())
+                }
+                Err(reason) if signed_out.deleted.is_none() => {
+                    println!("Nothing to do: {reason}.");
+                    Ok(())
+                }
+                Err(reason) => anyhow::bail!(
+                    "the local token is deleted, but the server was not told: {reason}; \
+                     run aster cache login and aster cache logout again to revoke it"
+                ),
+            };
+        };
         let options = aster::cache::LoginOptions {
+            mode: match (*loopback, *no_browser) {
+                (true, _) => aster::cache::LoginMode::Loopback,
+                (false, true) => aster::cache::LoginMode::Copy,
+                (false, false) => aster::cache::LoginMode::Auto,
+            },
             open_browser: !no_browser,
             timeout: aster::cache::LOGIN_TIMEOUT,
         };
-        let signed_in = aster::cache::login(&server, &options, &mut |url| {
-            if output_mode != OutputMode::Quiet {
-                if options.open_browser {
-                    println!("Opening your browser to sign in. If it does not open, visit:");
-                } else {
-                    println!("Open this URL in a browser to sign in:");
+        let quiet = output_mode == OutputMode::Quiet;
+        let signed_in = aster::cache::login(
+            &server,
+            &options,
+            &mut |announcement| {
+                use aster::cache::{CodeReason, Flow};
+                // A pasted code cannot work without the URL and the prompt,
+                // so those print even when quiet.
+                let copy = matches!(announcement.flow, Flow::Code(_));
+                if quiet && !copy {
+                    return;
                 }
-                println!("{url}");
-                println!("Waiting for the browser (Ctrl-C to cancel)...");
-            }
-        })?;
-        if output_mode != OutputMode::Quiet {
+                match announcement.flow {
+                    Flow::OpenedBrowser => {
+                        println!("Opening your browser to sign in. If it does not open, visit:")
+                    }
+                    Flow::LoopbackUrl => println!("Open this URL in a browser to sign in:"),
+                    Flow::Code(reason) => {
+                        match reason {
+                            CodeReason::Requested => {}
+                            CodeReason::RemoteSession => println!(
+                                "This looks like a remote shell, so Aster will ask for a code instead of a redirect."
+                            ),
+                            CodeReason::BrowserFailed => println!(
+                                "Could not open a browser, so Aster will ask for a code instead of a redirect."
+                            ),
+                        }
+                        println!("Open this URL in a browser on any computer and sign in:");
+                    }
+                }
+                println!("{}", announcement.url);
+                println!(
+                    "Confirm only if the page shows this code: {}",
+                    announcement.user_code
+                );
+                if copy {
+                    println!("Request id: {}", announcement.request_id);
+                    print!("Paste the code the page shows, then press Enter: ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                } else {
+                    println!("Waiting for the browser (Ctrl-C to cancel)...");
+                }
+            },
+            &mut std::io::stdin().lock(),
+        )?;
+        if !quiet {
             let who = signed_in
                 .email
                 .as_deref()
@@ -1416,7 +1484,9 @@ fn run() -> Result<()> {
                         print_cache_status(&status, target.as_deref(), output_mode)?;
                     }
                 }
-                CacheCommands::Login { .. } => unreachable!("login handled above"),
+                CacheCommands::Login { .. } | CacheCommands::Logout => {
+                    unreachable!("login handled above")
+                }
                 CacheCommands::Prune { max_size, max_age } => {
                     use aster::cache::{prune_cache, PruneLimits};
                     use aster::config::WorkspaceConfig;

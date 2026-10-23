@@ -12,13 +12,17 @@ use std::sync::Arc;
 use aster_srv::cache::{BlobStore, FixedSigner, Signer};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use base64::Engine;
-use common::{iap_assertion, iap_assertion_for, person_bearer, token_with_claims, Server};
+use common::{
+    iap_assertion, iap_assertion_for, person_bearer, token_with_claims, Server, PUBLIC_URL,
+};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const REPO: &str = "ArchAstro/firstlanding";
 const ADA: &str = "ada@example.com";
+/// The code the CLI would print and the page would show (as ABCD-2345).
+const USER_CODE: &str = "ABCD2345";
 const CI_WORKFLOW: &str = "ArchAstro/firstlanding/.github/workflows/ci.yml@refs/heads/main";
 
 fn server_env() -> Vec<(&'static str, &'static str)> {
@@ -108,6 +112,8 @@ async fn confirm(server: &Server, fields: &[(&str, &str)], assertion: Option<&st
     let mut request = browser()
         .post(format!("{}/cli-auth", server.url))
         .header("content-type", "application/x-www-form-urlencoded")
+        // A browser submitting the server's own form names its origin.
+        .header("origin", PUBLIC_URL)
         .body(body);
     if let Some(assertion) = assertion {
         request = request.header("x-goog-iap-jwt-assertion", assertion);
@@ -143,7 +149,7 @@ fn as_refs(fields: &[(String, String)]) -> Vec<(&str, &str)> {
 }
 
 fn query(port: impl std::fmt::Display, challenge: &str, state: &str) -> String {
-    format!("port={port}&challenge={challenge}&state={state}")
+    format!("port={port}&challenge={challenge}&state={state}&user_code={USER_CODE}")
 }
 
 /// The code and state a successful confirmation sent to the loopback port.
@@ -179,7 +185,7 @@ async fn exchange(server: &Server, code: &str, verifier: &str, port: u16) -> (u1
     server
         .post_json(
             "/v1/auth/token",
-            &json!({"code": code, "verifier": verifier, "port": port}),
+            &json!({"code": code, "verifier": verifier, "user_code": USER_CODE, "port": port}),
             None,
             None,
         )
@@ -247,13 +253,16 @@ async fn sign_in_refuses_a_bad_port_challenge_or_state() {
     let (_, challenge) = pkce();
     let long_state = "s".repeat(129);
     for (what, q) in [
-        ("no port", format!("challenge={challenge}&state=s")),
+        (
+            "no port",
+            format!("challenge={challenge}&state=s&user_code={USER_CODE}"),
+        ),
         ("port below 1024", query(1023, &challenge, "s")),
         ("port 0", query(0, &challenge, "s")),
         ("port too large", query(65_536, &challenge, "s")),
         (
             "port not a number",
-            format!("port=80a&challenge={challenge}&state=s"),
+            format!("port=80a&challenge={challenge}&state=s&user_code={USER_CODE}"),
         ),
         ("short challenge", query(40_000, "abc", "s")),
         (
@@ -264,7 +273,10 @@ async fn sign_in_refuses_a_bad_port_challenge_or_state() {
             "challenge with a plus",
             query(40_000, &format!("{}+", &challenge[..42]), "s"),
         ),
-        ("no state", format!("port=40000&challenge={challenge}")),
+        (
+            "no state",
+            format!("port=40000&challenge={challenge}&user_code={USER_CODE}"),
+        ),
         ("empty state", query(40_000, &challenge, "")),
         ("long state", query(40_000, &challenge, &long_state)),
         ("state with markup", query(40_000, &challenge, "%3Cb%3E")),
@@ -291,7 +303,10 @@ async fn the_confirmation_form_is_bound_to_who_asked_what_and_when() {
     let form = open_login(&server, &q, Some(&ada)).await;
     let fields = form_fields(&form.body);
     let names: Vec<_> = fields.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["port", "challenge", "state", "exp", "mac"]);
+    assert_eq!(
+        names,
+        ["user_code", "challenge", "state", "exp", "mac", "port"]
+    );
 
     let with = |name: &str, value: &str| -> Vec<(String, String)> {
         fields
@@ -322,11 +337,14 @@ async fn the_confirmation_form_is_bound_to_who_asked_what_and_when() {
     // A correctly MACed form whose time has passed.
     let issuer = server.app.person_tokens.as_ref().unwrap();
     let past = (chrono::Utc::now().timestamp() - 5).to_string();
-    let mac = issuer.mac(&[ADA, &challenge, "40000", "state-x", &past]);
+    let mac = issuer.mac(&[
+        ADA, &challenge, "loopback", "40000", "state-x", USER_CODE, &past,
+    ]);
     attempts.push((
         "an expired form",
         vec![
             ("port".into(), "40000".into()),
+            ("user_code".into(), USER_CODE.into()),
             ("challenge".into(), challenge.clone()),
             ("state".into(), "state-x".into()),
             ("exp".into(), past),
@@ -421,7 +439,10 @@ async fn every_refused_exchange_is_the_same_invalid_grant() {
     let (code, verifier, port) = sign_in(&server, ADA).await;
     let (_, other_verifier) = pkce();
     assert_eq!(
-        post(json!({"code": code, "verifier": other_verifier, "port": port})).await,
+        post(
+            json!({"code": code, "verifier": other_verifier, "user_code": USER_CODE, "port": port})
+        )
+        .await,
         (400, invalid_grant())
     );
     assert_eq!(
@@ -487,11 +508,11 @@ async fn every_refused_exchange_is_the_same_invalid_grant() {
     // Never issued, malformed, short verifier, wrong types.
     let (_, verifier) = pkce();
     for body in [
-        json!({"code": "nope", "verifier": verifier, "port": 40_123}),
-        json!({"code": "", "verifier": "", "port": 40_123}),
-        json!({"code": "x", "verifier": "short", "port": 40_123}),
-        json!({"code": 1, "verifier": verifier, "port": 40_123}),
-        json!({"code": "x", "verifier": verifier}),
+        json!({"code": "nope", "verifier": verifier, "user_code": USER_CODE, "port": 40_123}),
+        json!({"code": "", "verifier": "", "user_code": USER_CODE, "port": 40_123}),
+        json!({"code": "x", "verifier": "short", "user_code": USER_CODE, "port": 40_123}),
+        json!({"code": 1, "verifier": verifier, "user_code": USER_CODE, "port": 40_123}),
+        json!({"code": "x", "verifier": verifier, "user_code": USER_CODE}),
         json!({}),
     ] {
         assert_eq!(post(body.clone()).await, (400, invalid_grant()), "{body}");

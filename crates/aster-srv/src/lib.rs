@@ -215,7 +215,24 @@ impl App {
         &self,
         authorization: Option<&str>,
     ) -> Result<auth::Principal, auth::AuthError> {
-        auth::authenticate(&self.verifier, self.person_tokens.as_ref(), authorization).await
+        let principal =
+            auth::authenticate(&self.verifier, self.person_tokens.as_ref(), authorization).await?;
+        // A person who signed out everywhere (`aster cache logout`) loses
+        // every token issued before that. A database error fails closed.
+        if let auth::Principal::Person(person) = &principal {
+            match person::is_revoked(&self.pool, person).await {
+                Ok(false) => {}
+                Ok(true) => return Err(auth::AuthError::Invalid("the token was revoked".into())),
+                Err(error) => {
+                    log::error(
+                        "revocation check failed",
+                        serde_json::json!({"error": format!("{error:#}")}),
+                    );
+                    return Err(auth::AuthError::Invalid("cannot check the token".into()));
+                }
+            }
+        }
+        Ok(principal)
     }
 
     /// Apply every migration not yet applied, then mark the schema ready.

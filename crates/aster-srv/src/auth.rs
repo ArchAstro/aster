@@ -575,13 +575,11 @@ mod tests {
             .issue("accounts.google.com:1", "ada@example.com")
             .unwrap()
             .token;
-        assert_eq!(
+        assert!(matches!(
             principal(Some(&issuer), &person).await,
-            Ok(Principal::Person(crate::person::Person {
-                subject: "accounts.google.com:1".into(),
-                email: "ada@example.com".into()
-            }))
-        );
+            Ok(Principal::Person(p))
+                if p.subject == "accounts.google.com:1" && p.email == "ada@example.com"
+        ));
         let ci = token(claims("ArchAstro/firstlanding"), "k1");
         assert!(matches!(
             principal(Some(&issuer), &ci).await,

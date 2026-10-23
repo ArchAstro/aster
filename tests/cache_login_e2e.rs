@@ -73,6 +73,7 @@ impl Running {
             &json!({
                 "iss": "https://cloud.google.com/iap",
                 "aud": IAP_AUDIENCE,
+                "iat": chrono::Utc::now().timestamp(),
                 "exp": chrono::Utc::now().timestamp() + 300,
                 "email": email,
                 "sub": "accounts.google.com:e2e-1001",
@@ -347,7 +348,7 @@ fn login_with(
     browse: impl FnOnce(&str) + Send,
 ) -> (std::process::ExitStatus, Vec<String>) {
     let mut child = aster(dir)
-        .args(["cache", "login", "--no-browser"])
+        .args(["cache", "login", "--loopback", "--no-browser"])
         .env("ASTER_SRV_URL", server)
         .env("XDG_CONFIG_HOME", config_home)
         .stdout(Stdio::piped())
@@ -406,6 +407,7 @@ async fn sign_in(
                         .post(format!("{url}/cli-auth"))
                         .header("content-type", "application/x-www-form-urlencoded")
                         .header("x-goog-iap-jwt-assertion", &assertion)
+                        .header("origin", &url)
                         .send(form_body(&page.body))
                         .expect("POST /cli-auth"),
                 );
@@ -807,4 +809,358 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
     }
 
     server.stop().await;
+}
+/// Run `aster cache login` as a person in a remote shell would: stdin is a
+/// pipe the person types into, and `ssh` makes the environment look like an
+/// SSH session (so no flag is needed). `browse` gets the printed sign-in URL
+/// and returns the line to paste, or `None` to type nothing.
+fn copy_login_with(
+    dir: &Path,
+    server: &str,
+    config_home: &Path,
+    flags: &[&str],
+    ssh: bool,
+    browse: impl FnOnce(&str) -> Option<String> + Send,
+) -> (std::process::ExitStatus, Vec<String>, String) {
+    let mut command = aster(dir);
+    command
+        .args(["cache", "login"])
+        .args(flags)
+        .env("ASTER_SRV_URL", server)
+        .env("XDG_CONFIG_HOME", config_home)
+        // A real SSH session has no display; make the test host look alike.
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_CLIENT")
+        .env_remove("SSH_TTY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if ssh {
+        command.env("SSH_CONNECTION", "203.0.113.9 50000 10.0.0.2 22");
+    }
+    let mut child = command.spawn().expect("spawn aster cache login");
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.starts_with("http") {
+                let _ = url_tx.send(line.clone());
+            }
+            lines.push(line);
+        }
+        lines
+    });
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("aster cache login prints the sign-in URL");
+    let mut stdin = child.stdin.take().unwrap();
+    if let Some(paste) = browse(&url) {
+        writeln!(stdin, "{paste}").unwrap();
+    }
+    drop(stdin);
+    let status = child.wait().expect("aster cache login exits");
+    (status, reader.join().unwrap(), errors.join().unwrap())
+}
+
+fn query_value(url: &str, name: &str) -> String {
+    url.split(['?', '&'])
+        .find_map(|part| part.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("{name} in {url}"))
+        .to_string()
+}
+
+/// The code a copy-mode page shows.
+fn shown_code(html: &str) -> String {
+    html.split("<pre><code>")
+        .nth(1)
+        .expect("the page shows a code")
+        .split("</code>")
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_shell_signs_in_by_pasting_a_code_and_restores_what_ci_wrote() {
+    let Some(server) = start().await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let ci_checkout = root.path().join("ci").join("workspace");
+    let devbox = root.path().join("devbox").join("workspace");
+    let config_home = root.path().join("devbox-config");
+    for dir in [&ci_checkout, &devbox] {
+        checkout(dir);
+    }
+    let url = server.url.clone();
+
+    // Phase 1: CI builds on main and writes the artifact, as in the laptop
+    // test: a GitHub OIDC token from the (stand-in) Actions endpoint.
+    let stop_oidc = Arc::new(AtomicBool::new(false));
+    let oidc_url = github_oidc_endpoint(stop_oidc.clone());
+    tokio::task::spawn_blocking({
+        let (dir, url) = (ci_checkout.clone(), url.clone());
+        move || {
+            let mut command = aster(&dir);
+            command
+                .env("ASTER_SRV_URL", &url)
+                .env("ASTER_SRV_GCS_BASE", &url)
+                .env("ACTIONS_ID_TOKEN_REQUEST_URL", oidc_url)
+                .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "request-token");
+            build(command)
+        }
+    })
+    .await
+    .unwrap();
+    stop_oidc.store(true, Ordering::Relaxed);
+    let written = tree(&ci_checkout.join("app/out"));
+    assert_eq!(written, vec![("file.txt".into(), b"hi\n".to_vec())]);
+
+    let assertion = server.iap_assertion(PERSON);
+    let token_file = config_home.join("aster/cache-tokens").join(format!(
+        "{}.json",
+        url.trim_start_matches("http://").replace(':', "_")
+    ));
+
+    // Phase 2: a sign-in whose code is stolen before the person pastes it.
+    // The person's browser confirms, but another party redeems the code with
+    // a verifier of its own. The CLI's paste is then refused and stores nothing.
+    let (status, lines, _) = tokio::task::spawn_blocking({
+        let (dir, url, config, assertion) = (
+            devbox.clone(),
+            url.clone(),
+            config_home.clone(),
+            assertion.clone(),
+        );
+        move || {
+            copy_login_with(&dir, &url, &config, &[], true, |sign_in_url| {
+                let agent = browser();
+                let page = reply(
+                    agent
+                        .get(sign_in_url)
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .call()
+                        .unwrap(),
+                );
+                assert_eq!(page.status, 200, "{}", page.body);
+                let code = confirm_copy(&agent, &url, &assertion, &page);
+                // Someone who saw the code but not the CLI's verifier.
+                let thief = reply(
+                    agent
+                        .post(format!("{url}/v1/auth/token"))
+                        .header("content-type", "application/json")
+                        .send(
+                            json!({
+                                "code": code,
+                                "verifier": "v".repeat(43),
+                                "user_code": query_value(sign_in_url, "user_code"),
+                            })
+                            .to_string(),
+                        )
+                        .unwrap(),
+                );
+                assert_eq!(thief.status, 400, "a wrong verifier is refused");
+                Some(code)
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!status.success(), "a spent code cannot sign in: {lines:?}");
+    assert!(!token_file.exists(), "a refused sign-in stores nothing");
+
+    // Phase 3: the real sign-in. No flag: SSH_CONNECTION alone picks the
+    // pasted-code flow. The scripted browser plays a person behind IAP.
+    let (status, lines, stderr) = tokio::task::spawn_blocking({
+        let (dir, url, config, assertion) = (
+            devbox.clone(),
+            url.clone(),
+            config_home.clone(),
+            assertion.clone(),
+        );
+        move || {
+            copy_login_with(&dir, &url, &config, &[], true, |sign_in_url| {
+                assert!(
+                    sign_in_url.contains("/cli-auth?mode=copy&") && !sign_in_url.contains("port="),
+                    "copy mode names no port: {sign_in_url}"
+                );
+                let agent = browser();
+                let page = reply(
+                    agent
+                        .get(sign_in_url)
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .call()
+                        .unwrap(),
+                );
+                assert_eq!(page.status, 200, "{}", page.body);
+                let user_code = query_value(sign_in_url, "user_code");
+                assert!(
+                    page.body
+                        .contains(&format!("{}-{}", &user_code[..4], &user_code[4..])),
+                    "the page shows the code the terminal printed: {}",
+                    page.body
+                );
+
+                // A loopback-shaped replay of this form cannot make a code:
+                // adding a port, or dropping the mode, breaks the MAC.
+                let form = form_body(&page.body);
+                for tampered in [format!("{form}&port=40000"), form.replace("mode=copy", "")] {
+                    let refused = reply(
+                        agent
+                            .post(format!("{url}/cli-auth"))
+                            .header("content-type", "application/x-www-form-urlencoded")
+                            .header("x-goog-iap-jwt-assertion", &assertion)
+                            .header("origin", &url)
+                            .send(tampered)
+                            .unwrap(),
+                    );
+                    assert_eq!(refused.status, 400, "{}", refused.body);
+                    assert!(refused.location.is_none());
+                }
+                // And a loopback page's form cannot be turned into a copy code.
+                let loopback_page = reply(
+                    agent
+                        .get(format!(
+                            "{}&port=40000",
+                            sign_in_url.replace("mode=copy&", "")
+                        ))
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .call()
+                        .unwrap(),
+                );
+                assert_eq!(loopback_page.status, 200, "{}", loopback_page.body);
+                let as_copy = reply(
+                    agent
+                        .post(format!("{url}/cli-auth"))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("x-goog-iap-jwt-assertion", &assertion)
+                        .header("origin", &url)
+                        .send(format!("{}&mode=copy", form_body(&loopback_page.body)))
+                        .unwrap(),
+                );
+                assert_eq!(as_copy.status, 400, "{}", as_copy.body);
+
+                Some(confirm_copy(&agent, &url, &assertion, &page))
+            })
+        }
+    })
+    .await
+    .unwrap();
+    let transcript = lines.join("\n");
+    assert!(status.success(), "login failed: {transcript}\n{stderr}");
+    assert!(
+        transcript.contains("looks like a remote shell"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains(&format!("Signed in as {PERSON}")),
+        "{transcript}"
+    );
+    let stored: Value = serde_json::from_str(&fs::read_to_string(&token_file).unwrap()).unwrap();
+    let token = stored["token"].as_str().unwrap().to_string();
+    assert!(
+        !transcript.contains(&token) && !stderr.contains(&token),
+        "the token must not be printed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&token_file), 0o600);
+        assert_eq!(mode(token_file.parent().unwrap()), 0o700);
+    }
+
+    // Phase 4: the signed-in devbox restores what CI wrote, byte for byte,
+    // without running the command.
+    let restored = tokio::task::spawn_blocking({
+        let (dir, url, config) = (devbox.clone(), url.clone(), config_home.clone());
+        move || {
+            let mut command = aster(&dir);
+            command
+                .env("ASTER_SRV_URL", &url)
+                .env("ASTER_SRV_GCS_BASE", &url)
+                .env("XDG_CONFIG_HOME", &config);
+            build(command)
+        }
+    })
+    .await
+    .unwrap();
+    let restore_stderr = String::from_utf8_lossy(&restored.stderr);
+    assert_eq!(
+        runs(&devbox),
+        0,
+        "must not run the target: {restore_stderr}"
+    );
+    assert_eq!(tree(&devbox.join("app/out")), written, "{restore_stderr}");
+    assert!(!restore_stderr.contains(&token), "{restore_stderr}");
+
+    // Phase 5: `aster cache logout` deletes the file and the server refuses
+    // the old token from then on.
+    let logout = tokio::task::spawn_blocking({
+        let (dir, url, config) = (devbox.clone(), url.clone(), config_home.clone());
+        move || {
+            aster(&dir)
+                .args(["cache", "logout"])
+                .env("ASTER_SRV_URL", &url)
+                .env("XDG_CONFIG_HOME", &config)
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    assert!(!token_file.exists(), "logout deletes the token file");
+    let after = tokio::task::spawn_blocking({
+        let (url, token) = (url.clone(), token.clone());
+        move || {
+            reply(
+                browser()
+                    .post(format!("{url}/v1/cache/lookup"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .send(json!({"repo": REPO, "keys": ["k"]}).to_string())
+                    .unwrap(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        after.status, 401,
+        "a revoked token is refused: {}",
+        after.body
+    );
+
+    server.stop().await;
+}
+
+/// Click Authorize on `page` and read the code off the answer. A copy-mode
+/// answer is a page, never a redirect, and never carries a token.
+fn confirm_copy(agent: &ureq::Agent, url: &str, assertion: &str, page: &Reply) -> String {
+    let done = reply(
+        agent
+            .post(format!("{url}/cli-auth"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-goog-iap-jwt-assertion", assertion)
+            .header("origin", url)
+            .send(form_body(&page.body))
+            .expect("POST /cli-auth"),
+    );
+    assert_eq!(done.status, 200, "copy mode never redirects: {}", done.body);
+    assert!(done.location.is_none());
+    assert!(!done.body.contains("eyJ"), "no token on the page");
+    shown_code(&done.body)
 }
