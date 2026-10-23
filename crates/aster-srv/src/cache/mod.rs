@@ -31,7 +31,7 @@ pub fn person_may_browse(
 ) -> Result<(), &'static str> {
     policy::person_browser(&app.iap, person, repo, &app.config.repositories)
 }
-pub use routes::{handle, Headers};
+pub use routes::{handle, Headers, MAX_LOOKUP_BLOBS};
 pub use signing::{expires_at, FixedSigner, SignLimits, Signer, URL_TTL};
 pub use store::{run_retention, spawn, BlobStore, FanoutConfig, Report};
 
