@@ -869,3 +869,161 @@ fn a_bad_quarantine_file_is_an_error() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// Declared reports: a target whose runner hides behind a script.
+
+/// A Go module whose `test` target runs `tools/run-tests.sh`, as
+/// firstlanding's Rust and Go lanes wrap `cargo nextest` and `go test` in
+/// scripts. The script writes `REPORT` where `write_to` says and fails.
+fn wrapped_workspace(write_to: &str, report: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "svc/go.mod",
+        "module example.com/svc\n\ngo 1.21\n",
+    );
+    write(tmp.path(), "svc/svc_test.go", "package svc\n");
+    fs::write(tmp.path().join("report.xml"), REPORT).unwrap();
+    write(
+        tmp.path(),
+        "svc/tools/run-tests.sh",
+        &format!("#!/bin/sh\nmkdir -p \"$(dirname \"{write_to}\")\"\ncp ../report.xml \"{write_to}\"\nexit 1\n"),
+    );
+    write(
+        tmp.path(),
+        "svc/aster.toml",
+        &format!(
+            "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"sh tools/run-tests.sh\"\n{report}"
+        ),
+    );
+    tmp
+}
+
+fn run_wrapped(tmp: &TempDir) -> (Output, Vec<Record>) {
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//svc",
+        ],
+    );
+    assert!(!output.status.success(), "the failing test fails the run");
+    (output, read_records(&results))
+}
+
+fn confidence_of(records: &[Record], address: &str) -> Option<Confidence> {
+    records.iter().find_map(|r| match r {
+        Record::Target(t) if t.address == address => t.confidence,
+        _ => None,
+    })
+}
+
+#[test]
+fn a_wrapped_runner_records_nothing_until_its_report_is_declared() {
+    // Before: the script hides the runner, so its tests are not recorded,
+    // the "(0 tests)" firstlanding's Rust lane uploaded.
+    let tmp = wrapped_workspace("$ASTER_TEST_REPORT_DIR/junit.xml", "");
+    let (_, records) = run_wrapped(&tmp);
+    assert!(tests_of(&records).is_empty());
+
+    // Declared, the script writes into the directory Aster names in
+    // ASTER_TEST_REPORT_DIR and both tests are recorded, complete.
+    let tmp = wrapped_workspace(
+        "$ASTER_TEST_REPORT_DIR/junit.xml",
+        "\n[targets.test.report]\nformat = \"junit\"\n",
+    );
+    let (output, records) = run_wrapped(&tmp);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Test results (2 tests) written to"),
+        "{stderr}"
+    );
+    assert_eq!(
+        tests_of(&records),
+        vec![
+            ("adds()".to_string(), TestOutcome::Pass, 1),
+            ("divides()".to_string(), TestOutcome::Fail, 1),
+        ]
+    );
+    assert_eq!(
+        confidence_of(&records, "//svc:test"),
+        Some(Confidence::Complete)
+    );
+    // The report directory is removed after it is read.
+    let reports = tmp.path().join("runner-temp/aster-reports");
+    assert!(fs::read_dir(&reports).map_or(true, |mut d| d.next().is_none()));
+}
+
+#[test]
+fn declared_report_files_in_the_project_are_read_only_when_written_by_this_run() {
+    // nextest's JUnit profile writes into the project's target directory.
+    let tmp = wrapped_workspace(
+        "target/nextest/ci/junit.xml",
+        "\n[targets.test.report]\nformat = \"junit\"\nfiles = [\"target/nextest/*/junit.xml\"]\n",
+    );
+    // A report left by an earlier run is not this run's.
+    write(
+        tmp.path(),
+        "svc/target/nextest/old/junit.xml",
+        r#"<testsuite name="Old"><testcase classname="Old" name="stale"/></testsuite>"#,
+    );
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(tmp.path().join("svc/target/nextest/old/junit.xml"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let (_, records) = run_wrapped(&tmp);
+    let names: Vec<String> = tests_of(&records).into_iter().map(|t| t.0).collect();
+    assert_eq!(names, vec!["adds()", "divides()"]);
+}
+
+#[test]
+fn quarantine_never_lets_a_declared_report_pass() {
+    // Every failing test is quarantined and the script exits 1, the code a
+    // JUnit runner uses for failed tests. But the script could have failed
+    // in any of its steps, so the target still fails.
+    let tmp = wrapped_workspace(
+        "$ASTER_TEST_REPORT_DIR/junit.xml",
+        "\n[targets.test.report]\nformat = \"junit\"\n",
+    );
+    write(
+        tmp.path(),
+        "aster-quarantine.toml",
+        "[[test]]\nname = \"divides()\"\ntarget = \"//svc\"\nreason = \"flaky\"\nexpires = 2999-01-01\n",
+    );
+    let (output, records) = run_wrapped(&tmp);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot tell this runner's test failures from other errors"),
+        "{stderr}"
+    );
+    assert_eq!(target_status(&records, "//svc:test"), TargetStatus::Failed);
+    let capture = records.iter().find_map(|r| match r {
+        Record::Target(t) if t.address == "//svc:test" => t.capture.clone(),
+        _ => None,
+    });
+    assert_eq!(capture.as_deref(), Some("declared-junit"));
+}
+
+#[test]
+fn a_bad_declared_report_is_a_configuration_error() {
+    for report in [
+        "\n[targets.test.report]\nformat = \"tap\"\n",
+        "\n[targets.test.report]\nformat = \"junit\"\nfiles = [\"../target/junit.xml\"]\n",
+        "\n[targets.test.report]\nformat = \"junit\"\nfiles = [\"./target/junit.xml\"]\n",
+        "\n[targets.test.report]\nformat = \"junit\"\nfiles = [\"[\"]\n",
+        "\n[targets.test.report]\nformat = \"junit\"\npath = \"x\"\n",
+    ] {
+        let tmp = wrapped_workspace("$ASTER_TEST_REPORT_DIR/junit.xml", report);
+        let output = aster(tmp.path(), &["test", "//svc"]);
+        assert!(!output.status.success(), "{report}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("aster.toml"), "{report}: {stderr}");
+    }
+}

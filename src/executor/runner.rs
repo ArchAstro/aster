@@ -934,7 +934,18 @@ impl<'a> Executor<'a> {
             plugin_registry
                 .find_by_name(&project.plugin_name)
                 .map(|plugin| {
-                    plan_captures(plugin, &project_root, &working_dir, &target_name, &commands)
+                    let declared = project
+                        .targets
+                        .get(&target_name)
+                        .and_then(|target| target.report.as_ref());
+                    plan_captures(
+                        plugin,
+                        declared,
+                        &project_root,
+                        &working_dir,
+                        &target_name,
+                        &commands,
+                    )
                 })
                 .unwrap_or_default()
         } else {
@@ -2174,14 +2185,24 @@ impl Invocation {
 /// planned command gets its own empty report directory.
 fn plan_captures(
     plugin: &dyn LanguagePlugin,
+    declared: Option<&crate::config::ReportConfig>,
     project_dir: &Path,
     working_dir: &Path,
     target_name: &str,
     commands: &[String],
 ) -> Vec<Option<(ReportPlan, PathBuf)>> {
+    let last = commands.len().saturating_sub(1);
     commands
         .iter()
-        .map(|command| {
+        .enumerate()
+        .map(|(index, command)| {
+            // Declared report files at fixed paths in the project are
+            // overwritten by each command of a split target, so only the
+            // last command's are read; the earlier commands go unread and
+            // the results are partial.
+            if declared.is_some_and(|report| !report.files.is_empty()) && index != last {
+                return None;
+            }
             let report_dir = match test_results::new_report_dir() {
                 Ok(dir) => dir,
                 Err(error) => {
@@ -2196,10 +2217,15 @@ fn plan_captures(
                 command,
                 report_dir: &report_dir,
             };
-            match plugin
-                .test_report_plan(&context)
-                .or_else(|| crate::plugins::test_reports::recognise(&context))
-            {
+            // A report the target declares wins: it says what the command
+            // really runs, which recognising the command text can only guess.
+            let plan = match declared {
+                Some(report) => Some(crate::plugins::test_reports::declared(report, &context)),
+                None => plugin
+                    .test_report_plan(&context)
+                    .or_else(|| crate::plugins::test_reports::recognise(&context)),
+            };
+            match plan {
                 Some(plan) => Some((plan, report_dir)),
                 None => {
                     let _ = std::fs::remove_dir_all(&report_dir);
@@ -2238,8 +2264,13 @@ fn read_test_report(
             Ok(found) => {
                 complete &= found.complete && plan.confidence == Confidence::Complete;
                 cases.extend(found.cases);
-                if !names.contains(&plan.format.capture_name()) {
-                    names.push(plan.format.capture_name());
+                let name = if plan.declared {
+                    plan.format.declared_capture_name()
+                } else {
+                    plan.format.capture_name()
+                };
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
             Err(error) => {
@@ -2795,6 +2826,7 @@ mod tests {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         }
     }
 
@@ -3348,6 +3380,7 @@ mod tests {
             working_dir: None,
             exclusive_resources: resources.into_iter().map(|s| s.to_string()).collect(),
             retry_setup: None,
+            report: None,
         }
     }
 
@@ -3994,6 +4027,7 @@ mod tests {
                 confidence: Confidence::Complete,
                 rewrite: None,
                 relative_to: None,
+                declared: false,
             })
         }
     }
@@ -4004,7 +4038,7 @@ mod tests {
         tmp: &Path,
         commands: &[String],
     ) -> (ExecutionResult, Vec<Option<(ReportPlan, PathBuf)>>) {
-        let captures = plan_captures(&JunitPlugin, tmp, tmp, "test", commands);
+        let captures = plan_captures(&JunitPlugin, None, tmp, tmp, "test", commands);
         let invocations: Vec<Invocation> = commands
             .iter()
             .zip(&captures)
@@ -4060,10 +4094,56 @@ mod tests {
     }
 
     #[test]
+    fn a_split_target_reads_a_fixed_declared_report_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = ["run a".to_string(), "run b".to_string()];
+        let at_path = crate::config::ReportConfig {
+            format: crate::config::ReportConfigFormat::Junit,
+            files: vec!["target/junit.xml".to_string()],
+        };
+        // Both commands write the same file: only the last one's is read,
+        // and the unread first command makes the results partial.
+        let captures = plan_captures(
+            &JunitPlugin,
+            Some(&at_path),
+            tmp.path(),
+            tmp.path(),
+            "test",
+            &commands,
+        );
+        assert!(captures[0].is_none());
+        assert!(captures[1].as_ref().is_some_and(|(plan, _)| plan.declared));
+        for (_, dir) in captures.iter().flatten() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Into the report directory, each command has its own.
+        let into_dir = crate::config::ReportConfig {
+            files: Vec::new(),
+            ..at_path
+        };
+        let captures = plan_captures(
+            &JunitPlugin,
+            Some(&into_dir),
+            tmp.path(),
+            tmp.path(),
+            "test",
+            &commands,
+        );
+        let dirs: Vec<&PathBuf> = captures.iter().flatten().map(|(_, dir)| dir).collect();
+        assert_eq!(dirs.len(), 2);
+        assert_ne!(dirs[0], dirs[1]);
+        for (_, dir) in captures.iter().flatten() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn no_plan_means_no_report() {
         let tmp = tempfile::tempdir().unwrap();
         let captures = plan_captures(
             &JunitPlugin,
+            None,
             tmp.path(),
             tmp.path(),
             "test",

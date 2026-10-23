@@ -114,6 +114,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -142,6 +143,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -159,6 +161,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -176,6 +179,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -193,6 +197,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -210,6 +215,7 @@ impl LanguagePlugin for RustPlugin {
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
 
@@ -257,6 +263,7 @@ impl LanguagePlugin for RustPlugin {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         })
     }
 

@@ -141,6 +141,7 @@ impl LanguagePlugin for ElixirPlugin {
                     working_dir: None,
                     exclusive_resources: vec!["hex_registry".into()],
                     retry_setup: None,
+                    report: None,
                 },
             );
             return Ok(targets);
@@ -301,6 +302,7 @@ impl LanguagePlugin for ElixirPlugin {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         })
     }
 }
@@ -427,6 +429,7 @@ fn detect_umbrella_child_targets(
             working_dir: Some(umbrella_root.to_path_buf()),
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -447,6 +450,7 @@ fn detect_umbrella_child_targets(
             working_dir: Some(umbrella_root.to_path_buf()),
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -464,6 +468,7 @@ fn detect_umbrella_child_targets(
             working_dir: Some(umbrella_root.to_path_buf()),
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -482,6 +487,7 @@ fn detect_umbrella_child_targets(
                 working_dir: Some(umbrella_root.to_path_buf()),
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
     }
@@ -500,6 +506,7 @@ fn detect_umbrella_child_targets(
             working_dir: Some(umbrella_root.to_path_buf()),
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -527,6 +534,7 @@ fn detect_standalone_targets(
             working_dir: None,
             exclusive_resources: vec!["hex_registry".into()],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -570,6 +578,7 @@ fn detect_standalone_targets(
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -588,6 +597,7 @@ fn detect_standalone_targets(
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 
@@ -606,6 +616,7 @@ fn detect_standalone_targets(
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
     }
@@ -625,6 +636,7 @@ fn detect_standalone_targets(
                 working_dir: None,
                 exclusive_resources: vec![],
                 retry_setup: None,
+                report: None,
             },
         );
     }
@@ -643,6 +655,7 @@ fn detect_standalone_targets(
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         },
     );
 

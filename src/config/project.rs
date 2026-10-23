@@ -182,6 +182,44 @@ pub struct RichTargetConfig {
     /// `--retry-failed` rerun of failing tests (e.g. a database reset). If
     /// it fails, that retry is skipped and the original failure stands.
     pub retry_setup: Option<String>,
+
+    /// Where the command's test runner writes its results, for a command
+    /// Aster does not recognise on its own: `[targets.test.report]`.
+    pub report: Option<ReportConfig>,
+}
+
+/// A target's declared test report: `[targets.test.report]`.
+///
+/// Aster recognises plain test commands (`cargo nextest run`, `go test`,
+/// `vitest`) and adds a reporter itself. A command that wraps its runner in
+/// a script hides it; the target declares the report instead, and the
+/// command writes it. The command runs with `ASTER_TEST_REPORT_DIR` set to
+/// an empty directory it may write the report into.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReportConfig {
+    pub format: ReportConfigFormat,
+    /// Report files: globs relative to the project directory. Empty means
+    /// every file the command writes under `ASTER_TEST_REPORT_DIR`. Only
+    /// files written while the command ran are read.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// The formats a declared report can be in.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReportConfigFormat {
+    /// JUnit XML, such as `cargo nextest`'s JUnit profile or vitest's
+    /// `junit` reporter.
+    Junit,
+    /// `go test -json` output.
+    GoJson,
+    /// Jest's (or vitest's) `--json` results.
+    JestJson,
+    /// `cargo test` console output saved to a file. Console output can miss
+    /// tests, so these results are partial.
+    Libtest,
 }
 
 impl TargetConfig {
@@ -394,6 +432,29 @@ pub(super) fn validate_aster_config(
                     path.display()
                 )
             })?;
+        }
+
+        if let Some(report) = &target.report {
+            for pattern in &report.files {
+                // Matched against paths under the project directory, so a
+                // pattern that leaves it, or starts with `./`, never matches.
+                if Path::new(pattern).is_absolute()
+                    || pattern.starts_with("./")
+                    || pattern.split(['/', '\\']).any(|part| part == "..")
+                {
+                    anyhow::bail!(
+                        "Report file glob '{pattern}' for target '{target_name}' in {} must be \
+                         relative to the project directory, without './' or '..'",
+                        path.display()
+                    );
+                }
+                Glob::new(pattern).with_context(|| {
+                    format!(
+                        "Invalid report file glob '{pattern}' for target '{target_name}' in {}",
+                        path.display()
+                    )
+                })?;
+            }
         }
 
         if let Some(cache) = &target.cache {

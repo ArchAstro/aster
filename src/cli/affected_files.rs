@@ -1042,6 +1042,7 @@ mod file_command_tests {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         }
     }
 

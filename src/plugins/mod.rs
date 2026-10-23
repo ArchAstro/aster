@@ -175,6 +175,8 @@ pub struct Target {
     /// `--retry-failed` rerun, such as a database reset. A failing setup
     /// skips that retry.
     pub retry_setup: Option<String>,
+    /// The test report the target's command writes, declared in aster.toml.
+    pub report: Option<crate::config::ReportConfig>,
 }
 
 /// Context passed to plugins for target detection

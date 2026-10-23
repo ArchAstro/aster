@@ -444,6 +444,7 @@ fn target(
         working_dir,
         exclusive_resources,
         retry_setup: None,
+        report: None,
     }
 }
 

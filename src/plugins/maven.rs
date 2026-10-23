@@ -143,6 +143,7 @@ impl LanguagePlugin for MavenPlugin {
                 working_dir: working_dir.clone(),
                 exclusive_resources: vec![resource.clone()],
                 retry_setup: None,
+                report: None,
             }
         };
 

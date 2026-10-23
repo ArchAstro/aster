@@ -370,6 +370,7 @@ impl LanguagePlugin for NodeJsPlugin {
                     working_dir: None,
                     exclusive_resources: vec![pm.cache_resource()],
                     retry_setup: None,
+                    report: None,
                 },
             );
             "//self:deps".to_string()
@@ -416,6 +417,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             working_dir: None,
                             exclusive_resources: vec![],
                             retry_setup: None,
+                            report: None,
                         },
                     );
                 }
@@ -434,6 +436,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         working_dir: None,
                         exclusive_resources: vec![],
                         retry_setup: None,
+                        report: None,
                     },
                 );
             }
@@ -451,6 +454,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         working_dir: None,
                         exclusive_resources: vec![],
                         retry_setup: None,
+                        report: None,
                     },
                 );
             }
@@ -468,6 +472,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         working_dir: None,
                         exclusive_resources: vec![],
                         retry_setup: None,
+                        report: None,
                     },
                 );
             }
@@ -489,6 +494,7 @@ impl LanguagePlugin for NodeJsPlugin {
                             working_dir: None,
                             exclusive_resources: vec![],
                             retry_setup: None,
+                            report: None,
                         },
                     );
                 }
@@ -528,6 +534,7 @@ impl LanguagePlugin for NodeJsPlugin {
                         working_dir: None,
                         exclusive_resources: vec![],
                         retry_setup: None,
+                        report: None,
                     },
                 );
             }
@@ -769,6 +776,7 @@ impl LanguagePlugin for NodeJsPlugin {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         })
     }
 }

@@ -423,6 +423,9 @@ pub fn tests_failed_codes(plugin: &str, capture: &str, command: &str) -> &'stati
         // pytest: 1 is failed tests, 2+ is interrupted or broken. vitest
         // and bun: 1.
         "junit" => &[1],
+        // A declared report's runner is behind a script whose exit code
+        // Aster cannot read: it may be a test failure or any other step.
+        c if c.starts_with("declared-") => &[],
         // cargo test exits 101 for a failed test and for a compile error.
         _ => &[],
     }
@@ -653,6 +656,15 @@ mod tests {
         assert_eq!(tests_failed_codes("maven", "junit", "mvn -q test"), none);
         assert_eq!(tests_failed_codes("go", "go-json", "go test ./..."), &[1]);
         assert_eq!(tests_failed_codes("rust", "libtest", "cargo test"), none);
+        // A script's exit code says nothing certain about its runner.
+        assert_eq!(
+            tests_failed_codes("go", "declared-junit", "bash tools/test.sh"),
+            none
+        );
+        assert_eq!(
+            tests_failed_codes("go", "declared-go-json", "sh -c 'go test ./... > r.json'"),
+            none
+        );
     }
 
     #[test]

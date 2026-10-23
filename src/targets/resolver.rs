@@ -52,6 +52,7 @@ impl TargetResolver {
                     working_dir: target.working_dir.clone(),
                     exclusive_resources: target.exclusive_resources.clone(),
                     retry_setup: target.retry_setup.clone(),
+                    report: target.report.clone(),
                 },
             );
         }
@@ -76,6 +77,7 @@ impl TargetResolver {
                                 working_dir: existing.working_dir.clone(),
                                 exclusive_resources: existing.exclusive_resources.clone(),
                                 retry_setup: existing.retry_setup.clone(),
+                                report: existing.report.clone(),
                             },
                         );
                     } else {
@@ -93,6 +95,7 @@ impl TargetResolver {
                                 working_dir: None,
                                 exclusive_resources: vec![],
                                 retry_setup: None,
+                                report: None,
                             },
                         );
                     }
@@ -157,6 +160,10 @@ impl TargetResolver {
                                 .retry_setup
                                 .clone()
                                 .or_else(|| existing.and_then(|e| e.retry_setup.clone())),
+                            report: rich
+                                .report
+                                .clone()
+                                .or_else(|| existing.and_then(|e| e.report.clone())),
                         },
                     );
                 }
@@ -206,6 +213,7 @@ impl TargetResolver {
                         working_dir: source_target.working_dir,
                         exclusive_resources: source_target.exclusive_resources,
                         retry_setup: source_target.retry_setup,
+                        report: source_target.report,
                     },
                 );
                 false
@@ -267,6 +275,7 @@ mod tests {
             working_dir: None,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         }
     }
 
@@ -290,6 +299,7 @@ mod tests {
             invalidates_cache: false,
             exclusive_resources: vec![],
             retry_setup: None,
+            report: None,
         })
     }
 
@@ -691,6 +701,7 @@ mod tests {
             invalidates_cache: false,
             exclusive_resources: vec!["custom_resource".to_string()],
             retry_setup: None,
+            report: None,
         };
         custom.insert("deps".to_string(), TargetConfig::Rich(rich_config));
 
