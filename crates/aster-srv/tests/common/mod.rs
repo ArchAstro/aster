@@ -181,7 +181,15 @@ async fn launch(
                 {
                     Some(CLI_TOKEN_KEYS.into())
                 }
-                "ASTER_SRV_DEV_BLOB_ROUTE" => Some("1".into()),
+                // The `/v1` listener refuses to start with the stand-in route,
+                // without owner-id pins, or without a writer-workflow list.
+                "ASTER_SRV_DEV_BLOB_ROUTE" if !has("ASTER_SRV_API_ADDR") => Some("1".into()),
+                "ASTER_SRV_REPOSITORY_OWNER_IDS" if has("ASTER_SRV_API_ADDR") => {
+                    Some("ArchAstro/*=4242".into())
+                }
+                "ASTER_SRV_CACHE_WRITER_WORKFLOWS" if has("ASTER_SRV_API_ADDR") => {
+                    Some("ArchAstro/firstlanding/.github/workflows/ci.yml@".into())
+                }
                 _ => None,
             }),
     })
@@ -401,6 +409,7 @@ pub fn token_with_ref(repository: &str, workflow_ref: Option<&str>) -> String {
         "aud": "aster-srv",
         "exp": Utc::now().timestamp() + 300,
         "repository": repository,
+        "repository_owner_id": "4242",
         "event_name": "push",
     });
     if let Some(workflow_ref) = workflow_ref {
@@ -424,6 +433,7 @@ pub fn token_with_claims(repository: &str, extra: Value) -> String {
         "aud": "aster-srv",
         "exp": Utc::now().timestamp() + 300,
         "repository": repository,
+        "repository_owner_id": "4242",
         "event_name": "push",
     });
     for (name, value) in extra.as_object().expect("claims are an object") {
