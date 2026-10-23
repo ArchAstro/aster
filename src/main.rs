@@ -369,6 +369,7 @@ fn run() -> Result<()> {
                 );
                 if copy {
                     println!("Request id: {}", announcement.request_id);
+                    println!("{}", aster::cache::PASTE_WARNING);
                     print!("Paste the code the page shows, then press Enter: ");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 } else {

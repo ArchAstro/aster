@@ -215,6 +215,32 @@ async fn copy_mode_shows_a_one_time_code_and_never_redirects_or_shows_a_token() 
         "{}",
         form.body
     );
+    // Each detail says who vouches for it: the device name is typed by the
+    // requesting command, so the page says it is not verified.
+    assert!(
+        form.body.contains(
+            "Device name (reported by the requesting computer, not verified): <code>devbox-7</code>"
+        ),
+        "{}",
+        form.body
+    );
+    assert!(
+        form.body
+            .contains("Your browser's address (seen by this server)"),
+        "{}",
+        form.body
+    );
+    assert!(
+        form.body.contains("Your browser (as it describes itself)"),
+        "{}",
+        form.body
+    );
+    assert!(
+        form.body
+            .contains("Only continue if you started this command yourself"),
+        "copy mode warns on the confirm page: {}",
+        form.body
+    );
     assert!(
         !form.body.contains("name=\"port\"") && !form.body.contains("(port"),
         "copy mode has no port: {}",
@@ -235,6 +261,11 @@ async fn copy_mode_shows_a_one_time_code_and_never_redirects_or_shows_a_token() 
     let code = shown_code(&done.body);
     assert_eq!(code.len(), 43, "a 256-bit code, base64url");
     assert!(done.body.contains("state-co"), "the request id is shown");
+    assert!(
+        done.body.contains("Never send this code to anyone."),
+        "{}",
+        done.body
+    );
     for (name, value) in [
         ("cache-control", "no-store"),
         ("x-frame-options", "DENY"),
