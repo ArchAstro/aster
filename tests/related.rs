@@ -694,6 +694,131 @@ const GO_WITH_TAGGED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Real Aster -> owning setup shell -> external Go; unrelated failure is
+/// the negative control against accidentally accepting a full-suite fallback.
+#[test]
+fn go_setup_boundary_selects_after_exports_and_preserves_cleanup() {
+    assert!(Command::new("go")
+        .arg("version")
+        .status()
+        .unwrap()
+        .success());
+    for (setup, inherited, tagged) in [
+        ("export GOFLAGS=-tags=$DEV_TAGS", "", true),
+        ("unset GOFLAGS", "-tags=devtool", false),
+    ] {
+        let command = "bash -ec 'source setup.sh; aster exec-go-test -- -count=1 ./...'";
+        let config = format!(
+            "[targets.deps]\ncommand = \"true\"\n[targets.test]\ncommand = {}\n",
+            serde_json::to_string(command).unwrap()
+        );
+        let setup = format!("touch setup-ran\ntrap 'touch cleanup-ran' EXIT\n{setup}\n# A shell function must not intercept the explicitly external Go boundary.\ngo() {{ return 91; }}\nmkdir -p elsewhere\ncd elsewhere\ncd ..\n");
+        let mut files = GO_WITH_TAGGED_PACKAGE.to_vec();
+        files.extend([
+            ("svc/aster.toml", config.as_str()),
+            ("svc/setup.sh", setup.as_str()),
+            ("svc/cart/unrelated_test.go", "package cart\nimport \"testing\"\nfunc TestUnrelated(t *testing.T) { t.Fatal(\"full suite must not run\") }\n"),
+        ]);
+        let ws = Workspace::new(&files);
+        ws.edit("svc/stock/stock.go", "{ return n }", "{ return n + 0 }");
+        let run = |dry| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_aster"));
+            cmd.current_dir(ws.root())
+                .env("DEV_TAGS", "devtool")
+                .env("GOFLAGS", inherited)
+                .args(["--json", "affected", "test", "--base=HEAD", "--related"]);
+            if dry {
+                cmd.arg("--dry-run");
+            }
+            cmd.output().unwrap()
+        };
+        // Planning records a deferred payload, without executing setup or Go tests.
+        let plan = run(true);
+        assert!(plan.status.success(), "{plan:?}");
+        assert!(String::from_utf8_lossy(&plan.stdout).contains("exec-go-test"));
+        assert!(!ws.root().join("svc/setup-ran").exists());
+        // Runtime selection observes the exports (including removal), and the
+        // shell waits for the external process before performing cleanup.
+        let output = run(false);
+        assert!(output.status.success(), "{output:?}");
+        assert!(ws.root().join("svc/setup-ran").exists());
+        assert!(ws.root().join("svc/cleanup-ran").exists());
+        assert!(ws.root().join("svc/ran-cart").exists());
+        assert_eq!(ws.root().join("svc/ran-devtool").exists(), tagged);
+
+        // With no related payload the explicit boundary runs the full suite:
+        // the unrelated failure proves the narrowed run above was selective.
+        let control = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(ws.root().join("svc"))
+            .args(["exec-go-test", "--", "-count=1", "./..."])
+            .output()
+            .unwrap();
+        assert!(!control.status.success());
+        assert!(String::from_utf8_lossy(&control.stdout).contains("full suite must not run"));
+    }
+}
+
+#[test]
+fn go_setup_boundary_uses_runtime_cwd_for_package_selection() {
+    let ws = Workspace::new(GO_WITH_TAGGED_PACKAGE);
+    let selection = serde_json::to_string(&vec![(
+        ws.root().join("svc/cart/cart_test.go"),
+        vec!["TestReserve"],
+    )])
+    .unwrap();
+    // The shell changes cwd after Aster has recorded absolute selected files.
+    let script = format!(
+        "cd svc/cart; trap 'touch cleanup-ran' EXIT; {} exec-go-test --selection {} -- -count=1 .",
+        shell_words::quote(env!("CARGO_BIN_EXE_aster")),
+        shell_words::quote(&selection)
+    );
+    let output = Command::new("bash")
+        .args(["-ec", &script])
+        .current_dir(ws.root())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(ws.root().join("svc/ran-cart").exists());
+    assert!(ws.root().join("svc/cart/cleanup-ran").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("-run"));
+}
+
+#[test]
+fn go_setup_boundary_unknown_context_runs_full_and_cleans_up_on_failure() {
+    let command = "bash -ec 'source setup.sh; aster exec-go-test -- -count=1 ./...'";
+    let config = format!(
+        "[targets.deps]\ncommand = \"true\"\n[targets.test]\ncommand = {}\n",
+        serde_json::to_string(command).unwrap()
+    );
+    let mut files = GO_WITH_TAGGED_PACKAGE.to_vec();
+    files.extend([
+        ("svc/aster.toml", config.as_str()),
+        ("svc/setup.sh", "export PATH=\"$PWD/bin:$PATH\"\ntrap 'touch cleanup-ran' EXIT\n"),
+        // Unknown go-list result must preserve the full invocation, not drop tests.
+        ("svc/bin/go", "#!/bin/sh\nif [ \"$1\" = list ]; then exit 1; fi\nprintf '%s\\n' \"$@\" > executed-args\nexit 23\n"),
+    ]);
+    let ws = Workspace::new(&files);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            ws.root().join("svc/bin/go"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    ws.git(&["add", "."]);
+    ws.git(&["commit", "--allow-empty", "-qm", "executable probe"]);
+    ws.edit("svc/stock/stock.go", "{ return n }", "{ return n + 0 }");
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(ws.root().join("svc/executed-args")).unwrap(),
+        "test\n-count=1\n./...\n"
+    );
+    assert!(ws.root().join("svc/cleanup-ran").exists());
+}
+
 #[test]
 fn go_related_run_names_only_packages_go_test_builds() {
     if Command::new("go").arg("version").output().is_err() {
