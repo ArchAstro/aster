@@ -626,7 +626,11 @@ async fn classify(
 
     // The main sequence of every test whose state is re-derived: its
     // `test_main` row, then its main results in the window, each with the
-    // result before it and the failure streak it ends.
+    // result before it and the failure streak it ends. The seeds are picked
+    // with `IN` over one key set, not `EXISTS (cls_win) OR EXISTS (tests)`:
+    // under `OR` Postgres cannot turn the correlated `EXISTS` into a join, so
+    // it scanned `cls_win` once per `test_main` row (30k rows times a 234k-row
+    // hour of results did not finish in five minutes in production).
     transaction
         .execute(
             &format!(
@@ -637,11 +641,11 @@ async fn classify(
                             m.streak AS seed_streak, m.streak_since_sha AS seed_since \
                      FROM test_results.test_main m \
                      WHERE m.received_on >= {history} \
-                       AND (EXISTS (SELECT 1 FROM cls_win w \
-                                    WHERE w.repo = m.repo AND w.test_id = m.test_id) \
-                            OR EXISTS (SELECT 1 FROM test_results.tests t \
-                                       WHERE t.repo = m.repo AND t.test_id = m.test_id \
-                                         AND (t.state <> 'healthy' OR t.flake_score > 0))) \
+                       AND (m.repo, m.test_id) IN ( \
+                           SELECT repo, test_id FROM cls_win \
+                           UNION \
+                           SELECT repo, test_id FROM test_results.tests \
+                           WHERE state <> 'healthy' OR flake_score > 0) \
                      UNION ALL \
                      SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
                             failure_hash, false, 0, NULL::text \
@@ -651,7 +655,13 @@ async fn classify(
             &[],
         )
         .await?;
-    transaction.batch_execute("ANALYZE cls_main").await?;
+    // Indexed for the per-test joins below. The state update's estimate after
+    // its `IS DISTINCT FROM` filter is about one row, so without an index it
+    // took a nested loop that scanned `cls_main` once per test (200s for
+    // 20,000 tests in `classifier_bench`).
+    transaction
+        .batch_execute("CREATE INDEX ON cls_main (repo, test_id); ANALYZE cls_main")
+        .await?;
 
     // Rule 3: a default-branch pass right after a default-branch failure
     // that did not end a broken streak. The event is the failed run's,
