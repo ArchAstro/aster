@@ -595,3 +595,108 @@ async fn disable_mode_connects_in_plain_text() {
         .get(0);
     assert!(!encrypted);
 }
+
+#[tokio::test]
+async fn concurrent_uploads_of_the_same_tests_all_store() {
+    let Some(server) = start(30).await else {
+        return;
+    };
+    // Setup: the tests exist, so every upload below updates the same rows.
+    let tests = 2_000;
+    let (status, reply) = upload(
+        &server,
+        Some(&token(REPO)),
+        gzip(&to_ndjson(&stream(&gh("seed"), REPO, tests))),
+    )
+    .await;
+    assert_eq!(status, 201, "{reply}");
+
+    // Action: shards of one CI run upload at once, as many as one server
+    // reads at a time (`ASTER_SRV_MAX_LARGE_BODIES`, 8). Each upsert locks those
+    // rows; uploads that locked them in different orders deadlocked, and the
+    // loser got a 503.
+    let uploads = (0..8).map(|shard| {
+        let body = gzip(&to_ndjson(&stream(
+            &gh(&format!("shard-{shard}")),
+            REPO,
+            tests,
+        )));
+        let server = &server;
+        async move { upload(server, Some(&token(REPO)), body).await }
+    });
+    let replies = futures_util::future::join_all(uploads).await;
+
+    // Outcome: every shard stored, and the tests stay one row each.
+    for (status, reply) in &replies {
+        assert_eq!(*status, 201, "{reply}");
+    }
+    assert_eq!(
+        count(&server, "SELECT count(*) FROM test_results.runs").await,
+        9
+    );
+    assert_eq!(
+        count(&server, "SELECT count(*) FROM test_results.tests").await,
+        tests as i64
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_upload_rewrites_a_test_only_when_it_changed_or_an_hour_passed() {
+    let Some(server) = start(30).await else {
+        return;
+    };
+    upload_ok(&server, stream(&gh("first"), REPO, 3)).await;
+    let first = test_row(&server).await;
+
+    // The same tests again within the hour: the rows are left alone, so
+    // uploads do not leave a dead row per test each time.
+    upload_ok(&server, stream(&gh("again"), REPO, 3)).await;
+    assert_eq!(test_row(&server).await, first);
+
+    // A renamed test is rewritten at once.
+    let mut renamed = stream(&gh("renamed"), REPO, 3);
+    for record in &mut renamed {
+        if let Record::Test(test) = record {
+            test.name = format!("{} renamed", test.name);
+        }
+    }
+    upload_ok(&server, renamed).await;
+    let after_rename = test_row(&server).await;
+    assert_ne!(after_rename.0, first.0);
+    assert_eq!(after_rename.2, "test 1 renamed");
+
+    // An hour on, `last_seen` moves again.
+    let client = server.app.pool.get().await.unwrap();
+    client
+        .execute(
+            "UPDATE test_results.tests SET last_seen = last_seen - interval '61 minutes'",
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let stale = test_row(&server).await;
+    upload_ok(&server, stream(&gh("later"), REPO, 3)).await;
+    let later = test_row(&server).await;
+    assert!(later.1 > stale.1 + chrono::Duration::minutes(60));
+    server.stop().await;
+}
+
+/// Test 1's row version (`xmin`), `last_seen` and name.
+async fn test_row(server: &Server) -> (i64, chrono::DateTime<Utc>, String) {
+    let client = server.app.pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT xmin::text::bigint, last_seen, name FROM test_results.tests WHERE test_id = $1",
+            &[&format!("{:064x}", 1)],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+async fn upload_ok(server: &Server, records: Vec<Record>) {
+    let (status, reply) = upload(server, Some(&token(REPO)), gzip(&to_ndjson(&records))).await;
+    assert_eq!(status, 201, "{reply}");
+}

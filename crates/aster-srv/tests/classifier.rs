@@ -713,3 +713,96 @@ async fn ten_failures_sharing_one_hash_are_an_incident_and_nine_are_flakes() {
         server.stop().await;
     }
 }
+
+#[tokio::test]
+async fn a_pass_and_an_upload_sharing_tests_wait_instead_of_deadlocking() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // Setup: 200 tests that each pass and then fail under one input hash,
+    // so the pass changes every one of them to flaky. Each fails in a run of
+    // its own: 20 failures in one target run would be an incident instead.
+    // Seeded last test first, so the table holds them in the reverse of the
+    // order uploads lock them; a pass that locks in table or join order then
+    // takes t199..t001 before it reaches t000.
+    let names: Vec<String> = (0..200).map(|i| format!("t{i:03}")).collect();
+    let runs: Vec<(String, String)> = names
+        .iter()
+        .map(|name| (format!("pass-{name}"), format!("fail-{name}")))
+        .collect();
+    for (name, (pass, fail)) in names.iter().zip(&runs).rev() {
+        seed(
+            &server,
+            &Run::new(pass, "pr-1", ago(now, 50)).result(name, "pass", None),
+        )
+        .await;
+        seed(
+            &server,
+            &Run::new(fail, "pr-1", ago(now, 40)).result(name, "fail", Some("f1")),
+        )
+        .await;
+    }
+
+    // An upload part way through its upsert: it has locked the first test
+    // and goes on in (repo, test_id) order, as ingest writes.
+    let mut upload = server.client().await;
+    let upload = upload.transaction().await.unwrap();
+    upload
+        .execute(
+            "SELECT 1 FROM test_results.tests WHERE test_id = 't000' FOR UPDATE",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // Boundary: the pass runs on its own connection and blocks on t000.
+    let pass = tokio::spawn({
+        let app = std::sync::Arc::clone(&server.app);
+        async move { classifier::run_once(&app, now).await }
+    });
+    let watcher = server.client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let waiting: i64 = watcher
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query ILIKE '%test_results.tests%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pass never waited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Action: the upload locks the rest. A pass that had locked any of them
+    // before waiting on t000 makes this a deadlock, and Postgres kills one.
+    upload
+        .batch_execute("SET LOCAL lock_timeout = '5s'")
+        .await
+        .unwrap();
+    upload
+        .execute(
+            "SELECT 1 FROM test_results.tests WHERE test_id <> 't000' \
+             ORDER BY repo COLLATE \"C\", test_id COLLATE \"C\" FOR UPDATE",
+            &[],
+        )
+        .await
+        .expect("the pass holds none of the upload's rows while it waits");
+    upload.commit().await.unwrap();
+
+    // Outcome: the pass then finishes and classifies every test.
+    pass.await.unwrap().unwrap().expect("the lock is free");
+    for name in &names {
+        assert_eq!(state(&server, name).await.state, "flaky", "{name}");
+    }
+    server.stop().await;
+}

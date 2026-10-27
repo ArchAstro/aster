@@ -1,6 +1,6 @@
 //! `POST /v1/test-results/runs`: store one results stream.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Read;
 
 use aster_results_model::{parse_ndjson, Record, RunRecord, TargetRecord, TestRecord};
@@ -408,8 +408,14 @@ pub async fn store(
     }
     writer.finish().await?;
 
-    // One row per test, however many attempts it had.
-    let mut seen: HashMap<&str, &TestRecord> = HashMap::new();
+    // One row per test, however many attempts it had, in `test_id` byte
+    // order: every writer of `tests` locks its rows in (repo, test_id) "C"
+    // order, so two uploads, or an upload and a classifier pass, sharing
+    // tests wait for each other instead of deadlocking. A row is rewritten
+    // only when its name changed or `last_seen` is an hour behind: every
+    // upload rewriting every test (and `last_seen`'s index) bloated the
+    // table with dead rows.
+    let mut seen: BTreeMap<&str, &TestRecord> = BTreeMap::new();
     for test in tests {
         seen.insert(&test.test_id, test);
     }
@@ -427,11 +433,17 @@ pub async fn store(
             "INSERT INTO test_results.tests (repo, test_id, target, file, suite, name, first_seen, last_seen) \
              SELECT $1, t.test_id, t.target, t.file, t.suite, t.name, $2, $2 \
              FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[]) \
-                  AS t(test_id, target, file, suite, name) \
+                  WITH ORDINALITY AS t(test_id, target, file, suite, name, n) \
+             ORDER BY t.n \
              ON CONFLICT (repo, test_id) DO UPDATE SET \
                  target = EXCLUDED.target, file = EXCLUDED.file, suite = EXCLUDED.suite, \
                  name = EXCLUDED.name, \
-                 last_seen = GREATEST(test_results.tests.last_seen, EXCLUDED.last_seen)",
+                 last_seen = GREATEST(test_results.tests.last_seen, EXCLUDED.last_seen) \
+             WHERE (test_results.tests.target, test_results.tests.file, \
+                    test_results.tests.suite, test_results.tests.name) \
+                   IS DISTINCT FROM \
+                   (EXCLUDED.target, EXCLUDED.file, EXCLUDED.suite, EXCLUDED.name) \
+                OR test_results.tests.last_seen < EXCLUDED.last_seen - interval '1 hour'",
             &[
                 &run.repo,
                 &received_at,
