@@ -694,6 +694,41 @@ const GO_WITH_TAGGED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
+#[test]
+fn go_setup_boundary_preserves_shell_package_globs() {
+    // A real delegated shell expands ./c* to ./cart before invoking Aster.
+    // Quoting that token during deferred planning instead sends Go ./c*.
+    let command = "bash -ec 'source setup.sh; aster exec-go-test -- -count=1 ./c*'";
+    let config = format!(
+        "[targets.deps]\ncommand = \"true\"\n[targets.test]\ncommand = {}\n",
+        serde_json::to_string(command).unwrap()
+    );
+    let setup = format!(
+        "export PATH={}:\"$PATH\"\ntrap 'touch cleanup-ran' EXIT\n",
+        shell_words::quote(
+            Path::new(env!("CARGO_BIN_EXE_aster"))
+                .parent()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+    );
+    let mut files = GO_WITH_TAGGED_PACKAGE.to_vec();
+    files.extend([
+        ("svc/aster.toml", config.as_str()),
+        ("svc/setup.sh", setup.as_str()),
+    ]);
+    let ws = Workspace::new(&files);
+    ws.edit("svc/stock/stock.go", "{ return n }", "{ return n + 0 }");
+    // Planning must preserve the original shell syntax, not serialize argv.
+    assert!(ws.plan("test").commands("//svc:test").is_empty());
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(ws.root().join("svc/ran-cart").exists());
+    assert!(!ws.root().join("svc/ran-devtool").exists());
+    assert!(ws.root().join("svc/cleanup-ran").exists());
+}
+
 /// Real Aster -> owning setup shell -> external Go; unrelated failure is
 /// the negative control against accidentally accepting a full-suite fallback.
 #[test]

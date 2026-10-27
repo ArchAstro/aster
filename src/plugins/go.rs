@@ -368,7 +368,16 @@ fn deferred_go_tests(
     command: &str,
     tests: &[RelatedTest],
 ) -> Option<FilesListPlan> {
-    let argv = shell_words::split(command).ok()?;
+    // This tail may be reinserted into a delegated shell script. Do not turn
+    // expansions or operators into literal arguments. Direct execution does
+    // not expand them either; declining narrowing keeps its argv unchanged.
+    let parsed = super::related_tests::Argv::parse(command)?;
+    if command.contains([
+        '$', '`', '*', '?', '[', ']', '{', '}', '~', '|', '&', '<', '>', ';', '\n',
+    ]) {
+        return None;
+    }
+    let argv = parsed.parts;
     if argv.first()?.as_str() != "aster"
         || argv.get(1)?.as_str() != "exec-go-test"
         || argv.get(2)?.as_str() != "--"
@@ -380,7 +389,13 @@ fn deferred_go_tests(
         .map(|test| (project_dir.join(&test.file), &test.names))
         .collect();
     let payload = serde_json::to_string(&selection).ok()?;
-    let exe = std::env::current_exe().ok()?;
+    // A concurrent rebuild can unlink the running binary. On Linux,
+    // current_exe can return a nonexistent path ending in " (deleted)".
+    // Resolve the actual file or leave the original command untouched.
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    if !exe.is_file() {
+        return None;
+    }
     let quote = crate::executor::quote_command_argument;
     Some(FilesListPlan::Commands(vec![format!(
         "{} exec-go-test --selection {} -- {}",
@@ -741,6 +756,67 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn deferred_tests_decline_shell_active_arguments() {
+        for tail in [
+            "-tags=$DEV_TAGS ./...",
+            "./c*",
+            "./c?rt",
+            "./[c]art",
+            "./... | cat",
+            "./... >out",
+            "$(echo ./...)",
+            "{files}",
+        ] {
+            assert!(
+                deferred_go_tests(
+                    Path::new("."),
+                    &format!("aster exec-go-test -- {tail}"),
+                    &[]
+                )
+                .is_none(),
+                "{tail}"
+            );
+        }
+        assert!(deferred_go_tests(
+            Path::new("."),
+            "aster exec-go-test -- -tags=devtool ./...",
+            &[]
+        )
+        .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deferred_tests_decline_unlinked_current_executable() {
+        const CHILD: &str = "ASTER_TEST_UNLINK_CURRENT_EXE";
+        if std::env::var_os(CHILD).is_some() {
+            std::fs::remove_file(std::env::current_exe().unwrap()).unwrap();
+            assert!(
+                deferred_go_tests(Path::new("."), "aster exec-go-test -- ./...", &[]).is_none()
+            );
+            return;
+        }
+        // Unlink only a disposable copy, never Cargo's binary or another run.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("test-copy");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "plugins::go::tests::deferred_tests_decline_unlinked_current_executable",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
     }
 
     #[test]

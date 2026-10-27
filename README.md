@@ -36,7 +36,11 @@ trap. This boundary deliberately bypasses shell functions and aliases named
 `go`; unmarked shell commands retain their existing behavior and conservative
 full-suite fallback. Without a related selection the helper runs the supplied
 Go test arguments unchanged. Unknown buildability falls back to the full
-invocation, and failure to start Go remains an error.
+invocation, and failure to start Go remains an error. Deferred rewriting requires
+static arguments and a resolvable running Aster executable. Shell-active argument
+forms (including variables and package globs) retain the original command rather
+than being converted to literal arguments. Ordinary Aster commands do not expand
+shell syntax; expansion requires an explicit shell such as `bash -ec` above.
 
 New to Aster? Follow the [end-to-end getting started tutorial](GETTING_STARTED.MD)
 to create a workspace, connect project dependencies, build, test, cache, watch,
