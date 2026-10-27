@@ -1,4 +1,4 @@
-//! Sign-in for `aster cache login`: an OAuth-style authorization-code flow
+//! Sign-in for `aster srv login`: an OAuth-style authorization-code flow
 //! with PKCE (S256 only), in one of two modes.
 //!
 //! ```text
@@ -424,7 +424,7 @@ pub async fn confirm(app: &App, browser: &Browser, query: Option<&str>) -> Reply
          to read the shared build cache as <strong>{email}</strong>?</p>\
          {origin_details}\
          <p class=\"muted\">It can read cache entries only, and the sign-in ends after a \
-         few hours. If you did not just run <code>aster cache login</code>, or these details \
+         few hours. If you did not just run <code>aster srv login</code>, or these details \
          are not yours, close this tab. The device name comes from the command that sent you \
          here, so anyone can make it say anything. Trust the code above, not the name.</p>\
          {copy_warning}\
@@ -456,7 +456,7 @@ pub async fn authorize(app: &App, browser: &Browser, body: &[u8]) -> Reply {
         page(
             400,
             "Bad request",
-            "This confirmation is not valid or has expired. Run `aster cache login` again.",
+            "This confirmation is not valid or has expired. Run `aster srv login` again.",
         )
     };
     if !app
@@ -516,7 +516,7 @@ pub async fn authorize(app: &App, browser: &Browser, body: &[u8]) -> Reply {
                 "Your sign-in code",
                 &format!(
                     "<p>Paste this code into the terminal where you ran \
-                     <code>aster cache login</code> (request <code>{id}</code>):</p>\
+                     <code>aster srv login</code> (request <code>{id}</code>):</p>\
                      <pre><code>{code}</code></pre>\
                      <p><strong>Never send this code to anyone.</strong> Whoever has it can \
                      sign in as you until it expires. Paste it only into your own terminal.</p>\

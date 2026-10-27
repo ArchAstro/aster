@@ -18,8 +18,8 @@ use aster::cli::{
     build_execution_output, build_execution_output_with_cache, check_reserved_target,
     expand_selection, output_json, parse_run_args, print_summary, select_projects, CacheCommands,
     CiCommands, Cli, Commands, GraphOutput, OutputMode, ProjectCommands, ProjectInfo,
-    ResultsCommands, ServicesCommands, ServicesDaemonCommands, SrvCommands, TlsCommands, WhyOutput,
-    SKILLS_MARKDOWN,
+    ResultsCommands, ServicesCommands, ServicesDaemonCommands, SrvCommands, SrvTarget, TlsCommands,
+    WhyOutput, SKILLS_MARKDOWN,
 };
 use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
@@ -105,7 +105,33 @@ fn run() -> Result<()> {
         return handle_results(command, output_mode);
     }
     if let Commands::Srv { command } = &command {
-        return handle_srv(command);
+        return handle_srv(command, output_mode);
+    }
+    // These talk to aster-srv and the user's config directory, not the
+    // workspace, so they work outside one.
+    if let Commands::Cache { command } = &command {
+        match command {
+            CacheCommands::Login {
+                no_browser,
+                loopback,
+            } => {
+                eprintln!("[aster] `aster cache login` is now `aster srv login`");
+                return srv_login(*no_browser, *loopback, output_mode);
+            }
+            CacheCommands::Logout => {
+                eprintln!("[aster] `aster cache logout` is now `aster srv logout`");
+                return srv_logout();
+            }
+            CacheCommands::Stats { target } => {
+                return print_srv_dataset(
+                    &aster::test_results::read::Dataset::CacheSummary.path(),
+                    target,
+                );
+            }
+            CacheCommands::Clear { .. }
+            | CacheCommands::Status { .. }
+            | CacheCommands::Prune { .. } => {}
+        }
     }
     if let Commands::Services {
         command: ServicesCommands::Daemon { command },
@@ -282,122 +308,6 @@ fn run() -> Result<()> {
                 aster::dev::serve_tls(&workspace_root, &workspace_config.dev, edge)
             }
         };
-    }
-
-    // Login talks to the server and the user's config directory. It must not
-    // wait on project discovery.
-    if let Commands::Cache {
-        command: CacheCommands::Login { .. } | CacheCommands::Logout,
-    } = &command
-    {
-        let server = std::env::var(aster::cache::ASTER_SRV_URL_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "set {} to your aster-srv URL, then run aster cache login again",
-                    aster::cache::ASTER_SRV_URL_ENV
-                )
-            })?;
-        let Commands::Cache {
-            command:
-                CacheCommands::Login {
-                    no_browser,
-                    loopback,
-                },
-        } = &command
-        else {
-            let signed_out = aster::cache::logout(&server)?;
-            if let Some(path) = &signed_out.deleted {
-                println!("Deleted {}.", path.display());
-            }
-            return match signed_out.revoked {
-                Ok(()) => {
-                    println!(
-                        "Signed out: the server refuses every token issued to you before now."
-                    );
-                    Ok(())
-                }
-                Err(reason) if signed_out.deleted.is_none() => {
-                    println!("Nothing to do: {reason}.");
-                    Ok(())
-                }
-                Err(reason) => anyhow::bail!(
-                    "the local token is deleted, but the server was not told: {reason}; \
-                     run aster cache login and aster cache logout again to revoke it"
-                ),
-            };
-        };
-        let options = aster::cache::LoginOptions {
-            mode: match (*loopback, *no_browser) {
-                (true, _) => aster::cache::LoginMode::Loopback,
-                (false, true) => aster::cache::LoginMode::Copy,
-                (false, false) => aster::cache::LoginMode::Auto,
-            },
-            open_browser: !no_browser,
-            timeout: aster::cache::LOGIN_TIMEOUT,
-        };
-        let quiet = output_mode == OutputMode::Quiet;
-        let signed_in = aster::cache::login(
-            &server,
-            &options,
-            &mut |announcement| {
-                use aster::cache::{CodeReason, Flow};
-                // A pasted code cannot work without the URL and the prompt,
-                // so those print even when quiet.
-                let copy = matches!(announcement.flow, Flow::Code(_));
-                if quiet && !copy {
-                    return;
-                }
-                match announcement.flow {
-                    Flow::OpenedBrowser => {
-                        println!("Opening your browser to sign in. If it does not open, visit:")
-                    }
-                    Flow::LoopbackUrl => println!("Open this URL in a browser to sign in:"),
-                    Flow::Code(reason) => {
-                        match reason {
-                            CodeReason::Requested => {}
-                            CodeReason::RemoteSession => println!(
-                                "This looks like a remote shell, so Aster will ask for a code instead of a redirect."
-                            ),
-                            CodeReason::BrowserFailed => println!(
-                                "Could not open a browser, so Aster will ask for a code instead of a redirect."
-                            ),
-                        }
-                        println!("Open this URL in a browser on any computer and sign in:");
-                    }
-                }
-                println!("{}", announcement.url);
-                println!(
-                    "Confirm only if the page shows this code: {}",
-                    announcement.user_code
-                );
-                if copy {
-                    println!("Request id: {}", announcement.request_id);
-                    println!("{}", aster::cache::PASTE_WARNING);
-                    print!("Paste the code the page shows, then press Enter: ");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                } else {
-                    println!("Waiting for the browser (Ctrl-C to cancel)...");
-                }
-            },
-            &mut std::io::stdin().lock(),
-        )?;
-        if !quiet {
-            let who = signed_in
-                .email
-                .as_deref()
-                .map(|email| format!(" as {email}"))
-                .unwrap_or_default();
-            let until = chrono::DateTime::from_timestamp(signed_in.expires_at as i64, 0)
-                .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| "it expires".to_string());
-            println!(
-                "Signed in{who}. Token stored at {} until {until}.",
-                signed_in.path.display()
-            );
-        }
-        return Ok(());
     }
 
     if output_mode == OutputMode::Verbose {
@@ -1490,8 +1400,10 @@ fn run() -> Result<()> {
                         print_cache_status(&status, target.as_deref(), output_mode)?;
                     }
                 }
-                CacheCommands::Login { .. } | CacheCommands::Logout => {
-                    unreachable!("login handled above")
+                CacheCommands::Login { .. }
+                | CacheCommands::Logout
+                | CacheCommands::Stats { .. } => {
+                    unreachable!("handled before workspace discovery")
                 }
                 CacheCommands::Prune { max_size, max_age } => {
                     use aster::cache::{prune_cache, PruneLimits};
@@ -1894,6 +1806,23 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
             println!("{report}");
             Ok(())
         }
+        ResultsCommands::Flaky { target } => {
+            print_srv_dataset(&aster::test_results::read::Dataset::Flaky.path(), target)
+        }
+        ResultsCommands::Broken { target } => {
+            print_srv_dataset(&aster::test_results::read::Dataset::Broken.path(), target)
+        }
+        ResultsCommands::Quarantine { target } => print_srv_dataset(
+            &aster::test_results::read::Dataset::Quarantine.path(),
+            target,
+        ),
+        ResultsCommands::Clusters { target } => {
+            print_srv_dataset(&aster::test_results::read::Dataset::Clusters.path(), target)
+        }
+        ResultsCommands::Test { id, target } => print_srv_dataset(
+            &aster::test_results::read::Dataset::Test(id.clone()).path(),
+            target,
+        ),
         ResultsCommands::Durations { url } => {
             use aster::test_results::balance;
             let url = srv_url(url.as_deref())
@@ -1933,23 +1862,172 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
     }
 }
 
-/// `aster srv ...`: print one dashboard dataset as JSON.
-fn handle_srv(command: &SrvCommands) -> Result<()> {
-    use aster::test_results::read::{self, Dataset};
-    let (path, target) = match command {
+/// The aster-srv URL login, logout and whoami use: `--url`, else
+/// `$ASTER_SRV_URL`.
+fn srv_login_url(url: Option<&str>, verb: &str) -> Result<String> {
+    srv_url(url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "set {} to your aster-srv URL, then run aster srv {verb} again",
+            aster::cache::ASTER_SRV_URL_ENV
+        )
+    })
+}
+
+/// `aster srv login`.
+fn srv_login(no_browser: bool, loopback: bool, output_mode: OutputMode) -> Result<()> {
+    let server = srv_login_url(None, "login")?;
+    let options = aster::cache::LoginOptions {
+        mode: match (loopback, no_browser) {
+            (true, _) => aster::cache::LoginMode::Loopback,
+            (false, true) => aster::cache::LoginMode::Copy,
+            (false, false) => aster::cache::LoginMode::Auto,
+        },
+        open_browser: !no_browser,
+        timeout: aster::cache::LOGIN_TIMEOUT,
+    };
+    let quiet = output_mode == OutputMode::Quiet;
+    let signed_in = aster::cache::login(
+        &server,
+        &options,
+        &mut |announcement| {
+            use aster::cache::{CodeReason, Flow};
+            // A pasted code cannot work without the URL and the prompt,
+            // so those print even when quiet.
+            let copy = matches!(announcement.flow, Flow::Code(_));
+            if quiet && !copy {
+                return;
+            }
+            match announcement.flow {
+                Flow::OpenedBrowser => {
+                    println!("Opening your browser to sign in. If it does not open, visit:")
+                }
+                Flow::LoopbackUrl => println!("Open this URL in a browser to sign in:"),
+                Flow::Code(reason) => {
+                    match reason {
+                        CodeReason::Requested => {}
+                        CodeReason::RemoteSession => println!(
+                            "This looks like a remote shell, so Aster will ask for a code instead of a redirect."
+                        ),
+                        CodeReason::BrowserFailed => println!(
+                            "Could not open a browser, so Aster will ask for a code instead of a redirect."
+                        ),
+                    }
+                    println!("Open this URL in a browser on any computer and sign in:");
+                }
+            }
+            println!("{}", announcement.url);
+            println!(
+                "Confirm only if the page shows this code: {}",
+                announcement.user_code
+            );
+            if copy {
+                println!("Request id: {}", announcement.request_id);
+                println!("{}", aster::cache::PASTE_WARNING);
+                print!("Paste the code the page shows, then press Enter: ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            } else {
+                println!("Waiting for the browser (Ctrl-C to cancel)...");
+            }
+        },
+        &mut std::io::stdin().lock(),
+    )?;
+    if !quiet {
+        let who = signed_in
+            .email
+            .as_deref()
+            .map(|email| format!(" as {email}"))
+            .unwrap_or_default();
+        let until = chrono::DateTime::from_timestamp(signed_in.expires_at as i64, 0)
+            .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "it expires".to_string());
+        println!(
+            "Signed in{who}. Token stored at {} until {until}.",
+            signed_in.path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `aster srv logout`.
+fn srv_logout() -> Result<()> {
+    let server = srv_login_url(None, "logout")?;
+    let signed_out = aster::cache::logout(&server)?;
+    if let Some(path) = &signed_out.deleted {
+        println!("Deleted {}.", path.display());
+    }
+    match signed_out.revoked {
+        Ok(()) => {
+            println!("Signed out: the server refuses every token issued to you before now.");
+            Ok(())
+        }
+        Err(reason) if signed_out.deleted.is_none() => {
+            println!("Nothing to do: {reason}.");
+            Ok(())
+        }
+        Err(reason) => anyhow::bail!(
+            "the local token is deleted, but the server was not told: {reason}; \
+             run aster srv login and aster srv logout again to revoke it"
+        ),
+    }
+}
+
+/// `aster srv whoami`.
+fn srv_whoami(url: Option<&str>) -> Result<()> {
+    let server = srv_login_url(url, "whoami")?;
+    let stored = aster::cache::stored_token(&server, std::time::SystemTime::now())
+        .ok_or_else(|| anyhow::anyhow!("not signed in to {server}; run aster srv login"))?;
+    let until = chrono::DateTime::from_timestamp(stored.expires_at as i64, 0)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "it expires".to_string());
+    let who = stored.email.as_deref().unwrap_or("an unknown account");
+    println!("Signed in to {} as {who} until {until}.", stored.server);
+    Ok(())
+}
+
+/// `aster srv ...`.
+fn handle_srv(command: &SrvCommands, output_mode: OutputMode) -> Result<()> {
+    use aster::test_results::read::Dataset;
+    let (path, target, renamed) = match command {
+        SrvCommands::Login {
+            no_browser,
+            loopback,
+        } => return srv_login(*no_browser, *loopback, output_mode),
+        SrvCommands::Logout => return srv_logout(),
+        SrvCommands::Whoami { url } => return srv_whoami(url.as_deref()),
         SrvCommands::Get { path, target } => {
             if !path.starts_with('/') {
                 anyhow::bail!("the path must start with /, for example /v1/cache/summary");
             }
-            (path.clone(), target)
+            (path.clone(), target, None)
         }
-        SrvCommands::Cache { target } => (Dataset::CacheSummary.path(), target),
-        SrvCommands::Flaky { target } => (Dataset::Flaky.path(), target),
-        SrvCommands::Broken { target } => (Dataset::Broken.path(), target),
-        SrvCommands::Quarantine { target } => (Dataset::Quarantine.path(), target),
-        SrvCommands::Clusters { target } => (Dataset::Clusters.path(), target),
-        SrvCommands::Test { id, target } => (Dataset::Test(id.clone()).path(), target),
+        SrvCommands::Cache { target } => {
+            (Dataset::CacheSummary.path(), target, Some("cache stats"))
+        }
+        SrvCommands::Flaky { target } => (Dataset::Flaky.path(), target, Some("results flaky")),
+        SrvCommands::Broken { target } => (Dataset::Broken.path(), target, Some("results broken")),
+        SrvCommands::Quarantine { target } => (
+            Dataset::Quarantine.path(),
+            target,
+            Some("results quarantine"),
+        ),
+        SrvCommands::Clusters { target } => {
+            (Dataset::Clusters.path(), target, Some("results clusters"))
+        }
+        SrvCommands::Test { id, target } => (
+            Dataset::Test(id.clone()).path(),
+            target,
+            Some("results test"),
+        ),
     };
+    if let Some(renamed) = renamed {
+        eprintln!("[aster] this command is now `aster {renamed}`");
+    }
+    print_srv_dataset(&path, target)
+}
+
+/// Print one aster-srv `/v1` GET as JSON.
+fn print_srv_dataset(path: &str, target: &SrvTarget) -> Result<()> {
+    use aster::test_results::read;
     let url = srv_url(target.url.as_deref())
         .ok_or_else(|| anyhow::anyhow!("give --url or set ASTER_SRV_URL to your aster-srv URL"))?;
     let cwd = env::current_dir().context("Failed to get current directory")?;
@@ -1958,7 +2036,7 @@ fn handle_srv(command: &SrvCommands) -> Result<()> {
     let repo = read::default_repo(target.repo.as_deref(), &root, &env_var);
     let body = read::get(
         &url,
-        &read::with_repo(&path, repo.as_deref()),
+        &read::with_repo(path, repo.as_deref()),
         &env_var,
         std::time::SystemTime::now(),
     )?;

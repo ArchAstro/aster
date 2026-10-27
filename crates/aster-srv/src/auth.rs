@@ -1,5 +1,5 @@
 //! Who is calling: a GitHub Actions OIDC token, a person's token from
-//! `aster cache login`, or a configured static token in development.
+//! `aster srv login`, or a configured static token in development.
 //!
 //! An OIDC token is accepted when it is signed by the issuer's current key,
 //! is unexpired, names this server's audience, and comes from a repository
@@ -30,7 +30,7 @@ use crate::person::{Person, TokenIssuer};
 pub enum Principal {
     /// A CI job (or a development static token).
     Ci(Identity),
-    /// A person signed in with `aster cache login`.
+    /// A person signed in with `aster srv login`.
     Person(Person),
 }
 

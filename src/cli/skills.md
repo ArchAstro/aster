@@ -344,7 +344,11 @@ aster cache status //services/api:test --inputs
 aster cache clear //services/api:test
 aster cache clear
 aster cache prune --max-size 10GB --max-age 14d
-aster cache login
+aster cache stats
+aster srv login
+aster srv whoami
+aster results flaky
+aster results quarantine
 aster test //services/api --no-cache
 ```
 
@@ -365,16 +369,17 @@ removes one address. Blobs stay until `aster cache prune`.
 `.aster/cache/cache.json` is obsolete and unused; Aster neither reads nor
 writes it.
 
-`aster cache login` signs a laptop or devbox in to the aster-srv named by
+`aster srv login` signs a laptop or devbox in to the aster-srv named by
 `ASTER_SRV_URL`. It opens your browser, you sign in and confirm only if the
 page shows the code the terminal printed. In a remote shell (SSH, a devbox;
 `--no-browser`, or chosen automatically) it prints a URL and you paste back
-the one-time code the page shows. `aster cache logout` signs out everywhere.
+the one-time code the page shows. `aster srv logout` signs out everywhere;
+`aster srv whoami` prints the signed-in email and expiry.
 Aster stores a read-only token under
 `$XDG_CONFIG_HOME/aster` (else `~/.config/aster`, mode 0600) until it
 expires. A later `aster run` with `ASTER_SRV_URL` set then reads the remote
 cache with no extra variable. Signed out, the run prints
-`not signed in; run aster cache login` once and continues locally.
+`not signed in; run aster srv login` once and continues locally.
 
 `aster cache status <target> --inputs` prints every component of that target's
 cache key: salt, platform, hashed files, command, dependency hashes, tracked

@@ -363,12 +363,12 @@ pub enum Commands {
         command: ResultsCommands,
     },
 
-    /// Read aster-srv's dashboard data as JSON
+    /// Sign in to aster-srv, and read any of its routes
     ///
-    /// Prints what the dashboard pages show, from the server's read-only
-    /// `/v1` routes. Sign in once with `aster cache login`; CI credentials
-    /// (`ASTER_SRV_TOKEN`, GitHub OIDC) are used when present. Exits non-zero
-    /// with a message when you are not signed in or the server refuses.
+    /// `login` signs this machine in for the shared cache and the
+    /// `aster results` readers. `get` prints any read-only `/v1` route as
+    /// JSON. Exits non-zero with a message when you are not signed in or the
+    /// server refuses.
     Srv {
         #[command(subcommand)]
         command: SrvCommands,
@@ -583,38 +583,26 @@ pub enum CacheCommands {
         inputs: bool,
     },
 
-    /// Sign in to the shared remote cache from this machine
+    /// The shared cache's size, lookups and last writer, from aster-srv
     ///
-    /// Opens `$ASTER_SRV_URL/cli-auth` in your browser. Sign in there with
-    /// the company account the server's proxy uses and confirm only if the
-    /// page shows the code this command printed. Aster receives the answer
-    /// on a one-shot listener on 127.0.0.1 and stores a read-only token
-    /// under your config directory ($XDG_CONFIG_HOME/aster, else
-    /// ~/.config/aster), readable only by you, until it expires (hours).
-    /// Later `aster run`s with `ASTER_SRV_URL` set restore from the shared
-    /// cache; without a sign-in they print one line and use the local cache.
-    ///
-    /// On a remote shell (SSH, a devbox) the browser cannot reach that
-    /// listener, so Aster prints a URL instead: open it in any browser,
-    /// confirm, and paste the one-time code the page shows back into the
-    /// terminal. That happens with `--no-browser`, and automatically when
-    /// SSH_CONNECTION, SSH_CLIENT or SSH_TTY is set, when a Linux shell has
-    /// neither DISPLAY nor WAYLAND_DISPLAY, or when the browser fails to
-    /// open. `--loopback` forces the browser redirect.
+    /// Prints what the dashboard's Cache page shows, as JSON. Uses the
+    /// sign-in `aster srv login` stored, or CI credentials.
+    Stats {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+
+    /// Renamed to `aster srv login`
+    #[command(hide = true)]
     Login {
-        /// Do not open a browser: print a URL and paste back the code
         #[arg(long)]
         no_browser: bool,
-        /// Always use the browser redirect to 127.0.0.1 (with --no-browser:
-        /// print the URL, and forward the port with `ssh -R`)
         #[arg(long)]
         loopback: bool,
     },
 
-    /// Sign out of the shared remote cache
-    ///
-    /// Deletes the stored token and asks the server to refuse every token
-    /// issued to you so far, on every machine.
+    /// Renamed to `aster srv logout`
+    #[command(hide = true)]
     Logout,
 
     /// Evict old and least-recently-used artifact cache entries
@@ -651,6 +639,52 @@ pub struct SrvTarget {
 /// `aster srv` subcommands
 #[derive(Subcommand)]
 pub enum SrvCommands {
+    /// Sign in to aster-srv from this machine
+    ///
+    /// Opens `$ASTER_SRV_URL/cli-auth` in your browser. Sign in there with
+    /// the company account the server's proxy uses and confirm only if the
+    /// page shows the code this command printed. Aster receives the answer
+    /// on a one-shot listener on 127.0.0.1 and stores a read-only token
+    /// under your config directory ($XDG_CONFIG_HOME/aster, else
+    /// ~/.config/aster), readable only by you, until it expires (hours).
+    /// Later `aster run`s with `ASTER_SRV_URL` set restore from the shared
+    /// cache, and `aster results flaky` and the other readers use it; without
+    /// a sign-in a run prints one line and uses the local cache.
+    ///
+    /// On a remote shell (SSH, a devbox) the browser cannot reach that
+    /// listener, so Aster prints a URL instead: open it in any browser,
+    /// confirm, and paste the one-time code the page shows back into the
+    /// terminal. That happens with `--no-browser`, and automatically when
+    /// SSH_CONNECTION, SSH_CLIENT or SSH_TTY is set, when a Linux shell has
+    /// neither DISPLAY nor WAYLAND_DISPLAY, or when the browser fails to
+    /// open. `--loopback` forces the browser redirect.
+    Login {
+        /// Do not open a browser: print a URL and paste back the code
+        #[arg(long)]
+        no_browser: bool,
+        /// Always use the browser redirect to 127.0.0.1 (with --no-browser:
+        /// print the URL, and forward the port with `ssh -R`)
+        #[arg(long)]
+        loopback: bool,
+    },
+
+    /// Sign out of aster-srv
+    ///
+    /// Deletes the stored token and asks the server to refuse every token
+    /// issued to you so far, on every machine.
+    Logout,
+
+    /// Show who this machine is signed in to aster-srv as
+    ///
+    /// Reads the stored sign-in for `$ASTER_SRV_URL` (or --url) and prints the
+    /// email and when it expires. Exits 1 when there is no usable sign-in.
+    /// Does not contact the server.
+    Whoami {
+        /// The aster-srv URL [default: $ASTER_SRV_URL]
+        #[arg(long)]
+        url: Option<String>,
+    },
+
     /// GET any aster-srv path and print the JSON
     ///
     /// For example `aster srv get '/v1/test-results/tests?state=flaky&limit=20'`.
@@ -661,34 +695,39 @@ pub enum SrvCommands {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// The cache's size, lookups and last writer (the Cache page)
+    /// Renamed to `aster cache stats`
+    #[command(hide = true)]
     Cache {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// Flaky tests, highest score first (the Flaky tests page)
+    /// Renamed to `aster results flaky`
+    #[command(hide = true)]
     Flaky {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// Broken tests (the Flaky tests page's broken list)
+    /// Renamed to `aster results broken`
+    #[command(hide = true)]
     Broken {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// The quarantine list (the Quarantine page)
+    /// Renamed to `aster results quarantine`
+    #[command(hide = true)]
     Quarantine {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// The last week's failures grouped by failure hash (the Failure clusters page)
+    /// Renamed to `aster results clusters`
+    #[command(hide = true)]
     Clusters {
         #[command(flatten)]
         target: SrvTarget,
     },
-    /// One test's state and recent results (a test's page)
+    /// Renamed to `aster results test`
+    #[command(hide = true)]
     Test {
-        /// The test id, as listed by `aster srv flaky`
         id: String,
         #[command(flatten)]
         target: SrvTarget,
@@ -771,6 +810,38 @@ pub enum ResultsCommands {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Flaky tests, highest score first (the Flaky tests page)
+    ///
+    /// This and `broken`, `quarantine`, `clusters` and `test` print what
+    /// aster-srv's dashboard shows, as JSON. They use the sign-in
+    /// `aster srv login` stored, or CI credentials (`ASTER_SRV_TOKEN`, GitHub
+    /// OIDC) when present.
+    Flaky {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// Broken tests (the Flaky tests page's broken list)
+    Broken {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// The quarantine list (the Quarantine page)
+    Quarantine {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// The last week's failures grouped by failure hash (the Failure clusters page)
+    Clusters {
+        #[command(flatten)]
+        target: SrvTarget,
+    },
+    /// One test's state and recent results (a test's page)
+    Test {
+        /// The test id, as listed by `aster results flaky`
+        id: String,
+        #[command(flatten)]
+        target: SrvTarget,
+    },
 }
 
 /// Project-level subcommands
@@ -795,6 +866,37 @@ pub enum ProjectCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_srv_and_cache_commands_still_parse_and_are_hidden() {
+        use clap::CommandFactory;
+        for args in [
+            &["aster", "cache", "login", "--no-browser"][..],
+            &["aster", "cache", "logout"],
+            &["aster", "srv", "flaky"],
+            &["aster", "srv", "cache"],
+            &["aster", "srv", "test", "id"],
+            &["aster", "srv", "login", "--loopback"],
+            &["aster", "srv", "whoami"],
+            &["aster", "cache", "stats", "--repo", "o/r"],
+            &["aster", "results", "quarantine"],
+            &["aster", "results", "test", "id"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        let cli = Cli::command();
+        let visible = |group: &str| -> Vec<String> {
+            cli.find_subcommand(group)
+                .unwrap()
+                .get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+                .map(|sub| sub.get_name().to_string())
+                .collect()
+        };
+        assert_eq!(visible("srv"), ["login", "logout", "whoami", "get"]);
+        assert_eq!(visible("cache"), ["clear", "status", "stats", "prune"]);
+        assert!(visible("results").contains(&"flaky".to_string()));
+    }
 
     #[test]
     fn test_results_flag_takes_an_optional_path() {

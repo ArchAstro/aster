@@ -2,7 +2,7 @@
 //! binary on both ends, a scripted browser in the middle.
 //!
 //! CI writes a build artifact with a GitHub OIDC token. A laptop with no
-//! credentials builds locally until `aster cache login` signs it in: the
+//! credentials builds locally until `aster srv login` signs it in: the
 //! scripted browser plays a person behind IAP (a signed
 //! `x-goog-iap-jwt-assertion`), confirms the sign-in, and follows the
 //! server's redirect to the CLI's loopback listener. The laptop then
@@ -346,7 +346,7 @@ fn form_body(html: &str) -> String {
         .join("&")
 }
 
-/// Run `aster cache login --no-browser` and return its stdout lines once it
+/// Run `aster srv login --no-browser` and return its stdout lines once it
 /// exits, handing the sign-in URL it prints to `browse` while it waits.
 fn login_with(
     dir: &Path,
@@ -355,13 +355,13 @@ fn login_with(
     browse: impl FnOnce(&str) + Send,
 ) -> (std::process::ExitStatus, Vec<String>) {
     let mut child = aster(dir)
-        .args(["cache", "login", "--loopback", "--no-browser"])
+        .args(["srv", "login", "--loopback", "--no-browser"])
         .env("ASTER_SRV_URL", server)
         .env("XDG_CONFIG_HOME", config_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn aster cache login");
+        .expect("spawn aster srv login");
     let stdout = child.stdout.take().unwrap();
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
@@ -377,13 +377,13 @@ fn login_with(
     });
     let url = url_rx
         .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("aster cache login prints the sign-in URL");
+        .expect("aster srv login prints the sign-in URL");
     browse(&url);
-    let status = child.wait().expect("aster cache login exits");
+    let status = child.wait().expect("aster srv login exits");
     (status, reader.join().unwrap())
 }
 
-/// `aster cache login` against the real server, with the scripted browser
+/// `aster srv login` against the real server, with the scripted browser
 /// playing a person behind IAP: GET the page, confirm, and follow the
 /// server's redirect to the CLI's loopback listener.
 async fn sign_in(
@@ -500,12 +500,12 @@ async fn a_laptop_signs_in_through_aster_srv_and_restores_what_ci_wrote() {
     .unwrap();
     let before_stderr = String::from_utf8_lossy(&before.stderr);
     assert!(
-        before_stderr.contains("not signed in; run aster cache login"),
+        before_stderr.contains("not signed in; run aster srv login"),
         "{before_stderr}"
     );
     assert_eq!(runs(&early_laptop), 1, "no sign-in means no restore");
 
-    // Phase 3: `aster cache login` against the real server. The scripted
+    // Phase 3: `aster srv login` against the real server. The scripted
     // browser is a person behind IAP: GET the page, confirm, and follow the
     // server's redirect to the CLI's loopback listener.
     let (status, lines) = sign_in(&server, &laptop, &config_home).await;
@@ -588,8 +588,13 @@ async fn a_laptop_signs_in_through_aster_srv_and_restores_what_ci_wrote() {
     server.stop().await;
 }
 
-/// What `aster srv <args>` printed and how it exited.
-async fn srv(dir: &Path, url: &str, config_home: &Path, args: &[&str]) -> (bool, Value, String) {
+/// What `aster <args>` printed as JSON, whether it exited 0, and its stderr.
+async fn cli_json(
+    dir: &Path,
+    url: &str,
+    config_home: &Path,
+    args: &[&str],
+) -> (bool, Value, String) {
     let output = tokio::task::spawn_blocking({
         let (dir, url, config) = (
             dir.to_path_buf(),
@@ -599,12 +604,11 @@ async fn srv(dir: &Path, url: &str, config_home: &Path, args: &[&str]) -> (bool,
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         move || {
             aster(&dir)
-                .arg("srv")
                 .args(args)
                 .env("ASTER_SRV_URL", url)
                 .env("XDG_CONFIG_HOME", config)
                 .output()
-                .expect("spawn aster srv")
+                .expect("spawn aster")
         }
     })
     .await
@@ -656,11 +660,11 @@ fn ci_results(run: usize) -> String {
     .concat()
 }
 
-/// A person who signed in with `aster cache login` can read every dataset the
+/// A person who signed in with `aster srv login` can read every dataset the
 /// dashboard shows through `aster srv`, from data CI uploaded, and the server
 /// refuses their writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
+async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_results() {
     let Some(server) = start().await else {
         return;
     };
@@ -715,16 +719,33 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
     .expect("the classifier lock is free");
 
     // Phase 2: before signing in, the laptop is told how, and prints no JSON.
-    let (ok, body, stderr) = srv(&laptop, &url, &config_home, &["flaky"]).await;
+    let (ok, body, stderr) = cli_json(&laptop, &url, &config_home, &["results", "flaky"]).await;
     assert!(!ok && body.is_null(), "{body}");
     assert!(
-        stderr.contains("not signed in; run aster cache login"),
+        stderr.contains("not signed in; run aster srv login"),
         "{stderr}"
     );
 
     // Phase 3: sign in, as in the cache test.
     let (status, lines) = sign_in(&server, &laptop, &config_home).await;
     assert!(status.success(), "login failed: {}", lines.join("\n"));
+    // `whoami` reads the stored sign-in and never prints the token.
+    let whoami = {
+        let (laptop, url, config_home) = (laptop.clone(), url.clone(), config_home.clone());
+        tokio::task::spawn_blocking(move || {
+            let output = aster(&laptop)
+                .args(["srv", "whoami"])
+                .env("ASTER_SRV_URL", &url)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        })
+        .await
+        .unwrap()
+    };
+    assert!(whoami.contains(&format!("as {PERSON} until")), "{whoami}");
 
     // Phase 4: one read per dataset. The repository is the checkout's
     // (GITHUB_REPOSITORY), which the person never typed.
@@ -741,18 +762,24 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
     let read = |args: &'static [&'static str]| {
         let (laptop, url, config_home) = (laptop.clone(), url.clone(), config_home.clone());
         async move {
-            let (ok, body, stderr) = srv(&laptop, &url, &config_home, args).await;
-            assert!(ok, "aster srv {args:?}: {stderr}");
-            assert_eq!(body["repo"], REPO, "aster srv {args:?}: {body}");
+            let (ok, body, stderr) = cli_json(&laptop, &url, &config_home, args).await;
+            assert!(ok, "aster {args:?}: {stderr}");
+            assert_eq!(body["repo"], REPO, "aster {args:?}: {body}");
             body
         }
     };
-    assert!(read(&["cache"]).await["entries"].is_null());
-    assert_eq!(ids(&read(&["flaky"]).await, "tests"), ["flaky_test"]);
-    assert_eq!(ids(&read(&["broken"]).await, "tests"), ["broken_test"]);
-    let quarantine = read(&["quarantine"]).await;
+    assert!(read(&["cache", "stats"]).await["entries"].is_null());
+    assert_eq!(
+        ids(&read(&["results", "flaky"]).await, "tests"),
+        ["flaky_test"]
+    );
+    assert_eq!(
+        ids(&read(&["results", "broken"]).await, "tests"),
+        ["broken_test"]
+    );
+    let quarantine = read(&["results", "quarantine"]).await;
     assert_eq!(ids(&quarantine, "tests"), ["flaky_test"], "{quarantine}");
-    let clusters = read(&["clusters"]).await;
+    let clusters = read(&["results", "clusters"]).await;
     let hashes: Vec<&str> = clusters["clusters"]
         .as_array()
         .unwrap()
@@ -761,17 +788,23 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
         .collect();
     assert_eq!(hashes.len(), 2, "{clusters}");
     assert!(hashes.contains(&"flake-hash") && hashes.contains(&"broken-hash"));
-    let history = read(&["test", "flaky_test"]).await;
+    let history = read(&["results", "test", "flaky_test"]).await;
     assert_eq!(history["test"]["state"], "flaky", "{history}");
     assert_eq!(history["history"].as_array().unwrap().len(), 6, "{history}");
+    // The pre-rename spelling still reads, and names the new one.
+    let (ok, old_flaky, stderr) = cli_json(&laptop, &url, &config_home, &["srv", "flaky"]).await;
+    assert!(ok, "{stderr}");
+    assert_eq!(ids(&old_flaky, "tests"), ["flaky_test"]);
+    assert!(stderr.contains("now `aster results flaky`"), "{stderr}");
     let by_path = {
-        let (ok, body, stderr) = srv(
+        let (ok, body, stderr) = cli_json(
             &laptop,
             &url,
             &config_home,
             // The run id holds the repository's `/`, so it is percent-encoded
             // to stay one path segment.
             &[
+                "srv",
                 "get",
                 &format!(
                     "/v1/test-results/runs/{}/failures",
@@ -784,16 +817,17 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
         body
     };
     assert_eq!(by_path["run"]["repo"], REPO, "{by_path}");
-    let (ok, durations_body, stderr) = srv(&laptop, &url, &config_home, &["get", &durations]).await;
+    let (ok, durations_body, stderr) =
+        cli_json(&laptop, &url, &config_home, &["srv", "get", &durations]).await;
     assert!(ok, "{stderr}");
     assert!(durations_body["files"].is_array(), "{durations_body}");
 
     // Phase 5: a repository the server does not serve, and writes, are 403.
-    let (ok, body, stderr) = srv(
+    let (ok, body, stderr) = cli_json(
         &laptop,
         &url,
         &config_home,
-        &["flaky", "--repo", "evil/other"],
+        &["results", "flaky", "--repo", "evil/other"],
     )
     .await;
     assert!(!ok && body.is_null(), "{body}");
@@ -838,7 +872,7 @@ async fn a_signed_in_laptop_reads_every_dashboard_dataset_with_aster_srv() {
 
     server.stop().await;
 }
-/// Run `aster cache login` as a person in a remote shell would: stdin is a
+/// Run `aster srv login` as a person in a remote shell would: stdin is a
 /// pipe the person types into, and `ssh` makes the environment look like an
 /// SSH session (so no flag is needed). `browse` gets the printed sign-in URL
 /// and returns the line to paste, or `None` to type nothing.
@@ -852,7 +886,7 @@ fn copy_login_with(
 ) -> (std::process::ExitStatus, Vec<String>, String) {
     let mut command = aster(dir);
     command
-        .args(["cache", "login"])
+        .args(["srv", "login"])
         .args(flags)
         .env("ASTER_SRV_URL", server)
         .env("XDG_CONFIG_HOME", config_home)
@@ -866,7 +900,7 @@ fn copy_login_with(
     if ssh {
         command.env("SSH_CONNECTION", "203.0.113.9 50000 10.0.0.2 22");
     }
-    let mut child = command.spawn().expect("spawn aster cache login");
+    let mut child = command.spawn().expect("spawn aster srv login");
     let stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
@@ -888,13 +922,13 @@ fn copy_login_with(
     });
     let url = url_rx
         .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("aster cache login prints the sign-in URL");
+        .expect("aster srv login prints the sign-in URL");
     let mut stdin = child.stdin.take().unwrap();
     if let Some(paste) = browse(&url) {
         writeln!(stdin, "{paste}").unwrap();
     }
     drop(stdin);
-    let status = child.wait().expect("aster cache login exits");
+    let status = child.wait().expect("aster srv login exits");
     (status, reader.join().unwrap(), errors.join().unwrap())
 }
 
@@ -1130,13 +1164,13 @@ async fn a_remote_shell_signs_in_by_pasting_a_code_and_restores_what_ci_wrote() 
     assert_eq!(tree(&devbox.join("app/out")), written, "{restore_stderr}");
     assert!(!restore_stderr.contains(&token), "{restore_stderr}");
 
-    // Phase 5: `aster cache logout` deletes the file and the server refuses
+    // Phase 5: `aster srv logout` deletes the file and the server refuses
     // the old token from then on.
     let logout = tokio::task::spawn_blocking({
         let (dir, url, config) = (devbox.clone(), url.clone(), config_home.clone());
         move || {
             aster(&dir)
-                .args(["cache", "logout"])
+                .args(["srv", "logout"])
                 .env("ASTER_SRV_URL", &url)
                 .env("XDG_CONFIG_HOME", &config)
                 .output()

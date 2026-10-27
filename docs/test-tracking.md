@@ -124,14 +124,14 @@ share the laptop's sign-in):
 
 ```console
 export ASTER_SRV_URL=https://aster-srv.example.com
-aster cache login
+aster srv login
 ```
 
 `ASTER_SRV_URL` must be `https://`; plain `http://` is accepted only for
 `127.0.0.1`, `::1` and `localhost`, because the code, verifier and token would
 cross the network in the clear.
 
-1. `aster cache login` makes a PKCE verifier and a short **user code**
+1. `aster srv login` makes a PKCE verifier and a short **user code**
    (`ABCD-EFGH`), prints the code, and opens
    `$ASTER_SRV_URL/cli-auth` in your browser.
 2. You sign in there with your company Google account (the server's
@@ -146,7 +146,7 @@ cross the network in the clear.
    it, it does not store the token). Aster ignores a token file that group or
    others can read and tells you to log in again. The token is never printed,
    and it lives outside the repository. It lasts 12 hours by default
-   (`ASTER_SRV_CLI_TOKEN_TTL` on the server); then run `aster cache login`
+   (`ASTER_SRV_CLI_TOKEN_TTL` on the server); then run `aster srv login`
    again.
 
 The next `aster run` with `ASTER_SRV_URL` set sends the token as a bearer
@@ -158,10 +158,10 @@ A browser on your laptop cannot reach `127.0.0.1` on the remote machine, so
 Aster uses a pasted code there. It picks that flow by itself when
 `SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY` is set, when a Linux shell has
 neither `DISPLAY` nor `WAYLAND_DISPLAY`, or when the system browser fails to
-start. `aster cache login --no-browser` asks for it explicitly:
+start. `aster srv login --no-browser` asks for it explicitly:
 
 ```console
-$ aster cache login
+$ aster srv login
 This looks like a remote shell, so Aster will ask for a code instead of a redirect.
 Open this URL in a browser on any computer and sign in:
 https://aster-srv.example.com/cli-auth?mode=copy&challenge=...&state=...&user_code=K7QM2XWD
@@ -185,7 +185,7 @@ instead of opening one).
 
 ### Signing out
 
-`aster cache logout` deletes the stored token and asks the server to refuse
+`aster srv logout` deletes the stored token and asks the server to refuse
 every token issued to you before now, on every machine. If the server cannot
 be reached the local file is still deleted and the command fails, so run it
 again later. Operators can turn person sign-in off for everyone with
@@ -193,8 +193,8 @@ again later. Operators can turn person sign-in off for everyone with
 person token is refused.
 
 Signed out, or with an expired or refused token, `aster run` prints one line
-(`not signed in; run aster cache login`) and builds from the local cache. It
-does not fail. If the server has not enabled sign-in, `aster cache login`
+(`not signed in; run aster srv login`) and builds from the local cache. It
+does not fail. If the server has not enabled sign-in, `aster srv login`
 says the server refused it.
 
 A person's token reads and never writes: it cannot upload or commit (the
@@ -205,19 +205,24 @@ so a macOS laptop mostly misses entries written on Linux CI.
 ### Reading the dashboard's data
 
 The same token reads every dataset the `/ui` pages show, as JSON, for any
-repository the server serves. `aster srv` prints it; the repository defaults to
+repository the server serves. `aster results` and `aster cache stats` print
+it; the repository defaults to
 `GITHUB_REPOSITORY`, else the checkout's `origin` (`--repo owner/name`
 overrides).
 
 | `/ui` page | Command | Route |
 |---|---|---|
-| Cache | `aster srv cache` | `GET /v1/cache/summary`, `/v1/cache/entries?target=` |
-| Flaky tests | `aster srv flaky` | `GET /v1/test-results/tests?state=flaky` |
-| Flaky tests (broken list) | `aster srv broken` | `GET /v1/test-results/tests?state=broken` |
-| Failure clusters | `aster srv clusters` | `GET /v1/test-results/clusters` |
-| Quarantine | `aster srv quarantine` | `GET /v1/test-results/quarantine` |
-| A test | `aster srv test <id>` | `GET /v1/test-results/tests/<id>` |
+| Cache | `aster cache stats` | `GET /v1/cache/summary`, `/v1/cache/entries?target=` |
+| Flaky tests | `aster results flaky` | `GET /v1/test-results/tests?state=flaky` |
+| Flaky tests (broken list) | `aster results broken` | `GET /v1/test-results/tests?state=broken` |
+| Failure clusters | `aster results clusters` | `GET /v1/test-results/clusters` |
+| Quarantine | `aster results quarantine` | `GET /v1/test-results/quarantine` |
+| A test | `aster results test <id>` | `GET /v1/test-results/tests/<id>` |
 | Anything else | `aster srv get '<path>'` | any `GET /v1/...` route, such as `/v1/test-results/durations?...` or `/v1/test-results/runs/<id>/failures` |
+
+The pre-0.25 spellings (`aster cache login`/`logout`, `aster srv flaky`,
+`broken`, `quarantine`, `clusters`, `test`, `cache`) still work, are hidden
+from `--help`, and print the new name on stderr.
 
 With CI credentials in the environment (`ASTER_SRV_TOKEN`, GitHub OIDC) the CI
 token is used and reads its own repository. Not signed in, or a refused token,

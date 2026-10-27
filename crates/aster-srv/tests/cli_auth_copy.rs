@@ -167,7 +167,7 @@ fn shown_code(html: &str) -> String {
     rest.split("</code>").next().unwrap().to_string()
 }
 
-/// `POST /v1/auth/revoke` with no body, as `aster cache logout` sends it
+/// `POST /v1/auth/revoke` with no body, as `aster srv logout` sends it
 /// (the route takes none).
 async fn revoke(server: &Server, bearer: Option<&str>) -> (u16, Value) {
     let mut request = aster_srv::http_client()

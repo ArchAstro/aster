@@ -125,7 +125,7 @@ pub struct Config {
     /// uses GCS and has no such route.
     pub dev_blob_route: bool,
     /// `ASTER_SRV_PUBLIC_URL`: the URL people reach this server at, the
-    /// `iss` of the tokens `aster cache login` hands out. Unset turns
+    /// `iss` of the tokens `aster srv login` hands out. Unset turns
     /// person login off.
     pub public_url: Option<String>,
     /// `ASTER_SRV_CLI_TOKEN_KEYS`: `kid:secret` pairs, comma-separated. The

@@ -1,4 +1,4 @@
-//! Person tokens: what `aster cache login` hands a laptop.
+//! Person tokens: what `aster srv login` hands a laptop.
 //!
 //! A token is an HS256 JWT this server signs and verifies with its own keys
 //! (`ASTER_SRV_CLI_TOKEN_KEYS`, each at least 256 bits). Claims, all required:
@@ -58,7 +58,7 @@ const _: () = assert!(LEEWAY_SECONDS <= 60);
 /// The longest token verified at all; real ones are about 450 bytes.
 const MAX_TOKEN_BYTES: usize = 2048;
 
-/// A person signed in with `aster cache login`.
+/// A person signed in with `aster srv login`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Person {
     /// The stable IAP subject.
@@ -235,7 +235,7 @@ impl TokenIssuer {
 }
 
 /// Whether `person`'s token was issued before the person last signed out
-/// everywhere (`aster cache logout`). The cutoff is the whole second after
+/// everywhere (`aster srv logout`). The cutoff is the whole second after
 /// the logout's, because `iat` has second resolution: a token minted in the
 /// same second as the logout is refused too, never kept, even when the
 /// logout fell exactly on a second boundary (where `ceil` would not round).

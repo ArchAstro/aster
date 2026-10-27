@@ -5,7 +5,7 @@
 //! test-result uploads already use: GitHub OIDC in Actions, `ASTER_SRV_TOKEN`
 //! elsewhere, and `ASTER_SRV_PROXY_TOKEN` as `Proxy-Authorization` (still sent
 //! for deployments that keep an identity-aware proxy in front). With no CI
-//! credential, a person uses the token `aster cache login` stored; with
+//! credential, a person uses the token `aster srv login` stored; with
 //! neither, the remote is skipped with one line and the build stays local.
 //! A person's token reads only, so writes are never attempted with it.
 //!
@@ -93,7 +93,7 @@ pub struct AsterSrvBackend {
     credentials: Option<Credentials>,
     /// Sent as `Proxy-Authorization` when set, whatever else is used.
     proxy_token: Option<String>,
-    /// The token `aster cache login` stored, used when there is no CI
+    /// The token `aster srv login` stored, used when there is no CI
     /// credential. Reads only.
     person_token: Option<String>,
     /// When set, blob URLs on `storage.googleapis.com` are fetched here
@@ -109,7 +109,7 @@ impl AsterSrvBackend {
     /// Build a backend when `ASTER_SRV_URL` is set.
     ///
     /// CI uses `ASTER_SRV_TOKEN` or GitHub OIDC. A laptop has neither: it
-    /// uses the token `aster cache login` stored for this server, and with
+    /// uses the token `aster srv login` stored for this server, and with
     /// no unexpired token the remote is skipped. `None` when the URL or repo
     /// is empty.
     ///
