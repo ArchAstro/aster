@@ -578,7 +578,7 @@ pub fn current_gha() -> Option<Arc<GhaBackend>> {
 /// `none` stays local. `gha` uses [`GhaBackend`] when the Actions runtime
 /// env is present. `aster-srv` is used when `ASTER_SRV_URL` is set. CI
 /// authenticates with `ASTER_SRV_TOKEN` or GitHub Actions OIDC; a laptop has
-/// neither and reads with the token `aster cache login` stored. A configured URL
+/// neither and reads with the token `aster srv login` stored. A configured URL
 /// with no repository is local-only, with one warning, rather than a build
 /// failure. `workspace_root` names the checkout whose origin is the cache
 /// repo. `http` uses [`super::http::HttpCache`] when `ASTER_REMOTE_CACHE_URL`

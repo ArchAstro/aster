@@ -5,7 +5,7 @@
 //! schema); the shared artifact cache (`/v1/cache/...`, the `cache` schema)
 //! sits beside it. Both share the core: configuration, GitHub Actions
 //! OIDC authentication, migrations and the HTTP server. People sign in
-//! from a laptop with `aster cache login` (`/cli-auth`, [`cli_auth`]) and
+//! from a laptop with `aster srv login` (`/cli-auth`, [`cli_auth`]) and
 //! hold a token that reads the cache ([`person`]).
 
 pub mod audit;
@@ -225,7 +225,7 @@ impl App {
     ) -> Result<auth::Principal, auth::AuthError> {
         let principal =
             auth::authenticate(&self.verifier, self.person_tokens.as_ref(), authorization).await?;
-        // A person who signed out everywhere (`aster cache logout`) loses
+        // A person who signed out everywhere (`aster srv logout`) loses
         // every token issued before that. A database error fails closed.
         if let auth::Principal::Person(person) = &principal {
             match person::is_revoked(&self.pool, person).await {

@@ -1,4 +1,4 @@
-//! `aster cache login`: a person's sign-in to an aster-srv.
+//! `aster srv login`: a person's sign-in to an aster-srv.
 //!
 //! Aster opens the browser at `<ASTER_SRV_URL>/cli-auth`, where the person
 //! signs in through the server's identity-aware proxy and confirms. Aster
@@ -68,7 +68,7 @@ use crate::srv_url::{checked_origin, is_secure_origin, server_origin};
 /// How close to expiry a stored token is treated as already expired.
 const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 
-/// How long `aster cache login` waits for the browser to come back.
+/// How long `aster srv login` waits for the browser to come back.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Printed before the paste prompt. A code someone else minted signs this
@@ -78,7 +78,7 @@ pub const PASTE_WARNING: &str = "Only paste a code you got from this browser you
 Never paste a code someone sent you; it would sign this terminal in as them.";
 
 /// The one line printed when there is no usable sign-in.
-pub const SIGNED_OUT_MESSAGE: &str = "[aster] not signed in; run aster cache login";
+pub const SIGNED_OUT_MESSAGE: &str = "[aster] not signed in; run aster srv login";
 
 /// A stored sign-in. `token` is a credential; do not print it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,7 +139,7 @@ fn load_token(config_dir: &Path, server_url: &str, now: SystemTime) -> Option<St
     let path = token_path(config_dir, &origin)?;
     if readable_by_others(&path) {
         eprintln!(
-            "[aster] ignoring {}: other users can read it; run aster cache login again",
+            "[aster] ignoring {}: other users can read it; run aster srv login again",
             path.display()
         );
         return None;
@@ -430,7 +430,7 @@ fn login_in(
     })
 }
 
-/// What `aster cache logout` did.
+/// What `aster srv logout` did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SignedOut {
     /// The token file that was deleted, if there was one.
@@ -493,7 +493,7 @@ fn read_pasted_code(input: &mut dyn BufRead) -> Result<String> {
         .context("cannot read the code")?;
     let code = line.trim();
     if read == 0 {
-        bail!("no code was entered; run aster cache login again");
+        bail!("no code was entered; run aster srv login again");
     }
     if code.is_empty()
         || code.len() > 128
@@ -501,7 +501,7 @@ fn read_pasted_code(input: &mut dyn BufRead) -> Result<String> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        bail!("that is not a sign-in code; copy the code shown on the page and run aster cache login again");
+        bail!("that is not a sign-in code; copy the code shown on the page and run aster srv login again");
     }
     Ok(code.to_string())
 }
@@ -562,7 +562,7 @@ fn wait_for_callback(listener: &TcpListener, state: &str, timeout: Duration) -> 
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     bail!(
-                        "timed out after {} seconds waiting for the browser; run aster cache login again",
+                        "timed out after {} seconds waiting for the browser; run aster srv login again",
                         timeout.as_secs()
                     );
                 }
@@ -611,7 +611,7 @@ fn handle_callback(stream: TcpStream, state: &str) -> Option<String> {
             &mut stream,
             400,
             "Bad request",
-            "This sign-in reply is for a different request. Run aster cache login again.",
+            "This sign-in reply is for a different request. Run aster srv login again.",
         );
         return None;
     }
@@ -672,7 +672,7 @@ fn exchange(
     let status = response.status().as_u16();
     if status != 200 {
         bail!(
-            "the server refused the sign-in ({status}); run aster cache login again \
+            "the server refused the sign-in ({status}); run aster srv login again \
              (if it keeps failing, the server may not have sign-in enabled)"
         );
     }
@@ -944,7 +944,7 @@ mod tests {
         });
         let text = format!("{:#}", result.unwrap_err());
         assert!(text.contains("refused the sign-in (400)"), "{text}");
-        assert!(text.contains("aster cache login"), "{text}");
+        assert!(text.contains("aster srv login"), "{text}");
         assert!(load_token(dir.path(), &server, at(0)).is_none());
     }
 

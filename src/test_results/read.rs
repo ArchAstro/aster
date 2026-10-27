@@ -1,8 +1,8 @@
-//! `aster srv`: read the datasets aster-srv's dashboard shows, as JSON.
+//! `aster results flaky` and the other readers: read the datasets aster-srv's dashboard shows, as JSON.
 //!
 //! Each dataset is one `GET /v1/...` route. The credential is the CI one
 //! when the environment has it (`ASTER_SRV_TOKEN`, GitHub OIDC), else the
-//! token `aster cache login` stored for this server. A person's token can
+//! token `aster srv login` stored for this server. A person's token can
 //! read every dataset of any repository the server serves; it names the
 //! repository with `repo`, which defaults the way the cache client derives
 //! it (`GITHUB_REPOSITORY`, else the checkout's `origin`).
@@ -102,7 +102,7 @@ pub fn get(
     let reason = body["error"].as_str().unwrap_or("no reason given");
     match status {
         401 if person => {
-            bail!("the server did not accept your sign-in ({reason}); run aster cache login")
+            bail!("the server did not accept your sign-in ({reason}); run aster srv login")
         }
         401 => bail!("the server did not accept the credentials ({reason})"),
         403 => bail!("the server refused the request (403): {reason}"),

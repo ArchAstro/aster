@@ -329,17 +329,17 @@ other than `deps`. A nested Node project hashes a root `package-lock.json`,
 for targets other than `deps`.
 
 When `ASTER_SRV_URL` points at an aster-srv, a laptop or devbox reads that
-cache after one `aster cache login`: it opens your browser, you sign in with
+cache after one `aster srv login`: it opens your browser, you sign in with
 your company account and confirm, and Aster stores a read-only token under
 `$XDG_CONFIG_HOME/aster` (else `~/.config/aster`) until it expires. Signed
-out, Aster prints one line (`not signed in; run aster cache login`) and
+out, Aster prints one line (`not signed in; run aster srv login`) and
 continues with the local cache. Over SSH or on a devbox, where the browser
 cannot reach the CLI, it prints a URL and you paste back a one-time code;
-`aster cache logout` signs out everywhere. See
+`aster srv logout` signs out everywhere. See
 [Reading the cache from a laptop](docs/test-tracking.md#reading-the-cache-from-a-laptop).
 The same sign-in reads the flaky, broken, cluster and quarantine data the
-dashboard shows: `aster srv flaky`, `aster srv clusters`, `aster srv get <path>`
-print JSON ([details](docs/test-tracking.md#reading-the-dashboards-data)).
+dashboard shows: `aster results flaky`, `aster results clusters`, `aster srv get <path>`
+print JSON; `aster srv whoami` shows who you are signed in as ([details](docs/test-tracking.md#reading-the-dashboards-data)).
 
 A hit restores declared `outputs` from the artifact cache and skips execution.
 `aster cache status` reads that store's per-project index. `--json` prints

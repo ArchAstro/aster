@@ -331,7 +331,7 @@ impl Server {
 }
 
 /// An `Authorization` value holding a person token for `email`, as
-/// `aster cache login` would have fetched it.
+/// `aster srv login` would have fetched it.
 pub fn person_bearer(server: &Server, email: &str) -> String {
     let issuer = server
         .app

@@ -1,7 +1,7 @@
 //! Who may read and write the cache.
 //!
 //! Reads: any authenticated CI token for the repository, and a signed-in
-//! person (`aster cache login`) whose email domain is allowed, for any
+//! person (`aster srv login`) whose email domain is allowed, for any
 //! repository the server serves. Writes: a static development token, or a CI
 //! token whose `ref` claim matches `ASTER_SRV_CACHE_WRITERS` and, when
 //! `ASTER_SRV_CACHE_WRITER_WORKFLOWS` is set, whose `job_workflow_ref`

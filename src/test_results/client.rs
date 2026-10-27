@@ -83,7 +83,7 @@ impl Server {
             .context("cannot read the server's reply")
     }
 
-    /// A server that sends a signed-in person's token (`aster cache login`)
+    /// A server that sends a signed-in person's token (`aster srv login`)
     /// instead of a CI credential.
     pub fn with_token(
         url: &str,

@@ -697,7 +697,7 @@ token is verified; a commit may be as large as `ASTER_SRV_MAX_BODY_BYTES`.
 
 ## Laptop sign-in
 
-`aster cache login` signs a person in so a laptop can read the cache. It is
+`aster srv login` signs a person in so a laptop can read the cache. It is
 an authorization-code flow with PKCE against the CLI's loopback port.
 
 | Route | |
@@ -762,7 +762,7 @@ Planned rotation, with nobody signed out:
 
 Emergency rotation, when a secret leaked: replace the whole list with one new
 pair, `k3:<new>`, and deploy. Every token signed with an older key is refused
-at once, so everyone signs in again with `aster cache login`; a `/cli-auth`
+at once, so everyone signs in again with `aster srv login`; a `/cli-auth`
 page open during the deploy fails its MAC and has to be reloaded.
 
 Kill switch: `ASTER_SRV_PERSON_TOKENS=off` refuses every person token and
@@ -773,7 +773,7 @@ tokens still within their lifetime and signed by a listed key work again.
 ### Revoking a departed person's tokens
 
 Removing someone from IAP stops new sign-ins, but a token they already hold
-works until it expires (up to 12 hours). `aster cache logout` revokes a
+works until it expires (up to 12 hours). `aster srv logout` revokes a
 person's own tokens; an operator does the same for someone else by writing
 their row in `auth.revocations` directly. There is no admin route for this.
 
