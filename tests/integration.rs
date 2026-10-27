@@ -4065,3 +4065,58 @@ env = ["CI"]
         "opting in with cache.env = [\"CI\"] must change the cache key"
     );
 }
+
+/// Sign-in and the aster-srv readers talk to the server and the user's config
+/// directory, so they run outside a workspace, legacy spellings included. The
+/// rename notices go to stderr so `--json` stdout stays clean.
+#[test]
+fn srv_commands_run_outside_a_workspace_and_name_renames_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let cases: &[(&[&str], &str, Option<&str>)] = &[
+        (&["srv", "login"], "run aster srv login again", None),
+        (&["srv", "logout"], "run aster srv logout again", None),
+        (&["srv", "whoami"], "run aster srv whoami again", None),
+        (
+            &["cache", "login"],
+            "run aster srv login again",
+            Some("`aster cache login` is now `aster srv login`"),
+        ),
+        (
+            &["cache", "logout"],
+            "run aster srv logout again",
+            Some("`aster cache logout` is now `aster srv logout`"),
+        ),
+        (&["cache", "stats"], "set ASTER_SRV_URL", None),
+        (&["results", "flaky"], "set ASTER_SRV_URL", None),
+        (
+            &["srv", "flaky"],
+            "set ASTER_SRV_URL",
+            Some("now `aster results flaky`"),
+        ),
+    ];
+    for (args, error, notice) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(*args)
+            .env_remove("ASTER_SRV_URL")
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?}: stdout {:?}",
+            output.stdout
+        );
+        assert!(
+            !stderr.contains("Not in an aster workspace"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains(error), "{args:?}: {stderr}");
+        match notice {
+            Some(notice) => assert!(stderr.contains(notice), "{args:?}: {stderr}"),
+            None => assert!(!stderr.contains("is now"), "{args:?}: {stderr}"),
+        }
+    }
+}
