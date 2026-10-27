@@ -255,6 +255,20 @@ impl Delegated {
             .collect()
     }
 
+    /// Whether the script before the test command may change its
+    /// environment in a way [`Self::environment`] does not show:
+    /// `export`, `source env.sh`, `set -a`, `eval` and the like.
+    pub(crate) fn hides_environment(&self) -> bool {
+        self.head
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+            .any(|word| {
+                matches!(
+                    word,
+                    "export" | "source" | "." | "set" | "eval" | "declare" | "typeset" | "unset"
+                )
+            })
+    }
+
     /// The same one-liner without the environment assignments of `name`
     /// written before the test command.
     pub(crate) fn without_assignment(&self, name: &str) -> Self {
@@ -576,88 +590,193 @@ pub(super) const GO_VALUE_FLAGS: &[&str] = &[
     "-C",
 ];
 
-/// `go test` over relative package patterns. Selected packages run filtered
-/// to the selected test functions with `-run`.
-pub(super) fn go(command: &str, tests: &[RelatedTest]) -> Option<FilesListPlan> {
-    let argv = Argv::parse(command)?;
-    let parts = &argv.parts;
-    if Path::new(&parts[argv.program]).file_name()?.to_str()? != "go"
-        || parts.get(argv.program + 1).map(String::as_str) != Some("test")
-    {
-        return None;
-    }
-    let start = argv.program + 2;
-    // A command that already filters tests is left alone.
-    if parts[start..]
-        .iter()
-        .any(|p| p == "-run" || p.starts_with("-run=") || p == "--run" || p.starts_with("--run="))
-    {
-        return None;
-    }
-    let mut packages = Vec::new();
-    for i in argv.positionals(start, GO_VALUE_FLAGS) {
-        // Positionals after `-args` belong to the test binary.
-        if parts[start..i]
-            .iter()
-            .any(|p| p == "-args" || p == "--args")
+/// `go test` flags that change which files a package builds from or how
+/// packages resolve, and so must reach `go list` too. `-race`, `-msan` and
+/// `-asan` set the build tag of the same name.
+const GO_CONTEXT_VALUE_FLAGS: &[&str] = &["C", "tags", "mod", "modfile", "overlay", "compiler"];
+const GO_CONTEXT_BOOL_FLAGS: &[&str] = &["race", "msan", "asan"];
+
+/// A `go test` command over relative package patterns. Selected packages
+/// run filtered to the selected test functions with `-run`.
+pub(super) struct GoTest {
+    argv: Argv,
+    /// Indexes of the package patterns in `argv`.
+    packages: Vec<usize>,
+}
+
+impl GoTest {
+    pub(super) fn parse(command: &str) -> Option<Self> {
+        let argv = Argv::parse(command)?;
+        let parts = &argv.parts;
+        if Path::new(&parts[argv.program]).file_name()?.to_str()? != "go"
+            || parts.get(argv.program + 1).map(String::as_str) != Some("test")
         {
             return None;
         }
-        if !(parts[i] == "." || parts[i].starts_with("./")) {
+        let start = argv.program + 2;
+        // A command that already filters tests is left alone.
+        if parts[start..].iter().any(|p| {
+            p == "-run" || p.starts_with("-run=") || p == "--run" || p.starts_with("--run=")
+        }) {
             return None;
         }
-        packages.push(i);
+        let mut packages = Vec::new();
+        for i in argv.positionals(start, GO_VALUE_FLAGS) {
+            // Positionals after `-args` belong to the test binary.
+            if parts[start..i]
+                .iter()
+                .any(|p| p == "-args" || p == "--args")
+            {
+                return None;
+            }
+            if !(parts[i] == "." || parts[i].starts_with("./")) {
+                return None;
+            }
+            packages.push(i);
+        }
+        Some(Self { argv, packages })
     }
-    let in_scope = |dir: &str| {
-        packages.is_empty() && dir == "."
-            || packages.iter().any(|&i| {
+
+    /// The package directory of a test file, relative to the project: `.`
+    /// for the project root.
+    pub(super) fn package_dir(test: &RelatedTest) -> String {
+        test.file
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| ".".to_string())
+    }
+
+    /// Whether the command's package patterns cover the package in `dir`.
+    pub(super) fn covers(&self, dir: &str) -> bool {
+        let parts = &self.argv.parts;
+        self.packages.is_empty() && dir == "."
+            || self.packages.iter().any(|&i| {
                 let pattern = parts[i].trim_start_matches("./");
                 match pattern.strip_suffix("...") {
                     Some(prefix) => {
                         let prefix = prefix.trim_end_matches('/');
-                        prefix.is_empty() || dir == prefix || dir.starts_with(&format!("{prefix}/"))
+                        let below = if prefix.is_empty() {
+                            Some(if dir == "." { "" } else { dir })
+                        } else if dir == prefix {
+                            Some("")
+                        } else {
+                            dir.strip_prefix(&format!("{prefix}/"))
+                        };
+                        // `...` skips `testdata` and directories whose
+                        // names start with `.` or `_`, as `go test` does.
+                        below.is_some_and(|below| {
+                            !below.split('/').any(|name| {
+                                name == "testdata" || name.starts_with('.') || name.starts_with('_')
+                            })
+                        })
                     }
                     None => dir == pattern.trim_end_matches('/') || (pattern == "." && dir == "."),
                 }
             })
-    };
-    let mut whole: BTreeSet<String> = BTreeSet::new();
-    let mut named: BTreeSet<String> = BTreeSet::new();
-    let mut names: BTreeSet<&str> = BTreeSet::new();
-    for test in tests {
-        let dir = test
-            .file
-            .parent()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| ".".to_string());
-        if !in_scope(&dir) {
-            continue;
+    }
+
+    /// The program that runs the command.
+    pub(super) fn program(&self) -> &str {
+        &self.argv.parts[self.argv.program]
+    }
+
+    /// The environment assignments written before the program.
+    pub(super) fn environment(&self) -> Vec<(String, String)> {
+        self.argv.parts[..self.argv.program]
+            .iter()
+            .filter_map(|p| p.split_once('='))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// shell_words removes quoting but does not expand shell expressions.
+    /// Never pass those literal expressions to the probe. Even quoted or
+    /// escaped literals conservatively fall back: evaluating shell is unsafe.
+    pub(super) fn context_is_static(&self) -> bool {
+        self.argv.parts[..self.argv.program]
+            .iter()
+            .chain(self.build_context_flags().iter())
+            .all(|part| !part.contains(['$', '`', '~', '*', '?', '[', '{']))
+    }
+
+    /// The command's flags that decide which files each package builds
+    /// from, in their order, ready to pass to `go list`.
+    pub(super) fn build_context_flags(&self) -> Vec<String> {
+        let parts = &self.argv.parts;
+        let mut flags = Vec::new();
+        let mut i = self.argv.program + 2;
+        while i < parts.len() {
+            let part = parts[i].as_str();
+            if part == "--" || part == "-args" || part == "--args" {
+                break;
+            }
+            let Some(flag) = part.strip_prefix("--").or_else(|| part.strip_prefix('-')) else {
+                i += 1;
+                continue;
+            };
+            let (name, inline) = match flag.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (flag, false),
+            };
+            if GO_CONTEXT_BOOL_FLAGS.contains(&name)
+                || (GO_CONTEXT_VALUE_FLAGS.contains(&name) && inline)
+            {
+                flags.push(part.to_string());
+            } else if GO_CONTEXT_VALUE_FLAGS.contains(&name) {
+                flags.push(part.to_string());
+                if let Some(value) = parts.get(i + 1) {
+                    flags.push(value.clone());
+                }
+                i += 1;
+            } else if GO_VALUE_FLAGS.contains(&part) {
+                i += 1;
+            }
+            i += 1;
         }
-        let package = if dir == "." {
-            ".".to_string()
-        } else {
-            format!("./{dir}")
-        };
-        if test.names.is_empty() {
-            whole.insert(package);
-        } else {
-            named.insert(package);
-            names.extend(test.names.iter().map(String::as_str));
+        flags
+    }
+
+    /// The commands that run `tests`: packages with whole-file selections
+    /// in full, the rest filtered to the selected test functions with
+    /// `-run`. Tests outside the command's packages are ignored.
+    pub(super) fn plan(&self, tests: &[RelatedTest]) -> Option<FilesListPlan> {
+        let mut whole: BTreeSet<String> = BTreeSet::new();
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for test in tests {
+            let dir = Self::package_dir(test);
+            if !self.covers(&dir) {
+                continue;
+            }
+            let package = if dir == "." {
+                ".".to_string()
+            } else {
+                format!("./{dir}")
+            };
+            if test.names.is_empty() {
+                whole.insert(package);
+            } else {
+                named.insert(package);
+                names.extend(test.names.iter().map(String::as_str));
+            }
         }
+        named.retain(|package| !whole.contains(package));
+        let mut commands = Vec::new();
+        if !whole.is_empty() {
+            commands.push(
+                self.argv
+                    .render(&self.packages, &whole.into_iter().collect::<Vec<_>>()),
+            );
+        }
+        if !named.is_empty() {
+            let pattern = format!("^({})$", names.into_iter().collect::<Vec<_>>().join("|"));
+            let mut add = vec!["-run".to_string(), pattern];
+            add.extend(named);
+            commands.push(self.argv.render(&self.packages, &add));
+        }
+        plan(commands)
     }
-    named.retain(|package| !whole.contains(package));
-    let mut commands = Vec::new();
-    if !whole.is_empty() {
-        commands.push(argv.render(&packages, &whole.into_iter().collect::<Vec<_>>()));
-    }
-    if !named.is_empty() {
-        let pattern = format!("^({})$", names.into_iter().collect::<Vec<_>>().join("|"));
-        let mut add = vec!["-run".to_string(), pattern];
-        add.extend(named);
-        commands.push(argv.render(&packages, &add));
-    }
-    plan(commands)
 }
 
 pub(super) const PYTEST_VALUE_FLAGS: &[&str] = &[
@@ -732,6 +851,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    fn go(command: &str, tests: &[RelatedTest]) -> Option<FilesListPlan> {
+        GoTest::parse(command)?.plan(tests)
+    }
+
     fn tests_of(files: &[(&str, &[&str])]) -> Vec<RelatedTest> {
         files
             .iter()
@@ -789,6 +912,33 @@ mod tests {
         let local = Delegated::parse("bash -c 'bash check.sh && go test ./...'").unwrap();
         assert_eq!(local.dir, None);
         assert_eq!(local.command, "go test ./...");
+    }
+
+    #[test]
+    fn one_liners_that_set_the_environment_out_of_sight_say_so() {
+        for (command, hides) in [
+            ("bash -c 'go test ./...'", false),
+            (
+                "bash -c 'cd ../core && GOFLAGS=-tags=x exec go test ./...'",
+                false,
+            ),
+            ("bash -c 'make setup && go test ./...'", false),
+            ("bash -c 'export GOFLAGS=-tags=x; go test ./...'", true),
+            ("bash -c 'source env.sh && go test ./...'", true),
+            ("bash -c '. ./env.sh; go test ./...'", true),
+            ("bash -c 'set -a; . .env; set +a; go test ./...'", true),
+            (
+                "sh -c 'eval \"$(direnv export bash)\"; go test ./...'",
+                true,
+            ),
+        ] {
+            let delegated = Delegated::parse(command);
+            assert_eq!(
+                delegated.as_ref().map(Delegated::hides_environment),
+                Some(hides),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -887,6 +1037,21 @@ mod tests {
 
     #[test]
     fn go_runs_whole_packages_and_named_tests_separately() {
+        for (command, known) in [
+            ("go test -tags devtool ./...", true),
+            ("GOFLAGS=-tags=devtool go test ./...", true),
+            ("go test -tags \"$DEV_TAGS\" ./...", false),
+            ("GOFLAGS=-tags=$DEV_TAGS go test ./...", false),
+            ("go test -tags `tag-command` ./...", false),
+            ("go test -overlay ~/overlay.json ./...", false),
+        ] {
+            assert_eq!(
+                GoTest::parse(command).is_some_and(|go| go.context_is_static()),
+                known,
+                "{command}"
+            );
+        }
+
         let tests = tests_of(&[
             ("cart/cart_test.go", &["TestTotal", "TestAdd"]),
             ("stock/stock_test.go", &[]),

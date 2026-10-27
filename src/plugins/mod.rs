@@ -328,6 +328,19 @@ pub trait LanguagePlugin: Send + Sync {
         None
     }
 
+    /// [`Self::related_tests`] for a command run by a shell one-liner that
+    /// may change its environment where Aster cannot read it (`export`,
+    /// `source env.sh`). A plugin whose narrowing reads the environment
+    /// overrides this to stay correct without it.
+    fn related_tests_in_hidden_environment(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[RelatedTest],
+    ) -> Option<FilesListPlan> {
+        self.related_tests(project_dir, command, tests)
+    }
+
     /// Modify a command to treat warnings as errors
     ///
     /// Called when a target has the WarningsAsErrors capability and

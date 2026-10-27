@@ -451,8 +451,18 @@ impl<'a> RelatedPlanner<'a> {
             .map(|delegated| delegated.environment())
             .unwrap_or_default();
         let command = format!("{environment}{}", runner.command);
+        let hidden_environment = runner
+            .delegated
+            .as_ref()
+            .is_some_and(Delegated::hides_environment);
         let attempt = |tests: &[RelatedTest]| {
-            plugin.and_then(|p| p.related_tests(&project.root, &command, tests))
+            plugin.and_then(|p| {
+                if hidden_environment {
+                    p.related_tests_in_hidden_environment(&project.root, &command, tests)
+                } else {
+                    p.related_tests(&project.root, &command, tests)
+                }
+            })
         };
         if !placeholder && attempt(&[]).is_none() {
             return Ok(Narrowed::NotRunner);

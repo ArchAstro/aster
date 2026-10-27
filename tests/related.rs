@@ -664,6 +664,222 @@ fn go_names_are_told_apart_by_package_and_receiver() {
     );
 }
 
+/// A Go module where a change to `stock` reaches a test in `cart`, a test
+/// in `devtool`, a package whose every file needs the `devtool` build tag,
+/// and a failing test in `_old`, a directory `./...` does not match.
+/// `go test ./...` skips `devtool` and `_old`; naming `devtool` fails the
+/// run with "build constraints exclude all Go files". Each test records that
+/// it ran in a file at the module root.
+const GO_WITH_TAGGED_PACKAGE: &[(&str, &str)] = &[
+    ("svc/go.mod", "module example.com/svc\n\ngo 1.21\n"),
+    (
+        "svc/stock/stock.go",
+        "package stock\n\nfunc Hold(n int) int { return n }\n",
+    ),
+    (
+        "svc/cart/cart_test.go",
+        "package cart\n\nimport (\n\t\"os\"\n\t\"testing\"\n\n\t\"example.com/svc/stock\"\n)\n\nfunc TestReserve(t *testing.T) {\n\tstock.Hold(1)\n\tos.WriteFile(\"../ran-cart\", nil, 0o644)\n}\n",
+    ),
+    (
+        "svc/devtool/main.go",
+        "//go:build devtool\n\npackage main\n\nimport \"example.com/svc/stock\"\n\nfunc main() { stock.Hold(2) }\n",
+    ),
+    (
+        "svc/_old/old_test.go",
+        "package old\n\nimport (\n\t\"testing\"\n\n\t\"example.com/svc/stock\"\n)\n\nfunc TestRetired(t *testing.T) {\n\tstock.Hold(4)\n\tt.Fatal(\"retired code is not built\")\n}\n",
+    ),
+    (
+        "svc/devtool/main_test.go",
+        "//go:build devtool\n\npackage main\n\nimport (\n\t\"os\"\n\t\"testing\"\n\n\t\"example.com/svc/stock\"\n)\n\nfunc TestDevHold(t *testing.T) {\n\tstock.Hold(3)\n\tos.WriteFile(\"../ran-devtool\", nil, 0o644)\n}\n",
+    ),
+];
+
+#[test]
+fn go_related_run_names_only_packages_go_test_builds() {
+    if Command::new("go").arg("version").output().is_err() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    // Setup: `go test ./...`, the default Go test target, over a module with
+    // a tag-gated package. `deps` is stubbed so the run needs no network.
+    let mut files = GO_WITH_TAGGED_PACKAGE.to_vec();
+    files.push((
+        "svc/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"go test ./...\"\n",
+    ));
+    let ws = Workspace::new(&files);
+
+    // The change reaches tests in `cart`, `devtool` and `_old`.
+    ws.edit("svc/stock/stock.go", "{ return n }", "{ return n + 0 }");
+
+    // The narrowed command names only `cart`: `devtool` has no Go files
+    // under the command's build context and `./...` does not match `_old`,
+    // so `go test ./...` would not run their tests either.
+    assert_eq!(
+        ws.plan("test").commands("//svc:test"),
+        ["go test -run '^(TestReserve)$' ./cart"]
+    );
+
+    // The real run crosses into `go test` and passes, and the related test
+    // in the buildable package ran.
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related"]);
+    assert!(
+        output.status.success(),
+        "aster failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ws.root().join("svc/ran-cart").exists(),
+        "TestReserve did not run"
+    );
+    assert!(!ws.root().join("svc/ran-devtool").exists());
+
+    // With the tag on the command, `devtool` builds, so its test is
+    // selected and runs too.
+    ws.write(
+        "svc/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"go test -tags devtool ./...\"\n",
+    );
+    ws.git(&["add", "svc/aster.toml"]);
+    ws.git(&["commit", "-q", "-m", "tag the test target"]);
+    // `stock.go` is still changed against the new HEAD.
+    fs::remove_file(ws.root().join("svc/ran-cart")).unwrap();
+    assert_eq!(
+        ws.plan("test").commands("//svc:test"),
+        ["go test -tags devtool -run '^(TestDevHold|TestReserve)$' ./cart ./devtool"]
+    );
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related"]);
+    assert!(
+        output.status.success(),
+        "aster failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ws.root().join("svc/ran-cart").exists(),
+        "TestReserve did not run"
+    );
+    assert!(
+        ws.root().join("svc/ran-devtool").exists(),
+        "TestDevHold did not run"
+    );
+
+    // A one-liner that exports the tag before the test command hides it
+    // from Aster. `go list` without the tag would cut `devtool`, so the
+    // target runs as written instead of dropping a test the script runs.
+    ws.write(
+        "svc/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"bash -c 'export GOFLAGS=-tags=devtool; go test ./...'\"\n",
+    );
+    ws.git(&["add", "svc/aster.toml"]);
+    ws.git(&["commit", "-q", "-m", "export the tag"]);
+    fs::remove_file(ws.root().join("svc/ran-cart")).unwrap();
+    fs::remove_file(ws.root().join("svc/ran-devtool")).unwrap();
+    assert!(ws.plan("test").commands("//svc:test").is_empty());
+    assert!(ws
+        .plan("test")
+        .notes("//svc:test")
+        .contains("could not be narrowed"));
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related"]);
+    assert!(
+        output.status.success(),
+        "aster failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ws.root().join("svc/ran-cart").exists(),
+        "TestReserve did not run"
+    );
+    assert!(
+        ws.root().join("svc/ran-devtool").exists(),
+        "TestDevHold did not run"
+    );
+}
+
+/// Inverse hidden context: the parent builds devtool, but the target removes
+/// the tag. Naming the package based on the parent would fail the real run.
+#[test]
+fn go_related_run_preserves_hidden_environment_removal() {
+    go_related_dynamic_context_cases(&[(
+        "bash -c 'unset GOFLAGS; go test ./...'",
+        "GOFLAGS",
+        "-tags=devtool",
+        false,
+    )]);
+}
+
+/// Shell expansion belongs to the target shell, not the go-list subprocess.
+#[test]
+fn go_related_run_preserves_inherited_variable_expansion() {
+    go_related_dynamic_context_cases(&[
+        (
+            "bash -c 'go test -tags \"$DEV_TAGS\" ./...'",
+            "DEV_TAGS",
+            "devtool",
+            true,
+        ),
+        (
+            "bash -c 'GOFLAGS=-tags=$DEV_TAGS go test ./...'",
+            "DEV_TAGS",
+            "devtool",
+            true,
+        ),
+    ]);
+}
+
+fn go_related_dynamic_context_cases(cases: &[(&str, &str, &str, bool)]) {
+    assert!(Command::new("go")
+        .arg("version")
+        .status()
+        .unwrap()
+        .success());
+    for &(command, key, value, devtool_runs) in cases {
+        // Real git workspace and production Aster process; environment is
+        // scoped to each child, never mutated in the parallel test process.
+        let config = format!(
+            "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = {}\n",
+            serde_json::to_string(command).unwrap()
+        );
+        let mut files = GO_WITH_TAGGED_PACKAGE.to_vec();
+        files.push(("svc/aster.toml", &config));
+        let ws = Workspace::new(&files);
+        ws.edit("svc/stock/stock.go", "{ return n }", "{ return n + 0 }");
+        let run = |dry: bool| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_aster"));
+            child
+                .current_dir(ws.root())
+                .env_remove("GOFLAGS")
+                .env(key, value);
+            child.args(["--json", "affected", "test", "--base=HEAD", "--related"]);
+            if dry {
+                child.arg("--dry-run");
+            }
+            child.output().unwrap()
+        };
+        // Planning cannot prove the effective context: preserve the target.
+        let plan = run(true);
+        assert!(plan.status.success(), "{plan:?}");
+        let json: Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let target = json["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["address"] == "//svc:test")
+            .unwrap();
+        assert!(
+            target["commands"].as_array().is_none_or(|c| c.is_empty()),
+            "{command}: {target}"
+        );
+        // Cross Aster -> shell -> real Go and observe which tests ran.
+        let output = run(false);
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(ws.root().join("svc/ran-cart").exists());
+        assert_eq!(ws.root().join("svc/ran-devtool").exists(), devtool_runs);
+    }
+}
+
 #[test]
 fn a_method_reaches_only_the_tests_that_load_its_file() {
     let ws = Workspace::new(&[
