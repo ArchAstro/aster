@@ -500,7 +500,13 @@ the tests that reach them, across project boundaries.
   requested target and in the same-project targets it depends on, whether
   run directly (`pnpm exec vitest run`) or through a package script that is
   only the runner. Elixir, JavaScript and Python run the selected test
-  files; Go runs the selected packages with `-run '^(TestA|TestB)$'`. A
+  files; Go runs the selected packages with `-run '^(TestA|TestB)$'`. Go
+  keeps only the test files `go list` builds under the command's build
+  context (`-tags`, `-race`, `GOOS`, `GOFLAGS` and the like), so a package
+  `go test ./...` would skip, such as one whose files all need a build tag
+  the command does not set, is not named. If `go list` fails or the build
+  context depends on shell expansion or hidden environment changes, the
+  command runs as written. A
   command that already lists test files keeps the ones selected. A
   `{files}` placeholder receives the selected test files.
 - **Shard and wrapper projects follow the project whose tests they run.**

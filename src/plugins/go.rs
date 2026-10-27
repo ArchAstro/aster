@@ -6,9 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use super::related_tests::GoTest;
 use super::{
-    LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
-    TargetContext,
+    FilesListPlan, LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, RelatedTest,
+    Target, TargetCapability, TargetContext,
 };
 
 /// Regex to extract module path from go.mod: `module github.com/user/project`
@@ -207,11 +208,20 @@ impl LanguagePlugin for GoPlugin {
 
     fn related_tests(
         &self,
-        _project_dir: &Path,
+        project_dir: &Path,
         command: &str,
-        tests: &[super::RelatedTest],
-    ) -> Option<super::FilesListPlan> {
-        super::related_tests::go(command, tests)
+        tests: &[RelatedTest],
+    ) -> Option<FilesListPlan> {
+        related_go_tests(project_dir, command, tests, true)
+    }
+
+    fn related_tests_in_hidden_environment(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[RelatedTest],
+    ) -> Option<FilesListPlan> {
+        related_go_tests(project_dir, command, tests, false)
     }
 
     fn with_files_list(
@@ -347,6 +357,138 @@ impl LanguagePlugin for GoPlugin {
             report: None,
         })
     }
+}
+
+/// Narrow `go test` to the selected tests that build under its build
+/// context. When the environment is not fully known (`environment_known`
+/// false), `go list` may see either more or fewer buildable files than the
+/// command will. Preserve the original command in either direction.
+fn related_go_tests(
+    project_dir: &Path,
+    command: &str,
+    tests: &[RelatedTest],
+    environment_known: bool,
+) -> Option<FilesListPlan> {
+    let go_test = GoTest::parse(command)?;
+    if !environment_known || !go_test.context_is_static() {
+        return Some(FilesListPlan::Full);
+    }
+    let selected: Vec<RelatedTest> = tests
+        .iter()
+        .filter(|test| go_test.covers(&GoTest::package_dir(test)))
+        .cloned()
+        .collect();
+    if selected.is_empty() {
+        return go_test.plan(&selected);
+    }
+    match buildable_tests(project_dir, &go_test, &selected) {
+        Ok(Some(kept)) => go_test.plan(&kept),
+        // Without a Go toolchain, buildability is unknown. Preserve the
+        // original command rather than naming potentially excluded packages.
+        Ok(None) => Some(FilesListPlan::Full),
+        // A narrowed command that may name a package that does not build
+        // would fail where the full command passes.
+        Err(_) => Some(FilesListPlan::Full),
+    }
+}
+
+/// One package as `go list -e -json` prints it: the fields that say which
+/// test files build.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListedPackage {
+    dir: Option<PathBuf>,
+    #[serde(default)]
+    test_go_files: Vec<String>,
+    #[serde(default)]
+    x_test_go_files: Vec<String>,
+}
+
+/// The `tests` whose files build under the command's build context: its
+/// build tags and other build flags, its environment assignments, and the
+/// environment Aster runs it in. `go test ./...` only runs these, and a
+/// package with none of its files in the build fails the run when named
+/// ("build constraints exclude all Go files").
+///
+/// `go list` decides, so build constraints, file name suffixes such as
+/// `_windows.go`, cgo and `-race` count as they do for `go test`. `Ok(None)`
+/// means the Go program could not be started; `Err` means `go list` did not
+/// describe the packages.
+fn buildable_tests(
+    project_dir: &Path,
+    go_test: &GoTest,
+    tests: &[RelatedTest],
+) -> Result<Option<Vec<RelatedTest>>> {
+    let dirs: std::collections::BTreeSet<String> = tests.iter().map(GoTest::package_dir).collect();
+    let mut command = std::process::Command::new(go_test.program());
+    command
+        .arg("list")
+        .args(go_test.build_context_flags())
+        // `-find` reads each package's files without resolving its imports;
+        // `-e` describes a package that does not build instead of failing.
+        .args(["-find", "-e", "-json"])
+        .args(dirs.iter().map(|dir| {
+            if dir == "." {
+                ".".to_string()
+            } else {
+                format!("./{dir}")
+            }
+        }))
+        .envs(go_test.environment())
+        // Which files build never depends on downloads, and planning must
+        // not fetch modules (`-find` still does when go.sum lists them).
+        .env("GOPROXY", "off")
+        .current_dir(project_dir)
+        .stdin(std::process::Stdio::null());
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to run go list"),
+    };
+    if !output.status.success() {
+        return Err(anyhow!(
+            "go list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let root = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let mut building: HashMap<String, HashSet<String>> = HashMap::new();
+    for package in serde_json::Deserializer::from_slice(&output.stdout).into_iter() {
+        let package: ListedPackage = package.context("go list printed invalid JSON")?;
+        let Some(dir) = package.dir else { continue };
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let Ok(relative) = dir.strip_prefix(&root) else {
+            continue;
+        };
+        let relative = workspace_relative(relative, Path::new(""));
+        let relative = if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative
+        };
+        building.entry(relative).or_default().extend(
+            package
+                .test_go_files
+                .into_iter()
+                .chain(package.x_test_go_files),
+        );
+    }
+    // Every package asked about is described, even one that does not build.
+    if let Some(missing) = dirs.iter().find(|dir| !building.contains_key(*dir)) {
+        return Err(anyhow!("go list did not describe ./{missing}"));
+    }
+    Ok(Some(
+        tests
+            .iter()
+            .filter(|test| {
+                let name = test.file.file_name().map(|n| n.to_string_lossy());
+                name.is_some_and(|name| building[&GoTest::package_dir(test)].contains(&*name))
+            })
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// Path after the `-o` flag of a `go build` invocation in `command`.
@@ -509,6 +651,263 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn related_tests_without_go_preserve_the_original_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = format!("{} test ./...", tmp.path().join("go").display());
+        let tests = [RelatedTest {
+            file: PathBuf::from("devonly/main_test.go"),
+            names: vec!["TestDev".to_string()],
+        }];
+        // No toolchain is needed to prove that an unavailable executable
+        // leaves buildability unknown, for both direct and shell runners.
+        for environment_known in [true, false] {
+            assert_eq!(
+                related_go_tests(tmp.path(), &command, &tests, environment_known),
+                Some(FilesListPlan::Full)
+            );
+        }
+    }
+
+    /// Every package case of a module, each with one test, and how a
+    /// related-tests run narrows `go test` over them. `go list` decides
+    /// which packages build, so each row runs the real Go toolchain.
+    #[test]
+    fn related_tests_keep_only_the_test_files_the_build_context_builds() {
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: go is not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let test = |package: &str, name: &str| {
+            format!("package {package}\n\nimport \"testing\"\n\nfunc {name}(t *testing.T) {{}}\n")
+        };
+        let tagged = |tag: &str, body: String| format!("//go:build {tag}\n\n{body}");
+        let files = [
+            ("go.mod", "module example.com/m\n\ngo 1.21\n".to_string()),
+            // A test file in the module root package.
+            ("root_test.go", test("m", "TestRoot")),
+            ("plain/plain.go", "package plain\n".to_string()),
+            ("plain/plain_test.go", test("plain", "TestPlain")),
+            // Every file needs a build tag.
+            (
+                "devonly/main.go",
+                tagged("devtag", "package main\n\nfunc main() {}\n".into()),
+            ),
+            (
+                "devonly/main_test.go",
+                tagged("devtag", test("main", "TestDev")),
+            ),
+            // Only test files: an in-package one and an external one.
+            ("testonly/only_test.go", test("testonly", "TestOnly")),
+            ("xtestonly/x_test.go", test("xtestonly_test", "TestX")),
+            // Built only for another OS, by file name.
+            ("otheros/os_plan9.go", "package otheros\n".to_string()),
+            ("otheros/os_plan9_test.go", test("otheros", "TestPlan9")),
+            // A package that builds, with one test file behind a tag.
+            ("mixed/mixed.go", "package mixed\n".to_string()),
+            ("mixed/a_test.go", test("mixed", "TestA")),
+            ("mixed/b_test.go", tagged("devtag", test("mixed", "TestB"))),
+            // Built only with the race detector, which sets the `race` tag.
+            ("racey/racey.go", "package racey\n".to_string()),
+            (
+                "racey/racey_test.go",
+                tagged("race", test("racey", "TestRace")),
+            ),
+            // Directories `./...` does not match.
+            ("testdata/fx/fx_test.go", test("fx", "TestFixture")),
+            ("_old/old_test.go", test("old", "TestOld")),
+            (".hidden/h_test.go", test("h", "TestHidden")),
+        ];
+        for (path, content) in &files {
+            let path = tmp.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let named = |file: &str, name: &str| RelatedTest {
+            file: PathBuf::from(file),
+            names: vec![name.to_string()],
+        };
+        let every: Vec<RelatedTest> = files
+            .iter()
+            .filter(|(path, _)| path.ends_with("_test.go"))
+            .map(|(path, content)| {
+                let name = content
+                    .split("func ")
+                    .nth(1)
+                    .unwrap()
+                    .split('(')
+                    .next()
+                    .unwrap();
+                named(path, name)
+            })
+            .collect();
+        let commands = |list: &[&str]| {
+            Some(FilesListPlan::Commands(
+                list.iter().map(|c| c.to_string()).collect(),
+            ))
+        };
+
+        let rows: Vec<(&str, &str, Vec<RelatedTest>, Option<FilesListPlan>)> = vec![
+            (
+                "no tags: tag-gated, other-OS and race-only files and testdata, _ and . directories drop out",
+                "go test ./...",
+                every.clone(),
+                commands(&["go test -run '^(TestA|TestOnly|TestPlain|TestRoot|TestX)$' . ./mixed ./plain ./testonly ./xtestonly"]),
+            ),
+            (
+                "the command's -tags builds the tagged files",
+                "go test -tags devtag ./...",
+                every.clone(),
+                commands(&["go test -tags devtag -run '^(TestA|TestB|TestDev|TestOnly|TestPlain|TestRoot|TestX)$' . ./devonly ./mixed ./plain ./testonly ./xtestonly"]),
+            ),
+            (
+                "-tags=value and --tags forms",
+                "go test --tags=devtag ./devonly",
+                vec![named("devonly/main_test.go", "TestDev")],
+                commands(&["go test --tags=devtag -run '^(TestDev)$' ./devonly"]),
+            ),
+            (
+                "tags set through GOFLAGS on the command",
+                "GOFLAGS=-tags=devtag go test ./devonly",
+                vec![named("devonly/main_test.go", "TestDev")],
+                commands(&["GOFLAGS=-tags=devtag go test -run '^(TestDev)$' ./devonly"]),
+            ),
+            (
+                "a package whose only files are tag-gated runs nothing",
+                "go test ./devonly",
+                vec![named("devonly/main_test.go", "TestDev")],
+                Some(FilesListPlan::Nothing),
+            ),
+            (
+                "a whole-file selection in a tag-gated package drops out",
+                "go test ./...",
+                vec![
+                    RelatedTest { file: PathBuf::from("devonly/main_test.go"), names: vec![] },
+                    RelatedTest { file: PathBuf::from("plain/plain_test.go"), names: vec![] },
+                ],
+                commands(&["go test ./plain"]),
+            ),
+            (
+                "a tag-gated test file in a package that builds drops out",
+                "go test ./mixed",
+                vec![named("mixed/b_test.go", "TestB")],
+                Some(FilesListPlan::Nothing),
+            ),
+            (
+                "a file for another OS drops out",
+                "go test ./otheros",
+                vec![named("otheros/os_plan9_test.go", "TestPlan9")],
+                Some(FilesListPlan::Nothing),
+            ),
+            (
+                "GOOS on the command builds that OS's files",
+                "GOOS=plan9 go test ./otheros",
+                vec![named("otheros/os_plan9_test.go", "TestPlan9")],
+                commands(&["GOOS=plan9 go test -run '^(TestPlan9)$' ./otheros"]),
+            ),
+            (
+                "-race sets the race build tag",
+                "CGO_ENABLED=1 go test -race -count=1 ./racey",
+                vec![named("racey/racey_test.go", "TestRace")],
+                commands(&["CGO_ENABLED=1 go test -race -count=1 -run '^(TestRace)$' ./racey"]),
+            ),
+            (
+                "a race-only file drops out without -race",
+                "go test -count=1 ./racey",
+                vec![named("racey/racey_test.go", "TestRace")],
+                Some(FilesListPlan::Nothing),
+            ),
+            (
+                "go list failing runs the command as written",
+                "go test -mod=nonsense ./...",
+                vec![named("plain/plain_test.go", "TestPlain")],
+                Some(FilesListPlan::Full),
+            ),
+            (
+                "without a Go program the command runs as written",
+                "/nonexistent/go test ./...",
+                vec![named("devonly/main_test.go", "TestDev")],
+                Some(FilesListPlan::Full),
+            ),
+            (
+                "tests outside the command's packages are not listed",
+                "go test ./plain",
+                vec![named("plain/plain_test.go", "TestPlain"), named("devonly/main_test.go", "TestDev")],
+                commands(&["go test -run '^(TestPlain)$' ./plain"]),
+            ),
+            (
+                "a testdata directory named on the command is listed",
+                "go test ./testdata/fx",
+                vec![named("testdata/fx/fx_test.go", "TestFixture")],
+                commands(&["go test -run '^(TestFixture)$' ./testdata/fx"]),
+            ),
+            (
+                "a pattern rooted in an _ directory matches beneath it",
+                "go test ./_old/...",
+                vec![named("_old/old_test.go", "TestOld")],
+                commands(&["go test -run '^(TestOld)$' ./_old"]),
+            ),
+            (
+                "a command that is not go test is not narrowed",
+                "go vet ./...",
+                every.clone(),
+                None,
+            ),
+        ];
+        // A one-liner that sets its environment out of sight (`export`,
+        // `source`) may build files `go list` cannot see building.
+        let hidden: Vec<(&str, &str, Vec<RelatedTest>, Option<FilesListPlan>)> = vec![
+            (
+                "hidden environment: even a selection that all builds runs as written",
+                "go test ./...",
+                vec![named("plain/plain_test.go", "TestPlain")],
+                Some(FilesListPlan::Full),
+            ),
+            (
+                "hidden environment: a selection go list would cut runs as written",
+                "go test ./...",
+                vec![
+                    named("plain/plain_test.go", "TestPlain"),
+                    named("devonly/main_test.go", "TestDev"),
+                ],
+                Some(FilesListPlan::Full),
+            ),
+        ];
+        for command in [
+            "go test -tags \"$DEV_TAGS\" ./...",
+            "GOFLAGS=-tags=$DEV_TAGS go test ./...",
+        ] {
+            assert_eq!(
+                GoPlugin.related_tests(tmp.path(), command, &every),
+                Some(FilesListPlan::Full),
+                "dynamic build context: {command}"
+            );
+        }
+        let mut failures = Vec::new();
+        let runs = rows
+            .into_iter()
+            .map(|row| (false, row))
+            .chain(hidden.into_iter().map(|row| (true, row)));
+        for (hidden, (case, command, tests, expected)) in runs {
+            let actual = if hidden {
+                GoPlugin.related_tests_in_hidden_environment(tmp.path(), command, &tests)
+            } else {
+                GoPlugin.related_tests(tmp.path(), command, &tests)
+            };
+            if actual != expected {
+                failures.push(format!(
+                    "{case}: `{command}`\n  expected {expected:?}\n  got      {actual:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
