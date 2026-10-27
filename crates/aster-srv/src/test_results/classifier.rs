@@ -700,11 +700,13 @@ async fn classify(
         .await?;
 
     // State: re-derived for the tests in the new runs and for every test
-    // that is not healthy, whose score ages or whose streak may end.
-    let tests_updated = transaction
-        .query(
+    // that is not healthy, whose score ages or whose streak may end. Only
+    // the tests whose state changes are kept.
+    transaction
+        .execute(
             &format!(
-                "WITH affected AS ( \
+                "CREATE TEMP TABLE cls_state ON COMMIT DROP AS \
+                 WITH affected AS ( \
                      SELECT repo, test_id FROM cls_win \
                      UNION \
                      SELECT repo, test_id FROM test_results.tests \
@@ -725,31 +727,51 @@ async fn classify(
                  derived AS ( \
                      SELECT s.repo, s.test_id, s.score, s.last_flake_at, \
                             COALESCE(k.length, 0) >= {k} AS broken, \
-                            k.since_sha, k.failure_hash, o.state AS old_state \
-                     FROM scores s LEFT JOIN streaks k USING (repo, test_id) \
-                     JOIN test_results.tests o USING (repo, test_id)) \
-                 UPDATE test_results.tests t SET \
-                     state = CASE WHEN d.broken THEN 'broken' \
-                                  WHEN d.score > 0 THEN 'flaky' ELSE 'healthy' END, \
-                     flake_score = d.score, \
-                     last_flake_at = d.last_flake_at, \
-                     broken_since_sha = CASE WHEN d.broken THEN d.since_sha END, \
-                     broken_failure_hash = CASE WHEN d.broken THEN d.failure_hash END \
-                 FROM derived d \
-                 WHERE t.repo = d.repo AND t.test_id = d.test_id \
-                   AND (t.state, t.flake_score, t.last_flake_at, \
-                        t.broken_since_sha, t.broken_failure_hash) \
+                            k.since_sha, k.failure_hash \
+                     FROM scores s LEFT JOIN streaks k USING (repo, test_id)), \
+                 next AS ( \
+                     SELECT repo, test_id, \
+                            CASE WHEN broken THEN 'broken' \
+                                 WHEN score > 0 THEN 'flaky' ELSE 'healthy' END AS state, \
+                            score AS flake_score, last_flake_at, \
+                            CASE WHEN broken THEN since_sha END AS broken_since_sha, \
+                            CASE WHEN broken THEN failure_hash END AS broken_failure_hash \
+                     FROM derived) \
+                 SELECT n.*, o.state AS old_state \
+                 FROM next n JOIN test_results.tests o USING (repo, test_id) \
+                 WHERE (o.state, o.flake_score, o.last_flake_at, \
+                        o.broken_since_sha, o.broken_failure_hash) \
                        IS DISTINCT FROM \
-                       (CASE WHEN d.broken THEN 'broken' \
-                             WHEN d.score > 0 THEN 'flaky' ELSE 'healthy' END, \
-                        d.score, d.last_flake_at, \
-                        CASE WHEN d.broken THEN d.since_sha END, \
-                        CASE WHEN d.broken THEN d.failure_hash END) \
-                 RETURNING t.repo, t.test_id, t.target, t.file, t.suite, t.name, t.state, \
-                           d.old_state, t.broken_since_sha, t.broken_failure_hash",
+                       (n.state, n.flake_score, n.last_flake_at, \
+                        n.broken_since_sha, n.broken_failure_hash)",
                 to = at(window.to),
                 k = window.broken_runs,
             ),
+            &[],
+        )
+        .await?;
+    // Uploads upsert `tests` too. Locking the changed rows in (repo, test_id)
+    // "C" order first, the order uploads write in, means an upload and this
+    // pass wait for each other instead of deadlocking; the `UPDATE` alone
+    // locks in whatever order its join produces.
+    transaction
+        .execute(
+            "SELECT 1 FROM test_results.tests t JOIN cls_state s USING (repo, test_id) \
+             ORDER BY t.repo COLLATE \"C\", t.test_id COLLATE \"C\" \
+             FOR NO KEY UPDATE OF t",
+            &[],
+        )
+        .await?;
+    let tests_updated = transaction
+        .query(
+            "UPDATE test_results.tests t SET \
+                 state = s.state, flake_score = s.flake_score, last_flake_at = s.last_flake_at, \
+                 broken_since_sha = s.broken_since_sha, \
+                 broken_failure_hash = s.broken_failure_hash \
+             FROM cls_state s \
+             WHERE t.repo = s.repo AND t.test_id = s.test_id \
+             RETURNING t.repo, t.test_id, t.target, t.file, t.suite, t.name, t.state, \
+                       s.old_state, t.broken_since_sha, t.broken_failure_hash",
             &[],
         )
         .await?;
