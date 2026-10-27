@@ -807,10 +807,18 @@ mod tests {
                 Some(FilesListPlan::Nothing),
             ),
             (
-                "GOOS on the command builds that OS's files",
-                "GOOS=plan9 go test ./otheros",
+                // Plan 9 has no arm64 port: fix both axes so this probe
+                // also succeeds on Apple Silicon CI runners.
+                "GOOS and GOARCH on the command build that platform's files",
+                "GOOS=plan9 GOARCH=amd64 go test ./otheros",
                 vec![named("otheros/os_plan9_test.go", "TestPlan9")],
-                commands(&["GOOS=plan9 go test -run '^(TestPlan9)$' ./otheros"]),
+                commands(&["GOOS=plan9 GOARCH=amd64 go test -run '^(TestPlan9)$' ./otheros"]),
+            ),
+            (
+                "an unsupported GOOS/GOARCH pair preserves the original command",
+                "GOOS=plan9 GOARCH=arm64 go test ./otheros",
+                vec![named("otheros/os_plan9_test.go", "TestPlan9")],
+                Some(FilesListPlan::Full),
             ),
             (
                 "-race sets the race build tag",
