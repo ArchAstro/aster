@@ -212,7 +212,8 @@ impl LanguagePlugin for GoPlugin {
         command: &str,
         tests: &[RelatedTest],
     ) -> Option<FilesListPlan> {
-        related_go_tests(project_dir, command, tests, true)
+        deferred_go_tests(project_dir, command, tests)
+            .or_else(|| related_go_tests(project_dir, command, tests, true))
     }
 
     fn related_tests_in_hidden_environment(
@@ -221,7 +222,8 @@ impl LanguagePlugin for GoPlugin {
         command: &str,
         tests: &[RelatedTest],
     ) -> Option<FilesListPlan> {
-        related_go_tests(project_dir, command, tests, false)
+        deferred_go_tests(project_dir, command, tests)
+            .or_else(|| related_go_tests(project_dir, command, tests, false))
     }
 
     fn with_files_list(
@@ -357,6 +359,94 @@ impl LanguagePlugin for GoPlugin {
             report: None,
         })
     }
+}
+
+/// An explicit external execution boundary, not recognition of arbitrary setup
+/// syntax. The payload records absolute files so a sourced setup may change cwd.
+fn deferred_go_tests(
+    project_dir: &Path,
+    command: &str,
+    tests: &[RelatedTest],
+) -> Option<FilesListPlan> {
+    let argv = shell_words::split(command).ok()?;
+    if argv.first()?.as_str() != "aster"
+        || argv.get(1)?.as_str() != "exec-go-test"
+        || argv.get(2)?.as_str() != "--"
+    {
+        return None;
+    }
+    let selection: Vec<_> = tests
+        .iter()
+        .map(|test| (project_dir.join(&test.file), &test.names))
+        .collect();
+    let payload = serde_json::to_string(&selection).ok()?;
+    let exe = std::env::current_exe().ok()?;
+    let quote = crate::executor::quote_command_argument;
+    Some(FilesListPlan::Commands(vec![format!(
+        "{} exec-go-test --selection {} -- {}",
+        quote(&exe.to_string_lossy()),
+        quote(&payload),
+        argv[3..]
+            .iter()
+            .map(|arg| quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )]))
+}
+
+/// Execute external Go in the setup shell's exported environment and cwd.
+/// No command string is evaluated by a shell. The parent shell stays alive,
+/// including its EXIT trap, until this process returns.
+pub fn exec_go_test(selection: Option<&str>, args: &[String]) -> Result<i32> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let quote = crate::executor::quote_command_argument;
+    let original = format!(
+        "go test {}",
+        args.iter()
+            .map(|arg| quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let plan = if let Some(selection) = selection {
+        let selected: Vec<(PathBuf, Vec<String>)> =
+            serde_json::from_str(selection).context("invalid deferred Go selection")?;
+        let tests: Option<Vec<_>> = selected
+            .into_iter()
+            .map(|(file, names)| {
+                Some(RelatedTest {
+                    file: file
+                        .canonicalize()
+                        .ok()?
+                        .strip_prefix(&cwd)
+                        .ok()?
+                        .to_path_buf(),
+                    names,
+                })
+            })
+            .collect();
+        tests
+            .and_then(|tests| related_go_tests(&cwd, &original, &tests, true))
+            .unwrap_or(FilesListPlan::Full)
+    } else {
+        FilesListPlan::Full
+    };
+    let commands = match plan {
+        FilesListPlan::Nothing => return Ok(0),
+        FilesListPlan::Commands(commands) => commands,
+        _ => vec![original],
+    };
+    for command in commands {
+        let argv = shell_words::split(&command)?;
+        eprintln!("[aster] external Go after setup: {command}");
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .context("failed to run external Go tests")?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+    Ok(0)
 }
 
 /// Narrow `go test` to the selected tests that build under its build

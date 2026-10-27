@@ -92,6 +92,11 @@ fn run() -> Result<()> {
 
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
+    if let Commands::ExecGoTest { selection, args } = &command {
+        let code = aster::plugins::go::exec_go_test(selection.as_deref(), args)?;
+        std::process::exit(code);
+    }
+
     // Handle init and daemon lifecycle commands before requiring a workspace.
     if matches!(command, Commands::Init) {
         return handle_init(&cwd, cli.verbose);
@@ -412,7 +417,7 @@ fn run() -> Result<()> {
 
     let explicit_target = matches!(&command, Commands::RunTarget { .. });
     match command {
-        Commands::Init => unreachable!("Init handled above"),
+        Commands::Init | Commands::ExecGoTest { .. } => unreachable!("handled above"),
         Commands::Results { .. } => unreachable!("results handled above"),
         Commands::Srv { .. } => unreachable!("srv handled above"),
         Commands::List { path, lang } => {

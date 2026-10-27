@@ -17,6 +17,27 @@ aster build //services/api
 aster affected test --base=main
 ```
 
+### Go tests with shell setup
+
+When setup exports build flags or starts fixtures with an EXIT cleanup trap,
+use the explicit external-Go boundary:
+
+```toml
+[targets.test]
+command = "bash -ec 'source setup.sh; aster exec-go-test -- -count=1 ./...'"
+```
+
+`affected --related` records a deferred selection in the dry-run command; it
+never executes setup during planning. At runtime the owning shell performs
+setup, then Aster checks buildability with `go list` and runs external `go test`
+in that shell's exported environment and current directory. The shell waits
+and retains its cleanup trap. Do not use `exec` if the shell must run an EXIT
+trap. This boundary deliberately bypasses shell functions and aliases named
+`go`; unmarked shell commands retain their existing behavior and conservative
+full-suite fallback. Without a related selection the helper runs the supplied
+Go test arguments unchanged. Unknown buildability falls back to the full
+invocation, and failure to start Go remains an error.
+
 New to Aster? Follow the [end-to-end getting started tutorial](GETTING_STARTED.MD)
 to create a workspace, connect project dependencies, build, test, cache, watch,
 and run only affected projects.
