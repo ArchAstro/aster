@@ -116,6 +116,13 @@ adds uncommitted changes. `--head <ref>` compares committed refs explicitly.
 `--dry-run` previews selection. CI checkouts need enough Git history to
 resolve the merge base.
 
+For CI fan-out, `aster affected test --base=main --related --matrix` prints a
+JSON array with one row per configured lane (`[affected.lanes.<name>]`) that
+has work: `lane`, `name`, `target`, `toolchains`, plus the lane's `matrix`
+fields. Run each row with `aster affected test --base=main --related --lane
+<lane>`. `--all` treats every project as changed, for scheduled full runs. A
+target's `cache.workspace_include` files also select it when they change.
+
 `--only-affected-files` narrows targets that declare the `files_list`
 capability to each project's changed files: the requested target and any
 same-project target it depends on (so a `test-ci` wrapper that depends on

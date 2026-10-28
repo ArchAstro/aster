@@ -4,19 +4,14 @@ use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 
 use crate::address::ProjectSelector;
-use crate::config::AffectedWorkspaceConfig;
+use crate::config::{AffectedLaneConfig, AffectedWorkspaceConfig};
 use crate::discovery::DiscoveredProject;
 
-/// Apply a configured lane to affected project addresses.
-///
-/// Every configured selector must match at least one discovered project. Empty
-/// includes mean all affected projects, and exclusions always win.
-pub fn select_affected_lane(
+/// The configured lane named `lane_name`.
+pub fn find_lane<'a>(
     lane_name: &str,
-    config: &AffectedWorkspaceConfig,
-    affected: HashSet<String>,
-    projects: &[DiscoveredProject],
-) -> Result<HashSet<String>> {
+    config: &'a AffectedWorkspaceConfig,
+) -> Result<&'a AffectedLaneConfig> {
     let lane = config.lanes.get(lane_name).ok_or_else(|| {
         let mut known = config.lanes.keys().cloned().collect::<Vec<_>>();
         known.sort();
@@ -30,6 +25,32 @@ pub fn select_affected_lane(
             )
         }
     })?;
+    // Matrix fields share the row with the fields Aster writes.
+    for key in lane.matrix.keys() {
+        if MATRIX_ROW_KEYS.contains(&key.as_str()) {
+            return Err(anyhow!(
+                "affected lane '{lane_name}' matrix field '{key}' is reserved; \
+                 set the lane's own `{key}` instead, or rename the field"
+            ));
+        }
+    }
+    Ok(lane)
+}
+
+/// Fields Aster writes into every `--matrix` row.
+pub const MATRIX_ROW_KEYS: [&str; 4] = ["lane", "name", "target", "toolchains"];
+
+/// Apply a configured lane to affected project addresses.
+///
+/// Every configured selector must match at least one discovered project. Empty
+/// includes mean all affected projects, and exclusions always win.
+pub fn select_affected_lane(
+    lane_name: &str,
+    config: &AffectedWorkspaceConfig,
+    affected: HashSet<String>,
+    projects: &[DiscoveredProject],
+) -> Result<HashSet<String>> {
+    let lane = find_lane(lane_name, config)?;
 
     let addresses = projects
         .iter()

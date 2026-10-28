@@ -2204,6 +2204,247 @@ fn test_affected_lane_empty_selection_uses_existing_output_contracts() {
     assert!(quiet.stdout.is_empty() && quiet.stderr.is_empty());
 }
 
+/// Write two Node projects and a root aster.toml with two lanes; commit.
+fn lane_matrix_workspace(tmp: &TempDir) {
+    setup_git_repo(tmp);
+    write_package_json(
+        tmp,
+        "services/api/package.json",
+        r#"{"name":"api","scripts":{"test":"true"}}"#,
+    );
+    write_package_json(
+        tmp,
+        "services/web/package.json",
+        r#"{"name":"web","scripts":{"test":"true"}}"#,
+    );
+    write_package_json(tmp, "docs/package.json", r#"{"name":"docs"}"#);
+    write_aster_toml(
+        tmp,
+        "services/web/aster.toml",
+        r#"
+[targets.browser-e2e]
+command = "true"
+cache = { workspace_include = ["scripts/browser/**"] }
+"#,
+    );
+    write_aster_toml(
+        tmp,
+        "aster.toml",
+        r#"
+[affected.lanes.api]
+include = ["//services/api"]
+matrix = { runs_on = "small" }
+
+[affected.lanes.browser]
+include = ["//services/web"]
+name = "Browser proofs"
+target = "browser-e2e"
+toolchains = ["python"]
+matrix = { runs_on = "large", browser = true }
+
+[affected.lanes.everything]
+include = ["//..."]
+"#,
+    );
+    write_fixture(tmp, "scripts/browser/run.sh", "echo base");
+    write_fixture(tmp, "README.md", "base");
+    git_commit(tmp, "Initial commit");
+}
+
+fn aster_json(tmp: &TempDir, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "aster {args:?} failed: {output:?}");
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("aster {args:?} printed non-JSON ({e}): {output:?}"))
+}
+
+#[test]
+fn matrix_has_a_row_for_each_lane_the_change_reaches() {
+    let tmp = TempDir::new().unwrap();
+    lane_matrix_workspace(&tmp);
+
+    // A change inside services/api reaches the api lane and the catch-all
+    // lane; the browser lane's project did not change.
+    write_fixture(&tmp, "services/api/index.js", "changed");
+    let rows = aster_json(&tmp, &["affected", "test", "--base=HEAD", "--matrix"]);
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"lane": "api", "name": "api", "target": "test",
+             "toolchains": ["nodejs"], "runs_on": "small"},
+            {"lane": "everything", "name": "everything", "target": "test",
+             "toolchains": ["nodejs"]},
+        ])
+    );
+
+    // --lane limits the matrix to the lanes named.
+    let rows = aster_json(
+        &tmp,
+        &[
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--matrix",
+            "--lane",
+            "api",
+        ],
+    );
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["lane"], "api");
+}
+
+#[test]
+fn a_changed_workspace_input_selects_the_lane_target_that_declares_it() {
+    let tmp = TempDir::new().unwrap();
+    lane_matrix_workspace(&tmp);
+
+    // scripts/browser is outside every project; only browser-e2e declares it.
+    write_fixture(&tmp, "scripts/browser/run.sh", "echo changed");
+    let rows = aster_json(&tmp, &["affected", "test", "--base=HEAD", "--matrix"]);
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"lane": "browser", "name": "Browser proofs", "target": "browser-e2e",
+             "toolchains": ["nodejs", "python"], "runs_on": "large", "browser": true},
+        ])
+    );
+
+    // The lane plan names the input as the reason, and under --related the
+    // target runs in full because its own sources did not change.
+    let plan = aster_json(
+        &tmp,
+        &[
+            "--json",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--related",
+            "--dry-run",
+            "--lane",
+            "browser",
+        ],
+    );
+    let target = &plan["targets"][0];
+    assert_eq!(target["address"], "//services/web:browser-e2e");
+    assert_eq!(target["reason"], "affected");
+    assert_eq!(
+        target["files"],
+        serde_json::json!(["scripts/browser/run.sh"])
+    );
+    assert!(
+        target["selection"]
+            .to_string()
+            .contains("declared workspace input"),
+        "{plan}"
+    );
+
+    // An unrelated root file selects nothing.
+    write_fixture(&tmp, "scripts/browser/run.sh", "echo base");
+    write_fixture(&tmp, "README.md", "changed");
+    let rows = aster_json(&tmp, &["affected", "test", "--base=HEAD", "--matrix"]);
+    assert_eq!(rows, serde_json::json!([]));
+}
+
+#[test]
+fn matrix_rejects_reserved_fields_and_a_workspace_without_lanes() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name":"api","scripts":{"test":"true"}}"#,
+    );
+    write_aster_toml(&tmp, "aster.toml", "");
+    git_commit(&tmp, "Initial commit");
+    let run = |tmp: &TempDir| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(["affected", "test", "--all", "--matrix"])
+            .output()
+            .unwrap()
+    };
+
+    // No lanes: an empty matrix would silently skip every job.
+    let output = run(&tmp);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--matrix needs lanes"));
+
+    // A matrix field named like a row field would be a duplicate JSON key.
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        "[affected.lanes.api]\ninclude = [\"//services/api\"]\nmatrix = { name = \"x\" }\n",
+    );
+    let output = run(&tmp);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("matrix field 'name' is reserved"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn all_selects_every_lane_project_that_defines_the_target_and_runs_it() {
+    let tmp = TempDir::new().unwrap();
+    lane_matrix_workspace(&tmp);
+
+    // Nothing changed, yet --all plans every lane. docs has no test target,
+    // so the catch-all lane runs only api and web.
+    let rows = aster_json(&tmp, &["affected", "test", "--all", "--matrix"]);
+    let lanes: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["lane"].as_str().unwrap())
+        .collect();
+    assert_eq!(lanes, ["api", "browser", "everything"]);
+    let plan = aster_json(
+        &tmp,
+        &[
+            "--json",
+            "affected",
+            "test",
+            "--all",
+            "--dry-run",
+            "--lane",
+            "everything",
+        ],
+    );
+    let addresses: Vec<&str> = plan["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["reason"] != "target dependency")
+        .map(|t| t["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(addresses.len(), 2, "{plan}");
+    assert!(addresses.contains(&"//services/api:test"));
+    assert!(addresses.contains(&"//services/web:test"));
+
+    // Running a lane with --all executes its target.
+    let run = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--all",
+            "--lane",
+            "browser",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {run:?}");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("PASS //services/web:browser-e2e"),
+        "{run:?}"
+    );
+}
+
 #[test]
 fn test_affected_help_shows_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
