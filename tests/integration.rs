@@ -4566,3 +4566,103 @@ fn selected_by_must_name_an_existing_target() {
         "{output:?}"
     );
 }
+
+#[test]
+fn selected_by_target_runs_in_a_real_affected_run_and_only_when_selected() {
+    let tmp = TempDir::new().unwrap();
+    selected_by_workspace(&tmp);
+    let marker = |name: &str| tmp.path().join(format!("{name}.ran"));
+    let touch = |name: &str| format!("touch '{}'", marker(name).display());
+    write_aster_toml(
+        &tmp,
+        "services/gateway/aster.toml",
+        &format!(
+            "[targets.build]\ncommand = \"true\"\n\n[targets.test-ci]\ncommand = \"{}\"\n",
+            touch("gateway-test-ci")
+        ),
+    );
+    write_aster_toml(
+        &tmp,
+        "services/platform/aster.toml",
+        &format!(
+            "depends_on = [\"//services/gateway\"]\n\n\
+             [targets.gateway-reads]\ncommand = \"{}\"\nselected_by = [\"//services/gateway:test-ci\"]\n\n\
+             [targets.test-ci]\ncommand = \"{}\"\ndepends_on = [\"//self:gateway-reads\"]\n",
+            touch("gateway-reads"),
+            touch("platform-test-ci")
+        ),
+    );
+    git_commit(&tmp, "Write markers from each target");
+    let run = |lane: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(["affected", "test-ci", "--base=HEAD", "--lane", lane])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "aster affected --lane {lane} failed: {output:?}"
+        );
+    };
+    let ran = |name: &str| marker(name).exists();
+
+    // A gateway change executes platform's reads in the gateway lane, not
+    // platform's own test-ci.
+    write_fixture(&tmp, "services/gateway/index.js", "changed");
+    run("gateway");
+    assert!(ran("gateway-test-ci"));
+    assert!(
+        ran("gateway-reads"),
+        "selected_by target was planned but not executed"
+    );
+    assert!(!ran("platform-test-ci"));
+
+    // A platform change runs nothing in the gateway lane.
+    for name in ["gateway-test-ci", "gateway-reads"] {
+        std::fs::remove_file(marker(name)).unwrap();
+    }
+    write_fixture(&tmp, "services/gateway/index.js", "base");
+    write_fixture(&tmp, "services/platform/index.js", "changed");
+    run("gateway");
+    assert!(!ran("gateway-test-ci") && !ran("gateway-reads"));
+}
+
+#[test]
+fn selected_by_targets_join_an_aster_run_of_the_named_target() {
+    let tmp = TempDir::new().unwrap();
+    selected_by_workspace(&tmp);
+    write_aster_toml(
+        &tmp,
+        "services/platform/aster.toml",
+        r#"
+depends_on = ["//services/gateway"]
+
+[targets.gateway-reads]
+command = "touch reads.ran"
+selected_by = ["//services/gateway:test-ci"]
+cache = { enabled = false }
+"#,
+    );
+    git_commit(&tmp, "Reads leave a marker");
+    let marker = tmp.path().join("services/platform/reads.ran");
+    let aster = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "aster {args:?}: {output:?}");
+    };
+
+    // aster run of the target it joins runs it (affected runs are covered
+    // above); --no-deps runs only the named target.
+    aster(&["run", "//services/gateway:test-ci", "--no-deps"]);
+    assert!(!marker.exists(), "--no-deps ran the joining target");
+    aster(&["run", "//services/gateway:test-ci"]);
+    assert!(marker.exists(), "aster run did not run the joining target");
+    std::fs::remove_file(&marker).unwrap();
+
+    // Another target of the gateway does not.
+    aster(&["run", "//services/gateway:build"]);
+    assert!(!marker.exists());
+}
