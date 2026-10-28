@@ -66,6 +66,11 @@ pub struct GraphOutput {
     pub nodes: Vec<String>,
     /// Adjacency list: target -> dependencies
     pub edges: HashMap<String, Vec<String>>,
+    /// Target -> workspace-relative globs it reads outside its project
+    /// (`[targets.<name>.cache] workspace_include`). These are file-level
+    /// dependencies the edges cannot show; a sparse checkout needs them.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub workspace_inputs: HashMap<String, Vec<String>>,
 }
 
 /// Why command output for JSON
@@ -402,11 +407,13 @@ mod tests {
         let output = GraphOutput {
             nodes: vec!["//a:test".to_string(), "//a:deps".to_string()],
             edges,
+            workspace_inputs: HashMap::new(),
         };
 
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("nodes"));
         assert!(json.contains("edges"));
+        assert!(!json.contains("workspace_inputs"));
     }
 
     #[test]

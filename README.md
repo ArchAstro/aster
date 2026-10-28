@@ -323,6 +323,14 @@ the workspace root, so a member can name a root `Cargo.lock` or
 `ws:` prefix and do not collide with a file of the same name in the project.
 `aster affected` also selects the target when one of these files changes
 ([Inputs outside the project directory](#inputs-outside-the-project-directory)).
+Declare any file a target reads from another project here, such as an
+`include_str!` of a sibling's generated JSON: the cache key then covers it, and
+`aster graph --json` reports it under `workspace_inputs`, so tools that build
+sparse checkouts from the graph include it.
+
+In a Git sparse checkout (`core.sparseCheckout`), discovery drops a
+`depends_on` whose project directory is not checked out. A dependency whose
+directory is present but does not define the target is still an error.
 
 A Cargo workspace member also hashes the workspace-root `Cargo.toml` and
 `Cargo.lock`, plus `rust-toolchain.toml` and `.cargo/config.toml` for targets
