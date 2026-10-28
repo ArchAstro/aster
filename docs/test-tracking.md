@@ -41,6 +41,33 @@ and classified, but they never let a quarantined failure pass.
 `cargo nextest run` writes JUnit only when the repository's nextest config
 gives the profile a `junit.path`; without it nothing is recorded.
 
+### Vitest commands that already write a report, and shell expansions
+
+Aster adds a JUnit reporter to a Vitest command. A command that already
+passes `--reporter=junit` with a file (`--outputFile.junit=<path>`,
+`--outputFile.junit <path>`, or a plain `--outputFile=<path>` when no other
+file reporter such as `json` is listed) is not given a second one: Vitest
+turns two `--outputFile.junit` flags into an array and its JUnit reporter
+throws before any test runs. Aster leaves the command unchanged and reads the
+file it names, relative to `--root` or the working directory. Under
+`--retry-failed` the rerun writes that file again and is read the same way.
+
+A `sh -c`/`bash -c` one-liner may use `$VAR` and `${VAR:-default}` in the
+runner's arguments (`vitest run ${E2E_FILE:-e2e}`); they are kept exactly as
+written. A report path that is an expansion is worked out from Aster's own
+environment, which the command inherits: `${OUT:-/tmp/r.xml}` is
+`/tmp/r.xml` when `OUT` is unset. Aster does not see variables the one-liner
+sets itself (`OUT=r.xml; vitest ... --outputFile.junit=$OUT`) or `~`; for those
+it leaves the command alone and records no tests. Declare the report (below)
+or use a literal path. Aster still does not recognise a runner behind an
+expansion (`$RUNNER run`), command substitution (`$(...)`, backticks) or an
+unbalanced `${`.
+
+When a target Aster planned to capture ends with 0 test cases, the run
+prints `[aster] Warning: no test results were captured for <target>`: the
+report was empty or missing, so quarantine and flake tracking cannot apply
+to that run.
+
 ### Declared reports
 
 Aster recognises a runner in the target's command, directly or as the last

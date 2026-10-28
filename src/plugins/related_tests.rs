@@ -32,6 +32,73 @@ fn quote_command_argument(value: &str) -> String {
 pub(super) struct Argv {
     pub(super) parts: Vec<String>,
     pub(super) program: usize,
+    /// For each part, its source text when the shell would expand it
+    /// (`$QF`, `"${OUT:-x.xml}"`). [`Self::render`] writes those back
+    /// verbatim: quoting the value would turn the expansion into a literal.
+    /// Empty when no part expands.
+    pub(super) expanding: Vec<Option<String>>,
+}
+
+/// The source text of each word of `command`, split the way the shell does
+/// (whitespace outside quotes). `None` for an unterminated quote.
+fn raw_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') | (None, '\\') => {
+                word.push(c);
+                word.extend(chars.next());
+                continue;
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        word.push(c);
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// Whether the shell expands something in a word's source text: a `$` that
+/// is not single-quoted or escaped and starts a name, `${`, or a special
+/// parameter. A `$` that ends a word (`'x$'`) is literal.
+pub(super) fn expands(raw: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (_, '\\') => {
+                chars.next();
+            }
+            (_, '$')
+                if chars
+                    .peek()
+                    .is_some_and(|n| n.is_ascii_alphanumeric() || "_{?@*#!$-".contains(*n)) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_assignment(value: &str) -> bool {
@@ -56,7 +123,40 @@ impl Argv {
         if INTERPRETERS.contains(&name) {
             return None;
         }
-        Some(Self { parts, program })
+        // Keep the text of the words the shell expands. If the words cannot
+        // be matched up with the split, rendering would quote an expansion
+        // away, so the command is not understood.
+        let mut expanding = Vec::new();
+        if command.contains('$') {
+            let raw = raw_words(command).filter(|raw| raw.len() == parts.len())?;
+            if raw.iter().any(|word| expands(word)) {
+                expanding = raw
+                    .into_iter()
+                    .map(|word| expands(&word).then_some(word))
+                    .collect();
+            }
+        }
+        // An expansion in the program position could run anything.
+        if expanding.get(program).is_some_and(Option::is_some) {
+            return None;
+        }
+        Some(Self {
+            parts,
+            program,
+            expanding,
+        })
+    }
+
+    /// One argument as written in a rendered command.
+    fn word(&self, index: usize) -> String {
+        if let Some(Some(raw)) = self.expanding.get(index) {
+            return raw.clone();
+        }
+        if index < self.program {
+            self.parts[index].clone()
+        } else {
+            quote_command_argument(&self.parts[index])
+        }
     }
 
     /// The command with the arguments at `drop` removed and `add` appended.
@@ -65,15 +165,9 @@ impl Argv {
             .iter()
             .enumerate()
             .filter(|(i, _)| !drop.contains(i))
-            .map(|(i, part)| {
-                // Environment assignments must stay unquoted to be read as
-                // assignments.
-                if i < self.program {
-                    part.clone()
-                } else {
-                    quote_command_argument(part)
-                }
-            })
+            // Environment assignments stay unquoted to be read as
+            // assignments.
+            .map(|(i, _)| self.word(i))
             .chain(add.iter().map(|a| quote_command_argument(a)))
             .collect::<Vec<_>>()
             .join(" ")
@@ -83,15 +177,11 @@ impl Argv {
     /// appended when `at` is past the end).
     pub(super) fn render_inserting(&self, at: usize, add: &[String]) -> String {
         let mut parts: Vec<String> = Vec::with_capacity(self.parts.len() + add.len());
-        for (i, part) in self.parts.iter().enumerate() {
+        for i in 0..self.parts.len() {
             if i == at {
                 parts.extend(add.iter().map(|a| quote_command_argument(a)));
             }
-            parts.push(if i < self.program {
-                part.clone()
-            } else {
-                quote_command_argument(part)
-            });
+            parts.push(self.word(i));
         }
         if at >= self.parts.len() {
             parts.extend(add.iter().map(|a| quote_command_argument(a)));
@@ -140,6 +230,23 @@ pub(crate) struct Delegated {
 
 impl Delegated {
     pub(crate) fn parse(command: &str) -> Option<Self> {
+        Self::parse_with(command, false)
+    }
+
+    /// [`Self::parse`] for callers that only append flags to the test
+    /// command: it may also contain shell expansions (`$FILTER`,
+    /// `${OUT:-x.xml}`), which are carried through untouched. Callers that
+    /// read the command's arguments (to narrow it to files, say) use
+    /// [`Self::parse`], which treats an expansion as an unknown command.
+    ///
+    /// Still refused: an expansion in the program position, command
+    /// substitution (`$(...)`, backticks) and an unbalanced `${`, none of
+    /// which leave the shape of the arguments predictable.
+    pub(crate) fn parse_allowing_expansions(command: &str) -> Option<Self> {
+        Self::parse_with(command, true)
+    }
+
+    fn parse_with(command: &str, allow_expansions: bool) -> Option<Self> {
         let mut parts = shell_words::split(command).ok()?;
         let script = parts.pop()?;
         let (program, flags) = parts.split_first()?;
@@ -187,7 +294,12 @@ impl Delegated {
         let mut head = script[..tail_start].to_string();
         let mut tail = script[tail_start..].trim();
         // The last command must be a plain one.
-        if tail.is_empty() || tail.contains(['|', '&', '<', '>', '(', ')', '$', '`', '\n']) {
+        if tail.is_empty() || tail.contains(['|', '&', '<', '>', '(', ')', '`', '\n']) {
+            return None;
+        }
+        if tail.contains('$')
+            && (!allow_expansions || tail.matches("${").count() != tail.matches('}').count())
+        {
             return None;
         }
         if !head.is_empty() {
@@ -205,6 +317,10 @@ impl Delegated {
             head.push_str(word);
             head.push(' ');
             tail = tail[word.len()..].trim_start();
+        }
+        // The program is not a word to guess at.
+        if tail.split_whitespace().next()?.contains('$') {
+            return None;
         }
         // `cd <dir> &&` immediately before the command.
         let dir = match separators.as_slice() {
@@ -937,6 +1053,56 @@ mod tests {
                 delegated.as_ref().map(Delegated::hides_environment),
                 Some(hides),
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn expansions_are_written_back_as_they_were() {
+        let argv = Argv::parse(r#"vitest run $QF "${OUT:-a b}" 'x$' "\$HOME" -t "a b""#).unwrap();
+        assert_eq!(
+            argv.render(&[], &["--flag".to_string()]),
+            r#"vitest run $QF "${OUT:-a b}" 'x$' '$HOME' -t 'a b' --flag"#
+        );
+        assert_eq!(
+            argv.render_inserting(2, &["--flag".to_string()]),
+            r#"vitest --flag run $QF "${OUT:-a b}" 'x$' '$HOME' -t 'a b'"#
+                .replace("--flag run", "run --flag")
+        );
+        // An expansion in the program position is not a known command.
+        assert!(Argv::parse("$RUNNER run").is_none());
+        assert!(Argv::parse("A=1 ${RUNNER} run").is_none());
+    }
+
+    #[test]
+    fn only_callers_that_append_flags_see_through_expansions() {
+        let command = r#"bash -c 'exec vitest run ${QF:-flaky} "$OTHER" -t "a $B"'"#;
+        assert_eq!(Delegated::parse(command), None);
+        let delegated = Delegated::parse_allowing_expansions(command).unwrap();
+        assert_eq!(
+            delegated.command,
+            r#"vitest run ${QF:-flaky} "$OTHER" -t "a $B""#
+        );
+        assert_eq!(
+            delegated.render("vitest run --x"),
+            r#"bash -c 'exec vitest run --x'"#
+        );
+        // The boundary: what runs, or the shape of its arguments, must not
+        // depend on an expansion.
+        for refused in [
+            "bash -c '$RUNNER run'",
+            "bash -c 'exec ${RUNNER} run'",
+            "bash -c 'FOO=1 $RUNNER run'",
+            "bash -c 'vitest run $(ls)'",
+            "bash -c 'vitest run \"$(ls)\"'",
+            "bash -c 'vitest run `ls`'",
+            "bash -c 'vitest run ${QF:-a'",
+            "bash -c 'cd \"$DIR\" && vitest run $QF'",
+        ] {
+            assert_eq!(
+                Delegated::parse_allowing_expansions(refused),
+                None,
+                "{refused}"
             );
         }
     }

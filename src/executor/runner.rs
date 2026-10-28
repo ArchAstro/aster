@@ -2255,6 +2255,7 @@ fn read_test_report(
         return None;
     }
     let mut complete = raw_outputs.len() == captures.len();
+    let mut failed_to_read = false;
     let mut cases = Vec::new();
     let mut names: Vec<&str> = Vec::new();
     for (capture, raw) in captures.iter().zip(raw_outputs) {
@@ -2278,11 +2279,20 @@ fn read_test_report(
             Err(error) => {
                 eprintln!("[aster] Warning: test results for {address} are incomplete: {error:#}");
                 complete = false;
+                failed_to_read = true;
             }
         }
     }
     for (_, dir) in captures.iter().flatten() {
         let _ = std::fs::remove_dir_all(dir);
+    }
+    // A planned capture that found nothing is a lost report, not a run
+    // without tests: quarantine and flake tracking see only what is captured.
+    if cases.is_empty() && !failed_to_read {
+        eprintln!(
+            "[aster] Warning: no test results were captured for {address}; the runner's report \
+             was empty or missing, so quarantine and flake tracking cannot apply to this run"
+        );
     }
     Some(TestReport {
         project: None,

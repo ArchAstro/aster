@@ -38,7 +38,7 @@ pub(crate) fn commands(
         return Some(found);
     }
     // A shard project's `bash -c 'cd ../core && MIX_TEST_PARTITION=1 exec mix test'`.
-    let delegated = Delegated::parse(command)?;
+    let delegated = Delegated::parse_allowing_expansions(command)?;
     let inner_dir = match &delegated.dir {
         Some(dir) => working_dir.join(dir),
         None => working_dir.to_path_buf(),
@@ -553,7 +553,10 @@ const LIBTEST_VALUE_FLAGS: &[&str] = &[
 fn cargo(command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
     let argv = Argv::parse(command)?;
     let parts = &argv.parts;
-    if Path::new(&parts[argv.program]).file_name()?.to_str()? != "cargo" {
+    // Rebuilt below from parts of the command, which loses expansions.
+    if Path::new(&parts[argv.program]).file_name()?.to_str()? != "cargo"
+        || !argv.expanding.is_empty()
+    {
         return None;
     }
     let mut i = argv.program + 1;
@@ -583,6 +586,7 @@ fn cargo(command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
     let cargo_side = Argv {
         parts: parts[..separator].to_vec(),
         program: argv.program,
+        expanding: Vec::new(),
     };
     let mut drop = cargo_side.positionals(args_start, CARGO_VALUE_FLAGS);
     let mut names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
@@ -621,6 +625,7 @@ fn cargo(command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
     let tail_argv = Argv {
         parts: tail.to_vec(),
         program: 0,
+        expanding: Vec::new(),
     };
     let mut skip = tail_argv.positionals(0, LIBTEST_VALUE_FLAGS);
     skip.extend(flag_indexes(tail, 0, &["--exact"], false));
@@ -723,6 +728,25 @@ mod tests {
         );
         let script = shell_words::split(&found).unwrap().pop().unwrap();
         assert_eq!(script, "cd ../core && exec mix test test/a_test.exs");
+    }
+
+    #[test]
+    fn vitest_in_a_one_liner_with_expansions_keeps_them_and_its_own_report() {
+        let dir = Path::new("/w/web");
+        let failures = [failure(Some("e2e/a.e2e.test.ts"), None, "flaky one")];
+        let found = one(
+            dir,
+            "bash -c 'vitest run ${FILE:-e2e} --reporter=junit --outputFile.junit=\"${OUT:-/tmp/r.xml}\"'",
+            &failures,
+        );
+        let script = shell_words::split(&found).unwrap().pop().unwrap();
+        // The retry reads the command's own report again, so it keeps the
+        // reporter flags and the expansions as written.
+        assert_eq!(
+            script,
+            "vitest run ${FILE:-e2e} --reporter=junit --outputFile.junit=\"${OUT:-/tmp/r.xml}\" \
+             e2e/a.e2e.test.ts -t 'flaky one$'"
+        );
     }
 
     #[test]
