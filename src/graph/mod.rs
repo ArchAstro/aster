@@ -15,4 +15,4 @@ pub mod targets;
 pub use builder::{build_graph, ProjectGraph, ProjectNode};
 pub use cycles::{find_cycle, CycleError};
 pub use path::{find_path, format_path};
-pub use targets::{build_target_graph, TargetGraph, TargetNode};
+pub use targets::{build_target_graph, workspace_inputs, TargetGraph, TargetNode};

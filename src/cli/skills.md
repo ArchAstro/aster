@@ -37,6 +37,14 @@ aster why //services/api:test //libs/core:build
 `list` shows discovered projects, languages, build systems, and targets.
 `graph` shows dependencies. `why` explains a dependency path between two target
 addresses. `--json` provides structured output where supported.
+`graph --json` also lists `workspace_inputs`: each target's
+`[targets.<name>.cache] workspace_include` globs. Declare there any file a
+target reads from another project (an `include_str!`, a schema, a fixture), so
+the cache key covers it and sparse-checkout tools see the dependency.
+
+In a Git sparse checkout (`core.sparseCheckout`), a `depends_on` whose project
+directory is not checked out is dropped instead of failing discovery; one
+whose directory is present but lacks the target is still an error.
 
 ## Select projects
 

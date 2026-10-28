@@ -493,7 +493,12 @@ fn run() -> Result<()> {
                     (nodes, edges)
                 };
 
-                let output = GraphOutput { nodes, edges };
+                let workspace_inputs = aster::graph::workspace_inputs(&projects, &nodes);
+                let output = GraphOutput {
+                    nodes,
+                    edges,
+                    workspace_inputs,
+                };
                 output_json(&output)?;
             } else if output_mode == OutputMode::Quiet {
                 // Quiet mode: no output for graph
@@ -505,6 +510,11 @@ fn run() -> Result<()> {
                         println!("{}", style(&node.address).cyan().bold());
                         for dep in graph.dependencies(&addr) {
                             println!("  {} {}", style("→").dim(), style(&dep.address).dim());
+                        }
+                        let inputs =
+                            aster::graph::workspace_inputs(&projects, std::slice::from_ref(&addr));
+                        for glob in inputs.get(&addr).into_iter().flatten() {
+                            println!("  {} {}", style("reads").dim(), style(glob).dim());
                         }
                     } else {
                         return Err(anyhow::anyhow!("Target not found: {addr}"));

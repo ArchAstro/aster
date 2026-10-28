@@ -199,6 +199,72 @@ impl std::fmt::Display for CycleError {
     }
 }
 
+/// The workspace-relative globs each of `addresses` reads outside its own
+/// project: its `[targets.<name>.cache] workspace_include`, and any `include`
+/// glob that climbs out of the project (`../../shared/*.json`).
+///
+/// These are file-level dependencies the target graph's edges cannot show.
+/// Targets without any are omitted.
+pub fn workspace_inputs(
+    projects: &[DiscoveredProject],
+    addresses: &[String],
+) -> HashMap<String, Vec<String>> {
+    let wanted: std::collections::HashSet<&str> = addresses.iter().map(String::as_str).collect();
+    let mut inputs = HashMap::new();
+    for project in projects {
+        let project_address = format!("//{}", project.relative_path.display());
+        for (target_name, target) in &project.targets {
+            let address = format!("{project_address}:{target_name}");
+            let Some(cache) = &target.cache else {
+                continue;
+            };
+            if !wanted.contains(address.as_str()) {
+                continue;
+            }
+            let mut globs = cache.workspace_include.clone();
+            globs.extend(
+                cache
+                    .include
+                    .iter()
+                    .filter_map(|glob| escaping_glob(&project.relative_path, glob)),
+            );
+            if !globs.is_empty() {
+                inputs.insert(address, globs);
+            }
+        }
+    }
+    inputs
+}
+
+/// The workspace-relative form of a project-relative `glob` that leaves the
+/// project through `..`; `None` for one that stays inside it.
+fn escaping_glob(project: &std::path::Path, glob: &str) -> Option<String> {
+    if !glob.starts_with("../") {
+        return None;
+    }
+    let mut parts: Vec<&str> = project
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let depth = parts.len();
+    let mut climbed = 0;
+    for part in glob.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                parts.pop()?;
+                climbed += 1;
+            }
+            other => parts.push(other),
+        }
+    }
+    // `../<own dir>/x` climbs out and straight back in.
+    let own = project.to_string_lossy().replace('\\', "/");
+    let joined = parts.join("/");
+    let inside = !own.is_empty() && (joined == own || joined.starts_with(&format!("{own}/")));
+    (climbed > 0 && climbed <= depth && !inside).then_some(joined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +517,55 @@ mod tests {
 
         let cycle = graph.find_cycle();
         assert!(cycle.is_none());
+    }
+
+    #[test]
+    fn workspace_inputs_lists_cross_project_globs_of_requested_targets() {
+        let mut app = make_project(
+            "app",
+            vec![("build", "make", vec![]), ("test", "make test", vec![])],
+        );
+        app.targets.get_mut("build").unwrap().cache = Some(crate::config::CacheConfig {
+            workspace_include: vec!["libs/schema/*.json".to_string()],
+            ..Default::default()
+        });
+        app.targets.get_mut("test").unwrap().cache = Some(crate::config::CacheConfig {
+            include: vec!["fixtures/**".to_string()],
+            ..Default::default()
+        });
+        let projects = vec![app];
+
+        let all = workspace_inputs(
+            &projects,
+            &["//app:build".to_string(), "//app:test".to_string()],
+        );
+        assert_eq!(
+            all.len(),
+            1,
+            "project-relative includes are not cross-project reads"
+        );
+        assert_eq!(all["//app:build"], vec!["libs/schema/*.json".to_string()]);
+
+        let none = workspace_inputs(&projects, &["//app:test".to_string()]);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn workspace_inputs_resolves_include_globs_that_leave_the_project() {
+        let mut lint = make_project("services/rust/cli", vec![("lint", "clippy", vec![])]);
+        lint.targets.get_mut("lint").unwrap().cache = Some(crate::config::CacheConfig {
+            include: vec![
+                "crates/core/**".to_string(),
+                "../../../src/ts/vectors.json".to_string(),
+                "../cli/back-inside.json".to_string(),
+            ],
+            ..Default::default()
+        });
+
+        let inputs = workspace_inputs(&[lint], &["//services/rust/cli:lint".to_string()]);
+        assert_eq!(
+            inputs["//services/rust/cli:lint"],
+            vec!["src/ts/vectors.json".to_string()]
+        );
     }
 }

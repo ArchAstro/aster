@@ -312,6 +312,53 @@ fn test_pnpm_workspace_protocol_build_edge() {
     );
 }
 
+/// `graph --json` reports the files a target reads from other projects
+/// (`cache.workspace_include`, and `cache.include` globs that leave the
+/// project), which its edges cannot show.
+#[test]
+fn test_graph_json_reports_workspace_inputs() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "apps/web/package.json",
+        r#"{"name": "web", "scripts": {"build": "tsc", "lint": "eslint ."}}"#,
+    );
+    write_file(
+        &tmp,
+        "apps/web/aster.toml",
+        r#"
+[targets.build]
+command = "tsc"
+
+[targets.build.cache]
+workspace_include = ["libs/schema/*.json"]
+include = ["src/**", "../../libs/theme/catalog.json"]
+"#,
+    );
+
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
+    let output = cmd
+        .current_dir(tmp.path())
+        .args(["--json", "graph"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Command failed: {output:?}");
+    let parsed: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let inputs = parsed["workspace_inputs"]
+        .as_object()
+        .expect("workspace_inputs map");
+    assert_eq!(
+        inputs.len(),
+        1,
+        "only //apps/web:build reads outside its project: {inputs:?}"
+    );
+    assert_eq!(
+        inputs["//apps/web:build"],
+        serde_json::json!(["libs/schema/*.json", "libs/theme/catalog.json"])
+    );
+}
+
 fn setup_rust_and_node_workspace() -> TempDir {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
