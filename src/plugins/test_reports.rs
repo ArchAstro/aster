@@ -320,9 +320,33 @@ fn js_flags(
     };
     match runner {
         JsRunner::Vitest => {
+            let reporters = flag_values(argv, start, &["--reporter"]);
+            let own_junit = reporters.iter().any(|(name, _)| name == "junit");
+            if own_junit {
+                // The command writes its own JUnit report. A second
+                // `--outputFile.junit` makes Vitest hand its JUnit reporter
+                // an array, which throws in `onInit` before any test runs, so
+                // read the command's file instead of adding a reporter.
+                if let Some(path) = own_junit_path(ctx.working_dir, argv, start, &reporters) {
+                    let files = path.map_or_else(Vec::new, |path| vec![path]);
+                    let confidence = if files.is_empty() {
+                        Confidence::Partial
+                    } else {
+                        Confidence::Complete
+                    };
+                    return Some((
+                        Vec::new(),
+                        ReportPlan {
+                            files: ReportFiles::Paths(files),
+                            confidence,
+                            ..plan(ctx.report_dir.join("vitest.xml"), ReportFormat::JUnitXml)
+                        },
+                    ));
+                }
+            }
             let file = ctx.report_dir.join("vitest.xml");
             let mut flags = Vec::new();
-            if !has("--reporter") {
+            if reporters.is_empty() {
                 if vitest_config_sets_reporters(ctx.working_dir, argv, start) {
                     return None;
                 }
@@ -331,7 +355,9 @@ fn js_flags(
                     flags.push("--reporter=github-actions".to_string());
                 }
             }
-            flags.push("--reporter=junit".to_string());
+            if !own_junit {
+                flags.push("--reporter=junit".to_string());
+            }
             flags.push(format!("--outputFile.junit={}", file.display()));
             Some((flags, plan(file, ReportFormat::JUnitXml)))
         }
@@ -358,6 +384,143 @@ fn js_flags(
             Some((flags, plan(file, ReportFormat::JUnitXml)))
         }
     }
+}
+
+/// The values of a flag given as `--name=value` or `--name value`, with the
+/// index of the argument that holds each value.
+fn flag_values(argv: &Argv, start: usize, names: &[&str]) -> Vec<(String, usize)> {
+    let parts = &argv.parts;
+    let mut found = Vec::new();
+    for (i, part) in parts.iter().enumerate().skip(start) {
+        for name in names {
+            if let Some(value) = part.strip_prefix(&format!("{name}=")) {
+                found.push((value.to_string(), i));
+            } else if part == name && parts.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
+                found.push((parts[i + 1].clone(), i + 1));
+            }
+        }
+    }
+    found
+}
+
+/// Reporters that never write to `--outputFile`, so a plain `--outputFile`
+/// next to `--reporter=junit` can only be the JUnit report's.
+const CONSOLE_REPORTERS: &[&str] = &[
+    "default",
+    "verbose",
+    "dot",
+    "tree",
+    "agent",
+    "github-actions",
+    "hanging-process",
+];
+
+/// Where a command that already passes `--reporter=junit` has Vitest write
+/// its report, as an absolute path. `None` when the command names no file
+/// (the report goes to the console, or the config decides). `Some(None)`
+/// when it names one that Aster cannot work out because it depends on a
+/// shell expansion with no known value.
+///
+/// Vitest takes the file from `--outputFile.junit=<path>`, or from a plain
+/// `--outputFile=<path>` that applies to every reporter that writes files, so
+/// the plain form counts only when no other file reporter is listed. Paths
+/// are relative to `--root`, which is relative to the working directory.
+fn own_junit_path(
+    dir: &Path,
+    argv: &Argv,
+    start: usize,
+    reporters: &[(String, usize)],
+) -> Option<Option<std::path::PathBuf>> {
+    let specific = flag_values(argv, start, &["--outputFile.junit", "--output-file.junit"]);
+    let (value, at) = match specific.last() {
+        Some(found) => found.clone(),
+        None => {
+            let only_junit = reporters
+                .iter()
+                .all(|(name, _)| name == "junit" || CONSOLE_REPORTERS.contains(&name.as_str()));
+            let plain = flag_values(argv, start, &["--outputFile", "--output-file"]);
+            match plain.last() {
+                Some(found) if only_junit => found.clone(),
+                _ => return None,
+            }
+        }
+    };
+    let resolve = |value: &str, at: usize| -> Option<String> {
+        if value.starts_with('~') {
+            None
+        } else if argv.expanding.get(at).is_some_and(Option::is_some) {
+            expand_known(value)
+        } else {
+            Some(value.to_string())
+        }
+    };
+    let root = match flag_values(argv, start, &["--root", "-r"]).last() {
+        Some((root, at)) => resolve(root, *at).map(|root| dir.join(root)),
+        None => Some(dir.to_path_buf()),
+    };
+    Some(
+        resolve(&value, at)
+            .zip(root)
+            .map(|(path, root)| root.join(path)),
+    )
+}
+
+/// Expand `$NAME`, `${NAME}`, `${NAME:-default}` and `${NAME-default}` in a
+/// path from Aster's own environment, which the command inherits. `None` when
+/// the text uses any other expansion (or `~`), or expands to nothing.
+///
+/// This is a guess about what the shell will see: a one-liner that sets the
+/// variable itself before the command is not seen. The report is only read
+/// if the command wrote it during the run, and a wrong guess ends in the
+/// "captured 0 tests" warning rather than another run's results.
+fn expand_known(text: &str) -> Option<String> {
+    if text.starts_with('~') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let (name, default, after) = if let Some(braced) = rest.strip_prefix('{') {
+            let end = braced.find('}')?;
+            let body = &braced[..end];
+            let name_len = body
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(body.len());
+            let (name, operator) = body.split_at(name_len);
+            let default = match operator {
+                "" => None,
+                _ => Some((
+                    operator.starts_with(":-"),
+                    operator
+                        .strip_prefix(":-")
+                        .or_else(|| operator.strip_prefix('-'))?,
+                )),
+            };
+            (name, default, &braced[end + 1..])
+        } else {
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            (&rest[..name_len], None, &rest[name_len..])
+        };
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let value = std::env::var(name).ok();
+        match (value, default) {
+            (Some(value), Some((true, default))) if value.is_empty() => {
+                out.push_str(&expand_known(default)?)
+            }
+            (Some(value), _) => out.push_str(&value),
+            (None, Some((_, default))) => out.push_str(&expand_known(default)?),
+            (None, None) => {}
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    (!out.is_empty()).then_some(out)
 }
 
 /// Whether the Vitest config the command uses lists `reporters`.
@@ -399,7 +562,7 @@ pub(super) fn delegating(
     if let Some(found) = plan(ctx) {
         return Some(found);
     }
-    let delegated = Delegated::parse(ctx.command)?;
+    let delegated = Delegated::parse_allowing_expansions(ctx.command)?;
     let working_dir = match &delegated.dir {
         Some(dir) => ctx.working_dir.join(dir),
         None => ctx.working_dir.to_path_buf(),
@@ -424,7 +587,8 @@ pub(super) fn delegating(
 pub(super) fn mix(ctx: &ReportContext) -> Option<ReportPlan> {
     let argv = Argv::parse(ctx.command)?;
     // Only a bare `mix` from PATH: `elixir -S mix` finds the same script.
-    if argv.parts[argv.program] != "mix" {
+    // The command is rebuilt from its parts below, which loses expansions.
+    if argv.parts[argv.program] != "mix" || !argv.expanding.is_empty() {
         return None;
     }
     let test = argv.program
@@ -475,6 +639,7 @@ pub(super) fn mix(ctx: &ReportContext) -> Option<ReportPlan> {
     let rewritten = Argv {
         program: argv.program,
         parts,
+        expanding: Vec::new(),
     };
     Some(ReportPlan {
         command: rewritten.render_inserting(usize::MAX, &[]),
@@ -895,6 +1060,199 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         ] {
             assert!(mix(&context(&f, "test", command)).is_none(), "{command}");
         }
+    }
+
+    fn vitest_paths(plan: &ReportPlan) -> Vec<PathBuf> {
+        match &plan.files {
+            ReportFiles::Paths(paths) => paths.clone(),
+            other => panic!("expected paths, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vitest_with_its_own_junit_report_reads_that_file_and_adds_nothing() {
+        let (_tmp, f) = js_fixture("{}", &[]);
+        // Both forms of the per-reporter option, and the plain option when
+        // junit is the only file reporter.
+        for command in [
+            "vitest run e2e --reporter=default --reporter=junit --outputFile.junit=out/r.xml",
+            "vitest run e2e --reporter default --reporter junit --outputFile.junit out/r.xml",
+            "vitest run e2e --reporter=junit --outputFile=out/r.xml",
+            "vitest run e2e --reporter=junit --output-file.junit=out/r.xml",
+        ] {
+            let plan = js(&context(&f, "test", command)).unwrap();
+            // A second `--outputFile.junit` makes Vitest throw before any
+            // test runs, so the command is not touched.
+            assert_eq!(plan.command, command);
+            assert_eq!(
+                vitest_paths(&plan),
+                [f.project.join("out/r.xml")],
+                "{command}"
+            );
+            assert_eq!(plan.confidence, Confidence::Complete);
+        }
+
+        // A relative path is relative to `--root`, and an absolute one stays.
+        let plan = js(&context(
+            &f,
+            "test",
+            "vitest run --root web --reporter=junit --outputFile.junit=r.xml",
+        ))
+        .unwrap();
+        assert_eq!(vitest_paths(&plan), [f.project.join("web/r.xml")]);
+        let plan = js(&context(
+            &f,
+            "test",
+            "vitest run --reporter=junit --outputFile.junit=/tmp/r.xml",
+        ))
+        .unwrap();
+        assert_eq!(vitest_paths(&plan), [PathBuf::from("/tmp/r.xml")]);
+    }
+
+    #[test]
+    fn vitest_plain_output_file_is_not_junits_when_another_file_reporter_is_listed() {
+        let (_tmp, f) = js_fixture("{}", &[]);
+        // `--outputFile` also applies to the json reporter, so the report
+        // may not be JUnit: fall back to adding Aster's own, which names
+        // its file per reporter.
+        let plan = js(&context(
+            &f,
+            "test",
+            "vitest run --reporter=json --reporter=junit --outputFile=out.json",
+        ))
+        .unwrap();
+        assert_eq!(
+            vitest_paths(&plan),
+            [PathBuf::from("/tmp/aster-reports/1/vitest.xml")]
+        );
+        assert!(plan
+            .command
+            .contains("--outputFile.junit=/tmp/aster-reports/1/vitest.xml"));
+        assert_eq!(plan.command.matches("--reporter=junit").count(), 1);
+    }
+
+    #[test]
+    fn vitest_junit_to_the_console_gets_a_file_without_a_second_reporter() {
+        let (_tmp, f) = js_fixture("{}", &[]);
+        let plan = js(&context(&f, "test", "vitest run --reporter=junit")).unwrap();
+        assert_eq!(
+            plan.command,
+            "vitest run --outputFile.junit=/tmp/aster-reports/1/vitest.xml --reporter=junit"
+        );
+    }
+
+    #[test]
+    fn vitest_junit_path_from_the_environment_is_expanded_or_left_unread() {
+        let (_tmp, f) = js_fixture("{}", &[]);
+        // The real firstlanding e2e command: an unset variable takes its
+        // default, and the expansion stays in the command as written.
+        let command = "bash -c 'pnpm exec vitest run --config v.ts ${ASTER_TEST_UNSET_FILE:-e2e} \
+             --reporter=default --reporter=junit \
+             --outputFile.junit=\"${ASTER_TEST_UNSET_OUT:-/tmp/web-e2e.xml}\"'";
+        let plan = recognise(&context(&f, "test", command)).unwrap();
+        let script = shell_words::split(&plan.command).unwrap().pop().unwrap();
+        assert!(script.contains("${ASTER_TEST_UNSET_FILE:-e2e}"), "{script}");
+        assert!(
+            script.contains("--outputFile.junit=\"${ASTER_TEST_UNSET_OUT:-/tmp/web-e2e.xml}\""),
+            "{script}"
+        );
+        assert_eq!(script.matches("--outputFile.junit").count(), 1);
+        assert_eq!(vitest_paths(&plan), [PathBuf::from("/tmp/web-e2e.xml")]);
+
+        // A variable the one-liner sets itself, or any other expansion,
+        // cannot be known: nothing is added (a duplicate would crash
+        // Vitest) and the results are partial.
+        for path in ["$ASTER_TEST_UNSET_DIR", "~/r.xml", "${X:=a}"] {
+            let command =
+                format!("bash -c 'vitest run --reporter=junit --outputFile.junit={path}'");
+            let plan = recognise(&context(&f, "test", &command)).unwrap();
+            assert!(vitest_paths(&plan).is_empty(), "{path}");
+            assert_eq!(plan.confidence, Confidence::Partial);
+            assert_eq!(plan.command.matches("--outputFile").count(), 1);
+        }
+    }
+
+    #[test]
+    fn expand_known_reads_the_environment_and_refuses_the_rest() {
+        std::env::set_var("ASTER_TEST_SET", "set");
+        std::env::set_var("ASTER_TEST_EMPTY", "");
+        for (text, expected) in [
+            ("a/$ASTER_TEST_SET/b", Some("a/set/b")),
+            ("${ASTER_TEST_SET}x", Some("setx")),
+            ("${ASTER_TEST_SET:-d}", Some("set")),
+            ("${ASTER_TEST_NOPE:-d/e}", Some("d/e")),
+            ("${ASTER_TEST_NOPE-d}", Some("d")),
+            ("${ASTER_TEST_EMPTY:-d}", Some("d")),
+            ("${ASTER_TEST_EMPTY-d}", Some("")),
+            ("$ASTER_TEST_NOPE", None),
+            ("${ASTER_TEST_NOPE:-$ASTER_TEST_SET}", Some("set")),
+            ("${ASTER_TEST_NOPE:=d}", None),
+            ("${#ASTER_TEST_SET}", None),
+            ("$1", None),
+            ("~/x", None),
+            ("plain", Some("plain")),
+        ] {
+            assert_eq!(
+                expand_known(text).as_deref(),
+                expected.filter(|e| !e.is_empty()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegating_treats_shell_expansions_as_opaque_arguments() {
+        let (_tmp, f) = js_fixture("{}", &[]);
+        let ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
+        let github = if ci { " --reporter=github-actions" } else { "" };
+        for command in [
+            "bash -c 'vitest run --root . $QF'",
+            "sh -c 'vitest run --root . ${QF:-flaky}'",
+            "bash -c 'vitest run \"$QF\" -t \"a $B\"'",
+            "bash -c 'FOO=$BAR exec vitest run'",
+        ] {
+            let plan = recognise(&context(&f, "test", command)).unwrap();
+            let script = shell_words::split(&plan.command).unwrap().pop().unwrap();
+            let expected = command.split_once('\'').unwrap().1.trim_end_matches('\'');
+            // Only Aster's flags are new; every expansion is written back as
+            // it was, not quoted into a literal.
+            let stripped = script
+                .replace(&format!("--reporter=default{github} "), "")
+                .replace(
+                    " --reporter=junit --outputFile.junit=/tmp/aster-reports/1/vitest.xml",
+                    "",
+                )
+                .replace(
+                    "--reporter=junit --outputFile.junit=/tmp/aster-reports/1/vitest.xml ",
+                    "",
+                );
+            assert_eq!(
+                stripped.split_whitespace().count(),
+                expected.split_whitespace().count(),
+                "{script}"
+            );
+            for word in expected.split_whitespace().filter(|w| w.contains('$')) {
+                assert!(script.contains(word), "{word} in {script}");
+            }
+        }
+
+        // The boundary: an expansion that decides what runs, or whose
+        // value reshapes the arguments, is not planned.
+        for command in [
+            "bash -c '$RUNNER run'",
+            "bash -c 'exec $RUNNER run'",
+            "bash -c 'vitest run $(cat files)'",
+            "bash -c 'vitest run `cat files`'",
+            "bash -c 'vitest run ${QF:-a'",
+        ] {
+            assert!(
+                recognise(&context(&f, "test", command)).is_none(),
+                "{command}"
+            );
+        }
+        // A literal `$` in single quotes is not an expansion.
+        let plan = recognise(&context(&f, "test", "bash -c \"vitest run -t 'x$'\"")).unwrap();
+        assert!(plan.command.contains("x$"));
     }
 
     #[test]

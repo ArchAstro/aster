@@ -1027,3 +1027,133 @@ fn a_bad_declared_report_is_a_configuration_error() {
         assert!(stderr.contains("aster.toml"), "{report}: {stderr}");
     }
 }
+
+// Vitest commands that carry their own JUnit report or shell expansions.
+
+/// A stand-in for the `vitest` binary that behaves like Vitest 4 for what
+/// matters here: it writes JUnit to `--outputFile.junit` (relative to the
+/// working directory) and fails because `flaky one` fails. A second
+/// `--outputFile.junit` becomes an array in Vitest's option parser and its
+/// JUnit reporter throws in `onInit`, so the stand-in crashes with no report.
+const FAKE_VITEST: &str = r#"#!/bin/sh
+out=""; n=0; junit=0
+for arg in "$@"; do
+  case "$arg" in
+    --outputFile.junit=*) out="${arg#--outputFile.junit=}"; n=$((n + 1)) ;;
+    --reporter=junit) junit=1 ;;
+  esac
+done
+echo "ran: $*" >> ../vitest.calls
+if [ "$n" -gt 1 ]; then
+  echo "TypeError: input.replace is not a function" >&2
+  exit 1
+fi
+if [ "$junit" = 1 ] && [ -n "$out" ]; then
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'XML'
+<testsuites><testsuite name="flaky.e2e.test.ts" tests="2" failures="1"><testcase classname="flaky.e2e.test.ts" name="flaky one" time="0.003"><failure message="expected 1 to be 2">at flaky.e2e.test.ts:2</failure></testcase><testcase classname="flaky.e2e.test.ts" name="fine one" time="0.001"/></testsuite></testsuites>
+XML
+fi
+exit 1
+"#;
+
+fn vitest_workspace(command: &str) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "web/package.json", r#"{"name":"web"}"#);
+    write(tmp.path(), "web/bin/vitest", FAKE_VITEST);
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp.path().join("web/bin/vitest");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        tmp.path(),
+        "web/aster.toml",
+        &format!(
+            "[targets.deps]\ncommand = \"true\"\n\n[targets.e2e]\ncommand = {}\n",
+            serde_json::to_string(command).unwrap()
+        ),
+    );
+    write(
+        tmp.path(),
+        "aster-quarantine.toml",
+        "[[test]]\nname = \"flaky one\"\ntarget = \"//web\"\nreason = \"flaky on CI\"\nexpires = 2999-01-01\n",
+    );
+    tmp
+}
+
+fn run_e2e(tmp: &TempDir, envs: &[(&str, &str)]) -> (Output, Vec<Record>) {
+    let results = tmp.path().join("out/results.ndjson");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("ASTER_RETRY_FAILED")
+        .env_remove("ASTER_SRV_URL")
+        .env_remove("ASTER_SRV_TOKEN")
+        .env_remove("GITHUB_ACTIONS")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .envs(envs.iter().copied())
+        .args([
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "run",
+            "//web:e2e",
+        ])
+        .output()
+        .unwrap();
+    let records = fs::read_to_string(&results)
+        .map(|text| parse_ndjson(&text).unwrap())
+        .unwrap_or_default();
+    (output, records)
+}
+
+#[test]
+fn a_vitest_command_with_its_own_junit_report_and_expansions_is_captured_and_quarantined() {
+    // firstlanding's browser e2e command: a shell one-liner whose file filter
+    // and report path are `${VAR:-default}` expansions, with a JUnit reporter
+    // of its own. Captured 0 tests before, so quarantine could not apply.
+    let tmp = vitest_workspace(
+        "bash -c 'bin/vitest run --root . ${E2E_FILE:-e2e} --reporter=default --reporter=junit \
+         --outputFile.junit=\"${E2E_RESULTS:-out/e2e.xml}\"'",
+    );
+    let (output, records) = run_e2e(&tmp, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    assert!(
+        !stderr.contains("no test results were captured"),
+        "{stderr}"
+    );
+    assert_eq!(tests_of(&records).len(), 2, "{stderr}");
+    // The command ran once, as written: no second reporter or output file.
+    let calls = fs::read_to_string(tmp.path().join("vitest.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+    assert!(calls.contains("--root . e2e --reporter=default"), "{calls}");
+
+    // The variable can name the file; Aster reads whichever it expands to.
+    let (output, records) = run_e2e(&tmp, &[("E2E_RESULTS", "out/other.xml")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(tests_of(&records).len(), 2);
+    assert!(tmp.path().join("web/out/other.xml").exists());
+}
+
+#[test]
+fn a_report_path_the_one_liner_sets_itself_is_not_guessed_and_the_run_says_so() {
+    let tmp = vitest_workspace(
+        "bash -c 'OUT=out/set.xml; bin/vitest run --root . e2e --reporter=default --reporter=junit \
+         --outputFile.junit=$OUT'",
+    );
+    let (output, records) = run_e2e(&tmp, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Nothing is added to the command, so the stand-in still gets a single
+    // `--outputFile.junit` and writes its report, but Aster cannot know where.
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[aster] Warning: no test results were captured for //web:e2e"),
+        "{stderr}"
+    );
+    assert!(tests_of(&records).is_empty());
+}
