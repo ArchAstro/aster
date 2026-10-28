@@ -292,7 +292,12 @@ pub fn discover_projects(
     resolve_name_collisions(&mut projects);
 
     validate_project_addresses(&projects)?;
-    normalize_target_dependencies(&mut projects, &explicit_target_dependencies)?;
+    let sparse = is_sparse_checkout(workspace_root);
+    normalize_target_dependencies(
+        &mut projects,
+        &explicit_target_dependencies,
+        sparse.then_some(workspace_root),
+    )?;
 
     Ok(projects)
 }
@@ -357,9 +362,34 @@ fn validate_project_addresses(projects: &[DiscoveredProject]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the workspace is a Git sparse checkout (`core.sparseCheckout`).
+fn is_sparse_checkout(workspace_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["config", "--bool", "core.sparseCheckout"])
+        .output()
+        .map(|out| out.status.success() && out.stdout.trim_ascii() == b"true")
+        .unwrap_or(false)
+}
+
+/// In a sparse checkout, a dependency whose project directory is not checked
+/// out is outside the cone rather than a typo, so its edge is dropped.
+fn outside_sparse_cone(sparse_root: Option<&Path>, dependency: &str) -> bool {
+    let Some(root) = sparse_root else {
+        return false;
+    };
+    let project = dependency
+        .strip_prefix("//")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_default();
+    !project.is_empty() && !root.join(project).exists()
+}
+
 fn normalize_target_dependencies(
     projects: &mut [DiscoveredProject],
     explicit_dependencies: &[(String, String)],
+    sparse_root: Option<&Path>,
 ) -> Result<()> {
     let available: std::collections::HashSet<String> = projects
         .iter()
@@ -374,6 +404,9 @@ fn normalize_target_dependencies(
 
     for (source, dependency) in explicit_dependencies {
         if !available.contains(dependency) {
+            if outside_sparse_cone(sparse_root, dependency) {
+                continue;
+            }
             anyhow::bail!("{source} depends on missing target {dependency}");
         }
     }
@@ -1009,6 +1042,50 @@ depends_on = ["//missing:build"]
         .unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
 
+        let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("depends on missing target //missing:build"));
+    }
+
+    #[test]
+    fn sparse_checkout_drops_dependency_outside_cone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"echo build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            r#"
+[targets.deploy]
+command = "echo deploy"
+depends_on = ["//missing:build"]
+"#,
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.sparseCheckout", "true"]);
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let deploy = &projects[0].targets["deploy"];
+        assert!(deploy.depends_on.is_empty());
+
+        // A checked-out project with no such target is still a typo.
+        std::fs::create_dir(tmp.path().join("missing")).unwrap();
         let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
         assert!(error
             .to_string()
