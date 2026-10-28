@@ -237,32 +237,28 @@ pub fn workspace_inputs(
 }
 
 /// The workspace-relative form of a project-relative `glob` that leaves the
-/// project through `..`; `None` for one that stays inside it.
+/// project through a `..` anywhere in it (`../x`, `src/../../x`); `None` for
+/// one that stays inside the project or climbs above the workspace root.
 fn escaping_glob(project: &std::path::Path, glob: &str) -> Option<String> {
-    if !glob.starts_with("../") {
+    if !glob.split('/').any(|part| part == "..") {
         return None;
     }
-    let mut parts: Vec<&str> = project
+    let own: Vec<&str> = project
         .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-    let depth = parts.len();
-    let mut climbed = 0;
+    let mut parts = own.clone();
     for part in glob.split('/') {
         match part {
             "." | "" => {}
             ".." => {
                 parts.pop()?;
-                climbed += 1;
             }
             other => parts.push(other),
         }
     }
     // `../<own dir>/x` climbs out and straight back in.
-    let own = project.to_string_lossy().replace('\\', "/");
-    let joined = parts.join("/");
-    let inside = !own.is_empty() && (joined == own || joined.starts_with(&format!("{own}/")));
-    (climbed > 0 && climbed <= depth && !inside).then_some(joined)
+    (!parts.starts_with(&own)).then(|| parts.join("/"))
 }
 
 #[cfg(test)]
@@ -558,6 +554,9 @@ mod tests {
                 "crates/core/**".to_string(),
                 "../../../src/ts/vectors.json".to_string(),
                 "../cli/back-inside.json".to_string(),
+                "src/../../shared/*.yaml".to_string(),
+                "src/../tests/inside.rs".to_string(),
+                "../../../../above-the-root.json".to_string(),
             ],
             ..Default::default()
         });
@@ -565,7 +564,10 @@ mod tests {
         let inputs = workspace_inputs(&[lint], &["//services/rust/cli:lint".to_string()]);
         assert_eq!(
             inputs["//services/rust/cli:lint"],
-            vec!["src/ts/vectors.json".to_string()]
+            vec![
+                "src/ts/vectors.json".to_string(),
+                "services/rust/shared/*.yaml".to_string()
+            ]
         );
     }
 }

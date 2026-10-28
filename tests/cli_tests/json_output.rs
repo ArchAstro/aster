@@ -359,6 +359,82 @@ include = ["src/**", "../../libs/theme/catalog.json"]
     );
 }
 
+/// A real sparse worktree (`git worktree add` + `git sparse-checkout set`,
+/// which records core.sparseCheckout in the worktree's config.worktree): an
+/// explicit dependency on a project outside the cone no longer fails
+/// discovery, and the checked-out projects load.
+#[test]
+fn test_list_in_sparse_worktree_with_dependency_outside_cone() {
+    let tmp = TempDir::new().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for (path, body) in [
+        ("aster.toml", ""),
+        (
+            "app/package.json",
+            r#"{"name": "app", "scripts": {"build": "tsc"}}"#,
+        ),
+        (
+            "app/aster.toml",
+            "[targets.deploy]\ncommand = \"true\"\ndepends_on = [\"//lib:build\"]\n",
+        ),
+        (
+            "lib/package.json",
+            r#"{"name": "lib", "scripts": {"build": "tsc"}}"#,
+        ),
+    ] {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            wt.to_str().unwrap(),
+        ],
+    );
+    git(&wt, &["sparse-checkout", "set", "--cone", "app"]);
+    git(&wt, &["checkout", "-q"]);
+    assert!(!wt.join("lib").exists(), "lib must be outside the cone");
+
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("aster");
+    let output = cmd
+        .current_dir(&wt)
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "list failed in a sparse worktree: {output:?}"
+    );
+    let projects: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let addresses: Vec<&str> = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["address"].as_str().unwrap())
+        .collect();
+    assert!(addresses.contains(&"//app"), "{addresses:?}");
+    assert!(!addresses.contains(&"//lib"), "{addresses:?}");
+}
+
 fn setup_rust_and_node_workspace() -> TempDir {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
