@@ -435,6 +435,76 @@ fn test_list_in_sparse_worktree_with_dependency_outside_cone() {
     assert!(!addresses.contains(&"//lib"), "{addresses:?}");
 }
 
+#[test]
+fn test_list_in_sparse_worktree_with_selected_by_outside_cone() {
+    let tmp = TempDir::new().unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for (path, body) in [
+        ("aster.toml", ""),
+        ("app/package.json", r#"{"name": "app"}"#),
+        (
+            "app/aster.toml",
+            "[targets.reads]\ncommand = \"true\"\nselected_by = [\"//lib:test\"]\n",
+        ),
+        (
+            "lib/package.json",
+            r#"{"name": "lib", "scripts": {"test": "true"}}"#,
+        ),
+    ] {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            wt.to_str().unwrap(),
+        ],
+    );
+    git(&wt, &["sparse-checkout", "set", "--cone", "app"]);
+    git(&wt, &["checkout", "-q"]);
+
+    // The selector's project is outside the cone: the entry is dropped.
+    let output = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(&wt)
+        .args(["--json", "graph"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "graph failed: {output:?}");
+    let graph: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(graph.get("selected_by").is_none(), "{graph}");
+
+    // In the full checkout the same entry stands.
+    let output = assert_cmd::cargo::cargo_bin_cmd!("aster")
+        .current_dir(&repo)
+        .args(["--json", "graph"])
+        .output()
+        .unwrap();
+    let graph: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(
+        graph["selected_by"]["//app:reads"],
+        serde_json::json!(["//lib:test"])
+    );
+}
+
 fn setup_rust_and_node_workspace() -> TempDir {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

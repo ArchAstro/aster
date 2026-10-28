@@ -427,6 +427,7 @@ impl<'a> Executor<'a> {
             for addr in primary_targets {
                 collect_target_deps(addr, &project_map, &mut targets_to_run);
             }
+            collect_selected_targets(&project_map, &mut targets_to_run);
         }
 
         let target_label = primary_targets
