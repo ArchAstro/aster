@@ -178,6 +178,12 @@ pub struct RichTargetConfig {
     #[serde(default)]
     pub exclusive_resources: Vec<String>,
 
+    /// Targets whose runs this target joins: `["//services/api:test-ci"]`.
+    /// When one of them runs, this target runs too, without a dependency
+    /// edge: no ordering, no dependents, no cycle.
+    #[serde(default)]
+    pub selected_by: Vec<String>,
+
     /// Shell command run in the target's working directory before each
     /// `--retry-failed` rerun of failing tests (e.g. a database reset). If
     /// it fails, that retry is skipped and the original failure stands.
@@ -289,6 +295,14 @@ impl TargetConfig {
         }
     }
 
+    /// Get selected_by (empty for simple/alias format)
+    pub fn selected_by(&self) -> &[String] {
+        match self {
+            TargetConfig::Simple(_) | TargetConfig::Alias(_) => &[],
+            TargetConfig::Rich(rich) => &rich.selected_by,
+        }
+    }
+
     /// Check if this is an alias target
     pub fn is_alias(&self) -> bool {
         matches!(self, TargetConfig::Alias(_))
@@ -388,6 +402,22 @@ pub(super) fn validate_aster_config(
                     path.display()
                 )
             })?;
+        }
+
+        for selector in target.selected_by() {
+            let address = Address::parse(selector).with_context(|| {
+                format!(
+                    "Invalid selected_by '{selector}' for target '{target_name}' in {}",
+                    path.display()
+                )
+            })?;
+            if address.target.is_none() {
+                anyhow::bail!(
+                    "selected_by '{selector}' for target '{target_name}' in {} names a project; \
+                     name the target whose runs this one joins, such as '{selector}:test'",
+                    path.display()
+                );
+            }
         }
 
         if let Some(token) = find_unquoted_shell_operator(target.command()) {
@@ -981,6 +1011,37 @@ depends_on = ["//self:lint", "//self:typecheck"]
         assert!(config.name.is_none());
         assert!(config.depends_on.is_empty());
         assert!(config.targets.is_empty());
+    }
+
+    #[test]
+    fn selected_by_parses_and_must_name_a_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[targets.reads]
+command = "true"
+selected_by = ["//services/gateway:test-ci"]
+"#,
+        )
+        .unwrap();
+        let config = parse_aster_toml(&toml_path).unwrap();
+        assert_eq!(
+            config.targets["reads"].selected_by(),
+            &["//services/gateway:test-ci"]
+        );
+
+        std::fs::write(
+            &toml_path,
+            "[targets.reads]\ncommand = \"true\"\nselected_by = [\"//services/gateway\"]\n",
+        )
+        .unwrap();
+        let error = parse_aster_toml(&toml_path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("names a project"),
+            "{error:#}"
+        );
     }
 
     #[test]

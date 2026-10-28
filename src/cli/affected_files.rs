@@ -312,18 +312,33 @@ const MAX_COMMAND_BYTES: usize = 100_000;
 struct Lookup<'a> {
     by_addr: HashMap<String, &'a DiscoveredProject>,
     by_root: HashMap<PathBuf, &'a DiscoveredProject>,
+    /// Targets that join a target's runs (`selected_by`), by its address.
+    joiners: HashMap<String, Vec<(String, String)>>,
 }
 
 impl<'a> Lookup<'a> {
     fn new(projects: &'a [DiscoveredProject]) -> Self {
+        let mut joiners: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for project in projects {
+            for (name, def) in &project.targets {
+                for selector in &def.selected_by {
+                    joiners
+                        .entry(selector.clone())
+                        .or_default()
+                        .push((address(project), name.clone()));
+                }
+            }
+        }
         Self {
             by_addr: projects.iter().map(|p| (address(p), p)).collect(),
             by_root: projects.iter().map(|p| (p.root.clone(), p)).collect(),
+            joiners,
         }
     }
 
     /// `target` of `project_addr` followed by every target it transitively
     /// depends on, in any project, as `(project address, target name)`.
+    /// Targets `selected_by` one of them join it, as the run does.
     fn closure(&self, project_addr: &str, target: &str) -> Vec<(String, String)> {
         let start = (project_addr.to_string(), target.to_string());
         let mut seen: HashSet<(String, String)> = HashSet::from([start.clone()]);
@@ -333,12 +348,18 @@ impl<'a> Lookup<'a> {
             let Some(def) = self.by_addr.get(&owner).and_then(|p| p.targets.get(&name)) else {
                 continue;
             };
-            for dependency in &def.depends_on {
-                let Some((project, name)) = dependency.rsplit_once(':') else {
-                    continue;
-                };
+            let joining = self
+                .joiners
+                .get(&format!("{owner}:{name}"))
+                .into_iter()
+                .flatten()
+                .cloned();
+            let dependencies = def.depends_on.iter().filter_map(|dependency| {
+                let (project, name) = dependency.rsplit_once(':')?;
                 let project = if project == "//self" { &owner } else { project };
-                let next = (project.to_string(), name.to_string());
+                Some((project.to_string(), name.to_string()))
+            });
+            for next in dependencies.collect::<Vec<_>>().into_iter().chain(joining) {
                 if seen.insert(next.clone()) {
                     order.push(next.clone());
                     queue.push_back(next);
@@ -1060,6 +1081,7 @@ mod file_command_tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         }

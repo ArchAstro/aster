@@ -171,6 +171,11 @@ string literals name a path inside the dependency) and/or `files = [globs]`
 definitions and the tests that reach them run, and the narrowing carries on
 to the project's own dependents. The key must be listed in `depends_on`; an
 entry that finds nothing runs the project in full, and `--dry-run` says why.
+A test target that reads files a project depending on it owns should not be
+a dependency of that project's target (the edge is a cycle, and the
+dependency's changes start the reader's lane). Declare
+`selected_by = ["//services/gateway:test-ci"]` on the test target instead: it
+joins every run of the named target, in that run's lane, without an edge.
 A shard project whose target is a one-liner such as
 `bash -c 'cd ../core && MIX_TEST_PARTITION=1 exec mix test --partitions 2'`
 runs its slice of the tests selected in `//core`, and test targets that the

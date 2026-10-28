@@ -25,8 +25,8 @@ use aster::config::{find_workspace_root, WorkspaceConfig};
 use aster::discovery::{discover_projects, DiscoveredProject};
 use aster::executor::logs::LogStore;
 use aster::executor::{
-    collect_target_deps, compute_target_levels, install_signal_handler, parse_target_address,
-    shutdown_signal, CommandOverride, Executor,
+    collect_selected_targets, collect_target_deps, compute_target_levels, install_signal_handler,
+    parse_target_address, shutdown_signal, CommandOverride, Executor,
 };
 use aster::git::{
     affected_with_dependents, files_to_projects, find_lane, select_affected_lane,
@@ -494,10 +494,12 @@ fn run() -> Result<()> {
                 };
 
                 let workspace_inputs = aster::graph::workspace_inputs(&projects, &nodes);
+                let selected_by = aster::graph::selected_by(&projects, &nodes);
                 let output = GraphOutput {
                     nodes,
                     edges,
                     workspace_inputs,
+                    selected_by,
                 };
                 output_json(&output)?;
             } else if output_mode == OutputMode::Quiet {
@@ -515,6 +517,11 @@ fn run() -> Result<()> {
                             aster::graph::workspace_inputs(&projects, std::slice::from_ref(&addr));
                         for glob in inputs.get(&addr).into_iter().flatten() {
                             println!("  {} {}", style("reads").dim(), style(glob).dim());
+                        }
+                        let selectors =
+                            aster::graph::selected_by(&projects, std::slice::from_ref(&addr));
+                        for selector in selectors.get(&addr).into_iter().flatten() {
+                            println!("  {} {}", style("selected by").dim(), style(selector).dim());
                         }
                     } else {
                         return Err(anyhow::anyhow!("Target not found: {addr}"));
@@ -1074,6 +1081,25 @@ fn run() -> Result<()> {
                         targets_to_run.insert(target_addr.clone());
                         collect_target_deps(&target_addr, &all_project_map, &mut targets_to_run);
                     }
+                    collect_selected_targets(&all_project_map, &mut targets_to_run);
+
+                    // A target that joined through `selected_by` says whose run.
+                    let joined_runs = |target_addr: &str| -> Vec<String> {
+                        parse_target_address(target_addr)
+                            .and_then(|(project_addr, name)| {
+                                all_project_map.get(&project_addr)?.targets.get(&name)
+                            })
+                            .map(|def| {
+                                def.selected_by
+                                    .iter()
+                                    .filter(|selector| targets_to_run.contains(*selector))
+                                    .map(|selector| {
+                                        format!("selected_by: joins the run of {selector}")
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
 
                     // Compute DAG levels for execution order
                     let levels = compute_target_levels(&targets_to_run, &all_project_map);
@@ -1146,15 +1172,15 @@ fn run() -> Result<()> {
                                     Some(CommandOverride::Run(commands)) => commands.clone(),
                                     _ => vec![],
                                 };
+                                let mut selection =
+                                    target_notes.get(target_addr).cloned().unwrap_or_default();
+                                selection.extend(joined_runs(target_addr));
                                 all_targets.push(DryRunTarget {
                                     address: target_addr.clone(),
                                     reason,
                                     files,
                                     commands,
-                                    selection: target_notes
-                                        .get(target_addr)
-                                        .cloned()
-                                        .unwrap_or_default(),
+                                    selection,
                                 });
                             }
                         }

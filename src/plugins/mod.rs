@@ -171,6 +171,9 @@ pub struct Target {
     /// Targets sharing a resource are serialized via per-resource mutexes
     /// while non-contending targets still run in parallel.
     pub exclusive_resources: Vec<String>,
+    /// Target addresses whose runs this target joins (`selected_by` in
+    /// aster.toml). Not a dependency: it orders nothing and adds no edge.
+    pub selected_by: Vec<String>,
     /// Shell command run in the target's working directory before each
     /// `--retry-failed` rerun, such as a database reset. A failing setup
     /// skips that retry.

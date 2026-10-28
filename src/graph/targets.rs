@@ -199,6 +199,31 @@ impl std::fmt::Display for CycleError {
     }
 }
 
+/// The `selected_by` of each requested target that has one: the targets
+/// whose runs it joins.
+pub fn selected_by(
+    projects: &[DiscoveredProject],
+    addresses: &[String],
+) -> HashMap<String, Vec<String>> {
+    let mut found = HashMap::new();
+    for addr in addresses {
+        let Some((project_addr, name)) = addr.rsplit_once(':') else {
+            continue;
+        };
+        let Some(target) = projects
+            .iter()
+            .find(|p| format!("//{}", p.relative_path.display()) == project_addr)
+            .and_then(|p| p.targets.get(name))
+        else {
+            continue;
+        };
+        if !target.selected_by.is_empty() {
+            found.insert(addr.clone(), target.selected_by.clone());
+        }
+    }
+    found
+}
+
 /// The workspace-relative globs each of `addresses` reads outside its own
 /// project: its `[targets.<name>.cache] workspace_include`, and any `include`
 /// glob that climbs out of the project (`../../shared/*.json`).
@@ -305,6 +330,7 @@ mod tests {
                             invalidates_cache: false,
                             working_dir: None,
                             exclusive_resources: vec![],
+                            selected_by: vec![],
                             retry_setup: None,
                             report: None,
                         },

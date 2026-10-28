@@ -443,6 +443,7 @@ fn target(
         invalidates_cache: false,
         working_dir,
         exclusive_resources,
+        selected_by: vec![],
         retry_setup: None,
         report: None,
     }
