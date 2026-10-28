@@ -321,6 +321,8 @@ syntax; Gradle tracks `ORG_GRADLE_PROJECT_*`.
 the workspace root, so a member can name a root `Cargo.lock` or
 `tsconfig.base.json` that `include` cannot see. Those paths are hashed with a
 `ws:` prefix and do not collide with a file of the same name in the project.
+`aster affected` also selects the target when one of these files changes
+([Inputs outside the project directory](#inputs-outside-the-project-directory)).
 
 A Cargo workspace member also hashes the workspace-root `Cargo.toml` and
 `Cargo.lock`, plus `rust-toolchain.toml` and `.cargo/config.toml` for targets
@@ -827,6 +829,82 @@ added; the targets they depend on still run. Repeat it with `--dry-run` to
 plan several lanes from one analysis of the change: each lane gets the plan it
 would get alone, and `--json` prints them under `lanes`, keyed by lane name.
 Running takes one lane per invocation.
+
+A lane can also say what it runs and what its runner needs:
+
+```toml
+[affected.lanes.browser]
+include = ["//services/web"]
+name = "Browser proofs"        # display name; defaults to the lane key
+target = "browser-e2e"         # run this target instead of the requested one
+toolchains = ["python"]        # needed beyond the plugins of the projects it runs
+matrix = { runner = "large" }  # free-form; copied into the lane's matrix row
+```
+
+Only projects that define the lane's target are selected. Every JSON plan
+lists `toolchains`: the plugins (`nodejs`, `go`, `rust`, …) of each project the
+plan runs a target in, including target dependencies, plus the lane's
+`toolchains`. A runner installs exactly those.
+
+### Fanning lanes out as a CI matrix
+
+`--matrix` plans every configured lane (or the `--lane`s given) from one
+analysis of the change and prints a JSON array with one row per lane that has
+something to run. Lanes the change does not reach have no row.
+
+```console
+$ aster affected test --base=main --related --matrix
+[{"lane":"backend","name":"backend","target":"test","toolchains":["go"]},
+ {"lane":"browser","name":"Browser proofs","target":"browser-e2e","toolchains":["nodejs","python"],"runner":"large"}]
+```
+
+Each row has `lane`, `name`, `target`, `toolchains`, and the lane's `matrix`
+fields at the top level; a `matrix` field may not reuse one of those four
+names. `--matrix` fails when no lanes are configured, so a missing section
+cannot pass as "nothing to run". Any CI system that fans a list out into parallel
+jobs can use it: one job per row, each running the same command with its
+lane, so the plan and the run come from the same selection rules.
+
+```console
+aster affected test --base=main --related --lane "$LANE"
+```
+
+[GitHub Actions](docs/ci/github-actions.md#fanning-lanes-out-as-a-job-matrix)
+has a worked workflow.
+
+### Running everything
+
+`--all` treats every project as changed: each lane selects every project it
+includes that defines the target, and targets run in full. A scheduled or
+post-merge run uses the same command, lanes and matrix as a change-driven
+one:
+
+```console
+aster affected test --all --matrix
+aster affected test --all --lane backend
+```
+
+`--dependents` and `--related` have no effect with `--all`, and `--base` is
+not read. With or without lanes, `--all` skips projects that do not define the
+target.
+
+### Inputs outside the project directory
+
+A changed file selects the project whose directory holds it. A target that
+reads files elsewhere in the workspace declares them in
+`cache.workspace_include` (see [Cache behavior](#cache-behavior));
+a change to one of them also selects that target's project, and the target
+runs in full, since its own sources did not change:
+
+```toml
+[targets.browser-e2e]
+command = "./scripts/browser-e2e.sh"
+cache = { workspace_include = ["scripts/browser/**", ".tool-versions"] }
+```
+
+Only the requested target's (or the lane's target's) declarations count, and
+the selection does not extend to that project's dependents.
+Plugin defaults such as a root lockfile still only affect the cache key.
 
 ## Watch mode
 

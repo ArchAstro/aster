@@ -309,3 +309,75 @@ Manifests are `GET`/`PUT` under `<base>/ac/<key>`; blobs are under
 `<base>/cas/<sha256>`. A write that the server refuses (401 or 403) switches
 that process to read-only. `ASTER_CACHE_MODE=read` on a pull request is the
 setting that matches the trust model above, even when the token can upload.
+
+## Fanning lanes out as a job matrix
+
+[`aster affected --matrix`](../../README.md#fanning-lanes-out-as-a-ci-matrix)
+prints one JSON row per lane the change selects. A plan job turns the rows
+into `strategy.matrix.include`; each test job installs the row's
+`toolchains` and runs its lane. No other selection logic lives in the
+workflow.
+
+```toml
+# aster.toml
+[affected.lanes.backend]
+include = ["//services/..."]
+matrix = { runs_on = "ubuntu-latest" }
+
+[affected.lanes.web]
+include = ["//web/..."]
+matrix = { runs_on = "ubuntu-latest-8-cores" }
+```
+
+```yaml
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      rows: ${{ steps.plan.outputs.rows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Aster
+        run: cargo install aster --locked
+      - name: Plan lanes
+        id: plan
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            echo "rows=$(aster affected test --all --matrix)" >> "$GITHUB_OUTPUT"
+          else
+            echo "rows=$(aster affected test --base=origin/${{ github.base_ref || 'main' }} --related --matrix)" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.rows != '[]'
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.rows) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Aster
+        run: cargo install aster --locked
+      - uses: actions/setup-go@v5
+        if: contains(matrix.toolchains, 'go')
+      - uses: actions/setup-node@v4
+        if: contains(matrix.toolchains, 'nodejs')
+      - name: Test lane
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            aster affected test --all --lane "${{ matrix.lane }}"
+          else
+            aster affected test --base=origin/${{ github.base_ref || 'main' }} --related --lane "${{ matrix.lane }}"
+          fi
+```
+
+The plan and test jobs pass the same flags, so a row exists exactly when its
+lane has something to run. A lane-specific setup step reads a `matrix` field
+(`if: matrix.browser`) rather than comparing lane names.

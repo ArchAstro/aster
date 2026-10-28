@@ -512,6 +512,22 @@ pub struct AffectedLaneConfig {
     /// Selectors removed from the lane. Exclusions always win.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Target the lane runs instead of the requested one, for a lane that
+    /// runs a proof (`browser-e2e`) rather than the suite every other lane
+    /// runs (`test-ci`).
+    pub target: Option<String>,
+    /// Display name for the lane. Defaults to the lane key.
+    pub name: Option<String>,
+    /// Toolchains the lane needs beyond those of the projects it runs, such
+    /// as one a CI step outside Aster uses. Merged into the plan's
+    /// `toolchains`.
+    #[serde(default)]
+    pub toolchains: Vec<String>,
+    /// Free-form fields copied verbatim into the lane's `--matrix` row, for
+    /// whatever runs the lane (a CI runner size, setup switches). Aster does
+    /// not read them.
+    #[serde(default)]
+    pub matrix: toml::Table,
 }
 
 /// Watch-mode configuration controlling fs-event ignore and suppression behavior.
@@ -927,6 +943,12 @@ ignore = [".agents/**", ".claude/skills/**"]
 [affected.lanes.core]
 include = ["//src/elixir/core/..."]
 exclude = ["//src/elixir/core/generated"]
+
+[affected.lanes.browser]
+name = "Browser proofs"
+target = "browser-e2e"
+toolchains = ["go"]
+matrix = { runs_on = "large", herdr = true }
 "#,
         )
         .unwrap();
@@ -944,6 +966,13 @@ exclude = ["//src/elixir/core/generated"]
             config.affected.lanes["core"].exclude,
             vec!["//src/elixir/core/generated".to_string()]
         );
+        assert_eq!(config.affected.lanes["core"].target, None);
+        let browser = &config.affected.lanes["browser"];
+        assert_eq!(browser.name.as_deref(), Some("Browser proofs"));
+        assert_eq!(browser.target.as_deref(), Some("browser-e2e"));
+        assert_eq!(browser.toolchains, vec!["go".to_string()]);
+        assert_eq!(browser.matrix["runs_on"].as_str(), Some("large"));
+        assert_eq!(browser.matrix["herdr"].as_bool(), Some(true));
     }
 
     #[test]

@@ -313,6 +313,25 @@ pub enum Commands {
         /// Filter by source language (e.g., nodejs, ruby, java, kotlin)
         #[arg(long, value_delimiter = ',')]
         lang: Vec<String>,
+
+        /// Treat every project as changed
+        ///
+        /// Selects every project (in each lane, when lanes are given) without
+        /// reading Git changes, and runs targets in full. Use it for a
+        /// scheduled or post-merge run that must cover everything with the
+        /// same command line as a change-driven run.
+        #[arg(long, conflicts_with_all = ["only_affected_files", "head"])]
+        all: bool,
+
+        /// Print the CI matrix: one JSON row per lane the change selects
+        ///
+        /// Plans every configured lane (or the ones given with --lane) and
+        /// prints a JSON array with a row for each lane that has targets to
+        /// run: `lane`, `name`, `target`, `toolchains`, and the lane's
+        /// `matrix` fields. A CI system fans the rows out into jobs, each
+        /// running `aster affected <target> --lane <lane>`. Implies --dry-run.
+        #[arg(long)]
+        matrix: bool,
     },
 
     /// View logs from the last run

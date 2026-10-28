@@ -57,6 +57,10 @@ pub struct AffectedRequest<'a> {
     pub related: Option<&'a Related>,
     /// Every discovered project, for targets that run in another project.
     pub all_projects: &'a [DiscoveredProject],
+    /// Projects selected because a changed file is a declared workspace
+    /// input of the target. Their change is not in their own sources, so
+    /// they run in full.
+    pub declared_inputs: &'a HashSet<String>,
 }
 
 /// How a project's targets are narrowed.
@@ -92,10 +96,12 @@ pub fn plan_affected_commands(
         let mut pinned = HashSet::new();
         for project in request.projects {
             let addr = address(project);
-            let narrowed = related.projects.get(&addr).is_some_and(|outcome| {
-                outcome.analysed
-                    && (outcome.full.is_none() || planner.follows_runners(&addr, target, outcome))
-            });
+            let narrowed = !request.declared_inputs.contains(&addr)
+                && related.projects.get(&addr).is_some_and(|outcome| {
+                    outcome.analysed
+                        && (outcome.full.is_none()
+                            || planner.follows_runners(&addr, target, outcome))
+                });
             if !narrowed {
                 pinned.extend(
                     planner
@@ -144,6 +150,9 @@ pub fn plan_affected_commands(
                 .collect();
 
             let narrowing = match outcome {
+                _ if request.declared_inputs.contains(&project_addr) => Narrowing::Full(
+                    "a changed file is a declared workspace input; running in full".into(),
+                ),
                 Some(outcome) => match &outcome.full {
                     Some(_)
                         if planner.as_ref().is_some_and(|planner| {

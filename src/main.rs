@@ -29,8 +29,8 @@ use aster::executor::{
     shutdown_signal, CommandOverride, Executor,
 };
 use aster::git::{
-    affected_with_dependents, files_to_projects, select_affected_lane, AffectedDetector,
-    AffectedIgnore,
+    affected_with_dependents, files_to_projects, find_lane, select_affected_lane,
+    select_by_declared_inputs, AffectedDetector, AffectedIgnore,
 };
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::PluginRegistry;
@@ -668,23 +668,39 @@ fn run() -> Result<()> {
             related,
             warnings_as_errors,
             lang,
+            all,
+            matrix: matrix_rows,
         } => {
             validate_lang_filter(&lang)?;
+            // --matrix plans every lane and prints JSON only.
+            let dry_run = dry_run || matrix_rows;
+            let output_mode = if matrix_rows {
+                OutputMode::Json
+            } else {
+                output_mode
+            };
+            // --all selects every project and runs it in full.
+            let related = related && !all;
+            let dependents = dependents && !all;
 
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)
                 .context("Not in a git repository. The 'affected' command requires git.")?;
 
             // Get changed files
-            let changed_files = detector
-                .all_affected_files(&base, head.as_deref())
-                .with_context(|| {
-                    format!(
-                        "Failed to detect changed files between '{}' and '{}'",
-                        base,
-                        head.as_deref().unwrap_or("HEAD + uncommitted")
-                    )
-                })?;
+            let changed_files = if all {
+                HashSet::new()
+            } else {
+                detector
+                    .all_affected_files(&base, head.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "Failed to detect changed files between '{}' and '{}'",
+                            base,
+                            head.as_deref().unwrap_or("HEAD + uncommitted")
+                        )
+                    })?
+            };
 
             // Affected ignores are distinct from discovery ignores: they remove
             // matching Git changes before ownership, rationale, and files-list handling.
@@ -705,7 +721,14 @@ fn run() -> Result<()> {
             }
 
             // Map files to projects
-            let directly_affected = files_to_projects(&changed_files, &projects);
+            let directly_affected = if all {
+                projects
+                    .iter()
+                    .map(|p| format!("//{}", p.relative_path.display()))
+                    .collect()
+            } else {
+                files_to_projects(&changed_files, &projects)
+            };
 
             if output_mode == OutputMode::Verbose {
                 eprintln!("[aster] Directly affected: {directly_affected:?}");
@@ -756,20 +779,14 @@ fn run() -> Result<()> {
 
             // Expand with dependents if requested
             let affected_addrs = if let Some(analysis) = &related_analysis {
-                let mut reached: HashSet<String> = analysis
+                let reached: HashSet<String> = analysis
                     .projects
                     .iter()
                     .filter(|(_, outcome)| outcome.affected())
                     .map(|(addr, _)| addr.clone())
                     .collect();
-                // Shard and wrapper projects follow the project whose tests
-                // they run.
-                reached.extend(related_proxies(
-                    &projects,
-                    &target,
-                    analysis,
-                    &PluginRegistry::with_all_plugins(),
-                ));
+                // Shard and wrapper projects are added per lane below, for
+                // the target each lane runs.
                 reached
             } else if dependents {
                 affected_with_dependents(directly_affected, &graph)
@@ -790,6 +807,15 @@ fn run() -> Result<()> {
                 selection: Vec<String>,
             }
             #[derive(serde::Serialize)]
+            struct LaneRow {
+                lane: String,
+                name: String,
+                target: String,
+                toolchains: Vec<String>,
+                #[serde(flatten)]
+                matrix: toml::Table,
+            }
+            #[derive(serde::Serialize)]
             struct DryRunOutput {
                 target: String,
                 base: String,
@@ -799,10 +825,27 @@ fn run() -> Result<()> {
                 /// Requested targets dropped by --only-affected-files.
                 #[serde(skip_serializing_if = "Vec::is_empty")]
                 skipped: Vec<String>,
+                /// Plugins of every project the plan runs a target in, plus
+                /// the lane's declared toolchains: what a runner must install.
+                toolchains: Vec<String>,
             }
             // Several lanes are planned from the one analysis above; running
             // them is one invocation per lane, each on its own runner.
-            let several_lanes = lane.len() > 1;
+            let lane = if matrix_rows && lane.is_empty() {
+                let mut configured: Vec<String> =
+                    workspace_config.affected.lanes.keys().cloned().collect();
+                if configured.is_empty() {
+                    // An empty matrix would read as "nothing to run".
+                    return Err(anyhow::anyhow!(
+                        "--matrix needs lanes: configure [affected.lanes.<name>] in the root aster.toml"
+                    ));
+                }
+                configured.sort();
+                configured
+            } else {
+                lane
+            };
+            let several_lanes = lane.len() > 1 || matrix_rows;
             if several_lanes && !dry_run {
                 return Err(anyhow::anyhow!(
                     "Several lanes can be planned together but not run together: \
@@ -816,9 +859,39 @@ fn run() -> Result<()> {
                 lane.iter().map(|name| Some(name.as_str())).collect()
             };
             let mut lane_plans = serde_json::Map::new();
+            let mut lane_rows: Vec<LaneRow> = Vec::new();
             for lane in lanes {
                 let lane_label = lane.unwrap_or_default();
+                let lane_config = lane
+                    .map(|name| find_lane(name, &workspace_config.affected))
+                    .transpose()?;
+                // A lane can run its own target instead of the requested one.
+                let target = lane_config
+                    .and_then(|config| config.target.clone())
+                    .unwrap_or_else(|| target.clone());
+                let lane_toolchains = lane_config
+                    .map(|config| config.toolchains.clone())
+                    .unwrap_or_default();
                 let mut affected_addrs = reached.clone();
+
+                // A changed file the target declares as a workspace input
+                // selects its project, which then runs the target in full.
+                let declared_inputs =
+                    select_by_declared_inputs(&target, &changed_files, &projects)?;
+                let declared_addrs: HashSet<String> = declared_inputs.keys().cloned().collect();
+                affected_addrs.extend(declared_addrs.iter().cloned());
+                let mut directly_affected_addrs = directly_affected_addrs.clone();
+                directly_affected_addrs.extend(declared_addrs.iter().cloned());
+                // Shard and wrapper projects follow the project whose tests
+                // they run.
+                if let Some(analysis) = &related_analysis {
+                    affected_addrs.extend(related_proxies(
+                        &projects,
+                        &target,
+                        analysis,
+                        &PluginRegistry::with_all_plugins(),
+                    ));
+                }
 
                 // Lane selection applies only to primary projects, after optional
                 // dependent expansion and before target dependency closure.
@@ -832,6 +905,17 @@ fn run() -> Result<()> {
                     if output_mode == OutputMode::Verbose {
                         eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
                     }
+                }
+                // A lane, or --all, runs the target only where it is defined.
+                // Without either, an affected project that lacks the target is
+                // still reported, as before.
+                if lane_config.is_some() || all {
+                    affected_addrs.retain(|addr| {
+                        projects.iter().any(|p| {
+                            format!("//{}", p.relative_path.display()) == *addr
+                                && p.targets.contains_key(&target)
+                        })
+                    });
                 }
 
                 // Primary projects are the affected ones (only these run the requested target)
@@ -857,6 +941,7 @@ fn run() -> Result<()> {
                                 targets: Vec::new(),
                                 count: 0,
                                 skipped: Vec::new(),
+                                toolchains: Vec::new(),
                             };
                             lane_plans
                                 .insert(lane_label.to_string(), serde_json::to_value(&empty)?);
@@ -947,6 +1032,7 @@ fn run() -> Result<()> {
                             warnings_as_errors,
                             related: related_analysis.as_ref(),
                             all_projects: &projects,
+                            declared_inputs: &declared_addrs,
                         },
                         &registry,
                     )?)
@@ -995,6 +1081,22 @@ fn run() -> Result<()> {
                             files_per_project.insert(project_addr, project_files);
                         }
                     }
+                    for (project_addr, files) in &declared_inputs {
+                        files_per_project
+                            .entry(project_addr.clone())
+                            .or_default()
+                            .extend(files.iter().map(|f| f.to_string_lossy().to_string()));
+                    }
+
+                    let mut toolchains: Vec<String> = targets_to_run
+                        .iter()
+                        .filter_map(|addr| parse_target_address(addr))
+                        .filter_map(|(project_addr, _)| all_project_map.get(&project_addr))
+                        .map(|project| project.plugin_name.clone())
+                        .chain(lane_toolchains.iter().cloned())
+                        .collect();
+                    toolchains.sort();
+                    toolchains.dedup();
 
                     // Categorize each target's rationale
                     let rationale_for = |target_addr: &str| -> &'static str {
@@ -1057,7 +1159,20 @@ fn run() -> Result<()> {
                                 .as_ref()
                                 .map(|plan| plan.skipped.clone())
                                 .unwrap_or_default(),
+                            toolchains,
                         };
+                        if let (true, Some(config)) = (!primary_addrs.is_empty(), lane_config) {
+                            lane_rows.push(LaneRow {
+                                lane: lane_label.to_string(),
+                                name: config
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| lane_label.to_string()),
+                                target: target.clone(),
+                                toolchains: output.toolchains.clone(),
+                                matrix: config.matrix.clone(),
+                            });
+                        }
                         if several_lanes {
                             lane_plans
                                 .insert(lane_label.to_string(), serde_json::to_value(&output)?);
@@ -1208,7 +1323,9 @@ fn run() -> Result<()> {
                     return Err(anyhow::anyhow!("{failed} project(s) failed"));
                 }
             }
-            if several_lanes && output_mode == OutputMode::Json {
+            if matrix_rows {
+                output_json(&lane_rows)?;
+            } else if several_lanes && output_mode == OutputMode::Json {
                 output_json(&serde_json::json!({ "lanes": lane_plans }))?;
             }
         }
