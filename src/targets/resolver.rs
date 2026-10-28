@@ -51,6 +51,10 @@ impl TargetResolver {
                     invalidates_cache: target.invalidates_cache,
                     working_dir: target.working_dir.clone(),
                     exclusive_resources: target.exclusive_resources.clone(),
+                    selected_by: Self::resolve_self_references(
+                        &target.selected_by,
+                        project_address,
+                    ),
                     retry_setup: target.retry_setup.clone(),
                     report: target.report.clone(),
                 },
@@ -76,6 +80,7 @@ impl TargetResolver {
                                 invalidates_cache: existing.invalidates_cache,
                                 working_dir: existing.working_dir.clone(),
                                 exclusive_resources: existing.exclusive_resources.clone(),
+                                selected_by: existing.selected_by.clone(),
                                 retry_setup: existing.retry_setup.clone(),
                                 report: existing.report.clone(),
                             },
@@ -94,6 +99,7 @@ impl TargetResolver {
                                 invalidates_cache: false,
                                 working_dir: None,
                                 exclusive_resources: vec![],
+                                selected_by: vec![],
                                 retry_setup: None,
                                 report: None,
                             },
@@ -144,6 +150,12 @@ impl TargetResolver {
                             .unwrap_or_default()
                     };
 
+                    let selected_by = if rich.selected_by.is_empty() {
+                        existing.map(|e| e.selected_by.clone()).unwrap_or_default()
+                    } else {
+                        Self::resolve_self_references(&rich.selected_by, project_address)
+                    };
+
                     targets.insert(
                         name.clone(),
                         Target {
@@ -156,6 +168,7 @@ impl TargetResolver {
                             invalidates_cache,
                             working_dir,
                             exclusive_resources,
+                            selected_by,
                             retry_setup: rich
                                 .retry_setup
                                 .clone()
@@ -212,6 +225,7 @@ impl TargetResolver {
                         invalidates_cache: source_target.invalidates_cache,
                         working_dir: source_target.working_dir,
                         exclusive_resources: source_target.exclusive_resources,
+                        selected_by: source_target.selected_by,
                         retry_setup: source_target.retry_setup,
                         report: source_target.report,
                     },
@@ -274,6 +288,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         }
@@ -298,6 +313,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec![],
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         })
@@ -700,6 +716,7 @@ mod tests {
             cache: None,
             invalidates_cache: false,
             exclusive_resources: vec!["custom_resource".to_string()],
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         };
@@ -733,6 +750,33 @@ mod tests {
 
         let deps = targets.get("deps").unwrap();
         assert_eq!(deps.exclusive_resources, vec!["hex_registry".to_string()]);
+    }
+
+    #[test]
+    fn selected_by_resolves_self_and_survives_a_simple_override() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "reads".to_string(),
+            TargetConfig::Rich(RichTargetConfig {
+                command: "true".to_string(),
+                selected_by: vec!["//self:lint".to_string(), "//apps/web:test".to_string()],
+                ..Default::default()
+            }),
+        );
+        let targets = TargetResolver::resolve(&HashMap::new(), &custom, "//apps/api");
+        assert_eq!(
+            targets["reads"].selected_by,
+            ["//apps/api:lint", "//apps/web:test"]
+        );
+        // The relation adds no dependency.
+        assert!(targets["reads"].depends_on.is_empty());
+
+        let mut reads = target("true", vec![]);
+        reads.selected_by = vec!["//apps/web:test".to_string()];
+        let detected = HashMap::from([("reads".to_string(), reads)]);
+        let custom = HashMap::from([("reads".to_string(), simple("false"))]);
+        let targets = TargetResolver::resolve(&detected, &custom, "//apps/api");
+        assert_eq!(targets["reads"].selected_by, ["//apps/web:test"]);
     }
 
     #[test]

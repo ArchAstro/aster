@@ -479,6 +479,7 @@ impl<'a> Executor<'a> {
                 collect_target_deps(&target_addr, &project_map, &mut targets_to_run);
             }
         }
+        collect_selected_targets(&project_map, &mut targets_to_run);
 
         self.execute_target_set(&targets_to_run, &project_map, command_overrides, target)
     }
@@ -1412,6 +1413,47 @@ pub fn collect_target_deps(
     for dep in &target.depends_on {
         if collected.insert(dep.clone()) {
             collect_target_deps(dep, project_map, collected);
+        }
+    }
+}
+
+/// Add every target that is `selected_by` a target in `collected`, with its
+/// own dependencies, until nothing more joins.
+///
+/// `selected_by` is not a dependency: the joining target is not ordered
+/// against the one that selected it, and neither project depends on the
+/// other.
+pub fn collect_selected_targets(
+    project_map: &HashMap<String, &DiscoveredProject>,
+    collected: &mut HashSet<String>,
+) {
+    let mut joiners: HashMap<&str, Vec<String>> = HashMap::new();
+    for (project_addr, project) in project_map {
+        for (name, target) in &project.targets {
+            for selector in &target.selected_by {
+                joiners
+                    .entry(selector.as_str())
+                    .or_default()
+                    .push(format!("{project_addr}:{name}"));
+            }
+        }
+    }
+    if joiners.is_empty() {
+        return;
+    }
+    let mut queue: Vec<String> = collected.iter().cloned().collect();
+    while let Some(addr) = queue.pop() {
+        let Some(found) = joiners.get(addr.as_str()) else {
+            continue;
+        };
+        for joiner in found {
+            if !collected.insert(joiner.clone()) {
+                continue;
+            }
+            let before: HashSet<String> = collected.clone();
+            collect_target_deps(joiner, project_map, collected);
+            queue.push(joiner.clone());
+            queue.extend(collected.difference(&before).cloned());
         }
     }
 }
@@ -2837,6 +2879,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec![],
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         }
@@ -2906,6 +2949,49 @@ mod tests {
 
         let result = parse_target_address("invalid");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn selected_targets_join_the_run_with_their_dependencies() {
+        let mut gateway = HashMap::new();
+        gateway.insert("test".to_string(), target("true", vec![]));
+        gateway.insert("lint".to_string(), target("true", vec![]));
+        let mut platform = HashMap::new();
+        platform.insert("deps".to_string(), target("true", vec![]));
+        let mut reads = target("true", vec!["//platform:deps"]);
+        reads.selected_by = vec!["//gateway:test".to_string()];
+        platform.insert("reads".to_string(), reads);
+        // Joining is transitive: a target can join a joiner's run.
+        let mut more = target("true", vec![]);
+        more.selected_by = vec!["//platform:reads".to_string()];
+        platform.insert("more".to_string(), more);
+        let projects = [
+            make_project_with_targets("gateway", gateway),
+            make_project_with_targets("platform", platform),
+        ];
+        let project_map: HashMap<String, &DiscoveredProject> = projects
+            .iter()
+            .map(|p| (format!("//{}", p.relative_path.display()), p))
+            .collect();
+
+        let mut run = HashSet::from(["//gateway:test".to_string()]);
+        collect_selected_targets(&project_map, &mut run);
+        let mut run: Vec<_> = run.into_iter().collect();
+        run.sort();
+        assert_eq!(
+            run,
+            [
+                "//gateway:test",
+                "//platform:deps",
+                "//platform:more",
+                "//platform:reads"
+            ]
+        );
+
+        // Another target of the same project selects nothing.
+        let mut run = HashSet::from(["//gateway:lint".to_string()]);
+        collect_selected_targets(&project_map, &mut run);
+        assert_eq!(run, HashSet::from(["//gateway:lint".to_string()]));
     }
 
     #[test]
@@ -3391,6 +3477,7 @@ mod tests {
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: resources.into_iter().map(|s| s.to_string()).collect(),
+            selected_by: vec![],
             retry_setup: None,
             report: None,
         }

@@ -11,8 +11,8 @@ pub mod runner;
 
 pub use logs::{LogStore, RunLog, TargetLog};
 pub use runner::{
-    collect_target_deps, compute_target_levels, fresh_cache_key, parse_target_address,
-    CommandOverride, ExecutionResult, Executor,
+    collect_selected_targets, collect_target_deps, compute_target_levels, fresh_cache_key,
+    parse_target_address, CommandOverride, ExecutionResult, Executor,
 };
 
 /// Quote one argument for use in an Aster target command string.

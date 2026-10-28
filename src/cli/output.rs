@@ -71,6 +71,10 @@ pub struct GraphOutput {
     /// dependencies the edges cannot show; a sparse checkout needs them.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub workspace_inputs: HashMap<String, Vec<String>>,
+    /// Target -> targets whose runs it joins (`selected_by`). Not edges:
+    /// they order nothing and select nothing in the other direction.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub selected_by: HashMap<String, Vec<String>>,
 }
 
 /// Why command output for JSON
@@ -408,12 +412,14 @@ mod tests {
             nodes: vec!["//a:test".to_string(), "//a:deps".to_string()],
             edges,
             workspace_inputs: HashMap::new(),
+            selected_by: HashMap::new(),
         };
 
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("nodes"));
         assert!(json.contains("edges"));
         assert!(!json.contains("workspace_inputs"));
+        assert!(!json.contains("selected_by"));
     }
 
     #[test]

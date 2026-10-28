@@ -4361,3 +4361,208 @@ fn srv_commands_run_outside_a_workspace_and_name_renames_on_stderr() {
         }
     }
 }
+
+/// //services/platform tests read files //services/gateway owns, and
+/// platform depends on gateway. Its reads join gateway's test-ci through
+/// `selected_by` instead of a reverse `depends_on`, which would be a cycle.
+fn selected_by_workspace(tmp: &TempDir) {
+    setup_git_repo(tmp);
+    write_package_json(
+        tmp,
+        "services/gateway/package.json",
+        r#"{"name":"gateway"}"#,
+    );
+    write_aster_toml(
+        tmp,
+        "services/gateway/aster.toml",
+        r#"
+[targets.build]
+command = "true"
+
+[targets.test-ci]
+command = "true"
+"#,
+    );
+    write_package_json(
+        tmp,
+        "services/platform/package.json",
+        r#"{"name":"platform"}"#,
+    );
+    write_aster_toml(
+        tmp,
+        "services/platform/aster.toml",
+        r#"
+depends_on = ["//services/gateway"]
+
+[targets.gateway-reads]
+command = "true"
+selected_by = ["//services/gateway:test-ci"]
+
+[targets.test-ci]
+command = "true"
+depends_on = ["//self:gateway-reads"]
+"#,
+    );
+    write_aster_toml(
+        tmp,
+        "aster.toml",
+        r#"
+[affected.lanes.gateway]
+include = ["//services/gateway"]
+
+[affected.lanes.platform]
+include = ["//services/platform"]
+"#,
+    );
+    write_fixture(tmp, "services/gateway/index.js", "base");
+    write_fixture(tmp, "services/platform/index.js", "base");
+    git_commit(tmp, "Initial commit");
+}
+
+fn planned(plan: &serde_json::Value) -> Vec<String> {
+    let mut addresses: Vec<String> = plan["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["address"].as_str().unwrap().to_string())
+        .collect();
+    addresses.sort();
+    addresses
+}
+
+#[test]
+fn selected_by_joins_the_run_of_the_named_target_without_an_edge() {
+    let tmp = TempDir::new().unwrap();
+    selected_by_workspace(&tmp);
+    let lane_plan = |tmp: &TempDir, lane: &str, related: bool| {
+        let mut args = vec!["--json", "affected", "test-ci", "--base=HEAD", "--dry-run"];
+        if related {
+            args.push("--related");
+        }
+        args.extend(["--lane", lane]);
+        aster_json(tmp, &args)
+    };
+
+    // No cycle, and the graph reports the relation apart from its edges.
+    let graph = aster_json(&tmp, &["--json", "graph"]);
+    assert_eq!(
+        graph["edges"]["//services/gateway:test-ci"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        graph["selected_by"]["//services/platform:gateway-reads"],
+        serde_json::json!(["//services/gateway:test-ci"])
+    );
+
+    // A gateway change runs platform's reads in the gateway lane, and says why.
+    write_fixture(&tmp, "services/gateway/index.js", "changed");
+    for related in [false, true] {
+        let plan = lane_plan(&tmp, "gateway", related);
+        assert_eq!(
+            planned(&plan),
+            [
+                "//services/gateway:test-ci",
+                "//services/platform:gateway-reads"
+            ],
+            "{plan}"
+        );
+        let reads = plan["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["address"] == "//services/platform:gateway-reads")
+            .unwrap();
+        assert_eq!(reads["reason"], "target dependency");
+        assert!(
+            reads["selection"]
+                .to_string()
+                .contains("joins the run of //services/gateway:test-ci"),
+            "{plan}"
+        );
+    }
+    let rows = aster_json(&tmp, &["affected", "test-ci", "--base=HEAD", "--matrix"]);
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["lane"], "gateway");
+
+    // A platform change selects only platform: the relation does not run
+    // gateway's lane, as a reverse dependency would.
+    write_fixture(&tmp, "services/gateway/index.js", "base");
+    write_fixture(&tmp, "services/platform/index.js", "changed");
+    let rows = aster_json(&tmp, &["affected", "test-ci", "--base=HEAD", "--matrix"]);
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["lane"], "platform");
+    assert_eq!(
+        planned(&lane_plan(&tmp, "platform", false)),
+        [
+            "//services/platform:gateway-reads",
+            "//services/platform:test-ci"
+        ]
+    );
+
+    // Under --dependents a gateway change reaches platform as a dependent;
+    // gateway's lane still runs only gateway's test-ci and the reads.
+    write_fixture(&tmp, "services/platform/index.js", "base");
+    write_fixture(&tmp, "services/gateway/index.js", "changed");
+    let plan = aster_json(
+        &tmp,
+        &[
+            "--json",
+            "affected",
+            "test-ci",
+            "--base=HEAD",
+            "--dependents",
+            "--dry-run",
+            "--lane",
+            "gateway",
+        ],
+    );
+    assert_eq!(
+        planned(&plan),
+        [
+            "//services/gateway:test-ci",
+            "//services/platform:gateway-reads"
+        ]
+    );
+}
+
+#[test]
+fn selected_by_must_name_an_existing_target() {
+    let tmp = TempDir::new().unwrap();
+    selected_by_workspace(&tmp);
+    let list = |tmp: &TempDir| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(["--json", "list"])
+            .output()
+            .unwrap()
+    };
+    let platform = |selector: &str| {
+        format!("[targets.gateway-reads]\ncommand = \"true\"\nselected_by = [\"{selector}\"]\n")
+    };
+
+    write_aster_toml(
+        &tmp,
+        "services/platform/aster.toml",
+        &platform("//services/gateway:lint"),
+    );
+    let output = list(&tmp);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("is selected_by missing target //services/gateway:lint"),
+        "{output:?}"
+    );
+
+    // A project alone does not say which of its runs to join.
+    write_aster_toml(
+        &tmp,
+        "services/platform/aster.toml",
+        &platform("//services/gateway"),
+    );
+    let output = list(&tmp);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("names a project"),
+        "{output:?}"
+    );
+}

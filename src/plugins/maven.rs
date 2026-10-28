@@ -142,6 +142,7 @@ impl LanguagePlugin for MavenPlugin {
                 invalidates_cache,
                 working_dir: working_dir.clone(),
                 exclusive_resources: vec![resource.clone()],
+                selected_by: vec![],
                 retry_setup: None,
                 report: None,
             }

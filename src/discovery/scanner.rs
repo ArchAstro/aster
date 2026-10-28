@@ -411,6 +411,33 @@ fn normalize_target_dependencies(
         }
     }
 
+    // `selected_by` names targets whose runs a target joins. A missing one
+    // is an error like a missing dependency, except outside a sparse cone.
+    for project in projects.iter_mut() {
+        let project_address = format!("//{}", project.relative_path.display());
+        let mut names: Vec<&String> = project.targets.keys().collect();
+        names.sort();
+        let mut missing = None;
+        for name in names {
+            for selector in &project.targets[name].selected_by {
+                if !available.contains(selector) && !outside_sparse_cone(sparse_root, selector) {
+                    missing = Some(format!(
+                        "target {project_address}:{name} is selected_by missing target {selector}"
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(message) = missing {
+            anyhow::bail!(message);
+        }
+        for target in project.targets.values_mut() {
+            target
+                .selected_by
+                .retain(|selector| available.contains(selector));
+        }
+    }
+
     // Language plugins infer `:build` edges from native path/workspace
     // dependencies. Not every dependency project defines a build target, so
     // discard only those unavailable inferred edges after explicit config has

@@ -813,6 +813,39 @@ ignore = [".agents/**", "docs/generated/**"]
 
 The root-level `ignore` list separately controls project discovery.
 
+### Tests that read another project's files
+
+A project's tests can read files that a project depending on it owns:
+the gateway's configs are checked by a Platform test, and Platform depends
+on the gateway. Making the gateway's `test-ci` depend on that test would
+run it on every gateway change, but the edge points backwards: the two
+projects now depend on each other, and a Platform change selects the
+gateway's lane too. `selected_by` states the relation without the edge:
+
+```toml
+# platform/aster.toml
+depends_on = ["//services/gateway"]
+
+[targets.gateway-reads]
+command = "mix test test/gateway_configs_test.exs"
+selected_by = ["//services/gateway:test-ci"]
+```
+
+- **When `//services/gateway:test-ci` runs, `gateway-reads` runs too**, with
+  its own dependencies, in the same run and lane: under `aster affected`
+  (with or without `--related`, `--dependents` or `--lane`) and under
+  `aster run`. `--dry-run` notes `selected_by: joins the run of …` on it.
+- **It is not a dependency.** Neither target waits for the other, no project
+  becomes a dependent of the other, `aster graph` lists it apart from the
+  edges (`selected_by` in `--json`), and it closes no cycle.
+- **Each entry names a target**, `//path:target` (`//self:target` for one of
+  the project's own). A project alone is rejected: joining every target of
+  it would run tests on a lint. A target that does not exist is an error
+  like a missing dependency, except outside a git sparse checkout's cone.
+- **Under `--related`** the joining target is narrowed as if the target it
+  joins depended on it: to the tests the change reaches in its project, or
+  skipped when none does.
+
 ### Splitting an affected run into lanes
 
 A lane is a named subset of projects in the root `aster.toml`, for CI that
