@@ -191,6 +191,19 @@ requested target depends on in other projects are narrowed the same way.
 `--dry-run` shows each narrowed command and the reference chain behind
 every selected test file.
 
+`--related` treats a string literal naming a workspace path as a read. Correct it
+with comments in any language: `aster: not-a-read` (applies to the line it
+trails, or the next code line; literals there name nothing) and
+`aster: reads <path>...` (inside a definition or on the line before it;
+workspace-relative paths or globs the definition reads, seeded like a literal).
+Adding, changing or removing one selects the tests that reach its definition.
+`aster check` lints the configuration and annotations (rules
+`unnarrowable-test-command`, `suspicious-path-literal`, `bad-consumes`,
+`orphan-test-target`, `stale-annotation`; `--strict`, `--rule <id>`,
+`--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
+errors or any finding with `--strict`, 2 for a configuration error). Root
+`aster.toml` `[check] entries = [..]` / `disable = [..]` configure it.
+
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 
 ```toml

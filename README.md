@@ -606,7 +606,9 @@ the tests that reach them, across project boundaries.
   to something that changed, and then only the tests that do. For targets
   that are not test commands (`build`, `lint`), the project runs as written
   when the change reaches it and is skipped otherwise.
-- **Comments, documentation and blank lines select nothing.**
+- **Comments, documentation and blank lines select nothing.** The one exception
+  is an `aster:` annotation comment (see
+  [Correcting which paths a test reads](#correcting-which-paths-a-test-reads)).
 - `--dry-run` prints, under each target, the narrowed command and the
   reference chain from each selected test file back to the changed line.
 - **Parsed files are cached.** The facts Aster extracts from each source file
@@ -885,6 +887,176 @@ selected_by = ["//services/gateway:test-ci"]
 - **Under `--related`** the joining target is narrowed as if the target it
   joins depended on it: to the tests the change reaches in its project, or
   skipped when none does.
+
+### Correcting which paths a test reads
+
+`--related` treats a string literal in a test as the test reading a path when
+it resolves to a file or directory of the workspace (from the workspace root,
+the file's directory or the project directory). It never looks at what the
+code does with the literal, so two things go wrong:
+
+- **A path that is written, not read.** A test that creates a fixture at
+  `Path.join(tmp, "config/app.yaml")` is selected whenever the repository's
+  own `config/app.yaml` changes, though it never reads it.
+- **A path that is read but invisible.** A path built from pieces
+  (`join(root, "config", name)`) or taken from the environment names nothing
+  the analysis can see.
+
+Two comments correct this. They work in any language Aster analyses; the
+comment syntax is the language's own (`#`, `//`, `/* */`), and the directive
+must start the comment text:
+
+```text
+aster: not-a-read
+aster: reads <path> [<path>...]
+```
+
+Anything after ` -- ` in the comment is a free-form reason and is ignored.
+
+**`aster: not-a-read`** applies to the line it trails, or to the next line of
+code when the comment stands alone. String literals on that line are not
+recorded as naming workspace paths.
+
+```elixir
+# aster: not-a-read -- a temp fixture, not the repo's own script
+File.write!(Path.join(source, ".devbox-setup/setup.sh"), script)
+```
+
+```typescript
+await writeFile(join(dir, "config/app.yaml"), yaml); // aster: not-a-read
+```
+
+```python
+# aster: not-a-read
+os.makedirs(os.path.join(tmp, "config/generated"))
+```
+
+```go
+os.WriteFile(filepath.Join(dir, "config/app.yaml"), data, 0o644) // aster: not-a-read
+```
+
+```rust
+// aster: not-a-read
+fs::write(dir.path().join("config/app.yaml"), yaml).unwrap();
+```
+
+A literal spanning several lines counts on the line where it starts. For a
+call spread over several lines, put the comment on the line that holds the
+literal.
+
+**`aster: reads <path>...`** declares paths the enclosing definition reads
+that its literals do not show. Paths are workspace-relative; `//` and `./`
+prefixes are accepted, and globs (`config/*.yaml`, `fixtures/**`) match any
+changed file they cover. A directory covers everything beneath it. Put the
+comment inside the definition, or on the line before it:
+
+```elixir
+test "loads every environment" do
+  # aster: reads config/dev.exs config/prod.exs
+  for env <- ~w(dev prod), do: Config.load(Path.join(config_dir(), "#{env}.exs"))
+end
+```
+
+```typescript
+// aster: reads schemas/**/*.json
+it("validates every schema", () => { /* reads them through a directory walk */ });
+```
+
+The definition is then selected whenever a changed file matches, exactly as if
+it held a literal naming that file: its tests, and the tests that reach a
+helper it annotates, run. A `reads` comment is honoured in any definition, in
+test code or not, because the definition it sits in is what changes.
+
+**Editing an annotation is a change to the definition it belongs to.**
+Adding or removing a comment normally selects nothing, but an annotation
+changes what its definition names, so the tests that reach that definition
+run once when one is added, changed or removed. Other comments stay inert, and
+so do unknown `aster:` directives (`aster check` reports them).
+
+Annotations are part of each file's cached facts; upgrading Aster starts a
+fresh facts cache.
+
+### Checking the configuration with `aster check`
+
+`aster check` lints the configuration and annotations that `--related`
+depends on. It reports what makes CI run more than it should, or never run
+something at all. It changes no selection.
+
+```console
+aster check                      # all rules, human-readable
+aster check --strict             # exit 1 on any finding
+aster check --rule bad-consumes  # only these rules (repeatable)
+aster check --entry test-ci      # name the target CI requests (repeatable)
+aster --json check               # machine-readable
+```
+
+Exit status: `0` when there are no findings or only warnings, `1` when a
+finding is an error (or on any finding with `--strict`), `2` when the
+configuration cannot be loaded.
+
+Each finding has a stable rule id, a severity and a location: `file:line` for
+source findings, a project or target address (`//services/api:test`) for
+configuration findings.
+
+| Rule | Severity | Reports |
+| --- | --- | --- |
+| `unnarrowable-test-command` | warning | A test target whose command contains a test runner Aster can narrow, but whose shape Aster refuses to narrow, so `--related` runs the whole target whenever it selects it. The reason is the one the narrowing computes: a substitution (`$(...)`, backticks, `{files}`), a shell operator, an interpreter running a script it cannot read to the end (`bash -c 'a && mix test && b'`), an expansion in the program position, a runner of another language than the project's, or a program in front of the runner that is not listed in `[affected.related] wrappers` (`mise exec node@24 -- vitest run`). Configured wrappers are honoured. |
+| `suspicious-path-literal` | warning | A literal in a test that names an existing workspace path, carries no annotation, and is an argument of a write-like call (write, mkdir, touch, the destination of a copy or rename) or a non-first argument of a path join whose base is not a workspace root expression. Suggests `aster: not-a-read` if the code does not read the repository path, or `aster: reads` / leaving it if it does. |
+| `bad-consumes` | error | A `[consumes."//x"]` key that is not a project, or a `files` glob that matches no source file. (A key that is missing from `depends_on` is already a configuration error, exit `2`.) |
+| `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. |
+| `stale-annotation` | error | An `aster: not-a-read` whose line holds no path-naming literal, an `aster: reads` path that matches nothing, or an unknown `aster:` directive. |
+
+**What counts as a workspace root base.** A join such as
+`Path.join(base, "config/app.yaml")` is reported when `base` is not
+recognisably the repository: its text does not mention `cwd`, `root`,
+`workspace`, `repo`, `dirname`, `__DIR__`, `__file__`, `import.meta`,
+`CARGO_MANIFEST_DIR` or the like (scratch names such as `tmp`, `temp`,
+`sandbox`, `fixture` never count), the variable it names is not assigned from
+such an expression in the same file (`@configs Path.expand("..", __DIR__)`),
+and it is not itself a path literal. A relative operand (`../x`) is not
+reported, since the base is then usually the file's own directory. These are
+text heuristics: the rule points at candidates, it does not prove a read or a
+write.
+
+**Which targets are test targets.** A target is a test target when its command
+(looking through configured wrappers, `bash -c '...'` scripts and shell
+operators) contains a command that its project's plugin recognises as a test
+runner: `mix test`, Vitest, Jest, `pytest`, `go test`, `cargo test`, and the
+others `--related` narrows. A script Aster cannot read as a test runner is not
+reported; it is not known to be a test. Targets named `watch`, or ending in
+`:watch`, `-watch` or `_watch`, are skipped: they run on a developer's
+machine. A shell operator written outside a `bash -c` script is already
+rejected when the configuration loads, so it never reaches this rule.
+
+**Entry targets.** `orphan-test-target` needs to know which targets CI
+requests. The entries are the `--entry` flags, `[check] entries` in the root
+`aster.toml`, and the `target` of each `[affected.lanes]` entry. The rule is
+skipped, and says so, when the workspace has no lanes, and when it has lanes
+but no entry target is known. A project is a root of the reachability search
+only where some lane admits it. This is a reachability check over the
+declared graph, so it cannot know about a CI step outside Aster that runs a
+target by name; add that target to `entries`.
+
+**Disabling a rule.** In the root `aster.toml`:
+
+```toml
+[check]
+entries = ["test-ci"]            # targets CI requests, for orphan-test-target
+disable = ["orphan-test-target"] # rule ids to skip
+```
+
+`aster check --rule` takes precedence over `disable`.
+
+**Speed.** `aster check` reads the same facts cache as `--related` (see
+above), so a warm run parses only files that changed. Only the files that
+hold a candidate literal are parsed a second time to see the call around it.
+
+**Not checked.** `bad-consumes` does not report a `[consumes]` entry whose
+reads the source graph already finds anyway: deciding that needs the analysis
+run with and without the entry, which is not cheap. `suspicious-path-literal`
+is a list of common standard-library names per language (Elixir `File`,
+Node `fs`, Python `os`/`shutil`/`pathlib`, Go `os`, Rust `std::fs`), so a
+write through a wrapper function of your own is not seen.
 
 ### Splitting an affected run into lanes
 
