@@ -199,10 +199,10 @@ workspace-relative paths or globs the definition reads, seeded like a literal).
 Adding, changing or removing one selects the tests that reach its definition.
 `aster check` lints the configuration and annotations (rules
 `unnarrowable-test-command`, `suspicious-path-literal`, `bad-consumes`,
-`orphan-test-target`, `stale-annotation`; `--strict`, `--rule <id>`,
+`orphan-test-target`, `stale-annotation`, `stale-allow-orphan`; `--strict`, `--rule <id>`,
 `--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
 errors or any finding with `--strict`, 2 for a configuration error). Root
-`aster.toml` `[check] entries = [..]` / `disable = [..]` configure it.
+`aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `disable = [..]` configure it.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 
