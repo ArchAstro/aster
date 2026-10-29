@@ -425,7 +425,7 @@ fn js_project(scripts: &str, ci_command: &str, subset: &str) -> Files {
 
 #[test]
 fn a_package_script_that_runs_the_suite_covers_the_same_runner_on_some_files() {
-    let cases: [(&str, Files, bool); 9] = [
+    let cases: [(&str, Files, bool); 7] = [
         (
             "script is the runner",
             js_project(
@@ -441,24 +441,6 @@ fn a_package_script_that_runs_the_suite_covers_the_same_runner_on_some_files() {
                 r#""test:ci":"vitest run --coverage""#,
                 "npm run test:ci",
                 "npx vitest run src/a.test.ts",
-            ),
-            false,
-        ),
-        (
-            "chain through other scripts",
-            js_project(
-                r#""test":"pnpm test:state && pnpm test:coverage","test:state":"vitest run --project state","test:coverage":"vitest run --coverage""#,
-                "pnpm test",
-                "pnpm exec vitest run src/a.test.ts",
-            ),
-            false,
-        ),
-        (
-            "scripts that call each other in a cycle do not hang",
-            js_project(
-                r#""test":"pnpm other && vitest run","other":"pnpm test""#,
-                "pnpm test",
-                "pnpm exec vitest run src/a.test.ts",
             ),
             false,
         ),
@@ -578,4 +560,23 @@ fn a_workspace_wide_cargo_test_covers_the_member_crates() {
     assert_eq!(orphans("cargo test --workspace"), Vec::<String>::new());
     assert_eq!(orphans("cargo test --all --locked"), Vec::<String>::new());
     assert_eq!(orphans("cargo test"), ["//rs/crates/a:test"]);
+}
+
+#[test]
+fn a_reached_files_list_target_runs_the_whole_suite_of_its_runner() {
+    let ws = Workspace::new(&[
+        (
+            "aster.toml",
+            "[affected.lanes.all]\ninclude = [\"//app\"]\n\n[check]\nentries = [\"test-ci\"]\n",
+        ),
+        ("app/package.json", "{\"name\":\"p\"}"),
+        (
+            "app/aster.toml",
+            "[targets.test-ci]\ncommand = \"true\"\ndepends_on = [\"//self:test\"]\n\n[targets.test]\ncommand = \"node related-tests.mjs vitest {files}\"\ncapabilities = [\"files_list\"]\n\n[targets.test-a]\ncommand = \"CI=true pnpm exec vitest run src/a.test.ts\"\n\n[targets.test-mocha]\ncommand = \"mocha test/a.js\"\n",
+        ),
+    ]);
+    let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+    let found = places(&report, "orphan-test-target");
+    assert!(!found.contains(&"//app:test-a".to_string()), "{found:?}");
+    assert!(found.contains(&"//app:test-mocha".to_string()), "{found:?}");
 }

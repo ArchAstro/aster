@@ -4,7 +4,7 @@
 //! Every rule has a stable id. Findings are warnings or errors; the command
 //! changes no selection. See the README, "Checking the configuration".
 
-use crate::cli::affected_files::{reachable_targets, test_targets};
+use crate::cli::affected_files::{reachable_targets, suite_runs, test_targets};
 use crate::config::WorkspaceConfig;
 use crate::discovery::DiscoveredProject;
 use crate::git::select_affected_lane;
@@ -190,6 +190,8 @@ pub fn run(
     Ok(report)
 }
 
+type Suites = Vec<(String, Option<String>)>;
+
 /// Test targets that no entry target runs.
 fn orphans(
     projects: &[DiscoveredProject],
@@ -252,12 +254,22 @@ fn orphans(
     // A whole-suite run of a project's tests (a shard that changes into the
     // project, say) covers the project's other targets that run the same
     // runner on some of its files.
-    let whole: Vec<&crate::cli::affected_files::TestTarget> = tests
+    // Each is the project it runs in and its `(program, config)` suites.
+    let mut whole: Vec<(String, Suites)> = tests
         .iter()
         .filter(|t| {
             !t.whole_suites.is_empty() && reached.contains(&(t.project.clone(), t.target.clone()))
         })
+        .map(|t| (t.runs_in.clone(), t.whole_suites.clone()))
         .collect();
+    // Package scripts and `{files}` commands run a suite their words do not
+    // name.
+    whole.extend(
+        suite_runs(projects, &config.affected.related.wrappers)
+            .into_iter()
+            .filter(|s| reached.contains(&(s.project.clone(), s.target.clone())))
+            .map(|s| (s.runs_in, s.suites)),
+    );
     // A reached `cargo test --workspace` runs every member crate's tests.
     let workspaces: Vec<PathBuf> = tests
         .iter()
@@ -281,9 +293,9 @@ fn orphans(
             continue;
         }
         if !test.selective
-            && whole.iter().any(|w| {
-                w.runs_in == test.runs_in
-                    && w.whole_suites
+            && whole.iter().any(|(runs_in, suites)| {
+                *runs_in == test.runs_in
+                    && suites
                         .iter()
                         .any(|(program, config)| *program == test.program && *config == test.config)
             })

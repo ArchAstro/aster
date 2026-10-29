@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::config::RelatedWrapperConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
-use crate::plugins::related_tests::{Delegated, Wrappers};
+use crate::plugins::related_tests::{package_script_runners, Delegated, Wrappers};
 use crate::plugins::{
     FilesListPlan, FilesListSelection, PluginRegistry, RelatedTest, Target, TargetCapability,
 };
@@ -851,9 +851,8 @@ pub struct TestTarget {
     /// another run of the runner does not cover it. A `--config` is in
     /// [`Self::config`] instead.
     pub selective: bool,
-    /// The whole-suite runs this command makes, each as `(program, config)`:
-    /// itself when it names no test file, or the runners of the package
-    /// script it calls (`pnpm test` where `test` is `vitest run`).
+    /// The whole-suite run this command makes as `(program, config)`: itself
+    /// when it names no test file.
     pub whole_suites: Vec<(String, Option<String>)>,
 }
 
@@ -972,6 +971,82 @@ fn describe_runner(command: &str) -> RunnerShape {
     }
 }
 
+/// The whole-suite run of a `{files}` command with an empty list, as
+/// `(program, config)`: the runner it names, behind a script
+/// (`related-tests.mjs vitest {files}`) or a `--run=<path>` option.
+fn files_runner(command: &str) -> Option<(String, Option<String>)> {
+    let words = shell_words::split(&command.replace("{files}", "")).ok()?;
+    words.iter().skip(1).find_map(|word| {
+        let word = word.strip_prefix("--run=").unwrap_or(word);
+        let name = word.rsplit('/').next().unwrap_or(word);
+        let program = match name {
+            "vitest" => "vitest",
+            "jest" => "jest",
+            "mocha" => "mocha",
+            "pytest" => "pytest",
+            "go" => "go test",
+            "cargo" => "cargo test",
+            "bun" => "bun test",
+            "node" => "node",
+            _ => return None,
+        };
+        Some((program.to_string(), None))
+    })
+}
+
+/// A target whose command runs a whole suite of a runner other than the
+/// command's own words, for `aster check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteRun {
+    pub project: String,
+    pub target: String,
+    /// Address of the project whose tests it runs.
+    pub runs_in: String,
+    /// `(program, config)` of each whole-suite run.
+    pub suites: Vec<(String, Option<String>)>,
+}
+
+/// The targets that run a whole suite through something `describe_runner`
+/// cannot see: a package script (`pnpm test` where `test` is `vitest run`),
+/// or a `{files}` command, which runs the whole suite of the runner it names
+/// when the list is empty. Used only to decide what a reached target covers;
+/// it does not decide which targets are test targets.
+pub fn suite_runs(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+) -> Vec<SuiteRun> {
+    let lookup = Lookup::new(projects, wrappers);
+    let mut found = Vec::new();
+    for project in projects {
+        for (name, def) in &project.targets {
+            let Some(runner) = lookup.runner(project, def) else {
+                continue;
+            };
+            let suites: Vec<(String, Option<String>)> = if def.command.contains("{files}")
+                && def.capabilities.contains(&TargetCapability::FilesList)
+            {
+                files_runner(&def.command).into_iter().collect()
+            } else {
+                package_script_runners(&runner.project.root, &runner.command)
+                    .iter()
+                    .map(|command| describe_runner(command))
+                    .filter(|s| s.whole && !s.selective)
+                    .map(|s| (s.program, s.config))
+                    .collect()
+            };
+            if !suites.is_empty() {
+                found.push(SuiteRun {
+                    project: address(project),
+                    target: name.clone(),
+                    runs_in: address(runner.project),
+                    suites,
+                });
+            }
+        }
+    }
+    found
+}
+
 /// The targets whose command runs tests, ordered by address.
 ///
 /// A command the project's plugin reads as a test runner (through the
@@ -984,9 +1059,7 @@ pub fn test_targets(
     wrappers: &[RelatedWrapperConfig],
     registry: &PluginRegistry,
 ) -> Vec<TestTarget> {
-    use crate::plugins::related_tests::{
-        package_script_runners, refusal, simple_commands, trailing_commands,
-    };
+    use crate::plugins::related_tests::{refusal, simple_commands, trailing_commands};
     let lookup = Lookup::new(projects, wrappers);
     let mut found = Vec::new();
     for project in projects {
@@ -1007,10 +1080,6 @@ pub fn test_targets(
                 None => def.command.clone(),
             };
             let runner = lookup.runner(project, def);
-            let runner_root = match &runner {
-                Some(runner) => runner.project.root.clone(),
-                None => project.root.clone(),
-            };
             // The same attempt `--related` makes when it narrows the target.
             let narrowable = runner.as_ref().is_some_and(|runner| {
                 let environment = runner
@@ -1066,12 +1135,7 @@ pub fn test_targets(
                             })
                     })
                 };
-                // A package script that chains runners (`a && b`).
-                let scripted = || {
-                    (!package_script_runners(&runner_root, &written).is_empty())
-                        .then(|| (project.plugin_name.clone(), None))
-                };
-                let Some((recogniser, wrapper)) = whole.or_else(behind).or_else(scripted) else {
+                let Some((recogniser, wrapper)) = whole.or_else(behind) else {
                     continue;
                 };
                 Some(match (&runner, refusal(&written), wrapper) {
@@ -1112,17 +1176,10 @@ pub fn test_targets(
                 None => (address(project), written.as_str()),
             };
             let shape = describe_runner(runner_command);
-            // Through a package script (`pnpm test`) the whole suite is
-            // what the script's runners run.
-            let mut runners = package_script_runners(&runner_root, runner_command);
-            if runners.is_empty() {
-                runners.push(runner_command.to_string());
-            }
-            let whole_suites = runners
-                .iter()
-                .map(|command| describe_runner(command))
+            let whole_suites = Some(&shape)
                 .filter(|s| s.whole && !s.selective)
-                .map(|s| (s.program, s.config))
+                .map(|s| (s.program.clone(), s.config.clone()))
+                .into_iter()
                 .collect();
             found.push(TestTarget {
                 project: address(project),
