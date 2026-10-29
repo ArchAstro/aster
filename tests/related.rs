@@ -2437,3 +2437,99 @@ fn a_warm_run_reuses_parsed_facts_and_a_changed_file_is_parsed_again() {
     assert_eq!(reused, 0);
     assert_eq!(cached_entries(other.path()), 0);
 }
+
+/// The `shop` project plus a data file that one test reads and another
+/// writes a fixture over.
+fn shop_with_data(writer: &str) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = ELIXIR
+        .iter()
+        .map(|(path, content)| (*path, content.to_string()))
+        .collect();
+    files.push(("shop/priv/prices.json", "{}\n".into()));
+    files.push((
+        "shop/test/shop/reader_test.exs",
+        "defmodule Shop.ReaderTest do\n  use ExUnit.Case\n\n  test \"reads\" do\n    assert File.read!(\"priv/prices.json\") == \"{}\\n\"\n  end\nend\n".into(),
+    ));
+    files.push(("shop/test/shop/writer_test.exs", writer.into()));
+    files
+}
+
+fn workspace_of(files: &[(&'static str, String)]) -> Workspace {
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    Workspace::new(&borrowed)
+}
+
+const WRITER: &str = "defmodule Shop.WriterTest do\n  use ExUnit.Case\n\n  test \"writes a fixture\" do\n    File.write!(Path.join(System.tmp_dir!(), \"priv/prices.json\"), \"{}\")\n  end\nend\n";
+
+#[test]
+fn a_write_that_names_a_workspace_path_selects_its_test_until_it_is_annotated() {
+    // Canonical proof for `aster: not-a-read`: the same data-file change, with
+    // and without the comment, through the real `aster affected --related`.
+    let ws = workspace_of(&shop_with_data(WRITER));
+    ws.write("shop/priv/prices.json", "{\"a\": 1}\n");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/reader_test.exs test/shop/writer_test.exs"]
+    );
+
+    let annotated = WRITER.replace(
+        "    File.write!",
+        "    # aster: not-a-read -- a temp fixture\n    File.write!",
+    );
+    let ws = workspace_of(&shop_with_data(&annotated));
+    ws.write("shop/priv/prices.json", "{\"a\": 1}\n");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/reader_test.exs"]
+    );
+}
+
+#[test]
+fn reads_selects_a_test_whose_paths_the_source_does_not_show() {
+    let builds_the_path = "defmodule Shop.PiecewiseTest do\n  use ExUnit.Case\n\n  test \"reads\" do\n    # aster: reads shop/priv/*.json\n    File.read!(Path.join([\"priv\", name()]))\n  end\n\n  defp name, do: \"prices\" <> \".json\"\nend\n";
+    let ws = workspace_of(&shop_with_data(builds_the_path));
+    ws.write("shop/priv/prices.json", "{\"a\": 1}\n");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/reader_test.exs test/shop/writer_test.exs"]
+    );
+}
+
+#[test]
+fn adding_or_removing_an_annotation_selects_the_test_it_belongs_to() {
+    let ws = workspace_of(&shop_with_data(WRITER));
+    ws.edit(
+        "shop/test/shop/writer_test.exs",
+        "    File.write!",
+        "    # aster: not-a-read\n    File.write!",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/writer_test.exs"]
+    );
+
+    // A comment that is not an annotation stays inert.
+    let ws = workspace_of(&shop_with_data(WRITER));
+    ws.edit(
+        "shop/test/shop/writer_test.exs",
+        "    File.write!",
+        "    # a plain note\n    File.write!",
+    );
+    assert_eq!(ws.plan("test").skipped, ["//shop:test"]);
+
+    // Removing one is a change too.
+    let annotated = WRITER.replace(
+        "    File.write!",
+        "    # aster: not-a-read\n    File.write!",
+    );
+    let ws = workspace_of(&shop_with_data(&annotated));
+    ws.edit(
+        "shop/test/shop/writer_test.exs",
+        "    # aster: not-a-read\n",
+        "",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/writer_test.exs"]
+    );
+}

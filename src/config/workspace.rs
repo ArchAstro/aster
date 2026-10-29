@@ -21,6 +21,10 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub affected: AffectedWorkspaceConfig,
 
+    /// `aster check` settings
+    #[serde(default)]
+    pub check: CheckConfig,
+
     /// Local development service harness configuration
     #[serde(default)]
     pub dev: DevWorkspaceConfig,
@@ -38,6 +42,20 @@ pub struct WorkspaceConfig {
     pub targets: HashMap<String, TargetConfig>,
     #[serde(default)]
     pub consumes: std::collections::BTreeMap<String, ConsumesConfig>,
+}
+
+/// `[check]`: settings for `aster check`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckConfig {
+    /// Targets CI requests (`aster affected <target>`), from which
+    /// `orphan-test-target` looks for test targets that never run. The
+    /// `target` of each `[affected.lanes]` entry is added.
+    #[serde(default)]
+    pub entries: Vec<String>,
+    /// Rule ids `aster check` skips.
+    #[serde(default)]
+    pub disable: Vec<String>,
 }
 
 /// `[cache]` retention for the local artifact store.

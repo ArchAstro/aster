@@ -104,6 +104,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     let mut facts = walker.facts;
     facts.is_test_file = is_test_path(path) || (walker.has_tests && in_test_dir(path));
     facts.classify_lines(source, &walker.inert);
+    super::annotations::apply(&mut facts, &tree, source);
     facts
 }
 
@@ -555,7 +556,7 @@ impl Walker<'_> {
             return;
         };
         // An imported asset is found by name when it changes.
-        self.facts.top.string(spec);
+        self.facts.top.string(spec, node.start_position().row + 1);
         self.facts.top.loaded.insert(spec.to_string());
         let clause = children(node)
             .into_iter()
@@ -676,7 +677,9 @@ impl Walker<'_> {
                 if value.starts_with("./") || value.starts_with("../") {
                     self.facts.owner(owner).uses.insert(value.clone());
                 }
-                self.facts.owner(owner).string(&value);
+                self.facts
+                    .owner(owner)
+                    .string(&value, node.start_position().row + 1);
                 return;
             }
             "import_statement" => return self.import(node),

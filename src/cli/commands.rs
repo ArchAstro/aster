@@ -244,6 +244,29 @@ pub enum Commands {
         ext: Vec<String>,
     },
 
+    /// Lint the configuration and annotations that `--related` depends on
+    ///
+    /// Rules: unnarrowable-test-command, suspicious-path-literal,
+    /// bad-consumes, orphan-test-target, stale-annotation. Exit status 0 for
+    /// no findings or only warnings, 1 for an error finding (or any finding
+    /// with --strict), 2 when the configuration cannot be loaded. Use the
+    /// global --json for machine-readable output.
+    Check {
+        /// Exit 1 on any finding, not only on errors
+        #[arg(long)]
+        strict: bool,
+
+        /// Run only this rule (repeatable)
+        #[arg(long, value_name = "ID")]
+        rule: Vec<String>,
+
+        /// A target CI requests, from which orphan-test-target looks for
+        /// test targets that never run (repeatable; adds to
+        /// `[check] entries` and the lanes' targets)
+        #[arg(long, value_name = "TARGET")]
+        entry: Vec<String>,
+    },
+
     /// Show the dependency path between two targets
     Why {
         /// Source target (//path/to/project:target)

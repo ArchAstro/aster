@@ -805,6 +805,168 @@ pub fn related_proxies(
         .collect()
 }
 
+/// A target whose command runs tests, for `aster check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestTarget {
+    /// Address of the project that defines the target.
+    pub project: String,
+    pub target: String,
+    pub command: String,
+    /// Why `--related` runs the whole target whenever it selects it. `None`
+    /// when the command is narrowed to the selected tests.
+    pub unnarrowable: Option<String>,
+}
+
+/// The targets whose command runs tests, ordered by address.
+///
+/// A command the project's plugin reads as a test runner (through the
+/// configured wrappers and a shell one-liner's final command, as
+/// `--related` reads it) is one. So is a command that contains such a runner
+/// among other commands, an interpreter's script or a pipeline: `--related`
+/// cannot narrow it, and the reason is the one narrowing computes.
+pub fn test_targets(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+    registry: &PluginRegistry,
+) -> Vec<TestTarget> {
+    use crate::plugins::related_tests::{refusal, simple_commands, trailing_commands};
+    let lookup = Lookup::new(projects, wrappers);
+    let mut found = Vec::new();
+    for project in projects {
+        let mut names: Vec<&String> = project.targets.keys().collect();
+        names.sort();
+        for name in names {
+            let def = &project.targets[name];
+            // Watch mode runs on a developer's machine, not in CI.
+            if name == "watch"
+                || name.ends_with(":watch")
+                || name.ends_with("-watch")
+                || name.ends_with("_watch")
+            {
+                continue;
+            }
+            let written = match lookup.wrappers.strip(&def.command) {
+                Some(wrapped) => wrapped.command,
+                None => def.command.clone(),
+            };
+            let runner = lookup.runner(project, def);
+            // The same attempt `--related` makes when it narrows the target.
+            let narrowable = runner.as_ref().is_some_and(|runner| {
+                let environment = runner
+                    .delegated
+                    .as_ref()
+                    .map(Delegated::environment)
+                    .unwrap_or_default();
+                let command = format!("{environment}{}", runner.command);
+                let hidden = runner
+                    .delegated
+                    .as_ref()
+                    .is_some_and(Delegated::hides_environment);
+                registry
+                    .find_by_name(&runner.project.plugin_name)
+                    .is_some_and(|plugin| {
+                        if hidden {
+                            plugin.related_tests_in_hidden_environment(
+                                &runner.project.root,
+                                &command,
+                                &[],
+                            )
+                        } else {
+                            plugin.related_tests(&runner.project.root, &command, &[])
+                        }
+                        .is_some()
+                    })
+            });
+            let placeholder = def.command.contains("{files}")
+                && def.capabilities.contains(&TargetCapability::FilesList);
+            let unnarrowable = if narrowable || placeholder {
+                None
+            } else {
+                // A test runner somewhere inside the command makes it a
+                // test target that cannot be narrowed.
+                let reads = |command: &str| {
+                    registry
+                        .plugins()
+                        .iter()
+                        .find(|p| p.related_tests(&project.root, command, &[]).is_some())
+                        .map(|p| p.name().to_string())
+                };
+                let segments = simple_commands(&written);
+                let whole = segments
+                    .iter()
+                    .find_map(|command| reads(command).map(|plugin| (plugin, None)));
+                // Behind a program Aster does not know runs a command.
+                let behind = || {
+                    segments.iter().find_map(|command| {
+                        trailing_commands(command)
+                            .into_iter()
+                            .find_map(|(prefix, rest)| {
+                                reads(&rest).map(|plugin| (plugin, Some(prefix)))
+                            })
+                    })
+                };
+                let Some((recogniser, wrapper)) = whole.or_else(behind) else {
+                    continue;
+                };
+                Some(match (&runner, refusal(&written), wrapper) {
+                    (None, _, _) => {
+                        "its shell script changes into a directory that is not a project"
+                            .to_string()
+                    }
+                    (_, Some(reason), _) => reason.to_string(),
+                    (_, None, Some(prefix)) => format!(
+                        "it starts with `{prefix}`, which is not a configured wrapper; if that \
+                         program runs the command after it, list it in \
+                         `[affected.related] wrappers`"
+                    ),
+                    _ if recogniser != project.plugin_name => format!(
+                        "it runs a {recogniser} test command in a {} project, and a command is \
+                         narrowed only by the plugin of the project that runs it",
+                        project.plugin_name
+                    ),
+                    _ => "its form is not one the test runner's narrowing supports \
+                          (an unsupported flag or argument)"
+                        .to_string(),
+                })
+            };
+            if placeholder && !narrowable {
+                // A `{files}` placeholder is filled from the selection; it
+                // is a test target only if the plugin recognises the rest.
+                let stripped = written.replace("{files}", "");
+                let recognised = registry.plugins().iter().any(|p| {
+                    p.related_tests(&project.root, stripped.trim(), &[])
+                        .is_some()
+                });
+                if !recognised {
+                    continue;
+                }
+            }
+            found.push(TestTarget {
+                project: address(project),
+                target: name.clone(),
+                command: def.command.clone(),
+                unnarrowable,
+            });
+        }
+    }
+    found.sort_by(|a, b| (&a.project, &a.target).cmp(&(&b.project, &b.target)));
+    found
+}
+
+/// Every `(project address, target)` that running the `roots` runs: the
+/// roots, what they depend on and what is `selected_by` any of those.
+pub fn reachable_targets(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+    roots: &[(String, String)],
+) -> HashSet<(String, String)> {
+    let lookup = Lookup::new(projects, wrappers);
+    roots
+        .iter()
+        .flat_map(|(project, target)| lookup.closure(project, target))
+        .collect()
+}
+
 /// The command a files-list target runs with no file list: a standalone
 /// `{files}` placeholder expands to nothing. `None` when the command has no
 /// placeholder and runs as written.

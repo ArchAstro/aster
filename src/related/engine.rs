@@ -1,6 +1,7 @@
 //! The workspace source graph and the walk from a change to the tests that
 //! can observe it.
 
+use super::annotations;
 use super::cache::FactsCache;
 use super::consumers::{self, Consume};
 use super::facts::{DefKind, Family, FileFacts, LineClass};
@@ -363,7 +364,7 @@ fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
 
 /// Every file of the workspace, the facts of every source file and how many
 /// of those the cache held.
-fn scan(
+pub(super) fn scan(
     root: &Path,
     cache: Option<FactsCache>,
 ) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>, usize) {
@@ -467,7 +468,7 @@ fn address(project: &DiscoveredProject) -> String {
 }
 
 /// The most specific project containing `path`.
-fn owner(projects: &[DiscoveredProject], path: &Path) -> Option<usize> {
+pub(super) fn owner(projects: &[DiscoveredProject], path: &Path) -> Option<usize> {
     projects
         .iter()
         .enumerate()
@@ -2172,7 +2173,13 @@ impl<'a> Index<'a> {
                         .into_iter()
                         .find(|path| owner(self.projects, path) == Some(dependency))
                 });
-                if let Some(path) = named {
+                let declared = || {
+                    def.reads
+                        .iter()
+                        .map(|pattern| annotations::literal_prefix(pattern))
+                        .find(|path| owner(self.projects, path) == Some(dependency))
+                };
+                if let Some(path) = named.or_else(declared) {
                     found.push((id, path));
                 }
             }
@@ -2239,6 +2246,18 @@ impl<'a> Index<'a> {
                 .map(|(d, def)| ((f as u32, d as u32), def))
                 .chain(std::iter::once(((f as u32, TOP), &source.facts.top)));
             for (id, def) in defs {
+                // Paths the definition declares it reads, in a comment.
+                for pattern in &def.reads {
+                    for change in changes {
+                        if annotations::covers(pattern, &change.path) {
+                            mentioned.insert(change.path.clone());
+                            run.mark(
+                                id,
+                                Why::Changed(format!("{} changed", change.path.display())),
+                            );
+                        }
+                    }
+                }
                 for string in &def.strings {
                     for token in string.split(|c: char| {
                         !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '@' | '+' | '-'))
