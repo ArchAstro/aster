@@ -580,3 +580,92 @@ fn a_reached_files_list_target_runs_the_whole_suite_of_its_runner() {
     assert!(!found.contains(&"//app:test-a".to_string()), "{found:?}");
     assert!(found.contains(&"//app:test-mocha".to_string()), "{found:?}");
 }
+
+#[test]
+fn a_reads_annotation_declares_the_literal_a_real_read() {
+    // Lines asserted: keep the layout. Each test joins a literal onto a
+    // scratch base, which is suspicious unless `reads` covers it.
+    let src = "defmodule ShopTest do
+  use ExUnit.Case
+
+  test \"same line\" do
+    File.read!(Path.join(base(), \"data/fixture.json\")) # aster: reads data/fixture.json
+  end
+
+  test \"line above\" do
+    # aster: reads data/fixture.json
+    File.read!(Path.join(base(), \"data/fixture.json\"))
+  end
+
+  test \"anywhere in the definition\" do
+    File.read!(Path.join(base(), \"data/fixture.json\"))
+    # aster: reads data/*.json
+  end
+
+  test \"a glob under the literal directory\" do
+    # aster: reads deep/dir/scripts/*.sh
+    File.read!(Path.join(base(), \"scripts/#{name()}.sh\"))
+  end
+
+  test \"a different path\" do
+    # aster: reads data/other.json
+    File.read!(Path.join(base(), \"data/fixture.json\"))
+  end
+
+  test \"declared in another definition\" do
+    # aster: reads data/fixture.json
+    :ok
+  end
+
+  test \"the literal of another definition\" do
+    File.read!(Path.join(base(), \"data/fixture.json\"))
+  end
+
+  test \"suffix must be whole components\" do
+    # aster: reads deep/dir/myscripts/*.sh
+    File.read!(Path.join(base(), \"scripts/#{name()}.sh\"))
+  end
+end
+";
+    let ws = Workspace::new(&[
+        ("aster.toml", ""),
+        ("data/fixture.json", "{}\n"),
+        ("data/other.json", "{}\n"),
+        ("scripts/a.sh", "\n"),
+        ("deep/dir/scripts/a.sh", "\n"),
+        ("deep/dir/myscripts/a.sh", "\n"),
+        ("tests/shop_test.exs", src),
+    ]);
+    let (status, report) = ws.check(&["--rule", "suspicious-path-literal"]);
+    assert_eq!(status, 0, "{report}");
+    assert_eq!(
+        places(&report, "suspicious-path-literal"),
+        [
+            "tests/shop_test.exs:25",
+            "tests/shop_test.exs:34",
+            "tests/shop_test.exs:39",
+        ],
+        "{report}"
+    );
+    // Every reads entry matches something, so none is stale.
+    let (status, report) = ws.check(&["--rule", "stale-annotation"]);
+    assert_eq!(status, 0, "{report}");
+}
+
+#[test]
+fn a_reads_annotation_that_matches_nothing_stays_stale_beside_the_literal() {
+    let ws = Workspace::new(&[
+        ("aster.toml", ""),
+        ("data/fixture.json", "{}\n"),
+        (
+            "tests/shop_test.exs",
+            "defmodule ShopTest do\n  use ExUnit.Case\n\n  test \"a\" do\n    # aster: reads data/missing.json\n    File.read!(Path.join(base(), \"data/fixture.json\"))\n  end\nend\n",
+        ),
+    ]);
+    let (_, report) = ws.check(&["--rule", "stale-annotation"]);
+    assert_eq!(
+        places(&report, "stale-annotation"),
+        ["tests/shop_test.exs:5"],
+        "{report}"
+    );
+}
