@@ -819,45 +819,92 @@ pub struct TestTarget {
     /// project's, for a shard that changes into it).
     pub runs_in: String,
     /// The runner, as the words before its first flag or path
-    /// (`mix test`, `pnpm exec vitest run`).
+    /// (`mix test`, `vitest`). A launcher in front (`pnpm exec`, `npx`) is
+    /// left out.
     pub program: String,
-    /// The command names no test file: it runs the project's whole suite.
-    pub whole_suite: bool,
-    /// The command picks tests by configuration or tag (`--config`,
-    /// `--include`, `--only`), so another run of the runner does not cover it.
+    /// The `--config` the command passes, if any.
+    pub config: Option<String>,
+    /// The command picks tests by tag or name (`--include`, `--only`), so
+    /// another run of the runner does not cover it. A `--config` is in
+    /// [`Self::config`] instead.
     pub selective: bool,
+    /// The whole-suite runs this command makes, each as `(program, config)`:
+    /// itself when it names no test file, or the runners of the package
+    /// script it calls (`pnpm test` where `test` is `vitest run`).
+    pub whole_suites: Vec<(String, Option<String>)>,
 }
 
-/// How a test command selects what it runs: its runner, whether it lists
-/// test files, and whether it picks tests by configuration or tag.
-fn describe_runner(command: &str) -> (String, bool, bool) {
+/// How a test command selects what it runs.
+struct RunnerShape {
+    program: String,
+    config: Option<String>,
+    /// Names no test file.
+    whole: bool,
+    selective: bool,
+}
+
+/// The runner of `command`, whether it lists test files, its `--config`, and
+/// whether it picks tests by tag or name.
+fn describe_runner(command: &str) -> RunnerShape {
     let words = shell_words::split(command).unwrap_or_default();
-    let words: Vec<&String> = words
+    let words: Vec<&str> = words
         .iter()
         .filter(|w| !is_environment_assignment(w))
+        .map(String::as_str)
         .collect();
     let plain = |w: &str| !w.starts_with('-') && !w.contains(['/', '.', '=']);
-    let program: Vec<&str> = words
+    let mut program: Vec<&str> = words
         .iter()
-        .map(|w| w.as_str())
+        .copied()
         .take_while(|w| plain(w))
         .take(4)
         .collect();
+    // The same runner whichever launcher starts it, and with or without
+    // `run` (`vitest` and `vitest run` both run the suite once in CI).
+    match program.as_slice() {
+        ["npx" | "bunx", ..] => {
+            program.remove(0);
+        }
+        ["pnpm" | "yarn" | "npm" | "bun", "exec" | "x" | "dlx", ..] => {
+            program.drain(..2);
+        }
+        ["pnpm" | "yarn", "vitest" | "jest" | "mocha", ..] => {
+            program.remove(0);
+        }
+        _ => {}
+    }
+    if program.first() == Some(&"vitest") {
+        program.truncate(1);
+    }
+    let mut config = None;
+    // The value of `--config` is not a test path.
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if matches!(w, "--config" | "-c") {
+            config = words.get(i + 1).map(|v| v.to_string());
+            i += 1;
+        } else if let Some(value) = w.strip_prefix("--config=") {
+            config = Some(value.to_string());
+        } else {
+            rest.push(w);
+        }
+        i += 1;
+    }
     let path_like = |w: &str| {
-        w.contains('/')
-            || [
-                ".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs",
-            ]
-            .iter()
-            .any(|ext| w.ends_with(ext))
+        !w.starts_with('-')
+            && (w.contains('/')
+                || [
+                    ".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs",
+                ]
+                .iter()
+                .any(|ext| w.ends_with(ext)))
     };
-    let whole = !words.iter().any(|w| path_like(w));
-    let selective = words.iter().any(|w| {
+    let selective = rest.iter().any(|w| {
         matches!(
-            w.as_str(),
-            "--config"
-                | "-c"
-                | "--include"
+            *w,
+            "--include"
                 | "--only"
                 | "--exclude"
                 | "--tag"
@@ -868,9 +915,14 @@ fn describe_runner(command: &str) -> (String, bool, bool) {
                 | "-k"
                 | "-m"
                 | "--testNamePattern"
-        ) || w.starts_with("--config=")
+        )
     });
-    (program.join(" "), whole, selective)
+    RunnerShape {
+        program: program.join(" "),
+        config,
+        whole: !rest.iter().any(|w| path_like(w)),
+        selective,
+    }
 }
 
 /// The targets whose command runs tests, ordered by address.
@@ -885,7 +937,9 @@ pub fn test_targets(
     wrappers: &[RelatedWrapperConfig],
     registry: &PluginRegistry,
 ) -> Vec<TestTarget> {
-    use crate::plugins::related_tests::{refusal, simple_commands, trailing_commands};
+    use crate::plugins::related_tests::{
+        package_script_runners, refusal, simple_commands, trailing_commands,
+    };
     let lookup = Lookup::new(projects, wrappers);
     let mut found = Vec::new();
     for project in projects {
@@ -906,6 +960,10 @@ pub fn test_targets(
                 None => def.command.clone(),
             };
             let runner = lookup.runner(project, def);
+            let runner_root = match &runner {
+                Some(runner) => runner.project.root.clone(),
+                None => project.root.clone(),
+            };
             // The same attempt `--related` makes when it narrows the target.
             let narrowable = runner.as_ref().is_some_and(|runner| {
                 let environment = runner
@@ -961,7 +1019,12 @@ pub fn test_targets(
                             })
                     })
                 };
-                let Some((recogniser, wrapper)) = whole.or_else(behind) else {
+                // A package script that chains runners (`a && b`).
+                let scripted = || {
+                    (!package_script_runners(&runner_root, &written).is_empty())
+                        .then(|| (project.plugin_name.clone(), None))
+                };
+                let Some((recogniser, wrapper)) = whole.or_else(behind).or_else(scripted) else {
                     continue;
                 };
                 Some(match (&runner, refusal(&written), wrapper) {
@@ -1001,16 +1064,29 @@ pub fn test_targets(
                 Some(runner) => (address(runner.project), runner.command.as_str()),
                 None => (address(project), written.as_str()),
             };
-            let (program, whole_suite, selective) = describe_runner(runner_command);
+            let shape = describe_runner(runner_command);
+            // Through a package script (`pnpm test`) the whole suite is
+            // what the script's runners run.
+            let mut runners = package_script_runners(&runner_root, runner_command);
+            if runners.is_empty() {
+                runners.push(runner_command.to_string());
+            }
+            let whole_suites = runners
+                .iter()
+                .map(|command| describe_runner(command))
+                .filter(|s| s.whole && !s.selective)
+                .map(|s| (s.program, s.config))
+                .collect();
             found.push(TestTarget {
                 project: address(project),
                 target: name.clone(),
                 command: def.command.clone(),
                 unnarrowable,
                 runs_in,
-                program,
-                whole_suite,
-                selective,
+                program: shape.program,
+                config: shape.config,
+                selective: shape.selective,
+                whole_suites,
             });
         }
     }

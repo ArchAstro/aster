@@ -867,6 +867,84 @@ pub(super) fn js_script(argv: &Argv) -> Option<&str> {
     }
 }
 
+/// The package script a command runs, by any spelling the launchers accept:
+/// `npm test`, `pnpm run test:ci`, `yarn test:unit`, `bun run test`.
+fn script_name(argv: &Argv) -> Option<&str> {
+    let parts: Vec<&str> = argv.parts[argv.program..]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    match parts.as_slice() {
+        ["npm" | "pnpm" | "yarn" | "bun", "run" | "run-script", script] => Some(script),
+        ["npm" | "pnpm" | "yarn", "test"] => Some("test"),
+        ["pnpm" | "yarn" | "bun", script] if !script.starts_with('-') => Some(script),
+        _ => None,
+    }
+}
+
+/// How many package scripts deep [`package_script_runners`] follows a script
+/// that runs another one.
+const SCRIPT_DEPTH: usize = 8;
+
+/// The test runner commands that running `command` in `project_dir` runs: the
+/// command itself when it is a runner, or, for a package script call
+/// (`pnpm test`), the runners in the script's body. A body that chains
+/// commands with `&&` is read segment by segment, following the scripts it
+/// calls (with a depth and cycle guard); `pre` and `post` hooks are not
+/// followed. Empty when `command` runs no runner this way, when the script is
+/// missing, or when a script changes directory first, since its runner then
+/// belongs to another project.
+pub(crate) fn package_script_runners(project_dir: &Path, command: &str) -> Vec<String> {
+    fn collect(
+        scripts: &serde_json::Map<String, serde_json::Value>,
+        command: &str,
+        seen: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        let start = out.len();
+        for segment in simple_commands(command) {
+            let Some(argv) = Argv::parse(&segment) else {
+                continue;
+            };
+            if matches!(
+                argv.parts.get(argv.program).map(String::as_str),
+                Some("cd" | "pushd")
+            ) {
+                out.truncate(start);
+                return;
+            }
+            if js_runner(&argv).is_some() {
+                out.push(segment);
+                continue;
+            }
+            let Some(name) = script_name(&argv) else {
+                continue;
+            };
+            let Some(body) = scripts.get(name).and_then(|b| b.as_str()) else {
+                continue;
+            };
+            if seen.len() >= SCRIPT_DEPTH || seen.iter().any(|s| s == name) {
+                continue;
+            }
+            seen.push(name.to_string());
+            collect(scripts, body, seen, out);
+            seen.pop();
+        }
+    }
+    let Ok(manifest) = std::fs::read_to_string(project_dir.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return Vec::new();
+    };
+    let Some(scripts) = manifest.get("scripts").and_then(|s| s.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect(scripts, command, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Vitest, Jest, Mocha, `bun test` and `node --test`, run directly or
 /// through a package script that is nothing but the runner.
 pub(super) fn node(
