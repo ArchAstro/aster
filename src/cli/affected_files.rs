@@ -341,6 +341,29 @@ impl<'a> Lookup<'a> {
         }
     }
 
+    /// Makes running an `alias` target run the target it aliases too: a
+    /// project keeps the alias as a copy of the aliased command, so the
+    /// relation is read back from its `aster.toml`.
+    fn join_aliases(&mut self, projects: &[DiscoveredProject]) {
+        for project in projects {
+            let Some(path) = crate::config::find_aster_toml(&project.root) else {
+                continue;
+            };
+            let Ok(config) = crate::config::parse_aster_toml(&path) else {
+                continue;
+            };
+            for (name, target) in &config.targets {
+                if let crate::config::TargetConfig::Alias(alias) = target {
+                    let aliased = alias.alias.strip_prefix("//self:").unwrap_or(&alias.alias);
+                    self.joiners
+                        .entry(format!("{}:{name}", address(project)))
+                        .or_default()
+                        .push((address(project), aliased.to_string()));
+                }
+            }
+        }
+    }
+
     /// `target` of `project_addr` followed by every target it transitively
     /// depends on, in any project, as `(project address, target name)`.
     /// Targets `selected_by` one of them join it, as the run does.
@@ -834,6 +857,16 @@ pub struct TestTarget {
     pub whole_suites: Vec<(String, Option<String>)>,
 }
 
+impl TestTarget {
+    /// The command runs every crate of its Cargo workspace (`--workspace`,
+    /// `--all`).
+    pub fn whole_suite_flags(&self) -> bool {
+        self.command
+            .split_whitespace()
+            .any(|w| w == "--workspace" || w == "--all")
+    }
+}
+
 /// How a test command selects what it runs.
 struct RunnerShape {
     program: String,
@@ -853,12 +886,22 @@ fn describe_runner(command: &str) -> RunnerShape {
         .map(String::as_str)
         .collect();
     let plain = |w: &str| !w.starts_with('-') && !w.contains(['/', '.', '=']);
-    let mut program: Vec<&str> = words
-        .iter()
-        .copied()
-        .take_while(|w| plain(w))
-        .take(4)
-        .collect();
+    // The first word is the program even when it is a path
+    // (`.venv/bin/python -m pytest`); its arguments are not.
+    let head = words
+        .first()
+        .map(|w| w.rsplit('/').next().unwrap_or(w))
+        .filter(|w| !w.starts_with('-') && !w.contains(['.', '=']) && !w.is_empty());
+    let mut program: Vec<&str> = match (head, words.get(1), words.get(2)) {
+        (Some(head), Some(&"-m"), Some(module)) if head.starts_with("python") => {
+            vec![head, "-m", module]
+        }
+        (Some(head), ..) => std::iter::once(head)
+            .chain(words[1..].iter().copied().take_while(|w| plain(w)))
+            .take(4)
+            .collect(),
+        (None, ..) => Vec::new(),
+    };
     // The same runner whichever launcher starts it, and with or without
     // `run` (`vitest` and `vitest run` both run the suite once in CI).
     match program.as_slice() {
@@ -876,6 +919,8 @@ fn describe_runner(command: &str) -> RunnerShape {
     if program.first() == Some(&"vitest") {
         program.truncate(1);
     }
+    // `python -m pytest`: `-m` there names a module, not a marker.
+    let consumed = if program.get(1) == Some(&"-m") { 3 } else { 1 };
     let mut config = None;
     // The value of `--config` is not a test path.
     let mut rest = Vec::new();
@@ -893,7 +938,9 @@ fn describe_runner(command: &str) -> RunnerShape {
         i += 1;
     }
     let path_like = |w: &str| {
+        // `./...` is every package: the suite, not a path.
         !w.starts_with('-')
+            && !matches!(w, "./..." | "...")
             && (w.contains('/')
                 || [
                     ".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs",
@@ -901,7 +948,7 @@ fn describe_runner(command: &str) -> RunnerShape {
                 .iter()
                 .any(|ext| w.ends_with(ext)))
     };
-    let selective = rest.iter().any(|w| {
+    let selective = rest.iter().skip(consumed).any(|w| {
         matches!(
             *w,
             "--include"
@@ -920,7 +967,7 @@ fn describe_runner(command: &str) -> RunnerShape {
     RunnerShape {
         program: program.join(" "),
         config,
-        whole: !rest.iter().any(|w| path_like(w)),
+        whole: !rest.iter().skip(consumed).any(|w| path_like(w)),
         selective,
     }
 }
@@ -1101,7 +1148,8 @@ pub fn reachable_targets(
     wrappers: &[RelatedWrapperConfig],
     roots: &[(String, String)],
 ) -> HashSet<(String, String)> {
-    let lookup = Lookup::new(projects, wrappers);
+    let mut lookup = Lookup::new(projects, wrappers);
+    lookup.join_aliases(projects);
     roots
         .iter()
         .flat_map(|(project, target)| lookup.closure(project, target))
@@ -1491,5 +1539,58 @@ mod file_command_tests {
         assert!(error
             .to_string()
             .contains("cannot be expanded directly through a command interpreter"));
+    }
+}
+
+#[cfg(test)]
+mod describe_runner_tests {
+    use super::describe_runner;
+
+    #[test]
+    fn a_path_to_the_interpreter_is_still_the_program() {
+        let whole = describe_runner(".venv/bin/python -m pytest");
+        assert_eq!(whole.program, "python -m pytest");
+        assert!(whole.whole && !whole.selective);
+        let subset = describe_runner(
+            ".venv/bin/python -m pytest tests/test_cli.py tests/test_archastro_provider.py",
+        );
+        assert_eq!(subset.program, whole.program);
+        assert!(!subset.whole);
+    }
+
+    #[test]
+    fn go_test_all_packages_is_the_suite_and_a_package_list_is_a_subset() {
+        let whole = describe_runner("go test ./...");
+        assert_eq!(whole.program, "go test");
+        assert!(whole.whole);
+        for subset in [
+            "go test -count=1 ./internal/x",
+            "go test -race ./cmd/gateway ./internal/gateway",
+            "go test ./cmd/...",
+        ] {
+            let shape = describe_runner(subset);
+            assert_eq!(shape.program, "go test", "{subset}");
+            assert!(!shape.whole && !shape.selective, "{subset}");
+        }
+    }
+
+    #[test]
+    fn the_value_of_config_is_not_a_test_file() {
+        for command in [
+            "vitest run --coverage --config vitest.cov.config.ts",
+            "vitest run -c vitest.cov.config.ts",
+            "vitest run --config=vitest.cov.config.ts",
+        ] {
+            let shape = describe_runner(command);
+            assert!(shape.whole, "{command}");
+            assert_eq!(shape.config.as_deref(), Some("vitest.cov.config.ts"));
+        }
+    }
+
+    #[test]
+    fn the_launcher_is_not_part_of_the_runner() {
+        for command in ["pnpm exec vitest run", "npx vitest", "pnpm vitest run"] {
+            assert_eq!(describe_runner(command).program, "vitest", "{command}");
+        }
     }
 }
