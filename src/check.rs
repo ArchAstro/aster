@@ -22,9 +22,17 @@ pub const SUSPICIOUS: &str = "suspicious-path-literal";
 pub const BAD_CONSUMES: &str = "bad-consumes";
 pub const ORPHAN: &str = "orphan-test-target";
 pub const STALE: &str = "stale-annotation";
+pub const STALE_ALLOW: &str = "stale-allow-orphan";
 
 /// Every rule id, in the order findings are listed.
-pub const RULES: [&str; 5] = [UNNARROWABLE, SUSPICIOUS, BAD_CONSUMES, ORPHAN, STALE];
+pub const RULES: [&str; 6] = [
+    UNNARROWABLE,
+    SUSPICIOUS,
+    BAD_CONSUMES,
+    ORPHAN,
+    STALE,
+    STALE_ALLOW,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,7 +43,7 @@ pub enum Severity {
 
 fn severity(rule: &str) -> Severity {
     match rule {
-        BAD_CONSUMES | STALE => Severity::Error,
+        BAD_CONSUMES | STALE | STALE_ALLOW => Severity::Error,
         _ => Severity::Warning,
     }
 }
@@ -124,7 +132,7 @@ pub fn run(
     let mut report = Report::default();
 
     // Rules about targets.
-    if enabled(UNNARROWABLE) || enabled(ORPHAN) {
+    if enabled(UNNARROWABLE) || enabled(ORPHAN) || enabled(STALE_ALLOW) {
         let tests = test_targets(projects, wrappers, registry);
         if enabled(UNNARROWABLE) {
             for test in tests.iter().filter(|t| t.unnarrowable.is_some()) {
@@ -142,8 +150,15 @@ pub fn run(
                 });
             }
         }
-        if enabled(ORPHAN) {
-            orphans(projects, config, options, &tests, &mut report)?;
+        if enabled(ORPHAN) || enabled(STALE_ALLOW) {
+            orphans(
+                projects,
+                config,
+                options,
+                &tests,
+                (enabled(ORPHAN), enabled(STALE_ALLOW)),
+                &mut report,
+            )?;
         }
     }
 
@@ -198,6 +213,7 @@ fn orphans(
     config: &WorkspaceConfig,
     options: &Options,
     tests: &[crate::cli::affected_files::TestTarget],
+    (report_orphans, report_stale_allows): (bool, bool),
     report: &mut Report,
 ) -> Result<()> {
     let lanes = &config.affected.lanes;
@@ -280,6 +296,13 @@ fn orphans(
         })
         .filter_map(|t| roots_by_addr.get(&t.runs_in).cloned())
         .collect();
+    let allowed: HashSet<&str> = config
+        .check
+        .allow_orphans
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut orphaned: HashSet<String> = HashSet::new();
     for test in tests {
         if reached.contains(&(test.project.clone(), test.target.clone())) {
             continue;
@@ -302,6 +325,11 @@ fn orphans(
         {
             continue;
         }
+        let address = format!("{}:{}", test.project, test.target);
+        orphaned.insert(address.clone());
+        if allowed.contains(address.as_str()) || !report_orphans {
+            continue;
+        }
         let why = if admitted.contains(&test.project) {
             "no entry target depends on it or is joined by it with `selected_by`"
         } else {
@@ -312,9 +340,35 @@ fn orphans(
             severity: severity(ORPHAN),
             file: None,
             line: None,
-            target: Some(format!("{}:{}", test.project, test.target)),
+            target: Some(address),
             message: format!("`{}` never runs automatically: {why}", test.command),
         });
+    }
+    if report_stale_allows {
+        let tests_by_address: HashSet<String> = tests
+            .iter()
+            .map(|t| format!("{}:{}", t.project, t.target))
+            .collect();
+        let mut listed: Vec<&String> = config.check.allow_orphans.iter().collect();
+        listed.sort();
+        listed.dedup();
+        for address in listed {
+            let why = if !tests_by_address.contains(address.as_str()) {
+                "names no test target of the workspace"
+            } else if !orphaned.contains(address.as_str()) {
+                "names a target an entry already reaches, so it is not an orphan"
+            } else {
+                continue;
+            };
+            report.findings.push(Finding {
+                rule: STALE_ALLOW,
+                severity: severity(STALE_ALLOW),
+                file: None,
+                line: None,
+                target: Some(address.clone()),
+                message: format!("`[check] allow_orphans` entry `{address}` {why}; remove it"),
+            });
+        }
     }
     Ok(())
 }

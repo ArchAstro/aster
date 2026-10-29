@@ -669,3 +669,64 @@ fn a_reads_annotation_that_matches_nothing_stays_stale_beside_the_literal() {
         "{report}"
     );
 }
+
+#[test]
+fn allow_orphans_exempts_a_target_and_stale_entries_are_errors() {
+    let ws = |allow: &str| {
+        Workspace::new(&[
+            (
+                "aster.toml",
+                &format!(
+                    "[affected.lanes.shop]\ninclude = [\"//shop\"]\n\n[check]\nentries = [\"test-ci\"]\nallow_orphans = [{allow}]\n"
+                ),
+            ),
+            ("shop/mix.exs", MIX),
+            (
+                "shop/aster.toml",
+                "[targets.test-ci]\ncommand = \"mix test\"\n\n[targets.test-smoke]\ncommand = \"mix test --only smoke\"\n\n[targets.lint]\ncommand = \"mix format --check-formatted\"\n",
+            ),
+        ])
+    };
+
+    // An allow-listed orphan is not reported, and the entry is not stale.
+    let (status, report) = ws("\"//shop:test-smoke\"").check(&[]);
+    assert_eq!(status, 0, "{report}");
+    assert!(
+        findings(&report, "orphan-test-target").is_empty(),
+        "{report}"
+    );
+    assert!(
+        findings(&report, "stale-allow-orphan").is_empty(),
+        "{report}"
+    );
+
+    // Without the entry the target is an orphan.
+    let (_, report) = ws("").check(&["--rule", "orphan-test-target"]);
+    assert_eq!(places(&report, "orphan-test-target"), ["//shop:test-smoke"]);
+
+    // An address naming no target, a target that is not a test target, and a
+    // target an entry reaches are stale errors.
+    let (status, report) =
+        ws("\"//shop:test-smoke\", \"//shop:nope\", \"//shop:lint\", \"//shop:test-ci\"")
+            .check(&["--rule", "stale-allow-orphan"]);
+    assert_eq!(status, 1, "{report}");
+    assert_eq!(
+        places(&report, "stale-allow-orphan"),
+        ["//shop:lint", "//shop:nope", "//shop:test-ci"],
+        "{report}"
+    );
+    assert_eq!(
+        findings(&report, "stale-allow-orphan")[0]["severity"],
+        "error"
+    );
+    let messages: Vec<&str> = findings(&report, "stale-allow-orphan")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert!(messages[1].contains("names no test target"), "{messages:?}");
+    assert!(messages[2].contains("already reaches"), "{messages:?}");
+
+    // The stale check also runs when no rule is selected.
+    let (status, _) = ws("\"//shop:nope\"").check(&[]);
+    assert_eq!(status, 1);
+}

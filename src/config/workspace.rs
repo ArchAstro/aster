@@ -53,6 +53,12 @@ pub struct CheckConfig {
     /// `target` of each `[affected.lanes]` entry is added.
     #[serde(default)]
     pub entries: Vec<String>,
+    /// Test targets (`//project:target`) that `orphan-test-target` does
+    /// not report because they are meant to run by hand. An entry that names
+    /// no test target, or a target an entry already reaches, is reported by
+    /// `stale-allow-orphan`.
+    #[serde(default)]
+    pub allow_orphans: Vec<String>,
     /// Rule ids `aster check` skips.
     #[serde(default)]
     pub disable: Vec<String>,
