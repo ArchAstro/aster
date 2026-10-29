@@ -845,16 +845,29 @@ fn describe_runner(command: &str) -> (String, bool, bool) {
         .collect();
     let path_like = |w: &str| {
         w.contains('/')
-            || [".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs"]
-                .iter()
-                .any(|ext| w.ends_with(ext))
+            || [
+                ".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs",
+            ]
+            .iter()
+            .any(|ext| w.ends_with(ext))
     };
     let whole = !words.iter().any(|w| path_like(w));
     let selective = words.iter().any(|w| {
         matches!(
             w.as_str(),
-            "--config" | "-c" | "--include" | "--only" | "--exclude" | "--tag" | "-t"
-                | "--project" | "--grep" | "-g" | "-k" | "-m" | "--testNamePattern"
+            "--config"
+                | "-c"
+                | "--include"
+                | "--only"
+                | "--exclude"
+                | "--tag"
+                | "-t"
+                | "--project"
+                | "--grep"
+                | "-g"
+                | "-k"
+                | "-m"
+                | "--testNamePattern"
         ) || w.starts_with("--config=")
     });
     (program.join(" "), whole, selective)
