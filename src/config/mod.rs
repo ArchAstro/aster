@@ -7,9 +7,9 @@ pub use project::{
 };
 pub use workspace::{
     find_workspace_root, AffectedLaneConfig, AffectedRelatedConfig, AffectedWorkspaceConfig,
-    CacheRetentionConfig, DetailedDevServiceGroupConfig, DevPortConfig, DevServiceConfig,
-    DevServiceGroupConfig, DevServiceProxyConfig, DevTlsProxyConfig, DevTlsRouteConfig,
-    DevWorkspaceConfig, DynamicDevPortConfig, DynamicPortAllocation, RelatedWrapperConfig,
-    RelatedWrapperTable, ResolvedDevPortConfig, StaticPortAllocation, WatchWorkspaceConfig,
-    WorkspaceConfig,
+    CacheRetentionConfig, CheckConfig, DetailedDevServiceGroupConfig, DevPortConfig,
+    DevServiceConfig, DevServiceGroupConfig, DevServiceProxyConfig, DevTlsProxyConfig,
+    DevTlsRouteConfig, DevWorkspaceConfig, DynamicDevPortConfig, DynamicPortAllocation,
+    RelatedWrapperConfig, RelatedWrapperTable, ResolvedDevPortConfig, StaticPortAllocation,
+    WatchWorkspaceConfig, WorkspaceConfig,
 };

@@ -27,11 +27,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const ROOT: &str = "related-facts";
 
+/// Bump when the stored shape of facts changes without any extractor source
+/// changing. Facts that carry `aster:` annotations are format 2.
+const FORMAT: &str = "facts-format-2";
+
 /// Everything that decides what facts a given source text yields.
 fn build_id() -> String {
     let mut hash = Sha256::new();
     for part in [
+        FORMAT,
         env!("CARGO_PKG_VERSION"),
+        include_str!("annotations.rs"),
         include_str!("../../Cargo.lock"),
         include_str!("facts.rs"),
         include_str!("elixir.rs"),

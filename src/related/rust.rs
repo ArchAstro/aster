@@ -138,6 +138,7 @@ pub fn extract(_path: &Path, source: &str) -> FileFacts {
     walker.apply_bindings();
     let mut facts = walker.facts;
     facts.classify_lines(source, &walker.inert);
+    super::annotations::apply(&mut facts, &tree, source);
     facts
 }
 
@@ -919,7 +920,9 @@ impl Walker<'_> {
                 if value.contains("CARGO_BIN_") {
                     self.facts.owner(owner).reflects = Some("runs the package's binary");
                 }
-                self.facts.owner(owner).string(&value);
+                self.facts
+                    .owner(owner)
+                    .string(&value, node.start_position().row + 1);
                 return;
             }
             "scoped_identifier" | "scoped_type_identifier" => return self.scoped(node, owner),

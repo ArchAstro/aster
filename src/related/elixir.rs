@@ -115,6 +115,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     walker.block(tree.root_node(), scope, None);
     let mut facts = walker.facts;
     facts.classify_lines(source, &walker.inert);
+    super::annotations::apply(&mut facts, &tree, source);
     facts
 }
 
@@ -308,7 +309,8 @@ impl Walker<'_> {
             }
             "quoted_content" => {
                 let content = text(node, self.source).to_string();
-                self.facts.owner(scope.owner).string(&content);
+                let line = node.start_position().row + 1;
+                self.facts.owner(scope.owner).string(&content, line);
                 return;
             }
             "string" | "sigil" => {

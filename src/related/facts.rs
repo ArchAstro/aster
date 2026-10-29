@@ -77,6 +77,11 @@ pub struct Def {
     pub uses: BTreeSet<String>,
     /// String literals that could name a file.
     pub strings: Vec<String>,
+    /// The 1-based line each of [`Self::strings`] starts on.
+    pub string_lines: Vec<u32>,
+    /// Paths and globs the definition declares it reads with an
+    /// `aster: reads` comment (see the `annotations` module).
+    pub reads: Vec<String>,
     /// The string literals among them that name code to load: what
     /// `require`, `import()` and a module mock are given.
     pub loaded: BTreeSet<String>,
@@ -160,6 +165,8 @@ impl Def {
             atoms: BTreeSet::new(),
             uses: BTreeSet::new(),
             strings: Vec::new(),
+            string_lines: Vec::new(),
+            reads: Vec::new(),
             loaded: BTreeSet::new(),
             callback: false,
             via: Vec::new(),
@@ -186,9 +193,10 @@ impl Def {
     }
 
     /// Record a string literal when it could name a file.
-    pub fn string(&mut self, text: &str) {
+    pub fn string(&mut self, text: &str, line: usize) {
         if text.len() <= 4000 && (text.contains('.') || text.contains('/')) {
             self.strings.push(text.to_string());
+            self.string_lines.push(line as u32);
         }
     }
 }
@@ -249,6 +257,8 @@ pub struct FileFacts {
     /// is only known once the imported package has been read.
     pub go_imports: Vec<(Option<String>, String)>,
     pub line_class: Vec<LineClass>,
+    /// `aster:` directives found in comments.
+    pub annotations: Vec<super::annotations::Annotation>,
     pub is_test_file: bool,
     /// Calls into other files are qualified by module (`Module.function`),
     /// so a bare name refers to this file or to something it imports, and
@@ -308,6 +318,7 @@ impl FileFacts {
             imports: Vec::new(),
             go_imports: Vec::new(),
             line_class: Vec::new(),
+            annotations: Vec::new(),
             is_test_file: false,
             qualified: false,
             members: false,

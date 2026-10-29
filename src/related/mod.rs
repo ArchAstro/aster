@@ -32,6 +32,7 @@
 //! are all in the dependency's language and build on its code is followed
 //! by source, whatever marker file its project carries.
 
+mod annotations;
 mod cache;
 mod consumers;
 mod elixir;
@@ -39,9 +40,14 @@ mod engine;
 mod facts;
 mod go;
 mod js;
+mod lint;
 mod python;
 mod resolve;
 mod rust;
+mod sites;
 
 pub use engine::{analyse, Change, GraphNode, Outcome, Related, TestSelection};
 pub use facts::Family;
+pub use lint::{
+    bad_consumes, stale_annotations, suspicious_path_literals, Finding as SourceFinding, Sources,
+};

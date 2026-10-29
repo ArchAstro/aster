@@ -62,6 +62,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         facts.reexports = reexports;
     }
     facts.classify_lines(source, &walker.inert);
+    super::annotations::apply(&mut facts, &tree, source);
     facts
 }
 
@@ -240,7 +241,9 @@ impl Walker<'_> {
             }
             "string_content" => {
                 let value = text(node, self.source).to_string();
-                self.facts.owner(owner).string(&value);
+                self.facts
+                    .owner(owner)
+                    .string(&value, node.start_position().row + 1);
                 return;
             }
             "attribute" => {

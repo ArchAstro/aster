@@ -46,6 +46,8 @@ pub struct AsterToml {
     #[serde(default)]
     pub affected: AffectedWorkspaceConfig,
     #[serde(default)]
+    pub check: super::workspace::CheckConfig,
+    #[serde(default)]
     pub dev: super::workspace::DevWorkspaceConfig,
     /// Workspace artifact-cache retention. A root project shares this file.
     #[serde(default)]

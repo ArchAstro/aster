@@ -314,6 +314,31 @@ fn run() -> Result<()> {
         eprintln!("[aster] Workspace root: {}", workspace_root.display());
     }
 
+    // `aster check` reports a configuration it cannot load with its own
+    // exit status, so it discovers projects itself.
+    if let Commands::Check {
+        strict,
+        rule,
+        entry,
+    } = &command
+    {
+        let code = match handle_check(
+            &workspace_root,
+            *strict,
+            rule,
+            entry,
+            output_mode,
+            !cli.no_cache,
+        ) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+
     // Set up plugin registry with all language plugins
     let registry = PluginRegistry::with_all_plugins();
 
@@ -328,6 +353,7 @@ fn run() -> Result<()> {
     let explicit_target = matches!(&command, Commands::RunTarget { .. });
     match command {
         Commands::Init | Commands::ExecGoTest { .. } => unreachable!("handled above"),
+        Commands::Check { .. } => unreachable!("check handled above"),
         Commands::Results { .. } => unreachable!("results handled above"),
         Commands::Srv { .. } => unreachable!("srv handled above"),
         Commands::List { path, lang } => {
@@ -1931,6 +1957,40 @@ fn write_test_results(
 }
 
 /// `aster results ...`.
+/// Run `aster check`; the exit status, or an error for a configuration
+/// that cannot be loaded.
+fn handle_check(
+    workspace_root: &std::path::Path,
+    strict: bool,
+    rules: &[String],
+    entries: &[String],
+    output_mode: OutputMode,
+    use_cache: bool,
+) -> Result<i32> {
+    let registry = PluginRegistry::with_all_plugins();
+    let config = WorkspaceConfig::load(workspace_root)?;
+    let projects =
+        discover_projects(workspace_root, &registry).context("Failed to discover projects")?;
+    let options = aster::check::Options {
+        rules: rules.to_vec(),
+        entries: entries.to_vec(),
+        cache_dir: use_cache.then(|| aster::cache::resolve_cache_dir(workspace_root)),
+    };
+    let report = aster::check::run(workspace_root, &projects, &registry, &config, &options)?;
+    if output_mode == OutputMode::Json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    } else {
+        print!("{}", report.render_text());
+        if output_mode == OutputMode::Verbose {
+            eprintln!(
+                "[aster] Checked {} source files, {} from cache, in {} ms",
+                report.stats.source_files, report.stats.facts_reused, report.stats.elapsed_ms
+            );
+        }
+    }
+    Ok(report.exit_code(strict))
+}
+
 fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<()> {
     match command {
         ResultsCommands::Upload { path, url, strict } => {

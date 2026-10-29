@@ -109,26 +109,176 @@ fn is_assignment(value: &str) -> bool {
     })
 }
 
+/// Why a test command is not read as plain arguments, and so is not
+/// narrowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// `{files}`, a backtick or `$(`.
+    Substitution(&'static str),
+    /// The quoting does not balance.
+    Quoting,
+    /// A shell operator joins several commands or redirects one.
+    ShellOperator(String),
+    /// Only environment assignments.
+    NoProgram,
+    /// The program is an interpreter, so what it runs is in its arguments.
+    Interpreter(String),
+    /// The shell expands a word in a way that cannot be written back.
+    Expansion,
+    /// The program word itself is expanded.
+    ExpandedProgram,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Substitution("{files}") => write!(
+                f,
+                "it contains a `{{files}}` placeholder, which is filled only for a target with the files_list capability"
+            ),
+            Self::Substitution(what) => {
+                write!(f, "it contains `{what}`, a shell substitution")
+            }
+            Self::Quoting => write!(f, "its quoting does not balance"),
+            Self::ShellOperator(op) => write!(f, "it uses the shell operator `{op}`"),
+            Self::NoProgram => write!(f, "it has no program, only environment assignments"),
+            Self::Interpreter(name) => write!(
+                f,
+                "it runs through the interpreter `{name}` as a script Aster does not read (a wrapper program can be listed in `[affected.related] wrappers`)"
+            ),
+            Self::Expansion => write!(f, "a shell expansion in its arguments cannot be preserved"),
+            Self::ExpandedProgram => write!(f, "its program is a shell expansion"),
+        }
+    }
+}
+
+/// Why `command` is not read as plain arguments; `None` when it is.
+pub(crate) fn refusal(command: &str) -> Option<Refusal> {
+    Argv::try_parse(command).err()
+}
+
+/// The simple commands inside `command`: its parts between shell
+/// operators, and the script of an interpreter's `-c` argument, read the
+/// same way. Used to tell whether a refused command contains a test runner.
+pub(crate) fn simple_commands(command: &str) -> Vec<String> {
+    fn collect(command: &str, depth: usize, out: &mut Vec<String>) {
+        let Ok(parts) = shell_words::split(command) else {
+            return;
+        };
+        let mut current: Vec<String> = Vec::new();
+        let flush = |current: &mut Vec<String>, out: &mut Vec<String>| {
+            let words = std::mem::take(current);
+            let Some(program) = words.iter().position(|w| !is_assignment(w)) else {
+                return;
+            };
+            let name = Path::new(&words[program])
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if INTERPRETERS.contains(&name) && depth < 4 {
+                let script = words[program + 1..]
+                    .iter()
+                    .position(|w| w.starts_with('-') && !w.starts_with("--") && w.ends_with('c'))
+                    .and_then(|at| words.get(program + 2 + at));
+                match script {
+                    Some(script) => collect(script, depth + 1, out),
+                    // `env VAR=1 cmd`, `sudo cmd`, `xargs cmd`.
+                    None => {
+                        let rest: Vec<String> = words[program + 1..]
+                            .iter()
+                            .skip_while(|w| is_assignment(w))
+                            .cloned()
+                            .collect();
+                        if !rest.is_empty() {
+                            out.push(rest.join(" "));
+                        }
+                    }
+                }
+            } else {
+                out.push(
+                    words
+                        .iter()
+                        .map(|w| quote_command_argument(w))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        };
+        for part in parts {
+            if SHELL_OPERATORS.contains(&part.as_str()) {
+                flush(&mut current, out);
+            } else {
+                current.push(part);
+            }
+        }
+        flush(&mut current, out);
+    }
+    let mut out = Vec::new();
+    collect(command, 0, &mut out);
+    out
+}
+
+/// The ways to read the end of `command` as a command of its own, after a
+/// leading program and its arguments: `(skipped words, rest)`. A program Aster
+/// does not know that runs the command given as its arguments (`mise exec
+/// node@24 -- vitest run`) is what makes the whole command unreadable.
+pub(crate) fn trailing_commands(command: &str) -> Vec<(String, String)> {
+    let Ok(parts) = shell_words::split(command) else {
+        return Vec::new();
+    };
+    let start = parts.iter().position(|w| !is_assignment(w)).unwrap_or(0);
+    (start + 1..parts.len())
+        .map(|at| {
+            (
+                parts[..at]
+                    .iter()
+                    .map(|w| quote_command_argument(w))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                parts[at..]
+                    .iter()
+                    .map(|w| quote_command_argument(w))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
+        .collect()
+}
+
 impl Argv {
     pub(super) fn parse(command: &str) -> Option<Self> {
-        if command.contains("{files}") || command.contains('`') || command.contains("$(") {
-            return None;
+        Self::try_parse(command).ok()
+    }
+
+    fn try_parse(command: &str) -> Result<Self, Refusal> {
+        for (needle, what) in [("{files}", "{files}"), ("`", "`"), ("$(", "$(")] {
+            if command.contains(needle) {
+                return Err(Refusal::Substitution(what));
+            }
         }
-        let parts = shell_words::split(command).ok()?;
-        if parts.iter().any(|p| SHELL_OPERATORS.contains(&p.as_str())) {
-            return None;
+        let parts = shell_words::split(command).map_err(|_| Refusal::Quoting)?;
+        if let Some(op) = parts.iter().find(|p| SHELL_OPERATORS.contains(&p.as_str())) {
+            return Err(Refusal::ShellOperator(op.clone()));
         }
-        let program = parts.iter().position(|p| !is_assignment(p))?;
-        let name = Path::new(&parts[program]).file_name()?.to_str()?;
+        let program = parts
+            .iter()
+            .position(|p| !is_assignment(p))
+            .ok_or(Refusal::NoProgram)?;
+        let name = Path::new(&parts[program])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(Refusal::NoProgram)?;
         if INTERPRETERS.contains(&name) {
-            return None;
+            return Err(Refusal::Interpreter(name.to_string()));
         }
         // Keep the text of the words the shell expands. If the words cannot
         // be matched up with the split, rendering would quote an expansion
         // away, so the command is not understood.
         let mut expanding = Vec::new();
         if command.contains('$') {
-            let raw = raw_words(command).filter(|raw| raw.len() == parts.len())?;
+            let raw = raw_words(command)
+                .filter(|raw| raw.len() == parts.len())
+                .ok_or(Refusal::Expansion)?;
             if raw.iter().any(|word| expands(word)) {
                 expanding = raw
                     .into_iter()
@@ -138,9 +288,9 @@ impl Argv {
         }
         // An expansion in the program position could run anything.
         if expanding.get(program).is_some_and(Option::is_some) {
-            return None;
+            return Err(Refusal::ExpandedProgram);
         }
-        Some(Self {
+        Ok(Self {
             parts,
             program,
             expanding,
