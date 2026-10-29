@@ -320,7 +320,9 @@ pub fn build_execution_output_with_cache(
     let target_results: Vec<TargetResult> = results
         .iter()
         .map(|r| {
-            let status = if r.skipped {
+            let status = if r.interrupted {
+                "interrupted".to_string()
+            } else if r.skipped {
                 "skipped".to_string()
             } else if r.cached {
                 "cached".to_string()
@@ -482,6 +484,7 @@ mod tests {
                 exit_code: Some(0),
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             },
             ExecutionResult {
                 address: "//b:test".to_string(),
@@ -494,6 +497,7 @@ mod tests {
                 exit_code: Some(3),
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             },
             ExecutionResult {
                 address: "//c:test".to_string(),
@@ -506,6 +510,7 @@ mod tests {
                 exit_code: None,
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             },
         ];
 
@@ -561,6 +566,7 @@ mod tests {
                 quarantined: Vec::new(),
             }),
             input_hash: None,
+            interrupted: false,
         };
         let json = serde_json::to_value(build_execution_output(&[result])).unwrap();
         let tests = &json["results"][0]["tests"];

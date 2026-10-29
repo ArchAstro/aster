@@ -149,6 +149,7 @@ mod tests {
             exit_code: Some(if success { 0 } else { 2 }),
             tests,
             input_hash: Some("h".into()),
+            interrupted: false,
         }
     }
 

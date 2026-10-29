@@ -140,6 +140,44 @@ Do not loop it into one `actions/cache` step per entry: Actions expands
 `uses:` steps before the job runs, so a dynamic list cannot become a
 dynamic number of steps.
 
+## Cancelled and timed-out jobs
+
+Aster captures each target's stdout and stderr and prints it when the target
+finishes. A target that hangs therefore prints nothing, and a job that CI
+cancels or times out leaves a log with a `START` line and no clue about which
+test hung.
+
+GitHub Actions stops a cancelled job, or one past `timeout-minutes`, with
+SIGINT, then SIGTERM about 7.5 seconds later, then SIGKILL. Aster treats
+SIGINT and SIGTERM the same way. On the first signal it:
+
+1. Prints, to stderr and for every target still running, a header and the
+   output captured so far:
+
+   ```text
+   INTERRUPTED //deploy/controller:test-ci after 51m2s - output so far:
+       <output lines>
+   ```
+
+   Output follows the failure rule: all lines with `--full-logs`, otherwise
+   the last 15 (the tail is the part that shows where a run stopped). The
+   flush happens before Aster signals the targets, so it does not wait for a
+   target that ignores SIGTERM.
+2. Sends SIGTERM to each running target's process group, then SIGKILL after
+   3 seconds. Targets that had not started report `Cancelled: shutdown requested`
+   and are not printed.
+3. Exits with `128 + signal` (130 for SIGINT, 143 for SIGTERM).
+
+A second SIGINT or SIGTERM makes Aster SIGKILL the process groups at once and
+exit within about a second. A flush blocked on a full or stuck stderr pipe is
+abandoned after 2 seconds, and output pipes held open by a surviving
+grandchild no longer delay exit.
+
+With `--json`, nothing is added to stdout beyond the usual result document.
+A target that was running reports `"status": "interrupted"` with its
+captured `output` and the exit code its process group died with. It counts
+under `summary.failed`.
+
 ## Artifact cache (L1)
 
 L0 above warms language-tool directories. L1 is Aster's content-addressed

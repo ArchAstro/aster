@@ -36,6 +36,7 @@ use crate::test_results::quarantine::{Quarantine, Verdict};
 use crate::test_results::{
     self, Confidence, OutputRewrite, ReportContext, ReportFiles, ReportPlan, TestReport,
 };
+use crate::ui::progress::format_duration;
 use crate::ui::ProgressDisplay;
 
 mod partitions;
@@ -43,7 +44,7 @@ pub use partitions::partitioned_suites;
 mod retry;
 
 use super::command::parse_command;
-use super::shutdown_requested;
+use super::{force_shutdown_requested, shutdown_requested};
 #[cfg(any(unix, windows))]
 use super::{register_supervised_child, unregister_supervised_child};
 
@@ -126,6 +127,9 @@ pub struct ExecutionResult {
     /// capture is on. Two runs with the same hash ran the same tests on the
     /// same inputs.
     pub input_hash: Option<String>,
+    /// A process was running when Aster received SIGINT or SIGTERM. The output
+    /// is what it had written by then.
+    pub interrupted: bool,
 }
 
 /// Executor for running target commands on projects
@@ -509,6 +513,9 @@ impl<'a> Executor<'a> {
         let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
 
+        // JSON mode reports interrupted output in the result, not on stderr.
+        configure_interrupt_report(show_output.then_some(self.full_logs));
+
         let mut progress = ProgressDisplay::with_verbose(show_progress, verbose_progress);
 
         progress.set_total(targets_to_run.len());
@@ -564,8 +571,18 @@ impl<'a> Executor<'a> {
 
         // A target starts the moment its last dependency finishes. The loop
         // blocks on the result channel whenever nothing new can start.
+        let mut force_deadline: Option<Instant> = None;
+        let mut abandoned = false;
         loop {
             let stopping = shutdown_requested();
+            if force_shutdown_requested() {
+                let deadline =
+                    *force_deadline.get_or_insert_with(|| Instant::now() + FORCE_EXIT_GRACE);
+                if running > 0 && Instant::now() >= deadline {
+                    abandoned = true;
+                    break;
+                }
+            }
             let mut batch = if stopping {
                 Vec::new()
             } else {
@@ -579,7 +596,12 @@ impl<'a> Executor<'a> {
                 if running == 0 {
                     break;
                 }
-                let Ok(result) = rx.recv() else { break };
+                // Wake regularly to notice a signal while targets run.
+                let result = match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(result) => result,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 running -= 1;
                 if show_progress && !result.cached {
                     if result.success {
@@ -678,13 +700,16 @@ impl<'a> Executor<'a> {
                         exit_code: None,
                         tests: None,
                         input_hash: None,
+                        interrupted: false,
                     },
                 ));
             }
         }
 
-        for handle in handles {
-            let _ = handle.join();
+        if !abandoned {
+            for handle in handles {
+                let _ = handle.join();
+            }
         }
         collected.sort_by_key(|(level, rank, _)| (*level, *rank));
         let all_results: Vec<ExecutionResult> =
@@ -774,6 +799,7 @@ impl<'a> Executor<'a> {
                             exit_code: None,
                             tests: None,
                             input_hash: None,
+                            interrupted: false,
                         };
                         if show_progress {
                             progress.mark_skipped(target_addr);
@@ -798,6 +824,7 @@ impl<'a> Executor<'a> {
                             exit_code: None,
                             tests: None,
                             input_hash: None,
+                            interrupted: false,
                         };
                         if show_progress {
                             progress.mark_skipped(target_addr);
@@ -823,6 +850,7 @@ impl<'a> Executor<'a> {
                         exit_code: None,
                         tests: None,
                         input_hash: None,
+                        interrupted: false,
                     };
                     if show_progress {
                         progress.mark_skipped(target_addr);
@@ -1046,6 +1074,7 @@ impl<'a> Executor<'a> {
                         exit_code: None,
                         tests: None,
                         input_hash: None,
+                        interrupted: false,
                     };
                     let _ = tx_clone.send(result.clone());
                     return result;
@@ -1136,7 +1165,10 @@ impl<'a> Executor<'a> {
                 result.input_hash = input_hash;
                 if shutdown_requested() {
                     result.success = false;
-                    result.skipped = true;
+                    // A process that ran was interrupted; its output is
+                    // reported. One that never started was only cancelled.
+                    result.interrupted = result.exit_code.is_some();
+                    result.skipped = !result.interrupted;
                     result.output = if result.output.is_empty() {
                         "Cancelled: shutdown requested".to_string()
                     } else {
@@ -1255,6 +1287,7 @@ impl<'a> Executor<'a> {
                     exit_code: None,
                     tests: None,
                     input_hash: None,
+                    interrupted: false,
                 });
             }
         });
@@ -1297,9 +1330,10 @@ impl<'a> Executor<'a> {
 
     /// Print failure details for failed targets
     fn print_failure_details(&self, results: &[ExecutionResult], progress: &ProgressDisplay) {
+        // Interrupted targets were already flushed when the signal arrived.
         let failed: Vec<_> = results
             .iter()
-            .filter(|r| !r.success && !r.skipped)
+            .filter(|r| !r.success && !r.skipped && !r.interrupted)
             .collect();
 
         if failed.is_empty() {
@@ -1323,20 +1357,7 @@ impl<'a> Executor<'a> {
             }
 
             // Print output (full or truncated based on full_logs flag)
-            let lines: Vec<&str> = result.output.lines().collect();
-            let output_lines = if self.full_logs {
-                // Full output mode - show all lines
-                &lines[..]
-            } else {
-                // Truncated mode - show last 15 lines
-                if lines.len() > 15 {
-                    &lines[lines.len() - 15..]
-                } else {
-                    &lines[..]
-                }
-            };
-
-            for line in output_lines {
+            for line in tail_lines(&result.output, self.full_logs) {
                 let indented = format!("    {line}");
                 if progress.is_enabled() {
                     progress.println(&indented);
@@ -1361,6 +1382,177 @@ impl<'a> Executor<'a> {
                     eprintln!("{hint}");
                 }
             }
+        }
+    }
+}
+
+/// Lines of `output` to show for a failed or interrupted target: all of them
+/// with `--full-logs`, otherwise the last [`FAILURE_TAIL_LINES`].
+fn tail_lines(output: &str, full_logs: bool) -> Vec<&str> {
+    let lines: Vec<&str> = output.lines().collect();
+    if full_logs || lines.len() <= FAILURE_TAIL_LINES {
+        lines
+    } else {
+        lines[lines.len() - FAILURE_TAIL_LINES..].to_vec()
+    }
+}
+
+const FAILURE_TAIL_LINES: usize = 15;
+
+/// How long the interrupt flush may take before Aster moves on to killing
+/// targets and exiting. A stderr pipe nobody drains must not hold shutdown.
+const INTERRUPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// After a second signal, how long Aster waits for SIGKILLed targets to be
+/// reaped before it stops waiting and returns.
+const FORCE_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// A command that is running now, for the interrupt flush.
+struct RunningCommand {
+    address: String,
+    started: Instant,
+    log: Arc<CappedLog>,
+}
+
+static RUNNING_COMMANDS: Mutex<Vec<RunningCommand>> = Mutex::new(Vec::new());
+
+/// Lists a running command's log in [`RUNNING_COMMANDS`] until dropped.
+struct RunningRegistration {
+    log: Arc<CappedLog>,
+}
+
+impl RunningRegistration {
+    fn new(address: &str, started: Instant, log: &Arc<CappedLog>) -> Self {
+        RUNNING_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(RunningCommand {
+                address: address.to_string(),
+                started,
+                log: Arc::clone(log),
+            });
+        Self {
+            log: Arc::clone(log),
+        }
+    }
+}
+
+impl Drop for RunningRegistration {
+    fn drop(&mut self) {
+        RUNNING_COMMANDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|running| !Arc::ptr_eq(&running.log, &self.log));
+    }
+}
+
+/// Whether and how to print the interrupt report. `full_logs` is `None` when
+/// the output mode prints nothing (JSON, quiet).
+struct InterruptReport {
+    full_logs: Option<bool>,
+    printed: bool,
+}
+
+static INTERRUPT_REPORT: Mutex<InterruptReport> = Mutex::new(InterruptReport {
+    full_logs: None,
+    printed: false,
+});
+
+fn configure_interrupt_report(full_logs: Option<bool>) {
+    let mut report = INTERRUPT_REPORT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    report.full_logs = full_logs;
+    report.printed = false;
+}
+
+/// Print the report once, on the first shutdown notice. Each target's monitor
+/// calls this before it signals its process group; later callers wait on the
+/// lock, so no target is killed before the report has been written.
+fn flush_interrupt_report() {
+    let mut report = INTERRUPT_REPORT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if report.printed {
+        return;
+    }
+    report.printed = true;
+    if let Some(full_logs) = report.full_logs {
+        write_stderr_bounded(interrupted_report(full_logs));
+    }
+}
+
+/// Render the interrupt report for every command still running: a header
+/// and the output captured so far, indented like failure output. Sorted by
+/// address so the report is stable.
+fn interrupted_report(full_logs: bool) -> Vec<String> {
+    let mut running: Vec<(String, Duration, Vec<u8>)> = RUNNING_COMMANDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .map(|command| {
+            (
+                command.address.clone(),
+                command.started.elapsed(),
+                command.log.snapshot(),
+            )
+        })
+        .collect();
+    running.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut lines = Vec::new();
+    for (address, elapsed, log) in running {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} {} after {} - output so far:",
+            style("INTERRUPTED").yellow().bold(),
+            address,
+            format_duration(elapsed.as_millis())
+        ));
+        let output = String::from_utf8_lossy(&log);
+        let all = output.lines().count();
+        let shown = tail_lines(&output, full_logs);
+        if shown.len() < all {
+            lines.push(format!(
+                "    {}",
+                style(format!(
+                    "... {} earlier lines omitted; --full-logs shows all",
+                    all - shown.len()
+                ))
+                .dim()
+            ));
+        }
+        if shown.is_empty() {
+            lines.push(format!("    {}", style("(no output yet)").dim()));
+        }
+        lines.extend(shown.into_iter().map(|line| format!("    {line}")));
+    }
+    lines
+}
+
+/// Print `lines` to stderr on a helper thread and wait for it, but not past
+/// [`INTERRUPT_FLUSH_TIMEOUT`] or a second signal. A full pipe blocks the
+/// writer, not shutdown; the thread is abandoned and dies with the process.
+fn write_stderr_bounded(lines: Vec<String>) {
+    use std::io::Write;
+
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        for line in lines {
+            if writeln!(stderr, "{line}").is_err() {
+                break;
+            }
+        }
+        let _ = stderr.flush();
+        let _ = done_tx.send(());
+    });
+    let deadline = Instant::now() + INTERRUPT_FLUSH_TIMEOUT;
+    while Instant::now() < deadline && !force_shutdown_requested() {
+        match done_rx.recv_timeout(Duration::from_millis(10)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            _ => break,
         }
     }
 }
@@ -1926,6 +2118,7 @@ fn cached_result(
         exit_code: Some(manifest.exit_code),
         tests: None,
         input_hash,
+        interrupted: false,
     }
 }
 
@@ -2378,6 +2571,7 @@ fn run_invocations(
         exit_code: None,
         tests: None,
         input_hash: None,
+        interrupted: false,
     };
     let mut raw_outputs = Vec::new();
     for invocation in invocations {
@@ -2438,6 +2632,21 @@ impl CappedLog {
         buf.extend_from_slice(&chunk[..keep]);
     }
 
+    /// The bytes kept so far, with the truncation marker when bytes were
+    /// dropped. Readers may still be appending.
+    fn snapshot(&self) -> Vec<u8> {
+        let buf = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+        let received = *self.received.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = buf.clone();
+        let omitted = received.saturating_sub(buf.len() as u64);
+        if omitted > 0 {
+            out.extend_from_slice(
+                format!("\n[aster] log truncated: {omitted} bytes omitted\n").as_bytes(),
+            );
+        }
+        out
+    }
+
     fn finish(self) -> Vec<u8> {
         let mut buf = self.buf.into_inner().unwrap();
         let received = self.received.into_inner().unwrap();
@@ -2486,6 +2695,22 @@ fn exit_code_of(status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// Wait for the log readers to reach EOF. During shutdown a grandchild that
+/// outlived the command can hold the pipes open forever, so the wait is
+/// bounded then; the readers are left to die with the process.
+fn join_readers(readers: Vec<thread::JoinHandle<()>>) {
+    let deadline = Instant::now() + INTERRUPT_FLUSH_TIMEOUT;
+    for reader in readers {
+        while shutdown_requested() && !reader.is_finished() {
+            if Instant::now() >= deadline || force_shutdown_requested() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = reader.join();
+    }
+}
+
 /// Run a command in a directory and capture its combined log.
 fn run_command(
     address: &str,
@@ -2508,6 +2733,7 @@ fn run_command(
         exit_code: None,
         tests: None,
         input_hash: None,
+        interrupted: false,
     };
 
     let parsed = match parse_command(command) {
@@ -2565,6 +2791,7 @@ fn run_command(
                 exit_code: None,
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             };
         }
     };
@@ -2593,11 +2820,13 @@ fn run_command(
                 exit_code: None,
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             };
         }
     };
 
     let log = Arc::new(CappedLog::new(log_cap));
+    let registration = RunningRegistration::new(address, start, &log);
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let stdout_reader = spawn_log_reader(stdout, Arc::clone(&log));
@@ -2605,8 +2834,8 @@ fn run_command(
 
     let status = child.wait();
     // Join readers after the child exits so a full pipe cannot deadlock the wait.
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    join_readers(vec![stdout_reader, stderr_reader]);
+    drop(registration);
 
     #[cfg(any(unix, windows))]
     monitor.finish();
@@ -2614,9 +2843,11 @@ fn run_command(
     let duration_ms = start.elapsed().as_millis();
     match status {
         Ok(status) => {
-            let log = Arc::into_inner(log)
-                .expect("log readers have joined")
-                .finish();
+            // A reader that outlived a shutdown still holds the log.
+            let log = match Arc::try_unwrap(log) {
+                Ok(log) => log.finish(),
+                Err(log) => log.snapshot(),
+            };
             let output = String::from_utf8_lossy(&log).into_owned();
             ExecutionResult {
                 address: address.to_string(),
@@ -2629,6 +2860,7 @@ fn run_command(
                 exit_code: exit_code_of(status),
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             }
         }
         Err(error) => {
@@ -2644,6 +2876,7 @@ fn run_command(
                 exit_code: None,
                 tests: None,
                 input_hash: None,
+                interrupted: false,
             }
         }
     }
@@ -2711,6 +2944,7 @@ impl WindowsChildSignalMonitor {
             let handle = thread::spawn(move || {
                 while !completed_for_thread.load(Ordering::SeqCst) {
                     if shutdown_requested() {
+                        flush_interrupt_report();
                         let handle = termination_value as windows_sys::Win32::Foundation::HANDLE;
                         if job_backed {
                             windows_sys::Win32::System::JobObjects::TerminateJobObject(handle, 1);
@@ -2831,11 +3065,13 @@ impl ChildSignalMonitor {
         let handle = thread::spawn(move || {
             while !completed_for_thread.load(Ordering::SeqCst) {
                 if shutdown_requested() {
+                    // Print what the targets wrote before any of them dies.
+                    flush_interrupt_report();
                     unsafe {
                         libc::kill(-process_group, libc::SIGTERM);
                     }
                     let deadline = Instant::now() + Duration::from_secs(3);
-                    while Instant::now() < deadline {
+                    while Instant::now() < deadline && !force_shutdown_requested() {
                         if completed_for_thread.load(Ordering::SeqCst) {
                             return;
                         }
@@ -3951,6 +4187,7 @@ mod tests {
             exit_code: None,
             tests: None,
             input_hash: None,
+            interrupted: false,
         };
 
         assert_eq!(result.address, "//test:build");
