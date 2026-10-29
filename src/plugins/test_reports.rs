@@ -679,12 +679,25 @@ fn configures_formatters(dir: &Path) -> bool {
 /// that file instead.
 pub(super) fn pytest(ctx: &ReportContext) -> Option<ReportPlan> {
     let argv = Argv::parse(ctx.command)?;
-    let runner = argv.parts.iter().position(|p| {
+    // `uv run --with pytest -- python -m pytest`: the first `pytest` is the
+    // value of a wrapper option, not the runner. Skip those so the report
+    // flag lands after the runner, inside the wrapped command.
+    let runner = argv.parts.iter().enumerate().position(|(i, p)| {
         let name = Path::new(p)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(p);
-        name == "pytest" || name == "py.test"
+        let is_option_value = i > 0
+            && matches!(
+                argv.parts[i - 1].as_str(),
+                "--with"
+                    | "-w"
+                    | "--with-editable"
+                    | "--from"
+                    | "--package"
+                    | "--with-requirements"
+            );
+        (name == "pytest" || name == "py.test") && !is_option_value
     })?;
     let plan = |command: String, file: std::path::PathBuf| ReportPlan {
         command,
@@ -1533,6 +1546,13 @@ test("parent", async (t) => { await t.test("child", () => {}); });
     }
 
     #[test]
+    fn js_never_adds_report_flags_to_a_wrapper() {
+        let f = fixture();
+        let plan = js(&context(&f, "test", "mise exec node@24 -- vitest run"));
+        assert!(plan.is_none());
+    }
+
+    #[test]
     fn pytest_adds_a_junit_report() {
         let f = fixture();
         for (command, expected) in [
@@ -1547,6 +1567,14 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             (
                 "PYTHONPATH=src python -m pytest -x",
                 "PYTHONPATH=src python -m pytest -x --junitxml=/tmp/aster-reports/1/pytest.xml",
+            ),
+            (
+                "uv run --quiet --no-project --with pytest -- python -m pytest -q test_main.py",
+                "uv run --quiet --no-project --with pytest -- python -m pytest -q test_main.py --junitxml=/tmp/aster-reports/1/pytest.xml",
+            ),
+            (
+                "uvx --from pytest pytest -q",
+                "uvx --from pytest pytest -q --junitxml=/tmp/aster-reports/1/pytest.xml",
             ),
             (
                 "pytest -k fast -- tests/a.py",
