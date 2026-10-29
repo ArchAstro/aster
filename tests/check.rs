@@ -403,3 +403,125 @@ fn a_bad_configuration_exits_2_and_disable_skips_a_rule() {
     let (_, report) = ws.check(&[]);
     assert_eq!(report["summary"]["findings"], 0);
 }
+
+type Files = Vec<(String, String)>;
+
+/// A JavaScript project whose `test-ci` target is `ci_command` and which has
+/// one extra target, `test-subset`, that no entry runs.
+fn js_project(scripts: &str, ci_command: &str, subset: &str) -> Files {
+    vec![
+        (
+            "package.json".into(),
+            format!("{{\"name\":\"p\",\"scripts\":{{{scripts}}}}}"),
+        ),
+        (
+            "aster.toml".into(),
+            format!(
+                "[targets.test-ci]\ncommand = \"{ci_command}\"\n\n[targets.test-subset]\ncommand = \"{subset}\"\n"
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn a_package_script_that_runs_the_suite_covers_the_same_runner_on_some_files() {
+    let cases: [(&str, Files, bool); 9] = [
+        (
+            "script is the runner",
+            js_project(
+                r#""test":"vitest run""#,
+                "pnpm test",
+                "pnpm exec vitest run src/a.test.ts",
+            ),
+            false,
+        ),
+        (
+            "npm run, with flags",
+            js_project(
+                r#""test:ci":"vitest run --coverage""#,
+                "npm run test:ci",
+                "npx vitest run src/a.test.ts",
+            ),
+            false,
+        ),
+        (
+            "chain through other scripts",
+            js_project(
+                r#""test":"pnpm test:state && pnpm test:coverage","test:state":"vitest run --project state","test:coverage":"vitest run --coverage""#,
+                "pnpm test",
+                "pnpm exec vitest run src/a.test.ts",
+            ),
+            false,
+        ),
+        (
+            "scripts that call each other in a cycle do not hang",
+            js_project(
+                r#""test":"pnpm other && vitest run","other":"pnpm test""#,
+                "pnpm test",
+                "pnpm exec vitest run src/a.test.ts",
+            ),
+            false,
+        ),
+        (
+            "the config file is not a test path, and a subset with the same config is covered",
+            js_project(
+                r#""test":"vitest run --coverage --config vitest.cov.config.ts""#,
+                "pnpm test",
+                "pnpm exec vitest run --config vitest.cov.config.ts src/a.test.ts",
+            ),
+            false,
+        ),
+        (
+            "a subset with another config is reported",
+            js_project(
+                r#""test":"vitest run --config vitest.cov.config.ts""#,
+                "pnpm test",
+                "pnpm exec vitest run --config vitest.other.config.ts src/a.test.ts",
+            ),
+            true,
+        ),
+        (
+            "a script that runs another runner does not cover vitest",
+            js_project(
+                r#""test":"mocha""#,
+                "pnpm test",
+                "pnpm exec vitest run src/a.test.ts",
+            ),
+            true,
+        ),
+        (
+            "a subset that picks tests is reported",
+            js_project(
+                r#""test":"vitest run""#,
+                "pnpm test",
+                "pnpm exec vitest run --project web src/a.test.ts",
+            ),
+            true,
+        ),
+        (
+            "no such package script",
+            js_project(
+                r#""lint":"eslint .""#,
+                "pnpm test",
+                "pnpm exec vitest run src/a.test.ts",
+            ),
+            true,
+        ),
+    ];
+    for (name, files, reported) in cases {
+        let ws = Workspace::new(&[(
+            "aster.toml",
+            "[affected.lanes.all]\ninclude = [\"//app\"]\n\n[check]\nentries = [\"test-ci\"]\n",
+        )]);
+        for (path, content) in &files {
+            ws.write(&format!("app/{path}"), content);
+        }
+        let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+        let found = places(&report, "orphan-test-target");
+        assert_eq!(
+            found.contains(&"//app:test-subset".to_string()),
+            reported,
+            "{name}: {found:?} {report}"
+        );
+    }
+}

@@ -250,16 +250,21 @@ fn orphans(
     // runner on some of its files.
     let whole: Vec<&crate::cli::affected_files::TestTarget> = tests
         .iter()
-        .filter(|t| t.whole_suite && reached.contains(&(t.project.clone(), t.target.clone())))
+        .filter(|t| {
+            !t.whole_suites.is_empty() && reached.contains(&(t.project.clone(), t.target.clone()))
+        })
         .collect();
     for test in tests {
         if reached.contains(&(test.project.clone(), test.target.clone())) {
             continue;
         }
         if !test.selective
-            && whole
-                .iter()
-                .any(|w| w.runs_in == test.runs_in && w.program == test.program)
+            && whole.iter().any(|w| {
+                w.runs_in == test.runs_in
+                    && w.whole_suites
+                        .iter()
+                        .any(|(program, config)| *program == test.program && *config == test.config)
+            })
         {
             continue;
         }
