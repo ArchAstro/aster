@@ -6,9 +6,10 @@ pub use project::{
     ReportConfig, ReportConfigFormat, RichTargetConfig, TargetConfig,
 };
 pub use workspace::{
-    find_workspace_root, AffectedLaneConfig, AffectedWorkspaceConfig, CacheRetentionConfig,
-    DetailedDevServiceGroupConfig, DevPortConfig, DevServiceConfig, DevServiceGroupConfig,
-    DevServiceProxyConfig, DevTlsProxyConfig, DevTlsRouteConfig, DevWorkspaceConfig,
-    DynamicDevPortConfig, DynamicPortAllocation, ResolvedDevPortConfig, StaticPortAllocation,
-    WatchWorkspaceConfig, WorkspaceConfig,
+    find_workspace_root, AffectedLaneConfig, AffectedRelatedConfig, AffectedWorkspaceConfig,
+    CacheRetentionConfig, DetailedDevServiceGroupConfig, DevPortConfig, DevServiceConfig,
+    DevServiceGroupConfig, DevServiceProxyConfig, DevTlsProxyConfig, DevTlsRouteConfig,
+    DevWorkspaceConfig, DynamicDevPortConfig, DynamicPortAllocation, RelatedWrapperConfig,
+    RelatedWrapperTable, ResolvedDevPortConfig, StaticPortAllocation, WatchWorkspaceConfig,
+    WorkspaceConfig,
 };

@@ -437,7 +437,15 @@ fn run() -> Result<()> {
             source_graph::filter_changes(&mut changes, dir.as_deref(), &ext);
             changes.sort_by(|a, b| a.path.cmp(&b.path));
             let graph = build_graph(&projects)?;
-            let analysis = aster::related::analyse(&workspace_root, &projects, &graph, &changes);
+            let facts_cache =
+                (!cli.no_cache).then(|| aster::cache::resolve_cache_dir(&workspace_root));
+            let analysis = aster::related::analyse(
+                &workspace_root,
+                &projects,
+                &graph,
+                &changes,
+                facts_cache.as_deref(),
+            );
             let range = source_graph::describe_range(commit.as_deref());
             if output_mode == OutputMode::Json {
                 let value = source_graph::render_json(&analysis, &range);
@@ -781,12 +789,19 @@ fn run() -> Result<()> {
                     }
                 }
                 changes.sort_by(|a, b| a.path.cmp(&b.path));
-                let analysis =
-                    aster::related::analyse(&workspace_root, &projects, &graph, &changes);
+                let facts_cache =
+                    (!cli.no_cache).then(|| aster::cache::resolve_cache_dir(&workspace_root));
+                let analysis = aster::related::analyse(
+                    &workspace_root,
+                    &projects,
+                    &graph,
+                    &changes,
+                    facts_cache.as_deref(),
+                );
                 if output_mode == OutputMode::Verbose {
                     eprintln!(
-                        "[aster] Analysed {} source files ({})",
-                        analysis.files_analysed, analysis.timings
+                        "[aster] Analysed {} source files, {} from cache ({})",
+                        analysis.files_analysed, analysis.facts_reused, analysis.timings
                     );
                 }
                 Some(analysis)
@@ -907,6 +922,7 @@ fn run() -> Result<()> {
                         &target,
                         analysis,
                         &PluginRegistry::with_all_plugins(),
+                        &workspace_config.affected.related.wrappers,
                     ));
                 }
 
@@ -1050,6 +1066,7 @@ fn run() -> Result<()> {
                             related: related_analysis.as_ref(),
                             all_projects: &projects,
                             declared_inputs: &declared_addrs,
+                            related_wrappers: &workspace_config.affected.related.wrappers,
                         },
                         &registry,
                     )?)

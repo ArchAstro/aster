@@ -2,11 +2,12 @@
 //! contains, the names each one refers to, and the files each one draws
 //! those names from.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Languages that resolve names against each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Family {
     Elixir,
     Js,
@@ -41,7 +42,7 @@ impl Family {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DefKind {
     Function,
     /// Reached through a value rather than an import (a method, a protocol
@@ -55,7 +56,7 @@ pub enum DefKind {
 }
 
 /// One definition, or the code of a file outside every definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Def {
     pub name: String,
     /// Other names the same definition is known by (`default`).
@@ -93,7 +94,8 @@ pub struct Def {
     pub paths: Vec<String>,
     /// Reaches code it never names, and how: by listing an application's
     /// modules at run time, or by running the package's binary.
-    pub reflects: Option<&'static str>,
+    #[serde(with = "static_str")]
+    pub reflects: Option<Reason>,
     /// Test code in a file that also holds what it tests (a Rust
     /// `#[cfg(test)]` module): the definition counts as part of a test file
     /// though the file does not.
@@ -138,6 +140,10 @@ pub struct Def {
     /// the index keeps these only where the specifier resolves.
     pub outside: BTreeSet<(String, String)>,
 }
+
+/// A fixed explanation. An alias keeps serde from tying the lifetime of
+/// deserialized input to `'static`; see [`static_str`].
+pub type Reason = &'static str;
 
 /// A super type that cannot be named: a mixin call, a type from elsewhere.
 pub const ANY_TYPE: &str = "*";
@@ -188,7 +194,7 @@ impl Def {
 }
 
 /// How one source line maps onto the file's definitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineClass {
     /// Blank, comment or documentation.
     Inert,
@@ -202,7 +208,7 @@ pub enum LineClass {
 
 /// A statement that brings names into the file. Changing one matters to the
 /// definitions that use those names, not to the whole file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportLine {
     /// 1-based inclusive line span.
     pub lines: (usize, usize),
@@ -216,7 +222,7 @@ pub struct ImportLine {
 }
 
 /// A `mod name;` declaration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Submodule {
     /// Inline modules the declaration sits in.
     pub inline: Vec<String>,
@@ -225,7 +231,7 @@ pub struct Submodule {
     pub test: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileFacts {
     pub family: Family,
     pub defs: Vec<Def>,
@@ -282,7 +288,8 @@ pub struct FileFacts {
     /// (Go's `_test.go`).
     pub tests_private: bool,
     /// Loads code by a computed name, which no static analysis can follow.
-    pub dynamic: Option<&'static str>,
+    #[serde(with = "static_str")]
+    pub dynamic: Option<Reason>,
     /// `//go:embed` patterns, relative to the file's directory, with the
     /// definition each one fills.
     pub embeds: Vec<(String, Owner)>,
@@ -413,7 +420,7 @@ pub fn path_reaches(literal: &str, pattern: &str) -> bool {
 }
 
 /// Where the walk currently records references: a definition or the top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Owner {
     #[default]
     Top,
@@ -459,4 +466,38 @@ pub fn parse(language: tree_sitter::Language, source: &str) -> Option<tree_sitte
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).ok()?;
     parser.parse(source, None)
+}
+
+/// Serde for the fixed reason strings facts carry (`&'static str`). A
+/// string read back is interned, so the set of leaked strings is the set of
+/// distinct reasons, however many files are read.
+mod static_str {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static INTERNED: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<&'static str>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<&'static str>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let mut guard = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(HashSet::new);
+        if let Some(known) = set.get(text.as_str()) {
+            return Ok(Some(known));
+        }
+        let leaked: &'static str = Box::leak(text.into_boxed_str());
+        set.insert(leaked);
+        Ok(Some(leaked))
+    }
 }

@@ -500,6 +500,66 @@ pub struct AffectedWorkspaceConfig {
     /// Named subsets of affected primary projects.
     #[serde(default)]
     pub lanes: HashMap<String, AffectedLaneConfig>,
+
+    /// How `--related` reads test commands.
+    #[serde(default)]
+    pub related: AffectedRelatedConfig,
+}
+
+/// `[affected.related]`: how `--related` reads test commands.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedRelatedConfig {
+    /// Programs that run another command given as their arguments
+    /// (`scripts/with-rust-toolchain cargo test`, `mise exec node@24 --
+    /// vitest run`). The wrapped command is narrowed; the wrapper is kept in
+    /// front of it unchanged.
+    #[serde(default)]
+    pub wrappers: Vec<RelatedWrapperConfig>,
+}
+
+/// A wrapper program for `[affected.related] wrappers`: a bare string names a
+/// program whose remaining arguments are the wrapped command, a table adds
+/// the word that ends the wrapper's own arguments.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RelatedWrapperConfig {
+    Program(String),
+    Detailed(RelatedWrapperTable),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedWrapperTable {
+    pub program: String,
+    /// The word after which the wrapped command starts (`--`). Without it
+    /// the command starts right after the program.
+    pub until: Option<String>,
+}
+
+impl RelatedWrapperConfig {
+    /// The wrapper's program and the word that ends its own arguments.
+    pub fn parts(&self) -> (&str, Option<&str>) {
+        match self {
+            Self::Program(program) => (program, None),
+            Self::Detailed(table) => (&table.program, table.until.as_deref()),
+        }
+    }
+}
+
+impl AffectedRelatedConfig {
+    fn validate(&self) -> Result<()> {
+        for wrapper in &self.wrappers {
+            let (program, until) = wrapper.parts();
+            if program.trim().is_empty() || program.contains(char::is_whitespace) {
+                bail!("wrapper program {program:?} must be one word");
+            }
+            if until.is_some_and(|u| u.trim().is_empty() || u.contains(char::is_whitespace)) {
+                bail!("wrapper {program:?} has an `until` that is not one word");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Inclusive and exclusive project-address selectors for one affected lane.
@@ -575,6 +635,11 @@ impl WorkspaceConfig {
         config.dev.validate().with_context(|| {
             format!("Invalid development services in {}", config_path.display())
         })?;
+        config
+            .affected
+            .related
+            .validate()
+            .with_context(|| format!("Invalid [affected.related] in {}", config_path.display()))?;
 
         Ok(config)
     }

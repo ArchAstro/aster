@@ -413,6 +413,91 @@ impl Delegated {
     }
 }
 
+/// Programs configured in `[affected.related] wrappers` that run the command
+/// given as their arguments.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Wrappers {
+    /// `(program, until)`.
+    entries: Vec<(String, Option<String>)>,
+}
+
+/// A command split into its wrappers and the command they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Wrapped {
+    /// Everything before the wrapped command, as written, with a trailing
+    /// space.
+    pub(crate) prefix: String,
+    /// The wrapped command.
+    pub(crate) command: String,
+}
+
+impl Wrappers {
+    /// More than this many nested wrappers is not a command to guess at.
+    const MAX_DEPTH: usize = 4;
+
+    pub(crate) fn new(config: &[crate::config::RelatedWrapperConfig]) -> Self {
+        Self {
+            entries: config
+                .iter()
+                .map(|wrapper| {
+                    let (program, until) = wrapper.parts();
+                    (program.to_string(), until.map(str::to_string))
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether the written program word is the configured one: the same
+    /// word, or the same file name when the entry names no directory.
+    fn is_program(entry: &str, word: &str) -> bool {
+        word == entry
+            || (!entry.contains('/')
+                && Path::new(word)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name == entry))
+    }
+
+    /// The command a wrapper runs, when `command` starts with one (after any
+    /// `NAME=value` assignments). Wrappers may nest. Words keep their
+    /// quoting, and runs of spaces collapse to one.
+    pub(crate) fn strip(&self, command: &str) -> Option<Wrapped> {
+        if self.entries.is_empty() || command.contains("{files}") {
+            return None;
+        }
+        let mut words = raw_words(command)?;
+        let mut taken = 0;
+        let mut prefix = Vec::new();
+        for _ in 0..Self::MAX_DEPTH {
+            let program = words.iter().position(|w| !is_assignment(w))?;
+            let found = self.entries.iter().find_map(|(entry, until)| {
+                if !Self::is_program(entry, &words[program]) {
+                    return None;
+                }
+                match until {
+                    None => Some(program + 1),
+                    Some(until) => words[program + 1..]
+                        .iter()
+                        .position(|w| w == until)
+                        .map(|at| program + 2 + at),
+                }
+            });
+            let Some(start) = found.filter(|&start| start < words.len()) else {
+                break;
+            };
+            prefix.extend(words.drain(..start));
+            taken += 1;
+        }
+        if taken == 0 {
+            return None;
+        }
+        Some(Wrapped {
+            prefix: format!("{} ", prefix.join(" ")),
+            command: words.join(" "),
+        })
+    }
+}
+
 /// The selected files that the paths already listed in a command cover:
 /// all of them when none is listed. A listed path covers itself and, when
 /// it is a directory, everything under it.
@@ -670,7 +755,15 @@ pub(super) fn node(
     if selected.is_empty() {
         return plan(Vec::new());
     }
-    let mut add = vec!["--".to_string()];
+    // npm passes a script its arguments only after `--`. pnpm, yarn and bun
+    // pass them as they are and would hand a `--` on to the runner, which
+    // Vitest then reads as the end of options: it drops the file filters and
+    // runs everything.
+    let launcher = Path::new(&argv.parts[argv.program]).file_name()?.to_str()?;
+    let mut add = Vec::new();
+    if launcher == "npm" {
+        add.push("--".to_string());
+    }
     add.extend(selected);
     plan(vec![argv.render(&[], &add)])
 }
@@ -1167,6 +1260,59 @@ mod tests {
         );
     }
 
+    fn wrappers() -> Wrappers {
+        use crate::config::{RelatedWrapperConfig, RelatedWrapperTable};
+        Wrappers::new(&[
+            RelatedWrapperConfig::Program("scripts/with-toolchain".into()),
+            RelatedWrapperConfig::Program("env-run".into()),
+            RelatedWrapperConfig::Detailed(RelatedWrapperTable {
+                program: "mise".into(),
+                until: Some("--".into()),
+            }),
+        ])
+    }
+
+    #[test]
+    fn wrappers_expose_the_command_they_run() {
+        let wrappers = wrappers();
+        let strip = |command: &str| wrappers.strip(command).map(|w| (w.prefix, w.command));
+        assert_eq!(
+            strip("scripts/with-toolchain cargo test -p a"),
+            Some(("scripts/with-toolchain ".into(), "cargo test -p a".into()))
+        );
+        assert_eq!(
+            strip("CI=1 mise exec node@24 -- vitest run --reporter 'a b'"),
+            Some((
+                "CI=1 mise exec node@24 -- ".into(),
+                "vitest run --reporter 'a b'".into()
+            ))
+        );
+        // A name without a directory matches the program's file name.
+        assert_eq!(
+            strip("/usr/bin/env-run mix test"),
+            Some(("/usr/bin/env-run ".into(), "mix test".into()))
+        );
+        // Wrappers nest.
+        assert_eq!(
+            strip("mise exec -- scripts/with-toolchain cargo test"),
+            Some((
+                "mise exec -- scripts/with-toolchain ".into(),
+                "cargo test".into()
+            ))
+        );
+        // Not configured, no `until` word, nothing wrapped, or a path that
+        // is not the configured one.
+        assert_eq!(strip("cargo test"), None);
+        assert_eq!(strip("mise exec node@24"), None);
+        assert_eq!(strip("mise exec node@24 --"), None);
+        assert_eq!(strip("scripts/with-toolchain"), None);
+        assert_eq!(strip("other/scripts/with-toolchain cargo test"), None);
+        assert_eq!(
+            Wrappers::default().strip("scripts/with-toolchain cargo test"),
+            None
+        );
+    }
+
     #[test]
     fn node_narrows_direct_runners_and_plain_scripts() {
         let dir = TempDir::new().unwrap();
@@ -1186,8 +1332,20 @@ mod tests {
         );
         assert_eq!(
             commands(node(dir.path(), "pnpm test", &tests)),
-            ["pnpm test -- src/a.test.ts"]
+            ["pnpm test src/a.test.ts"]
         );
+        // Only npm needs `--` to pass arguments to a script; pnpm, yarn and
+        // bun would forward it to the runner, which then ignores the files.
+        for (command, expected) in [
+            ("npm test", "npm test -- src/a.test.ts"),
+            ("npm run test", "npm run test -- src/a.test.ts"),
+            ("pnpm run test", "pnpm run test src/a.test.ts"),
+            ("yarn test", "yarn test src/a.test.ts"),
+            ("yarn run test", "yarn run test src/a.test.ts"),
+            ("bun run test", "bun run test src/a.test.ts"),
+        ] {
+            assert_eq!(commands(node(dir.path(), command, &tests)), [expected]);
+        }
         assert_eq!(node(dir.path(), "pnpm run test:all", &tests), None);
         assert_eq!(node(dir.path(), "pnpm run test:src", &tests), None);
         assert_eq!(

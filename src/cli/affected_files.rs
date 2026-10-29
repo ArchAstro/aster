@@ -15,9 +15,10 @@ use globset::{Glob, GlobMatcher};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::config::RelatedWrapperConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
-use crate::plugins::related_tests::Delegated;
+use crate::plugins::related_tests::{Delegated, Wrappers};
 use crate::plugins::{
     FilesListPlan, FilesListSelection, PluginRegistry, RelatedTest, Target, TargetCapability,
 };
@@ -61,6 +62,8 @@ pub struct AffectedRequest<'a> {
     /// input of the target. Their change is not in their own sources, so
     /// they run in full.
     pub declared_inputs: &'a HashSet<String>,
+    /// `[affected.related] wrappers`: programs in front of a test command.
+    pub related_wrappers: &'a [RelatedWrapperConfig],
 }
 
 /// How a project's targets are narrowed.
@@ -88,7 +91,7 @@ pub fn plan_affected_commands(
     // are pinned before any other project's selection can narrow them.
     let planner = request.related.map(|related| {
         let mut planner = RelatedPlanner {
-            lookup: Lookup::new(request.all_projects),
+            lookup: Lookup::new(request.all_projects, request.related_wrappers),
             related,
             registry,
             pinned: HashSet::new(),
@@ -314,10 +317,11 @@ struct Lookup<'a> {
     by_root: HashMap<PathBuf, &'a DiscoveredProject>,
     /// Targets that join a target's runs (`selected_by`), by its address.
     joiners: HashMap<String, Vec<(String, String)>>,
+    wrappers: Wrappers,
 }
 
 impl<'a> Lookup<'a> {
-    fn new(projects: &'a [DiscoveredProject]) -> Self {
+    fn new(projects: &'a [DiscoveredProject], wrappers: &[RelatedWrapperConfig]) -> Self {
         let mut joiners: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for project in projects {
             for (name, def) in &project.targets {
@@ -333,6 +337,7 @@ impl<'a> Lookup<'a> {
             by_addr: projects.iter().map(|p| (address(p), p)).collect(),
             by_root: projects.iter().map(|p| (p.root.clone(), p)).collect(),
             joiners,
+            wrappers: Wrappers::new(wrappers),
         }
     }
 
@@ -374,11 +379,17 @@ impl<'a> Lookup<'a> {
     /// `None` when the one-liner changes into a directory that is not a
     /// project.
     fn runner(&self, owner: &'a DiscoveredProject, def: &Target) -> Option<Runner<'a>> {
-        let Some(delegated) = Delegated::parse(&def.command) else {
+        // A configured wrapper program stays in front of the command it runs.
+        let (wrapper, written) = match self.wrappers.strip(&def.command) {
+            Some(wrapped) => (Some(wrapped.prefix), wrapped.command),
+            None => (None, def.command.clone()),
+        };
+        let Some(delegated) = Delegated::parse(&written) else {
             return Some(Runner {
                 project: owner,
-                command: def.command.clone(),
+                command: written,
                 delegated: None,
+                wrapper,
             });
         };
         let base = def.working_dir.as_deref().unwrap_or(&owner.root);
@@ -390,6 +401,7 @@ impl<'a> Lookup<'a> {
             project,
             command: delegated.command.clone(),
             delegated: Some(delegated),
+            wrapper,
         })
     }
 }
@@ -417,6 +429,9 @@ struct Runner<'a> {
     project: &'a DiscoveredProject,
     command: String,
     delegated: Option<Delegated>,
+    /// The wrapper program(s) written before `command`, with a trailing
+    /// space.
+    wrapper: Option<String>,
 }
 
 /// What `--related` does with one target.
@@ -533,6 +548,10 @@ impl<'a> RelatedPlanner<'a> {
                             delegated.render(command.strip_prefix(&environment).unwrap_or(command))
                         }
                         None => command.clone(),
+                    })
+                    .map(|command| match (&runner.wrapper, placeholder) {
+                        (Some(wrapper), false) => format!("{wrapper}{command}"),
+                        _ => command,
                     })
                     .collect();
                 // Linux caps one argument at 128 KiB, and a shell script
@@ -744,9 +763,10 @@ pub fn related_proxies(
     target: &str,
     related: &Related,
     registry: &PluginRegistry,
+    wrappers: &[RelatedWrapperConfig],
 ) -> HashSet<String> {
     let planner = RelatedPlanner {
-        lookup: Lookup::new(projects),
+        lookup: Lookup::new(projects, wrappers),
         related,
         registry,
         pinned: HashSet::new(),
