@@ -17,11 +17,21 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-/// Prints 20 numbered lines on stdout, one on stderr, then hangs. `ready` is
-/// created only after the output was written, so a test that waits for it
-/// has seen the output leave the target.
+/// Prints 20 numbered lines on stdout, then hangs. `ready` is created only
+/// after the output was written, so a test that waits for it has seen the
+/// output leave the target. Nothing goes to stderr: Aster reads stdout and
+/// stderr on separate threads, so the order of lines across the two streams
+/// is not fixed and a 15-line tail could cut either one.
 const HANG_SCRIPT: &str = r#"echo $$ > pid
 for i in $(seq -w 1 20); do echo "out-$i"; done
+touch ready
+exec sleep 1000
+"#;
+
+/// One line per stream, few enough that the tail never truncates, so both
+/// show up whichever order the reader threads append them in.
+const TWO_STREAMS_SCRIPT: &str = r#"echo $$ > pid
+echo "out-line"
 echo "err-line" >&2
 touch ready
 exec sleep 1000
@@ -141,15 +151,29 @@ fn sigterm_prints_running_targets_output_tail_then_exits_nonzero() {
     );
     assert!(stderr.contains("out-20"), "tail missing:\n{stderr}");
     assert!(
-        stderr.contains("err-line"),
-        "stderr stream missing:\n{stderr}"
-    );
-    assert!(
         !stderr.contains("out-01"),
         "output should be truncated to the tail:\n{stderr}"
     );
     assert!(stderr.contains("earlier lines omitted"), "{stderr}");
     assert_eq!(output.status.code(), Some(128 + libc::SIGTERM), "{stderr}");
+    assert_gone(pid_of(&tmp));
+}
+
+#[test]
+fn sigterm_report_includes_both_stdout_and_stderr_of_the_target() {
+    // Setup: a target that wrote one line to each stream and is hanging.
+    let tmp = workspace(TWO_STREAMS_SCRIPT);
+
+    let (output, _) = interrupt(&tmp, &[], &[libc::SIGTERM], Duration::ZERO);
+    let stderr = stderr_of(&output);
+
+    // Outcome: the report holds both lines; their relative order is not
+    // asserted because two reader threads append them.
+    assert!(stderr.contains("out-line"), "stdout missing:\n{stderr}");
+    assert!(
+        stderr.contains("err-line"),
+        "stderr stream missing:\n{stderr}"
+    );
     assert_gone(pid_of(&tmp));
 }
 
