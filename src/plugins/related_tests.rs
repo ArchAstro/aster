@@ -1645,3 +1645,39 @@ mod tests {
         assert_eq!(pytest(dir.path(), "python -m build", &tests), None);
     }
 }
+
+#[cfg(test)]
+mod package_script_runner_tests {
+    use super::package_script_runners;
+
+    fn runners(scripts: &str, command: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!("{{\"scripts\":{{{scripts}}}}}"),
+        )
+        .unwrap();
+        package_script_runners(dir.path(), command)
+    }
+
+    #[test]
+    fn a_chain_is_read_through_the_scripts_it_calls() {
+        let scripts = r#""test":"pnpm test:state && pnpm test:cov","test:state":"vitest run --project state","test:cov":"vitest run --coverage""#;
+        assert_eq!(
+            runners(scripts, "pnpm test"),
+            ["vitest run --project state", "vitest run --coverage"]
+        );
+    }
+
+    #[test]
+    fn scripts_that_call_each_other_stop_at_the_cycle() {
+        let scripts = r#""test":"pnpm other && vitest run","other":"pnpm test""#;
+        assert_eq!(runners(scripts, "pnpm test"), ["vitest run"]);
+    }
+
+    #[test]
+    fn a_script_that_changes_directory_or_is_missing_has_no_runner() {
+        assert!(runners(r#""test":"cd web && vitest run""#, "pnpm test").is_empty());
+        assert!(runners(r#""lint":"eslint .""#, "pnpm test").is_empty());
+    }
+}
