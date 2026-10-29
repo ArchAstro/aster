@@ -815,6 +815,49 @@ pub struct TestTarget {
     /// Why `--related` runs the whole target whenever it selects it. `None`
     /// when the command is narrowed to the selected tests.
     pub unnarrowable: Option<String>,
+    /// Address of the project whose tests the command runs (another
+    /// project's, for a shard that changes into it).
+    pub runs_in: String,
+    /// The runner, as the words before its first flag or path
+    /// (`mix test`, `pnpm exec vitest run`).
+    pub program: String,
+    /// The command names no test file: it runs the project's whole suite.
+    pub whole_suite: bool,
+    /// The command picks tests by configuration or tag (`--config`,
+    /// `--include`, `--only`), so another run of the runner does not cover it.
+    pub selective: bool,
+}
+
+/// How a test command selects what it runs: its runner, whether it lists
+/// test files, and whether it picks tests by configuration or tag.
+fn describe_runner(command: &str) -> (String, bool, bool) {
+    let words = shell_words::split(command).unwrap_or_default();
+    let words: Vec<&String> = words
+        .iter()
+        .filter(|w| !is_environment_assignment(w))
+        .collect();
+    let plain = |w: &str| !w.starts_with('-') && !w.contains(['/', '.', '=']);
+    let program: Vec<&str> = words
+        .iter()
+        .map(|w| w.as_str())
+        .take_while(|w| plain(w))
+        .take(4)
+        .collect();
+    let path_like = |w: &str| {
+        w.contains('/')
+            || [".exs", ".ex", ".ts", ".tsx", ".js", ".mjs", ".py", ".go", ".rs"]
+                .iter()
+                .any(|ext| w.ends_with(ext))
+    };
+    let whole = !words.iter().any(|w| path_like(w));
+    let selective = words.iter().any(|w| {
+        matches!(
+            w.as_str(),
+            "--config" | "-c" | "--include" | "--only" | "--exclude" | "--tag" | "-t"
+                | "--project" | "--grep" | "-g" | "-k" | "-m" | "--testNamePattern"
+        ) || w.starts_with("--config=")
+    });
+    (program.join(" "), whole, selective)
 }
 
 /// The targets whose command runs tests, ordered by address.
@@ -941,11 +984,20 @@ pub fn test_targets(
                     continue;
                 }
             }
+            let (runs_in, runner_command) = match &runner {
+                Some(runner) => (address(runner.project), runner.command.as_str()),
+                None => (address(project), written.as_str()),
+            };
+            let (program, whole_suite, selective) = describe_runner(runner_command);
             found.push(TestTarget {
                 project: address(project),
                 target: name.clone(),
                 command: def.command.clone(),
                 unnarrowable,
+                runs_in,
+                program,
+                whole_suite,
+                selective,
             });
         }
     }

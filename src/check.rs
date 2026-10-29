@@ -245,8 +245,22 @@ fn orphans(
         admitted.extend(members);
     }
     let reached = reachable_targets(projects, &config.affected.related.wrappers, &roots);
+    // A whole-suite run of a project's tests (a shard that changes into the
+    // project, say) covers the project's other targets that run the same
+    // runner on some of its files.
+    let whole: Vec<&crate::cli::affected_files::TestTarget> = tests
+        .iter()
+        .filter(|t| t.whole_suite && reached.contains(&(t.project.clone(), t.target.clone())))
+        .collect();
     for test in tests {
         if reached.contains(&(test.project.clone(), test.target.clone())) {
+            continue;
+        }
+        if !test.selective
+            && whole
+                .iter()
+                .any(|w| w.runs_in == test.runs_in && w.program == test.program)
+        {
             continue;
         }
         let why = if admitted.contains(&test.project) {
