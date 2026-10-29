@@ -272,7 +272,7 @@ fn test_targets_that_no_entry_reaches_are_orphans() {
             ("shop/mix.exs", MIX),
             (
                 "shop/aster.toml",
-                "[targets.test-ci]\ncommand = \"mix test\"\ndepends_on = [\"//self:test-unit\"]\n\n[targets.test-unit]\ncommand = \"mix test test/unit\"\n\n[targets.test-smoke]\ncommand = \"mix test test/smoke\"\n\n[targets.test-joined]\ncommand = \"mix test test/joined\"\nselected_by = [\"//shop:test-ci\"]\n",
+                "[targets.test-ci]\ncommand = \"mix test\"\ndepends_on = [\"//self:test-unit\"]\n\n[targets.test-unit]\ncommand = \"mix test test/unit\"\n\n[targets.test-smoke]\ncommand = \"mix test --only smoke\"\n\n[targets.test-one-file]\ncommand = \"mix test test/one_test.exs\"\n\n[targets.test-joined]\ncommand = \"mix test test/joined\"\nselected_by = [\"//shop:test-ci\"]\n",
             ),
             ("unlisted/mix.exs", MIX),
             (
