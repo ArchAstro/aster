@@ -864,6 +864,35 @@ impl TestTarget {
             .split_whitespace()
             .any(|w| w == "--workspace" || w == "--all")
     }
+
+    /// A `cargo test` or `cargo nextest run` command.
+    pub fn is_cargo_test(&self) -> bool {
+        matches!(self.program.as_str(), "cargo test" | "cargo nextest run")
+    }
+
+    /// The command picks packages, targets or tests (`-p`, `--test`, a name
+    /// filter after `--`), so it does not run a whole crate.
+    pub fn selects_cargo_tests(&self) -> bool {
+        self.command.split_whitespace().any(|w| {
+            matches!(
+                w,
+                "-p" | "--package"
+                    | "--exclude"
+                    | "--test"
+                    | "--lib"
+                    | "--bin"
+                    | "--bins"
+                    | "--example"
+                    | "--bench"
+                    | "--doc"
+                    | "-E"
+                    | "--filterset"
+                    | "--"
+            ) || w.starts_with("--package=")
+                || w.starts_with("--test=")
+                || w.starts_with("--filterset=")
+        })
+    }
 }
 
 /// How a test command selects what it runs.
