@@ -23,6 +23,7 @@ pub fn quote_command_argument(value: &str) -> String {
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 static SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static SECOND_SIGNAL: AtomicBool = AtomicBool::new(false);
 static GRACEFUL_WHEN_IDLE: AtomicBool = AtomicBool::new(false);
 
 /// Install lightweight process signal handlers.
@@ -33,6 +34,7 @@ static GRACEFUL_WHEN_IDLE: AtomicBool = AtomicBool::new(false);
 pub fn install_signal_handler() -> &'static AtomicBool {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     SHUTDOWN_SIGNAL.store(0, Ordering::SeqCst);
+    SECOND_SIGNAL.store(false, Ordering::SeqCst);
     GRACEFUL_WHEN_IDLE.store(false, Ordering::SeqCst);
 
     #[cfg(unix)]
@@ -58,6 +60,11 @@ pub fn install_signal_handler() -> &'static AtomicBool {
 
 pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// A second SIGINT or SIGTERM arrived: stop waiting politely.
+pub(crate) fn force_shutdown_requested() -> bool {
+    SECOND_SIGNAL.load(Ordering::SeqCst)
 }
 
 pub fn shutdown_signal() -> Option<i32> {
@@ -91,7 +98,9 @@ extern "C" fn shutdown_handler(signal: libc::c_int) {
             libc::_exit(128 + signal);
         }
     }
-    SHUTDOWN_SIGNAL.store(signal, Ordering::SeqCst);
+    if SHUTDOWN_SIGNAL.swap(signal, Ordering::SeqCst) != 0 {
+        SECOND_SIGNAL.store(true, Ordering::SeqCst);
+    }
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
@@ -116,7 +125,9 @@ unsafe extern "system" fn windows_shutdown_handler(control_type: u32) -> i32 {
         return 0;
     }
     let signal = if control_type == CTRL_C_EVENT { 2 } else { 15 };
-    SHUTDOWN_SIGNAL.store(signal, Ordering::SeqCst);
+    if SHUTDOWN_SIGNAL.swap(signal, Ordering::SeqCst) != 0 {
+        SECOND_SIGNAL.store(true, Ordering::SeqCst);
+    }
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     1
 }

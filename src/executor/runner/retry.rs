@@ -363,6 +363,7 @@ mod tests {
                 quarantined: Vec::new(),
             }),
             input_hash: None,
+            interrupted: false,
         }
     }
 
