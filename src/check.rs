@@ -12,9 +12,9 @@ use crate::plugins::PluginRegistry;
 use crate::related::{self, SourceFinding, Sources};
 use anyhow::{bail, Result};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub const UNNARROWABLE: &str = "unnarrowable-test-command";
@@ -244,6 +244,10 @@ fn orphans(
         }
         admitted.extend(members);
     }
+    let roots_by_addr: HashMap<String, PathBuf> = projects
+        .iter()
+        .map(|p| (format!("//{}", p.relative_path.display()), p.root.clone()))
+        .collect();
     let reached = reachable_targets(projects, &config.affected.related.wrappers, &roots);
     // A whole-suite run of a project's tests (a shard that changes into the
     // project, say) covers the project's other targets that run the same
@@ -254,8 +258,26 @@ fn orphans(
             !t.whole_suites.is_empty() && reached.contains(&(t.project.clone(), t.target.clone()))
         })
         .collect();
+    // A reached `cargo test --workspace` runs every member crate's tests.
+    let workspaces: Vec<PathBuf> = tests
+        .iter()
+        .filter(|t| {
+            reached.contains(&(t.project.clone(), t.target.clone()))
+                && t.program == "cargo test"
+                && t.whole_suite_flags()
+        })
+        .filter_map(|t| roots_by_addr.get(&t.runs_in).cloned())
+        .collect();
     for test in tests {
         if reached.contains(&(test.project.clone(), test.target.clone())) {
+            continue;
+        }
+        if test.program == "cargo test"
+            && !test.selective
+            && roots_by_addr
+                .get(&test.runs_in)
+                .is_some_and(|root| workspaces.iter().any(|w| root.starts_with(w)))
+        {
             continue;
         }
         if !test.selective

@@ -525,3 +525,57 @@ fn a_package_script_that_runs_the_suite_covers_the_same_runner_on_some_files() {
         );
     }
 }
+
+#[test]
+fn an_alias_entry_reaches_the_target_it_aliases() {
+    let ws = Workspace::new(&[
+        (
+            "aster.toml",
+            "[affected.lanes.all]\ninclude = [\"//app\"]\n\n[check]\nentries = [\"test-ci\"]\n",
+        ),
+        ("app/package.json", "{\"name\":\"p\"}"),
+        (
+            "app/aster.toml",
+            "[targets]\ntest-ci = { alias = \"test\" }\n\n[targets.test]\ncommand = \"pnpm exec vitest run src/a.test.ts\"\n\n[targets.test-other]\ncommand = \"pnpm exec vitest run src/b.test.ts\"\n",
+        ),
+    ]);
+    let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+    // `test-other` is not aliased by anything; its runner is not a whole suite either.
+    assert_eq!(
+        places(&report, "orphan-test-target"),
+        ["//app:test-other"],
+        "{report}"
+    );
+}
+
+#[test]
+fn a_workspace_wide_cargo_test_covers_the_member_crates() {
+    let manifest = |name: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+    };
+    let orphans =
+        |ci: &str| {
+            let ws = Workspace::new(&[
+            (
+                "aster.toml",
+                "[affected.lanes.rs]\ninclude = [\"//rs\"]\n\n[check]\nentries = [\"test-ci\"]\n",
+            ),
+            (
+                "rs/Cargo.toml",
+                &format!("{}\n[workspace]\nmembers = [\"crates/a\"]\n", manifest("root")),
+            ),
+            ("rs/src/lib.rs", "pub fn f() {}\n"),
+            (
+                "rs/aster.toml",
+                &format!("[targets.test-ci]\ncommand = \"{ci}\"\n"),
+            ),
+            ("rs/crates/a/Cargo.toml", &manifest("a")),
+            ("rs/crates/a/src/lib.rs", "pub fn f() {}\n"),
+        ]);
+            let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+            places(&report, "orphan-test-target")
+        };
+    assert_eq!(orphans("cargo test --workspace"), Vec::<String>::new());
+    assert_eq!(orphans("cargo test --all --locked"), Vec::<String>::new());
+    assert_eq!(orphans("cargo test"), ["//rs/crates/a:test"]);
+}
