@@ -193,10 +193,23 @@ pub fn suspicious_path_literals(projects: &[DiscoveredProject], src: &Sources) -
         let file_dir = path.parent().unwrap_or(Path::new(""));
         // (line, literal) -> the workspace path it names.
         let mut wanted: HashMap<(usize, String), PathBuf> = HashMap::new();
-        for def in facts.defs.iter().chain([&facts.top]) {
+        for (index, def) in facts.defs.iter().chain([&facts.top]).enumerate() {
             if !(facts.is_test_file || def.in_test) {
                 continue;
             }
+            // `top` follows the definitions; annotations outside every
+            // definition have no owner.
+            let owner = (index < facts.defs.len()).then_some(index as u32);
+            let declared: Vec<&String> = facts
+                .annotations
+                .iter()
+                .filter(|a| a.owner == owner)
+                .filter_map(|a| match &a.directive {
+                    Directive::Reads(paths) => Some(paths),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             for (text, line) in def.strings.iter().zip(&def.string_lines) {
                 if def.loaded.contains(text) {
                     continue;
@@ -205,6 +218,9 @@ pub fn suspicious_path_literals(projects: &[DiscoveredProject], src: &Sources) -
                     .into_iter()
                     .find(|candidate| src.exists(candidate));
                 if let Some(existing) = existing {
+                    if declared.iter().any(|p| declares_read(p, &existing)) {
+                        continue;
+                    }
                     wanted.insert((*line as usize, text.clone()), existing);
                 }
             }
@@ -249,6 +265,31 @@ pub fn suspicious_path_literals(projects: &[DiscoveredProject], src: &Sources) -
         }
     }
     findings
+}
+
+/// Whether an `aster: reads` entry declares the read that a literal naming
+/// `named` stands for: the entry matches `named` or lies beneath it, or
+/// `named` is the trailing whole components of the entry's directory (the
+/// literal is joined onto a base other than the root), or a glob tail of
+/// the entry matches it.
+fn declares_read(pattern: &str, named: &Path) -> bool {
+    if annotations::covers(pattern, named) {
+        return true;
+    }
+    let prefix = annotations::literal_prefix(pattern);
+    if prefix.starts_with(named) {
+        return true;
+    }
+    let want: Vec<_> = named.components().collect();
+    let have: Vec<_> = prefix.components().collect();
+    if !want.is_empty() && have.ends_with(&want) {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('/').collect();
+    (1..parts.len()).any(|at| {
+        !parts[at].contains(['*', '?', '[', '{'])
+            && annotations::covers(&parts[at..].join("/"), named)
+    })
 }
 
 fn shorten(text: &str) -> String {
