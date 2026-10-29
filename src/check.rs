@@ -286,13 +286,15 @@ fn orphans(
             .filter(|s| reached.contains(&(s.project.clone(), s.target.clone())))
             .map(|s| (s.runs_in, s.suites)),
     );
-    // A reached `cargo test --workspace` runs every member crate's tests.
+    // A reached `cargo test --workspace` or `cargo nextest run --workspace`
+    // runs every member crate's tests, under either runner.
     let workspaces: Vec<PathBuf> = tests
         .iter()
         .filter(|t| {
             reached.contains(&(t.project.clone(), t.target.clone()))
-                && t.program == "cargo test"
+                && t.is_cargo_test()
                 && t.whole_suite_flags()
+                && !t.selects_cargo_tests()
         })
         .filter_map(|t| roots_by_addr.get(&t.runs_in).cloned())
         .collect();
@@ -307,8 +309,9 @@ fn orphans(
         if reached.contains(&(test.project.clone(), test.target.clone())) {
             continue;
         }
-        if test.program == "cargo test"
+        if test.is_cargo_test()
             && !test.selective
+            && !test.selects_cargo_tests()
             && roots_by_addr
                 .get(&test.runs_in)
                 .is_some_and(|root| workspaces.iter().any(|w| root.starts_with(w)))

@@ -535,9 +535,8 @@ fn a_workspace_wide_cargo_test_covers_the_member_crates() {
     let manifest = |name: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
     };
-    let orphans =
-        |ci: &str| {
-            let ws = Workspace::new(&[
+    let orphans = |ci: &str| {
+        let ws = Workspace::new(&[
             (
                 "aster.toml",
                 "[affected.lanes.rs]\ninclude = [\"//rs\"]\n\n[check]\nentries = [\"test-ci\"]\n",
@@ -553,13 +552,32 @@ fn a_workspace_wide_cargo_test_covers_the_member_crates() {
             ),
             ("rs/crates/a/Cargo.toml", &manifest("a")),
             ("rs/crates/a/src/lib.rs", "pub fn f() {}\n"),
+            (
+                "rs/crates/a/aster.toml",
+                "[targets.test-nextest]\ncommand = \"cargo nextest run --locked --all-targets --no-fail-fast\"\n\n[targets.test-p]\ncommand = \"cargo nextest run -p other\"\n",
+            ),
         ]);
-            let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
-            places(&report, "orphan-test-target")
-        };
-    assert_eq!(orphans("cargo test --workspace"), Vec::<String>::new());
-    assert_eq!(orphans("cargo test --all --locked"), Vec::<String>::new());
-    assert_eq!(orphans("cargo test"), ["//rs/crates/a:test"]);
+        let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+        places(&report, "orphan-test-target")
+    };
+    // Either runner with `--workspace` covers a member's `cargo test` and
+    // `cargo nextest run`; a member that picks a package stays reported.
+    let picked = ["//rs/crates/a:test-p"];
+    assert_eq!(orphans("cargo test --workspace"), picked);
+    assert_eq!(orphans("cargo test --all --locked"), picked);
+    assert_eq!(
+        orphans("cargo nextest run --locked --workspace --all-targets"),
+        picked
+    );
+    let plain = orphans("cargo test");
+    assert!(
+        plain.contains(&"//rs/crates/a:test".to_string()),
+        "{plain:?}"
+    );
+    assert!(
+        plain.contains(&"//rs/crates/a:test-nextest".to_string()),
+        "{plain:?}"
+    );
 }
 
 #[test]
