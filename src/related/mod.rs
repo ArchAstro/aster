@@ -32,6 +32,7 @@
 //! are all in the dependency's language and build on its code is followed
 //! by source, whatever marker file its project carries.
 
+mod cache;
 mod consumers;
 mod elixir;
 mod engine;

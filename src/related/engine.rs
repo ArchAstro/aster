@@ -1,6 +1,7 @@
 //! The workspace source graph and the walk from a change to the tests that
 //! can observe it.
 
+use super::cache::FactsCache;
 use super::consumers::{self, Consume};
 use super::facts::{DefKind, Family, FileFacts, LineClass};
 use super::resolve::{Resolvers, Workspace};
@@ -107,6 +108,8 @@ pub struct Related {
     /// Outcome by project address (`//path`).
     pub projects: HashMap<String, Outcome>,
     pub files_analysed: usize,
+    /// How many of them came from the persistent facts cache.
+    pub facts_reused: usize,
     /// Where the analysis spent its time, for `--verbose`.
     pub timings: String,
     /// Every definition the change reaches, ordered by file and line.
@@ -278,14 +281,18 @@ struct Run<'a, 'b> {
 }
 
 /// Analyse `changes` against the workspace at `root`.
+///
+/// `cache_dir` is where parsed facts persist between runs (`None` parses
+/// every file); see the `cache` module.
 pub fn analyse(
     root: &Path,
     projects: &[DiscoveredProject],
     graph: &ProjectGraph,
     changes: &[Change],
+    cache_dir: Option<&Path>,
 ) -> Related {
     let started = std::time::Instant::now();
-    let (paths, mut facts) = scan(root);
+    let (paths, mut facts, reused) = scan(root, cache_dir.map(FactsCache::open));
     let scanned = started.elapsed();
     for change in changes {
         let Some(family) = Family::of(&change.path) else {
@@ -334,6 +341,7 @@ pub fn analyse(
     let indexed = started.elapsed();
     let mut related = index.select(changes);
     related.files_analysed = files_analysed;
+    related.facts_reused = reused;
     related.timings = format!(
         "parse {:.1?}, link {:.1?}, select {:.1?}",
         scanned,
@@ -353,8 +361,12 @@ fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
     }
 }
 
-/// Every file of the workspace, and the facts of every source file.
-fn scan(root: &Path) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>) {
+/// Every file of the workspace, the facts of every source file and how many
+/// of those the cache held.
+fn scan(
+    root: &Path,
+    cache: Option<FactsCache>,
+) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>, usize) {
     let mut paths = HashSet::new();
     let mut sources = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
@@ -385,6 +397,9 @@ fn scan(root: &Path) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>) {
         .min(sources.len().max(1));
     let chunk = sources.len().div_ceil(threads).max(1);
     let mut facts = HashMap::with_capacity(sources.len());
+    let mut used = HashSet::new();
+    let mut reused = 0;
+    let cache_ref = cache.as_ref();
     std::thread::scope(|scope| {
         let handles: Vec<_> = sources
             .chunks(chunk)
@@ -401,15 +416,31 @@ fn scan(root: &Path) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>) {
                             } else {
                                 std::fs::read_to_string(&absolute).ok()
                             };
+                            let mut key = None;
+                            let mut hit = false;
                             let facts = match source {
-                                Some(source) => extract(*family, path, &source),
+                                Some(source) => {
+                                    key = cache_ref.map(|_| FactsCache::key(path, &source));
+                                    let cached = cache_ref
+                                        .zip(key.as_deref())
+                                        .and_then(|(cache, key)| cache.get(key))
+                                        .filter(|cached| cached.family == *family);
+                                    hit = cached.is_some();
+                                    cached.unwrap_or_else(|| {
+                                        let facts = extract(*family, path, &source);
+                                        if let Some((cache, key)) = cache_ref.zip(key.as_deref()) {
+                                            cache.put(key, &facts);
+                                        }
+                                        facts
+                                    })
+                                }
                                 None => {
                                     let mut facts = FileFacts::new(*family);
                                     facts.parse_error = true;
                                     facts
                                 }
                             };
-                            (path.clone(), facts)
+                            (path.clone(), facts, key, hit)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -417,11 +448,18 @@ fn scan(root: &Path) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>) {
             .collect();
         for handle in handles {
             if let Ok(chunk) = handle.join() {
-                facts.extend(chunk);
+                for (path, file_facts, key, hit) in chunk {
+                    facts.insert(path, file_facts);
+                    used.extend(key);
+                    reused += usize::from(hit);
+                }
             }
         }
     });
-    (paths, facts)
+    if let Some(cache) = &cache {
+        cache.prune(&used);
+    }
+    (paths, facts, reused)
 }
 
 fn address(project: &DiscoveredProject) -> String {
@@ -1685,6 +1723,7 @@ impl<'a> Index<'a> {
                 .collect(),
             graph: self.graph(&run),
             files_analysed: 0,
+            facts_reused: 0,
             timings: String::new(),
         }
     }

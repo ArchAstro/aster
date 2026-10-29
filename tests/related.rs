@@ -58,11 +58,16 @@ impl Workspace {
     }
 
     fn aster(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_aster"))
-            .args(args)
-            .current_dir(self.root())
-            .output()
-            .unwrap()
+        self.aster_with(args, &[])
+    }
+
+    fn aster_with(&self, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command.args(args).current_dir(self.root());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.output().unwrap()
     }
 
     /// The dry-run plan of `aster affected <target> --related`.
@@ -2148,4 +2153,287 @@ fn a_wrapper_in_a_project_with_its_own_code_does_not_follow_other_projects() {
     // The code-free wrapper follows the shop; the project with code does not.
     assert!(plan.runs().contains(&"//shop-smoke:test-ci"), "{plan:#?}");
     assert!(!plan.runs().contains(&"//tools:test-ci"), "{plan:#?}");
+}
+
+/// `files` with `extra` written after them, so an extra file replaces one of
+/// the same name.
+fn with(
+    files: &[(&'static str, &'static str)],
+    extra: &[(&'static str, &'static str)],
+) -> Vec<(&'static str, &'static str)> {
+    files.iter().chain(extra).copied().collect()
+}
+
+#[test]
+fn package_script_files_follow_each_package_managers_argument_rules() {
+    // Three packages whose `test` target names a different package manager.
+    // npm reads arguments only after `--`; pnpm, yarn and bun would hand a
+    // `--` to Vitest, which then ignores the file filters and runs the full
+    // suite.
+    let ws = Workspace::new(&with(
+        TYPESCRIPT,
+        &[
+            (
+                "money/aster.toml",
+                "[targets.test]\ncommand = \"pnpm test\"\n",
+            ),
+            (
+                "cart/aster.toml",
+                "[targets.test]\ncommand = \"yarn run test\"\n",
+            ),
+            (
+                "labels/aster.toml",
+                "[targets.test]\ncommand = \"bun run test\"\n",
+            ),
+        ],
+    ));
+    ws.edit("money/src/math.ts", "return a + b;", "return b + a;");
+    ws.edit("money/src/format.ts", "`$${n}`", "`$ ${n}`");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//money:test"),
+        ["pnpm test src/format.test.ts src/math.test.ts"]
+    );
+    assert_eq!(
+        plan.commands("//cart:test"),
+        ["yarn run test src/total.test.ts"]
+    );
+    assert_eq!(
+        plan.commands("//labels:test"),
+        ["bun run test src/label.test.ts"]
+    );
+
+    // npm keeps the separator.
+    let ws = Workspace::new(&with(
+        TYPESCRIPT,
+        &[(
+            "money/aster.toml",
+            "[targets.test]\ncommand = \"npm run test\"\n",
+        )],
+    ));
+    ws.edit("money/src/math.ts", "return a + b;", "return b + a;");
+    ws.edit("money/src/format.ts", "`$${n}`", "`$ ${n}`");
+    assert_eq!(
+        ws.plan("test").commands("//money:test"),
+        ["npm run test -- src/format.test.ts src/math.test.ts"]
+    );
+}
+
+#[test]
+fn cargo_nextest_is_narrowed_to_the_tests_a_change_reaches() {
+    let ws = Workspace::new(&with(
+        RUST,
+        &[(
+            "shop/aster.toml",
+            "[targets.test]\ncommand = \"cargo nextest run --locked\"\n",
+        )],
+    ));
+    ws.edit(
+        "shop/src/pricing.rs",
+        "items.iter().sum()",
+        "items.iter().sum::<u32>() + 0",
+    );
+    // The same selection as `cargo test`, without the doctest run nextest
+    // does not do. nextest fails a filter that matches nothing, so the
+    // narrowed runs pass on no tests.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        [
+            "cargo nextest run --locked --no-tests pass --lib -- --exact cart::tests::totals pricing::tests::sums",
+            "cargo nextest run --locked --no-tests pass --test api -- --exact total_of_a_cart",
+        ]
+    );
+
+    // A filterset already chooses tests; the command runs as written.
+    ws.write(
+        "shop/aster.toml",
+        "[targets.test]\ncommand = \"cargo nextest run -E 'test(sum)'\"\n",
+    );
+    assert!(ws.plan("test").commands("//shop:test").is_empty());
+}
+
+#[test]
+fn configured_wrapper_programs_stay_in_front_of_the_narrowed_command() {
+    let files = with(
+        &with(RUST, TYPESCRIPT),
+        &[
+            (
+                "aster.toml",
+                "[affected.related]\nwrappers = [\n  \"scripts/with-toolchain\",\n  { program = \"mise\", until = \"--\" },\n]\n",
+            ),
+            (
+                "shop/aster.toml",
+                "[targets.test]\ncommand = \"RUST_LOG=off scripts/with-toolchain cargo test --locked\"\n",
+            ),
+            (
+                "money/aster.toml",
+                "[targets.test]\ncommand = \"mise exec node@24 -- vitest run\"\n",
+            ),
+            (
+                "cart/aster.toml",
+                "[targets.test]\ncommand = \"mise exec node@24 -- vitest run\"\n",
+            ),
+        ],
+    );
+    let ws = Workspace::new(&files);
+    ws.edit("shop/src/pricing.rs", "amount / 5", "amount / 4");
+    ws.edit("money/src/math.ts", "return a + b;", "return b + a;");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        [
+            "RUST_LOG=off scripts/with-toolchain cargo test --locked --lib -- --exact pricing::tests::taxes",
+            "RUST_LOG=off scripts/with-toolchain cargo test --locked --doc",
+        ]
+    );
+    assert_eq!(
+        plan.commands("//money:test"),
+        ["mise exec node@24 -- vitest run src/math.test.ts"]
+    );
+    assert_eq!(
+        plan.commands("//cart:test"),
+        ["mise exec node@24 -- vitest run src/total.test.ts"]
+    );
+
+    // Without the entry the program is not known to run a test command, so
+    // the target runs as written.
+    ws.write("aster.toml", "");
+    let plan = ws.plan("test");
+    assert!(plan.commands("//shop:test").is_empty());
+    assert!(plan.commands("//money:test").is_empty());
+}
+
+#[test]
+fn an_invalid_wrapper_entry_is_rejected() {
+    let ws = Workspace::new(&[(
+        "aster.toml",
+        "[affected.related]\nwrappers = [\"mise exec\"]\n",
+    )]);
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must be one word"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The `(files analysed, files reused)` of a `--verbose --related` run, and
+/// its JSON plan.
+fn analysis_run(ws: &Workspace, cache: &Path, extra: &[&str]) -> (usize, usize, String) {
+    let mut args = vec![
+        "--verbose",
+        "affected",
+        "test",
+        "--base=HEAD",
+        "--related",
+        "--dry-run",
+    ];
+    args.extend(extra);
+    let output = ws.aster_with(&args, &[("ASTER_CACHE_DIR", cache)]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("source files"))
+        .unwrap_or_else(|| panic!("no analysis line: {stderr}"));
+    let numbers: Vec<usize> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    // Lines of targets with no order between them may swap.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut sorted: Vec<&str> = stdout.lines().collect();
+    sorted.sort();
+    (numbers[0], numbers[1], sorted.join("\n"))
+}
+
+fn cached_entries(cache: &Path) -> usize {
+    fn count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| {
+                if entry.path().is_dir() {
+                    count(&entry.path())
+                } else {
+                    usize::from(entry.path().extension().is_some_and(|e| e == "json"))
+                }
+            })
+            .sum()
+    }
+    count(&cache.join("related-facts"))
+}
+
+#[test]
+fn a_warm_run_reuses_parsed_facts_and_a_changed_file_is_parsed_again() {
+    let ws = Workspace::new(TYPESCRIPT);
+    let cache = TempDir::new().unwrap();
+    ws.edit("money/src/math.ts", "return a + b;", "return b + a;");
+
+    // Cold: everything is parsed and stored.
+    let (analysed, reused, cold) = analysis_run(&ws, cache.path(), &[]);
+    assert_eq!(reused, 0);
+    assert!(analysed >= 10);
+    assert_eq!(cached_entries(cache.path()), analysed);
+
+    // Warm: nothing is parsed, and the selection is the same.
+    let (_, reused, warm) = analysis_run(&ws, cache.path(), &[]);
+    assert_eq!(reused, analysed);
+    assert_eq!(warm, cold);
+
+    // A content change invalidates that file alone, and its old entry goes.
+    ws.edit("cart/src/cart.ts", "items.length", "items.length + 0");
+    let (_, reused, _) = analysis_run(&ws, cache.path(), &[]);
+    assert_eq!(reused, analysed - 1);
+    assert_eq!(cached_entries(cache.path()), analysed);
+
+    // A removed file's entry is pruned.
+    fs::remove_file(ws.root().join("labels/src/label.test.ts")).unwrap();
+    let (_, reused, _) = analysis_run(&ws, cache.path(), &[]);
+    // The deleted file is still read, from its old text, to see what used it.
+    assert_eq!(reused, analysed - 1);
+    assert_eq!(cached_entries(cache.path()), analysed - 1);
+
+    // The facts of a build that is gone are removed too.
+    let stale = cache.path().join("related-facts/0000000000000000/ab");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("ab0.json"), "{}").unwrap();
+    analysis_run(&ws, cache.path(), &[]);
+    assert!(!cache.path().join("related-facts/0000000000000000").exists());
+
+    // A damaged entry is parsed again rather than trusted.
+    let entry = fs::read_dir(cache.path().join("related-facts"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let damaged = fs::read_dir(&entry)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let file = fs::read_dir(&damaged)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    fs::write(&file, "not json").unwrap();
+    let (_, reused, _) = analysis_run(&ws, cache.path(), &[]);
+    assert_eq!(reused, analysed - 2);
+
+    // --no-cache neither reads nor writes it.
+    let other = TempDir::new().unwrap();
+    let (_, reused, _) = analysis_run(&ws, other.path(), &["--no-cache"]);
+    assert_eq!(reused, 0);
+    assert_eq!(cached_entries(other.path()), 0);
 }

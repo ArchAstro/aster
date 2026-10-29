@@ -271,7 +271,7 @@ pub(crate) fn related(
     if commands.is_empty() {
         return Some(FilesListPlan::Nothing);
     }
-    if !cargo.all_targets {
+    if cargo.runs_doctests() {
         let mut selection = match &cargo.scope {
             Scope::Default => Vec::new(),
             Scope::Workspace(excluded) => {
@@ -1671,7 +1671,11 @@ struct CargoTest {
     program: String,
     /// Arguments between the program and `test` (e.g. `+nightly`).
     pre: Vec<String>,
-    sub: String,
+    /// The subcommand: `test`, or `nextest run`.
+    sub: Vec<String>,
+    /// `cargo nextest run`, which accepts the same selection flags and
+    /// `-- <filters>` as `cargo test` but runs no doctests.
+    nextest: bool,
     /// Flags kept on every narrowed invocation (`--locked`, features, …).
     common: Vec<String>,
     scope: Scope,
@@ -1707,6 +1711,35 @@ const CARGO_VALUE_FLAGS: &[&str] = &[
     "-Z",
     "--lockfile-path",
 ];
+/// `cargo nextest run` options, beyond [`CARGO_VALUE_FLAGS`], whose value
+/// is a separate argument. A flag missing here makes its value look like a
+/// name filter, and the command then runs as written.
+const NEXTEST_VALUE_FLAGS: &[&str] = &[
+    "--build-jobs",
+    "--cargo-profile",
+    "--cargo-message-format",
+    "--config-file",
+    "--user-config-file",
+    "--tool-config-file",
+    "--platform-filter",
+    "--partition",
+    "--test-threads",
+    "--retries",
+    "--flaky-result",
+    "--max-fail",
+    "--no-tests",
+    "--run-ignored",
+    "--status-level",
+    "--final-status-level",
+    "--failure-output",
+    "--success-output",
+    "--show-progress",
+    "--debugger",
+    "--tracer",
+    "--hook",
+    "--stress-count",
+    "--stress-duration",
+];
 const LIBTEST_VALUE_FLAGS: &[&str] = &[
     "--test-threads",
     "--skip",
@@ -1719,6 +1752,12 @@ const LIBTEST_VALUE_FLAGS: &[&str] = &[
 ];
 
 impl CargoTest {
+    /// Whether the original command runs doctests: `--all-targets` excludes
+    /// them, and nextest never runs them.
+    fn runs_doctests(&self) -> bool {
+        !self.all_targets && !self.nextest
+    }
+
     fn parse(command: &str) -> Result<Self, String> {
         let parts =
             shell_words::split(command).map_err(|e| format!("cannot parse command: {e}"))?;
@@ -1747,7 +1786,11 @@ impl CargoTest {
         let sub = loop {
             let part = iter.next().ok_or("not a cargo test command")?;
             if part == "test" || part == "t" {
-                break part;
+                break vec![part];
+            }
+            if part == "nextest" && iter.peek().is_some_and(|next| next == "run" || next == "r") {
+                let run = iter.next().unwrap_or_default();
+                break vec![part, run];
             }
             if part == "-C" || part.starts_with("--manifest-path") || !part.starts_with(['-', '+'])
             {
@@ -1756,6 +1799,7 @@ impl CargoTest {
             pre.push(part);
         };
 
+        let nextest = sub[0] == "nextest";
         let mut common = Vec::new();
         let mut workspace = false;
         let mut excludes = Vec::new();
@@ -1786,6 +1830,19 @@ impl CargoTest {
                 _ if flag.starts_with("-p") => packages.push(value(&mut iter)?),
                 "--all-targets" => all_targets = true,
                 "--no-run" => return Err("the command only compiles tests (--no-run)".into()),
+                "-E"
+                | "--filterset"
+                | "--archive-file"
+                | "--cargo-metadata"
+                | "--binaries-metadata"
+                | "-R"
+                | "--rerun"
+                    if nextest =>
+                {
+                    return Err(format!(
+                        "the nextest command already selects tests ({flag})"
+                    ));
+                }
                 "--manifest-path" => {
                     return Err("the command sets --manifest-path".into());
                 }
@@ -1793,9 +1850,10 @@ impl CargoTest {
                     return Err(format!("the command already selects test targets ({f})"));
                 }
                 _ => {
-                    let takes_value = common
-                        .last()
-                        .is_some_and(|p: &String| CARGO_VALUE_FLAGS.contains(&p.as_str()));
+                    let takes_value = common.last().is_some_and(|p: &String| {
+                        CARGO_VALUE_FLAGS.contains(&p.as_str())
+                            || (nextest && NEXTEST_VALUE_FLAGS.contains(&p.as_str()))
+                    });
                     if !part.starts_with('-') && !takes_value {
                         return Err("the command already filters tests by name".into());
                     }
@@ -1828,11 +1886,20 @@ impl CargoTest {
         } else {
             Scope::Default
         };
+        // nextest fails a run whose filters match no test; libtest passes it.
+        if nextest
+            && !common
+                .iter()
+                .any(|p| p == "--no-tests" || p.starts_with("--no-tests="))
+        {
+            common.extend(["--no-tests".to_string(), "pass".to_string()]);
+        }
         Ok(CargoTest {
             env,
             program,
             pre,
             sub,
+            nextest,
             common,
             scope,
             all_targets,
@@ -1846,7 +1913,7 @@ impl CargoTest {
         parts.extend(self.env.iter().map(String::as_str));
         parts.push(&self.program);
         parts.extend(self.pre.iter().map(String::as_str));
-        parts.push(&self.sub);
+        parts.extend(self.sub.iter().map(String::as_str));
         parts.extend(self.common.iter().map(String::as_str));
         parts.extend(selection.iter().map(String::as_str));
         if !self.trailing.is_empty() || !filters.is_empty() {
@@ -2026,6 +2093,9 @@ impl Selector<'_> {
                     self.explanation
                         .push("library unit tests and doctests: none related".to_string());
                 }
+            } else if self.cargo.nextest {
+                self.explanation
+                    .push("doctests: not run (nextest does not run them)".to_string());
             } else if self.cargo.all_targets {
                 self.explanation.push(
                     "doctests: not run (the original command uses --all-targets, which excludes them)"
@@ -2572,6 +2642,56 @@ mod tests {
             "cargo test --locked -p demo-crate --test uses_a"
         );
         assert_eq!(commands.len(), 3);
+    }
+
+    #[test]
+    fn nextest_is_narrowed_like_cargo_test_without_doctests() {
+        let tmp = fixture();
+        let commands = commands(&run(
+            &tmp,
+            "cargo nextest run --locked --profile ci",
+            &["src/c.rs"],
+        ));
+        // Same selection as `cargo test`, no `--doc` command, and
+        // `--no-tests pass` because nextest fails a filter that matches nothing.
+        assert_eq!(
+            commands,
+            [
+                "cargo nextest run --locked --profile ci --no-tests pass -p demo-crate --lib -- a:: b:: c::",
+                "cargo nextest run --locked --profile ci --no-tests pass -p demo-crate --test uses_a",
+            ]
+        );
+        // A command that sets `--no-tests` keeps its choice.
+        let commands = self::commands(&run(
+            &tmp,
+            "cargo nextest r --no-tests warn --partition hash:1/2",
+            &["src/a.rs"],
+        ));
+        assert_eq!(
+            commands[0],
+            "cargo nextest r --no-tests warn --partition hash:1/2 -p demo-crate --lib -- a::"
+        );
+    }
+
+    #[test]
+    fn nextest_commands_that_already_select_tests_run_as_written() {
+        let tmp = fixture();
+        for command in [
+            "cargo nextest run -E 'test(foo)'",
+            "cargo nextest run --filterset 'test(foo)'",
+            "cargo nextest run --archive-file x.tar.zst",
+            "cargo nextest run my_test",
+            "cargo nextest run --lib",
+            "cargo nextest list",
+            "cargo nextest run --no-run",
+        ] {
+            let selection = run(&tmp, command, &["src/c.rs"]);
+            assert!(
+                matches!(selection.plan, FilesListPlan::Full),
+                "{command}: {:?}",
+                selection.plan
+            );
+        }
     }
 
     #[test]

@@ -472,8 +472,8 @@ its `test` prerequisite. A `{files}` placeholder expands to the changed files
   `--json` adds them as `commands` and `selection`.
 
 Rust test targets (the detected `test` target, or any target whose command is
-`cargo test …` and declares `files_list`) run only the tests related to the
-change, the way `vitest related` follows importers:
+`cargo test …` or `cargo nextest run …` and declares `files_list`) run only
+the tests related to the change, the way `vitest related` follows importers:
 
 - Aster walks each crate target from its root through `mod` declarations and
   builds a module graph from `crate::`, `super::`, `self::`, `use` aliases,
@@ -489,6 +489,13 @@ change, the way `vitest related` follows importers:
   assert_cmd's `cargo_bin`, escargot) run when any binary is related.
   Doctests all run when any module is related, unless the command uses
   `--all-targets`, which excludes them.
+- `cargo nextest run` is narrowed the same way and renders the same
+  `-p`, `--lib`, `--test` selections and `-- <filters>` (nextest accepts
+  libtest's `--exact` and substring filters after `--`). nextest does not run
+  doctests, so none are added. Narrowed commands get `--no-tests pass`, since
+  nextest otherwise fails a filter that matches nothing; a command that sets
+  `--no-tests` keeps its value. A command with `-E`/`--filterset`,
+  `--archive-file`, `--rerun` or name filters already given runs as written.
 - A non-Rust file maps to the sources whose string literals name it as a
   path (`include_str!("../fixtures/x.json")`, `"port/index.toml"`,
   `dir.join("fixtures")`). A file no source names runs the original command.
@@ -535,7 +542,10 @@ the tests that reach them, across project boundaries.
   requested target and in the same-project targets it depends on, whether
   run directly (`pnpm exec vitest run`) or through a package script that is
   only the runner. Elixir, JavaScript and Python run the selected test
-  files; Go runs the selected packages with `-run '^(TestA|TestB)$'`. Go
+  files (a package script gets them as `npm test -- <files>`, and as
+  `pnpm test <files>`, `yarn test <files>`, `bun run test <files>`: pnpm,
+  yarn and bun would pass a `--` on to the runner, and Vitest then ignores the
+  file filters and runs everything); Go runs the selected packages with `-run '^(TestA|TestB)$'`. Go
   keeps only the test files `go list` builds under the command's build
   context (`-tags`, `-race`, `GOOS`, `GOFLAGS` and the like), so a package
   `go test ./...` would skip, such as one whose files all need a build tag
@@ -544,6 +554,28 @@ the tests that reach them, across project boundaries.
   command runs as written. A
   command that already lists test files keeps the ones selected. A
   `{files}` placeholder receives the selected test files.
+- **Wrapper programs in front of the runner.** A command such as
+  `scripts/with-rust-toolchain cargo test` or
+  `mise exec node@24 -- vitest run` starts with a program that is not a test
+  runner, so Aster cannot tell what it runs. List such wrappers in the root
+  `aster.toml`; the rest of the command is then narrowed and the wrapper
+  written back in front of it unchanged:
+
+  ```toml
+  [affected.related]
+  wrappers = [
+    "scripts/with-rust-toolchain",             # everything after it is the command
+    { program = "mise", until = "--" },        # the command starts after the first `--`
+  ]
+  ```
+
+  A bare string names a program whose remaining arguments are the wrapped
+  command (as with `env`). The table form adds `until`, a word that ends the
+  wrapper's own arguments. A program matches by the exact word written in the
+  command, or by file name when the entry has no `/`. Leading `NAME=value`
+  assignments stay in front. Without an entry the command runs as written;
+  Aster does not guess which programs are wrappers. Wrappers apply to
+  `--related`, not to `--only-affected-files`.
 - **Shard and wrapper projects follow the project whose tests they run.**
   A shell one-liner that ends in a test command is narrowed in place, in
   the directory it changes into:
@@ -577,6 +609,14 @@ the tests that reach them, across project boundaries.
 - **Comments, documentation and blank lines select nothing.**
 - `--dry-run` prints, under each target, the narrowed command and the
   reference chain from each selected test file back to the changed line.
+- **Parsed files are cached.** The facts Aster extracts from each source file
+  are stored under `<cache dir>/related-facts/` (`.aster/cache` by default;
+  `ASTER_CACHE_DIR` and `--cache-dir` apply), keyed by the file's path and
+  content hash and by the Aster build, so a warm run parses only files that
+  changed since the last one. Entries are written atomically, safe for
+  concurrent Aster processes, and entries for files that no longer exist are
+  deleted at the end of a run. `--no-cache` skips the cache. `--verbose`
+  reports how many files were reused.
 
 How a change is followed:
 

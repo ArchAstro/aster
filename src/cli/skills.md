@@ -139,7 +139,7 @@ skipped. Under `--dependents`, a project selected only as a dependent, or whose
 dependency also changed, runs in full; without it each project runs on its
 own changed files. `--dry-run` shows each chosen command and why.
 
-Rust `cargo test` targets run only related tests: unit tests filtered to the
+Rust `cargo test` and `cargo nextest run` targets run only related tests: unit tests filtered to the
 modules that transitively import a changed module, integration tests that
 changed or import one, and workspace members that depend on a changed crate.
 Manifest, lockfile, toolchain, build-script and library-root changes, and any
@@ -157,7 +157,15 @@ Aster parses Elixir, TypeScript/JavaScript, Go and Python sources, maps the
 diff's hunks to the functions, types and tests they touch, and follows
 references to the affected tests. `mix test`, Vitest/Jest/Mocha, `bun test`,
 `go test` and `pytest` commands run narrowed to those tests (Go by test
-name); a `{files}` placeholder receives the selected test files. Dependents
+name); a `{files}` placeholder receives the selected test files. Package
+scripts get the files as `npm test -- <files>` but `pnpm test <files>`
+(pnpm, yarn and bun would pass a `--` on to the runner). A command behind a
+wrapper program (`scripts/with-rust-toolchain cargo test`,
+`mise exec node@24 -- vitest run`) is narrowed only when the root
+`aster.toml` lists the wrapper: `[affected.related]`, `wrappers = [
+"scripts/with-rust-toolchain", { program = "mise", until = "--" } ]`.
+Parsed source facts are cached under `<cache dir>/related-facts/` so warm
+runs parse only changed files (`--no-cache` skips it). Dependents
 run only when they refer to something that changed, so do not combine it
 with `--dependents`. Comment-only changes select nothing. Manifests,
 lockfiles, tool configuration, files no source names, changes that reach no
