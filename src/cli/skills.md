@@ -159,7 +159,13 @@ references to the affected tests. `mix test`, Vitest/Jest/Mocha, `bun test`,
 `go test` and `pytest` commands run narrowed to those tests (Go by test
 name); a `{files}` placeholder receives the selected test files. Package
 scripts get the files as `npm test -- <files>` but `pnpm test <files>`
-(pnpm, yarn and bun would pass a `--` on to the runner). A command behind a
+(pnpm, yarn and bun would pass a `--` on to the runner). An `npm`/`pnpm`
+script that chains commands with `&&` (`pnpm test-ci` = `pnpm test:unit &&
+tsc --noEmit`) is expanded through the scripts it calls: each runner
+(including `node --test` and `tsx --test` with files or globs) runs only the
+selected files, a runner that selects none is dropped, other commands are kept
+(started with `pnpm exec`/`npm exec -c`), and a target left with no runner is
+skipped, so keep non-test checks in `lint`/`build`. A command behind a
 wrapper program (`scripts/with-rust-toolchain cargo test`,
 `mise exec node@24 -- vitest run`) is narrowed only when the root
 `aster.toml` lists the wrapper: `[affected.related]`, `wrappers = [
@@ -199,7 +205,9 @@ workspace-relative paths or globs the definition reads, seeded like a literal).
 Adding, changing or removing one selects the tests that reach its definition.
 `aster check` lints the configuration and annotations (rules
 `unnarrowable-test-command`, `suspicious-path-literal`, `bad-consumes`,
-`orphan-test-target`, `stale-annotation`, `stale-allow-orphan`; `--strict`, `--rule <id>`,
+`orphan-test-target`, `stale-annotation`, `stale-allow-orphan`;
+`unnarrowable-test-command` also flags an `--entry` target that runs a script
+file or a package script Aster cannot read; `--strict`, `--rule <id>`,
 `--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
 errors or any finding with `--strict`, 2 for a configuration error). Root
 `aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `disable = [..]` configure it.

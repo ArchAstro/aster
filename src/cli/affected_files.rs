@@ -895,6 +895,71 @@ impl TestTarget {
     }
 }
 
+/// Why a command with no test runner in its words is still reported, when
+/// it is: a package script that runs a runner Aster cannot narrow, or, for an
+/// entry target, any command that is not inert.
+fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> {
+    use crate::plugins::related_tests::{package_script_body, package_script_runners};
+    let Some(runner) = runner else {
+        return entry.then(|| {
+            "its shell script changes into a directory that is not a project".to_string()
+        });
+    };
+    let root = &runner.project.root;
+    if let Some((name, body)) = package_script_body(root, &runner.command) {
+        if let Some(found) = package_script_runners(root, &runner.command).first() {
+            return Some(format!(
+                "package script `{name}` contains `{found}`, which Aster cannot narrow (it \
+                 narrows `npm` and `pnpm` scripts whose `&&` chain it can read; a `cd`, a pipe, \
+                 an interpreter script, a `pre`/`post` hook or another launcher stops it)"
+            ));
+        }
+        return entry.then(|| {
+            format!(
+                "package script `{name}` (`{body}`) contains no test runner Aster can narrow; \
+                 put the runner command in the target"
+            )
+        });
+    }
+    if !entry {
+        return None;
+    }
+    let words = shell_words::split(&runner.command).unwrap_or_default();
+    let words: Vec<&String> = words
+        .iter()
+        .filter(|w| !is_environment_assignment(w))
+        .collect();
+    if let Some(file) = script_file(&words) {
+        return Some(format!(
+            "it runs the script file `{file}`, which Aster does not read; put the runner command \
+             in the target"
+        ));
+    }
+    Some(format!(
+        "`{}` is not a test runner Aster can narrow",
+        runner.command
+    ))
+}
+
+/// The script file a command runs: `./test-ci.sh`, `bash tools/run.sh`,
+/// `node scripts/test.mjs`.
+fn script_file(words: &[&String]) -> Option<String> {
+    let first = words.first()?.as_str();
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let interpreters = [
+        "sh", "bash", "zsh", "dash", "node", "python", "python3", "ruby", "perl", "tsx", "deno",
+    ];
+    if interpreters.contains(&name) {
+        return words
+            .iter()
+            .skip(1)
+            .take_while(|w| w.as_str() != "-c")
+            .find(|w| !w.starts_with('-'))
+            .map(|w| w.to_string());
+    }
+    (first.contains('/') || name.contains('.')).then(|| first.to_string())
+}
+
 /// How a test command selects what it runs.
 struct RunnerShape {
     program: String,
@@ -1083,10 +1148,17 @@ pub fn suite_runs(
 /// `--related` reads it) is one. So is a command that contains such a runner
 /// among other commands, an interpreter's script or a pipeline: `--related`
 /// cannot narrow it, and the reason is the one narrowing computes.
+///
+/// A target named in `entries` (a CI entry such as `test-ci`) is a test target
+/// whatever its command is, unless the command is inert: an entry exists to
+/// run tests, so a command Aster cannot read as a runner (a script file, a
+/// package script with no runner it can narrow) is one it cannot narrow, and
+/// `--related` runs it as written.
 pub fn test_targets(
     projects: &[DiscoveredProject],
     wrappers: &[RelatedWrapperConfig],
     registry: &PluginRegistry,
+    entries: &[String],
 ) -> Vec<TestTarget> {
     use crate::plugins::related_tests::{refusal, simple_commands, trailing_commands};
     let lookup = Lookup::new(projects, wrappers);
@@ -1138,6 +1210,8 @@ pub fn test_targets(
             });
             let placeholder = def.command.contains("{files}")
                 && def.capabilities.contains(&TargetCapability::FilesList);
+            // The runner is not in the command's words, only behind a script.
+            let mut hidden = false;
             let unnarrowable = if narrowable || placeholder {
                 None
             } else {
@@ -1164,29 +1238,43 @@ pub fn test_targets(
                             })
                     })
                 };
-                let Some((recogniser, wrapper)) = whole.or_else(behind) else {
-                    continue;
-                };
-                Some(match (&runner, refusal(&written), wrapper) {
-                    (None, _, _) => {
-                        "its shell script changes into a directory that is not a project"
-                            .to_string()
+                match whole.or_else(behind) {
+                    None => {
+                        // No runner in the written words: a script file, or a
+                        // package script whose runners Aster cannot narrow.
+                        // Only a target known to run tests is reported.
+                        let entry = entries.contains(name) && !is_inert(&def.command);
+                        match hidden_runner_reason(runner.as_ref(), entry) {
+                            Some(reason) => {
+                                hidden = true;
+                                Some(reason)
+                            }
+                            None => continue,
+                        }
                     }
-                    (_, Some(reason), _) => reason.to_string(),
-                    (_, None, Some(prefix)) => format!(
+                    Some((recogniser, wrapper)) => {
+                        Some(match (&runner, refusal(&written), wrapper) {
+                            (None, _, _) => {
+                                "its shell script changes into a directory that is not a project"
+                                    .to_string()
+                            }
+                            (_, Some(reason), _) => reason.to_string(),
+                            (_, None, Some(prefix)) => format!(
                         "it starts with `{prefix}`, which is not a configured wrapper; if that \
                          program runs the command after it, list it in \
                          `[affected.related] wrappers`"
                     ),
-                    _ if recogniser != project.plugin_name => format!(
+                            _ if recogniser != project.plugin_name => format!(
                         "it runs a {recogniser} test command in a {} project, and a command is \
                          narrowed only by the plugin of the project that runs it",
                         project.plugin_name
                     ),
-                    _ => "its form is not one the test runner's narrowing supports \
+                            _ => "its form is not one the test runner's narrowing supports \
                           (an unsupported flag or argument)"
-                        .to_string(),
-                })
+                                .to_string(),
+                        })
+                    }
+                }
             };
             if placeholder && !narrowable {
                 // A `{files}` placeholder is filled from the selection; it
@@ -1205,8 +1293,9 @@ pub fn test_targets(
                 None => (address(project), written.as_str()),
             };
             let shape = describe_runner(runner_command);
+            // A script Aster cannot read runs no suite it can name.
             let whole_suites = Some(&shape)
-                .filter(|s| s.whole && !s.selective)
+                .filter(|s| s.whole && !s.selective && !hidden)
                 .map(|s| (s.program.clone(), s.config.clone()))
                 .into_iter()
                 .collect();

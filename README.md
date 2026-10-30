@@ -540,8 +540,9 @@ the tests that reach them, across project boundaries.
 - **Test commands run narrowed.** `mix test`, Vitest, Jest, Mocha,
   `bun test`, `node --test`, `go test` and `pytest` are recognised in the
   requested target and in the same-project targets it depends on, whether
-  run directly (`pnpm exec vitest run`) or through a package script that is
-  only the runner. Elixir, JavaScript and Python run the selected test
+  run directly (`pnpm exec vitest run`), through a package script that is
+  only the runner, or through an `npm`/`pnpm` package script that chains
+  commands (see "Package script chains" below). Elixir, JavaScript and Python run the selected test
   files (a package script gets them as `npm test -- <files>`, and as
   `pnpm test <files>`, `yarn test <files>`, `bun run test <files>`: pnpm,
   yarn and bun would pass a `--` on to the runner, and Vitest then ignores the
@@ -554,6 +555,37 @@ the tests that reach them, across project boundaries.
   command runs as written. A
   command that already lists test files keeps the ones selected. A
   `{files}` placeholder receives the selected test files.
+- **Package script chains.** A target that runs an `npm` or `pnpm` script
+  (`pnpm test-ci`, `npm run test:ci`) is read through `package.json`: the
+  script body is split on `&&`, and a command that calls another script
+  (`pnpm test:unit`) is replaced by that script's commands, to a depth of 8.
+  Each command is then narrowed or kept:
+  - A test runner command (Vitest, Jest, Mocha, `bun test`, `node --test`,
+    `tsx --test`, `node --import tsx --test`) runs only the selected files it
+    covers. A file list in the command (`tests/a.test.ts`) or a glob the shell
+    would expand (`test/*.test.ts`) is replaced by the selected files it
+    covers. A runner that covers none of the selected files is dropped.
+  - Any other command (`tsc --noEmit`, `node gen.mjs --check`, a setup
+    script) is kept as written.
+  - When every runner is dropped, the target is skipped like any narrowed
+    test target. Checks that are not tests therefore run only when a test in
+    the same target runs; put them in `lint` or `build`, which are not
+    narrowed.
+  Each command becomes one command of the plan, run in order, and the target
+  fails at the first failure, as `&&` does. Because the package script no
+  longer wraps them, each command starts through `pnpm exec <command>` or
+  `npm exec -c '<command>'`, which put `node_modules/.bin` on the path as the
+  script did; `NAME=value` assignments stay in front. Vitest and Jest commands
+  get `--passWithNoTests`, since a selected file that another config's
+  `include` does not cover would otherwise fail the run. A chain is left to
+  run as written when it uses another operator (`||`, `;`, `|`, a redirect), a
+  `cd`, an interpreter running a script (`bash run.sh`), a cycle, a
+  `pre<script>` or `post<script>` hook, a chain in which no runner can be
+  narrowed, or a launcher other than `npm` or `pnpm`. A single runner whose
+  own arguments cannot be narrowed (`node --test dist/a.test.js`, where the
+  file is built by an earlier step and does not exist yet) is kept as written
+  and runs in full beside the runners that were narrowed. A script that is
+  only the runner keeps its name (`pnpm test <files>`).
 - **Wrapper programs in front of the runner.** A command such as
   `scripts/with-rust-toolchain cargo test` or
   `mise exec node@24 -- vitest run` starts with a program that is not a test
@@ -1010,7 +1042,7 @@ configuration findings.
 
 | Rule | Severity | Reports |
 | --- | --- | --- |
-| `unnarrowable-test-command` | warning | A test target whose command contains a test runner Aster can narrow, but whose shape Aster refuses to narrow, so `--related` runs the whole target whenever it selects it. The reason is the one the narrowing computes: a substitution (`$(...)`, backticks, `{files}`), a shell operator, an interpreter running a script it cannot read to the end (`bash -c 'a && mix test && b'`), an expansion in the program position, a runner of another language than the project's, or a program in front of the runner that is not listed in `[affected.related] wrappers` (`mise exec node@24 -- vitest run`). Configured wrappers are honoured. |
+| `unnarrowable-test-command` | warning | A test target whose command contains a test runner Aster can narrow, but whose shape Aster refuses to narrow, so `--related` runs the whole target whenever it selects it. This includes a package script that contains a runner Aster cannot narrow ("package script test-ci contains vitest run, which Aster cannot narrow"), and an entry target (`--entry`, `[check] entries`, a lane's `target`) whose command is not inert and not narrowable: a script file (`./test-ci.sh`, `bash tools/run.sh`), which Aster does not read, or a package script with no runner. These are the targets `--related` reports as "not a test command Aster can narrow; running as written". The reason is the one the narrowing computes: a substitution (`$(...)`, backticks, `{files}`), a shell operator, an interpreter running a script it cannot read to the end (`bash -c 'a && mix test && b'`), an expansion in the program position, a runner of another language than the project's, or a program in front of the runner that is not listed in `[affected.related] wrappers` (`mise exec node@24 -- vitest run`). Configured wrappers are honoured. |
 | `suspicious-path-literal` | warning | A literal in a test that names an existing workspace path, carries no `not-a-read` or covering `reads` annotation, and is an argument of a write-like call (write, mkdir, touch, the destination of a copy or rename) or a non-first argument of a path join whose base is not a workspace root expression. Not reported when an `aster: reads` entry in the same definition declares the path (see [Correcting which paths a test reads](#correcting-which-paths-a-test-reads)). Suggests `aster: not-a-read` if the code does not read the repository path, or `aster: reads` / leaving it if it does. |
 | `bad-consumes` | error | A `[consumes."//x"]` key that is not a project, or a `files` glob that matches no source file. (A key that is missing from `depends_on` is already a configuration error, exit `2`.) |
 | `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
@@ -1034,7 +1066,8 @@ write.
 operators) contains a command that its project's plugin recognises as a test
 runner: `mix test`, Vitest, Jest, `pytest`, `go test`, `cargo test`, and the
 others `--related` narrows. A script Aster cannot read as a test runner is not
-reported; it is not known to be a test. Targets named `watch`, or ending in
+reported, since it is not known to be a test, unless it is an entry target
+(below) or a package script that contains a runner Aster cannot narrow. Targets named `watch`, or ending in
 `:watch`, `-watch` or `_watch`, are skipped: they run on a developer's
 machine. A shell operator written outside a `bash -c` script is already
 rejected when the configuration loads, so it never reaches this rule.
