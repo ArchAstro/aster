@@ -28432,6 +28432,7 @@ exports.releaseAsset = releaseAsset;
 exports.releaseTag = releaseTag;
 const ASSETS = {
     "linux:x64": "aster-linux-x64.tar.gz",
+    "linux:arm64": "aster-linux-arm64.tar.gz",
     "darwin:x64": "aster-darwin-x64.tar.gz",
     "darwin:arm64": "aster-darwin-arm64.tar.gz",
 };
@@ -28439,7 +28440,7 @@ const ASSETS = {
 function releaseAsset(host = process) {
     const name = ASSETS[`${host.platform}:${host.arch}`];
     if (!name) {
-        throw new Error(`no Aster release asset for ${host.platform}/${host.arch}; published assets are linux/x64, darwin/x64, and darwin/arm64`);
+        throw new Error(`no Aster release asset for ${host.platform}/${host.arch}; published assets are linux/x64, linux/arm64, darwin/x64, and darwin/arm64`);
     }
     return name;
 }

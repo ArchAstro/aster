@@ -5,6 +5,7 @@ export interface AssetRequest {
 
 const ASSETS: Record<string, string> = {
   "linux:x64": "aster-linux-x64.tar.gz",
+  "linux:arm64": "aster-linux-arm64.tar.gz",
   "darwin:x64": "aster-darwin-x64.tar.gz",
   "darwin:arm64": "aster-darwin-arm64.tar.gz",
 };
@@ -14,7 +15,7 @@ export function releaseAsset(host: AssetRequest = process): string {
   const name = ASSETS[`${host.platform}:${host.arch}`];
   if (!name) {
     throw new Error(
-      `no Aster release asset for ${host.platform}/${host.arch}; published assets are linux/x64, darwin/x64, and darwin/arm64`,
+      `no Aster release asset for ${host.platform}/${host.arch}; published assets are linux/x64, linux/arm64, darwin/x64, and darwin/arm64`,
     );
   }
   return name;
