@@ -384,6 +384,13 @@ the last attempt's failures.
 Retries capture results even without `--test-results`; that flag alone decides
 whether a results file is written.
 
+A runner behind a program listed in `[affected.related] wrappers` (`mise exec
+go -- bun test`, `scripts/with-rust-toolchain cargo test`) is captured and
+retried too: Aster plans the report and the rerun on the command the wrapper
+runs and writes the wrapper back in front. A target whose results cannot be
+captured is never retried and cannot be quarantined; `aster check` reports it
+as `uncaptured-test-results`.
+
 `retry_setup` is a shell command run in the target's working directory before
 each retry, such as a database reset. If it fails the retry is skipped and the
 original failure stands.
@@ -622,7 +629,12 @@ the tests that reach them, across project boundaries.
   command, or by file name when the entry has no `/`. Leading `NAME=value`
   assignments stay in front. Without an entry the command runs as written;
   Aster does not guess which programs are wrappers. Wrappers apply to
-  `--related`, not to `--only-affected-files`.
+  `--related`, not to `--only-affected-files`. They also apply to test result
+  capture, `--retry-failed` and quarantine: `mise exec go -- bun test` gets
+  its JUnit flags after `bun test`, and a retry reruns `mise exec go -- bun
+  test <failing files> -t <name>`, with the wrapper in front and the console
+  output unchanged. Without the entry the runner is hidden and the target
+  records no tests (`uncaptured-test-results` reports it).
 - **Shard and wrapper projects follow the project whose tests they run.**
   A shell one-liner that ends in a test command is narrowed in place, in
   the directory it changes into:
@@ -1063,6 +1075,8 @@ configuration findings.
 | `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A target whose command is a package script that a reached target calls (`pnpm <script>`, `pnpm run <script>`, `npm run <script>`, `yarn <script>`, through nested scripts), or whose script only calls such scripts, is reached too. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
 | `stale-annotation` | error | An `aster: not-a-read` whose line holds no path-naming literal, an `aster: reads` path that matches nothing, or an unknown `aster:` directive. |
 | `stale-allow-orphan` | error | A `[check] allow_orphans` entry that names no test target of the workspace, or a target that an entry already reaches (so it is not an orphan and the entry does nothing). |
+| `uncaptured-test-results` | warning | A test target whose per-test results Aster cannot capture, so `--retry-failed` cannot rerun its failing tests and quarantine cannot excuse a flaky one. It applies to every test target, entry targets (`--entry`, `[check] entries`, a lane's `target`) included, and is reported even when `--related` can narrow the command or `allow_unnarrowable` lists it: a fixed proof still needs results. The message says why: it runs a script file, a package script that is more than a bare runner, a runner inside a compound command, a runner behind a program that is not a configured wrapper, or a runner whose flags or config choose their own reporters. The rule asks the function the executor plans every command with (configured wrappers included), so a target is reported exactly when a run would record no tests for it. A target that declares its report (`[targets.X] report = { .. }`) is captured and is not reported. A command that runs no per-test runner at all is listed in `[check] allow_no_test_results`. |
+| `stale-allow-no-test-results` | error | A `[check] allow_no_test_results` entry that names no test target of the workspace, or a target whose results Aster captures now. |
 | `stale-allow-unnarrowable` | error | A `[check] allow_unnarrowable` entry that names no test target of the workspace, or a target that `--related` narrows now (so it produces no `unnarrowable-test-command` finding and the entry does nothing). |
 
 **What counts as a workspace root base.** A join such as
@@ -1117,6 +1131,14 @@ reports the entry as an error so the list does not rot. An entry is checked
 against the entry targets Aster knows (`[check] entries`, `--entry`, lane
 targets), so set `entries` in the root `aster.toml` when you use it.
 
+**Accepting a target with no per-test results.** Declare its report first
+(`[targets.X] report = { format = "junit" }`, see [Test
+tracking](docs/test-tracking.md)), so retries and quarantine work where the
+command writes one. A target that runs no per-test runner at all (a single
+compile check, a model checker, an infrastructure bring-up script) is listed
+in `[check] allow_no_test_results` by address. When the target is captured
+later, or is gone, `stale-allow-no-test-results` reports the entry as an error.
+
 **Disabling a rule.** In the root `aster.toml`:
 
 ```toml
@@ -1124,6 +1146,7 @@ targets), so set `entries` in the root `aster.toml` when you use it.
 entries = ["test-ci"]            # targets CI requests, for orphan-test-target
 allow_orphans = ["//benchmarks:test"] # test targets run by hand, not reported
 allow_unnarrowable = ["//infra/bring-up:test-ci"] # fixed commands, not reported
+allow_no_test_results = ["//infra/bring-up:test-ci"] # no per-test runner, not reported
 disable = ["orphan-test-target"] # rule ids to skip
 ```
 

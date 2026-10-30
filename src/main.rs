@@ -1365,6 +1365,7 @@ fn run() -> Result<()> {
                 )
                 .with_test_capture(test_results.is_some())
                 .with_retry_failed(cli.retry_failed())
+                .with_wrappers(&workspace_config.affected.related.wrappers)
                 .with_no_replay(cli.no_replay)
                 .with_quarantine(quarantine_for(
                     &workspace_root,
@@ -1503,6 +1504,12 @@ fn run() -> Result<()> {
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
                     .with_retry_failed(cli.retry_failed())
+                    .with_wrappers(
+                        &WorkspaceConfig::load(&workspace_root)?
+                            .affected
+                            .related
+                            .wrappers,
+                    )
                     .with_no_replay(cli.no_replay)
                     .with_quarantine(quarantine_for(
                         &workspace_root,
@@ -1831,6 +1838,12 @@ fn run() -> Result<()> {
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
                     .with_retry_failed(cli.retry_failed())
+                    .with_wrappers(
+                        &WorkspaceConfig::load(&workspace_root)?
+                            .affected
+                            .related
+                            .wrappers,
+                    )
                     .with_no_replay(cli.no_replay)
                     .with_quarantine(quarantine_for(
                         &workspace_root,

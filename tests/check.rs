@@ -345,10 +345,12 @@ fn output_schema_exit_status_and_rule_selection() {
     let (status, report) = ws.check(&[]);
     assert_eq!(status, 0, "warnings alone exit 0: {report}");
     assert_eq!(report["version"], 1);
-    assert_eq!(report["summary"]["findings"], 1);
-    assert_eq!(report["summary"]["warnings"], 1);
+    // The chained command cannot be narrowed, and no report can be added to it.
+    assert_eq!(report["summary"]["findings"], 2);
+    assert_eq!(report["summary"]["warnings"], 2);
     assert_eq!(report["summary"]["errors"], 0);
     assert_eq!(report["summary"]["by_rule"]["unnarrowable-test-command"], 1);
+    assert_eq!(report["summary"]["by_rule"]["uncaptured-test-results"], 1);
     let finding = &report["findings"][0];
     for key in ["rule", "severity", "file", "line", "target", "message"] {
         assert!(finding.get(key).is_some(), "{key} missing: {finding}");
@@ -392,7 +394,7 @@ fn a_bad_configuration_exits_2_and_disable_skips_a_rule() {
     let ws = Workspace::new(&[
         (
             "aster.toml",
-            "[check]\ndisable = [\"unnarrowable-test-command\"]\n",
+            "[check]\ndisable = [\"unnarrowable-test-command\", \"uncaptured-test-results\"]\n",
         ),
         ("shop/mix.exs", MIX),
         (
@@ -837,4 +839,100 @@ fn allow_unnarrowable_accepts_a_fixed_command_and_stale_entries_are_errors() {
         .collect();
     assert!(messages[0].contains("names no test target"), "{messages:?}");
     assert!(messages[1].contains("narrows now"), "{messages:?}");
+}
+
+#[test]
+fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report() {
+    let workspace = |wrappers: &str, extra: &str| {
+        Workspace::new(&[
+            (
+                "aster.toml",
+                &format!("[check]\nentries = [\"test-ci\"]\n{extra}\n{wrappers}"),
+            ),
+            (
+                "web/package.json",
+                r#"{"name":"web","scripts":{"test":"vitest run && eslint ."}}"#,
+            ),
+            (
+                "web/aster.toml",
+                "[targets.test-ci]\ncommand = \"./run-tests.sh\"\n\n\
+                 [targets.test-bun]\ncommand = \"mise exec go -- bun test --timeout=60000\"\n\n\
+                 [targets.test-chain]\ncommand = \"bash -c 'bun test && bun run lint'\"\n\n\
+                 [targets.test-pkg]\ncommand = \"pnpm test\"\n\n\
+                 [targets.test-declared]\ncommand = \"./run-tests.sh\"\n\n\
+                 [targets.test-declared.report]\nformat = \"junit\"\n",
+            ),
+        ])
+    };
+    let wrappers = "[affected.related]\nwrappers = [{ program = \"mise\", until = \"--\" }]\n";
+    let rule = "uncaptured-test-results";
+
+    // `mise` is not configured: the wrapped runner is hidden from capture.
+    let (status, report) = workspace("", "").check(&["--rule", rule]);
+    assert_eq!(status, 0, "a warning does not fail the check: {report}");
+    assert_eq!(
+        places(&report, rule),
+        [
+            "//web:test",
+            "//web:test-bun",
+            "//web:test-chain",
+            "//web:test-ci",
+            "//web:test-pkg"
+        ]
+    );
+    let message = |target: &str| -> String {
+        findings(&report, rule)
+            .iter()
+            .find(|f| f["target"] == target)
+            .unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let bun = message("//web:test-bun");
+    assert!(
+        bun.contains("behind `mise exec go`, which is not a configured wrapper"),
+        "{bun}"
+    );
+    assert!(bun.contains("--retry-failed"), "{bun}");
+    let chain = message("//web:test-chain");
+    assert!(
+        chain.contains("among other commands") && chain.contains("`bun test`"),
+        "{chain}"
+    );
+    let script = message("//web:test-ci");
+    assert!(script.contains("script file `./run-tests.sh`"), "{script}");
+    let package = message("//web:test-pkg");
+    assert!(package.contains("package script `test`"), "{package}");
+
+    // Configured, the wrapped runner is captured; the declared target never
+    // was a finding; the rest stay (a fixed, unnarrowable command still needs
+    // results).
+    let (_, report) = workspace(wrappers, "").check(&["--rule", rule]);
+    assert_eq!(
+        places(&report, rule),
+        [
+            "//web:test",
+            "//web:test-chain",
+            "//web:test-ci",
+            "//web:test-pkg"
+        ]
+    );
+
+    // allow_no_test_results exempts a target that runs no per-test runner,
+    // and a stale entry is an error.
+    let (status, report) = workspace(
+        wrappers,
+        "allow_no_test_results = [\"//web:test-ci\", \"//web:test-bun\", \"//web:nope\"]",
+    )
+    .check(&[]);
+    assert_eq!(status, 1, "{report}");
+    assert_eq!(
+        places(&report, rule),
+        ["//web:test", "//web:test-chain", "//web:test-pkg"]
+    );
+    assert_eq!(
+        places(&report, "stale-allow-no-test-results"),
+        ["//web:nope", "//web:test-bun"]
+    );
 }

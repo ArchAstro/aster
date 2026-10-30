@@ -35,6 +35,14 @@ invocation: a run record, a record per target, and one per test attempt.
 | `cargo test` | console `test x ... ok/FAILED` lines | partial |
 | Gradle, Maven | existing `build/test-results` and `target/surefire-reports` files | complete |
 
+A runner behind a program listed in `[affected.related] wrappers` (`mise exec
+go -- bun test`, `scripts/with-rust-toolchain cargo test`) is read through the
+wrapper: Aster plans the report on the command the wrapper runs, then writes
+the wrapper back in front, so the flags land after the runner and the console
+output is unchanged. The same reading applies to `--retry-failed`. A runner
+behind a program that is not listed records no tests; `aster check` reports
+such a target as `uncaptured-test-results`.
+
 `partial` means some tests may be missing. Partial results are still uploaded
 and classified, but they never let a quarantined failure pass.
 
@@ -97,6 +105,11 @@ directory, not a target's `working_dir`. A declared report wins over
 recognising the command. `libtest` (saved `cargo test` console output) is
 partial; the others are complete, and the capture is recorded as
 `declared-<format>`.
+
+`aster check` reports every test target that has no capturable results and no
+declared report (`uncaptured-test-results`), with the reason, because such a
+target cannot be retried or quarantined. `[check] allow_no_test_results` lists
+targets that run no per-test runner at all.
 
 A declared report never lets a quarantined failure pass: Aster does not see
 the runner, so it cannot tell a test failure from a failed step of the script
