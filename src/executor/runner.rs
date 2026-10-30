@@ -43,6 +43,7 @@ mod partitions;
 pub use partitions::partitioned_suites;
 mod retry;
 
+use super::admission::{Host, Permit};
 use super::command::parse_command;
 use super::{force_shutdown_requested, shutdown_requested};
 #[cfg(any(unix, windows))]
@@ -130,6 +131,22 @@ pub struct ExecutionResult {
     /// A process was running when Aster received SIGINT or SIGTERM. The output
     /// is what it had written by then.
     pub interrupted: bool,
+}
+
+fn execution_failure(address: &str, output: String) -> ExecutionResult {
+    ExecutionResult {
+        address: address.into(),
+        success: false,
+        skipped: false,
+        cached: false,
+        log: output.as_bytes().to_vec(),
+        output,
+        duration_ms: 0,
+        exit_code: None,
+        tests: None,
+        input_hash: None,
+        interrupted: false,
+    }
 }
 
 /// Executor for running target commands on projects
@@ -368,9 +385,37 @@ impl<'a> Executor<'a> {
 
         // Run with inherited stdio for streaming
         use std::process::Stdio;
-        let mut cmd = Command::new(&parsed.program);
-        cmd.args(&parsed.args)
-            .current_dir(working_dir)
+        let host = Host::configured().map_err(|error| format!("Execution admission: {error:#}"))?;
+        let permit = host
+            .as_ref()
+            .map(|host| {
+                host.acquire(
+                    &target_def.exclusive_resources,
+                    self.workspace_root,
+                    &target_addr,
+                )
+            })
+            .transpose()
+            .map_err(|error| format!("Execution admission: {error:#}"))?;
+        #[cfg(unix)]
+        let mut cmd = match &permit {
+            Some(permit) => permit
+                .command(&parsed.program, &parsed.args)
+                .map_err(|error| error.to_string())?,
+            None => {
+                let mut command = Command::new(&parsed.program);
+                command.args(&parsed.args);
+                command
+            }
+        };
+        #[cfg(not(unix))]
+        let mut cmd = {
+            let _ = permit;
+            let mut command = Command::new(&parsed.program);
+            command.args(&parsed.args);
+            command
+        };
+        cmd.current_dir(working_dir)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -392,7 +437,7 @@ impl<'a> Executor<'a> {
             format!("Failed to execute {target_addr}: {e}")
         })?;
         #[cfg(unix)]
-        let monitor = ChildSignalMonitor::new(child.id());
+        let monitor = ChildSignalMonitor::start(child.id(), permit.is_some());
         #[cfg(windows)]
         let monitor = WindowsChildSignalMonitor::new(&mut child)
             .inspect_err(|_| unregister_supervised_child())
@@ -509,6 +554,17 @@ impl<'a> Executor<'a> {
             }
         }
 
+        let host = match Host::configured() {
+            Ok(host) => host,
+            Err(error) => {
+                return targets_to_run
+                    .iter()
+                    .map(|address| {
+                        execution_failure(address, format!("Execution admission: {error:#}"))
+                    })
+                    .collect()
+            }
+        };
         let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
         let verbose_progress = self.output_mode == OutputMode::Verbose;
         let show_output = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);
@@ -559,6 +615,7 @@ impl<'a> Executor<'a> {
             env_snapshot: &env_snapshot,
             runtime_inputs: &runtime_inputs,
             resource_mutexes: &resource_mutexes,
+            host: &host,
             tx: &tx,
         };
 
@@ -767,6 +824,7 @@ impl<'a> Executor<'a> {
             env_snapshot,
             runtime_inputs,
             resource_mutexes,
+            host,
             tx: _,
         } = *ctx;
         let target_addr = &target_addr.to_string();
@@ -1042,12 +1100,19 @@ impl<'a> Executor<'a> {
                 .unwrap_or_default();
             // Sort by resource name to prevent deadlocks
             res_names.sort();
+            res_names.dedup();
             res_names
                 .iter()
                 .filter_map(|name| resource_mutexes.get(*name).map(Arc::clone))
                 .collect()
         };
 
+        let host = host.clone();
+        let resource_names = project
+            .targets
+            .get(&target_name)
+            .map(|t| t.exclusive_resources.clone())
+            .unwrap_or_default();
         let panic_addr = addr.clone();
         let panic_tx = ctx.tx.clone();
         let handle = thread::spawn(move || {
@@ -1079,9 +1144,28 @@ impl<'a> Executor<'a> {
                     let _ = tx_clone.send(result.clone());
                     return result;
                 }
+                let permit = match host
+                    .as_ref()
+                    .map(|host| host.acquire(&resource_names, &workspace_root_path, &addr))
+                    .transpose()
+                {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let result =
+                            execution_failure(&addr, format!("Execution admission: {error:#}"));
+                        let _ = tx_clone.send(result.clone());
+                        return result;
+                    }
+                };
                 let started = SystemTime::now();
-                let (mut result, raw_outputs) =
-                    run_invocations(&addr, &invocations, &working_dir, null_stdin, log_cap);
+                let (mut result, raw_outputs) = run_invocations(
+                    &addr,
+                    &invocations,
+                    &working_dir,
+                    null_stdin,
+                    log_cap,
+                    permit.as_ref(),
+                );
                 if !captures.is_empty() {
                     result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
                 }
@@ -1099,6 +1183,7 @@ impl<'a> Executor<'a> {
                                 command,
                                 setup: retry_setup.as_deref(),
                                 max_retries: retry_failed,
+                                permit: permit.as_ref(),
                                 null_stdin,
                                 log_cap,
                             },
@@ -1684,6 +1769,7 @@ struct LaunchContext<'a> {
     env_snapshot: &'a HashMap<String, String>,
     runtime_inputs: &'a Arc<RuntimeInputCache>,
     resource_mutexes: &'a HashMap<String, Arc<Mutex<()>>>,
+    host: &'a Option<Arc<Host>>,
     tx: &'a mpsc::Sender<ExecutionResult>,
 }
 
@@ -2395,6 +2481,7 @@ impl Invocation {
         working_dir: &Path,
         null_stdin: bool,
         log_cap: usize,
+        permit: Option<&Permit>,
     ) -> (ExecutionResult, Option<String>) {
         let mut result = run_command(
             address,
@@ -2403,6 +2490,7 @@ impl Invocation {
             working_dir,
             null_stdin,
             log_cap,
+            permit,
         );
         let raw = self.rewrite.map(|rewrite| {
             let rendered = test_results::rewrite_output(rewrite, &result.output);
@@ -2555,9 +2643,10 @@ fn run_invocations(
     working_dir: &Path,
     null_stdin: bool,
     log_cap: usize,
+    permit: Option<&Permit>,
 ) -> (ExecutionResult, Vec<Option<String>>) {
     if let [invocation] = invocations {
-        let (result, raw) = invocation.run(address, working_dir, null_stdin, log_cap);
+        let (result, raw) = invocation.run(address, working_dir, null_stdin, log_cap, permit);
         return (result, vec![raw]);
     }
     let mut combined = ExecutionResult {
@@ -2578,7 +2667,7 @@ fn run_invocations(
         if shutdown_requested() {
             break;
         }
-        let (result, raw) = invocation.run(address, working_dir, null_stdin, log_cap);
+        let (result, raw) = invocation.run(address, working_dir, null_stdin, log_cap, permit);
         raw_outputs.push(raw);
         if !combined.log.is_empty() && !combined.log.ends_with(b"\n") {
             combined.log.push(b'\n');
@@ -2719,6 +2808,7 @@ fn run_command(
     working_dir: &Path,
     null_stdin: bool,
     log_cap: usize,
+    permit: Option<&Permit>,
 ) -> ExecutionResult {
     let start = Instant::now();
 
@@ -2745,9 +2835,26 @@ fn run_command(
         return failed("Empty command".to_string());
     }
 
-    let mut cmd = Command::new(&parsed.program);
-    cmd.args(&parsed.args)
-        .current_dir(working_dir)
+    #[cfg(unix)]
+    let mut cmd = match permit {
+        Some(permit) => match permit.command(&parsed.program, &parsed.args) {
+            Ok(command) => command,
+            Err(error) => return failed(format!("Execution supervision: {error:#}")),
+        },
+        None => {
+            let mut command = Command::new(&parsed.program);
+            command.args(&parsed.args);
+            command
+        }
+    };
+    #[cfg(not(unix))]
+    let mut cmd = {
+        let _ = permit;
+        let mut command = Command::new(&parsed.program);
+        command.args(&parsed.args);
+        command
+    };
+    cmd.current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if null_stdin {
@@ -2797,7 +2904,7 @@ fn run_command(
     };
 
     #[cfg(unix)]
-    let monitor = ChildSignalMonitor::new(child.id());
+    let monitor = ChildSignalMonitor::start(child.id(), permit.is_some());
     #[cfg(windows)]
     let monitor = match WindowsChildSignalMonitor::new(&mut child) {
         Ok(monitor) => monitor,
@@ -3058,7 +3165,7 @@ struct ChildSignalMonitor {
 
 #[cfg(unix)]
 impl ChildSignalMonitor {
-    fn new(process_id: u32) -> Self {
+    fn start(process_id: u32, delegated: bool) -> Self {
         let process_group = process_id as i32;
         let completed = Arc::new(AtomicBool::new(false));
         let completed_for_thread = Arc::clone(&completed);
@@ -3069,6 +3176,20 @@ impl ChildSignalMonitor {
                     flush_interrupt_report();
                     unsafe {
                         libc::kill(-process_group, libc::SIGTERM);
+                    }
+                    if delegated {
+                        // The helper owns escalation and its leases. Forward a
+                        // second signal rather than killing that owner early.
+                        while !completed_for_thread.load(Ordering::SeqCst) {
+                            if force_shutdown_requested() {
+                                unsafe {
+                                    libc::kill(-process_group, libc::SIGTERM);
+                                }
+                                break;
+                            }
+                            thread::park_timeout(Duration::from_millis(20));
+                        }
+                        return;
                     }
                     let deadline = Instant::now() + Duration::from_secs(3);
                     while Instant::now() < deadline && !force_shutdown_requested() {
@@ -4232,6 +4353,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(result.success, "command failed: {}", result.output);
         assert!(
@@ -4259,6 +4381,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(!result.success);
         assert_eq!(raw.len(), 2, "the third command never ran");
@@ -4288,6 +4411,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(result.success, "{}", result.output);
         assert_eq!(raw, vec![None, Some("report=on\n".to_string())]);
@@ -4317,6 +4441,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(result.success, "{}", result.output);
         assert_eq!(result.output, "ok  \tp\t0.01s\n");
@@ -4385,8 +4510,14 @@ mod tests {
             })
             .collect();
         let started = SystemTime::now();
-        let (mut result, raw) =
-            run_invocations("//a:test", &invocations, tmp, true, DEFAULT_LOG_CAP_BYTES);
+        let (mut result, raw) = run_invocations(
+            "//a:test",
+            &invocations,
+            tmp,
+            true,
+            DEFAULT_LOG_CAP_BYTES,
+            None,
+        );
         result.tests = read_test_report("//a:test", &captures, &raw, started);
         (result, captures)
     }
@@ -4501,6 +4632,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(!result.success);
         assert_eq!(result.exit_code, Some(3));
@@ -4521,6 +4653,7 @@ mod tests {
             tmp.path(),
             true,
             8,
+            None,
         );
         assert!(result.success, "{}", result.output);
         assert_eq!(result.exit_code, Some(0));
@@ -4554,6 +4687,7 @@ mod tests {
             tmp.path(),
             true,
             DEFAULT_LOG_CAP_BYTES,
+            None,
         );
         assert!(!result.success);
         assert_eq!(result.exit_code, Some(128 + libc::SIGTERM));

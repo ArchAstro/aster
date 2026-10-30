@@ -36,6 +36,8 @@ pub struct RunArgs {
     /// Stream override: Some(true) = force stream, Some(false) = force no-stream, None = use target config
     pub stream_override: Option<bool>,
     // Global flags that clap can't parse from external subcommands
+    /// Host execution capacity, validated by the CLI before running targets.
+    pub jobs: Option<String>,
     /// Disable caching
     pub no_cache: bool,
     /// Enable verbose output
@@ -101,8 +103,15 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut full_logs = false;
     let mut lang = Vec::new();
     let mut expecting_lang = false;
+    let mut jobs = None;
+    let mut expecting_jobs = false;
 
     for arg in args {
+        if expecting_jobs {
+            expecting_jobs = false;
+            jobs = Some(arg);
+            continue;
+        }
         if expecting_lang {
             expecting_lang = false;
             for l in arg.split(',') {
@@ -122,6 +131,11 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
             "--stream" => stream_override = Some(true),
             "--no-stream" => stream_override = Some(false),
             // Global flags that clap can't parse from external subcommands
+            "--jobs" => {
+                jobs = Some(String::new());
+                expecting_jobs = true;
+            }
+            _ if arg.starts_with("--jobs=") => jobs = Some(arg["--jobs=".len()..].into()),
             "--no-cache" => no_cache = true,
             "--verbose" | "-v" => verbose = true,
             "--quiet" | "-q" => quiet = true,
@@ -179,6 +193,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         use_cwd,
         warnings_as_errors,
         stream_override,
+        jobs,
         no_cache,
         verbose,
         quiet,

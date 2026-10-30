@@ -26,6 +26,7 @@ pub(super) struct RetryJob<'a> {
     pub max_retries: u32,
     pub null_stdin: bool,
     pub log_cap: usize,
+    pub permit: Option<&'a Permit>,
 }
 
 /// Rerun the failing tests of a failed `result`, updating it in place:
@@ -123,6 +124,7 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
                 job.working_dir,
                 job.null_stdin,
                 job.log_cap,
+                job.permit,
             );
             ran_any = true;
             commands_ok &= ran.success;
@@ -254,6 +256,7 @@ fn run_setup(job: &RetryJob, setup: &str) -> ExecutionResult {
         job.working_dir,
         job.null_stdin,
         job.log_cap,
+        job.permit,
     )
 }
 
@@ -383,6 +386,7 @@ mod tests {
             max_retries: 1,
             null_stdin: true,
             log_cap: 1024,
+            permit: None,
         };
         // Killed by SIGKILL, though a test failed.
         let mut killed = failed_result(Some(137), vec![case("A", TestOutcome::Fail, 1)]);

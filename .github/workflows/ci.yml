@@ -42,6 +42,7 @@ jobs:
             --test config_bug_bash \
             --test dev_tls \
             --test integration \
+            --test execution_capacity \
             --test cache_artifacts \
             --test cache_gha \
             --test cache_remote \

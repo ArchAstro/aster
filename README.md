@@ -1541,6 +1541,61 @@ line-delimited JSON commands on localhost: `status`, `list_services`,
 the path to a per-run token file; state-changing requests must include its
 contents as the JSON `token` field. Read-only requests do not require it.
 
+### Concurrency across local workspaces
+
+On Linux and macOS, target execution shares one per-user host budget. Use
+`aster --jobs 2 run //app:build` or `ASTER_JOBS=2 aster affected test` to set it.
+The initial default is the smaller of four and the available CPU count. Later
+invocations without an explicit setting reuse the host's value. While any run
+or surviving command owns the execution epoch, a different explicit value is
+an error; change it once those runs finish. Cache hits and skipped targets do
+not take execution slots. Streaming output uses the same admission boundary.
+
+State lives in `$HOME/.cache/aster/execution-v1`, independent of a job's
+`TMPDIR`. `ASTER_EXECUTION_DIR` selects an absolute alternative directory for
+isolated tests or independently managed budgets. Callers using different state
+directories, users, machines, or older Aster binaries do not share a bound.
+Do not delete active lockfiles: OS locks attach to their inodes.
+
+`exclusive_resources` retains its existing within-invocation behavior for bare
+names. Explicit scopes additionally coordinate independent Aster processes:
+
+```toml
+[targets.test]
+command = "mix test"
+exclusive_resources = ["host:local-postgres", "workspace:generated-fixtures"]
+```
+
+`host:` names share one host namespace. `workspace:` names are qualified by the
+canonical workspace root. Distinct workspaces can therefore run their own
+fixture generators concurrently. Admission acquires resources and a slot as a
+nonblocking set, releasing partial acquisitions while waiting. Dependency
+prerequisites do not reserve their dependents' capacity.
+
+A short-lived execution supervisor holds each command's permits until its
+process group and nested borrowers finish, including when the scheduling Aster
+process is killed. Targets may close inherited file descriptors. Cancellation
+and a second signal propagate through nested supervisors. Directly killing the private execution supervisor, or commands detaching
+with `setsid` and leaving its process group, is outside this lifetime contract;
+use `aster services` for independent long-lived services. Service
+bundles have their own supervisor lifecycle and do not consume build slots.
+
+Nested Aster invocations borrow the parent's slot and serialize within that
+command family, including concurrent sibling invocations. They do not each
+acquire another full host budget. Ancestor-owned named resources are inherited;
+new nested resources must follow the ancestor's last resource in lexical order
+or Aster reports the lock-order error instead of deadlocking. Nested callers
+must retain the same execution directory. This bounds admitted command families,
+not every compiler thread: configure Cargo jobs, Mix dependency partitions and
+other language-runner parallelism to fit the host too.
+
+Library embedders opt into this protocol with
+`aster::executor::admission::enable(current_exe)` and dispatch
+`internal_invocation()` before their normal CLI. The Aster binary does both;
+embedding applications which do not enable it retain their existing executor
+behavior. Windows retains its existing process/job behavior; host admission is
+not enabled there.
+
 ## Community
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request
