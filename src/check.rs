@@ -4,7 +4,7 @@
 //! Every rule has a stable id. Findings are warnings or errors; the command
 //! changes no selection. See the README, "Checking the configuration".
 
-use crate::cli::affected_files::{reachable_targets, suite_runs, test_targets};
+use crate::cli::affected_files::{called_scripts, reachable_targets, suite_runs, test_targets};
 use crate::config::WorkspaceConfig;
 use crate::discovery::DiscoveredProject;
 use crate::git::select_affected_lane;
@@ -23,15 +23,17 @@ pub const BAD_CONSUMES: &str = "bad-consumes";
 pub const ORPHAN: &str = "orphan-test-target";
 pub const STALE: &str = "stale-annotation";
 pub const STALE_ALLOW: &str = "stale-allow-orphan";
+pub const STALE_ALLOW_UNNARROWABLE: &str = "stale-allow-unnarrowable";
 
 /// Every rule id, in the order findings are listed.
-pub const RULES: [&str; 6] = [
+pub const RULES: [&str; 7] = [
     UNNARROWABLE,
     SUSPICIOUS,
     BAD_CONSUMES,
     ORPHAN,
     STALE,
     STALE_ALLOW,
+    STALE_ALLOW_UNNARROWABLE,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -43,7 +45,7 @@ pub enum Severity {
 
 fn severity(rule: &str) -> Severity {
     match rule {
-        BAD_CONSUMES | STALE | STALE_ALLOW => Severity::Error,
+        BAD_CONSUMES | STALE | STALE_ALLOW | STALE_ALLOW_UNNARROWABLE => Severity::Error,
         _ => Severity::Warning,
     }
 }
@@ -132,15 +134,28 @@ pub fn run(
     let mut report = Report::default();
 
     // Rules about targets.
-    if enabled(UNNARROWABLE) || enabled(ORPHAN) || enabled(STALE_ALLOW) {
+    if enabled(UNNARROWABLE)
+        || enabled(ORPHAN)
+        || enabled(STALE_ALLOW)
+        || enabled(STALE_ALLOW_UNNARROWABLE)
+    {
         let tests = test_targets(
             projects,
             wrappers,
             registry,
             &entry_targets(config, options),
         );
+        let allowed: HashSet<&str> = config
+            .check
+            .allow_unnarrowable
+            .iter()
+            .map(String::as_str)
+            .collect();
         if enabled(UNNARROWABLE) {
             for test in tests.iter().filter(|t| t.unnarrowable.is_some()) {
+                if allowed.contains(format!("{}:{}", test.project, test.target).as_str()) {
+                    continue;
+                }
                 report.findings.push(Finding {
                     rule: UNNARROWABLE,
                     severity: severity(UNNARROWABLE),
@@ -151,6 +166,39 @@ pub fn run(
                         "`{}` runs in full whenever `--related` selects it: {}",
                         test.command,
                         test.unnarrowable.as_deref().unwrap_or_default()
+                    ),
+                });
+            }
+        }
+        if enabled(STALE_ALLOW_UNNARROWABLE) {
+            let unnarrowable: HashSet<String> = tests
+                .iter()
+                .filter(|t| t.unnarrowable.is_some())
+                .map(|t| format!("{}:{}", t.project, t.target))
+                .collect();
+            let known: HashSet<String> = tests
+                .iter()
+                .map(|t| format!("{}:{}", t.project, t.target))
+                .collect();
+            let mut listed: Vec<&String> = config.check.allow_unnarrowable.iter().collect();
+            listed.sort();
+            listed.dedup();
+            for address in listed {
+                let why = if unnarrowable.contains(address.as_str()) {
+                    continue;
+                } else if known.contains(address.as_str()) {
+                    "names a target `--related` narrows now, so it has nothing to allow"
+                } else {
+                    "names no test target of the workspace"
+                };
+                report.findings.push(Finding {
+                    rule: STALE_ALLOW_UNNARROWABLE,
+                    severity: severity(STALE_ALLOW_UNNARROWABLE),
+                    file: None,
+                    line: None,
+                    target: Some(address.clone()),
+                    message: format!(
+                        "`[check] allow_unnarrowable` entry `{address}` {why}; remove it"
                     ),
                 });
             }
@@ -320,6 +368,9 @@ fn orphans(
         })
         .filter_map(|t| roots_by_addr.get(&t.runs_in).cloned())
         .collect();
+    // A script that a reached target calls (`pnpm test-ci` where `test-ci` is
+    // `pnpm a && pnpm b`) runs, and so does the target that is that script.
+    let called = called_scripts(projects, &config.affected.related.wrappers, &reached);
     let allowed: HashSet<&str> = config
         .check
         .allow_orphans
@@ -338,6 +389,23 @@ fn orphans(
                 .get(&test.runs_in)
                 .is_some_and(|root| workspaces.iter().any(|w| root.starts_with(w)))
         {
+            continue;
+        }
+        if test
+            .script
+            .as_ref()
+            .is_some_and(|script| called.contains(&(test.runs_in.clone(), script.clone())))
+        {
+            continue;
+        }
+        // An alias of scripts that run (`test` = `pnpm test-ci`) runs nothing
+        // of its own.
+        if test.script_aliases.as_ref().is_some_and(|names| {
+            !names.is_empty()
+                && names
+                    .iter()
+                    .all(|name| called.contains(&(test.runs_in.clone(), name.clone())))
+        }) {
             continue;
         }
         if !test.selective

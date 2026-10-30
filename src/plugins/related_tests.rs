@@ -929,11 +929,45 @@ const SCRIPT_DEPTH: usize = 8;
 /// missing, or when a script changes directory first, since its runner then
 /// belongs to another project.
 pub(crate) fn package_script_runners(project_dir: &Path, command: &str) -> Vec<String> {
+    package_script_walk(project_dir, command).0
+}
+
+/// The names of the package scripts running `command` calls, transitively,
+/// in the order they are met: `pnpm test-ci` where `test-ci` is `pnpm a &&
+/// pnpm run b` has `test-ci`, `a` and `b`. This reads calls as
+/// [`package_script_runners`] and the chain expansion do (`pnpm <script>`,
+/// `npm run <script>`, `yarn <script>`), so what `--related` narrows and what
+/// `aster check` counts as run are the same set.
+pub(crate) fn package_script_calls(project_dir: &Path, command: &str) -> Vec<String> {
+    package_script_walk(project_dir, command).1
+}
+
+/// The scripts that the package script `command` calls is made of, when its
+/// body is nothing but calls to other scripts (`pnpm test` where `test` is
+/// `pnpm test-ci`): such a script is an alias, and runs whatever they run.
+pub(crate) fn package_script_aliases(project_dir: &Path, command: &str) -> Option<Vec<String>> {
+    let argv = Argv::parse(command)?;
+    let scripts = package_scripts(project_dir)?;
+    let body = scripts.get(script_name(&argv)?)?.as_str()?;
+    and_chain(body)?
+        .iter()
+        .map(|segment| {
+            let argv = Argv::parse(segment)?;
+            script_name(&argv)
+                .filter(|name| scripts.contains_key(*name))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// [`package_script_runners`] and [`package_script_calls`] together.
+fn package_script_walk(project_dir: &Path, command: &str) -> (Vec<String>, Vec<String>) {
     fn collect(
         scripts: &serde_json::Map<String, serde_json::Value>,
         command: &str,
         seen: &mut Vec<String>,
         out: &mut Vec<String>,
+        calls: &mut Vec<String>,
     ) {
         let start = out.len();
         for segment in simple_commands(command) {
@@ -961,22 +995,17 @@ pub(crate) fn package_script_runners(project_dir: &Path, command: &str) -> Vec<S
                 continue;
             }
             seen.push(name.to_string());
-            collect(scripts, body, seen, out);
+            calls.push(name.to_string());
+            collect(scripts, body, seen, out, calls);
             seen.pop();
         }
     }
-    let Ok(manifest) = std::fs::read_to_string(project_dir.join("package.json")) else {
-        return Vec::new();
+    let Some(scripts) = package_scripts(project_dir) else {
+        return (Vec::new(), Vec::new());
     };
-    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest) else {
-        return Vec::new();
-    };
-    let Some(scripts) = manifest.get("scripts").and_then(|s| s.as_object()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    collect(scripts, command, &mut Vec::new(), &mut out);
-    out
+    let (mut out, mut calls) = (Vec::new(), Vec::new());
+    collect(&scripts, command, &mut Vec::new(), &mut out, &mut calls);
+    (out, calls)
 }
 
 /// Flags that turn coverage on or configure it, for the runners Aster

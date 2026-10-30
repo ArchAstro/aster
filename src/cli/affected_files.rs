@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use crate::config::RelatedWrapperConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
-use crate::plugins::related_tests::{package_script_runners, Delegated, Wrappers};
+use crate::plugins::related_tests::{
+    package_script_aliases, package_script_body, package_script_calls, package_script_runners,
+    Delegated, Wrappers,
+};
 use crate::plugins::{
     FilesListPlan, FilesListSelection, PluginRegistry, RelatedTest, Target, TargetCapability,
 };
@@ -835,6 +838,11 @@ pub struct TestTarget {
     pub project: String,
     pub target: String,
     pub command: String,
+    /// The package script the command calls, when it is one.
+    pub script: Option<String>,
+    /// The scripts that script consists of, when its body is nothing but
+    /// calls to other scripts.
+    pub script_aliases: Option<Vec<String>>,
     /// Why `--related` runs the whole target whenever it selects it. `None`
     /// when the command is narrowed to the selected tests.
     pub unnarrowable: Option<String>,
@@ -1147,6 +1155,31 @@ pub fn suite_runs(
     found
 }
 
+/// The package scripts that the `roots`' targets call, as `(address of the
+/// project that has the script, script name)`.
+pub fn called_scripts(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+    reached: &HashSet<(String, String)>,
+) -> HashSet<(String, String)> {
+    let lookup = Lookup::new(projects, wrappers);
+    let mut found = HashSet::new();
+    for project in projects {
+        for (name, def) in &project.targets {
+            if !reached.contains(&(address(project), name.clone())) {
+                continue;
+            }
+            let Some(runner) = lookup.runner(project, def) else {
+                continue;
+            };
+            for script in package_script_calls(&runner.project.root, &runner.command) {
+                found.insert((address(runner.project), script));
+            }
+        }
+    }
+    found
+}
+
 /// The targets whose command runs tests, ordered by address.
 ///
 /// A command the project's plugin reads as a test runner (through the
@@ -1309,6 +1342,12 @@ pub fn test_targets(
                 project: address(project),
                 target: name.clone(),
                 command: def.command.clone(),
+                script: runner.as_ref().and_then(|runner| {
+                    package_script_body(&runner.project.root, &runner.command).map(|(name, _)| name)
+                }),
+                script_aliases: runner.as_ref().and_then(|runner| {
+                    package_script_aliases(&runner.project.root, &runner.command)
+                }),
                 unnarrowable,
                 runs_in,
                 program: shape.program,
