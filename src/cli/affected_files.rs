@@ -1378,7 +1378,7 @@ pub fn test_targets(
 }
 
 /// Why Aster cannot capture per-test results from `def`, a command that
-/// [`crate::plugins::test_reports::plan`] returned no plan for. Reads the
+/// `crate::plugins::test_reports::plan` returned no plan for. Reads the
 /// command the way `--related` does: through the configured wrappers and a
 /// shell one-liner.
 pub fn uncaptured_reason(
