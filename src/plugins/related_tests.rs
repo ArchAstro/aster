@@ -1023,6 +1023,12 @@ pub(super) fn node(
     plain_script(project_dir, &argv, selected).or_else(|| script_chain(project_dir, &argv, tests))
 }
 
+/// Whether `command` is a JavaScript test runner (Vitest, Jest, Mocha,
+/// `bun test`, `node --test`) written directly.
+pub(crate) fn is_js_runner(command: &str) -> bool {
+    Argv::parse(command).is_some_and(|argv| js_runner(&argv).is_some())
+}
+
 /// A package script that is nothing but a runner (`pnpm test` where `test` is
 /// `vitest run`): the script call keeps its name and gets the files as
 /// arguments.
@@ -1123,10 +1129,11 @@ fn and_chain(body: &str) -> Option<Vec<String>> {
 }
 
 /// The commands a package script runs, in order: its `&&` chain with the
-/// scripts it calls replaced by their own commands. `None` when the chain
-/// cannot be read reliably: another shell operator, a `cd`, an interpreter
-/// running a script, a cycle, nesting deeper than [`SCRIPT_DEPTH`], or a
-/// `pre`/`post` hook that npm or pnpm would run around a script.
+/// scripts it calls replaced by their own commands. `None` when the script
+/// itself cannot be read reliably: another shell operator, a `cd`, an
+/// interpreter running a script, a cycle, nesting deeper than
+/// [`SCRIPT_DEPTH`], or a `pre`/`post` hook that npm or pnpm would run around
+/// it. A called script that cannot be read is left as the call.
 fn script_commands(
     scripts: &serde_json::Map<String, serde_json::Value>,
     name: &str,
@@ -1151,7 +1158,15 @@ fn script_commands(
         }
         match script_name(&argv).filter(|n| scripts.contains_key(*n)) {
             Some(called) if PACKAGE_LAUNCHERS.contains(&program) => {
-                script_commands(scripts, called, seen, out)?;
+                let (kept_commands, kept_seen) = (out.len(), seen.len());
+                if script_commands(scripts, called, seen, out).is_none() {
+                    // A script that cannot be read (a cycle, a `cd`, a hook)
+                    // stays a call, which the package manager runs as it
+                    // always did.
+                    out.truncate(kept_commands);
+                    seen.truncate(kept_seen);
+                    out.push(segment);
+                }
             }
             _ => out.push(segment),
         }
@@ -2116,8 +2131,6 @@ mod package_script_chain_tests {
     #[test]
     fn a_chain_that_cannot_be_read_is_left_as_written() {
         for scripts in [
-            // A cycle.
-            r#""t":"pnpm u && vitest run","u":"pnpm t""#,
             // A directory change.
             r#""t":"cd web && vitest run""#,
             // Another operator.
@@ -2148,6 +2161,22 @@ mod package_script_chain_tests {
         let scripts = r#""t":"vitest run && tsc""#;
         assert_eq!(narrow(scripts, &[], "yarn t", &["a.test.ts"]), None);
         assert_eq!(narrow(scripts, &[], "bun run t", &["a.test.ts"]), None);
+    }
+
+    #[test]
+    fn a_called_script_that_cannot_be_read_stays_a_call() {
+        // `build` has a `cd`; `e2e` has a hook npm and pnpm run around it; `a`
+        // and `b` call each other.
+        let scripts = r#""t":"pnpm run build && pnpm e2e && pnpm a && vitest run","build":"cd web && tsc","e2e":"vitest run --config e2e.config.ts","pree2e":"node prep.mjs","a":"pnpm b","b":"pnpm a""#;
+        assert_eq!(
+            run(narrow(scripts, &[], "pnpm t", &["src/a.test.ts"])),
+            [
+                "pnpm run build",
+                "pnpm e2e",
+                "pnpm a",
+                "pnpm exec vitest run src/a.test.ts --passWithNoTests"
+            ]
+        );
     }
 
     #[test]

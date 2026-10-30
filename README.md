@@ -577,14 +577,16 @@ the tests that reach them, across project boundaries.
   `npm exec -c '<command>'`, which put `node_modules/.bin` on the path as the
   script did; `NAME=value` assignments stay in front. Vitest and Jest commands
   get `--passWithNoTests`, since a selected file that another config's
-  `include` does not cover would otherwise fail the run. A chain is left to
-  run as written when it uses another operator (`||`, `;`, `|`, a redirect), a
-  `cd`, an interpreter running a script (`bash run.sh`), a cycle, a
-  `pre<script>` or `post<script>` hook, a chain in which no runner can be
-  narrowed, or a launcher other than `npm` or `pnpm`. A single runner whose
-  own arguments cannot be narrowed (`node --test dist/a.test.js`, where the
-  file is built by an earlier step and does not exist yet) is kept as written
-  and runs in full beside the runners that were narrowed. A script that is
+  `include` does not cover would otherwise fail the run. The target runs as
+  written when the script itself uses another operator (`||`, `;`, `|`, a
+  redirect), a `cd`, an interpreter running a script (`bash run.sh`), a
+  `pre<script>` or `post<script>` hook, a launcher other than `npm` or
+  `pnpm`, or when no runner in the chain can be narrowed. A called script
+  that cannot be read the same way (it has a `cd`, a hook, or calls itself)
+  stays a call (`pnpm run build`) and runs with its hooks. A single runner
+  whose own arguments cannot be narrowed (`node --test dist/a.test.js`,
+  where the file is built by an earlier step and does not exist yet) is kept
+  as written and runs in full beside the runners that were narrowed. A script that is
   only the runner keeps its name (`pnpm test <files>`).
 - **Wrapper programs in front of the runner.** A command such as
   `scripts/with-rust-toolchain cargo test` or
