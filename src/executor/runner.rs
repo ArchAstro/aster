@@ -31,6 +31,7 @@ use crate::config::CacheConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::logs::{LogStore, RunLog, TargetLog};
 use crate::graph::ProjectGraph;
+use crate::plugins::related_tests::Wrappers;
 use crate::plugins::{LanguagePlugin, PluginRegistry};
 use crate::test_results::quarantine::{Quarantine, Verdict};
 use crate::test_results::{
@@ -180,6 +181,9 @@ pub struct Executor<'a> {
     log_cap: usize,
     /// The tests whose failures may not fail their target.
     quarantine: Option<Arc<Quarantine>>,
+    /// `[affected.related] wrappers`: programs in front of a test command.
+    /// Report capture and retries read through them as narrowing does.
+    wrappers: Wrappers,
     /// When set, a cache hit still reports `cached` but does not print the
     /// stored log. Status and JSON fields are unchanged.
     no_replay: bool,
@@ -202,6 +206,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            wrappers: Wrappers::default(),
             no_replay: false,
         }
     }
@@ -219,6 +224,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            wrappers: Wrappers::default(),
             no_replay: false,
         }
     }
@@ -240,6 +246,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            wrappers: Wrappers::default(),
             no_replay: false,
         }
     }
@@ -262,6 +269,7 @@ impl<'a> Executor<'a> {
             retry_failed: 0,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
+            wrappers: Wrappers::default(),
             no_replay: false,
         }
     }
@@ -299,6 +307,13 @@ impl<'a> Executor<'a> {
     /// is cached.
     pub fn with_test_capture(mut self, capture_tests: bool) -> Self {
         self.capture_tests = capture_tests;
+        self
+    }
+
+    /// Read test commands through the `[affected.related] wrappers` programs
+    /// when planning report capture and retries.
+    pub fn with_wrappers(mut self, wrappers: &[crate::config::RelatedWrapperConfig]) -> Self {
+        self.wrappers = Wrappers::new(wrappers);
         self
     }
 
@@ -1035,6 +1050,7 @@ impl<'a> Executor<'a> {
                         &working_dir,
                         &target_name,
                         &commands,
+                        &self.wrappers,
                     )
                 })
                 .unwrap_or_default()
@@ -1081,6 +1097,7 @@ impl<'a> Executor<'a> {
         let retry_command =
             (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
         let retry_failed = self.retry_failed;
+        let wrappers = self.wrappers.clone();
         // Quarantine judges one command's results, like a retry.
         let quarantine = self
             .quarantine
@@ -1182,6 +1199,7 @@ impl<'a> Executor<'a> {
                                 target_name: &target_name_clone,
                                 command,
                                 setup: retry_setup.as_deref(),
+                                wrappers: &wrappers,
                                 max_retries: retry_failed,
                                 permit: permit.as_ref(),
                                 null_stdin,
@@ -2509,13 +2527,14 @@ impl Invocation {
 
 /// Ask the plugin how to capture test results from each command. Each
 /// planned command gets its own empty report directory.
-fn plan_captures(
+pub(crate) fn plan_captures(
     plugin: &dyn LanguagePlugin,
     declared: Option<&crate::config::ReportConfig>,
     project_dir: &Path,
     working_dir: &Path,
     target_name: &str,
     commands: &[String],
+    wrappers: &Wrappers,
 ) -> Vec<Option<(ReportPlan, PathBuf)>> {
     let last = commands.len().saturating_sub(1);
     commands
@@ -2543,14 +2562,7 @@ fn plan_captures(
                 command,
                 report_dir: &report_dir,
             };
-            // A report the target declares wins: it says what the command
-            // really runs, which recognising the command text can only guess.
-            let plan = match declared {
-                Some(report) => Some(crate::plugins::test_reports::declared(report, &context)),
-                None => plugin
-                    .test_report_plan(&context)
-                    .or_else(|| crate::plugins::test_reports::recognise(&context)),
-            };
+            let plan = crate::plugins::test_reports::plan(plugin, declared, &context, wrappers);
             match plan {
                 Some(plan) => Some((plan, report_dir)),
                 None => {
@@ -4500,7 +4512,15 @@ mod tests {
         tmp: &Path,
         commands: &[String],
     ) -> (ExecutionResult, Vec<Option<(ReportPlan, PathBuf)>>) {
-        let captures = plan_captures(&JunitPlugin, None, tmp, tmp, "test", commands);
+        let captures = plan_captures(
+            &JunitPlugin,
+            None,
+            tmp,
+            tmp,
+            "test",
+            commands,
+            &Wrappers::default(),
+        );
         let invocations: Vec<Invocation> = commands
             .iter()
             .zip(&captures)
@@ -4578,6 +4598,7 @@ mod tests {
             tmp.path(),
             "test",
             &commands,
+            &Wrappers::default(),
         );
         assert!(captures[0].is_none());
         assert!(captures[1].as_ref().is_some_and(|(plan, _)| plan.declared));
@@ -4597,6 +4618,7 @@ mod tests {
             tmp.path(),
             "test",
             &commands,
+            &Wrappers::default(),
         );
         let dirs: Vec<&PathBuf> = captures.iter().flatten().map(|(_, dir)| dir).collect();
         assert_eq!(dirs.len(), 2);
@@ -4616,6 +4638,7 @@ mod tests {
             tmp.path(),
             "test",
             &["true".to_string()],
+            &Wrappers::default(),
         );
         assert!(captures.iter().all(Option::is_none));
         assert!(read_test_report("//a:test", &captures, &[None], SystemTime::now()).is_none());

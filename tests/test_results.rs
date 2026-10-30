@@ -327,6 +327,63 @@ fn retry_failed_reruns_only_the_failing_test_and_marks_the_pass_flaky() {
 }
 
 #[test]
+fn a_runner_behind_a_configured_wrapper_is_recorded_and_retried() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    // `env` stands in for `mise exec go --`: a program that runs the
+    // command after it.
+    let run = |wrappers: &str| {
+        let tmp = flaky_go_workspace("command = \"env go test ./...\"");
+        write(tmp.path(), "aster.toml", wrappers);
+        let results = tmp.path().join("out/results.ndjson");
+        let output = aster(
+            tmp.path(),
+            &[
+                "--no-cache",
+                "--retry-failed=1",
+                &format!("--test-results={}", results.display()),
+                "test",
+                "//app",
+            ],
+        );
+        let records = if results.exists() {
+            read_records(&results)
+        } else {
+            Vec::new()
+        };
+        (tmp, output, records)
+    };
+
+    // Before: Aster did not read through the wrapper, so the run recorded
+    // no tests and the failing one could not be retried.
+    let (_tmp, output, records) = run("");
+    assert!(!output.status.success());
+    assert!(tests_of(&records).is_empty(), "{records:?}");
+
+    // After: the wrapper stays in front of the planned command, the
+    // failing test is rerun alone, and every attempt is recorded.
+    let (tmp, output, records) = run("[affected.related]\nwrappers = [\"env\"]\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the retry passes: {stderr}");
+    let tests = tests_of(&records);
+    for expected in [
+        ("TestFlaky", TestOutcome::Fail, 1),
+        ("TestFlaky", TestOutcome::Pass, 2),
+        ("TestStable", TestOutcome::Pass, 1),
+    ] {
+        assert!(
+            tests.contains(&(expected.0.into(), expected.1, expected.2)),
+            "{expected:?} in {tests:?}"
+        );
+    }
+    let stable = fs::read_to_string(tmp.path().join("stable.log")).unwrap();
+    assert_eq!(stable.lines().count(), 1, "{stable}");
+    assert!(stderr.contains("flaky: 1 test passed on retry"), "{stderr}");
+}
+
+#[test]
 fn retry_failed_lists_the_flaky_tests_in_json_without_a_results_file() {
     if !go_available() {
         eprintln!("skipping: go is not installed");

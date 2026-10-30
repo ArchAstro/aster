@@ -66,6 +66,14 @@ pub struct CheckConfig {
     /// is reported by `stale-allow-unnarrowable`.
     #[serde(default)]
     pub allow_unnarrowable: Vec<String>,
+    /// Test targets (`//project:target`) that `uncaptured-test-results` does
+    /// not report because they run no per-test runner: one compile check, a
+    /// model checker, an infrastructure bring-up script. Prefer declaring
+    /// the report (`[targets.X] report`) when the command writes one. An
+    /// entry that no longer produces the finding is reported by
+    /// `stale-allow-no-test-results`.
+    #[serde(default)]
+    pub allow_no_test_results: Vec<String>,
     /// Rule ids `aster check` skips.
     #[serde(default)]
     pub disable: Vec<String>,

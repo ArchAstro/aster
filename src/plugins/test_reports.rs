@@ -8,7 +8,8 @@
 
 use std::path::Path;
 
-use super::related_tests::{js_runner, js_script, Argv, Delegated};
+use super::related_tests::{js_runner, js_script, Argv, Delegated, Wrappers};
+use super::LanguagePlugin;
 use crate::config::{ReportConfig, ReportConfigFormat};
 use crate::test_results::{exunit, nodetest};
 use crate::test_results::{
@@ -50,6 +51,39 @@ pub(crate) fn declared(report: &ReportConfig, ctx: &ReportContext) -> ReportPlan
         relative_to: Some(ctx.project_dir.to_path_buf()),
         declared: true,
     }
+}
+
+/// The report plan for one command of a target, the single place the
+/// executor and `aster check` both ask.
+///
+/// A report the target declares wins: it says what the command really runs,
+/// which recognising the command text can only guess. Otherwise the plugin
+/// and then the language-independent recogniser read the command. A command
+/// that starts with a configured `[affected.related] wrappers` program is
+/// read as the command the wrapper runs, and the wrapper is written back in
+/// front of the planned command, as narrowing does, so console output and
+/// the wrapper's own behaviour are unchanged.
+pub(crate) fn plan(
+    plugin: &dyn LanguagePlugin,
+    declared_report: Option<&ReportConfig>,
+    ctx: &ReportContext,
+    wrappers: &Wrappers,
+) -> Option<ReportPlan> {
+    if let Some(report) = declared_report {
+        return Some(declared(report, ctx));
+    }
+    let direct = |ctx: &ReportContext| plugin.test_report_plan(ctx).or_else(|| recognise(ctx));
+    if let Some(wrapped) = wrappers.strip(ctx.command) {
+        let inner = ReportContext {
+            command: &wrapped.command,
+            ..*ctx
+        };
+        if let Some(mut found) = direct(&inner) {
+            found.command = wrapped.render(&found.command);
+            return Some(found);
+        }
+    }
+    direct(ctx)
 }
 
 /// Plan for a test command whatever the project's language: the runners
@@ -1266,6 +1300,105 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         // A literal `$` in single quotes is not an expansion.
         let plan = recognise(&context(&f, "test", "bash -c \"vitest run -t 'x$'\"")).unwrap();
         assert!(plan.command.contains("x$"));
+    }
+
+    /// Every runner behind a configured wrapper is planned as the command the
+    /// wrapper runs, with the wrapper written back in front.
+    #[test]
+    fn plan_reads_a_runner_through_configured_wrappers() {
+        use crate::config::{RelatedWrapperConfig, RelatedWrapperTable};
+        use crate::plugins::PluginRegistry;
+        let wrappers = Wrappers::new(&[
+            RelatedWrapperConfig::Program("with-rust-toolchain".to_string()),
+            RelatedWrapperConfig::Detailed(RelatedWrapperTable {
+                program: "mise".to_string(),
+                until: Some("--".to_string()),
+            }),
+        ]);
+        let registry = PluginRegistry::with_all_plugins();
+        let (_tmp, f) = node_project("{}");
+        let plan_of = |plugin: &str, command: &str, wrappers: &Wrappers| {
+            let plugin = registry.find_by_name(plugin).unwrap();
+            plan(plugin, None, &context(&f, "test", command), wrappers)
+        };
+        let none = Wrappers::default();
+
+        // The incident: `//evals/fix:test-ci`.
+        let command = "mise exec go -- bun test --timeout=60000";
+        assert!(plan_of("nodejs", command, &none).is_none());
+        let bun = plan_of("nodejs", command, &wrappers).unwrap();
+        assert!(
+            bun.command
+                .starts_with("mise exec go -- bun test --reporter=junit ")
+                && bun.command.contains("bun.xml")
+                && bun.command.ends_with(" --timeout=60000"),
+            "{}",
+            bun.command
+        );
+        assert_eq!(bun.format, ReportFormat::JUnitXml);
+        assert_eq!(bun.confidence, Confidence::Complete);
+
+        let cargo = plan_of("rust", "with-rust-toolchain cargo test -p x", &wrappers).unwrap();
+        assert_eq!(cargo.command, "with-rust-toolchain cargo test -p x");
+        assert_eq!(cargo.format, ReportFormat::LibtestText);
+
+        let go = plan_of("go", "mise exec go@1.24 -- go test ./...", &wrappers).unwrap();
+        assert!(
+            go.command.starts_with("mise exec go@1.24 -- go test "),
+            "{}",
+            go.command
+        );
+        assert_eq!(go.format, ReportFormat::GoTestJson);
+
+        let mix = plan_of("elixir", "mise exec elixir -- mix test", &wrappers).unwrap();
+        assert!(
+            mix.command.starts_with("mise exec elixir -- "),
+            "{}",
+            mix.command
+        );
+        assert!(mix.command.contains("mix test"), "{}", mix.command);
+
+        let pytest = plan_of("python", "mise exec python -- pytest tests", &wrappers).unwrap();
+        assert!(
+            pytest.command.starts_with("mise exec python -- pytest "),
+            "{}",
+            pytest.command
+        );
+        assert_eq!(pytest.format, ReportFormat::JUnitXml);
+
+        // Nested wrappers and assignments before the program keep their order.
+        let nested = plan_of(
+            "nodejs",
+            "CI=1 with-rust-toolchain mise exec go -- bun test",
+            &wrappers,
+        )
+        .unwrap();
+        assert!(
+            nested
+                .command
+                .starts_with("CI=1 with-rust-toolchain mise exec go -- bun test "),
+            "{}",
+            nested.command
+        );
+
+        // A program that is not configured still hides the runner.
+        assert!(plan_of("nodejs", "unlisted exec -- bun test", &wrappers).is_none());
+
+        // A declared report wins and runs the command as written.
+        let declared_report = ReportConfig {
+            format: ReportConfigFormat::Junit,
+            files: Vec::new(),
+        };
+        let plugin = registry.find_by_name("nodejs").unwrap();
+        let declared_plan = plan(
+            plugin,
+            Some(&declared_report),
+            &context(&f, "test", command),
+            &wrappers,
+        )
+        .unwrap();
+        assert!(declared_plan.declared);
+        assert_eq!(declared_plan.command, command);
     }
 
     #[test]

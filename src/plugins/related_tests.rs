@@ -581,6 +581,13 @@ pub(crate) struct Wrapped {
     pub(crate) command: String,
 }
 
+impl Wrapped {
+    /// The wrapper written back in front of `command`.
+    pub(crate) fn render(&self, command: &str) -> String {
+        format!("{}{command}", self.prefix)
+    }
+}
+
 impl Wrappers {
     /// More than this many nested wrappers is not a command to guess at.
     const MAX_DEPTH: usize = 4;

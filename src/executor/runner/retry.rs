@@ -23,6 +23,8 @@ pub(super) struct RetryJob<'a> {
     pub command: &'a str,
     /// Run in the working directory before each retry.
     pub setup: Option<&'a str>,
+    /// `[affected.related] wrappers`.
+    pub wrappers: &'a Wrappers,
     pub max_retries: u32,
     pub null_stdin: bool,
     pub log_cap: usize,
@@ -61,7 +63,9 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
             break;
         }
         let refs: Vec<&TestCase> = failing.iter().collect();
-        let Some(commands) = test_retry::commands(job.working_dir, job.command, &refs) else {
+        let Some(commands) =
+            test_retry::commands(job.working_dir, job.command, &refs, job.wrappers)
+        else {
             break;
         };
         let mut captures = Vec::new();
@@ -76,6 +80,7 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
                 job.working_dir,
                 job.target_name,
                 std::slice::from_ref(command),
+                job.wrappers,
             ));
         }
         if captures.iter().any(|c| c.iter().all(Option::is_none)) {
@@ -375,8 +380,10 @@ mod tests {
         let registry = PluginRegistry::with_all_plugins();
         let plugin = registry.find_by_name("go").unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let wrappers = Wrappers::default();
         let job = RetryJob {
             address: "//app:test",
+            wrappers: &wrappers,
             plugin,
             project_dir: tmp.path(),
             working_dir: tmp.path(),

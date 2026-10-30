@@ -1361,6 +1361,83 @@ pub fn test_targets(
     found
 }
 
+/// Why Aster cannot capture per-test results from `def`, a command that
+/// [`crate::plugins::test_reports::plan`] returned no plan for. Reads the
+/// command the way `--related` does: through the configured wrappers and a
+/// shell one-liner.
+pub fn uncaptured_reason(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+    registry: &PluginRegistry,
+    project: &DiscoveredProject,
+    def: &Target,
+) -> String {
+    use crate::plugins::related_tests::{simple_commands, trailing_commands};
+    let lookup = Lookup::new(projects, wrappers);
+    let written = match lookup.wrappers.strip(&def.command) {
+        Some(wrapped) => wrapped.command,
+        None => def.command.clone(),
+    };
+    let reads = |command: &str| {
+        registry
+            .plugins()
+            .iter()
+            .find(|p| p.related_tests(&project.root, command, &[]).is_some())
+            .map(|p| p.name().to_string())
+    };
+    let hint = "; declare the report with `[targets.<name>] report = { .. }` if the command \
+                writes one";
+    let runner = lookup.runner(project, def);
+    if let Some((name, body)) = runner.as_ref().and_then(|runner| {
+        crate::plugins::related_tests::package_script_body(&runner.project.root, &runner.command)
+    }) {
+        return format!(
+            "package script `{name}` (`{body}`) is not a single test runner; Aster adds a report \
+             only to a script that is one `vitest`, `jest` or `bun test` command, or one that \
+             runs `node --test`. Put the runner command in the target{hint}"
+        );
+    }
+    if let Some(plugin) = reads(&written) {
+        let why = match plugin.as_str() {
+            "nodejs" => {
+                "the command or the runner's config chooses its own reporters or report file, \
+                 which Aster cannot add a report beside"
+            }
+            "elixir" => {
+                "the project configures its own ExUnit formatters, which Aster would replace"
+            }
+            _ => "its form is not one Aster plans a report for (an unsupported flag or argument)",
+        };
+        return format!("a {plugin} test runner whose report Aster cannot add: {why}{hint}");
+    }
+    let segments = simple_commands(&written);
+    if let Some((plugin, runner)) = segments
+        .iter()
+        .find_map(|command| reads(command).map(|plugin| (plugin, command)))
+    {
+        return format!(
+            "a {plugin} test runner (`{runner}`) among other commands or behind a script Aster \
+             cannot read to the end; Aster plans a report only when the runner is the whole \
+             command or the last command of a `cd dir && runner` one-liner{hint}"
+        );
+    }
+    let behind = segments.iter().find_map(|command| {
+        trailing_commands(command)
+            .into_iter()
+            .find_map(|(prefix, rest)| reads(&rest).map(|plugin| (plugin, prefix)))
+    });
+    if let Some((plugin, prefix)) = behind {
+        return format!(
+            "a {plugin} test runner behind `{prefix}`, which is not a configured wrapper; if \
+             that program runs the command after it, list it in `[affected.related] wrappers`"
+        );
+    }
+    match hidden_runner_reason(runner.as_ref(), true) {
+        Some(reason) => format!("no test runner whose results Aster can capture: {reason}"),
+        None => "no test runner whose results Aster can capture".to_string(),
+    }
+}
+
 /// Every `(project address, target)` that running the `roots` runs: the
 /// roots, what they depend on and what is `selected_by` any of those.
 pub fn reachable_targets(

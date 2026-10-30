@@ -4,12 +4,16 @@
 //! Every rule has a stable id. Findings are warnings or errors; the command
 //! changes no selection. See the README, "Checking the configuration".
 
-use crate::cli::affected_files::{called_scripts, reachable_targets, suite_runs, test_targets};
+use crate::cli::affected_files::{
+    called_scripts, reachable_targets, suite_runs, test_targets, uncaptured_reason, TestTarget,
+};
 use crate::config::WorkspaceConfig;
 use crate::discovery::DiscoveredProject;
 use crate::git::select_affected_lane;
-use crate::plugins::PluginRegistry;
+use crate::plugins::related_tests::Wrappers;
+use crate::plugins::{test_reports, PluginRegistry};
 use crate::related::{self, SourceFinding, Sources};
+use crate::test_results::{new_report_dir, ReportContext};
 use anyhow::{bail, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,9 +28,11 @@ pub const ORPHAN: &str = "orphan-test-target";
 pub const STALE: &str = "stale-annotation";
 pub const STALE_ALLOW: &str = "stale-allow-orphan";
 pub const STALE_ALLOW_UNNARROWABLE: &str = "stale-allow-unnarrowable";
+pub const UNCAPTURED: &str = "uncaptured-test-results";
+pub const STALE_ALLOW_NO_RESULTS: &str = "stale-allow-no-test-results";
 
 /// Every rule id, in the order findings are listed.
-pub const RULES: [&str; 7] = [
+pub const RULES: [&str; 9] = [
     UNNARROWABLE,
     SUSPICIOUS,
     BAD_CONSUMES,
@@ -34,6 +40,8 @@ pub const RULES: [&str; 7] = [
     STALE,
     STALE_ALLOW,
     STALE_ALLOW_UNNARROWABLE,
+    UNCAPTURED,
+    STALE_ALLOW_NO_RESULTS,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,7 +53,9 @@ pub enum Severity {
 
 fn severity(rule: &str) -> Severity {
     match rule {
-        BAD_CONSUMES | STALE | STALE_ALLOW | STALE_ALLOW_UNNARROWABLE => Severity::Error,
+        BAD_CONSUMES | STALE | STALE_ALLOW | STALE_ALLOW_UNNARROWABLE | STALE_ALLOW_NO_RESULTS => {
+            Severity::Error
+        }
         _ => Severity::Warning,
     }
 }
@@ -138,6 +148,8 @@ pub fn run(
         || enabled(ORPHAN)
         || enabled(STALE_ALLOW)
         || enabled(STALE_ALLOW_UNNARROWABLE)
+        || enabled(UNCAPTURED)
+        || enabled(STALE_ALLOW_NO_RESULTS)
     {
         let tests = test_targets(
             projects,
@@ -203,6 +215,9 @@ pub fn run(
                 });
             }
         }
+        if enabled(UNCAPTURED) || enabled(STALE_ALLOW_NO_RESULTS) {
+            uncaptured(projects, registry, config, &tests, &enabled, &mut report);
+        }
         if enabled(ORPHAN) || enabled(STALE_ALLOW) {
             orphans(
                 projects,
@@ -256,6 +271,114 @@ pub fn run(
     });
     report.stats.elapsed_ms = started.elapsed().as_millis();
     Ok(report)
+}
+
+/// Test targets whose per-test results Aster cannot capture, which also
+/// means `--retry-failed` cannot rerun their failing tests and a quarantined
+/// test cannot be excused.
+///
+/// The decision is [`test_reports::plan`], the function the executor plans
+/// every command with, so this rule and a run cannot disagree. A target that
+/// declares its report is captured by definition. Applies to every test
+/// target, entry targets included, whether or not `--related` can narrow it.
+fn uncaptured(
+    projects: &[DiscoveredProject],
+    registry: &PluginRegistry,
+    config: &WorkspaceConfig,
+    tests: &[TestTarget],
+    enabled: &dyn Fn(&str) -> bool,
+    report: &mut Report,
+) {
+    let wrapper_config = &config.affected.related.wrappers;
+    let wrappers = Wrappers::new(wrapper_config);
+    let allowed: HashSet<&str> = config
+        .check
+        .allow_no_test_results
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut missing: HashSet<String> = HashSet::new();
+    for test in tests {
+        let Some(project) = projects
+            .iter()
+            .find(|p| format!("//{}", p.relative_path.display()) == test.project)
+        else {
+            continue;
+        };
+        let Some(def) = project.targets.get(&test.target) else {
+            continue;
+        };
+        // A target with no command runs nothing; its dependencies are the
+        // test targets.
+        if def.command.trim().is_empty() {
+            continue;
+        }
+        let Some(plugin) = registry.find_by_name(&project.plugin_name) else {
+            continue;
+        };
+        let Ok(report_dir) = new_report_dir() else {
+            continue;
+        };
+        let command = def.command.replace("{files}", "");
+        let working_dir = def.working_dir.as_deref().unwrap_or(&project.root);
+        let context = ReportContext {
+            project_dir: &project.root,
+            working_dir,
+            target_name: &test.target,
+            command: command.trim(),
+            report_dir: &report_dir,
+        };
+        let planned = test_reports::plan(plugin, def.report.as_ref(), &context, &wrappers);
+        let _ = std::fs::remove_dir_all(&report_dir);
+        if planned.is_some() {
+            continue;
+        }
+        let address = format!("{}:{}", test.project, test.target);
+        missing.insert(address.clone());
+        if enabled(UNCAPTURED) && !allowed.contains(address.as_str()) {
+            let reason = uncaptured_reason(projects, wrapper_config, registry, project, def);
+            report.findings.push(Finding {
+                rule: UNCAPTURED,
+                severity: severity(UNCAPTURED),
+                file: None,
+                line: None,
+                target: Some(address),
+                message: format!(
+                    "Aster cannot capture per-test results from `{}`, so `--retry-failed` and \
+                     quarantine do nothing for it: {reason}",
+                    test.command
+                ),
+            });
+        }
+    }
+    if enabled(STALE_ALLOW_NO_RESULTS) {
+        let known: HashSet<String> = tests
+            .iter()
+            .map(|t| format!("{}:{}", t.project, t.target))
+            .collect();
+        let mut listed: Vec<&String> = config.check.allow_no_test_results.iter().collect();
+        listed.sort();
+        listed.dedup();
+        for address in listed {
+            let why = if missing.contains(address.as_str()) {
+                continue;
+            } else if known.contains(address.as_str()) {
+                "names a target whose results Aster captures now, so it has nothing to allow"
+            } else {
+                "names no test target of the workspace"
+            };
+            report.findings.push(Finding {
+                rule: STALE_ALLOW_NO_RESULTS,
+                severity: severity(STALE_ALLOW_NO_RESULTS),
+                file: None,
+                line: None,
+                target: Some(address.clone()),
+                message: format!(
+                    "`[check] allow_no_test_results` entry `{address}` {why}; remove it"
+                ),
+            });
+        }
+    }
 }
 
 type Suites = Vec<(String, Option<String>)>;
@@ -543,5 +666,137 @@ impl Report {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::discover_projects;
+
+    /// `uncaptured-test-results` and the executor ask the same function, so a
+    /// target is reported exactly when a run would record no tests for it.
+    /// Plans every test target through the executor's own `plan_captures`
+    /// and compares with the rule.
+    #[test]
+    fn the_rule_agrees_with_the_executors_report_planning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let write = |path: &str, content: &str| {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+        };
+        write(
+            "aster.toml",
+            "[check]\nentries = [\"test-script\", \"test-declared\"]\n\n\
+             [affected.related]\nwrappers = [\"with-rust-toolchain\", { program = \"mise\", until = \"--\" }]\n",
+        );
+        write(
+            "web/package.json",
+            r#"{"name":"web","scripts":{"lint":"eslint ."}}"#,
+        );
+        write(
+            "web/aster.toml",
+            r#"
+[targets.test-plain]
+command = "bun test"
+[targets.test-wrapped]
+command = "mise exec go -- bun test --timeout=60000"
+[targets.test-unlisted]
+command = "unlisted exec -- bun test"
+[targets.test-script]
+command = "./run-tests.sh"
+[targets.test-compound]
+command = "bash -c 'bun test && bun run lint'"
+[targets.test-declared]
+command = "./run-tests.sh"
+[targets.test-declared.report]
+format = "junit"
+"#,
+        );
+        write("svc/go.mod", "module example.com/svc\n\ngo 1.21\n");
+        write(
+            "svc/aster.toml",
+            "[targets.test-go]\ncommand = \"mise exec go -- go test ./...\"\n\n\
+             [targets.test-go-bare]\ncommand = \"go test ./...\"\n",
+        );
+        write(
+            "rs/Cargo.toml",
+            "[package]\nname = \"rs\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "rs/aster.toml",
+            "[targets.test-rs]\ncommand = \"with-rust-toolchain cargo test\"\n",
+        );
+
+        let registry = PluginRegistry::with_all_plugins();
+        let projects = discover_projects(root, &registry).unwrap();
+        let config = WorkspaceConfig::load(root).unwrap();
+        let options = Options {
+            rules: vec![UNCAPTURED.to_string()],
+            ..Options::default()
+        };
+        let report = run(root, &projects, &registry, &config, &options).unwrap();
+        let flagged: HashSet<String> = report
+            .findings
+            .iter()
+            .filter_map(|f| f.target.clone())
+            .collect();
+
+        let wrappers = Wrappers::new(&config.affected.related.wrappers);
+        let tests = test_targets(
+            &projects,
+            &config.affected.related.wrappers,
+            &registry,
+            &entry_targets(&config, &options),
+        );
+        assert!(tests.len() >= 9, "{tests:?}");
+        for test in &tests {
+            let project = projects
+                .iter()
+                .find(|p| format!("//{}", p.relative_path.display()) == test.project)
+                .unwrap();
+            let def = &project.targets[&test.target];
+            let captures = crate::executor::runner::plan_captures(
+                registry.find_by_name(&project.plugin_name).unwrap(),
+                def.report.as_ref(),
+                &project.root,
+                &project.root,
+                &test.target,
+                std::slice::from_ref(&def.command),
+                &wrappers,
+            );
+            let planned = captures[0].is_some();
+            for (_, dir) in captures.iter().flatten() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            let address = format!("{}:{}", test.project, test.target);
+            assert_eq!(
+                flagged.contains(&address),
+                !planned,
+                "{address} `{}`: rule and executor disagree",
+                test.command
+            );
+        }
+        // And the cases are the ones the rule is about.
+        for (address, is_flagged) in [
+            ("//web:test-plain", false),
+            ("//web:test-wrapped", false),
+            ("//web:test-declared", false),
+            ("//web:test-unlisted", true),
+            ("//web:test-script", true),
+            ("//web:test-compound", true),
+            ("//svc:test-go", false),
+            ("//svc:test-go-bare", false),
+            ("//rs:test-rs", false),
+        ] {
+            assert_eq!(
+                flagged.contains(address),
+                is_flagged,
+                "{address}: {flagged:?}"
+            );
+        }
     }
 }

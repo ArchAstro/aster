@@ -171,7 +171,11 @@ Jest `--coverage=false`, pytest `--no-cov`, and `mix test` drops `--cover`. A co
 wrapper program (`scripts/with-rust-toolchain cargo test`,
 `mise exec node@24 -- vitest run`) is narrowed only when the root
 `aster.toml` lists the wrapper: `[affected.related]`, `wrappers = [
-"scripts/with-rust-toolchain", { program = "mise", until = "--" } ]`.
+"scripts/with-rust-toolchain", { program = "mise", until = "--" } ]`. Listed
+wrappers apply to test result capture and `--retry-failed` too (report flags and
+rerun selections go after the wrapped runner, the wrapper stays in front); a
+runner behind an unlisted wrapper records no tests and cannot be retried or
+quarantined.
 Parsed source facts are cached under `<cache dir>/related-facts/` so warm
 runs parse only changed files (`--no-cache` skips it). Dependents
 run only when they refer to something that changed, so do not combine it
@@ -208,12 +212,15 @@ Adding, changing or removing one selects the tests that reach its definition.
 `aster check` lints the configuration and annotations (rules
 `unnarrowable-test-command`, `suspicious-path-literal`, `bad-consumes`,
 `orphan-test-target`, `stale-annotation`, `stale-allow-orphan`,
-`stale-allow-unnarrowable`;
+`stale-allow-unnarrowable`, `uncaptured-test-results` (a test target whose
+per-test results Aster cannot capture, so retry and quarantine do nothing; fix
+it by listing the wrapper, putting the runner in the target or declaring
+`[targets.X] report`), `stale-allow-no-test-results`;
 `unnarrowable-test-command` also flags an `--entry` target that runs a script
 file or a package script Aster cannot read; `--strict`, `--rule <id>`,
 `--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
 errors or any finding with `--strict`, 2 for a configuration error). Root
-`aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `allow_unnarrowable = [..]` (a command fixed on purpose, such as one bring-up proof or a model checker; never "not worth narrowing") / `disable = [..]` configure it.
+`aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `allow_unnarrowable = [..]` (a command fixed on purpose, such as one bring-up proof or a model checker; never "not worth narrowing") / `allow_no_test_results = [..]` (a target that runs no per-test runner) / `disable = [..]` configure it.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 
