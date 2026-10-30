@@ -165,7 +165,9 @@ tsc --noEmit`) is expanded through the scripts it calls: each runner
 (including `node --test` and `tsx --test` with files or globs) runs only the
 selected files, a runner that selects none is dropped, other commands are kept
 (started with `pnpm exec`/`npm exec -c`), and a target left with no runner is
-skipped, so keep non-test checks in `lint`/`build`. A command behind a
+skipped, so keep non-test checks in `lint`/`build`. A narrowed run disables coverage
+(thresholds measure a whole suite): Vitest gets `--coverage.enabled=false`,
+Jest `--coverage=false`, pytest `--no-cov`, and `mix test` drops `--cover`. A command behind a
 wrapper program (`scripts/with-rust-toolchain cargo test`,
 `mise exec node@24 -- vitest run`) is narrowed only when the root
 `aster.toml` lists the wrapper: `[affected.related]`, `wrappers = [

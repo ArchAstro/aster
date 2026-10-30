@@ -197,7 +197,7 @@ fn a_package_script_chain_narrows_and_what_aster_cannot_read_is_reported() {
     assert_eq!(
         chain.1,
         [
-            "pnpm exec vitest run src/lib.test.ts --passWithNoTests",
+            "pnpm exec vitest run src/lib.test.ts --coverage.enabled=false --passWithNoTests",
             "pnpm exec tsc --noEmit"
         ]
     );
@@ -267,4 +267,32 @@ fn a_chain_with_no_selected_test_is_skipped_with_its_other_commands() {
     );
     let plan = ws.plan("test-ci");
     assert!(plan.is_empty(), "{plan:?}");
+}
+
+#[test]
+fn a_coverage_gated_chain_runs_its_narrowed_tests_without_coverage() {
+    // Setup: `test-ci` runs Vitest with coverage and a config that sets
+    // thresholds for the whole suite.
+    let files = project(
+        "web",
+        r#""test-ci":"vitest run --coverage --config vitest.review-coverage.config.ts && tsc --noEmit""#,
+        "pnpm test-ci",
+    );
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let ws = Workspace::new(&files);
+    ws.write("web/src/lib.ts", "export const one = () => 1 + 0;\n");
+
+    // Outcome: the subset runs with coverage switched off, so a threshold
+    // written for the whole suite cannot fail it.
+    let plan = ws.plan("test-ci");
+    assert_eq!(
+        plan[0].1,
+        [
+            "pnpm exec vitest run --config vitest.review-coverage.config.ts src/lib.test.ts --coverage.enabled=false --passWithNoTests",
+            "pnpm exec tsc --noEmit"
+        ]
+    );
 }
