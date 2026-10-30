@@ -1060,9 +1060,10 @@ configuration findings.
 | `unnarrowable-test-command` | warning | A test target whose command contains a test runner Aster can narrow, but whose shape Aster refuses to narrow, so `--related` runs the whole target whenever it selects it. This includes a package script that contains a runner Aster cannot narrow ("package script test-ci contains vitest run, which Aster cannot narrow"), and an entry target (`--entry`, `[check] entries`, a lane's `target`) whose command is not inert and not narrowable: a script file (`./test-ci.sh`, `bash tools/run.sh`), which Aster does not read, or a package script with no runner. These are the targets `--related` reports as "not a test command Aster can narrow; running as written". The reason is the one the narrowing computes: a substitution (`$(...)`, backticks, `{files}`), a shell operator, an interpreter running a script it cannot read to the end (`bash -c 'a && mix test && b'`), an expansion in the program position, a runner of another language than the project's, or a program in front of the runner that is not listed in `[affected.related] wrappers` (`mise exec node@24 -- vitest run`). Configured wrappers are honoured. |
 | `suspicious-path-literal` | warning | A literal in a test that names an existing workspace path, carries no `not-a-read` or covering `reads` annotation, and is an argument of a write-like call (write, mkdir, touch, the destination of a copy or rename) or a non-first argument of a path join whose base is not a workspace root expression. Not reported when an `aster: reads` entry in the same definition declares the path (see [Correcting which paths a test reads](#correcting-which-paths-a-test-reads)). Suggests `aster: not-a-read` if the code does not read the repository path, or `aster: reads` / leaving it if it does. |
 | `bad-consumes` | error | A `[consumes."//x"]` key that is not a project, or a `files` glob that matches no source file. (A key that is missing from `depends_on` is already a configuration error, exit `2`.) |
-| `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
+| `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A target whose command is a package script that a reached target calls (`pnpm <script>`, `pnpm run <script>`, `npm run <script>`, `yarn <script>`, through nested scripts), or whose script only calls such scripts, is reached too. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
 | `stale-annotation` | error | An `aster: not-a-read` whose line holds no path-naming literal, an `aster: reads` path that matches nothing, or an unknown `aster:` directive. |
 | `stale-allow-orphan` | error | A `[check] allow_orphans` entry that names no test target of the workspace, or a target that an entry already reaches (so it is not an orphan and the entry does nothing). |
+| `stale-allow-unnarrowable` | error | A `[check] allow_unnarrowable` entry that names no test target of the workspace, or a target that `--related` narrows now (so it produces no `unnarrowable-test-command` finding and the entry does nothing). |
 
 **What counts as a workspace root base.** A join such as
 `Path.join(base, "config/app.yaml")` is reported when `base` is not
@@ -1103,12 +1104,26 @@ benchmark, an explorer) is listed in `[check] allow_orphans` in the root
 because the address names no test target or an entry now reaches the target,
 `stale-allow-orphan` reports it as an error so the list does not rot.
 
+**Accepting a fixed test command.** A target whose command is meant to stay
+as written is listed in `[check] allow_unnarrowable` by address:
+`allow_unnarrowable = ["//infra/services/api:test-ci"]`.
+`unnarrowable-test-command` does not report it. Use it for a command that is
+one fixed proof, such as an infrastructure bring-up script, a model checker,
+or a script that builds an image and runs it, where running part of it
+proves nothing. Do not use it because narrowing the command was not worth the
+effort: put the runner command in the target, or split the script, instead.
+When the target is narrowable later, or is gone, `stale-allow-unnarrowable`
+reports the entry as an error so the list does not rot. An entry is checked
+against the entry targets Aster knows (`[check] entries`, `--entry`, lane
+targets), so set `entries` in the root `aster.toml` when you use it.
+
 **Disabling a rule.** In the root `aster.toml`:
 
 ```toml
 [check]
 entries = ["test-ci"]            # targets CI requests, for orphan-test-target
 allow_orphans = ["//benchmarks:test"] # test targets run by hand, not reported
+allow_unnarrowable = ["//infra/bring-up:test-ci"] # fixed commands, not reported
 disable = ["orphan-test-target"] # rule ids to skip
 ```
 

@@ -748,3 +748,93 @@ fn allow_orphans_exempts_a_target_and_stale_entries_are_errors() {
     let (status, _) = ws("\"//shop:nope\"").check(&[]);
     assert_eq!(status, 1);
 }
+
+#[test]
+fn a_target_that_a_reached_package_script_calls_is_not_an_orphan() {
+    // Setup: CI requests `test-ci`, a package script that calls the others
+    // as a bare `pnpm <script>`, as `pnpm run <script>`, and through a nested
+    // script. `test-c` is called by nothing; `test` only aliases `test-ci`.
+    let ws = Workspace::new(&[
+        (
+            "aster.toml",
+            "[affected.lanes.infra]\ninclude = [\"//infra\"]\n\n[check]\nentries = [\"test-ci\"]\n",
+        ),
+        (
+            "infra/package.json",
+            r#"{"name":"infra","scripts":{
+                "test":"pnpm test-ci",
+                "test-ci":"pnpm test-a && pnpm run test-b && vitest run top.test.ts",
+                "test-a":"tsx --test tests/a.test.ts",
+                "test-b":"pnpm test-d && tsx --test tests/b.test.ts",
+                "test-c":"tsx --test tests/c.test.ts",
+                "test-d":"tsx --test tests/d.test.ts"}}"#,
+        ),
+        (
+            "infra/aster.toml",
+            "[targets.test]\ncommand = \"pnpm test\"\n\n[targets.test-ci]\ncommand = \"pnpm test-ci\"\n\n[targets.test-a]\ncommand = \"pnpm run test-a\"\n\n[targets.test-b]\ncommand = \"pnpm run test-b\"\n\n[targets.test-c]\ncommand = \"pnpm run test-c\"\n\n[targets.test-d]\ncommand = \"pnpm run test-d\"\n",
+        ),
+    ]);
+    for file in ["a", "b", "c", "d"] {
+        ws.write(&format!("infra/tests/{file}.test.ts"), "");
+    }
+    ws.write("infra/top.test.ts", "");
+
+    // Outcome: only the target nothing calls is an orphan.
+    let (_, report) = ws.check(&["--rule", "orphan-test-target"]);
+    assert_eq!(places(&report, "orphan-test-target"), ["//infra:test-c"]);
+}
+
+#[test]
+fn allow_unnarrowable_accepts_a_fixed_command_and_stale_entries_are_errors() {
+    let ws = |allow: &str| {
+        Workspace::new(&[
+            (
+                "aster.toml",
+                &format!("[check]\nentries = [\"test-ci\"]\nallow_unnarrowable = [{allow}]\n"),
+            ),
+            ("shop/mix.exs", MIX),
+            (
+                "shop/aster.toml",
+                "[targets.test-ci]\ncommand = \"./bring-up.sh\"\n\n[targets.test]\ncommand = \"mix test\"\n",
+            ),
+        ])
+    };
+
+    // Without the entry the script file is reported.
+    let (_, report) = ws("").check(&["--rule", "unnarrowable-test-command"]);
+    assert_eq!(
+        places(&report, "unnarrowable-test-command"),
+        ["//shop:test-ci"]
+    );
+
+    // With it the finding is gone and the entry is not stale.
+    let (status, report) = ws("\"//shop:test-ci\"").check(&[]);
+    assert_eq!(status, 0, "{report}");
+    assert!(
+        findings(&report, "unnarrowable-test-command").is_empty(),
+        "{report}"
+    );
+    assert!(
+        findings(&report, "stale-allow-unnarrowable").is_empty(),
+        "{report}"
+    );
+
+    // A target that is narrowable, and an address naming nothing, are stale
+    // errors.
+    let (status, report) = ws("\"//shop:test-ci\", \"//shop:test\", \"//shop:nope\"").check(&[]);
+    assert_eq!(status, 1, "{report}");
+    assert_eq!(
+        places(&report, "stale-allow-unnarrowable"),
+        ["//shop:nope", "//shop:test"]
+    );
+    assert_eq!(
+        findings(&report, "stale-allow-unnarrowable")[0]["severity"],
+        "error"
+    );
+    let messages: Vec<&str> = findings(&report, "stale-allow-unnarrowable")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert!(messages[0].contains("names no test target"), "{messages:?}");
+    assert!(messages[1].contains("narrows now"), "{messages:?}");
+}

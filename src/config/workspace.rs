@@ -59,6 +59,13 @@ pub struct CheckConfig {
     /// `stale-allow-orphan`.
     #[serde(default)]
     pub allow_orphans: Vec<String>,
+    /// Test targets (`//project:target`) whose command is fixed on purpose
+    /// and that `unnarrowable-test-command` does not report: a single proof,
+    /// an infrastructure bring-up script, a model checker. An entry that no
+    /// longer produces the finding (the target is narrowable now, or is gone)
+    /// is reported by `stale-allow-unnarrowable`.
+    #[serde(default)]
+    pub allow_unnarrowable: Vec<String>,
     /// Rule ids `aster check` skips.
     #[serde(default)]
     pub disable: Vec<String>,
