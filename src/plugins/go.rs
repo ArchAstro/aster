@@ -805,10 +805,14 @@ mod tests {
             );
             return;
         }
-        // Unlink only a disposable copy, never Cargo's binary or another run.
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("test-copy");
-        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        // Unlink only a disposable hard link, never Cargo's binary or another
+        // run. A copy would be written through a file descriptor that a
+        // concurrent test's fork can inherit, and exec of a file open for
+        // writing fails with ETXTBSY; a hard link is never opened for writing.
+        let current = std::env::current_exe().unwrap();
+        let tmp = tempfile::tempdir_in(current.parent().unwrap()).unwrap();
+        let exe = tmp.path().join("test-link");
+        std::fs::hard_link(&current, &exe).unwrap();
         let output = std::process::Command::new(exe)
             .args([
                 "--exact",
