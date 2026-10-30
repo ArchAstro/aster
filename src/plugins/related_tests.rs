@@ -660,11 +660,35 @@ fn covered(selected: &[String], listed: &[&str]) -> Vec<String> {
         .filter(|file| {
             listed.iter().any(|path| {
                 let path = path.trim_start_matches("./").trim_end_matches('/');
+                if is_glob(path) {
+                    return glob_covers(path, file);
+                }
                 path == "." || *file == path || file.starts_with(&format!("{path}/"))
             })
         })
         .cloned()
         .collect()
+}
+
+/// Whether a listed path is a pattern the shell (or the runner) expands.
+fn is_glob(path: &str) -> bool {
+    path.contains(['*', '?', '[', '{'])
+}
+
+/// Whether the pattern `glob` matches `file` or a directory above it. `*`
+/// does not cross a `/`, as in a shell.
+fn glob_covers(glob: &str, file: &str) -> bool {
+    let Ok(glob) = globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .build()
+    else {
+        return false;
+    };
+    let matcher = glob.compile_matcher();
+    Path::new(file)
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .any(|ancestor| matcher.is_match(ancestor))
 }
 
 /// Whether a listed path points outside the project, where the project's
@@ -811,6 +835,13 @@ pub(super) const JS_VALUE_FLAGS: &[&str] = &[
     "--import",
     "--loader",
     "--timeout",
+    "--env-file",
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-name-pattern",
+    "--test-timeout",
+    "--test-concurrency",
+    "--test-shard",
 ];
 
 /// Where a JavaScript runner's own arguments start, if `argv` runs one
@@ -945,8 +976,10 @@ pub(crate) fn package_script_runners(project_dir: &Path, command: &str) -> Vec<S
     out
 }
 
-/// Vitest, Jest, Mocha, `bun test` and `node --test`, run directly or
-/// through a package script that is nothing but the runner.
+/// Vitest, Jest, Mocha, `bun test` and `node --test`, run directly, through a
+/// package script that is nothing but the runner, or through a package
+/// script (`npm`/`pnpm`) whose `&&` chain contains runners; see
+/// [`script_chain`].
 pub(super) fn node(
     project_dir: &Path,
     command: &str,
@@ -955,11 +988,28 @@ pub(super) fn node(
     let argv = Argv::parse(command)?;
     let selected = files(tests);
     if let Some(start) = js_runner(&argv) {
+        // `node --test` takes file patterns, which the shell or the runner
+        // expands; the other runners read an argument as a filter.
+        let patterns = start > 0
+            && matches!(
+                Path::new(&argv.parts[start - 1])
+                    .file_name()
+                    .and_then(|n| n.to_str()),
+                Some("node" | "tsx")
+            );
         let listed: Vec<usize> = argv
             .positionals(start, JS_VALUE_FLAGS)
             .into_iter()
-            .filter(|&i| project_dir.join(&argv.parts[i]).exists())
+            .filter(|&i| {
+                project_dir.join(&argv.parts[i]).exists() || (patterns && is_glob(&argv.parts[i]))
+            })
             .collect();
+        // `node --test` runs the files it is given. One that does not exist
+        // yet (compiled by an earlier step) is a test the selection cannot
+        // name, so the command is left alone.
+        if patterns && argv.positionals(start, JS_VALUE_FLAGS).len() != listed.len() {
+            return None;
+        }
         let listed_paths: Vec<&str> = listed.iter().map(|&i| argv.parts[i].as_str()).collect();
         if escapes(&listed_paths) {
             return None;
@@ -970,7 +1020,14 @@ pub(super) fn node(
         }
         return plan(vec![argv.render(&listed, &keep)]);
     }
-    let script = js_script(&argv)?;
+    plain_script(project_dir, &argv, selected).or_else(|| script_chain(project_dir, &argv, tests))
+}
+
+/// A package script that is nothing but a runner (`pnpm test` where `test` is
+/// `vitest run`): the script call keeps its name and gets the files as
+/// arguments.
+fn plain_script(project_dir: &Path, argv: &Argv, selected: Vec<String>) -> Option<FilesListPlan> {
+    let script = js_script(argv)?;
     let manifest = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
     let body = manifest.get("scripts")?.get(script)?.as_str()?;
@@ -994,6 +1051,216 @@ pub(super) fn node(
     }
     add.extend(selected);
     plan(vec![argv.render(&[], &add)])
+}
+
+/// Programs that start a package script or a package's binary themselves.
+const PACKAGE_LAUNCHERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "npx", "pnpx", "bunx"];
+
+/// The `package.json` scripts of `project_dir`.
+fn package_scripts(project_dir: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let manifest = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    manifest.get("scripts")?.as_object().cloned()
+}
+
+/// The package script `command` calls and its body, for a message about a
+/// script Aster cannot narrow.
+pub(crate) fn package_script_body(project_dir: &Path, command: &str) -> Option<(String, String)> {
+    let argv = Argv::parse(command)?;
+    let name = script_name(&argv)?;
+    let body = package_scripts(project_dir)?
+        .get(name)?
+        .as_str()?
+        .to_string();
+    Some((name.to_string(), body))
+}
+
+/// Whether the source text of a word has shell syntax outside quotes that
+/// joins or redirects commands.
+fn has_shell_syntax(raw: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), _) => {}
+            (Some('"'), '\\') | (None, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (_, '`') => return true,
+            (_, '$') if chars.peek() == Some(&'(') => return true,
+            (None, ';' | '|' | '&' | '<' | '>' | '(' | ')') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The commands of a script body joined by `&&`, each as source text. `None`
+/// when the body uses any other operator, so what runs is not known.
+fn and_chain(body: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for word in raw_words(body)? {
+        if word == "&&" {
+            if current.is_empty() {
+                return None;
+            }
+            segments.push(current.join(" "));
+            current.clear();
+        } else if has_shell_syntax(&word) {
+            return None;
+        } else {
+            current.push(word);
+        }
+    }
+    if current.is_empty() {
+        return None;
+    }
+    segments.push(current.join(" "));
+    Some(segments)
+}
+
+/// The commands a package script runs, in order: its `&&` chain with the
+/// scripts it calls replaced by their own commands. `None` when the chain
+/// cannot be read reliably: another shell operator, a `cd`, an interpreter
+/// running a script, a cycle, nesting deeper than [`SCRIPT_DEPTH`], or a
+/// `pre`/`post` hook that npm or pnpm would run around a script.
+fn script_commands(
+    scripts: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    seen: &mut Vec<String>,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    if seen.len() >= SCRIPT_DEPTH || seen.iter().any(|s| s == name) {
+        return None;
+    }
+    if scripts.contains_key(&format!("pre{name}")) || scripts.contains_key(&format!("post{name}")) {
+        return None;
+    }
+    let body = scripts.get(name)?.as_str()?;
+    seen.push(name.to_string());
+    for segment in and_chain(body)? {
+        let argv = Argv::parse(&segment)?;
+        let program = Path::new(&argv.parts[argv.program])
+            .file_name()
+            .and_then(|n| n.to_str())?;
+        if matches!(program, "cd" | "pushd") {
+            return None;
+        }
+        match script_name(&argv).filter(|n| scripts.contains_key(*n)) {
+            Some(called) if PACKAGE_LAUNCHERS.contains(&program) => {
+                script_commands(scripts, called, seen, out)?;
+            }
+            _ => out.push(segment),
+        }
+    }
+    seen.pop();
+    Some(())
+}
+
+/// A command as the package script that contained it would have run it:
+/// with the project's `node_modules/.bin` on the path. Calls to a package
+/// launcher or to a path start a program themselves and are left alone.
+fn in_package(command: &str, launcher: &str) -> String {
+    let Some(words) = raw_words(command) else {
+        return command.to_string();
+    };
+    let Some(program) = words.iter().position(|w| !is_assignment(w)) else {
+        return command.to_string();
+    };
+    let name = Path::new(&words[program])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if PACKAGE_LAUNCHERS.contains(&name) || words[program].contains('/') {
+        return command.to_string();
+    }
+    if launcher == "pnpm" {
+        // The assignments stay in front, where the shell reads them.
+        let mut out = words[..program].to_vec();
+        out.push("pnpm exec".to_string());
+        out.extend(words[program..].iter().cloned());
+        out.join(" ")
+    } else {
+        format!("npm exec -c {}", quote_any(command))
+    }
+}
+
+/// A package script (`npm` or `pnpm`) whose body is a chain of commands:
+/// `pnpm test-ci` where `test-ci` is `pnpm test:unit && tsc --noEmit`, with
+/// `test:unit` itself `vitest run`.
+///
+/// The chain is expanded through the scripts it calls ([`script_commands`])
+/// and each command is narrowed or kept: a test runner command runs only the
+/// selected files it covers, or is dropped when none; every other command
+/// (`tsc --noEmit`, a generator's `--check`) is kept as written. Each command
+/// is started through `pnpm exec` or `npm exec -c`, so it finds the binaries
+/// in `node_modules/.bin` as it did inside the script. The commands run in
+/// order and the target fails at the first that fails, as `&&` does.
+///
+/// A runner whose own arguments cannot be narrowed (it lists a test file that
+/// does not exist yet, say) is kept as written, so it runs in full. `None`
+/// for a chain with no test runner (it is not a test command), one that
+/// cannot be read, or one in which no runner was narrowed or dropped. When
+/// every runner is dropped the plan is [`FilesListPlan::Nothing`] and the
+/// commands that are not runners do not run alone.
+fn script_chain(project_dir: &Path, argv: &Argv, tests: &[RelatedTest]) -> Option<FilesListPlan> {
+    let launcher = Path::new(&argv.parts[argv.program]).file_name()?.to_str()?;
+    if !matches!(launcher, "npm" | "pnpm") {
+        return None;
+    }
+    let scripts = package_scripts(project_dir)?;
+    let mut leaves = Vec::new();
+    script_commands(&scripts, script_name(argv)?, &mut Vec::new(), &mut leaves)?;
+    let mut commands = Vec::new();
+    // Runners narrowed to some files, dropped for selecting none, and kept
+    // as written because their own arguments could not be narrowed.
+    let (mut narrowed, mut dropped, mut kept) = (0, 0, 0);
+    for leaf in leaves {
+        let leaf_argv = Argv::parse(&leaf)?;
+        if js_runner(&leaf_argv).is_none() {
+            commands.push(in_package(&leaf, launcher));
+            continue;
+        }
+        match node(project_dir, &leaf, tests) {
+            Some(FilesListPlan::Commands(selected)) => {
+                narrowed += 1;
+                // Vitest and Jest exit with an error when a config's
+                // `include` matches none of the files they are given, as
+                // happens when the selection belongs to another config.
+                let names_a_runner = leaf_argv.parts.iter().any(|p| {
+                    matches!(
+                        Path::new(p).file_name().and_then(|n| n.to_str()),
+                        Some("vitest" | "jest")
+                    )
+                });
+                for command in selected {
+                    let command = if names_a_runner && !command.contains("--passWithNoTests") {
+                        format!("{command} --passWithNoTests")
+                    } else {
+                        command
+                    };
+                    commands.push(in_package(&command, launcher));
+                }
+            }
+            Some(FilesListPlan::Nothing) => dropped += 1,
+            // Over-approximating is safe: it runs whatever it ran before.
+            _ => {
+                kept += 1;
+                commands.push(in_package(&leaf, launcher));
+            }
+        }
+    }
+    if narrowed + dropped + kept == 0 || narrowed + dropped == 0 {
+        // No runner, or none that the selection could narrow.
+        return None;
+    }
+    if narrowed + kept == 0 {
+        return plan(Vec::new());
+    }
+    plan(commands)
 }
 
 pub(super) const GO_VALUE_FLAGS: &[&str] = &[
@@ -1574,8 +1841,22 @@ mod tests {
         ] {
             assert_eq!(commands(node(dir.path(), command, &tests)), [expected]);
         }
-        assert_eq!(node(dir.path(), "pnpm run test:all", &tests), None);
-        assert_eq!(node(dir.path(), "pnpm run test:src", &tests), None);
+        // A script with other commands in its chain is expanded; see
+        // `package_script_chain_tests`.
+        assert_eq!(
+            commands(node(dir.path(), "pnpm run test:all", &tests)),
+            [
+                "pnpm exec vitest run src/a.test.ts --passWithNoTests",
+                "pnpm exec tsc"
+            ]
+        );
+        // A script that names a directory of its own is read through, so
+        // its path can be replaced by the selected files.
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        assert_eq!(
+            commands(node(dir.path(), "pnpm run test:src", &tests)),
+            ["pnpm exec vitest run src/a.test.ts --passWithNoTests"]
+        );
         assert_eq!(
             node(dir.path(), "pnpm exec vitest related x.ts", &tests),
             None
@@ -1679,5 +1960,225 @@ mod package_script_runner_tests {
     fn a_script_that_changes_directory_or_is_missing_has_no_runner() {
         assert!(runners(r#""test":"cd web && vitest run""#, "pnpm test").is_empty());
         assert!(runners(r#""lint":"eslint .""#, "pnpm test").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod package_script_chain_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn selected(files: &[&str]) -> Vec<RelatedTest> {
+        files
+            .iter()
+            .map(|f| RelatedTest {
+                file: PathBuf::from(f),
+                names: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// `node` over a project with these scripts (a JSON object body) and
+    /// existing `files`.
+    fn narrow(
+        scripts: &str,
+        files: &[&str],
+        command: &str,
+        tests: &[&str],
+    ) -> Option<FilesListPlan> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!("{{\"scripts\":{{{scripts}}}}}"),
+        )
+        .unwrap();
+        for file in files {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        node(dir.path(), command, &selected(tests))
+    }
+
+    fn run(plan: Option<FilesListPlan>) -> Vec<String> {
+        match plan {
+            Some(FilesListPlan::Commands(commands)) => commands,
+            other => panic!("expected commands, got {other:?}"),
+        }
+    }
+
+    const NESTED: &str = r#""test-ci":"pnpm unit && pnpm e2e && tsc --noEmit","unit":"vitest run --project unit","e2e":"pnpm run ensure && vitest run --config e2e.config.ts","ensure":"node setup.mjs --check""#;
+
+    #[test]
+    fn nested_scripts_expand_into_one_command_per_step() {
+        let plan = narrow(NESTED, &[], "pnpm test-ci", &["src/a.test.ts"]);
+        assert_eq!(
+            run(plan),
+            [
+                "pnpm exec vitest run --project unit src/a.test.ts --passWithNoTests",
+                "pnpm exec node setup.mjs --check",
+                "pnpm exec vitest run --config e2e.config.ts src/a.test.ts --passWithNoTests",
+                "pnpm exec tsc --noEmit",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_runner_that_selects_nothing_is_dropped_and_the_rest_keep_their_order() {
+        let scripts = r#""t":"vitest run src/old && node gen.mjs --check && vitest run src/new""#;
+        let plan = narrow(
+            scripts,
+            &["src/old/x.test.ts", "src/new/y.test.ts"],
+            "pnpm t",
+            &["src/new/y.test.ts"],
+        );
+        assert_eq!(
+            run(plan),
+            [
+                "pnpm exec node gen.mjs --check",
+                "pnpm exec vitest run src/new/y.test.ts --passWithNoTests"
+            ]
+        );
+    }
+
+    #[test]
+    fn when_every_runner_is_dropped_the_other_commands_do_not_run_alone() {
+        let scripts = r#""t":"node gen.mjs --check && vitest run src/old && tsc""#;
+        let plan = narrow(
+            scripts,
+            &["src/old/x.test.ts"],
+            "pnpm t",
+            &["src/new/y.test.ts"],
+        );
+        assert_eq!(plan, Some(FilesListPlan::Nothing));
+        let plan = narrow(scripts, &["src/old/x.test.ts"], "pnpm t", &[]);
+        assert_eq!(plan, Some(FilesListPlan::Nothing));
+    }
+
+    #[test]
+    fn a_chain_without_a_runner_is_not_a_test_command() {
+        let scripts = r#""t":"eslint . && tsc --noEmit""#;
+        assert_eq!(narrow(scripts, &[], "pnpm t", &["a.test.ts"]), None);
+    }
+
+    #[test]
+    fn node_test_commands_replace_their_files_and_globs() {
+        let scripts = r#""t":"NODE_OPTIONS=--max-old-space-size=8192 node --import tsx --test --test-timeout=600000 test/*.test.ts && tsx --test --test-force-exit tests/a.test.ts tests/b.test.ts""#;
+        let plan = narrow(
+            scripts,
+            &["tests/a.test.ts", "tests/b.test.ts"],
+            "pnpm run t",
+            &["test/x.test.ts", "tests/b.test.ts", "other/c.test.ts"],
+        );
+        assert_eq!(
+            run(plan),
+            [
+                "NODE_OPTIONS=--max-old-space-size=8192 pnpm exec node --import tsx --test --test-timeout=600000 test/x.test.ts",
+                "pnpm exec tsx --test --test-force-exit tests/b.test.ts",
+            ]
+        );
+        // A glob only covers the files it matches, `*` stopping at a `/`.
+        let plan = narrow(
+            scripts,
+            &["tests/a.test.ts", "tests/b.test.ts"],
+            "pnpm t",
+            &["test/deep/x.test.ts"],
+        );
+        assert_eq!(plan, Some(FilesListPlan::Nothing));
+    }
+
+    #[test]
+    fn npm_runs_each_command_in_a_shell_with_the_package_binaries() {
+        let plan = narrow(NESTED, &[], "npm run test-ci", &["src/a.test.ts"]);
+        let commands = run(plan);
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            commands[0],
+            "npm exec -c 'vitest run --project unit src/a.test.ts --passWithNoTests'"
+        );
+        assert_eq!(commands[3], "npm exec -c 'tsc --noEmit'");
+    }
+
+    #[test]
+    fn a_launcher_or_a_path_is_not_wrapped_again() {
+        let scripts = r#""t":"./scripts/check.sh && pnpm exec vitest run && npx tsc""#;
+        let plan = narrow(scripts, &[], "pnpm t", &["a.test.ts"]);
+        assert_eq!(
+            run(plan),
+            [
+                "./scripts/check.sh",
+                "pnpm exec vitest run a.test.ts --passWithNoTests",
+                "npx tsc"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chain_that_cannot_be_read_is_left_as_written() {
+        for scripts in [
+            // A cycle.
+            r#""t":"pnpm u && vitest run","u":"pnpm t""#,
+            // A directory change.
+            r#""t":"cd web && vitest run""#,
+            // Another operator.
+            r#""t":"vitest run || true""#,
+            r#""t":"vitest run; tsc""#,
+            r#""t":"vitest run | cat""#,
+            // A hook npm or pnpm would run around the script.
+            r#""t":"vitest run","pret":"node prep.mjs""#,
+            // A script file through an interpreter.
+            r#""t":"bash run.sh && vitest run""#,
+            // A missing script.
+            r#""other":"vitest run""#,
+        ] {
+            // Not the plain form either: the chain has two commands or more.
+            let scripts = if scripts.contains("pret") {
+                scripts.replace("vitest run\"", "vitest run && tsc\"")
+            } else {
+                scripts.to_string()
+            };
+            assert_eq!(
+                narrow(&scripts, &[], "pnpm t", &["a.test.ts"]),
+                None,
+                "{scripts}"
+            );
+        }
+        // Yarn and bun have no `exec` that finds the package binaries the
+        // way a script does.
+        let scripts = r#""t":"vitest run && tsc""#;
+        assert_eq!(narrow(scripts, &[], "yarn t", &["a.test.ts"]), None);
+        assert_eq!(narrow(scripts, &[], "bun run t", &["a.test.ts"]), None);
+    }
+
+    #[test]
+    fn a_runner_that_cannot_be_narrowed_runs_as_written_beside_the_ones_that_can() {
+        // `dist/a.test.js` is built by an earlier step and is not there yet.
+        let scripts = r#""t":"node --test dist/a.test.js && vitest run && tsc""#;
+        let plan = narrow(scripts, &[], "pnpm t", &["src/a.test.ts"]);
+        assert_eq!(
+            run(plan),
+            [
+                "pnpm exec node --test dist/a.test.js",
+                "pnpm exec vitest run src/a.test.ts --passWithNoTests",
+                "pnpm exec tsc"
+            ]
+        );
+        // With no runner narrowed, nothing is gained and the target runs as
+        // written.
+        let scripts = r#""t":"node --test dist/a.test.js && tsc""#;
+        assert_eq!(narrow(scripts, &[], "pnpm t", &["src/a.test.ts"]), None);
+        // A runner that is declined and one that is dropped: only the first
+        // runs.
+        let scripts = r#""t":"node --test dist/a.test.js && vitest run src/old && tsc""#;
+        let plan = narrow(
+            scripts,
+            &["src/old/x.test.ts"],
+            "pnpm t",
+            &["src/new/y.test.ts"],
+        );
+        assert_eq!(
+            run(plan),
+            ["pnpm exec node --test dist/a.test.js", "pnpm exec tsc"]
+        );
     }
 }

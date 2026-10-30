@@ -133,7 +133,12 @@ pub fn run(
 
     // Rules about targets.
     if enabled(UNNARROWABLE) || enabled(ORPHAN) || enabled(STALE_ALLOW) {
-        let tests = test_targets(projects, wrappers, registry);
+        let tests = test_targets(
+            projects,
+            wrappers,
+            registry,
+            &entry_targets(config, options),
+        );
         if enabled(UNNARROWABLE) {
             for test in tests.iter().filter(|t| t.unnarrowable.is_some()) {
                 report.findings.push(Finding {
@@ -206,6 +211,23 @@ pub fn run(
 }
 
 type Suites = Vec<(String, Option<String>)>;
+
+/// The CI entry targets: `[check] entries`, `--entry`, and the `target` of
+/// each lane.
+fn entry_targets(config: &WorkspaceConfig, options: &Options) -> Vec<String> {
+    let mut entries: Vec<String> = config.check.entries.clone();
+    entries.extend(options.entries.iter().cloned());
+    entries.extend(
+        config
+            .affected
+            .lanes
+            .values()
+            .filter_map(|lane| lane.target.clone()),
+    );
+    entries.sort();
+    entries.dedup();
+    entries
+}
 
 /// Test targets that no entry target runs.
 fn orphans(
