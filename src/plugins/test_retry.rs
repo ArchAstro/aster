@@ -41,14 +41,19 @@ pub(crate) fn commands(
         return None;
     }
     if let Some(wrapped) = wrappers.strip(command) {
-        if let Some(found) = unwrapped(working_dir, &wrapped.command, failures) {
+        if let Some(found) = unwrapped(working_dir, &wrapped.command, failures, wrappers) {
             return Some(found.iter().map(|c| wrapped.render(c)).collect());
         }
     }
-    unwrapped(working_dir, command, failures)
+    unwrapped(working_dir, command, failures, wrappers)
 }
 
-fn unwrapped(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
+fn unwrapped(
+    working_dir: &Path,
+    command: &str,
+    failures: &[&TestCase],
+    wrappers: &Wrappers,
+) -> Option<Vec<String>> {
     if let Some(found) = direct(working_dir, command, failures) {
         return Some(found);
     }
@@ -61,8 +66,18 @@ fn unwrapped(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Optio
     // A partition's retry runs the failing files, which are not that
     // partition's to deal out.
     let delegated = delegated.without_assignment("MIX_TEST_PARTITION");
-    let found = direct(&inner_dir, &delegated.command, failures)?;
-    Some(found.iter().map(|c| delegated.render(c)).collect())
+    if let Some(found) = direct(&inner_dir, &delegated.command, failures) {
+        return Some(found.iter().map(|c| delegated.render(c)).collect());
+    }
+    // A wrapper inside the one-liner: `bash -c 'mise exec x -- cargo test'`.
+    let wrapped = wrappers.strip(&delegated.command)?;
+    let found = direct(&inner_dir, &wrapped.command, failures)?;
+    Some(
+        found
+            .iter()
+            .map(|c| delegated.render(&wrapped.render(c)))
+            .collect(),
+    )
 }
 
 fn direct(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
@@ -932,6 +947,18 @@ mod tests {
         assert!(
             rerun_cargo[0].starts_with("with-rust-toolchain cargo test "),
             "{rerun_cargo:?}"
+        );
+        // A wrapper inside a one-liner keeps its place too.
+        let inside = rerun(
+            "with-rust-toolchain bash -c 'A=1 mise exec x -- cargo test --no-fail-fast'",
+            &cargo,
+        )
+        .unwrap();
+        assert!(
+            inside[0].starts_with("with-rust-toolchain bash -c ")
+                && inside[0].contains("mise exec x -- cargo test --no-fail-fast")
+                && inside[0].contains("tests::flaky"),
+            "{inside:?}"
         );
         // A wrapper that is not configured hides the runner, as before.
         assert!(rerun("unlisted exec -- bun test", &bun).is_none());
