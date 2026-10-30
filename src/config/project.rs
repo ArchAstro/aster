@@ -176,7 +176,9 @@ pub struct RichTargetConfig {
     #[serde(default)]
     pub invalidates_cache: bool,
 
-    /// Named resources requiring exclusive access within a DAG level
+    /// Named resources requiring exclusive access within an invocation.
+    /// `host:` and `workspace:` prefixes also coordinate independent CLI runs
+    /// on Linux/macOS; bare names retain their within-invocation scope.
     #[serde(default)]
     pub exclusive_resources: Vec<String>,
 

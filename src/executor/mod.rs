@@ -5,6 +5,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
+#[cfg(unix)]
+pub mod admission;
+#[cfg(not(unix))]
+#[path = "admission_unsupported.rs"]
+pub mod admission;
 pub(crate) mod command;
 pub mod logs;
 pub mod runner;

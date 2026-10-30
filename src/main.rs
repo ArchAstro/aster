@@ -42,6 +42,22 @@ use std::path::{Path, PathBuf};
 const CACHE_HASH_DISPLAY_LENGTH: usize = 8;
 
 fn main() -> ExitCode {
+    if let Some(result) = aster::executor::admission::internal_invocation() {
+        return match result {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("execution supervisor: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match env::current_exe() {
+        Ok(executable) => aster::executor::admission::enable(executable),
+        Err(error) => {
+            eprintln!("cannot locate Aster's execution supervisor: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     if aster::dev::is_internal_serve_invocation() {
         return match aster::dev::serve_from_environment() {
             Ok(()) => ExitCode::SUCCESS,
@@ -67,6 +83,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    if let Some(jobs) = cli.jobs {
+        env::set_var("ASTER_JOBS", jobs.to_string());
+    }
     if cli.skills {
         return print_skills();
     }
@@ -1721,6 +1740,12 @@ fn run() -> Result<()> {
             validate_lang_filter(&run_args.lang)?;
 
             // Apply global flags that clap couldn't parse from external subcommands
+            if let Some(jobs) = &run_args.jobs {
+                let jobs = jobs
+                    .parse::<std::num::NonZeroUsize>()
+                    .context("--jobs must be a positive integer")?;
+                env::set_var("ASTER_JOBS", jobs.to_string());
+            }
             if run_args.no_cache {
                 cli.no_cache = true;
             }

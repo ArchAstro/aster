@@ -59,6 +59,11 @@ pub struct Cli {
     #[arg(long, global = true, exclusive = true)]
     pub skills: bool,
 
+    /// Shared host capacity for target commands (also ASTER_JOBS).
+    /// An active invocation freezes this value; conflicting requests fail.
+    #[arg(long, global = true, value_name = "N")]
+    pub jobs: Option<std::num::NonZeroUsize>,
+
     /// Enable verbose output
     #[arg(short, long, global = true, conflicts_with = "quiet")]
     pub verbose: bool,
