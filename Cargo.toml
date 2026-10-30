@@ -101,6 +101,6 @@ predicates = "3.1"
 dirs = "6.0"
 rcgen = "0.14"
 aster-srv = { path = "crates/aster-srv" }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
