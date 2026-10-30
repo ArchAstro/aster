@@ -899,7 +899,9 @@ impl TestTarget {
 /// it is: a package script that runs a runner Aster cannot narrow, or, for an
 /// entry target, any command that is not inert.
 fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> {
-    use crate::plugins::related_tests::{package_script_body, package_script_runners};
+    use crate::plugins::related_tests::{
+        is_js_runner, package_script_body, package_script_runners,
+    };
     let Some(runner) = runner else {
         return entry.then(|| {
             "its shell script changes into a directory that is not a project".to_string()
@@ -929,14 +931,15 @@ fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> 
         .iter()
         .filter(|w| !is_environment_assignment(w))
         .collect();
-    if let Some(file) = script_file(&words) {
+    if let Some(file) = script_file(&words).filter(|_| !is_js_runner(&runner.command)) {
         return Some(format!(
             "it runs the script file `{file}`, which Aster does not read; put the runner command \
              in the target"
         ));
     }
     Some(format!(
-        "`{}` is not a test runner Aster can narrow",
+        "`{}` is not a test command Aster can narrow: it is not a runner Aster recognises, or its \
+         form (an unsupported flag, a path outside the project) is not supported",
         runner.command
     ))
 }
@@ -950,10 +953,13 @@ fn script_file(words: &[&String]) -> Option<String> {
         "sh", "bash", "zsh", "dash", "node", "python", "python3", "ruby", "perl", "tsx", "deno",
     ];
     if interpreters.contains(&name) {
+        // `-c` and `-m` run code or a module, not a file.
+        if words.iter().any(|w| matches!(w.as_str(), "-c" | "-m")) {
+            return None;
+        }
         return words
             .iter()
             .skip(1)
-            .take_while(|w| w.as_str() != "-c")
             .find(|w| !w.starts_with('-'))
             .map(|w| w.to_string());
     }
