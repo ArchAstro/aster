@@ -148,6 +148,10 @@ jobs:
       - name: Render public formula for the latest release
         run: |
           brew tap-new --no-git aster-ci/public-release
+          # Homebrew 7 refuses formulae from taps it has not been told to trust.
+          if brew commands | grep -qx trust; then
+            brew trust --tap aster-ci/public-release
+          fi
           formula="$(brew --repository aster-ci/public-release)/Formula/aster.rb"
           sed \
             -e "s/__VERSION__/0.7.0/g" \
