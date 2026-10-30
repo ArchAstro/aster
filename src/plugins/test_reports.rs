@@ -6,9 +6,12 @@
 //! written. Plans keep the runner's console output unchanged: a reporter is
 //! added alongside the one the user sees, never in place of it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::related_tests::{js_runner, js_script, Argv, Delegated, Wrappers};
+use super::related_tests::{
+    in_package_script, is_js_runner, is_script_call, js_runner, js_script, script_leaves, Argv,
+    Delegated, Wrappers,
+};
 use super::LanguagePlugin;
 use crate::config::{ReportConfig, ReportConfigFormat};
 use crate::test_results::{exunit, nodetest};
@@ -72,7 +75,7 @@ pub(crate) fn plan(
     if let Some(report) = declared_report {
         return Some(declared(report, ctx));
     }
-    let direct = |ctx: &ReportContext| plugin.test_report_plan(ctx).or_else(|| recognise(ctx));
+    let direct = |ctx: &ReportContext| plan_direct(plugin, ctx);
     if let Some(wrapped) = wrappers.strip(ctx.command) {
         let inner = ReportContext {
             command: &wrapped.command,
@@ -84,6 +87,148 @@ pub(crate) fn plan(
         }
     }
     direct(ctx)
+}
+
+fn plan_direct(plugin: &dyn LanguagePlugin, ctx: &ReportContext) -> Option<ReportPlan> {
+    plugin.test_report_plan(ctx).or_else(|| recognise(ctx))
+}
+
+/// How a package script chain is started: the wrapper in front of the
+/// script call, and the launcher (`pnpm`, `npm`) that starts each step the
+/// way the script would have.
+#[derive(Debug, Clone)]
+pub(crate) struct Launch {
+    prefix: String,
+    launcher: String,
+}
+
+impl Launch {
+    /// A step of the chain as it is started.
+    pub(crate) fn apply(&self, step: &str) -> String {
+        format!("{}{}", self.prefix, in_package_script(step, &self.launcher))
+    }
+}
+
+/// One command of an expanded package script chain.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainStep {
+    /// The step as the script wrote it.
+    pub leaf: String,
+    /// How to capture the results of a test runner step, and its own report
+    /// directory. `None` for a step that is not a test runner (`tsc`,
+    /// `eslint`, a generator): it runs as written.
+    pub plan: Option<(ReportPlan, PathBuf)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChainPlan {
+    pub launch: Launch,
+    pub steps: Vec<ChainStep>,
+}
+
+impl ChainPlan {
+    pub(crate) fn remove_report_dirs(&self) {
+        for (_, dir) in self.steps.iter().filter_map(|step| step.plan.as_ref()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// What reading a command as a package script chain found.
+pub(crate) enum Chain {
+    /// Not a chain with test runners in it, or one that cannot be read
+    /// (`cd`, a `pre`/`post` hook, a cycle, another shell operator).
+    Single,
+    /// A chain with a step Aster cannot plan or read: a runner whose flags or
+    /// config choose their own reporters, or a call to a script it could not
+    /// expand.
+    Unplanned {
+        step: String,
+    },
+    Plan(ChainPlan),
+}
+
+/// A package script (`npm`/`pnpm`) whose body is a chain of commands
+/// (`vitest run a && tsc --noEmit && vitest run b`) is expanded into the
+/// commands `--related` expands it into. Each test runner step gets its own
+/// report plan and report directory; other steps run as written. `new_dir`
+/// makes a report directory per runner step.
+pub(crate) fn chain(
+    plugin: &dyn LanguagePlugin,
+    ctx: &ReportContext,
+    wrappers: &Wrappers,
+    new_dir: &mut dyn FnMut() -> Option<PathBuf>,
+) -> Chain {
+    let (prefix, inner) = match wrappers.strip(ctx.command) {
+        Some(wrapped) => (wrapped.prefix, wrapped.command),
+        None => (String::new(), ctx.command.to_string()),
+    };
+    let Some((launcher, leaves)) = script_leaves(ctx.working_dir, &inner) else {
+        return Chain::Single;
+    };
+    if leaves.len() < 2 || !leaves.iter().any(|leaf| is_js_runner(leaf)) {
+        return Chain::Single;
+    }
+    let mut steps: Vec<ChainStep> = Vec::new();
+    let unplanned = |steps: &[ChainStep], step: String| {
+        for (_, dir) in steps.iter().filter_map(|step| step.plan.as_ref()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Chain::Unplanned { step }
+    };
+    for leaf in leaves {
+        if !is_js_runner(&leaf) {
+            if is_script_call(&leaf) {
+                return unplanned(&steps, leaf);
+            }
+            steps.push(ChainStep { leaf, plan: None });
+            continue;
+        }
+        let Some(dir) = new_dir() else {
+            return unplanned(&steps, leaf);
+        };
+        let step_ctx = ReportContext {
+            command: &leaf,
+            report_dir: &dir,
+            ..*ctx
+        };
+        match plan_direct(plugin, &step_ctx) {
+            Some(plan) => steps.push(ChainStep {
+                leaf,
+                plan: Some((plan, dir)),
+            }),
+            None => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return unplanned(&steps, leaf);
+            }
+        }
+    }
+    Chain::Plan(ChainPlan {
+        launch: Launch { prefix, launcher },
+        steps,
+    })
+}
+
+/// [`chain`] for a target: not when the target declares its report or one
+/// complete plan already covers its command. The decision the executor and
+/// `aster check` both ask, after [`plan`].
+pub(crate) fn chain_for_target(
+    plugin: &dyn LanguagePlugin,
+    declared_report: Option<&ReportConfig>,
+    ctx: &ReportContext,
+    wrappers: &Wrappers,
+    new_dir: &mut dyn FnMut() -> Option<PathBuf>,
+) -> Chain {
+    if declared_report.is_some() {
+        return Chain::Single;
+    }
+    // A command that only mentions `node --test` is planned as partial;
+    // the chain reads each of its steps completely.
+    if plan(plugin, None, ctx, wrappers).is_some_and(|plan| plan.confidence == Confidence::Complete)
+    {
+        return Chain::Single;
+    }
+    chain(plugin, ctx, wrappers, new_dir)
 }
 
 /// Plan for a test command whatever the project's language: the runners
@@ -1399,6 +1544,133 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         .unwrap();
         assert!(declared_plan.declared);
         assert_eq!(declared_plan.command, command);
+    }
+
+    #[test]
+    fn a_package_script_chain_gets_a_report_plan_per_runner_step() {
+        use crate::config::{RelatedWrapperConfig, RelatedWrapperTable};
+        use crate::plugins::PluginRegistry;
+        let manifest = r#"{"scripts":{
+            "test-ci":"pnpm test:a && tsc --noEmit && vitest run b.test.ts",
+            "test:a":"vitest run a.test.ts",
+            "hooked":"vitest run a && tsc","prehooked":"true",
+            "moved":"cd sub && vitest run && tsc",
+            "own":"vitest run && tsc",
+            "calls":"vitest run && pnpm build","build":"tsc && pnpm calls",
+            "lint":"eslint . && tsc"}}"#;
+        let (_tmp, f) = node_project(manifest);
+        let registry = PluginRegistry::with_all_plugins();
+        let plugin = registry.find_by_name("nodejs").unwrap();
+        let mise = Wrappers::new(&[RelatedWrapperConfig::Detailed(RelatedWrapperTable {
+            program: "mise".to_string(),
+            until: Some("--".to_string()),
+        })]);
+        let run = |command: &str, wrappers: &Wrappers| {
+            chain_for_target(
+                plugin,
+                None,
+                &context(&f, "test", command),
+                wrappers,
+                &mut || {
+                    static NEXT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let dir = f.report_dir.join(
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .to_string(),
+                    );
+                    std::fs::create_dir_all(&dir).ok()?;
+                    Some(dir)
+                },
+            )
+        };
+
+        // Two runner steps with their own report directories; tsc runs as
+        // written; the launcher and wrapper start every step.
+        let Chain::Plan(plan) = run("mise exec node -- pnpm test-ci", &mise) else {
+            panic!("a chain");
+        };
+        let leaves: Vec<&str> = plan.steps.iter().map(|s| s.leaf.as_str()).collect();
+        assert_eq!(
+            leaves,
+            [
+                "vitest run a.test.ts",
+                "tsc --noEmit",
+                "vitest run b.test.ts"
+            ]
+        );
+        let dirs: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|s| s.plan.as_ref().map(|(_, dir)| dir.clone()))
+            .collect();
+        assert_eq!(dirs.len(), 2);
+        assert_ne!(dirs[0], dirs[1]);
+        assert!(plan.steps[1].plan.is_none());
+        let planned = &plan.steps[2].plan.as_ref().unwrap().0;
+        assert_eq!(planned.format, ReportFormat::JUnitXml);
+        assert_eq!(planned.confidence, Confidence::Complete);
+        assert!(
+            planned.command.starts_with("vitest run "),
+            "{}",
+            planned.command
+        );
+        assert_eq!(
+            plan.launch.apply("tsc --noEmit"),
+            "mise exec node -- pnpm exec tsc --noEmit"
+        );
+        // The npm launcher quotes the whole step.
+        let Chain::Plan(npm) = run("npm run test-ci", &Wrappers::default()) else {
+            panic!("a chain");
+        };
+        assert_eq!(
+            npm.launch.apply("tsc --noEmit"),
+            "npm exec -c 'tsc --noEmit'"
+        );
+
+        // Chains that cannot be read stay uncaptured, as narrowing leaves them.
+        for command in [
+            "pnpm hooked",
+            "pnpm moved",
+            "pnpm lint",
+            "pnpm test-ci --if-present",
+        ] {
+            assert!(
+                matches!(run(command, &Wrappers::default()), Chain::Single),
+                "{command}"
+            );
+        }
+        // A runner step that picks its own reporters, or a call that is not
+        // expanded, is named.
+        match run("pnpm calls", &Wrappers::default()) {
+            Chain::Unplanned { step } => assert!(step.starts_with("pnpm "), "{step}"),
+            _ => panic!("a call that is not expanded"),
+        }
+        std::fs::write(
+            f.project.join("vitest.config.ts"),
+            "export default { test: { reporters: ['dot'] } }",
+        )
+        .unwrap();
+        match run("pnpm own", &Wrappers::default()) {
+            Chain::Unplanned { step } => assert_eq!(step, "vitest run"),
+            _ => panic!("a runner whose config sets reporters"),
+        }
+        // One plan already covers a plain script; a declared report wins.
+        assert!(matches!(
+            run("pnpm test:a", &Wrappers::default()),
+            Chain::Single
+        ));
+        let report = ReportConfig {
+            format: ReportConfigFormat::Junit,
+            files: Vec::new(),
+        };
+        let declared = chain_for_target(
+            plugin,
+            Some(&report),
+            &context(&f, "test", "pnpm test-ci"),
+            &Wrappers::default(),
+            &mut || None,
+        );
+        assert!(matches!(declared, Chain::Single));
     }
 
     #[test]

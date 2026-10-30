@@ -1386,6 +1386,35 @@ fn in_package(command: &str, launcher: &str) -> String {
     }
 }
 
+/// The commands that the package script `command` calls (`npm`/`pnpm`)
+/// runs, in order, expanded through the scripts it calls exactly as
+/// `--related` expands them ([`script_commands`]), with the launcher
+/// (`npm` or `pnpm`). `None` when `command` is not such a call or the chain
+/// cannot be read (a `cd`, a `pre`/`post` hook, a cycle, another shell
+/// operator).
+pub(crate) fn script_leaves(project_dir: &Path, command: &str) -> Option<(String, Vec<String>)> {
+    let argv = Argv::parse(command)?;
+    let launcher = Path::new(&argv.parts[argv.program]).file_name()?.to_str()?;
+    if !matches!(launcher, "npm" | "pnpm") {
+        return None;
+    }
+    let scripts = package_scripts(project_dir)?;
+    let mut leaves = Vec::new();
+    script_commands(&scripts, script_name(&argv)?, &mut Vec::new(), &mut leaves)?;
+    Some((launcher.to_string(), leaves))
+}
+
+/// Whether `command` calls a package script (`pnpm build`, `npm run lint`).
+pub(crate) fn is_script_call(command: &str) -> bool {
+    Argv::parse(command).is_some_and(|argv| script_name(&argv).is_some())
+}
+
+/// A command of a package script started as the script would have: through
+/// `pnpm exec` or `npm exec -c`, so it finds `node_modules/.bin`.
+pub(crate) fn in_package_script(command: &str, launcher: &str) -> String {
+    in_package(command, launcher)
+}
+
 /// A package script (`npm` or `pnpm`) whose body is a chain of commands:
 /// `pnpm test-ci` where `test-ci` is `pnpm test:unit && tsc --noEmit`, with
 /// `test:unit` itself `vitest run`.

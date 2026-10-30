@@ -42,6 +42,7 @@ use crate::ui::ProgressDisplay;
 
 mod partitions;
 pub use partitions::partitioned_suites;
+mod chain;
 mod retry;
 
 use super::admission::{Host, Permit};
@@ -1035,7 +1036,33 @@ impl<'a> Executor<'a> {
         });
         // Test capture rewrites the commands only now, after the cache
         // key was computed from the commands as written.
-        let captures = if self.capture_tests || self.retry_failed > 0 {
+        let capturing = self.capture_tests || self.retry_failed > 0;
+        // A package script chain is run step by step, each runner step with
+        // its own report.
+        let chain = if capturing {
+            plugin_registry
+                .find_by_name(&project.plugin_name)
+                .and_then(|plugin| {
+                    let declared = project
+                        .targets
+                        .get(&target_name)
+                        .and_then(|target| target.report.as_ref());
+                    plan_chain(
+                        plugin,
+                        declared,
+                        &project_root,
+                        &working_dir,
+                        &target_name,
+                        &commands,
+                        &self.wrappers,
+                    )
+                })
+        } else {
+            None
+        };
+        let captures = if chain.is_some() {
+            Vec::new()
+        } else if capturing {
             plugin_registry
                 .find_by_name(&project.plugin_name)
                 .map(|plugin| {
@@ -1094,8 +1121,8 @@ impl<'a> Executor<'a> {
         let log_cap = self.log_cap;
         // Retrying reruns one command, so a target that runs several
         // (a split `--only-affected-files` run) is not retried.
-        let retry_command =
-            (self.retry_failed > 0 && commands.len() == 1).then(|| commands[0].clone());
+        let retry_command = (self.retry_failed > 0 && commands.len() == 1 && chain.is_none())
+            .then(|| commands[0].clone());
         let retry_failed = self.retry_failed;
         let wrappers = self.wrappers.clone();
         // Quarantine judges one command's results, like a retry.
@@ -1104,6 +1131,7 @@ impl<'a> Executor<'a> {
             .clone()
             .filter(|_| !captures.is_empty() && commands.len() == 1);
         let quarantine_command = commands.first().cloned();
+        let chain_quarantine = self.quarantine.clone().filter(|_| chain.is_some());
         let retry_setup = project
             .targets
             .get(&target_name)
@@ -1175,14 +1203,41 @@ impl<'a> Executor<'a> {
                     }
                 };
                 let started = SystemTime::now();
-                let (mut result, raw_outputs) = run_invocations(
-                    &addr,
-                    &invocations,
-                    &working_dir,
-                    null_stdin,
-                    log_cap,
-                    permit.as_ref(),
-                );
+                let (mut result, raw_outputs) = match &chain {
+                    Some(chain_plan) => {
+                        let registry = PluginRegistry::with_all_plugins();
+                        let plugin = registry
+                            .find_by_name(&plugin_name)
+                            .expect("a chain is planned by its project's plugin");
+                        let result = chain::run(
+                            &chain::ChainJob {
+                                address: &addr,
+                                plugin,
+                                plugin_name: &plugin_name,
+                                project_dir: &project_root,
+                                working_dir: &working_dir,
+                                target_name: &target_name_clone,
+                                setup: retry_setup.as_deref(),
+                                max_retries: retry_failed,
+                                quarantine: chain_quarantine.as_deref(),
+                                null_stdin,
+                                log_cap,
+                                permit: permit.as_ref(),
+                            },
+                            chain_plan,
+                        );
+                        chain_plan.remove_report_dirs();
+                        (result, Vec::new())
+                    }
+                    None => run_invocations(
+                        &addr,
+                        &invocations,
+                        &working_dir,
+                        null_stdin,
+                        log_cap,
+                        permit.as_ref(),
+                    ),
+                };
                 if !captures.is_empty() {
                     result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
                 }
@@ -1200,6 +1255,7 @@ impl<'a> Executor<'a> {
                                 command,
                                 setup: retry_setup.as_deref(),
                                 wrappers: &wrappers,
+                                launch: None,
                                 max_retries: retry_failed,
                                 permit: permit.as_ref(),
                                 null_stdin,
@@ -2523,6 +2579,42 @@ impl Invocation {
         };
         (result, raw)
     }
+}
+
+/// The step-by-step capture of a target whose one command is a package script
+/// chain that no single report plan covers. `None` for any other target, a
+/// target with a declared report, or a chain with a step Aster cannot plan
+/// (the target is then uncaptured, which `aster check` reports).
+pub(crate) fn plan_chain(
+    plugin: &dyn LanguagePlugin,
+    declared: Option<&crate::config::ReportConfig>,
+    project_dir: &Path,
+    working_dir: &Path,
+    target_name: &str,
+    commands: &[String],
+    wrappers: &Wrappers,
+) -> Option<crate::plugins::test_reports::ChainPlan> {
+    use crate::plugins::test_reports::{self, Chain};
+    let [command] = commands else {
+        return None;
+    };
+    let probe = test_results::new_report_dir().ok()?;
+    let context = ReportContext {
+        project_dir,
+        working_dir,
+        target_name,
+        command,
+        report_dir: &probe,
+    };
+    let found =
+        match test_reports::chain_for_target(plugin, declared, &context, wrappers, &mut || {
+            test_results::new_report_dir().ok()
+        }) {
+            Chain::Plan(plan) => Some(plan),
+            Chain::Single | Chain::Unplanned { .. } => None,
+        };
+    let _ = std::fs::remove_dir_all(&probe);
+    found
 }
 
 /// Ask the plugin how to capture test results from each command. Each

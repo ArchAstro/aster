@@ -387,8 +387,24 @@ whether a results file is written.
 A runner behind a program listed in `[affected.related] wrappers` (`mise exec
 go -- bun test`, `scripts/with-rust-toolchain cargo test`) is captured and
 retried too: Aster plans the report and the rerun on the command the wrapper
-runs and writes the wrapper back in front. A target whose results cannot be
-captured is never retried and cannot be quarantined; `aster check` reports it
+runs and writes the wrapper back in front.
+
+A package script that chains commands (`pnpm test-ci` where `test-ci` is
+`vitest run a && tsc --noEmit && vitest run b`) is run step by step, the steps
+`--related` expands it into (through the scripts it calls, with `pnpm exec` or
+`npm exec -c` and the wrapper in front of each). Every runner step has its own
+report and the results of all steps are one report; `tsc`, `eslint` and other
+steps run as written. A failing test is retried by rerunning only its step's
+runner narrowed to that test, and the chain goes on after the step passes, as
+`&&` would have; a step whose only failures are quarantined goes on the same
+way. This holds for a full run too. A chain Aster cannot read (a `cd`, a
+`pre`/`post` hook, a cycle, an operator other than `&&`, a launcher other than
+`npm` or `pnpm`) or a runner step whose flags or config choose their own
+reporters leaves the target uncaptured. If a runner step crashes before it
+writes a report, the run's results are partial: the target fails and nothing is
+excused.
+
+A target whose results cannot be captured is never retried and cannot be quarantined; `aster check` reports it
 as `uncaptured-test-results`.
 
 `retry_setup` is a shell command run in the target's working directory before
@@ -1075,7 +1091,7 @@ configuration findings.
 | `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A target whose command is a package script that a reached target calls (`pnpm <script>`, `pnpm run <script>`, `npm run <script>`, `yarn <script>`, through nested scripts), or whose script only calls such scripts, is reached too. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
 | `stale-annotation` | error | An `aster: not-a-read` whose line holds no path-naming literal, an `aster: reads` path that matches nothing, or an unknown `aster:` directive. |
 | `stale-allow-orphan` | error | A `[check] allow_orphans` entry that names no test target of the workspace, or a target that an entry already reaches (so it is not an orphan and the entry does nothing). |
-| `uncaptured-test-results` | warning | A test target whose per-test results Aster cannot capture, so `--retry-failed` cannot rerun its failing tests and quarantine cannot excuse a flaky one. It applies to every test target, entry targets (`--entry`, `[check] entries`, a lane's `target`) included, and is reported even when `--related` can narrow the command or `allow_unnarrowable` lists it: a fixed proof still needs results. The message says why: it runs a script file, a package script that is more than a bare runner, a runner inside a compound command, a runner behind a program that is not a configured wrapper, or a runner whose flags or config choose their own reporters. The rule asks the function the executor plans every command with (configured wrappers included), so a target is reported exactly when a run would record no tests for it. A target that declares its report (`[targets.X] report = { .. }`) is captured and is not reported. A command that runs no per-test runner at all is listed in `[check] allow_no_test_results`. |
+| `uncaptured-test-results` | warning | A test target whose per-test results Aster cannot capture, so `--retry-failed` cannot rerun its failing tests and quarantine cannot excuse a flaky one. It applies to every test target, entry targets (`--entry`, `[check] entries`, a lane's `target`) included, and is reported even when `--related` can narrow the command or `allow_unnarrowable` lists it: a fixed proof still needs results. The message says why: it runs a script file, a package script chain Aster cannot read or one of whose runner steps it cannot plan, a runner inside a compound command, a runner behind a program that is not a configured wrapper, or a runner whose flags or config choose their own reporters. The rule asks the function the executor plans every command with (configured wrappers included), so a target is reported exactly when a run would record no tests for it. A target that declares its report (`[targets.X] report = { .. }`) is captured and is not reported. A command that runs no per-test runner at all is listed in `[check] allow_no_test_results`. |
 | `stale-allow-no-test-results` | error | A `[check] allow_no_test_results` entry that names no test target of the workspace, or a target whose results Aster captures now. |
 | `stale-allow-unnarrowable` | error | A `[check] allow_unnarrowable` entry that names no test target of the workspace, or a target that `--related` narrows now (so it produces no `unnarrowable-test-command` finding and the entry does nothing). |
 

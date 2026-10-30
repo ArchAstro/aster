@@ -7,6 +7,7 @@
 //! every retry command exits 0.
 
 use super::*;
+use crate::plugins::test_reports::Launch;
 use crate::plugins::test_retry;
 use crate::test_results::quarantine::Quarantined;
 use crate::test_results::same_test;
@@ -25,6 +26,9 @@ pub(super) struct RetryJob<'a> {
     pub setup: Option<&'a str>,
     /// `[affected.related] wrappers`.
     pub wrappers: &'a Wrappers,
+    /// Set when `command` is one step of a package script chain: each rerun
+    /// is started the way the script starts its steps.
+    pub launch: Option<&'a Launch>,
     pub max_retries: u32,
     pub null_stdin: bool,
     pub log_cap: usize,
@@ -118,10 +122,14 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
         let mut commands_ok = true;
         let mut last_exit = None;
         for (command, capture) in commands.iter().zip(&captures) {
-            let invocation = match capture.first() {
+            let mut invocation = match capture.first() {
                 Some(Some((plan, _))) => Invocation::planned(command, plan),
                 _ => Invocation::plain(command),
             };
+            if let Some(launch) = job.launch {
+                invocation.command = launch.apply(&invocation.command);
+                invocation.shown = launch.apply(&invocation.shown);
+            }
             let started = SystemTime::now();
             let (ran, raw_outputs) = run_invocations(
                 job.address,
@@ -384,6 +392,7 @@ mod tests {
         let job = RetryJob {
             address: "//app:test",
             wrappers: &wrappers,
+            launch: None,
             plugin,
             project_dir: tmp.path(),
             working_dir: tmp.path(),
