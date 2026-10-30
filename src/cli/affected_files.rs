@@ -906,7 +906,7 @@ impl TestTarget {
 /// Why a command with no test runner in its words is still reported, when
 /// it is: a package script that runs a runner Aster cannot narrow, or, for an
 /// entry target, any command that is not inert.
-fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> {
+fn hidden_runner_reason(runner: Option<&Runner>, entry: bool, purpose: Purpose) -> Option<String> {
     use crate::plugins::related_tests::{
         is_js_runner, package_script_body, package_script_runners,
     };
@@ -945,11 +945,27 @@ fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> 
              in the target"
         ));
     }
-    Some(format!(
-        "`{}` is not a test command Aster can narrow: it is not a runner Aster recognises, or its \
-         form (an unsupported flag, a path outside the project) is not supported",
-        runner.command
-    ))
+    Some(match purpose {
+        Purpose::Narrowing => format!(
+            "`{}` is not a test command Aster can narrow: it is not a runner Aster recognises, or \
+             its form (an unsupported flag, a path outside the project) is not supported",
+            runner.command
+        ),
+        Purpose::Capture => format!(
+            "`{}` runs no test runner Aster recognises (it may run no per-test runner at all, \
+             such as a compile check or a model checker)",
+            runner.command
+        ),
+    })
+}
+
+/// What a reason for an unreadable command is for.
+#[derive(Clone, Copy)]
+enum Purpose {
+    /// `--related` cannot narrow the command.
+    Narrowing,
+    /// Aster cannot capture the command's per-test results.
+    Capture,
 }
 
 /// The script file a command runs: `./test-ci.sh`, `bash tools/run.sh`,
@@ -1283,7 +1299,7 @@ pub fn test_targets(
                         // package script whose runners Aster cannot narrow.
                         // Only a target known to run tests is reported.
                         let entry = entries.contains(name) && !is_inert(&def.command);
-                        match hidden_runner_reason(runner.as_ref(), entry) {
+                        match hidden_runner_reason(runner.as_ref(), entry, Purpose::Narrowing) {
                             Some(reason) => {
                                 hidden = true;
                                 Some(reason)
@@ -1432,7 +1448,7 @@ pub fn uncaptured_reason(
              that program runs the command after it, list it in `[affected.related] wrappers`"
         );
     }
-    match hidden_runner_reason(runner.as_ref(), true) {
+    match hidden_runner_reason(runner.as_ref(), true, Purpose::Capture) {
         Some(reason) => format!("no test runner whose results Aster can capture: {reason}"),
         None => "no test runner whose results Aster can capture".to_string(),
     }
