@@ -771,7 +771,10 @@ pub(super) fn mix(
             return plan(Vec::new());
         }
     }
-    plan(vec![argv.render(&listed, &keep)])
+    let (mut drop, mut add) = MIX_COVERAGE.edit(&argv, test + 1);
+    drop.extend(&listed);
+    add.splice(0..0, keep);
+    plan(vec![argv.render(&drop, &add)])
 }
 
 /// Which partition a `mix test --partitions N` command runs, when
@@ -976,6 +979,136 @@ pub(crate) fn package_script_runners(project_dir: &Path, command: &str) -> Vec<S
     out
 }
 
+/// Flags that turn coverage on or configure it, for the runners Aster
+/// narrows. Coverage thresholds measure a whole suite, so a run narrowed to a
+/// few files fails them although the full run passes; a narrowed run
+/// disables coverage instead.
+struct CoverageFlags {
+    /// A flag starting with one of these is dropped.
+    prefixes: &'static [&'static str],
+    /// Of those, the ones whose value is the next argument when it is not
+    /// written with `=`.
+    value_flags: &'static [&'static str],
+    /// A flag that switches coverage off, added to a narrowed run.
+    off: Option<&'static str>,
+    /// Add `off` only when the command turned coverage on itself: the flag
+    /// belongs to a plugin that may not be installed.
+    off_only_if_present: bool,
+}
+
+const VITEST_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--coverage"],
+    value_flags: &[
+        "--coverage.provider",
+        "--coverage.reporter",
+        "--coverage.reportsDirectory",
+        "--coverage.include",
+        "--coverage.exclude",
+        "--coverage.thresholds.statements",
+        "--coverage.thresholds.branches",
+        "--coverage.thresholds.functions",
+        "--coverage.thresholds.lines",
+    ],
+    // Also overrides `coverage.enabled: true` in the config file.
+    off: Some("--coverage.enabled=false"),
+    off_only_if_present: false,
+};
+
+const JEST_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--coverage", "--collectCoverage"],
+    value_flags: &[
+        "--coverageProvider",
+        "--coverageReporters",
+        "--coverageDirectory",
+        "--coverageThreshold",
+        "--coveragePathIgnorePatterns",
+        "--collectCoverageFrom",
+    ],
+    off: Some("--coverage=false"),
+    off_only_if_present: false,
+};
+
+const BUN_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--coverage"],
+    value_flags: &["--coverage-reporter", "--coverage-dir"],
+    off: None,
+    off_only_if_present: false,
+};
+
+const NODE_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--experimental-test-coverage", "--test-coverage-"],
+    value_flags: &[],
+    off: None,
+    off_only_if_present: false,
+};
+
+const PYTEST_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--cov"],
+    value_flags: &[
+        "--cov",
+        "--cov-report",
+        "--cov-config",
+        "--cov-fail-under",
+        "--cov-context",
+    ],
+    off: Some("--no-cov"),
+    off_only_if_present: true,
+};
+
+const MIX_COVERAGE: CoverageFlags = CoverageFlags {
+    prefixes: &["--cover", "--export-coverage"],
+    value_flags: &["--export-coverage"],
+    off: None,
+    off_only_if_present: false,
+};
+
+impl CoverageFlags {
+    /// The indexes of the coverage arguments in `argv` from `from`, and the
+    /// flags to add.
+    fn edit(&self, argv: &Argv, from: usize) -> (Vec<usize>, Vec<String>) {
+        let mut drop = Vec::new();
+        let mut i = from;
+        while i < argv.parts.len() {
+            let part = argv.parts[i].as_str();
+            if part == "--" {
+                break;
+            }
+            if self.prefixes.iter().any(|prefix| part.starts_with(prefix)) {
+                drop.push(i);
+                let next = argv.parts.get(i + 1);
+                if self.value_flags.contains(&part) && next.is_some_and(|n| !n.starts_with('-')) {
+                    drop.push(i + 1);
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        let add = self
+            .off
+            .filter(|_| !self.off_only_if_present || !drop.is_empty())
+            .map(|flag| vec![flag.to_string()])
+            .unwrap_or_default();
+        (drop, add)
+    }
+}
+
+/// The coverage flags of the JavaScript runner `argv` runs.
+fn js_coverage(argv: &Argv) -> &'static CoverageFlags {
+    let names: Vec<&str> = argv.parts[argv.program..]
+        .iter()
+        .filter_map(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+        .collect();
+    if names.contains(&"vitest") {
+        &VITEST_COVERAGE
+    } else if names.contains(&"jest") {
+        &JEST_COVERAGE
+    } else if names.contains(&"bun") {
+        &BUN_COVERAGE
+    } else {
+        &NODE_COVERAGE
+    }
+}
+
 /// Vitest, Jest, Mocha, `bun test` and `node --test`, run directly, through a
 /// package script that is nothing but the runner, or through a package
 /// script (`npm`/`pnpm`) whose `&&` chain contains runners; see
@@ -1018,7 +1151,10 @@ pub(super) fn node(
         if keep.is_empty() {
             return plan(Vec::new());
         }
-        return plan(vec![argv.render(&listed, &keep)]);
+        let (mut drop, mut add) = js_coverage(&argv).edit(&argv, argv.program);
+        drop.extend(&listed);
+        add.splice(0..0, keep);
+        return plan(vec![argv.render(&drop, &add)]);
     }
     plain_script(project_dir, &argv, selected).or_else(|| script_chain(project_dir, &argv, tests))
 }
@@ -1043,6 +1179,16 @@ fn plain_script(project_dir: &Path, argv: &Argv, selected: Vec<String>) -> Optio
     if !script_argv.positionals(start, JS_VALUE_FLAGS).is_empty() {
         return None;
     }
+    // The script turns coverage on: its flags cannot be removed from the
+    // call, so the script is read as a chain instead.
+    let coverage = js_coverage(&script_argv);
+    if !coverage
+        .edit(&script_argv, script_argv.program)
+        .0
+        .is_empty()
+    {
+        return None;
+    }
     if selected.is_empty() {
         return plan(Vec::new());
     }
@@ -1056,6 +1202,7 @@ fn plain_script(project_dir: &Path, argv: &Argv, selected: Vec<String>) -> Optio
         add.push("--".to_string());
     }
     add.extend(selected);
+    add.extend(coverage.off.map(str::to_string));
     plan(vec![argv.render(&[], &add)])
 }
 
@@ -1561,7 +1708,10 @@ pub(super) fn pytest(
     if keep.is_empty() {
         return plan(Vec::new());
     }
-    plan(vec![argv.render(&listed, &keep)])
+    let (mut drop, mut add) = PYTEST_COVERAGE.edit(&argv, runner + 1);
+    drop.extend(&listed);
+    add.splice(0..0, keep);
+    plan(vec![argv.render(&drop, &add)])
 }
 
 #[cfg(test)]
@@ -1838,21 +1988,39 @@ mod tests {
                 "pnpm exec vitest run --config vitest.e2e.config.ts",
                 &tests
             )),
-            ["pnpm exec vitest run --config vitest.e2e.config.ts src/a.test.ts"]
+            ["pnpm exec vitest run --config vitest.e2e.config.ts src/a.test.ts --coverage.enabled=false"]
         );
         assert_eq!(
             commands(node(dir.path(), "pnpm test", &tests)),
-            ["pnpm test src/a.test.ts"]
+            ["pnpm test src/a.test.ts --coverage.enabled=false"]
         );
         // Only npm needs `--` to pass arguments to a script; pnpm, yarn and
         // bun would forward it to the runner, which then ignores the files.
         for (command, expected) in [
-            ("npm test", "npm test -- src/a.test.ts"),
-            ("npm run test", "npm run test -- src/a.test.ts"),
-            ("pnpm run test", "pnpm run test src/a.test.ts"),
-            ("yarn test", "yarn test src/a.test.ts"),
-            ("yarn run test", "yarn run test src/a.test.ts"),
-            ("bun run test", "bun run test src/a.test.ts"),
+            (
+                "npm test",
+                "npm test -- src/a.test.ts --coverage.enabled=false",
+            ),
+            (
+                "npm run test",
+                "npm run test -- src/a.test.ts --coverage.enabled=false",
+            ),
+            (
+                "pnpm run test",
+                "pnpm run test src/a.test.ts --coverage.enabled=false",
+            ),
+            (
+                "yarn test",
+                "yarn test src/a.test.ts --coverage.enabled=false",
+            ),
+            (
+                "yarn run test",
+                "yarn run test src/a.test.ts --coverage.enabled=false",
+            ),
+            (
+                "bun run test",
+                "bun run test src/a.test.ts --coverage.enabled=false",
+            ),
         ] {
             assert_eq!(commands(node(dir.path(), command, &tests)), [expected]);
         }
@@ -1861,7 +2029,7 @@ mod tests {
         assert_eq!(
             commands(node(dir.path(), "pnpm run test:all", &tests)),
             [
-                "pnpm exec vitest run src/a.test.ts --passWithNoTests",
+                "pnpm exec vitest run src/a.test.ts --coverage.enabled=false --passWithNoTests",
                 "pnpm exec tsc"
             ]
         );
@@ -1870,7 +2038,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         assert_eq!(
             commands(node(dir.path(), "pnpm run test:src", &tests)),
-            ["pnpm exec vitest run src/a.test.ts --passWithNoTests"]
+            ["pnpm exec vitest run src/a.test.ts --coverage.enabled=false --passWithNoTests"]
         );
         assert_eq!(
             node(dir.path(), "pnpm exec vitest related x.ts", &tests),
@@ -2030,9 +2198,9 @@ mod package_script_chain_tests {
         assert_eq!(
             run(plan),
             [
-                "pnpm exec vitest run --project unit src/a.test.ts --passWithNoTests",
+                "pnpm exec vitest run --project unit src/a.test.ts --coverage.enabled=false --passWithNoTests",
                 "pnpm exec node setup.mjs --check",
-                "pnpm exec vitest run --config e2e.config.ts src/a.test.ts --passWithNoTests",
+                "pnpm exec vitest run --config e2e.config.ts src/a.test.ts --coverage.enabled=false --passWithNoTests",
                 "pnpm exec tsc --noEmit",
             ]
         );
@@ -2051,7 +2219,7 @@ mod package_script_chain_tests {
             run(plan),
             [
                 "pnpm exec node gen.mjs --check",
-                "pnpm exec vitest run src/new/y.test.ts --passWithNoTests"
+                "pnpm exec vitest run src/new/y.test.ts --coverage.enabled=false --passWithNoTests"
             ]
         );
     }
@@ -2109,7 +2277,7 @@ mod package_script_chain_tests {
         assert_eq!(commands.len(), 4);
         assert_eq!(
             commands[0],
-            "npm exec -c 'vitest run --project unit src/a.test.ts --passWithNoTests'"
+            "npm exec -c 'vitest run --project unit src/a.test.ts --coverage.enabled=false --passWithNoTests'"
         );
         assert_eq!(commands[3], "npm exec -c 'tsc --noEmit'");
     }
@@ -2122,7 +2290,7 @@ mod package_script_chain_tests {
             run(plan),
             [
                 "./scripts/check.sh",
-                "pnpm exec vitest run a.test.ts --passWithNoTests",
+                "pnpm exec vitest run a.test.ts --coverage.enabled=false --passWithNoTests",
                 "npx tsc"
             ]
         );
@@ -2174,7 +2342,7 @@ mod package_script_chain_tests {
                 "pnpm run build",
                 "pnpm e2e",
                 "pnpm a",
-                "pnpm exec vitest run src/a.test.ts --passWithNoTests"
+                "pnpm exec vitest run src/a.test.ts --coverage.enabled=false --passWithNoTests"
             ]
         );
     }
@@ -2188,7 +2356,7 @@ mod package_script_chain_tests {
             run(plan),
             [
                 "pnpm exec node --test dist/a.test.js",
-                "pnpm exec vitest run src/a.test.ts --passWithNoTests",
+                "pnpm exec vitest run src/a.test.ts --coverage.enabled=false --passWithNoTests",
                 "pnpm exec tsc"
             ]
         );
@@ -2208,6 +2376,160 @@ mod package_script_chain_tests {
         assert_eq!(
             run(plan),
             ["pnpm exec node --test dist/a.test.js", "pnpm exec tsc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    //! A narrowed run measures a few files, so a coverage threshold written
+    //! for the whole suite would fail it: coverage is turned off.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn selected(files: &[&str]) -> Vec<RelatedTest> {
+        files
+            .iter()
+            .map(|f| RelatedTest {
+                file: PathBuf::from(f),
+                names: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn commands(plan: Option<FilesListPlan>) -> Vec<String> {
+        match plan {
+            Some(FilesListPlan::Commands(commands)) => commands,
+            other => panic!("expected commands, got {other:?}"),
+        }
+    }
+
+    fn project(scripts: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!("{{\"scripts\":{{{scripts}}}}}"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn vitest_loses_its_coverage_flags_and_gets_coverage_disabled() {
+        let dir = project("");
+        let tests = selected(&["src/a.test.ts"]);
+        assert_eq!(
+            commands(node(
+                dir.path(),
+                "vitest run --coverage --config vitest.review-coverage.config.ts",
+                &tests
+            )),
+            ["vitest run --config vitest.review-coverage.config.ts src/a.test.ts --coverage.enabled=false"]
+        );
+        // Dotted flags and their space-separated values go too; other flags stay.
+        assert_eq!(
+            commands(node(
+                dir.path(),
+                "vitest run --coverage.provider v8 --coverage.thresholds.lines 80 --coverage.reporter=text --bail 1",
+                &tests
+            )),
+            ["vitest run --bail 1 src/a.test.ts --coverage.enabled=false"]
+        );
+        // A config that enables coverage is overridden even when the command
+        // says nothing about it.
+        assert_eq!(
+            commands(node(dir.path(), "vitest run", &tests)),
+            ["vitest run src/a.test.ts --coverage.enabled=false"]
+        );
+    }
+
+    #[test]
+    fn jest_and_bun_and_node_lose_theirs() {
+        let dir = project("");
+        let tests = selected(&["src/a.test.ts"]);
+        assert_eq!(
+            commands(node(
+                dir.path(),
+                "jest --coverage --coverageThreshold '{\"global\":{\"lines\":80}}' --ci",
+                &tests
+            )),
+            ["jest --ci src/a.test.ts --coverage=false"]
+        );
+        assert_eq!(
+            commands(node(
+                dir.path(),
+                "bun test --coverage --coverage-reporter lcov --timeout 5",
+                &tests
+            )),
+            ["bun test --timeout 5 src/a.test.ts"]
+        );
+        assert_eq!(
+            commands(node(
+                dir.path(),
+                "node --test --experimental-test-coverage --test-coverage-lines=80",
+                &tests
+            )),
+            ["node --test src/a.test.ts"]
+        );
+    }
+
+    #[test]
+    fn a_plain_script_gets_the_flag_and_a_script_with_coverage_is_read_as_a_chain() {
+        let dir = project(
+            r#""test":"vitest run","test:coverage":"vitest run --coverage --config cov.config.ts""#,
+        );
+        let tests = selected(&["src/a.test.ts"]);
+        assert_eq!(
+            commands(node(dir.path(), "pnpm test", &tests)),
+            ["pnpm test src/a.test.ts --coverage.enabled=false"]
+        );
+        assert_eq!(
+            commands(node(dir.path(), "npm test", &tests)),
+            ["npm test -- src/a.test.ts --coverage.enabled=false"]
+        );
+        // The flag is in the script body, which the call cannot edit.
+        assert_eq!(
+            commands(node(dir.path(), "pnpm test:coverage", &tests)),
+            ["pnpm exec vitest run --config cov.config.ts src/a.test.ts --coverage.enabled=false --passWithNoTests"]
+        );
+        // yarn has no chain form, so it runs as written.
+        assert_eq!(node(dir.path(), "yarn test:coverage", &tests), None);
+    }
+
+    #[test]
+    fn pytest_drops_cov_flags_and_adds_no_cov_only_when_they_were_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let tests = selected(&["tests/test_a.py"]);
+        assert_eq!(
+            commands(pytest(
+                dir.path(),
+                "pytest --cov=src --cov-report term --cov-fail-under=80 -q",
+                &tests
+            )),
+            ["pytest -q tests/test_a.py --no-cov"]
+        );
+        assert_eq!(
+            commands(pytest(dir.path(), "pytest --cov src --cov-branch", &tests)),
+            ["pytest tests/test_a.py --no-cov"]
+        );
+        // `--no-cov` belongs to pytest-cov, which this command does not use.
+        assert_eq!(
+            commands(pytest(dir.path(), "pytest -q", &tests)),
+            ["pytest -q tests/test_a.py"]
+        );
+    }
+
+    #[test]
+    fn mix_drops_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let tests = selected(&["test/a_test.exs"]);
+        assert_eq!(
+            commands(mix(
+                dir.path(),
+                "mix test --cover --export-coverage default --warnings-as-errors",
+                &tests
+            )),
+            ["mix test --warnings-as-errors test/a_test.exs"]
         );
     }
 }

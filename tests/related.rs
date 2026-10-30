@@ -436,13 +436,13 @@ fn typescript_change_follows_package_imports_into_dependent_projects() {
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//money:test"),
-        ["npm test -- src/math.test.ts"]
+        ["npm test -- src/math.test.ts --coverage.enabled=false"]
     );
     // The dependent that calls `add` runs the one test that reaches it; the
     // dependent that only formats is not run at all.
     assert_eq!(
         plan.commands("//cart:test"),
-        ["npm test -- src/total.test.ts"]
+        ["npm test -- src/total.test.ts --coverage.enabled=false"]
     );
     assert_eq!(plan.runs(), ["//cart:test", "//money:test"]);
 }
@@ -476,11 +476,11 @@ fn a_source_file_read_by_path_selects_the_code_that_reads_it() {
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//cart:test"),
-        ["npm test -- src/bundle.test.ts"]
+        ["npm test -- src/bundle.test.ts --coverage.enabled=false"]
     );
     assert_eq!(
         plan.commands("//labels:test"),
-        ["npm test -- src/copy.test.ts"]
+        ["npm test -- src/copy.test.ts --coverage.enabled=false"]
     );
     assert!(plan
         .notes("//cart:test")
@@ -535,7 +535,7 @@ fn a_directory_named_by_path_selects_on_any_file_beneath_it() {
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//cart:test"),
-        ["npm test -- src/prices.test.ts"]
+        ["npm test -- src/prices.test.ts --coverage.enabled=false"]
     );
     assert!(plan
         .notes("//cart:test")
@@ -555,7 +555,7 @@ fn a_directory_named_by_path_selects_on_any_file_beneath_it() {
     ws.write("money/data/prices/golden.txt", "1.00\n");
     assert_eq!(
         ws.plan("test").commands("//cart:test"),
-        ["npm test -- src/prices.test.ts"]
+        ["npm test -- src/prices.test.ts --coverage.enabled=false"]
     );
 
     // A file beside the directory is not beneath it.
@@ -568,7 +568,7 @@ fn a_directory_named_by_path_selects_on_any_file_beneath_it() {
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//libs/tax:test"),
-        ["npm test -- src/tax.test.ts"]
+        ["npm test -- src/tax.test.ts --coverage.enabled=false"]
     );
     assert_eq!(plan.runs(), ["//libs/tax:test"]);
 }
@@ -1092,7 +1092,7 @@ fn a_method_reaches_only_the_tests_that_load_its_file() {
     // load `mail.ts`.
     assert_eq!(
         ws.plan("test").commands("//post:test"),
-        ["npm test -- src/mail.test.ts src/notify-mail.test.ts src/plugin.test.ts"]
+        ["npm test -- src/mail.test.ts src/notify-mail.test.ts src/plugin.test.ts --coverage.enabled=false"]
     );
 }
 
@@ -1129,7 +1129,7 @@ fn a_change_that_reaches_a_setup_file_runs_every_test() {
     ws.edit("post/src/clock.ts", "return 2", "return 3");
     assert_eq!(
         ws.plan("test").commands("//post:test"),
-        ["npm test -- src/clock.test.ts"]
+        ["npm test -- src/clock.test.ts --coverage.enabled=false"]
     );
 
     ws.git(&["checkout", "-q", "."]);
@@ -2192,15 +2192,15 @@ fn package_script_files_follow_each_package_managers_argument_rules() {
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//money:test"),
-        ["pnpm test src/format.test.ts src/math.test.ts"]
+        ["pnpm test src/format.test.ts src/math.test.ts --coverage.enabled=false"]
     );
     assert_eq!(
         plan.commands("//cart:test"),
-        ["yarn run test src/total.test.ts"]
+        ["yarn run test src/total.test.ts --coverage.enabled=false"]
     );
     assert_eq!(
         plan.commands("//labels:test"),
-        ["bun run test src/label.test.ts"]
+        ["bun run test src/label.test.ts --coverage.enabled=false"]
     );
 
     // npm keeps the separator.
@@ -2215,7 +2215,7 @@ fn package_script_files_follow_each_package_managers_argument_rules() {
     ws.edit("money/src/format.ts", "`$${n}`", "`$ ${n}`");
     assert_eq!(
         ws.plan("test").commands("//money:test"),
-        ["npm run test -- src/format.test.ts src/math.test.ts"]
+        ["npm run test -- src/format.test.ts src/math.test.ts --coverage.enabled=false"]
     );
 }
 
@@ -2289,11 +2289,11 @@ fn configured_wrapper_programs_stay_in_front_of_the_narrowed_command() {
     );
     assert_eq!(
         plan.commands("//money:test"),
-        ["mise exec node@24 -- vitest run src/math.test.ts"]
+        ["mise exec node@24 -- vitest run src/math.test.ts --coverage.enabled=false"]
     );
     assert_eq!(
         plan.commands("//cart:test"),
-        ["mise exec node@24 -- vitest run src/total.test.ts"]
+        ["mise exec node@24 -- vitest run src/total.test.ts --coverage.enabled=false"]
     );
 
     // Without the entry the program is not known to run a test command, so

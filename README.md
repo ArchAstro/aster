@@ -555,6 +555,19 @@ the tests that reach them, across project boundaries.
   command runs as written. A
   command that already lists test files keeps the ones selected. A
   `{files}` placeholder receives the selected test files.
+- **A narrowed run disables coverage.** Coverage thresholds measure a whole
+  suite, so a run narrowed to a few files would fail a threshold the full run
+  passes. A narrowed Vitest command loses its `--coverage` and `--coverage.*`
+  arguments and gets `--coverage.enabled=false` (which also overrides
+  `coverage.enabled: true` in the config file); Jest loses its coverage
+  arguments and gets `--coverage=false`; `pytest` loses `--cov*` and gets
+  `--no-cov` (only when the command used `--cov`, since the flag needs
+  pytest-cov); `mix test` loses `--cover` and `--export-coverage`; `bun test`
+  and `node --test` lose their coverage flags. A package script that turns
+  coverage on in its body is read as a chain so the flag can be removed (an
+  `npm`/`pnpm` script; other launchers run it as written). Coverage set only
+  in `mix.exs` (`test_coverage`) or `go test -coverprofile` is not touched:
+  Mix only measures with `--cover`, and a Go profile has no threshold.
 - **Package script chains.** A target that runs an `npm` or `pnpm` script
   (`pnpm test-ci`, `npm run test:ci`) is read through `package.json`: the
   script body is split on `&&`, and a command that calls another script
