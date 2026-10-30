@@ -329,14 +329,40 @@ fn uncaptured(
             report_dir: &report_dir,
         };
         let planned = test_reports::plan(plugin, def.report.as_ref(), &context, &wrappers);
+        // A package script chain is captured step by step.
+        let mut chain_reason = None;
+        let mut chained = false;
+        if planned.is_none() {
+            match test_reports::chain_for_target(
+                plugin,
+                def.report.as_ref(),
+                &context,
+                &wrappers,
+                &mut || new_report_dir().ok(),
+            ) {
+                test_reports::Chain::Plan(plan) => {
+                    plan.remove_report_dirs();
+                    chained = true;
+                }
+                test_reports::Chain::Unplanned { step } => chain_reason = Some(step),
+                test_reports::Chain::Single => {}
+            }
+        }
         let _ = std::fs::remove_dir_all(&report_dir);
-        if planned.is_some() {
+        if planned.is_some() || chained {
             continue;
         }
         let address = format!("{}:{}", test.project, test.target);
         missing.insert(address.clone());
         if enabled(UNCAPTURED) && !allowed.contains(address.as_str()) {
-            let reason = uncaptured_reason(projects, wrapper_config, registry, project, def);
+            let reason = match chain_reason {
+                Some(step) => format!(
+                    "its package script chain has a step Aster cannot capture or read: `{step}` \
+                     (a runner whose flags or config choose their own reporters, or a call to a \
+                     script Aster could not expand)"
+                ),
+                None => uncaptured_reason(projects, wrapper_config, registry, project, def),
+            };
             report.findings.push(Finding {
                 rule: UNCAPTURED,
                 severity: severity(UNCAPTURED),
@@ -695,7 +721,10 @@ mod tests {
         );
         write(
             "web/package.json",
-            r#"{"name":"web","scripts":{"lint":"eslint ."}}"#,
+            r#"{"name":"web","scripts":{"lint":"eslint .",
+            "chain":"vitest run a && tsc --noEmit && vitest run b",
+            "hooked":"vitest run && tsc","prehooked":"true",
+            "mixed":"vitest run && node --test x.test.js && tsc"}}"#,
         );
         write(
             "web/aster.toml",
@@ -710,6 +739,12 @@ command = "unlisted exec -- bun test"
 command = "./run-tests.sh"
 [targets.test-compound]
 command = "bash -c 'bun test && bun run lint'"
+[targets.test-chain]
+command = "pnpm chain"
+[targets.test-mixed]
+command = "pnpm mixed"
+[targets.test-hooked]
+command = "pnpm hooked"
 [targets.test-declared]
 command = "./run-tests.sh"
 [targets.test-declared.report]
@@ -752,25 +787,39 @@ format = "junit"
             &registry,
             &entry_targets(&config, &options),
         );
-        assert!(tests.len() >= 9, "{tests:?}");
+        assert!(tests.len() >= 12, "{tests:?}");
         for test in &tests {
             let project = projects
                 .iter()
                 .find(|p| format!("//{}", p.relative_path.display()) == test.project)
                 .unwrap();
             let def = &project.targets[&test.target];
+            let plugin = registry.find_by_name(&project.plugin_name).unwrap();
+            let commands = std::slice::from_ref(&def.command);
             let captures = crate::executor::runner::plan_captures(
-                registry.find_by_name(&project.plugin_name).unwrap(),
+                plugin,
                 def.report.as_ref(),
                 &project.root,
                 &project.root,
                 &test.target,
-                std::slice::from_ref(&def.command),
+                commands,
                 &wrappers,
             );
-            let planned = captures[0].is_some();
+            let chain = crate::executor::runner::plan_chain(
+                plugin,
+                def.report.as_ref(),
+                &project.root,
+                &project.root,
+                &test.target,
+                commands,
+                &wrappers,
+            );
+            let planned = captures[0].is_some() || chain.is_some();
             for (_, dir) in captures.iter().flatten() {
                 let _ = std::fs::remove_dir_all(dir);
+            }
+            if let Some(chain) = &chain {
+                chain.remove_report_dirs();
             }
             let address = format!("{}:{}", test.project, test.target);
             assert_eq!(
@@ -785,6 +834,9 @@ format = "junit"
             ("//web:test-plain", false),
             ("//web:test-wrapped", false),
             ("//web:test-declared", false),
+            ("//web:test-chain", false),
+            ("//web:test-mixed", false),
+            ("//web:test-hooked", true),
             ("//web:test-unlisted", true),
             ("//web:test-script", true),
             ("//web:test-compound", true),

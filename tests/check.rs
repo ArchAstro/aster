@@ -851,14 +851,14 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
             ),
             (
                 "web/package.json",
-                r#"{"name":"web","scripts":{"test":"vitest run && eslint ."}}"#,
+                r#"{"name":"web","scripts":{"test":"vitest run && eslint .","cdtest":"cd sub && vitest run","pretest-hook":"true","test-hook":"vitest run && tsc"}}"#,
             ),
             (
                 "web/aster.toml",
                 "[targets.test-ci]\ncommand = \"./run-tests.sh\"\n\n\
                  [targets.test-bun]\ncommand = \"mise exec go -- bun test --timeout=60000\"\n\n\
                  [targets.test-chain]\ncommand = \"bash -c 'bun test && bun run lint'\"\n\n\
-                 [targets.test-pkg]\ncommand = \"pnpm test\"\n\n\
+                 [targets.test-hook]\ncommand = \"pnpm test-hook\"\n\n\
                  [targets.test-declared]\ncommand = \"./run-tests.sh\"\n\n\
                  [targets.test-declared.report]\nformat = \"junit\"\n",
             ),
@@ -873,11 +873,10 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
     assert_eq!(
         places(&report, rule),
         [
-            "//web:test",
             "//web:test-bun",
             "//web:test-chain",
             "//web:test-ci",
-            "//web:test-pkg"
+            "//web:test-hook"
         ]
     );
     let message = |target: &str| -> String {
@@ -902,8 +901,10 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
     );
     let script = message("//web:test-ci");
     assert!(script.contains("script file `./run-tests.sh`"), "{script}");
-    let package = message("//web:test-pkg");
-    assert!(package.contains("package script `test`"), "{package}");
+    let hooked = message("//web:test-hook");
+    assert!(hooked.contains("package script `test-hook`"), "{hooked}");
+    // `//web:test` calls a chain (`vitest run && eslint .`): every runner step
+    // is captured, so it is not reported.
 
     // Configured, the wrapped runner is captured; the declared target never
     // was a finding; the rest stay (a fixed, unnarrowable command still needs
@@ -911,12 +912,7 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
     let (_, report) = workspace(wrappers, "").check(&["--rule", rule]);
     assert_eq!(
         places(&report, rule),
-        [
-            "//web:test",
-            "//web:test-chain",
-            "//web:test-ci",
-            "//web:test-pkg"
-        ]
+        ["//web:test-chain", "//web:test-ci", "//web:test-hook"]
     );
 
     // allow_no_test_results exempts a target that runs no per-test runner,
@@ -929,7 +925,7 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
     assert_eq!(status, 1, "{report}");
     assert_eq!(
         places(&report, rule),
-        ["//web:test", "//web:test-chain", "//web:test-pkg"]
+        ["//web:test-chain", "//web:test-hook"]
     );
     assert_eq!(
         places(&report, "stale-allow-no-test-results"),

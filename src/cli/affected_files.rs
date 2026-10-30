@@ -1408,9 +1408,10 @@ pub fn uncaptured_reason(
         crate::plugins::related_tests::package_script_body(&runner.project.root, &runner.command)
     }) {
         return format!(
-            "package script `{name}` (`{body}`) is not a single test runner; Aster adds a report \
-             only to a script that is one `vitest`, `jest` or `bun test` command, or one that \
-             runs `node --test`. Put the runner command in the target{hint}"
+            "package script `{name}` (`{body}`) is not a chain of commands Aster can read to \
+             the end with a test runner in it (a `cd`, a `pre`/`post` hook, a cycle, a shell \
+             operator other than `&&`, a launcher other than `npm` or `pnpm`, or no runner). \
+             Put the runner command in the target{hint}"
         );
     }
     if let Some(plugin) = reads(&written) {

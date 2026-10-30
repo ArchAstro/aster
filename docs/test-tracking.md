@@ -43,6 +43,18 @@ output is unchanged. The same reading applies to `--retry-failed`. A runner
 behind a program that is not listed records no tests; `aster check` reports
 such a target as `uncaptured-test-results`.
 
+A package script that chains commands (`npm`/`pnpm`, `a && b && c`, also
+through the scripts it calls) is run step by step: the steps `--related`
+expands it into, each started with `pnpm exec` or `npm exec -c` as the script
+would. Every test runner step has its own report in its own directory and the
+results of all steps merge into the target's. Other steps (`tsc`, `eslint`, a
+generator) run as written. A failing test is retried by rerunning only its
+step's runner, narrowed to that test, and the chain continues; a step whose
+only failures are quarantined continues too. A runner that crashes before
+writing a report makes the results partial, so the target fails and nothing is
+excused. A chain with a `cd`, a `pre`/`post` hook, a cycle, another shell
+operator, or a runner step Aster cannot plan is not captured.
+
 `partial` means some tests may be missing. Partial results are still uploaded
 and classified, but they never let a quarantined failure pass.
 

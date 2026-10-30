@@ -175,7 +175,11 @@ wrapper program (`scripts/with-rust-toolchain cargo test`,
 wrappers apply to test result capture and `--retry-failed` too (report flags and
 rerun selections go after the wrapped runner, the wrapper stays in front); a
 runner behind an unlisted wrapper records no tests and cannot be retried or
-quarantined.
+quarantined. A package script chain (`npm`/`pnpm`) is run step by step when
+capture or `--retry-failed` is on: each runner step has its own report, a
+failing test is retried in its step only and the chain goes on, other steps run
+as written; a chain Aster cannot read (cd, pre/post hook, cycle, `||`/`;`/pipe)
+is reported by `uncaptured-test-results`.
 Parsed source facts are cached under `<cache dir>/related-facts/` so warm
 runs parse only changed files (`--no-cache` skips it). Dependents
 run only when they refer to something that changed, so do not combine it
