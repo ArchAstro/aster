@@ -40,9 +40,11 @@ mkdir -p packages/core/src packages/core/test
 mkdir -p apps/api/src apps/api/test
 ```
 
-`aster init` creates the root `aster.toml`. That file marks the workspace
+`aster init` creates the root `aster.toml` and adds `.aster/` to `.gitignore`
+when that directory is not already ignored. `aster.toml` marks the workspace
 boundary and can later hold workspace-wide settings for affected-project
-analysis, watch mode, and development services.
+analysis, watch mode, and development services. Cache and logs live under
+`.aster/` and stay out of Git.
 
 ## 3. Add the shared library
 
@@ -251,9 +253,17 @@ aster cache clear
 
 ## 8. Run only what changed
 
-Create a baseline commit:
+Ignore build output before the first commit. `aster init` already added
+`.aster/` to `.gitignore`. Append `dist/` and `node_modules/` so `git add .`
+does not commit build artifacts or installed dependencies:
+
+```gitignore
+dist/
+node_modules/
+```
 
 ```console
+printf '%s\n' 'dist/' 'node_modules/' >> .gitignore
 git add .
 git commit -m "create Aster demo"
 ```
@@ -295,7 +305,7 @@ Ctrl-C to stop.
 
 For a real repository:
 
-1. Run `aster init` once at the Git root.
+1. Run `aster init` once at the Git root. Init adds `.aster/` to `.gitignore`.
 2. Run `aster list` to review automatically detected projects and targets.
 3. Add a project-level `aster.toml` only where you need custom commands,
    dependency edges, caching inputs or outputs, aliases, or file capabilities.
