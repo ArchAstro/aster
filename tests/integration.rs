@@ -4902,11 +4902,23 @@ fn target_help_flags_print_usage_and_run_nothing() {
         );
     }
 
-    // Unknown flags stay ignored, and a build without help still runs.
+    // A build without help still runs. Unknown flags are rejected without running.
     fs::remove_file(tmp.path().join("aster.toml")).unwrap();
-    let ran = Command::new(env!("CARGO_BIN_EXE_aster"))
+    let rejected = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(&project)
         .args(["build", "--no-such-flag", "--no-deps", "--no-cache"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "unknown flag should be rejected: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!built.exists(), "unknown flag must not run the target");
+    let ran = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(&project)
+        .args(["build", "--no-deps", "--no-cache"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&ran.stdout);

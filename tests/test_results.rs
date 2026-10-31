@@ -331,6 +331,49 @@ fn retry_failed_reruns_only_the_failing_test_and_marks_the_pass_flaky() {
 }
 
 #[test]
+fn global_flags_after_the_target_name_are_honored() {
+    if !go_available() {
+        eprintln!("skipping: go is not installed");
+        return;
+    }
+    let tmp = flaky_go_workspace("command = \"go test ./...\"");
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "test",
+            "//app",
+            "--retry-failed",
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the retry passes: {stderr}");
+    assert!(
+        stderr.contains("PASS //app:test") && stderr.contains("flaky: 1 test passed on retry"),
+        "{stderr}"
+    );
+    assert!(results.is_file(), "results file missing: {stderr}");
+    let records = read_records(&results);
+    let tests = tests_of(&records);
+    assert!(
+        tests.contains(&("TestFlaky".into(), TestOutcome::Pass, 2)),
+        "attempt-2 record missing: {tests:?}"
+    );
+
+    let bogus_ws = flaky_go_workspace("command = \"go test ./...\"");
+    let bogus = aster(bogus_ws.path(), &["test", "--all", "--bogus-flag"]);
+    let bogus_err = String::from_utf8_lossy(&bogus.stderr);
+    assert_eq!(bogus.status.code(), Some(2), "{bogus_err}");
+    assert!(bogus_err.contains("unexpected argument"), "{bogus_err}");
+    assert!(
+        !bogus_ws.path().join("marker").exists(),
+        "unknown flag must not run tests"
+    );
+}
+
+#[test]
 fn a_runner_behind_a_configured_wrapper_is_recorded_and_retried() {
     if !go_available() {
         eprintln!("skipping: go is not installed");
