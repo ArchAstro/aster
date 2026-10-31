@@ -455,7 +455,15 @@ impl<'a> Executor<'a> {
         let mut child = cmd.spawn().map_err(|e| {
             #[cfg(any(unix, windows))]
             unregister_supervised_child();
-            format!("Failed to execute {target_addr}: {e}")
+            // A permit spawns the execution supervisor, not the target. NotFound
+            // there is a missing supervisor or working directory, so keep the
+            // operating-system text. The target program is named in the supervisor.
+            let detail = if permit.is_some() {
+                e.to_string()
+            } else {
+                super::spawn_error_message(&parsed.program, &e)
+            };
+            format!("Failed to execute {target_addr}: {detail}")
         })?;
         #[cfg(unix)]
         let monitor = ChildSignalMonitor::start(child.id(), permit.is_some());
@@ -3089,7 +3097,13 @@ fn run_command(
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
-            let output = format!("Failed to execute command: {error}");
+            // A permit spawns the execution supervisor, not the target.
+            let detail = if permit.is_some() {
+                error.to_string()
+            } else {
+                super::spawn_error_message(&parsed.program, &error)
+            };
+            let output = format!("Failed to execute command: {detail}");
             return ExecutionResult {
                 address: address.to_string(),
                 success: false,

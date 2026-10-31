@@ -25,6 +25,19 @@ pub fn quote_command_argument(value: &str) -> String {
     command::quote_argument(value)
 }
 
+/// Text for a failed `Command::spawn`.
+///
+/// `ErrorKind::NotFound` means the program is not installed or not on `PATH`.
+/// Name that program. Every other failure keeps the operating system's text,
+/// which callers already interpolate into their existing messages.
+pub(crate) fn spawn_error_message(program: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("command not found: {program} (is it installed and on PATH?)")
+    } else {
+        error.to_string()
+    }
+}
+
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 static SHUTDOWN_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -135,4 +148,35 @@ unsafe extern "system" fn windows_shutdown_handler(control_type: u32) -> i32 {
     }
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_error_message;
+    use std::io::{Error, ErrorKind};
+    use std::process::Command;
+
+    #[test]
+    fn missing_program_names_the_command() {
+        let error = Command::new("aster-no-such-tool-unit")
+            .env("PATH", "")
+            .spawn()
+            .expect_err("a program that is not on PATH must fail to spawn");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            spawn_error_message("aster-no-such-tool-unit", &error),
+            "command not found: aster-no-such-tool-unit (is it installed and on PATH?)"
+        );
+    }
+
+    #[test]
+    fn other_spawn_errors_keep_the_os_text() {
+        let error = Error::new(
+            ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        let message = spawn_error_message("go", &error);
+        assert_eq!(message, error.to_string());
+        assert!(!message.contains("command not found"));
+    }
 }

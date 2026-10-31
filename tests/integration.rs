@@ -4727,3 +4727,36 @@ fn target_commands_print_usage_for_help() {
         "unknown help target should not require a workspace: {stderr}"
     );
 }
+
+#[test]
+fn missing_toolchain_program_is_named_in_failure() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        r#"
+[targets.build]
+command = "aster-no-such-tool --version"
+cache = { enabled = false }
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["build", "//app", "--no-deps", "--no-cache"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "missing program should fail\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("command not found: aster-no-such-tool"),
+        "stderr should name the missing program:\n{stderr}"
+    );
+}
