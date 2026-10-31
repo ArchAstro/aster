@@ -852,10 +852,15 @@ mod tests {
     /// which packages build, so each row runs the real Go toolchain.
     #[test]
     fn related_tests_keep_only_the_test_files_the_build_context_builds() {
+        // A shim can spawn and still exit non-zero when no toolchain is
+        // selected (`mise ERROR No version is set for shim: go`). That is
+        // not a usable Go, and `go list` would preserve every command.
         if std::process::Command::new("go")
             .arg("version")
             .output()
-            .is_err()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_none()
         {
             eprintln!("skipping: go is not installed");
             return;

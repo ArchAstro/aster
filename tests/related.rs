@@ -8,6 +8,23 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// A mise shim can spawn and still exit 1 when no Go version is selected.
+fn go_toolchain_available() -> bool {
+    Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn skip_without_go() -> bool {
+    if go_toolchain_available() {
+        false
+    } else {
+        eprintln!("skipping: go is not installed");
+        true
+    }
+}
+
 struct Workspace {
     tmp: TempDir,
 }
@@ -602,6 +619,9 @@ fn lockfile_change_runs_dependents_in_full() {
 
 #[test]
 fn go_change_selects_test_functions_by_name() {
+    if skip_without_go() {
+        return;
+    }
     let ws = Workspace::new(&[
         ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
         (
@@ -634,6 +654,9 @@ fn go_change_selects_test_functions_by_name() {
 
 #[test]
 fn go_names_are_told_apart_by_package_and_receiver() {
+    if skip_without_go() {
+        return;
+    }
     let ws = Workspace::new(&[
         ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
         (
@@ -701,6 +724,9 @@ const GO_WITH_TAGGED_PACKAGE: &[(&str, &str)] = &[
 
 #[test]
 fn go_setup_boundary_preserves_shell_package_globs() {
+    if skip_without_go() {
+        return;
+    }
     // A real delegated shell expands ./c* to ./cart before invoking Aster.
     // Quoting that token during deferred planning instead sends Go ./c*.
     let command = "bash -ec 'source setup.sh; aster exec-go-test -- -count=1 ./c*'";
@@ -738,11 +764,9 @@ fn go_setup_boundary_preserves_shell_package_globs() {
 /// the negative control against accidentally accepting a full-suite fallback.
 #[test]
 fn go_setup_boundary_selects_after_exports_and_preserves_cleanup() {
-    assert!(Command::new("go")
-        .arg("version")
-        .status()
-        .unwrap()
-        .success());
+    if skip_without_go() {
+        return;
+    }
     for (setup, inherited, tagged) in [
         ("export GOFLAGS=-tags=$DEV_TAGS", "", true),
         ("unset GOFLAGS", "-tags=devtool", false),
@@ -800,6 +824,9 @@ fn go_setup_boundary_selects_after_exports_and_preserves_cleanup() {
 
 #[test]
 fn go_setup_boundary_uses_runtime_cwd_for_package_selection() {
+    if skip_without_go() {
+        return;
+    }
     let ws = Workspace::new(GO_WITH_TAGGED_PACKAGE);
     let selection = serde_json::to_string(&vec![(
         ws.root().join("svc/cart/cart_test.go"),
@@ -861,8 +888,7 @@ fn go_setup_boundary_unknown_context_runs_full_and_cleans_up_on_failure() {
 
 #[test]
 fn go_related_run_names_only_packages_go_test_builds() {
-    if Command::new("go").arg("version").output().is_err() {
-        eprintln!("skipping: go is not installed");
+    if skip_without_go() {
         return;
     }
     // Setup: `go test ./...`, the default Go test target, over a module with
@@ -995,11 +1021,9 @@ fn go_related_run_preserves_inherited_variable_expansion() {
 }
 
 fn go_related_dynamic_context_cases(cases: &[(&str, &str, &str, bool)]) {
-    assert!(Command::new("go")
-        .arg("version")
-        .status()
-        .unwrap()
-        .success());
+    if skip_without_go() {
+        return;
+    }
     for &(command, key, value, devtool_runs) in cases {
         // Real git workspace and production Aster process; environment is
         // scoped to each child, never mutated in the parallel test process.
