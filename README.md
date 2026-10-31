@@ -296,6 +296,68 @@ Affected paths are filtered by `files_glob`.
 Unknown fields, capabilities, dependencies, and invalid globs are configuration
 errors.
 
+### Cargo workspace ownership
+
+Declare workspace-wide commands once in the Cargo root's `aster.toml`:
+
+```toml
+[cargo.workspace]
+targets = ["deps", "build", "lint"]
+
+[targets.deps]
+command = "cargo fetch --locked"
+
+[targets.build]
+command = "cargo build --workspace --locked"
+depends_on = ["//self:deps"]
+
+[targets.lint]
+command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+depends_on = ["//self:deps"]
+```
+
+Each listed target needs an explicit command at the Cargo root, including a
+virtual root with no `[package]`. Aster generates dependency-only entry points
+for every member. Selecting the root and several members runs each owner once
+per invocation. Member definitions with the same name are configuration errors;
+remove those definitions when adopting ownership. Use a different target name
+for a distinct build variant. Unlisted targets, including package tests, retain
+their commands. Existing `alias` targets still copy commands rather than share
+execution ownership.
+
+Membership comes from `cargo metadata --no-deps --offline --locked`, once per
+configured root during discovery. It includes Cargo's globbed and implicit path
+members. Cargo must be available, and all owned members must be present and
+discoverable. Discovery does not fetch packages or update lockfiles. Aster removes
+inferred build prerequisites between members of an owned workspace because
+Cargo compiles those dependencies itself; explicitly configured prerequisites
+remain in place.
+
+The owner's cache and affected-file scope includes member manifests and authored
+files, including embedded assets and custom Cargo target sources. Member walks
+respect ignore files and exclude nested projects and Cargo's output directory;
+the `deps` target only adds member manifests. Existing explicit cache inputs,
+environment/runtime settings and outputs remain supported. Build scripts that
+read files outside member directories must declare those files with `cache.include`
+or `cache.workspace_include`. Commands are used as written: ownership does not
+add `--workspace`, change profiles, or merge differently named operations.
+
+### Dependency-only targets
+
+Omit `command` to define an entry point that waits for other targets:
+
+```toml
+[targets.verify]
+depends_on = ["//services/api:lint", "//services/api:test"]
+```
+
+It launches no process, takes no execution permit, and stores no separate result
+in the artifact cache. A failed prerequisite fails the entry point; downstream
+cache keys still depend on its prerequisites. At least one dependency is required.
+`--no-deps` is rejected if it would omit a required prerequisite. Use `--no-stream`
+with dependency-only entry points, including generated Cargo member targets;
+streaming directly executes a single command without the dependency graph.
+
 ### Cache behavior
 
 Aster's local cache stores successful target executions as content-addressed

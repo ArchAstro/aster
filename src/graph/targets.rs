@@ -247,6 +247,18 @@ pub fn workspace_inputs(
                 continue;
             }
             let mut globs = cache.workspace_include.clone();
+            if let Some(scope) = &cache.cargo_workspace {
+                globs.extend(scope.roots.iter().map(|member| {
+                    member
+                        .join(if scope.manifests_only {
+                            "Cargo.toml"
+                        } else {
+                            "**"
+                        })
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                }));
+            }
             globs.extend(
                 cache
                     .include

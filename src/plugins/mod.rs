@@ -182,6 +182,13 @@ pub struct Target {
     pub report: Option<crate::config::ReportConfig>,
 }
 
+impl Target {
+    /// Dependency-only targets have no command, process, or stored result.
+    pub fn is_dependency_only(&self) -> bool {
+        self.command.is_empty() && !self.depends_on.is_empty()
+    }
+}
+
 /// Context passed to plugins for target detection
 ///
 /// Contains all the raw information a plugin needs to determine targets

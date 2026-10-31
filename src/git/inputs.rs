@@ -21,15 +21,14 @@ pub fn select_by_declared_inputs(
 ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
     let mut selected = BTreeMap::new();
     for project in projects {
-        let Some(patterns) = project
+        let Some(cache) = project
             .targets
             .get(target)
             .and_then(|definition| definition.cache.as_ref())
-            .map(|cache| &cache.workspace_include)
-            .filter(|patterns| !patterns.is_empty())
         else {
             continue;
         };
+        let patterns = &cache.workspace_include;
         let address = format!("//{}", project.relative_path.display());
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
@@ -40,7 +39,13 @@ pub fn select_by_declared_inputs(
         let globs = builder.build()?;
         let mut files: Vec<PathBuf> = changed_files
             .iter()
-            .filter(|file| globs.is_match(file))
+            .filter(|file| {
+                globs.is_match(file)
+                    || cache
+                        .cargo_workspace
+                        .as_ref()
+                        .is_some_and(|scope| scope.contains(file))
+            })
             .cloned()
             .collect();
         if !files.is_empty() {

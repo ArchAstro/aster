@@ -29,7 +29,9 @@ impl LanguagePlugin for RustPlugin {
         // A member that also declares `[workspace]` has a `[package]` and
         // is not skipped.
         match std::fs::read_to_string(config_path) {
-            Ok(content) => is_virtual_workspace_manifest(&content),
+            Ok(content) => {
+                is_virtual_workspace_manifest(&content) && !owns_workspace_targets(config_path)
+            }
             Err(_) => false,
         }
     }
@@ -40,6 +42,17 @@ impl LanguagePlugin for RustPlugin {
 
         let cargo_toml: Value = toml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+        if is_virtual_workspace_manifest(&content) && owns_workspace_targets(config_path) {
+            return Ok(ProjectMetadata {
+                name: config_path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "cargo-workspace".into()),
+                version: None,
+            });
+        }
 
         // Extract package name and version
         let package = cargo_toml.get("package").ok_or_else(|| {
@@ -98,6 +111,11 @@ impl LanguagePlugin for RustPlugin {
 
     fn detect_targets(&self, ctx: &TargetContext) -> Result<HashMap<String, Target>> {
         let mut targets = HashMap::new();
+        if std::fs::read_to_string(ctx.config_path)
+            .is_ok_and(|content| is_virtual_workspace_manifest(&content))
+        {
+            return Ok(targets);
+        }
 
         // deps target: fetch dependencies (cargo fetch is optional, cargo build does this)
         // Using empty command since cargo handles deps automatically
@@ -375,6 +393,27 @@ impl LanguagePlugin for RustPlugin {
                 shared: false,
             },
         ]
+    }
+}
+
+fn owns_workspace_targets(config_path: &Path) -> bool {
+    let Some(path) = config_path
+        .parent()
+        .and_then(crate::config::find_aster_toml)
+    else {
+        return false;
+    };
+    match std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| toml::from_str::<Value>(&content).ok())
+    {
+        Some(config) => config
+            .get("cargo")
+            .and_then(|cargo| cargo.get("workspace"))
+            .is_some(),
+        // Keep the virtual root so normal configuration loading reports the
+        // error. Invalid ownership must not fall back to independent members.
+        None => true,
     }
 }
 
