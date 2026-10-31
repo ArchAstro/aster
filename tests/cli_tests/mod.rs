@@ -2,6 +2,7 @@
 //!
 //! Contains additional integration tests organized by feature area.
 
+mod cargo_workspace;
 pub mod json_output;
 
 // Common test utilities shared across integration test modules

@@ -9,6 +9,9 @@ use super::project::{validate_aster_config, validate_consumes, ConsumesConfig, T
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
+    /// A Cargo root may also be the Aster workspace root.
+    #[serde(default)]
+    pub cargo: super::project::CargoConfig,
     /// Glob patterns for paths to ignore during project discovery
     #[serde(default)]
     pub ignore: Vec<String>,

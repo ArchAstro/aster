@@ -388,6 +388,11 @@ impl<'a> Executor<'a> {
             }
         };
         let command = &target_def.command;
+        if target_def.is_dependency_only() {
+            return Err(format!(
+                "{target_addr} is dependency-only; use --no-stream to execute its prerequisites"
+            ));
+        }
 
         // Use target's working_dir if set, otherwise use project root
         let working_dir = target_def.working_dir.as_ref().unwrap_or(&project.root);
@@ -563,6 +568,40 @@ impl<'a> Executor<'a> {
             return Vec::new();
         }
 
+        // A commandless entry point cannot succeed if --no-deps removed the
+        // operation it selects. Check before any process or cache admission.
+        let missing: Vec<_> = targets_to_run
+            .iter()
+            .filter_map(|address| {
+                let (project, name) = parse_target_address(address)?;
+                let target = project_map.get(&project)?.targets.get(&name)?;
+                (target.is_dependency_only()
+                    && target.depends_on.iter().any(|dep| {
+                        !targets_to_run.contains(dep)
+                            || parse_target_address(dep).is_none_or(|(project, name)| {
+                                project_map
+                                    .get(&project)
+                                    .is_none_or(|p| !p.targets.contains_key(&name))
+                            })
+                    }))
+                .then(|| {
+                    execution_failure(
+                        address,
+                        "Dependency-only target requires its prerequisites; remove --no-deps"
+                            .into(),
+                    )
+                })
+            })
+            .collect();
+        if !missing.is_empty() {
+            if self.output_mode != OutputMode::Json {
+                for result in &missing {
+                    eprintln!("[aster] {}: {}", result.address, result.output);
+                }
+            }
+            return missing;
+        }
+
         if self.output_mode != OutputMode::Json {
             let log_store = LogStore::new(self.workspace_root);
             if let Err(error) = log_store.clear_latest() {
@@ -713,6 +752,13 @@ impl<'a> Executor<'a> {
                 }
                 let keys: Vec<String> = batch
                     .iter()
+                    .filter(|addr| {
+                        parse_target_address(addr)
+                            .and_then(|(project, name)| {
+                                project_map.get(&project)?.targets.get(&name)
+                            })
+                            .is_none_or(|target| !target.is_dependency_only())
+                    })
                     .filter_map(|addr| {
                         fresh_cache_key(
                             addr,
@@ -854,6 +900,51 @@ impl<'a> Executor<'a> {
             Some(p) => *p,
             None => return false,
         };
+
+        if project
+            .targets
+            .get(&target_name)
+            .is_some_and(|target| target.is_dependency_only())
+        {
+            // No worker, process permit, artifact result, or test capture. Its
+            // key still carries prerequisite changes to downstream consumers.
+            let hash = computed_hashes.lock().ok().and_then(|hashes| {
+                let dependencies = project.targets[&target_name]
+                    .depends_on
+                    .iter()
+                    .map(|address| hashes.get(address).map(String::as_str))
+                    .collect::<Option<Vec<_>>>()?;
+                CacheHasher::new(&project.root, self.workspace_root)
+                    .compute_hash(
+                        &crate::plugins::CacheInputs::default(),
+                        None,
+                        "",
+                        &dependencies,
+                        env_snapshot,
+                        runtime_inputs,
+                    )
+                    .ok()
+            });
+            if let Some(hash) = hash {
+                if let Ok(mut hashes) = computed_hashes.lock() {
+                    hashes.insert(target_addr.clone(), hash);
+                }
+            }
+            let _ = ctx.tx.send(ExecutionResult {
+                address: target_addr.clone(),
+                success: true,
+                skipped: false,
+                cached: false,
+                output: "Dependency-only target: prerequisites completed".into(),
+                log: Vec::new(),
+                duration_ms: 0,
+                exit_code: None,
+                tests: None,
+                input_hash: None,
+                interrupted: false,
+            });
+            return true;
+        }
 
         // Get the command for this target
         // Check for command override first (used with --only-affected-files)
@@ -2074,6 +2165,9 @@ fn cacheable_inputs(
     plugin_registry: &PluginRegistry,
 ) -> Option<crate::plugins::CacheInputs> {
     let target = project.targets.get(target_name)?;
+    if target.is_dependency_only() {
+        return Some(crate::plugins::CacheInputs::default());
+    }
     let explicitly_enabled = target.cache.as_ref().and_then(|config| config.enabled);
     if explicitly_enabled == Some(false)
         || (explicitly_enabled != Some(true) && !is_default_cacheable_target(target_name))

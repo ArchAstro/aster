@@ -588,6 +588,59 @@ impl CacheHasher {
             file_hashes.extend(self.walk_workspace_globs(&globs, &mut seen)?);
         }
 
+        if let Some(scope) = user_config.and_then(|config| config.cargo_workspace.as_ref()) {
+            let mut exclude = GlobSetBuilder::new();
+            for pattern in user_config.into_iter().flat_map(|config| &config.exclude) {
+                exclude.add(Glob::new(pattern)?);
+            }
+            let exclude = exclude.build()?;
+            for member in &scope.roots {
+                let root = self.workspace_root.join(member);
+                let files: Vec<PathBuf> = if scope.manifests_only {
+                    vec![root.join("Cargo.toml")]
+                } else {
+                    // Generated inputs follow ordinary authored-file discovery.
+                    // Explicit workspace_include retains its existing behavior,
+                    // including the ability to name ignored generated files.
+                    let excluded: Vec<_> = scope
+                        .excluded
+                        .iter()
+                        .filter(|path| *path != member && path.starts_with(member))
+                        .map(|path| self.workspace_root.join(path))
+                        .collect();
+                    ignore::WalkBuilder::new(&root)
+                        .hidden(false)
+                        .follow_links(false)
+                        .git_global(false)
+                        .require_git(false)
+                        .filter_entry(move |entry| {
+                            !matches!(entry.file_name().to_str(), Some(".git" | ".aster"))
+                                && !excluded.iter().any(|path| entry.path().starts_with(path))
+                        })
+                        .build()
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                        .map(|entry| entry.into_path())
+                        .collect()
+                };
+                for path in files {
+                    if path
+                        .strip_prefix(&self.project_root)
+                        .is_ok_and(|rel| exclude.is_match(rel))
+                    {
+                        continue;
+                    }
+                    let rel = normalize_rel(path.strip_prefix(&self.workspace_root)?)?;
+                    if seen.insert(rel.clone()) {
+                        if let Some(hash) = hash_file_contents(&path)? {
+                            file_hashes.push((format!("{WORKSPACE_PATH_PREFIX}{rel}"), hash));
+                        }
+                    }
+                }
+            }
+        }
+
         file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(file_hashes)
     }

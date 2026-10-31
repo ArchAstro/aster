@@ -33,6 +33,18 @@ impl TargetResolver {
         custom_targets: &HashMap<String, TargetConfig>,
         project_address: &str,
     ) -> HashMap<String, Target> {
+        let mut targets =
+            Self::resolve_definitions(detected_targets, custom_targets, project_address);
+        Self::resolve_aliases(&mut targets, custom_targets, project_address);
+        targets
+    }
+
+    /// Resolve executable definitions before cross-project ownership is applied.
+    pub(crate) fn resolve_definitions(
+        detected_targets: &HashMap<String, Target>,
+        custom_targets: &HashMap<String, TargetConfig>,
+        project_address: &str,
+    ) -> HashMap<String, Target> {
         let mut targets = HashMap::new();
 
         // Start with detected targets, resolving //self: references
@@ -183,9 +195,30 @@ impl TargetResolver {
                 TargetConfig::Alias(_) => {
                     // Handled in second pass
                 }
+                TargetConfig::Dependencies(group) => {
+                    targets.insert(
+                        name.clone(),
+                        Target {
+                            depends_on: Self::resolve_self_references(
+                                &group.depends_on,
+                                project_address,
+                            ),
+                            ..Target::default()
+                        },
+                    );
+                }
             }
         }
 
+        targets
+    }
+
+    /// Aliases clone the final source, including generated ownership and inputs.
+    pub(crate) fn resolve_aliases(
+        targets: &mut HashMap<String, Target>,
+        custom_targets: &HashMap<String, TargetConfig>,
+        project_address: &str,
+    ) {
         // Resolve aliases iteratively so alias chains do not depend on HashMap
         // iteration order. Cycles and missing sources remain unresolved.
         let mut pending_aliases: Vec<_> = custom_targets
@@ -244,8 +277,6 @@ impl TargetResolver {
                 alias_config.alias
             );
         }
-
-        targets
     }
 
     /// Resolve //self: references to the actual project address

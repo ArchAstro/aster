@@ -16,6 +16,9 @@ use crate::plugins::{
 };
 use crate::targets::TargetResolver;
 
+#[path = "cargo_workspace.rs"]
+mod cargo_workspace;
+
 /// Build a GlobSet from ignore patterns
 fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
@@ -64,6 +67,7 @@ struct PartialProject {
     languages: Vec<String>,
     build_system: Option<String>,
     relative_path: PathBuf,
+    cargo: crate::config::project::CargoConfig,
 }
 
 /// Discover all projects in the workspace
@@ -160,10 +164,12 @@ pub fn discover_projects(
         // Collect custom targets from aster.toml (if exists)
         let mut custom_targets = HashMap::new();
         let mut explicit_target_dependencies = Vec::new();
+        let mut cargo = crate::config::project::CargoConfig::default();
 
         // Check for aster.toml and merge overrides
         if let Some(aster_path) = find_aster_toml(project_dir) {
             let aster_config = parse_aster_toml(&aster_path)?;
+            cargo = aster_config.cargo;
 
             // Override name if specified
             if let Some(name) = aster_config.name {
@@ -235,6 +241,7 @@ pub fn discover_projects(
             languages,
             build_system: plugin.build_system().map(str::to_string),
             relative_path,
+            cargo,
         });
     }
 
@@ -243,10 +250,12 @@ pub fn discover_projects(
     resolve_umbrella_dependencies_partial(&mut partial_projects);
     resolve_uv_workspace_dependencies_partial(&mut partial_projects);
     resolve_ruby_workspace_dependencies_partial(&mut partial_projects);
+    let cargo_owners = cargo_workspace::prepare(&mut partial_projects, workspace_root)?;
 
     // Phase 3: Detect targets with resolved dependencies
     let mut projects: Vec<DiscoveredProject> = Vec::new();
     let mut explicit_target_dependencies = Vec::new();
+    let mut alias_configs = HashMap::new();
     for partial in partial_projects {
         let plugin = registry
             .find_by_name(&partial.plugin_name)
@@ -262,17 +271,21 @@ pub fn discover_projects(
             workspace_root,
             dependencies: &partial.dependencies,
         };
-        let detected_targets = plugin.detect_targets(&target_ctx).with_context(|| {
+        let mut detected_targets = plugin.detect_targets(&target_ctx).with_context(|| {
             format!(
                 "Failed to detect targets from {}",
                 partial.config_path.display()
             )
         })?;
+        cargo_workspace::remove_inferred_builds(&partial, &cargo_owners, &mut detected_targets);
 
         // Resolve targets: detected + aster.toml overrides, resolving //self: references
-        let mut targets =
-            TargetResolver::resolve(&detected_targets, &partial.custom_targets, &project_address);
-        apply_default_outputs(&mut targets, plugin, &target_ctx);
+        let targets = TargetResolver::resolve_definitions(
+            &detected_targets,
+            &partial.custom_targets,
+            &project_address,
+        );
+        alias_configs.insert(partial.relative_path.clone(), partial.custom_targets);
         explicit_target_dependencies.extend(partial.explicit_target_dependencies);
 
         projects.push(DiscoveredProject {
@@ -288,6 +301,25 @@ pub fn discover_projects(
         });
     }
 
+    cargo_workspace::apply(&cargo_owners, &mut projects)?;
+    for project in &mut projects {
+        TargetResolver::resolve_aliases(
+            &mut project.targets,
+            &alias_configs[&project.relative_path],
+            &format!("//{}", project.relative_path.display()),
+        );
+        let plugin = registry
+            .find_by_name(&project.plugin_name)
+            .expect("Plugin should exist");
+        let ctx = TargetContext {
+            config_path: &project.config_path,
+            project_dir: &project.root,
+            workspace_root,
+            dependencies: &project.dependencies,
+        };
+        apply_default_outputs(&mut project.targets, plugin, &ctx);
+    }
+
     // Phase 4: Handle name collisions
     resolve_name_collisions(&mut projects);
 
@@ -298,6 +330,16 @@ pub fn discover_projects(
         &explicit_target_dependencies,
         sparse.then_some(workspace_root),
     )?;
+
+    if !cargo_owners.is_empty()
+        || projects
+            .iter()
+            .any(|project| project.targets.values().any(Target::is_dependency_only))
+    {
+        if let Some(cycle) = crate::graph::build_target_graph(&projects).find_cycle() {
+            anyhow::bail!("Target dependency cycle: {cycle}");
+        }
+    }
 
     Ok(projects)
 }
@@ -443,7 +485,16 @@ fn normalize_target_dependencies(
     // discard only those unavailable inferred edges after explicit config has
     // been validated.
     for project in projects {
-        for target in project.targets.values_mut() {
+        for (name, target) in &mut project.targets {
+            if target.is_dependency_only() {
+                if let Some(missing) = target
+                    .depends_on
+                    .iter()
+                    .find(|dependency| !available.contains(*dependency))
+                {
+                    anyhow::bail!("Dependency-only target //{}:{name} requires missing prerequisite {missing}; include it in the checkout", project.relative_path.display());
+                }
+            }
             target
                 .depends_on
                 .retain(|dependency| available.contains(dependency));
@@ -676,6 +727,30 @@ mod tests {
             "a target without default outputs keeps no cache config"
         );
         assert!(targets["deps"].cache.is_none());
+
+        // Output inference uses the final alias name and command. A custom
+        // Go target is not a build until another target aliases it as one.
+        let go = tmp.path().join("go-app");
+        std::fs::create_dir_all(&go).unwrap();
+        std::fs::write(go.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+        std::fs::write(
+            go.join("aster.toml"),
+            r#"
+[targets]
+compile = "go build -o bin/app ./cmd/app"
+build = { alias = "compile" }
+"#,
+        )
+        .unwrap();
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        let project = projects
+            .iter()
+            .find(|project| project.plugin_name == "go")
+            .unwrap();
+        assert_eq!(
+            project.targets["build"].cache.as_ref().unwrap().outputs,
+            Some(vec!["bin/app".to_string()])
+        );
     }
 
     #[test]
