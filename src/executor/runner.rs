@@ -4086,11 +4086,13 @@ mod tests {
     }
 
     /// Shell snippet that succeeds once `file` exists and fails after about
-    /// five seconds. Targets use it to wait for another target's marker, so
-    /// the test asserts on ordering instead of elapsed time.
+    /// thirty seconds. Targets use it to wait for another target's marker, so
+    /// the test asserts on ordering instead of elapsed time. The cap only
+    /// bounds a broken run; a loaded CI runner can take seconds to start the
+    /// other target.
     fn wait_for(file: &str) -> String {
         format!(
-            "i=0; while [ ! -f {file} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; [ -f {file} ]"
+            "i=0; while [ ! -f {file} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; [ -f {file} ]"
         )
     }
 
@@ -4194,7 +4196,7 @@ mod tests {
             .map(wait_for)
             .unwrap_or_else(|| "sleep 0.05".to_string());
         format!(
-            "sh -c 'echo start_{name} >> events; touch up_{name}; {wait}; echo end_{name} >> events'"
+            "sh -c 'echo start_{name} >> events; touch up_{name}; {wait} && echo end_{name} >> events'"
         )
     }
 
