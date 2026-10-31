@@ -253,25 +253,19 @@ pub(crate) fn chain_for_target(
     if declared_report.is_some() {
         return Chain::Single;
     }
-    // A command that only mentions `node --test` is planned as partial;
-    // the chain reads each of its steps completely.
-    let single = plan(plugin, None, ctx, wrappers);
-    if single
-        .as_ref()
-        .is_some_and(|plan| plan.confidence == Confidence::Complete)
-    {
-        return Chain::Single;
-    }
-    let plan_exists = single.is_some();
-    let found = chain(plugin, ctx, wrappers, new_dir);
-    // A script that is one runner keeps the plan that runs it as written.
-    if let Chain::Plan(plan) = &found {
-        if plan.steps.len() == 1 && plan_exists {
-            plan.remove_report_dirs();
-            return Chain::Single;
+    // A package script is read as the steps it consists of: each runner step
+    // gets its own report, and a failed test is retried from the step's own
+    // runner command, which the script's arguments could not narrow.
+    match chain(plugin, ctx, wrappers, new_dir) {
+        Chain::Unplanned { step } => {
+            if plan(plugin, None, ctx, wrappers).is_some() {
+                Chain::Single
+            } else {
+                Chain::Unplanned { step }
+            }
         }
+        found => found,
     }
-    found
 }
 
 /// Plan for a test command whatever the project's language: the runners
@@ -317,7 +311,9 @@ pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
     if [ctx.command, existing.as_str()]
         .iter()
         .any(|text| text.contains("--test-reporter"))
-        || ctx.command.contains("NODE_OPTIONS")
+        || (ctx.command.contains("NODE_OPTIONS")
+            && !ctx.command.contains("${NODE_OPTIONS")
+            && !ctx.command.contains("$NODE_OPTIONS"))
     {
         return None;
     }
@@ -1747,12 +1743,12 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             run("pnpm hiddenhook", &Wrappers::default()),
             Chain::Unplanned { .. }
         ));
-        // A script that is one `node --test` keeps its own plan when the
-        // command names it; behind another script it is a chain of one step.
-        assert!(matches!(
-            run("pnpm solo", &Wrappers::default()),
-            Chain::Single
-        ));
+        // A script that is one `node --test` is a chain of one step, however
+        // it is reached.
+        let Chain::Plan(direct) = run("pnpm solo", &Wrappers::default()) else {
+            panic!("one runner step");
+        };
+        direct.remove_report_dirs();
         let Chain::Plan(solo) = run("pnpm solo2", &Wrappers::default()) else {
             panic!("one runner step");
         };
@@ -1788,10 +1784,10 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         }
         // One plan already covers a plain script; a declared report wins.
         std::fs::remove_file(f.project.join("vitest.config.ts")).unwrap();
-        assert!(matches!(
-            run("pnpm run test:a", &Wrappers::default()),
-            Chain::Single
-        ));
+        let Chain::Plan(plain) = run("pnpm run test:a", &Wrappers::default()) else {
+            panic!("a plain script is a chain of one step");
+        };
+        plain.remove_report_dirs();
         let report = ReportConfig {
             format: ReportConfigFormat::Junit,
             files: Vec::new(),
