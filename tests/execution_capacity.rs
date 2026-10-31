@@ -5,7 +5,8 @@
 //! Integration matrix: run/affected/streaming; one/multiple ready targets; one/two
 //! workspaces and invocations; equal/different host keys; same/different workspace
 //! keys; cold/warm cache; normal/failure/waiting cancellation/scheduler SIGKILL;
-//! recursive nested siblings; first/second interruption of stubborn children.
+//! recursive nested siblings; workspace/state symlink aliases; inherited/new
+//! resources; captured/streaming first/second interruption of stubborn children.
 //! Fidelity: production CLI, scheduler, flock, process groups, Git affected
 //! selection, and socket barriers. Python commands replace expensive compilers,
 //! not the admission or lifecycle code. The test closes their inherited FDs.
@@ -319,6 +320,89 @@ fn nested_sibling_invocations_borrow_one_slot_without_deadlocking() {
 }
 
 #[test]
+fn nested_workspace_aliases_preserve_ancestor_and_workspace_exclusion() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let a = f.workspace("a", "workspace:compiler", "normal");
+    let b = f.workspace("b", "workspace:compiler", "normal");
+    let c = f.workspace("c", "host:ancestor", "normal");
+    let d = f.workspace("d", "workspace:compiler", "normal");
+    let b_alias = f.root.path().join("b-alias");
+    let host = f.root.path().join("host");
+    let host_alias = f.root.path().join("host-alias");
+    fs::create_dir(&host).unwrap();
+    symlink(&b, &b_alias).unwrap();
+    symlink(&host, &host_alias).unwrap();
+
+    // A -> B middle -> B leaf crosses real CLI boundaries through aliases.
+    // Each level reuses ancestor locks; B must also acquire its own workspace key.
+    let exe = aster::executor::quote_command_argument(&f.binary.display().to_string());
+    let alias = aster::executor::quote_command_argument(&b_alias.display().to_string());
+    let host_alias = aster::executor::quote_command_argument(&host_alias.display().to_string());
+    let mut b_config = fs::read_to_string(b.join("aster.toml")).unwrap();
+    let leaf = b_config[b_config.find("[targets.work]").unwrap()..]
+        .replace("[targets.work]", "[targets.leaf]")
+        .replace(
+            "[\"workspace:compiler\"]",
+            "[\"workspace:compiler\", \"host:ancestor\", \"workspace:compiler\"]",
+        );
+    b_config.push_str(&leaf);
+    let middle_script =
+        format!("cd {alias} && ASTER_EXECUTION_DIR={host_alias} {exe} run //:leaf --quiet");
+    let middle = format!(
+        "sh -c {}",
+        aster::executor::quote_command_argument(&middle_script)
+    );
+    b_config.push_str(&format!("\n[targets.middle]\ncommand = {middle:?}\ncache = {{ enabled = false }}\nexclusive_resources = ['host:ancestor', 'workspace:compiler']\n"));
+    fs::write(b.join("aster.toml"), b_config).unwrap();
+    let parent_script =
+        format!("cd {alias} && ASTER_EXECUTION_DIR={host_alias} {exe} run //:middle --quiet");
+    let parent = format!(
+        "sh -c {}",
+        aster::executor::quote_command_argument(&parent_script)
+    );
+    let mut a_config = fs::read_to_string(a.join("aster.toml")).unwrap();
+    a_config.push_str(&format!("\n[targets.parent]\ncommand = {parent:?}\ncache = {{ enabled = false }}\nexclusive_resources = ['workspace:compiler', 'host:ancestor']\n"));
+    fs::write(a.join("aster.toml"), a_config).unwrap();
+    let mut parent = f.start(&a, 3, "//:parent");
+    let held = f.started();
+    assert_eq!(
+        held.label, "b",
+        "nested aliases could not reuse ancestor locks"
+    );
+
+    // Two spare slots rule out capacity as the reason these contenders wait.
+    let mut workspace_contender = f.start(&b, 3, "//:work");
+    workspace_contender.waiting(&f.listener);
+    let mut ancestor_contender = f.start(&c, 3, "//:work");
+    ancestor_contender.waiting(&f.listener);
+    let mut independent = f.start(&d, 3, "//:work");
+    let free = f.started();
+    assert_eq!(
+        free.label, "d",
+        "a different workspace shared the compiler lock"
+    );
+    f.remains_blocked();
+    free.release();
+    assert!(independent.finish());
+
+    // Releasing the nested leaf returns both workspace and ancestor resources.
+    held.release();
+    let mut released = Vec::new();
+    for _ in 0..2 {
+        let next = f.started();
+        released.push(next.label.clone());
+        next.release();
+    }
+    released.sort();
+    assert_eq!(released, ["b", "c"]);
+    assert!(parent.finish());
+    assert!(workspace_contender.finish());
+    assert!(ancestor_contender.finish());
+}
+
+#[test]
 fn cancellation_while_waiting_never_starts_a_target_and_preserves_the_owner() {
     let f = Fixture::new();
     let a = f.workspace("a", "host:database", "normal");
@@ -338,9 +422,10 @@ fn cancellation_while_waiting_never_starts_a_target_and_preserves_the_owner() {
 #[test]
 fn cancelling_ancestor_stops_nested_work_after_its_scheduler_died() {
     let f = Fixture::new();
-    let a = f.workspace("a", "", "normal");
+    let a = f.workspace("a", "", "ignoreterm");
+    let b = f.workspace("b", "", "normal");
     let exe = aster::executor::quote_command_argument(&f.binary.display().to_string());
-    let script = format!("{exe} run //:work --quiet & echo $! > nested.pid; wait");
+    let script = format!("{exe} run //:work --quiet & nested=$!; echo $nested > nested.pid; wait \"$nested\"; echo $? > nested.exit.tmp; mv nested.exit.tmp nested.exit");
     let command = format!("sh -c {}", aster::executor::quote_command_argument(&script));
     let mut config = fs::read_to_string(a.join("aster.toml")).unwrap();
     config.push_str(&format!(
@@ -354,20 +439,48 @@ fn cancelling_ancestor_stops_nested_work_after_its_scheduler_died() {
         .trim()
         .parse()
         .unwrap();
-    unsafe {
-        libc::kill(nested, libc::SIGKILL);
+    let mut next = f.start(&b, 1, "//:work");
+    next.waiting(&f.listener);
+    // Kill the nested scheduler so its monitor cannot forward either signal.
+    assert_eq!(unsafe { libc::kill(nested, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match fs::read_to_string(a.join("nested.exit")) {
+            Ok(status) => {
+                assert_eq!(status.trim(), "137", "nested scheduler was not killed");
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(Instant::now() < deadline, "nested scheduler was not reaped");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("read nested scheduler exit: {error}"),
+        }
     }
+    let first_signal = Instant::now();
+    parent.signal(libc::SIGTERM);
+    let mut signal = [0; 5];
+    nested_target.stream.read_exact(&mut signal).unwrap();
+    assert_eq!(
+        &signal, b"term\n",
+        "ancestor cancellation did not reach the nested target"
+    );
+    f.remains_blocked();
+    // The ancestor's second signal must cross the same surviving supervisors.
     parent.signal(libc::SIGTERM);
     assert!(!parent.finish());
+    assert!(
+        first_signal.elapsed() < Duration::from_secs(3),
+        "ancestor force request did not beat the ordinary grace period"
+    );
     let mut byte = [0];
     assert_eq!(
         nested_target.stream.read(&mut byte).unwrap(),
         0,
         "nested target survived ancestor cancellation"
     );
-    let mut after = f.start(&a, 1, "//:work");
     f.started().release();
-    assert!(after.finish());
+    assert!(next.finish());
 }
 
 #[test]
@@ -471,8 +584,13 @@ fn multiple_ready_targets_share_two_slots_across_invocations() {
 }
 
 #[test]
-fn interrupts_stop_stubborn_targets_before_releasing_capacity() {
-    for second_signal in [false, true] {
+fn delegated_interrupts_reach_target_groups_before_releasing_capacity() {
+    for (streaming, second_signal, signal_number) in [
+        (false, false, libc::SIGTERM),
+        (false, true, libc::SIGINT),
+        (true, false, libc::SIGINT),
+        (true, true, libc::SIGTERM),
+    ] {
         let f = Fixture::new();
         let a = f.workspace("a", "", "ignoreterm");
         let b = f.workspace("b", "", "normal");
@@ -481,18 +599,23 @@ fn interrupts_stop_stubborn_targets_before_releasing_capacity() {
         command
             .env_remove("ASTER_JOBS")
             .args(["work", ".", "--jobs", "1", "--quiet"]);
+        if streaming {
+            command.arg("--stream");
+        }
         let mut owner = Run::spawn(command);
         let mut held = f.started();
         let mut next = f.start(&b, 1, "//:work");
         next.waiting(&f.listener);
         let first_signal = Instant::now();
-        owner.signal(libc::SIGTERM);
+        // Signal only the scheduling CLI. Its supervisor must bridge the
+        // separate target group; the target reports TERM over the real socket.
+        owner.signal(signal_number);
         let mut signal = [0; 5];
         held.stream.read_exact(&mut signal).unwrap();
         assert_eq!(&signal, b"term\n");
         f.remains_blocked();
         if second_signal {
-            owner.signal(libc::SIGTERM);
+            owner.signal(signal_number);
         }
         assert!(!owner.finish());
         if second_signal {
