@@ -400,7 +400,12 @@ fn supervise() -> Result<i32> {
     if super::shutdown_requested() || cancel || force {
         return Ok(143);
     }
-    let mut child = command.spawn().context("spawn admitted target")?;
+    let mut child = command.spawn().map_err(|error| {
+        anyhow::anyhow!(
+            "spawn admitted target: {}",
+            super::spawn_error_message(&spec.program, &error)
+        )
+    })?;
     let group = child.id() as i32;
     let mut status = None;
     let mut terminating = None;

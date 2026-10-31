@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use crate::executor::command::parse_command;
+use crate::executor::spawn_error_message;
 
 /// Runs runtime-input commands once and remembers their output.
 pub struct RuntimeInputCache {
@@ -53,7 +54,12 @@ fn run_command(workspace_root: &Path, command: &str) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|error| format!("failed to run runtime input `{command}`: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "failed to run runtime input `{command}`: {}",
+                spawn_error_message(&parsed.program, &error)
+            )
+        })?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
@@ -99,5 +105,22 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first, "v1");
         assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
+    }
+
+    #[test]
+    fn missing_runtime_program_names_the_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = RuntimeInputCache::new(tmp.path());
+        let error = cache
+            .output("/aster-no-such-tool --version")
+            .expect_err("missing program");
+        assert!(
+            error.contains("command not found: /aster-no-such-tool"),
+            "{error}"
+        );
+        assert!(
+            error.contains("failed to run runtime input `/aster-no-such-tool --version`"),
+            "{error}"
+        );
     }
 }
