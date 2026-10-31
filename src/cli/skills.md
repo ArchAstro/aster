@@ -171,7 +171,15 @@ Jest `--coverage=false`, pytest `--no-cov`, and `mix test` drops `--cover`. A co
 wrapper program (`scripts/with-rust-toolchain cargo test`,
 `mise exec node@24 -- vitest run`) is narrowed only when the root
 `aster.toml` lists the wrapper: `[affected.related]`, `wrappers = [
-"scripts/with-rust-toolchain", { program = "mise", until = "--" } ]`.
+"scripts/with-rust-toolchain", { program = "mise", until = "--" } ]`. Listed
+wrappers apply to test result capture and `--retry-failed` too (report flags and
+rerun selections go after the wrapped runner, the wrapper stays in front); a
+runner behind an unlisted wrapper records no tests and cannot be retried or
+quarantined. A package script chain (`npm`/`pnpm`) is run step by step when
+capture or `--retry-failed` is on: each runner step has its own report, a
+failing test is retried in its step only and the chain goes on, other steps run
+as written; a chain Aster cannot read (cd, pre/post hook, cycle, `||`/`;`/pipe)
+is reported by `uncaptured-test-results`.
 Parsed source facts are cached under `<cache dir>/related-facts/` so warm
 runs parse only changed files (`--no-cache` skips it). Dependents
 run only when they refer to something that changed, so do not combine it
@@ -208,12 +216,18 @@ Adding, changing or removing one selects the tests that reach its definition.
 `aster check` lints the configuration and annotations (rules
 `unnarrowable-test-command`, `suspicious-path-literal`, `bad-consumes`,
 `orphan-test-target`, `stale-annotation`, `stale-allow-orphan`,
-`stale-allow-unnarrowable`;
+`stale-allow-unnarrowable`, `uncaptured-test-results` (a test target whose
+per-test results Aster cannot capture, so retry and quarantine do nothing; fix
+it by listing the wrapper, putting the runner in the target or declaring
+`[targets.X] report`), `unquarantinable-test-results` (partial results or an exit code that is not the
+runner's, so quarantine cannot excuse a failure), `unretryable-test-target`
+(`--retry-failed` cannot rerun a failed test: `cargo test` without
+`--no-fail-fast`, `-x`, `--bail`, scripts), `stale-allow-no-test-results`;
 `unnarrowable-test-command` also flags an `--entry` target that runs a script
 file or a package script Aster cannot read; `--strict`, `--rule <id>`,
 `--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
 errors or any finding with `--strict`, 2 for a configuration error). Root
-`aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `allow_unnarrowable = [..]` (a command fixed on purpose, such as one bring-up proof or a model checker; never "not worth narrowing") / `disable = [..]` configure it.
+`aster.toml` `[check] entries = [..]` / `allow_orphans = [..]` / `allow_unnarrowable = [..]` (a command fixed on purpose, such as one bring-up proof or a model checker; never "not worth narrowing") / `allow_no_test_results = [..]` (a target that runs no per-test runner) / `disable = [..]` configure it.
 
 Workspace paths can be excluded from affected analysis in root `aster.toml`:
 

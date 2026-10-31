@@ -7,6 +7,7 @@
 //! every retry command exits 0.
 
 use super::*;
+use crate::plugins::test_reports::Launch;
 use crate::plugins::test_retry;
 use crate::test_results::quarantine::Quarantined;
 use crate::test_results::same_test;
@@ -23,6 +24,14 @@ pub(super) struct RetryJob<'a> {
     pub command: &'a str,
     /// Run in the working directory before each retry.
     pub setup: Option<&'a str>,
+    /// `[affected.related] wrappers`.
+    pub wrappers: &'a Wrappers,
+    /// Set when `command` is one step of a package script chain: each rerun
+    /// is started the way the script starts its steps.
+    pub launch: Option<&'a Launch>,
+    /// The target's declared report: every retry attempt is read from it too,
+    /// the rerun command being built from the runner the command names.
+    pub declared: Option<&'a crate::config::ReportConfig>,
     pub max_retries: u32,
     pub null_stdin: bool,
     pub log_cap: usize,
@@ -61,21 +70,24 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
             break;
         }
         let refs: Vec<&TestCase> = failing.iter().collect();
-        let Some(commands) = test_retry::commands(job.working_dir, job.command, &refs) else {
+        let Some(commands) =
+            test_retry::commands(job.working_dir, job.command, &refs, job.wrappers)
+        else {
             break;
         };
         let mut captures = Vec::new();
         for command in &commands {
             // A retry command selects tests with the runner's own flags, so
-            // Aster recognised the runner; its plan, not a declared one, reads
-            // the retry's results.
+            // Aster recognised the runner; a declared report reads each
+            // attempt, otherwise the runner's plan does.
             captures.push(plan_captures(
                 job.plugin,
-                None,
+                job.declared,
                 job.project_dir,
                 job.working_dir,
                 job.target_name,
                 std::slice::from_ref(command),
+                job.wrappers,
             ));
         }
         if captures.iter().any(|c| c.iter().all(Option::is_none)) {
@@ -113,10 +125,14 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
         let mut commands_ok = true;
         let mut last_exit = None;
         for (command, capture) in commands.iter().zip(&captures) {
-            let invocation = match capture.first() {
+            let mut invocation = match capture.first() {
                 Some(Some((plan, _))) => Invocation::planned(command, plan),
                 _ => Invocation::plain(command),
             };
+            if let Some(launch) = job.launch {
+                invocation.command = launch.apply(&invocation.command);
+                invocation.shown = launch.apply(&invocation.shown);
+            }
             let started = SystemTime::now();
             let (ran, raw_outputs) = run_invocations(
                 job.address,
@@ -375,8 +391,12 @@ mod tests {
         let registry = PluginRegistry::with_all_plugins();
         let plugin = registry.find_by_name("go").unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let wrappers = Wrappers::default();
         let job = RetryJob {
             address: "//app:test",
+            wrappers: &wrappers,
+            launch: None,
+            declared: None,
             plugin,
             project_dir: tmp.path(),
             working_dir: tmp.path(),

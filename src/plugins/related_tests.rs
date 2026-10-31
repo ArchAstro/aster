@@ -461,7 +461,9 @@ impl Delegated {
             if word != "exec" && !is_assignment(word) {
                 break;
             }
-            if word.contains(['\'', '"']) {
+            // A quoted value without spaces (`A="$PWD/.."`) is one word; a
+            // quote that stays open past the word is not.
+            if word.matches('\'').count() % 2 != 0 || word.matches('"').count() % 2 != 0 {
                 return None;
             }
             head.push_str(word);
@@ -579,6 +581,13 @@ pub(crate) struct Wrapped {
     pub(crate) prefix: String,
     /// The wrapped command.
     pub(crate) command: String,
+}
+
+impl Wrapped {
+    /// The wrapper written back in front of `command`.
+    pub(crate) fn render(&self, command: &str) -> String {
+        format!("{}{command}", self.prefix)
+    }
 }
 
 impl Wrappers {
@@ -1377,6 +1386,88 @@ fn in_package(command: &str, launcher: &str) -> String {
     } else {
         format!("npm exec -c {}", quote_any(command))
     }
+}
+
+/// The commands that the package script `command` calls (`npm`/`pnpm`)
+/// runs, in order, expanded through the scripts it calls exactly as
+/// `--related` expands them ([`script_commands`]), with the launcher
+/// (`npm` or `pnpm`). `None` when `command` is not such a call or the chain
+/// cannot be read (a `cd`, a `pre`/`post` hook, a cycle, another shell
+/// operator).
+pub(crate) fn script_leaves(project_dir: &Path, command: &str) -> Option<(String, Vec<String>)> {
+    let argv = Argv::parse(command)?;
+    let launcher = Path::new(&argv.parts[argv.program]).file_name()?.to_str()?;
+    if !matches!(launcher, "npm" | "pnpm") {
+        return None;
+    }
+    let scripts = package_scripts(project_dir)?;
+    let mut leaves = Vec::new();
+    script_commands(&scripts, script_name(&argv)?, &mut Vec::new(), &mut leaves)?;
+    Some((launcher.to_string(), leaves))
+}
+
+/// Whether the package script `command` calls, with the scripts it calls and
+/// the `pre`/`post` hooks around each, contains no test runner anywhere, so
+/// running it as written hides no tests (`pnpm run build` where `build` is
+/// `tsc` with a `prebuild` hook). A `cd` does not matter here; any runner
+/// found makes it `false`, and so does a script that is missing.
+pub(crate) fn script_runs_no_runner(project_dir: &Path, command: &str) -> bool {
+    fn clean(
+        scripts: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        if seen.len() >= SCRIPT_DEPTH || seen.iter().any(|s| s == name) {
+            return true;
+        }
+        seen.push(name.to_string());
+        let mut ok = true;
+        for script in [
+            format!("pre{name}"),
+            name.to_string(),
+            format!("post{name}"),
+        ] {
+            let Some(body) = scripts.get(&script).and_then(|b| b.as_str()) else {
+                if script == name {
+                    ok = false;
+                }
+                continue;
+            };
+            for segment in simple_commands(body) {
+                let Some(argv) = Argv::parse(&segment) else {
+                    ok = false;
+                    continue;
+                };
+                if js_runner(&argv).is_some() {
+                    ok = false;
+                } else if let Some(called) = script_name(&argv) {
+                    if scripts.contains_key(called) {
+                        ok &= clean(scripts, called, seen);
+                    }
+                }
+            }
+        }
+        seen.pop();
+        ok
+    }
+    let Some(argv) = Argv::parse(command) else {
+        return false;
+    };
+    let (Some(scripts), Some(name)) = (package_scripts(project_dir), script_name(&argv)) else {
+        return false;
+    };
+    clean(&scripts, name, &mut Vec::new())
+}
+
+/// Whether `command` calls a package script (`pnpm build`, `npm run lint`).
+pub(crate) fn is_script_call(command: &str) -> bool {
+    Argv::parse(command).is_some_and(|argv| script_name(&argv).is_some())
+}
+
+/// A command of a package script started as the script would have: through
+/// `pnpm exec` or `npm exec -c`, so it finds `node_modules/.bin`.
+pub(crate) fn in_package_script(command: &str, launcher: &str) -> String {
+    in_package(command, launcher)
 }
 
 /// A package script (`npm` or `pnpm`) whose body is a chain of commands:

@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::related_tests::{
-    js_runner, js_script, Argv, Delegated, GO_VALUE_FLAGS, JS_VALUE_FLAGS, PYTEST_VALUE_FLAGS,
+    js_runner, js_script, Argv, Delegated, Wrappers, GO_VALUE_FLAGS, JS_VALUE_FLAGS,
+    PYTEST_VALUE_FLAGS,
 };
 use super::test_reports::{js_runner_kind, JsRunner};
 use crate::test_results::TestCase;
@@ -26,14 +27,33 @@ use crate::test_results::TestCase;
 /// The commands that rerun `failures`, a run of `command` in `working_dir`.
 /// Several commands come back when the runner takes one selection per
 /// package (`go test`).
+///
+/// A command that starts with a configured wrapper (`mise exec go -- bun
+/// test`) is narrowed as the command the wrapper runs, and each rerun keeps
+/// the wrapper in front.
 pub(crate) fn commands(
     working_dir: &Path,
     command: &str,
     failures: &[&TestCase],
+    wrappers: &Wrappers,
 ) -> Option<Vec<String>> {
     if failures.is_empty() {
         return None;
     }
+    if let Some(wrapped) = wrappers.strip(command) {
+        if let Some(found) = unwrapped(working_dir, &wrapped.command, failures, wrappers) {
+            return Some(found.iter().map(|c| wrapped.render(c)).collect());
+        }
+    }
+    unwrapped(working_dir, command, failures, wrappers)
+}
+
+fn unwrapped(
+    working_dir: &Path,
+    command: &str,
+    failures: &[&TestCase],
+    wrappers: &Wrappers,
+) -> Option<Vec<String>> {
     if let Some(found) = direct(working_dir, command, failures) {
         return Some(found);
     }
@@ -46,8 +66,18 @@ pub(crate) fn commands(
     // A partition's retry runs the failing files, which are not that
     // partition's to deal out.
     let delegated = delegated.without_assignment("MIX_TEST_PARTITION");
-    let found = direct(&inner_dir, &delegated.command, failures)?;
-    Some(found.iter().map(|c| delegated.render(c)).collect())
+    if let Some(found) = direct(&inner_dir, &delegated.command, failures) {
+        return Some(found.iter().map(|c| delegated.render(c)).collect());
+    }
+    // A wrapper inside the one-liner: `bash -c 'mise exec x -- cargo test'`.
+    let wrapped = wrappers.strip(&delegated.command)?;
+    let found = direct(&inner_dir, &wrapped.command, failures)?;
+    Some(
+        found
+            .iter()
+            .map(|c| delegated.render(&wrapped.render(c)))
+            .collect(),
+    )
 }
 
 fn direct(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
@@ -661,7 +691,7 @@ mod tests {
 
     fn build(dir: &Path, command: &str, failures: &[TestCase]) -> Option<Vec<String>> {
         let refs: Vec<&TestCase> = failures.iter().collect();
-        commands(dir, command, &refs)
+        commands(dir, command, &refs, &Wrappers::default())
     }
 
     fn one(dir: &Path, command: &str, failures: &[TestCase]) -> String {
@@ -882,6 +912,56 @@ mod tests {
             "npx jest src/math.test.ts -t 'math adds \\(1\\+1\\) \\[x\\] returns 2$'"
         );
         assert_eq!(build(dir, "vitest run --bail 1", &failures), None);
+    }
+
+    #[test]
+    fn a_configured_wrapper_stays_in_front_of_each_rerun() {
+        use crate::config::RelatedWrapperConfig;
+        let dir = Path::new("/w");
+        let wrappers = Wrappers::new(&[
+            RelatedWrapperConfig::Program("with-rust-toolchain".to_string()),
+            RelatedWrapperConfig::Detailed(crate::config::RelatedWrapperTable {
+                program: "mise".to_string(),
+                until: Some("--".to_string()),
+            }),
+        ]);
+        let rerun = |command: &str, failures: &[TestCase]| {
+            let refs: Vec<&TestCase> = failures.iter().collect();
+            commands(dir, command, &refs, &wrappers)
+        };
+        let bun = [failure(Some("a.test.ts"), Some("math"), "adds up")];
+        assert_eq!(
+            rerun("mise exec go -- bun test --timeout=60000", &bun).unwrap(),
+            ["mise exec go -- bun test --timeout=60000 a.test.ts -t 'adds up$'"]
+        );
+        let go = [failure(None, Some("example.com/app"), "TestFlaky")];
+        let rerun_go = rerun("mise exec go@1.24 -- go test ./...", &go).unwrap();
+        assert_eq!(rerun_go.len(), 1, "{rerun_go:?}");
+        assert!(
+            rerun_go[0].starts_with("mise exec go@1.24 -- go test "),
+            "{rerun_go:?}"
+        );
+        assert!(rerun_go[0].contains("TestFlaky"), "{rerun_go:?}");
+        let cargo = [failure(None, None, "tests::flaky")];
+        let rerun_cargo = rerun("with-rust-toolchain cargo test --no-fail-fast", &cargo).unwrap();
+        assert!(
+            rerun_cargo[0].starts_with("with-rust-toolchain cargo test "),
+            "{rerun_cargo:?}"
+        );
+        // A wrapper inside a one-liner keeps its place too.
+        let inside = rerun(
+            "with-rust-toolchain bash -c 'A=1 mise exec x -- cargo test --no-fail-fast'",
+            &cargo,
+        )
+        .unwrap();
+        assert!(
+            inside[0].starts_with("with-rust-toolchain bash -c ")
+                && inside[0].contains("mise exec x -- cargo test --no-fail-fast")
+                && inside[0].contains("tests::flaky"),
+            "{inside:?}"
+        );
+        // A wrapper that is not configured hides the runner, as before.
+        assert!(rerun("unlisted exec -- bun test", &bun).is_none());
     }
 
     #[test]

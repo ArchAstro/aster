@@ -345,10 +345,12 @@ fn output_schema_exit_status_and_rule_selection() {
     let (status, report) = ws.check(&[]);
     assert_eq!(status, 0, "warnings alone exit 0: {report}");
     assert_eq!(report["version"], 1);
-    assert_eq!(report["summary"]["findings"], 1);
-    assert_eq!(report["summary"]["warnings"], 1);
+    // The chained command cannot be narrowed, and no report can be added to it.
+    assert_eq!(report["summary"]["findings"], 2);
+    assert_eq!(report["summary"]["warnings"], 2);
     assert_eq!(report["summary"]["errors"], 0);
     assert_eq!(report["summary"]["by_rule"]["unnarrowable-test-command"], 1);
+    assert_eq!(report["summary"]["by_rule"]["uncaptured-test-results"], 1);
     let finding = &report["findings"][0];
     for key in ["rule", "severity", "file", "line", "target", "message"] {
         assert!(finding.get(key).is_some(), "{key} missing: {finding}");
@@ -392,7 +394,7 @@ fn a_bad_configuration_exits_2_and_disable_skips_a_rule() {
     let ws = Workspace::new(&[
         (
             "aster.toml",
-            "[check]\ndisable = [\"unnarrowable-test-command\"]\n",
+            "[check]\ndisable = [\"unnarrowable-test-command\", \"uncaptured-test-results\"]\n",
         ),
         ("shop/mix.exs", MIX),
         (
@@ -837,4 +839,146 @@ fn allow_unnarrowable_accepts_a_fixed_command_and_stale_entries_are_errors() {
         .collect();
     assert!(messages[0].contains("names no test target"), "{messages:?}");
     assert!(messages[1].contains("narrows now"), "{messages:?}");
+}
+
+#[test]
+fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report() {
+    let workspace = |wrappers: &str, extra: &str| {
+        Workspace::new(&[
+            (
+                "aster.toml",
+                &format!("[check]\nentries = [\"test-ci\"]\n{extra}\n{wrappers}"),
+            ),
+            (
+                "web/package.json",
+                r#"{"name":"web","scripts":{"test":"vitest run && eslint .","cdtest":"cd sub && vitest run","pretest-hook":"true","test-hook":"vitest run && tsc"}}"#,
+            ),
+            (
+                "web/aster.toml",
+                "[targets.test-ci]\ncommand = \"./run-tests.sh\"\n\n\
+                 [targets.test-bun]\ncommand = \"mise exec go -- bun test --timeout=60000\"\n\n\
+                 [targets.test-chain]\ncommand = \"bash -c 'bun test && bun run lint'\"\n\n\
+                 [targets.test-hook]\ncommand = \"pnpm test-hook\"\n\n\
+                 [targets.test-declared]\ncommand = \"./run-tests.sh\"\n\n\
+                 [targets.test-declared.report]\nformat = \"junit\"\n",
+            ),
+        ])
+    };
+    let wrappers = "[affected.related]\nwrappers = [{ program = \"mise\", until = \"--\" }]\n";
+    let rule = "uncaptured-test-results";
+
+    // `mise` is not configured: the wrapped runner is hidden from capture.
+    let (status, report) = workspace("", "").check(&["--rule", rule]);
+    assert_eq!(status, 0, "a warning does not fail the check: {report}");
+    assert_eq!(
+        places(&report, rule),
+        [
+            "//web:test-bun",
+            "//web:test-chain",
+            "//web:test-ci",
+            "//web:test-hook"
+        ]
+    );
+    let message = |target: &str| -> String {
+        findings(&report, rule)
+            .iter()
+            .find(|f| f["target"] == target)
+            .unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let bun = message("//web:test-bun");
+    assert!(
+        bun.contains("behind `mise exec go`, which is not a configured wrapper"),
+        "{bun}"
+    );
+    assert!(bun.contains("--retry-failed"), "{bun}");
+    let chain = message("//web:test-chain");
+    assert!(
+        chain.contains("among other commands") && chain.contains("`bun test`"),
+        "{chain}"
+    );
+    let script = message("//web:test-ci");
+    assert!(script.contains("script file `./run-tests.sh`"), "{script}");
+    let hooked = message("//web:test-hook");
+    assert!(hooked.contains("package script `test-hook`"), "{hooked}");
+    // `//web:test` calls a chain (`vitest run && eslint .`): every runner step
+    // is captured, so it is not reported.
+
+    // Configured, the wrapped runner is captured; the declared target never
+    // was a finding; the rest stay (a fixed, unnarrowable command still needs
+    // results).
+    let (_, report) = workspace(wrappers, "").check(&["--rule", rule]);
+    assert_eq!(
+        places(&report, rule),
+        ["//web:test-chain", "//web:test-ci", "//web:test-hook"]
+    );
+
+    // allow_no_test_results exempts a target that runs no per-test runner,
+    // and a stale entry is an error.
+    let (status, report) = workspace(
+        wrappers,
+        "allow_no_test_results = [\"//web:test-ci\", \"//web:test-bun\", \"//web:nope\"]",
+    )
+    .check(&[]);
+    assert_eq!(status, 1, "{report}");
+    assert_eq!(
+        places(&report, rule),
+        ["//web:test-chain", "//web:test-hook"]
+    );
+    assert_eq!(
+        places(&report, "stale-allow-no-test-results"),
+        ["//web:nope", "//web:test-bun"]
+    );
+}
+
+#[test]
+fn partial_results_and_targets_that_cannot_be_retried_say_why() {
+    let ws = Workspace::new(&[
+        ("aster.toml", "[check]\nentries = [\"test-ci\"]\n"),
+        (
+            "rs/Cargo.toml",
+            "[package]\nname = \"rs\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "rs/aster.toml",
+            "[targets.test-ci]\ncommand = \"cargo test\"\n\n\
+             [targets.test-all]\ncommand = \"cargo test --no-fail-fast\"\n",
+        ),
+        ("web/package.json", r#"{"name":"web"}"#),
+        (
+            "web/aster.toml",
+            "[targets.test-ci]\ncommand = \"bash -c 'node --test a.test.js | cat'\"\n\n\
+             [targets.test-node]\ncommand = \"node --test a.test.js\"\n",
+        ),
+    ]);
+    let (status, report) = ws.check(&[
+        "--rule",
+        "unquarantinable-test-results",
+        "--rule",
+        "unretryable-test-target",
+    ]);
+    assert_eq!(status, 0, "{report}");
+    // `cargo test` stops at the first failing binary; `node --test` behind a
+    // shell pipeline may run tests another way too. `node --test` itself and
+    // `cargo test --no-fail-fast` are complete and retryable.
+    assert_eq!(
+        places(&report, "unretryable-test-target"),
+        ["//rs:test", "//rs:test-ci", "//web:test-ci"]
+    );
+    assert_eq!(
+        places(&report, "unquarantinable-test-results"),
+        ["//web:test-ci"]
+    );
+    let message = findings(&report, "unretryable-test-target")[1]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("--no-fail-fast"), "{message}");
+    let partial = findings(&report, "unquarantinable-test-results")[0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(partial.contains("mentions `node --test`"), "{partial}");
 }

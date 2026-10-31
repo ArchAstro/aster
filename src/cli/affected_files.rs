@@ -906,7 +906,7 @@ impl TestTarget {
 /// Why a command with no test runner in its words is still reported, when
 /// it is: a package script that runs a runner Aster cannot narrow, or, for an
 /// entry target, any command that is not inert.
-fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> {
+fn hidden_runner_reason(runner: Option<&Runner>, entry: bool, purpose: Purpose) -> Option<String> {
     use crate::plugins::related_tests::{
         is_js_runner, package_script_body, package_script_runners,
     };
@@ -945,11 +945,27 @@ fn hidden_runner_reason(runner: Option<&Runner>, entry: bool) -> Option<String> 
              in the target"
         ));
     }
-    Some(format!(
-        "`{}` is not a test command Aster can narrow: it is not a runner Aster recognises, or its \
-         form (an unsupported flag, a path outside the project) is not supported",
-        runner.command
-    ))
+    Some(match purpose {
+        Purpose::Narrowing => format!(
+            "`{}` is not a test command Aster can narrow: it is not a runner Aster recognises, or \
+             its form (an unsupported flag, a path outside the project) is not supported",
+            runner.command
+        ),
+        Purpose::Capture => format!(
+            "`{}` runs no test runner Aster recognises (it may run no per-test runner at all, \
+             such as a compile check or a model checker)",
+            runner.command
+        ),
+    })
+}
+
+/// What a reason for an unreadable command is for.
+#[derive(Clone, Copy)]
+enum Purpose {
+    /// `--related` cannot narrow the command.
+    Narrowing,
+    /// Aster cannot capture the command's per-test results.
+    Capture,
 }
 
 /// The script file a command runs: `./test-ci.sh`, `bash tools/run.sh`,
@@ -1283,7 +1299,7 @@ pub fn test_targets(
                         // package script whose runners Aster cannot narrow.
                         // Only a target known to run tests is reported.
                         let entry = entries.contains(name) && !is_inert(&def.command);
-                        match hidden_runner_reason(runner.as_ref(), entry) {
+                        match hidden_runner_reason(runner.as_ref(), entry, Purpose::Narrowing) {
                             Some(reason) => {
                                 hidden = true;
                                 Some(reason)
@@ -1359,6 +1375,84 @@ pub fn test_targets(
     }
     found.sort_by(|a, b| (&a.project, &a.target).cmp(&(&b.project, &b.target)));
     found
+}
+
+/// Why Aster cannot capture per-test results from `def`, a command that
+/// `crate::plugins::test_reports::plan` returned no plan for. Reads the
+/// command the way `--related` does: through the configured wrappers and a
+/// shell one-liner.
+pub fn uncaptured_reason(
+    projects: &[DiscoveredProject],
+    wrappers: &[RelatedWrapperConfig],
+    registry: &PluginRegistry,
+    project: &DiscoveredProject,
+    def: &Target,
+) -> String {
+    use crate::plugins::related_tests::{simple_commands, trailing_commands};
+    let lookup = Lookup::new(projects, wrappers);
+    let written = match lookup.wrappers.strip(&def.command) {
+        Some(wrapped) => wrapped.command,
+        None => def.command.clone(),
+    };
+    let reads = |command: &str| {
+        registry
+            .plugins()
+            .iter()
+            .find(|p| p.related_tests(&project.root, command, &[]).is_some())
+            .map(|p| p.name().to_string())
+    };
+    let hint = "; declare the report with `[targets.<name>] report = { .. }` if the command \
+                writes one";
+    let runner = lookup.runner(project, def);
+    if let Some((name, body)) = runner.as_ref().and_then(|runner| {
+        crate::plugins::related_tests::package_script_body(&runner.project.root, &runner.command)
+    }) {
+        return format!(
+            "package script `{name}` (`{body}`) is not a chain of commands Aster can read to \
+             the end with a test runner in it (a `cd`, a `pre`/`post` hook, a cycle, a shell \
+             operator other than `&&`, a launcher other than `npm` or `pnpm`, or no runner). \
+             Put the runner command in the target{hint}"
+        );
+    }
+    if let Some(plugin) = reads(&written) {
+        let why = match plugin.as_str() {
+            "nodejs" => {
+                "the command or the runner's config chooses its own reporters or report file, \
+                 which Aster cannot add a report beside"
+            }
+            "elixir" => {
+                "the project configures its own ExUnit formatters, which Aster would replace"
+            }
+            _ => "its form is not one Aster plans a report for (an unsupported flag or argument)",
+        };
+        return format!("a {plugin} test runner whose report Aster cannot add: {why}{hint}");
+    }
+    let segments = simple_commands(&written);
+    if let Some((plugin, runner)) = segments
+        .iter()
+        .find_map(|command| reads(command).map(|plugin| (plugin, command)))
+    {
+        return format!(
+            "a {plugin} test runner (`{runner}`) among other commands or behind a script Aster \
+             cannot read to the end; Aster plans a report only when the runner is the whole \
+             command or the last command of a `cd dir && runner` one-liner{hint}"
+        );
+    }
+    let behind = segments.iter().find_map(|command| {
+        trailing_commands(command)
+            .into_iter()
+            .find_map(|(prefix, rest)| reads(&rest).map(|plugin| (plugin, prefix)))
+    });
+    if let Some((plugin, prefix)) = behind {
+        return format!(
+            "a {plugin} test runner behind `{prefix}`, which is not a configured wrapper; if \
+             that program runs the command after it, list it in `[affected.related] wrappers`"
+        );
+    }
+    match hidden_runner_reason(runner.as_ref(), true, Purpose::Capture) {
+        Some(reason) => format!("no test runner whose results Aster can capture: {reason}"),
+        None => "no test runner whose results Aster can capture".to_string(),
+    }
 }
 
 /// Every `(project address, target)` that running the `roots` runs: the
