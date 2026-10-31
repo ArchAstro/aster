@@ -209,7 +209,11 @@ fn without_the_flag_nothing_is_recorded() {
 // --retry-failed, end to end with a real `go test`.
 
 fn go_available() -> bool {
-    Command::new("go").arg("version").output().is_ok()
+    // A shim can spawn and still exit non-zero when no toolchain is selected.
+    Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// A Go module whose `TestFlaky` fails until `../marker` exists (it creates
