@@ -40,6 +40,7 @@ pub const PARSE_RUN_ARG_FLAGS: &[&str] = &[
     "--test-results=",
     "--retry-failed",
     "--retry-failed=",
+    "--allow-empty",
     "--help",
     "-h",
 ];
@@ -92,6 +93,11 @@ pub struct RunArgs {
     pub cache_dir: Option<PathBuf>,
     /// `--help` or `-h`: print usage and do not run the target.
     pub help: bool,
+    /// Succeed when no selected project defines the target.
+    ///
+    /// Without this flag, a target defined nowhere among the selected projects
+    /// is an error. An empty selection still succeeds either way.
+    pub allow_empty: bool,
 }
 
 /// Check if a target name conflicts with a reserved command
@@ -147,6 +153,7 @@ pub fn parse_run_args(args: Vec<String>) -> Result<RunArgs, String> {
     let mut cache_dir = None;
     let mut expecting_cache_dir = false;
     let mut error: Option<String> = None;
+    let mut allow_empty = false;
 
     for arg in args {
         // Before value-taking flags and the unknown-flag arm, so help never runs work.
@@ -179,6 +186,7 @@ pub fn parse_run_args(args: Vec<String>) -> Result<RunArgs, String> {
             "--no-deps" => no_deps = true,
             "--dependents" => dependents = true,
             "--all" => all = true,
+            "--allow-empty" => allow_empty = true,
             "--warnings-as-errors" => warnings_as_errors = true,
             "--stream" => stream_override = Some(true),
             "--no-stream" => stream_override = Some(false),
@@ -287,6 +295,7 @@ pub fn parse_run_args(args: Vec<String>) -> Result<RunArgs, String> {
         test_results,
         no_replay,
         cache_dir,
+        allow_empty,
     })
 }
 
@@ -416,6 +425,20 @@ pub fn select_projects<'a>(
             if let Some(project) = best_match {
                 return Ok(vec![project]);
             }
+        }
+
+        // A word that no project defines is an unknown command, not a
+        // missing selector. A defined target keeps the selector hint so
+        // `aster test` outside a project still explains how to choose one.
+        if !args.target.is_empty()
+            && !discovered
+                .iter()
+                .any(|project| project.targets.contains_key(&args.target))
+        {
+            return Err(format!(
+                "unknown command or target '{}'; run aster --help",
+                args.target
+            ));
         }
 
         return Err(
@@ -581,6 +604,20 @@ mod tests {
         assert_eq!(args.target, "build");
         assert!(args.projects.is_empty());
         assert!(args.all);
+        assert!(!args.allow_empty);
+    }
+
+    #[test]
+    fn test_parse_run_args_allow_empty() {
+        let args = parse_ok(vec![
+            "tset".to_string(),
+            "--all".to_string(),
+            "--allow-empty".to_string(),
+        ]);
+
+        assert_eq!(args.target, "tset");
+        assert!(args.all);
+        assert!(args.allow_empty);
     }
 
     #[test]
