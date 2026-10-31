@@ -4,8 +4,10 @@
 //! names each test binary (`Running tests/api.rs (...)`, `Doc-tests demo`)
 //! on stderr. Aster's log holds stdout then stderr, so the Nth `running N
 //! tests` block belongs to the Nth binary cargo names; when the counts
-//! disagree no suite is recorded. Results read from the console are always
-//! partial: a test that prints without a newline can break a result line.
+//! disagree no suite is recorded. A test that prints without a newline can
+//! break a result line, so the results are complete only when every binary's
+//! `test result:` summary is there and the summaries add up to the tests
+//! read.
 
 use std::sync::LazyLock;
 
@@ -18,6 +20,12 @@ static RESULT: LazyLock<Regex> =
 static BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^running \d+ tests?$").unwrap());
 static BINARY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:Running (?:unittests )?(\S+)(?: \(.*\))?|Doc-tests (\S+))$").unwrap()
+});
+static SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured",
+    )
+    .unwrap()
 });
 static FAILURE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^---- (.+) (?:stdout|stderr) ----$").unwrap());
@@ -82,10 +90,17 @@ pub(super) fn parse(output: &str) -> Collected {
         }
         i += 1;
     }
-    Collected {
-        cases,
-        complete: false,
-    }
+    // Every binary that started printed its summary, and the summaries
+    // count exactly the results read: no line was lost or broken.
+    let summaries: Vec<usize> = lines
+        .iter()
+        .filter_map(|line| SUMMARY.captures(line))
+        .map(|c| (1..=4).map(|i| c[i].parse::<usize>().unwrap_or(0)).sum())
+        .collect();
+    let complete = !summaries.is_empty()
+        && summaries.len() == blocks
+        && summaries.iter().sum::<usize>() == cases.len();
+    Collected { cases, complete }
 }
 
 #[cfg(test)]
@@ -99,7 +114,7 @@ mod tests {
     #[test]
     fn reads_every_binary_and_names_its_suite() {
         let collected = parse(OUTPUT);
-        assert!(!collected.complete);
+        assert!(collected.complete, "every summary adds up");
         let cases: Vec<_> = collected
             .cases
             .iter()
@@ -123,6 +138,18 @@ mod tests {
         assert!(message.starts_with("some captured output"), "{message}");
         assert!(message.contains("division is off"));
         assert!(!message.contains("failures:"));
+    }
+
+    #[test]
+    fn a_missing_or_short_summary_makes_the_results_partial() {
+        let ok = "running 2 tests\ntest a ... ok\ntest b ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        assert!(parse(ok).complete);
+        // A binary that died before its summary.
+        let died = format!("{ok}running 1 test\ntest c ... ok\n");
+        assert!(!parse(&died).complete);
+        // A result line broken by a test's own output.
+        let broken = "running 2 tests\ntest a ... ok\nprinted test b ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        assert!(!parse(broken).complete);
     }
 
     #[test]

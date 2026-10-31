@@ -10,8 +10,9 @@ use crate::cli::affected_files::{
 use crate::config::WorkspaceConfig;
 use crate::discovery::DiscoveredProject;
 use crate::git::select_affected_lane;
+use crate::plugins::capture_audit::{self, Audit};
 use crate::plugins::related_tests::Wrappers;
-use crate::plugins::{test_reports, PluginRegistry};
+use crate::plugins::PluginRegistry;
 use crate::related::{self, SourceFinding, Sources};
 use crate::test_results::{new_report_dir, ReportContext};
 use anyhow::{bail, Result};
@@ -30,9 +31,11 @@ pub const STALE_ALLOW: &str = "stale-allow-orphan";
 pub const STALE_ALLOW_UNNARROWABLE: &str = "stale-allow-unnarrowable";
 pub const UNCAPTURED: &str = "uncaptured-test-results";
 pub const STALE_ALLOW_NO_RESULTS: &str = "stale-allow-no-test-results";
+pub const UNQUARANTINABLE: &str = "unquarantinable-test-results";
+pub const UNRETRYABLE: &str = "unretryable-test-target";
 
 /// Every rule id, in the order findings are listed.
-pub const RULES: [&str; 9] = [
+pub const RULES: [&str; 11] = [
     UNNARROWABLE,
     SUSPICIOUS,
     BAD_CONSUMES,
@@ -41,6 +44,8 @@ pub const RULES: [&str; 9] = [
     STALE_ALLOW,
     STALE_ALLOW_UNNARROWABLE,
     UNCAPTURED,
+    UNQUARANTINABLE,
+    UNRETRYABLE,
     STALE_ALLOW_NO_RESULTS,
 ];
 
@@ -149,6 +154,8 @@ pub fn run(
         || enabled(STALE_ALLOW)
         || enabled(STALE_ALLOW_UNNARROWABLE)
         || enabled(UNCAPTURED)
+        || enabled(UNQUARANTINABLE)
+        || enabled(UNRETRYABLE)
         || enabled(STALE_ALLOW_NO_RESULTS)
     {
         let tests = test_targets(
@@ -215,7 +222,11 @@ pub fn run(
                 });
             }
         }
-        if enabled(UNCAPTURED) || enabled(STALE_ALLOW_NO_RESULTS) {
+        if enabled(UNCAPTURED)
+            || enabled(UNQUARANTINABLE)
+            || enabled(UNRETRYABLE)
+            || enabled(STALE_ALLOW_NO_RESULTS)
+        {
             uncaptured(projects, registry, config, &tests, &enabled, &mut report);
         }
         if enabled(ORPHAN) || enabled(STALE_ALLOW) {
@@ -328,53 +339,73 @@ fn uncaptured(
             command: command.trim(),
             report_dir: &report_dir,
         };
-        let planned = test_reports::plan(plugin, def.report.as_ref(), &context, &wrappers);
-        // A package script chain is captured step by step.
-        let mut chain_reason = None;
-        let mut chained = false;
-        if planned.is_none() {
-            match test_reports::chain_for_target(
-                plugin,
-                def.report.as_ref(),
-                &context,
-                &wrappers,
-                &mut || new_report_dir().ok(),
-            ) {
-                test_reports::Chain::Plan(plan) => {
-                    plan.remove_report_dirs();
-                    chained = true;
-                }
-                test_reports::Chain::Unplanned { step } => chain_reason = Some(step),
-                test_reports::Chain::Single => {}
-            }
-        }
+        let audited = capture_audit::audit(
+            plugin,
+            def.report.as_ref(),
+            &context,
+            &wrappers,
+            &mut || new_report_dir().ok(),
+        );
         let _ = std::fs::remove_dir_all(&report_dir);
-        if planned.is_some() || chained {
-            continue;
-        }
         let address = format!("{}:{}", test.project, test.target);
-        missing.insert(address.clone());
-        if enabled(UNCAPTURED) && !allowed.contains(address.as_str()) {
-            let reason = match chain_reason {
-                Some(step) => format!(
-                    "its package script chain has a step Aster cannot capture or read: `{step}` \
-                     (a runner whose flags or config choose their own reporters, or a call to a \
-                     script Aster could not expand)"
-                ),
-                None => uncaptured_reason(projects, wrapper_config, registry, project, def),
-            };
+        let mut push = |rule: &'static str, message: String| {
             report.findings.push(Finding {
-                rule: UNCAPTURED,
-                severity: severity(UNCAPTURED),
+                rule,
+                severity: severity(rule),
                 file: None,
                 line: None,
-                target: Some(address),
-                message: format!(
-                    "Aster cannot capture per-test results from `{}`, so `--retry-failed` and \
-                     quarantine do nothing for it: {reason}",
-                    test.command
-                ),
+                target: Some(address.clone()),
+                message,
             });
+        };
+        match audited {
+            Audit::Uncaptured { chain_step } => {
+                missing.insert(address.clone());
+                if enabled(UNCAPTURED) && !allowed.contains(address.as_str()) {
+                    let reason = match chain_step {
+                        Some(step) => format!(
+                            "its package script chain has a step Aster cannot capture or read: \
+                             `{step}` (a runner whose flags or config choose their own reporters, \
+                             or a call to a script Aster could not expand)"
+                        ),
+                        None => uncaptured_reason(projects, wrapper_config, registry, project, def),
+                    };
+                    push(
+                        UNCAPTURED,
+                        format!(
+                            "Aster cannot capture per-test results from `{}`, so \
+                             `--retry-failed` and quarantine do nothing for it: {reason}",
+                            test.command
+                        ),
+                    );
+                }
+            }
+            Audit::Captured {
+                partial,
+                exit_code,
+                unretryable,
+            } => {
+                if enabled(UNQUARANTINABLE) {
+                    for why in partial.into_iter().chain(exit_code) {
+                        push(
+                            UNQUARANTINABLE,
+                            format!(
+                                "quarantine cannot excuse a failing test of this target: {why}"
+                            ),
+                        );
+                    }
+                }
+                if enabled(UNRETRYABLE) {
+                    if let Some(why) = unretryable {
+                        push(
+                            UNRETRYABLE,
+                            format!(
+                                "`--retry-failed` cannot rerun a failed test of this target: {why}"
+                            ),
+                        );
+                    }
+                }
+            }
         }
     }
     if enabled(STALE_ALLOW_NO_RESULTS) {
@@ -700,10 +731,12 @@ mod tests {
     use super::*;
     use crate::discovery::discover_projects;
 
-    /// `uncaptured-test-results` and the executor ask the same function, so a
-    /// target is reported exactly when a run would record no tests for it.
-    /// Plans every test target through the executor's own `plan_captures`
-    /// and compares with the rule.
+    /// The rules and the executor ask the same functions, so a target is
+    /// reported exactly when a run would record no tests for it, could not
+    /// quarantine a failure of it, or could not retry one. Plans every test
+    /// target through the executor's own `plan_captures` and `plan_chain`,
+    /// judges the plans with the quarantine's exit codes and builds a rerun
+    /// with `test_retry`, and compares with the three rules.
     #[test]
     fn the_rule_agrees_with_the_executors_report_planning() {
         let tmp = tempfile::tempdir().unwrap();
@@ -716,7 +749,7 @@ mod tests {
         };
         write(
             "aster.toml",
-            "[check]\nentries = [\"test-script\", \"test-declared\"]\n\n\
+            "[check]\nentries = [\"test-script\", \"test-declared\", \"test-node-opaque\"]\n\n\
              [affected.related]\nwrappers = [\"with-rust-toolchain\", { program = \"mise\", until = \"--\" }]\n",
         );
         write(
@@ -749,6 +782,19 @@ command = "pnpm hooked"
 command = "./run-tests.sh"
 [targets.test-declared.report]
 format = "junit"
+[targets.test-declared-bun]
+command = "bun test"
+[targets.test-declared-bun.report]
+format = "junit"
+files = ["junit.xml"]
+[targets.test-node]
+command = "node --test a.test.js"
+[targets.test-node-opaque]
+command = "bash -c 'node --test a.test.js | cat'"
+[targets.test-bail]
+command = "bun test --bail"
+[targets.test-pytest-x]
+command = "pytest -x"
 "#,
         );
         write("svc/go.mod", "module example.com/svc\n\ngo 1.21\n");
@@ -763,22 +809,33 @@ format = "junit"
         );
         write(
             "rs/aster.toml",
-            "[targets.test-rs]\ncommand = \"with-rust-toolchain cargo test\"\n",
+            "[targets.test-rs]\ncommand = \"with-rust-toolchain cargo test\"\n\n\
+             [targets.test-rs-all]\ncommand = \"cargo test --no-fail-fast\"\n",
         );
 
         let registry = PluginRegistry::with_all_plugins();
         let projects = discover_projects(root, &registry).unwrap();
         let config = WorkspaceConfig::load(root).unwrap();
         let options = Options {
-            rules: vec![UNCAPTURED.to_string()],
+            rules: vec![
+                UNCAPTURED.to_string(),
+                UNQUARANTINABLE.to_string(),
+                UNRETRYABLE.to_string(),
+            ],
             ..Options::default()
         };
         let report = run(root, &projects, &registry, &config, &options).unwrap();
-        let flagged: HashSet<String> = report
-            .findings
-            .iter()
-            .filter_map(|f| f.target.clone())
-            .collect();
+        let by_rule = |rule: &str| -> HashSet<String> {
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == rule)
+                .filter_map(|f| f.target.clone())
+                .collect()
+        };
+        let flagged = by_rule(UNCAPTURED);
+        let unquarantinable = by_rule(UNQUARANTINABLE);
+        let unretryable = by_rule(UNRETRYABLE);
 
         let wrappers = Wrappers::new(&config.affected.related.wrappers);
         let tests = test_targets(
@@ -787,7 +844,7 @@ format = "junit"
             &registry,
             &entry_targets(&config, &options),
         );
-        assert!(tests.len() >= 12, "{tests:?}");
+        assert!(tests.len() >= 18, "{tests:?}");
         for test in &tests {
             let project = projects
                 .iter()
@@ -815,13 +872,74 @@ format = "junit"
                 &wrappers,
             );
             let planned = captures[0].is_some() || chain.is_some();
+            // The runner commands a run reads, with their plans: the target's
+            // command (retried with the wrappers), or each step of a chain.
+            let mut steps: Vec<(String, crate::test_results::ReportPlan, bool)> = Vec::new();
+            if let Some(chain) = &chain {
+                for step in &chain.steps {
+                    if let Some((plan, _)) = &step.plan {
+                        steps.push((step.leaf.clone(), plan.clone(), true));
+                    }
+                }
+            } else if let Some((plan, _)) = &captures[0] {
+                steps.push((def.command.clone(), plan.clone(), false));
+            }
             for (_, dir) in captures.iter().flatten() {
                 let _ = std::fs::remove_dir_all(dir);
             }
             if let Some(chain) = &chain {
                 chain.remove_report_dirs();
             }
+            let failure = crate::test_results::TestCase {
+                file: Some("tests/a_test.py".into()),
+                suite: Some("Suite".into()),
+                name: "a test".into(),
+                outcome: crate::test_results::TestOutcome::Fail,
+                attempt: 1,
+                duration_ms: None,
+                message: None,
+            };
+            let quarantinable = steps.iter().all(|(command, plan, _)| {
+                let name = if plan.declared {
+                    plan.format.declared_capture_name()
+                } else {
+                    plan.format.capture_name()
+                };
+                plan.confidence == crate::test_results::Confidence::Complete
+                    && !crate::test_results::quarantine::tests_failed_codes(
+                        plugin.name(),
+                        name,
+                        command,
+                    )
+                    .is_empty()
+            });
+            let retryable = steps.iter().all(|(command, _, chained)| {
+                let none = Wrappers::default();
+                crate::plugins::test_retry::commands(
+                    &project.root,
+                    command,
+                    &[&failure],
+                    if *chained { &none } else { &wrappers },
+                )
+                .is_some()
+            });
             let address = format!("{}:{}", test.project, test.target);
+            if planned {
+                assert_eq!(
+                    unquarantinable.contains(&address),
+                    !quarantinable,
+                    "{address} `{}`: quarantine rule and executor disagree",
+                    test.command
+                );
+                assert_eq!(
+                    unretryable.contains(&address),
+                    !retryable,
+                    "{address} `{}`: retry rule and executor disagree",
+                    test.command
+                );
+            } else {
+                assert!(!unquarantinable.contains(&address) && !unretryable.contains(&address));
+            }
             assert_eq!(
                 flagged.contains(&address),
                 !planned,
@@ -843,6 +961,12 @@ format = "junit"
             ("//svc:test-go", false),
             ("//svc:test-go-bare", false),
             ("//rs:test-rs", false),
+            ("//rs:test-rs-all", false),
+            ("//web:test-declared-bun", false),
+            ("//web:test-node", false),
+            ("//web:test-node-opaque", false),
+            ("//web:test-bail", false),
+            ("//web:test-pytest-x", false),
         ] {
             assert_eq!(
                 flagged.contains(address),
@@ -850,5 +974,27 @@ format = "junit"
                 "{address}: {flagged:?}"
             );
         }
+
+        // The outcomes the rules are about.
+        let expect = |set: &HashSet<String>, address: &str, yes: bool| {
+            assert_eq!(set.contains(address), yes, "{address}: {set:?}");
+        };
+        // node --test: complete when Aster reads the invocation, partial
+        // behind a shell chain.
+        expect(&unquarantinable, "//web:test-node", false);
+        expect(&unquarantinable, "//web:test-node-opaque", true);
+        // cargo test is retryable only with --no-fail-fast.
+        expect(&unretryable, "//rs:test-rs", true);
+        expect(&unretryable, "//rs:test-rs-all", false);
+        expect(&unquarantinable, "//rs:test-rs", false);
+        // flags that stop at the first failure.
+        expect(&unretryable, "//web:test-bail", true);
+        expect(&unretryable, "//web:test-pytest-x", true);
+        // a declared report on a recognised runner is retried and quarantined
+        // by the runner's exit code; one on a script is neither.
+        expect(&unretryable, "//web:test-declared-bun", false);
+        expect(&unquarantinable, "//web:test-declared-bun", false);
+        expect(&unquarantinable, "//web:test-declared", true);
+        expect(&unretryable, "//web:test-declared", true);
     }
 }

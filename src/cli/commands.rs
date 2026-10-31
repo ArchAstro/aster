@@ -254,6 +254,7 @@ pub enum Commands {
     /// Rules: unnarrowable-test-command, suspicious-path-literal,
     /// bad-consumes, orphan-test-target, stale-annotation, stale-allow-orphan,
     /// stale-allow-unnarrowable, uncaptured-test-results,
+    /// unquarantinable-test-results, unretryable-test-target,
     /// stale-allow-no-test-results. Exit status 0 for
     /// no findings or only warnings, 1 for an error finding (or any finding
     /// with --strict), 2 when the configuration cannot be loaded. Use the

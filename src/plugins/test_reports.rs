@@ -296,7 +296,7 @@ pub(crate) fn recognise(ctx: &ReportContext) -> Option<ReportPlan> {
 /// to `spec`, Node's console reporter since Node 23, so every `node --test`
 /// the command starts appends its tests to one report, and other Node
 /// processes ignore the flags. Aster cannot tell whether the command runs
-/// tests some other way too, so the results are partial. Only a command
+/// tests some other way too, so the results are partial, unless the command is the `node --test` invocation itself (or a script that is only that), which is complete. Only a command
 /// that mentions `--test`, or runs a package script that does, is planned,
 /// and one that picks its own test reporter is left alone.
 pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
@@ -321,6 +321,11 @@ pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
     {
         return None;
     }
+    // The command is the `node --test` invocation itself, or a package script
+    // that is nothing else: Aster planned it from the argv. Only an opaque
+    // command that mentions `--test` (a shell chain, a script file) may run
+    // tests some other way too.
+    let direct = is_js_runner(ctx.command) || is_js_runner(script);
     let reporter = ctx.report_dir.join("aster_node_test_reporter.mjs");
     std::fs::write(&reporter, nodetest::REPORTER_SOURCE).ok()?;
     let report = ctx.report_dir.join("node-test.ndjson");
@@ -349,7 +354,11 @@ pub(super) fn node_test(ctx: &ReportContext) -> Option<ReportPlan> {
         ],
         files: ReportFiles::Paths(vec![report]),
         format: ReportFormat::NodeTest,
-        confidence: Confidence::Partial,
+        confidence: if direct {
+            Confidence::Complete
+        } else {
+            Confidence::Partial
+        },
         rewrite: None,
         // Node names test files by their resolved path.
         relative_to: Some(
@@ -378,7 +387,8 @@ fn package_script(command: &str, manifest: &str) -> Option<String> {
 
 /// `cargo test` and `cargo nextest run`.
 ///
-/// `cargo test` is read from its console output, which is always partial.
+/// `cargo test` is read from its console output; the results are complete
+/// when every binary's summary is there and adds up (see `libtest`).
 /// nextest writes JUnit only when the repository's nextest config asks for
 /// it, under `target/nextest/<profile>/`; Aster reads that file when it is
 /// there, and with no file the results are partial too.
@@ -399,7 +409,7 @@ pub(super) fn cargo(ctx: &ReportContext) -> Option<ReportPlan> {
         env: Vec::new(),
         files: ReportFiles::Stdout,
         format: ReportFormat::LibtestText,
-        confidence: Confidence::Partial,
+        confidence: Confidence::Complete,
         rewrite: None,
         relative_to: None,
         declared: false,
@@ -1078,6 +1088,23 @@ mod tests {
         };
         std::fs::create_dir_all(&f.report_dir).unwrap();
         (tmp, f)
+    }
+
+    #[test]
+    fn node_test_is_complete_when_aster_reads_the_invocation_itself() {
+        let (_tmp, f) = node_project(
+            r#"{"scripts": {"test": "node --test a.test.js", "chain": "pnpm lint && node --test"}}"#,
+        );
+        for command in ["node --test a.test.js", "tsx --test", "pnpm run test"] {
+            let plan = node_test(&context(&f, "test", command)).unwrap();
+            assert_eq!(plan.confidence, Confidence::Complete, "{command}");
+        }
+        // An opaque command that merely mentions `--test` may run tests
+        // another way too.
+        for command in ["pnpm run chain", "bash -c 'x && node --test'"] {
+            let plan = node_test(&context(&f, "test", command)).unwrap();
+            assert_eq!(plan.confidence, Confidence::Partial, "{command}");
+        }
     }
 
     #[test]
@@ -2045,7 +2072,7 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             assert_eq!(plan.command, command);
             assert_eq!(plan.files, ReportFiles::Stdout);
             assert_eq!(plan.format, ReportFormat::LibtestText);
-            assert_eq!(plan.confidence, Confidence::Partial);
+            assert_eq!(plan.confidence, Confidence::Complete);
         }
         let plan = cargo(&context(&f, "test", "cargo nextest run --profile ci")).unwrap();
         assert_eq!(plan.command, "cargo nextest run --profile ci");

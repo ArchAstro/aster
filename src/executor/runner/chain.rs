@@ -142,6 +142,7 @@ fn run_step(
                     setup: job.setup,
                     wrappers: &wrappers,
                     launch: Some(&chain.launch),
+                    declared: None,
                     max_retries: job.max_retries,
                     null_stdin: job.null_stdin,
                     log_cap: job.log_cap,

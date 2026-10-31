@@ -932,3 +932,53 @@ fn uncaptured_test_results_say_why_honour_wrappers_and_accept_a_declared_report(
         ["//web:nope", "//web:test-bun"]
     );
 }
+
+#[test]
+fn partial_results_and_targets_that_cannot_be_retried_say_why() {
+    let ws = Workspace::new(&[
+        ("aster.toml", "[check]\nentries = [\"test-ci\"]\n"),
+        (
+            "rs/Cargo.toml",
+            "[package]\nname = \"rs\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "rs/aster.toml",
+            "[targets.test-ci]\ncommand = \"cargo test\"\n\n\
+             [targets.test-all]\ncommand = \"cargo test --no-fail-fast\"\n",
+        ),
+        ("web/package.json", r#"{"name":"web"}"#),
+        (
+            "web/aster.toml",
+            "[targets.test-ci]\ncommand = \"bash -c 'node --test a.test.js | cat'\"\n\n\
+             [targets.test-node]\ncommand = \"node --test a.test.js\"\n",
+        ),
+    ]);
+    let (status, report) = ws.check(&[
+        "--rule",
+        "unquarantinable-test-results",
+        "--rule",
+        "unretryable-test-target",
+    ]);
+    assert_eq!(status, 0, "{report}");
+    // `cargo test` stops at the first failing binary; `node --test` behind a
+    // shell pipeline may run tests another way too. `node --test` itself and
+    // `cargo test --no-fail-fast` are complete and retryable.
+    assert_eq!(
+        places(&report, "unretryable-test-target"),
+        ["//rs:test", "//rs:test-ci", "//web:test-ci"]
+    );
+    assert_eq!(
+        places(&report, "unquarantinable-test-results"),
+        ["//web:test-ci"]
+    );
+    let message = findings(&report, "unretryable-test-target")[1]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("--no-fail-fast"), "{message}");
+    let partial = findings(&report, "unquarantinable-test-results")[0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(partial.contains("mentions `node --test`"), "{partial}");
+}

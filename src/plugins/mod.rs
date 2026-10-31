@@ -441,6 +441,7 @@ pub trait LanguagePlugin: Send + Sync {
     }
 }
 
+pub(crate) mod capture_audit;
 pub mod elixir;
 pub mod go;
 pub mod gradle;

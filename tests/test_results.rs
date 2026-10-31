@@ -471,11 +471,10 @@ fn a_package_script_chain_is_recorded_per_step_and_each_flaky_step_is_retried() 
         );
     }
     assert_eq!(tests.len(), 6, "{tests:?}");
-    // `node --test` is always read as partial (Aster cannot tell what else
-    // the command runs); the Vitest steps of a chain are complete.
+    // Aster plans each `node --test` step from its argv: complete.
     assert_eq!(
         confidence_of(&records, "//app:test"),
-        Some(Confidence::Partial)
+        Some(Confidence::Complete)
     );
 
     // Only the failing test of a step was rerun, and the steps that are not
@@ -514,6 +513,154 @@ fn a_failing_step_of_a_chain_stops_it_and_leaves_the_results_partial() {
         confidence_of(&records, "//app:test"),
         Some(Confidence::Complete),
         "steps that never ran leave the results partial"
+    );
+}
+
+/// A chain `node --test a && node --test b && node post.js`: step 2 holds a
+/// test that always fails (quarantined in the first scenario), optionally with
+/// a second, real failure.
+fn quarantine_chain_workspace(also_real: bool) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "app/package.json",
+        r#"{"name":"app","scripts":{"test-ci":"node --test a.test.js && node --test b.test.js && node post.js"}}"#,
+    );
+    write(
+        tmp.path(),
+        "app/a.test.js",
+        "require('node:test')('stable a', () => {});\n",
+    );
+    let real = if also_real {
+        "test('real failure b', () => { throw new Error('a real failure'); });\n"
+    } else {
+        ""
+    };
+    write(
+        tmp.path(),
+        "app/b.test.js",
+        &format!(
+            "const test = require('node:test');\n\
+             test('known flaky b', () => {{ throw new Error('flaky on CI'); }});\n\
+             test('stable b', () => {{}});\n{real}"
+        ),
+    );
+    write(
+        tmp.path(),
+        "app/post.js",
+        "require('node:fs').writeFileSync('../post.ran', 'x');\n",
+    );
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"npm run test-ci\"\n",
+    );
+    write(
+        tmp.path(),
+        "aster-quarantine.toml",
+        "[[test]]\nname = \"known flaky b\"\ntarget = \"//app\"\nreason = \"flaky on CI\"\nexpires = 2999-01-01\n",
+    );
+    tmp
+}
+
+#[test]
+fn a_quarantined_failure_in_a_chain_step_is_excused_and_the_chain_continues() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("node") || !available("npm") {
+        eprintln!("skipping: node or npm is not installed");
+        return;
+    }
+    // Only the quarantined test fails in step 2: the target passes and the
+    // steps after it run.
+    let tmp = quarantine_chain_workspace(false);
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    assert!(tmp.path().join("post.ran").exists(), "the chain continued");
+    let records = read_records(&results);
+    assert_eq!(target_status(&records, "//app:test"), TargetStatus::Passed);
+    let quarantined: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Test(t) if t.quarantined => Some(t.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(quarantined, ["known flaky b"]);
+    assert!(tests_of(&records).contains(&("stable a".into(), TestOutcome::Pass, 1)));
+
+    // Another failure in the same step is not quarantined: the target fails
+    // and the chain stops.
+    let tmp = quarantine_chain_workspace(true);
+    let output = aster(
+        tmp.path(),
+        &["--no-cache", "--test-results=1", "test", "//app"],
+    );
+    assert!(!output.status.success());
+    assert!(!tmp.path().join("post.ran").exists());
+}
+
+#[test]
+fn a_declared_report_on_a_recognised_runner_is_still_retried() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("node") {
+        eprintln!("skipping: node is not installed");
+        return;
+    }
+    // The command picks its own reporter and writes JUnit to a file the
+    // target declares; the runner is `node --test`, so the rerun is built
+    // from it and each attempt is read from the declared file.
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "app/package.json", r#"{"name":"app"}"#);
+    write(
+        tmp.path(),
+        "app/a.test.js",
+        "const test = require('node:test');\nconst fs = require('node:fs');\n\
+         test('stable', () => { fs.appendFileSync('../stable.log', 'ran\\n'); });\n\
+         test('flaky', () => {\n  if (!fs.existsSync('../marker')) {\n    fs.writeFileSync('../marker', 'x');\n    throw new Error('first run');\n  }\n});\n",
+    );
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\n\
+         command = \"node --test --test-reporter=junit --test-reporter-destination=junit.xml a.test.js\"\n\n\
+         [targets.test.report]\nformat = \"junit\"\nfiles = [\"junit.xml\"]\n",
+    );
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            "--retry-failed=1",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the retry passes: {stderr}");
+    let tests = tests_of(&read_records(&results));
+    assert!(
+        tests.contains(&("flaky".into(), TestOutcome::Pass, 2)),
+        "{tests:?}"
+    );
+    let stable = fs::read_to_string(tmp.path().join("stable.log")).unwrap();
+    assert_eq!(
+        stable.lines().count(),
+        1,
+        "only the failing test reran: {stable}"
     );
 }
 
