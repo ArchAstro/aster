@@ -31,9 +31,14 @@ use super::output::OutputMode;
     --all                 Run on all projects in the workspace
     --no-deps             Skip running dependencies first
     --dependents          Also run projects that depend on selected ones
+    --allow-empty         Succeed when no selected project defines the target
     --warnings-as-errors  Treat warnings as errors (for supported targets)
     --lang <langs>        Filter by language (e.g., --lang nodejs,ruby)
     --stream              Force streaming output (--no-stream disables it)
+
+  A target that no selected project defines fails. Projects that omit the
+  target are still skipped when at least one selected project defines it.
+  An empty workspace stays successful.
 
   Use `aster target <name>` when a target name conflicts with a built-in command.
 
@@ -220,6 +225,7 @@ Flags:
   --all                 Run on all projects in the workspace
   --no-deps             Skip running dependencies first
   --dependents          Also run projects that depend on the selection
+  --allow-empty         Succeed when no selected project defines the target
   --lang <langs>        Filter by language (repeatable; comma-separated or --lang=langs)
   --warnings-as-errors  Treat warnings as errors for supported targets
   --stream              Force streaming output

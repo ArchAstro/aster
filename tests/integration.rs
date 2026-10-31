@@ -5624,3 +5624,109 @@ testpaths = ["tests"]
         "a failed discovery must not print a JSON project list"
     );
 }
+
+#[test]
+fn typo_target_with_all_fails_when_no_project_defines_it() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    // One project defines only `test`. Another defines a different target so
+    // a partial skip can stay successful.
+    write_package_json(
+        &tmp,
+        "p/package.json",
+        r#"{"name":"p","scripts":{"test":"true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "q/package.json",
+        r#"{"name":"q","scripts":{"build":"true"}}"#,
+    );
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let text = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let tset = run(&["tset", "--all"]);
+    let tset_text = text(&tset);
+    assert!(!tset.status.success(), "{tset_text}");
+    assert!(
+        tset_text.contains("target 'tset' is not defined in any selected project"),
+        "{tset_text}"
+    );
+
+    let unknown = run(&["nonexist"]);
+    let unknown_text = text(&unknown);
+    assert!(!unknown.status.success(), "{unknown_text}");
+    assert!(
+        unknown_text.contains("unknown command or target 'nonexist'; run aster --help"),
+        "{unknown_text}"
+    );
+
+    // A defined target with no selector still explains how to choose a project.
+    let unspecified = run(&["test"]);
+    let unspecified_text = text(&unspecified);
+    assert!(!unspecified.status.success(), "{unspecified_text}");
+    assert!(
+        unspecified_text.contains("No projects specified"),
+        "{unspecified_text}"
+    );
+
+    let defined = run(&["test", "--all"]);
+    let defined_text = text(&defined);
+    assert!(
+        defined.status.success(),
+        "partial skip should succeed: {defined_text}"
+    );
+    assert!(
+        defined_text.contains("skipped (no target)"),
+        "expected the project without test to be skipped: {defined_text}"
+    );
+
+    let allowed = run(&["tset", "--all", "--allow-empty"]);
+    assert!(
+        allowed.status.success(),
+        "--allow-empty should restore exit 0: {}",
+        text(&allowed)
+    );
+
+    // Streaming returns before the batch summary. The same policy still applies.
+    let streamed = run(&["tset", "//p", "--stream"]);
+    let streamed_text = text(&streamed);
+    assert!(!streamed.status.success(), "{streamed_text}");
+    assert!(
+        streamed_text.contains("target 'tset' is not defined in any selected project"),
+        "{streamed_text}"
+    );
+    let streamed_allowed = run(&["tset", "--all", "--allow-empty", "--stream"]);
+    assert!(
+        streamed_allowed.status.success(),
+        "--allow-empty --stream should restore exit 0: {}",
+        text(&streamed_allowed)
+    );
+
+    // An empty workspace still exits 0: there is no selected project to miss
+    // the target in.
+    let empty = TempDir::new().unwrap();
+    setup_workspace(&empty);
+    let empty_run = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(empty.path())
+        .args(["tset", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        empty_run.status.success(),
+        "empty workspace should stay exit 0: {}",
+        text(&empty_run)
+    );
+}
