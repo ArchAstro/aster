@@ -157,16 +157,21 @@ fn retryable(
     command: &str,
     plugin: &str,
 ) -> Result<(), String> {
-    let failure = TestCase {
-        file: Some("tests/a_test.py".to_string()),
+    // Two hypothetical failures: runners differ in what a test is named by.
+    let failure = |file: &str| TestCase {
+        file: Some(file.to_string()),
         suite: Some("Suite".to_string()),
-        name: "a test".to_string(),
+        name: "a_test".to_string(),
         outcome: TestOutcome::Fail,
         attempt: 1,
         duration_ms: None,
         message: None,
     };
-    if test_retry::commands(ctx.working_dir, command, &[&failure], wrappers).is_some() {
+    let (python, script) = (failure("tests/a_test.py"), failure("tests/a.test.ts"));
+    if [&python, &script]
+        .iter()
+        .any(|f| test_retry::commands(ctx.working_dir, command, &[f], wrappers).is_some())
+    {
         return Ok(());
     }
     if matches!(plugin, "gradle" | "maven") {

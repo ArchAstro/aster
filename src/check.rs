@@ -890,15 +890,16 @@ command = "pytest -x"
             if let Some(chain) = &chain {
                 chain.remove_report_dirs();
             }
-            let failure = crate::test_results::TestCase {
-                file: Some("tests/a_test.py".into()),
+            let failure = |file: &str| crate::test_results::TestCase {
+                file: Some(file.into()),
                 suite: Some("Suite".into()),
-                name: "a test".into(),
+                name: "a_test".into(),
                 outcome: crate::test_results::TestOutcome::Fail,
                 attempt: 1,
                 duration_ms: None,
                 message: None,
             };
+            let failures = [failure("tests/a_test.py"), failure("tests/a.test.ts")];
             let quarantinable = steps.iter().all(|(command, plan, _)| {
                 let name = if plan.declared {
                     plan.format.declared_capture_name()
@@ -915,13 +916,15 @@ command = "pytest -x"
             });
             let retryable = steps.iter().all(|(command, _, chained)| {
                 let none = Wrappers::default();
-                crate::plugins::test_retry::commands(
-                    &project.root,
-                    command,
-                    &[&failure],
-                    if *chained { &none } else { &wrappers },
-                )
-                .is_some()
+                failures.iter().any(|failure| {
+                    crate::plugins::test_retry::commands(
+                        &project.root,
+                        command,
+                        &[failure],
+                        if *chained { &none } else { &wrappers },
+                    )
+                    .is_some()
+                })
             });
             let address = format!("{}:{}", test.project, test.target);
             if planned {
