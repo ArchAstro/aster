@@ -422,6 +422,11 @@ drops that project's index (`ArtifactCache::invalidate_project`);
 `aster cache prune`. `.aster/cache/cache.json` is obsolete and unused. Clean
 targets invalidate the project's cache after succeeding.
 
+`aster init` adds `.aster/` to the workspace `.gitignore` when that directory
+is not already ignored. The entry is appended; other lines are left unchanged.
+Cache, logs, and other local state under `.aster/` stay out of Git. A workspace
+created by an older `aster init` should add that line itself.
+
 A target that passed only on a retry (see below) is not cached, so the next run
 sees the flake again.
 
