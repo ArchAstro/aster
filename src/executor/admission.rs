@@ -82,7 +82,24 @@ impl Host {
         let Some(executable) = EXECUTABLE.get() else {
             return Ok(None);
         };
-        let directory = directory()?;
+        // A nested invocation joins the host state of the ancestor that admitted
+        // it. HOME and ASTER_EXECUTION_DIR describe where a fresh invocation
+        // keeps its state; a nested workspace may legitimately differ (a test
+        // sandbox with its own HOME), and a different directory could not see
+        // the ancestor's locks. The inherited context is authoritative.
+        let inherited = std::env::var(CONTEXT_ENV)
+            .ok()
+            .map(|s| serde_json::from_str::<Family>(&s))
+            .transpose()
+            .context("invalid inherited execution context")?;
+        let directory = match &inherited {
+            Some(family) => family
+                .directory
+                .parent()
+                .context("inherited execution context has no host directory")?
+                .to_path_buf(),
+            None => directory()?,
+        };
         fs::create_dir_all(&directory)?;
         let directory = fs::canonicalize(directory)?;
         use std::os::unix::fs::PermissionsExt;
@@ -121,7 +138,9 @@ impl Host {
             value
         } else {
             let value = previous.context("active execution epoch has no capacity")?;
-            if requested.is_some_and(|n| n != value) {
+            // A nested invocation borrows its ancestor's slot and never takes
+            // one of its own, so its requested job count cannot conflict.
+            if inherited.is_none() && requested.is_some_and(|n| n != value) {
                 bail!("host execution capacity is {value} while another invocation is active; requested {}. Use the active capacity or change it when all invocations finish", requested.unwrap());
             }
             value
@@ -133,17 +152,6 @@ impl Host {
         // exclusive-to-shared conversion is not atomic.
         FileExt::lock_shared(&epoch)?;
         drop(authority);
-        let inherited = std::env::var(CONTEXT_ENV)
-            .ok()
-            .map(|s| serde_json::from_str::<Family>(&s))
-            .transpose()
-            .context("invalid inherited execution context")?;
-        if inherited
-            .as_ref()
-            .is_some_and(|family| family.directory.parent() != Some(directory.as_path()))
-        {
-            bail!("nested execution cannot change ASTER_EXECUTION_DIR");
-        }
         Ok(Some(Arc::new(Self {
             directory,
             capacity,
