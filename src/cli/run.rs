@@ -14,6 +14,27 @@ use crate::graph::ProjectGraph;
 pub const RESERVED_COMMANDS: &[&str] =
     &["list", "graph", "why", "init", "affected", "logs", "help"];
 
+/// Flag spellings `parse_run_args` accepts. Target-command usage must mention each one.
+pub const PARSE_RUN_ARG_FLAGS: &[&str] = &[
+    "--no-deps",
+    "--dependents",
+    "--all",
+    "--warnings-as-errors",
+    "--stream",
+    "--no-stream",
+    "--jobs",
+    "--jobs=",
+    "--no-cache",
+    "--verbose",
+    "-v",
+    "--quiet",
+    "-q",
+    "--json",
+    "--full-logs",
+    "--lang",
+    "--lang=",
+];
+
 /// Parsed arguments for the run command
 #[derive(Debug, Clone, Default)]
 pub struct RunArgs {
@@ -414,6 +435,14 @@ fn collect_deps_recursive(addr: &str, graph: &ProjectGraph, collected: &mut Hash
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_command_usage_lists_every_parse_run_args_flag() {
+        let usage = crate::cli::commands::TARGET_COMMAND_USAGE;
+        for flag in PARSE_RUN_ARG_FLAGS {
+            assert!(usage.contains(flag), "target command usage missing {flag}");
+        }
+    }
 
     #[test]
     fn test_parse_run_args_target_only() {

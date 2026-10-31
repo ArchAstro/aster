@@ -2,7 +2,7 @@
 //!
 //! Defines the main CLI structure and available subcommands.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use super::output::OutputMode;
 
@@ -33,6 +33,7 @@ use super::output::OutputMode;
     --dependents          Also run projects that depend on selected ones
     --warnings-as-errors  Treat warnings as errors (for supported targets)
     --lang <langs>        Filter by language (e.g., --lang nodejs,ruby)
+    --stream              Force streaming output (--no-stream disables it)
 
   Use `aster target <name>` when a target name conflicts with a built-in command.
 
@@ -194,6 +195,116 @@ fn test_results_from_env(value: Option<&str>) -> Option<Option<std::path::PathBu
         Some("1" | "true" | "on") => Some(None),
         Some(path) => Some(Some(std::path::PathBuf::from(path))),
     }
+}
+
+/// Usage for external target commands (`aster test`, `aster build`, and any project target).
+///
+/// Printed for `aster <target> --help`/`-h` and for `aster help` of a conventional
+/// target name, including outside a workspace. Every flag `parse_run_args` accepts
+/// appears here.
+pub const TARGET_COMMAND_USAGE: &str = r#"Run a project target (test, build, lint, and any target a project defines).
+
+Selectors and flags are the same for every target. This does not require a workspace.
+Built-in commands are listed by `aster help` and `aster --help`.
+Use `aster target <name>` when a target name conflicts with a built-in command.
+
+Selectors:
+  //path/to/project     Exact project match
+  //path/prefix/...     All projects under a path prefix
+  //...                 All projects (same as --all)
+  ./...                 All projects under the current directory
+  .                     Project in the current directory
+  -//path/prefix/...    Exclude projects matching a pattern
+
+Flags:
+  --all                 Run on all projects in the workspace
+  --no-deps             Skip running dependencies first
+  --dependents          Also run projects that depend on the selection
+  --lang <langs>        Filter by language (repeatable; comma-separated or --lang=langs)
+  --warnings-as-errors  Treat warnings as errors for supported targets
+  --stream              Force streaming output
+  --no-stream           Force non-streaming output
+  --jobs <N>            Shared host capacity (also --jobs=N)
+  --no-cache            Disable caching
+  --verbose, -v         Enable verbose output
+  --quiet, -q           Suppress per-project output
+  --json                Output JSON
+  --full-logs           Show full output for failed targets
+"#;
+
+/// Target names `aster help <name>` recognizes without loading a workspace.
+///
+/// Any other unknown name still produces clap's unrecognized-subcommand error.
+/// `aster <name> --help` prints [`TARGET_COMMAND_USAGE`] for every name, including
+/// targets that are not in this list.
+const CONVENTIONAL_TARGET_NAMES: &[&str] = &["build", "test", "lint", "deps", "dev", "clean"];
+
+/// Print target-command usage. `target` personalizes the usage line when known.
+pub fn print_target_command_usage(target: Option<&str>) {
+    let header = match target {
+        Some(target) => format!("Usage: aster {target} [selectors...] [flags]"),
+        None => "Usage: aster <target> [selectors...] [flags]".to_string(),
+    };
+    println!("{header}\n\n{TARGET_COMMAND_USAGE}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// Whether external-target args are a help request (`--help` or `-h`).
+pub fn external_target_requests_help(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+/// First positional token in external-target args (the target name).
+pub fn external_target_name(args: &[String]) -> Option<&str> {
+    args.iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// `aster help <name>` for a conventional target that is not a built-in command.
+///
+/// Clap rejects these during parse (`unrecognized subcommand`), so this must run
+/// before `Cli::parse`. Built-ins and unknown names return `None` so clap can
+/// show command help or its usual error.
+pub fn conventional_target_help_name(args: &[String]) -> Option<&str> {
+    let positionals = positional_tokens(args);
+    let [command, name] = positionals.as_slice() else {
+        return None;
+    };
+    if *command != "help" || is_builtin_subcommand(name) || !is_conventional_target(name) {
+        return None;
+    }
+    Some(*name)
+}
+
+fn is_conventional_target(name: &str) -> bool {
+    CONVENTIONAL_TARGET_NAMES.contains(&name)
+}
+
+fn is_builtin_subcommand(name: &str) -> bool {
+    Cli::command().find_subcommand(name).is_some()
+}
+
+fn positional_tokens(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('-') {
+            if matches!(arg.as_str(), "--jobs" | "--cache-dir") {
+                skip_next = true;
+            }
+            continue;
+        }
+        positionals.push(arg.as_str());
+    }
+    positionals
 }
 
 /// Available commands
@@ -1145,5 +1256,33 @@ mod tests {
         assert!(cli.command.is_none());
 
         assert!(Cli::try_parse_from(["aster"]).is_err());
+    }
+
+    #[test]
+    fn help_subcommand_recognizes_only_conventional_targets() {
+        let args = |tokens: &[&str]| {
+            tokens
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            conventional_target_help_name(&args(&["help", "test"])),
+            Some("test")
+        );
+        assert_eq!(
+            conventional_target_help_name(&args(&["--quiet", "help", "build"])),
+            Some("build")
+        );
+        assert!(conventional_target_help_name(&args(&["help", "nonexistent"])).is_none());
+        assert!(conventional_target_help_name(&args(&["help", "list"])).is_none());
+        assert!(conventional_target_help_name(&args(&["help"])).is_none());
+        assert!(external_target_requests_help(&args(&["test", "--help"])));
+        assert!(external_target_requests_help(&args(&["build", "-h"])));
+        assert!(!external_target_requests_help(&args(&["test", "--all"])));
+        assert_eq!(
+            external_target_name(&args(&["test", "--help"])),
+            Some("test")
+        );
     }
 }

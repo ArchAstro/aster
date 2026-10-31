@@ -4666,3 +4666,64 @@ cache = { enabled = false }
     aster(&["run", "//services/gateway:build"]);
     assert!(!marker.exists());
 }
+
+#[test]
+fn target_commands_print_usage_for_help() {
+    let tmp = TempDir::new().unwrap();
+    assert!(!tmp.path().join(".git").exists());
+    assert!(!tmp.path().join("aster.toml").exists());
+
+    for args in [
+        &["test", "--help"][..],
+        &["build", "-h"][..],
+        &["help", "test"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "aster {args:?} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("--all") && stdout.contains("--no-deps"),
+            "aster {args:?} stdout missing target usage:\n{stdout}"
+        );
+        for flag in ["--dependents", "--lang", "--warnings-as-errors", "--stream"] {
+            assert!(
+                stdout.contains(flag),
+                "aster {args:?} stdout missing {flag}:\n{stdout}"
+            );
+        }
+        assert!(
+            !stderr.contains("Not in an aster workspace")
+                && !stderr.contains("No projects specified")
+                && !stderr.contains("unrecognized subcommand"),
+            "aster {args:?} stderr:\n{stderr}"
+        );
+    }
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["help", "nonexistent"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        !missing.status.success(),
+        "aster help nonexistent should fail, stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    assert!(
+        stderr.contains("nonexistent"),
+        "expected the error to name the unknown command: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Not in an aster workspace"),
+        "unknown help target should not require a workspace: {stderr}"
+    );
+}
