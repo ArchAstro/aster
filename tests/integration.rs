@@ -4727,3 +4727,143 @@ fn target_commands_print_usage_for_help() {
         "unknown help target should not require a workspace: {stderr}"
     );
 }
+
+#[test]
+fn relative_and_glob_selectors_select_expected_projects() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name":"api","scripts":{"test":"echo api"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "services/web/package.json",
+        r#"{"name":"web","scripts":{"test":"echo web"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "services/api/v2/package.json",
+        r#"{"name":"api-v2","scripts":{"test":"echo api-v2"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name":"core","scripts":{"test":"echo core"}}"#,
+    );
+
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let stderr_of =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).to_string();
+    let assert_passed = |stderr: &str, address: &str| {
+        assert!(
+            stderr.contains(&format!("PASS {address}")),
+            "missing PASS {address}:\n{stderr}"
+        );
+    };
+    let assert_not_passed = |stderr: &str, address: &str| {
+        assert!(
+            !stderr.contains(&format!("PASS {address}")),
+            "unexpected PASS {address}:\n{stderr}"
+        );
+    };
+
+    let api = run(tmp.path(), &["test", "services/api", "--no-deps"]);
+    let api_err = stderr_of(&api);
+    assert!(api.status.success(), "{api_err}");
+    assert_passed(&api_err, "//services/api:test");
+    assert_not_passed(&api_err, "//services/web:test");
+    assert_not_passed(&api_err, "//services/api/v2:test");
+
+    let star = run(tmp.path(), &["test", "services/*", "--no-deps"]);
+    let star_err = stderr_of(&star);
+    assert!(star.status.success(), "{star_err}");
+    assert_passed(&star_err, "//services/api:test");
+    assert_passed(&star_err, "//services/web:test");
+    assert_not_passed(&star_err, "//services/api/v2:test");
+    assert_not_passed(&star_err, "//libs/core:test");
+
+    let deep = run(tmp.path(), &["test", "services/**", "--no-deps"]);
+    let deep_err = stderr_of(&deep);
+    assert!(deep.status.success(), "{deep_err}");
+    assert_passed(&deep_err, "//services/api:test");
+    assert_passed(&deep_err, "//services/web:test");
+    assert_passed(&deep_err, "//services/api/v2:test");
+    assert_not_passed(&deep_err, "//libs/core:test");
+
+    let under_root = run(tmp.path(), &["test", "./...", "--no-deps"]);
+    let under_root_err = stderr_of(&under_root);
+    assert!(under_root.status.success(), "{under_root_err}");
+    assert_passed(&under_root_err, "//services/api:test");
+    assert_passed(&under_root_err, "//services/web:test");
+    assert_passed(&under_root_err, "//services/api/v2:test");
+    assert_passed(&under_root_err, "//libs/core:test");
+
+    let slashed = run(tmp.path(), &["test", "//services/api/", "--no-deps"]);
+    let slashed_err = stderr_of(&slashed);
+    assert!(slashed.status.success(), "{slashed_err}");
+    assert_passed(&slashed_err, "//services/api:test");
+    assert_not_passed(&slashed_err, "//services/web:test");
+
+    let bogus = run(
+        &tmp.path().join("services/api"),
+        &["test", "bogus", "--no-deps"],
+    );
+    let bogus_err = stderr_of(&bogus);
+    assert!(!bogus.status.success(), "{bogus_err}");
+    assert!(
+        bogus_err
+            .contains("unrecognised project selector 'bogus'; use //path, //path/..., ./..., or ."),
+        "{bogus_err}"
+    );
+    assert_not_passed(&bogus_err, "//services/api:test");
+
+    let sibling = run(
+        &tmp.path().join("services/api"),
+        &["test", "../web", "--no-deps"],
+    );
+    let sibling_err = stderr_of(&sibling);
+    assert!(sibling.status.success(), "{sibling_err}");
+    assert_passed(&sibling_err, "//services/web:test");
+    assert_not_passed(&sibling_err, "//services/api:test");
+
+    let from_web = run(
+        &tmp.path().join("services/web"),
+        &["test", "../api", "--no-deps"],
+    );
+    let from_web_err = stderr_of(&from_web);
+    assert!(from_web.status.success(), "{from_web_err}");
+    assert_passed(&from_web_err, "//services/api:test");
+    assert_not_passed(&from_web_err, "//services/web:test");
+    assert_not_passed(&from_web_err, "//services/api/v2:test");
+
+    let under_services = run(
+        &tmp.path().join("services/web"),
+        &["test", "../...", "--no-deps"],
+    );
+    let under_services_err = stderr_of(&under_services);
+    assert!(under_services.status.success(), "{under_services_err}");
+    assert_passed(&under_services_err, "//services/api:test");
+    assert_passed(&under_services_err, "//services/web:test");
+    assert_passed(&under_services_err, "//services/api/v2:test");
+    assert_not_passed(&under_services_err, "//libs/core:test");
+
+    let outside = run(tmp.path(), &["test", "..", "--no-deps"]);
+    let outside_err = stderr_of(&outside);
+    assert!(!outside.status.success(), "{outside_err}");
+    let root = tmp.path().canonicalize().unwrap();
+    assert!(
+        outside_err.contains(&format!(
+            "selector .. resolves outside the workspace {}",
+            root.display()
+        )),
+        "{outside_err}"
+    );
+}
