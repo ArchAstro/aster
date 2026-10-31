@@ -98,6 +98,55 @@ regenerated without private source code or credentials.
 brew install ArchAstro/tools/aster
 ```
 
+The tap installs macOS (x86-64 and Apple Silicon) and Linux x86-64. It has no
+Linux arm64 formula. On Linux arm64, use the release tarball or mise.
+
+### mise
+
+```console
+mise use github:ArchAstro/aster@latest
+```
+
+That writes the current directory's `mise.toml`. `aster` is then available in
+that project once mise is activated in your shell. For every directory, use
+`mise use -g github:ArchAstro/aster@latest`.
+
+mise installs the GitHub release archive for this machine, including
+`aster-linux-arm64` and the macOS archives. `@latest` follows mise's
+`minimum_release_age` (24 hours by default), so a release from today may not
+be selected until it is old enough. Pin a version without the leading `v`:
+`mise use github:ArchAstro/aster@0.30.1`.
+
+### Release archives
+
+Prebuilt archives are on [GitHub Releases](https://github.com/ArchAstro/aster/releases).
+Windows is not currently built or tested. Each tagged release includes:
+
+- `aster-linux-x64.tar.gz` (Linux x86-64)
+- `aster-linux-arm64.tar.gz` (Linux arm64)
+- `aster-darwin-x64.tar.gz` (macOS x86-64)
+- `aster-darwin-arm64.tar.gz` (macOS Apple Silicon)
+
+Linux arm64 users should use the `aster-linux-arm64` tarball rather than apt
+or dnf. Those native packages, and the Homebrew tap, are x86-64 only on Linux.
+
+Each release also attaches `SHA256SUMS` and `aster-archive-keyring.asc` (the
+package signing public key). `SHA256SUMS` lists every release asset, so check
+the archive you downloaded and ignore the rest (replace `VERSION`):
+
+```console
+curl -fsSL -O https://github.com/ArchAstro/aster/releases/download/vVERSION/SHA256SUMS
+curl -fsSL -O https://github.com/ArchAstro/aster/releases/download/vVERSION/aster-linux-arm64.tar.gz
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf aster-linux-arm64.tar.gz aster
+sudo install -m 0755 aster /usr/local/bin/aster
+```
+
+The archive also contains `LICENSE`. Extract only `aster`, as above, so a
+checkout's `LICENSE` is not overwritten. On macOS, keep the line for the
+archive you downloaded and run `shasum -a 256 -c SHA256SUMS`, then install
+that `aster` binary the same way.
+
 ### From source
 
 Aster requires Rust 1.88 or newer.
@@ -106,17 +155,15 @@ Aster requires Rust 1.88 or newer.
 cargo install --git https://github.com/ArchAstro/aster.git --locked
 ```
 
-Prebuilt archives are available from [GitHub Releases](https://github.com/ArchAstro/aster/releases)
-for Linux x86-64, macOS x86-64, and macOS Apple Silicon. Windows is not
-currently built or tested by the project.
-
 ### Native Linux packages
 
 Tagged releases also include native x86-64 packages for Debian/Ubuntu, RPM-based
-distributions, and Arch Linux.
+distributions, and Arch Linux. These packages target x86-64 Linux with glibc
+2.35 or newer. They are not built for arm64: arm64 users should use the
+`aster-linux-arm64` tarball rather than apt or dnf.
 
-For Debian and Ubuntu, add the signed Aster repository and install by package
-name:
+For Debian and Ubuntu x86-64, add the signed Aster repository and install by
+package name:
 
 ```console
 sudo install -d -m 0755 /usr/share/keyrings
@@ -126,14 +173,16 @@ sudo apt update
 sudo apt install aster-archive-keyring aster
 ```
 
-For Fedora and other RPM-based distributions:
+For Fedora and other RPM-based x86-64 distributions:
 
 ```console
 sudo curl -fsSL https://archastro.github.io/aster/rpm/aster.repo -o /etc/yum.repos.d/aster.repo
 sudo dnf install aster
 ```
 
-You can also download a native package directly from the GitHub release:
+You can also download a native x86-64 package from the GitHub release. The AUR
+`aster-bin` package is not published until `AUR_PUBLISH_ENABLED` is set, so
+Arch installs use `pacman -U`:
 
 ```console
 sudo apt install ./aster_VERSION_amd64.deb
@@ -141,7 +190,15 @@ sudo dnf install ./aster-VERSION-1.x86_64.rpm
 sudo pacman -U ./aster-VERSION-1-x86_64.pkg.tar.zst
 ```
 
-These packages currently target x86-64 Linux systems with glibc 2.35 or newer.
+### Upgrade and uninstall
+
+- Homebrew: `brew upgrade aster` / `brew uninstall aster`
+- mise: `mise upgrade github:ArchAstro/aster` / `mise uninstall github:ArchAstro/aster` and `mise unuse github:ArchAstro/aster` (add `-g` if the install was global)
+- Release archive: download a newer archive and replace `aster`; delete that binary to uninstall
+- APT: `sudo apt update && sudo apt install --only-upgrade aster` / `sudo apt remove aster`
+- DNF: `sudo dnf upgrade aster` / `sudo dnf remove aster`
+- Arch release package: `sudo pacman -U` of a newer package / `sudo pacman -R aster`
+- From source: rerun the `cargo install` command above / `cargo uninstall aster`
 
 ## Quick start
 

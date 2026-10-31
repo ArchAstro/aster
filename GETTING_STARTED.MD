@@ -20,6 +20,12 @@ brew install ArchAstro/tools/aster
 aster --version
 ```
 
+On Linux, install from a release archive, mise, or a native x86-64 package.
+Linux arm64 is not published through apt, dnf, or Homebrew; use the
+`aster-linux-arm64` archive or `mise use github:ArchAstro/aster@latest`
+(add `-g` to install it for every directory).
+Commands are in the [Installation](README.md#installation) section.
+
 To build Aster from source instead, install Rust 1.88 or newer and run:
 
 ```console
