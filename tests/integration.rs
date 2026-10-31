@@ -4760,3 +4760,152 @@ cache = { enabled = false }
         "stderr should name the missing program:\n{stderr}"
     );
 }
+
+#[test]
+fn init_ignores_aster_state_and_clean_tree_has_no_affected() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+
+    let init = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let init_stdout = String::from_utf8_lossy(&init.stdout);
+    assert!(
+        init_stdout.contains("Updated .gitignore"),
+        "init did not report the gitignore update: {init_stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+        ".aster/\n"
+    );
+
+    write_package_json(
+        &tmp,
+        "apps/api/package.json",
+        r#"{"name":"api","scripts":{"build":"mkdir -p dist && echo built > dist/index.js","test":"node --test"}}"#,
+    );
+
+    let build = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "//apps/api", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "build failed: {}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(
+        tmp.path().join(".aster/logs/latest.json").is_file(),
+        "build did not write .aster state, so a clean status would be vacuous"
+    );
+    assert!(tmp.path().join("apps/api/dist/index.js").is_file());
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let porcelain = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !porcelain.lines().any(|line| line.contains(".aster")),
+        "git status listed .aster state:\n{porcelain}"
+    );
+
+    // The tutorial appends build-output ignores before the baseline commit.
+    // package-lock.json is committed, matching `git add .` after that step.
+    fs::write(
+        tmp.path().join(".gitignore"),
+        ".aster/\ndist/\nnode_modules/\n",
+    )
+    .unwrap();
+    git_commit(&tmp, "create Aster demo");
+
+    let rerun = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "//apps/api", "--no-deps"])
+        .output()
+        .unwrap();
+    assert!(
+        rerun.status.success(),
+        "rerun failed: {}\n{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let porcelain = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !porcelain.lines().any(|line| line.contains(".aster")),
+        "later run listed .aster state:\n{porcelain}"
+    );
+
+    let affected = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        affected.status.success(),
+        "affected failed: {}\n{}",
+        String::from_utf8_lossy(&affected.stdout),
+        String::from_utf8_lossy(&affected.stderr)
+    );
+    let affected_stdout = String::from_utf8_lossy(&affected.stdout);
+    assert!(
+        affected_stdout.contains("No projects affected"),
+        "clean tree still affected projects:\n{affected_stdout}"
+    );
+
+    // A second init refuses because aster.toml exists, and must not duplicate
+    // the ignore line while doing so.
+    let again = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(!again.status.success(), "second init should refuse");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+        ".aster/\ndist/\nnode_modules/\n"
+    );
+
+    // A repository that already ignores .aster does not gain a second line.
+    let existing = TempDir::new().unwrap();
+    setup_git_repo(&existing);
+    fs::write(
+        existing.path().join(".gitignore"),
+        "node_modules/\n.aster\n",
+    )
+    .unwrap();
+    let init_existing = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(existing.path())
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(
+        init_existing.status.success(),
+        "init in an already-ignored repo failed: {}",
+        String::from_utf8_lossy(&init_existing.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&init_existing.stdout).contains("Updated .gitignore"),
+        "init rewrote a gitignore that already ignored .aster"
+    );
+    assert_eq!(
+        fs::read_to_string(existing.path().join(".gitignore")).unwrap(),
+        "node_modules/\n.aster\n"
+    );
+}

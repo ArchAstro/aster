@@ -2474,11 +2474,69 @@ fn print_heterogeneous_summary(
     );
 }
 
+/// Directory entry appended to the workspace `.gitignore` by `aster init`.
+const ASTER_GITIGNORE_ENTRY: &str = ".aster/";
+
+/// Ensure `<workspace>/.gitignore` ignores `.aster/`.
+///
+/// Creates the file when it is missing. Appends `.aster/` when no existing
+/// line already ignores that directory. Other lines are never rewritten.
+/// Returns whether the file was created or changed.
+fn ensure_aster_gitignored(workspace_root: &Path) -> Result<bool> {
+    let path = workspace_root.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    };
+
+    if gitignore_covers_aster(workspace_root, &existing) {
+        return Ok(false);
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(ASTER_GITIGNORE_ENTRY);
+    updated.push('\n');
+    fs::write(&path, updated).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+/// Whether `contents`, as the workspace-root `.gitignore`, already ignores
+/// the `.aster` directory. Unparseable lines are skipped; they cannot be the
+/// rule that covers that directory.
+///
+/// Only a match on `.aster` itself counts. A child path such as
+/// `.aster/logs/latest.json` would also match unrelated rules (`logs`,
+/// `*.json`) and hide cache files, quarantine state, and TLS keys.
+fn gitignore_covers_aster(workspace_root: &Path, contents: &str) -> bool {
+    let contents = contents.trim_start_matches('\u{feff}');
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
+    let from = Some(workspace_root.join(".gitignore"));
+    for line in contents.lines() {
+        let _ = builder.add_line(from.clone(), line);
+    }
+    let Ok(gitignore) = builder.build() else {
+        return false;
+    };
+
+    matches!(
+        gitignore.matched(workspace_root.join(".aster"), true),
+        ignore::Match::Ignore(_)
+    )
+}
+
 /// Handle the init command
 ///
 /// Creates aster.toml in either:
 /// - The existing workspace root (if in a git repo)
 /// - The current directory (if no workspace exists)
+///
+/// Also ensures `.aster/` is listed in the workspace `.gitignore`.
 fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     // Try to find an existing workspace root (git repo or existing aster.toml)
     let workspace_root = find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
@@ -2505,6 +2563,10 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
         .with_context(|| format!("Failed to write {}", aster_toml_path.display()))?;
 
     println!("Created {}", aster_toml_path.display());
+
+    if ensure_aster_gitignored(&workspace_root)? {
+        println!("Updated .gitignore");
+    }
 
     // Set up plugin registry
     let registry = PluginRegistry::with_all_plugins();
@@ -3174,4 +3236,70 @@ fn nested_project_roots(
     roots.sort();
     roots.dedup();
     roots
+}
+
+#[cfg(test)]
+mod init_gitignore_tests {
+    use super::*;
+
+    fn gitignore(root: &Path) -> String {
+        fs::read_to_string(root.join(".gitignore")).unwrap()
+    }
+
+    #[test]
+    fn creates_gitignore_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(ensure_aster_gitignored(tmp.path()).unwrap());
+        assert_eq!(gitignore(tmp.path()), ".aster/\n");
+
+        assert!(!ensure_aster_gitignored(tmp.path()).unwrap());
+        assert_eq!(gitignore(tmp.path()), ".aster/\n");
+    }
+
+    #[test]
+    fn appends_to_file_without_trailing_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = "# keep me\n\nnode_modules/";
+        fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+        assert!(ensure_aster_gitignored(tmp.path()).unwrap());
+        assert_eq!(
+            gitignore(tmp.path()),
+            "# keep me\n\nnode_modules/\n.aster/\n"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_when_already_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        for existing in [".aster/\n", ".aster\n", "/.aster/\n", "**/.aster\n"] {
+            fs::write(tmp.path().join(".gitignore"), existing).unwrap();
+            assert!(
+                !ensure_aster_gitignored(tmp.path()).unwrap(),
+                "appended despite {existing:?}"
+            );
+            assert_eq!(gitignore(tmp.path()), existing, "rewrote {existing:?}");
+        }
+    }
+
+    #[test]
+    fn appends_when_unrelated_rules_would_match_a_child_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for existing in ["logs\n", "*.json\n", "dist/\n**/.aster/**\n"] {
+            fs::write(tmp.path().join(".gitignore"), existing).unwrap();
+            assert!(
+                ensure_aster_gitignored(tmp.path()).unwrap(),
+                "treated {existing:?} as covering .aster/"
+            );
+            let updated = gitignore(tmp.path());
+            assert!(
+                updated.ends_with(".aster/\n"),
+                "did not append to {existing:?}: {updated:?}"
+            );
+            assert!(
+                updated.starts_with(existing),
+                "rewrote earlier lines of {existing:?}: {updated:?}"
+            );
+        }
+    }
 }
