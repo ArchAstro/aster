@@ -726,3 +726,66 @@ fn a_chain_target_holding_a_resource_keeps_it_while_its_step_lives() {
     let results = fs::read_to_string(b.join("results.ndjson")).unwrap();
     assert!(results.contains("\"runs\""), "{results}");
 }
+
+/// A nested workspace is often a sandbox with its own HOME (a test fixture that
+/// runs Aster on a temp workspace) and its own job count. Before the inherited
+/// context chose the host directory, the nested Aster recomputed
+/// `$HOME/.cache/aster/execution-v1`, found a different directory and failed
+/// every target in 0 ms with "nested execution cannot change
+/// ASTER_EXECUTION_DIR".
+#[test]
+fn nested_workspace_with_its_own_home_and_jobs_runs_its_targets() {
+    let f = Fixture::new();
+    let outer = f.root.path().join("outer");
+    let inner = f.root.path().join("inner");
+    let outer_home = f.root.path().join("outer-home");
+    let inner_home = f.root.path().join("inner-home");
+    for dir in [&outer, &inner, &outer_home, &inner_home] {
+        fs::create_dir(dir).unwrap();
+    }
+    for (dir, name) in [(&outer, "outer"), (&inner, "inner")] {
+        fs::write(dir.join("package.json"), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        inner.join("aster.toml"),
+        "name = 'inner'\n[targets.lint]\ncommand = 'true'\ncache = { enabled = false }\n[targets.test]\ncommand = 'true'\ncache = { enabled = false }\n",
+    )
+    .unwrap();
+    // The nested run reports through JSON so a failure carries its reason.
+    let script = format!(
+        "cd {} && HOME={} ASTER_JOBS=1 {} run //:lint //:test --json > {}",
+        aster::executor::quote_command_argument(&inner.display().to_string()),
+        aster::executor::quote_command_argument(&inner_home.display().to_string()),
+        aster::executor::quote_command_argument(&f.binary.display().to_string()),
+        aster::executor::quote_command_argument(&outer.join("nested.json").display().to_string()),
+    );
+    fs::write(
+        outer.join("aster.toml"),
+        format!(
+            "name = 'outer'\n[targets.nested]\ncommand = {:?}\ncache = {{ enabled = false }}\n",
+            format!("sh -c {}", aster::executor::quote_command_argument(&script))
+        ),
+    )
+    .unwrap();
+
+    // Neither level sets ASTER_EXECUTION_DIR, as in CI: the outer state lives
+    // under the outer HOME and the inner HOME differs.
+    let status = Command::new(&f.binary)
+        .current_dir(&outer)
+        .env("HOME", &outer_home)
+        .env("ASTER_JOBS", "2")
+        .env_remove("ASTER_EXECUTION_DIR")
+        .env_remove("ASTER_EXECUTION_CONTEXT")
+        .args(["run", "//:nested", "--quiet"])
+        .status()
+        .unwrap();
+    let nested = fs::read_to_string(outer.join("nested.json")).unwrap_or_default();
+    assert!(
+        status.success(),
+        "outer run failed; nested output: {nested}"
+    );
+    assert!(
+        nested.contains(r#""passed":2,"failed":0"#),
+        "nested targets did not pass: {nested}"
+    );
+}
