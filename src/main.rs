@@ -13,6 +13,10 @@ use std::process::ExitCode;
 use aster::cli::affected_files::{
     apply_warnings_as_errors, plan_affected_commands, related_proxies, AffectedRequest,
 };
+use aster::cli::commands::{
+    conventional_target_help_name, external_target_name, external_target_requests_help,
+    print_target_command_usage,
+};
 use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, build_execution_output_with_cache, check_reserved_target,
@@ -82,6 +86,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    let argv: Vec<String> = env::args().skip(1).collect();
+    if let Some(target) = conventional_target_help_name(&argv) {
+        print_target_command_usage(Some(target));
+        return Ok(());
+    }
     let mut cli = Cli::parse();
     if let Some(jobs) = cli.jobs {
         env::set_var("ASTER_JOBS", jobs.to_string());
@@ -191,6 +200,15 @@ fn run() -> Result<()> {
                 }
                 None => aster::dev::kill_ports(&selected, options),
             };
+        }
+    }
+
+    // Target-command help must work before project selection and outside a workspace.
+    // `--help`/`-h` on an external target are ordinary args to clap, not clap's help flag.
+    if let Commands::ExternalTarget(args) = &command {
+        if external_target_requests_help(args) {
+            print_target_command_usage(external_target_name(args));
+            return Ok(());
         }
     }
 
