@@ -64,6 +64,9 @@ fn configuration_scenario_matrix() {
         Scenario { name: "unknown port key", input: "[dev.ports.http]\ndefault = 4000\nmystery = true\n", expected: Expected::Reject },
         Scenario { name: "unknown service key", input: "[dev.services.api]\ntarget = \"//api:dev\"\nmystery = true\n", expected: Expected::Reject },
         Scenario { name: "unknown target key", input: "[targets.test]\ncommand = \"true\"\nmystery = true\n", expected: Expected::Reject },
+        Scenario { name: "mistyped target key", input: "[targets.test]\ncomand = \"echo hi\"\n", expected: Expected::Reject },
+        Scenario { name: "wrong-typed command", input: "[targets.test]\ncommand = 5\n", expected: Expected::Reject },
+        Scenario { name: "dependency-only target", input: "[targets.gate]\ndepends_on = [\"//app:build\"]\n", expected: Expected::Accept },
         Scenario { name: "unknown alias key", input: "[targets.check]\nalias = \"test\"\nmystery = true\n", expected: Expected::Reject },
         Scenario { name: "unknown cache key", input: "[targets.test]\ncommand = \"true\"\n[targets.test.cache]\nmystery = true\n", expected: Expected::Reject },
         Scenario { name: "malformed table", input: "[targets.test\ncommand = \"true\"\n", expected: Expected::Reject },
@@ -144,6 +147,62 @@ fn deterministic_mutation_fuzz_never_panics() {
         assert!(
             result.is_ok(),
             "configuration parser panicked at mutation {mutation}, state {state:#x}"
+        );
+    }
+}
+
+#[test]
+fn target_table_errors_name_the_offending_key() {
+    let cases = [
+        (
+            "[targets.test]\ncomand = \"echo hi\"\n",
+            &[
+                "unknown field `comand`",
+                "expected one of `command`, `depends_on`, `cache`",
+                "TOML parse error at line 2",
+                "comand = \"echo hi\"",
+            ][..],
+        ),
+        (
+            "[targets.test]\ncommand = 5\n",
+            &[
+                "invalid type",
+                "string",
+                "TOML parse error at line 2",
+                "command = 5",
+            ][..],
+        ),
+        (
+            "depends_on = [\"//nope\"]\n",
+            &["project //p depends on missing project //nope"][..],
+        ),
+    ];
+
+    for (aster_toml, expected) in cases {
+        let root = tempfile::TempDir::new().expect("temp project");
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let project = root.path().join("p");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"p","scripts":{"build":"echo hi"}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("aster.toml"), aster_toml).unwrap();
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(root.path())
+            .arg("list")
+            .output()
+            .expect("run aster list");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{aster_toml}: {stderr}");
+        for needle in expected {
+            assert!(stderr.contains(needle), "missing {needle} in {stderr}");
+        }
+        assert!(
+            !stderr.contains("untagged enum") && !stderr.contains("//nope:build"),
+            "{stderr}"
         );
     }
 }
