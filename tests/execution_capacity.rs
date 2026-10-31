@@ -653,3 +653,76 @@ fn nested_resource_order_violation_reports_an_error_without_deadlocking() {
     f.started().release();
     assert!(after.finish());
 }
+
+/// Canonical proof for package script chains: a chain target that holds a host
+/// resource launches every step (the test runner step with its launcher and
+/// the plain step after it) through the admission supervisor, so killing the
+/// scheduler while a step is live does not admit a contender for the resource.
+///
+/// Fidelity: production CLI with `--test-results`, real `npm run`, real
+/// `node --test`, the same socket barrier as above. Not proven here: Windows.
+#[test]
+fn a_chain_target_holding_a_resource_keeps_it_while_its_step_lives() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("node") || !available("npm") {
+        eprintln!("skipping: node or npm is not installed");
+        return;
+    }
+    let f = Fixture::new();
+    let port = f.listener.local_addr().unwrap().port();
+    let probe = f.root.path().join("probe.py");
+    let chain_workspace = |name: &str| {
+        let root = f.root.path().join(name);
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"name":"{name}","scripts":{{"work":"node --test t.test.js && python3 {} {port} {name} normal"}}}}"#,
+                probe.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("t.test.js"),
+            "require('node:test')('runs', () => {});\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("aster.toml"),
+            "name = 'chain'\n[targets.work]\ncommand = 'npm run work'\ncache = { enabled = false }\nexclusive_resources = ['host:db']\n",
+        )
+        .unwrap();
+        root
+    };
+    let start = |root: &Path| {
+        let mut command = f.command(root, 2);
+        command.args([
+            "run",
+            "//:work",
+            "--quiet",
+            &format!("--test-results={}", root.join("results.ndjson").display()),
+        ]);
+        Run::spawn(command)
+    };
+    let a = chain_workspace("a");
+    let b = chain_workspace("b");
+    let mut first = start(&a);
+    // Step 1 (`node --test`) ran, and step 2 now holds the barrier.
+    let held = f.started();
+    assert_eq!(held.label, "a");
+    let mut next = start(&b);
+    next.waiting(&f.listener);
+    f.remains_blocked();
+    // Fault: kill the scheduler, not the live step or its lease owner.
+    first.signal(libc::SIGKILL);
+    assert!(!first.finish());
+    f.remains_blocked();
+    held.release();
+    let started = f.started();
+    assert_eq!(started.label, "b");
+    started.release();
+    assert!(next.finish());
+    // The chain's runner step was recorded in the contender's results.
+    let results = fs::read_to_string(b.join("results.ndjson")).unwrap();
+    assert!(results.contains("\"runs\""), "{results}");
+}
