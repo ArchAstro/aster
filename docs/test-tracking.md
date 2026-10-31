@@ -55,6 +55,23 @@ writing a report makes the results partial, so the target fails and nothing is
 excused. A chain with a `cd`, a `pre`/`post` hook, a cycle, another shell
 operator, or a runner step Aster cannot plan is not captured.
 
+Where Aster runs the runner itself the results are `complete`: a `node --test`
+command (or a script that is only that), each `node --test` step of a chain,
+and `cargo test` when every test binary's `test result:` summary is there and
+adds up to the tests read. `partial` remains only where Aster cannot know:
+
+| Plan | Why partial |
+| --- | --- |
+| `node --test` mentioned in a shell chain or script file | the command may run tests another way too |
+| `mix test` in a project that sets its own ExUnit formatters | only failures in the console output are read |
+| Vitest writing its own JUnit report to a path Aster cannot resolve | the report is the command's, and the path is an expansion |
+| `cargo test` whose summaries do not add up | a binary died or a line was broken |
+| a declared `libtest` report | saved console output |
+
+`aster check` reports each of these as `unquarantinable-test-results`, and a
+target that cannot be retried as `unretryable-test-target` (`cargo test`
+without `--no-fail-fast`, `-x`, `--bail`, Gradle and Maven, scripts).
+
 `partial` means some tests may be missing. Partial results are still uploaded
 and classified, but they never let a quarantined failure pass.
 
@@ -123,10 +140,15 @@ declared report (`uncaptured-test-results`), with the reason, because such a
 target cannot be retried or quarantined. `[check] allow_no_test_results` lists
 targets that run no per-test runner at all.
 
-A declared report never lets a quarantined failure pass: Aster does not see
-the runner, so it cannot tell a test failure from a failed step of the script
-by the exit code. Nor does it make the target retryable: `--retry-failed`
-still needs a command Aster recognises.
+A declared report on a script never lets a quarantined failure pass: Aster does
+not see the runner, so it cannot tell a test failure from a failed step of the
+script by the exit code. A declared report on a command whose runner Aster
+recognises (one that names it, not through a shell)
+(`node --test ...` or `vitest run ...` that writes its own JUnit or JSON file)
+is retried: the rerun is built from the runner and each attempt is read from
+the declared report. On a script (`bash tools/run.sh`) there is no runner to
+rerun, and the script's exit code is not read as a runner's, so it is neither
+retried nor quarantined.
 
 ## 2. Retry
 

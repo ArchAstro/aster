@@ -413,6 +413,26 @@ pub fn tests_failed_codes(plugin: &str, capture: &str, command: &str) -> &'stati
         .map(|word| word.rsplit('/').next().unwrap_or(word))
         .collect();
     let runs = |name: &str| programs.contains(&name);
+    // A declared report's command is a script unless it names its runner:
+    // then the runner's own code applies, as for a report Aster planned.
+    let (capture, declared) = match capture.strip_prefix("declared-") {
+        Some(base) => (base, true),
+        None => (capture, false),
+    };
+    if declared
+        && (["sh", "bash", "zsh", "dash"]
+            .iter()
+            .any(|shell| runs(shell))
+            || ![
+                "vitest", "jest", "bun", "pytest", "go", "mix", "cargo", "nextest",
+            ]
+            .iter()
+            .any(|runner| runs(runner)))
+    {
+        // The exit code of a script says nothing certain about its runner:
+        // it may be a test failure or any other step.
+        return &[];
+    }
     match capture {
         // ExUnit exits 2 for failed tests and 1 for a compile error.
         "exunit" => &[2],
@@ -423,10 +443,10 @@ pub fn tests_failed_codes(plugin: &str, capture: &str, command: &str) -> &'stati
         // pytest: 1 is failed tests, 2+ is interrupted or broken. vitest
         // and bun: 1.
         "junit" => &[1],
-        // A declared report's runner is behind a script whose exit code
-        // Aster cannot read: it may be a test failure or any other step.
-        c if c.starts_with("declared-") => &[],
-        // cargo test exits 101 for a failed test and for a compile error.
+        // cargo test exits 101 for a failed test and for a compile error. A
+        // compile error runs no test, so a complete report with a failing
+        // test is a test failure.
+        "libtest" => &[101],
         _ => &[],
     }
 }
@@ -625,9 +645,10 @@ mod tests {
         }
         let mut cargo = failed.clone();
         cargo.capture = "libtest".into();
+        // cargo test: 101 for failed tests; a different code is not.
         assert!(matches!(
-            q.judge(ADDRESS, "rust", "cargo test", Some(101), &cargo),
-            Verdict::Fail(why) if why.contains("cannot tell")
+            q.judge(ADDRESS, "rust", "cargo test", Some(1), &cargo),
+            Verdict::Fail(why) if why.contains("101")
         ));
     }
 
@@ -655,7 +676,7 @@ mod tests {
         );
         assert_eq!(tests_failed_codes("maven", "junit", "mvn -q test"), none);
         assert_eq!(tests_failed_codes("go", "go-json", "go test ./..."), &[1]);
-        assert_eq!(tests_failed_codes("rust", "libtest", "cargo test"), none);
+        assert_eq!(tests_failed_codes("rust", "libtest", "cargo test"), &[101]);
         // A script's exit code says nothing certain about its runner.
         assert_eq!(
             tests_failed_codes("go", "declared-junit", "bash tools/test.sh"),

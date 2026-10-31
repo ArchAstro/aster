@@ -1125,6 +1125,10 @@ impl<'a> Executor<'a> {
             .then(|| commands[0].clone());
         let retry_failed = self.retry_failed;
         let wrappers = self.wrappers.clone();
+        let declared_report = project
+            .targets
+            .get(&target_name)
+            .and_then(|target| target.report.clone());
         // Quarantine judges one command's results, like a retry.
         let quarantine = self
             .quarantine
@@ -1256,6 +1260,7 @@ impl<'a> Executor<'a> {
                                 setup: retry_setup.as_deref(),
                                 wrappers: &wrappers,
                                 launch: None,
+                                declared: declared_report.as_ref(),
                                 max_retries: retry_failed,
                                 permit: permit.as_ref(),
                                 null_stdin,

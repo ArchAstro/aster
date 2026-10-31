@@ -29,6 +29,9 @@ pub(super) struct RetryJob<'a> {
     /// Set when `command` is one step of a package script chain: each rerun
     /// is started the way the script starts its steps.
     pub launch: Option<&'a Launch>,
+    /// The target's declared report: every retry attempt is read from it too,
+    /// the rerun command being built from the runner the command names.
+    pub declared: Option<&'a crate::config::ReportConfig>,
     pub max_retries: u32,
     pub null_stdin: bool,
     pub log_cap: usize,
@@ -75,11 +78,11 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
         let mut captures = Vec::new();
         for command in &commands {
             // A retry command selects tests with the runner's own flags, so
-            // Aster recognised the runner; its plan, not a declared one, reads
-            // the retry's results.
+            // Aster recognised the runner; a declared report reads each
+            // attempt, otherwise the runner's plan does.
             captures.push(plan_captures(
                 job.plugin,
-                None,
+                job.declared,
                 job.project_dir,
                 job.working_dir,
                 job.target_name,
@@ -393,6 +396,7 @@ mod tests {
             address: "//app:test",
             wrappers: &wrappers,
             launch: None,
+            declared: None,
             plugin,
             project_dir: tmp.path(),
             working_dir: tmp.path(),

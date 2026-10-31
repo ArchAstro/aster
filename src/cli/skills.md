@@ -219,7 +219,10 @@ Adding, changing or removing one selects the tests that reach its definition.
 `stale-allow-unnarrowable`, `uncaptured-test-results` (a test target whose
 per-test results Aster cannot capture, so retry and quarantine do nothing; fix
 it by listing the wrapper, putting the runner in the target or declaring
-`[targets.X] report`), `stale-allow-no-test-results`;
+`[targets.X] report`), `unquarantinable-test-results` (partial results or an exit code that is not the
+runner's, so quarantine cannot excuse a failure), `unretryable-test-target`
+(`--retry-failed` cannot rerun a failed test: `cargo test` without
+`--no-fail-fast`, `-x`, `--bail`, scripts), `stale-allow-no-test-results`;
 `unnarrowable-test-command` also flags an `--entry` target that runs a script
 file or a package script Aster cannot read; `--strict`, `--rule <id>`,
 `--entry <target>`, global `--json`; exit 0 clean or warnings only, 1 for
