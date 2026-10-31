@@ -1523,3 +1523,108 @@ fn a_report_path_the_one_liner_sets_itself_is_not_guessed_and_the_run_says_so() 
     );
     assert!(tests_of(&records).is_empty());
 }
+
+/// A stand-in that fails `flaky A` and `flaky B` until it is given `-t`,
+/// then passes both. Aster's capture planner adds `--outputFile.junit`.
+const FLAKY_VITEST: &str = r#"#!/bin/sh
+out=""
+pattern=""
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --outputFile.junit=*) out="${arg#--outputFile.junit=}" ;;
+    -t|--testNamePattern) prev=t ;;
+    *)
+      if [ "$prev" = t ]; then
+        pattern="$arg"
+        prev=""
+      fi
+      ;;
+  esac
+done
+echo "ran: $*" >> ../vitest.calls
+if [ -z "$out" ]; then
+  echo "no junit path" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$out")"
+if [ -n "$pattern" ]; then
+  cat > "$out" <<'XML'
+<testsuites><testsuite name="flaky.test.ts"><testcase classname="flaky.test.ts" name="flaky A" time="0.001"/><testcase classname="flaky.test.ts" name="flaky B" time="0.001"/></testsuite></testsuites>
+XML
+  exit 0
+fi
+cat > "$out" <<'XML'
+<testsuites><testsuite name="flaky.test.ts"><testcase classname="flaky.test.ts" name="flaky A" time="0.001"><failure message="fail">fail</failure></testcase><testcase classname="flaky.test.ts" name="flaky B" time="0.001"><failure message="fail">fail</failure></testcase></testsuite></testsuites>
+XML
+exit 1
+"#;
+
+fn flaky_vitest_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "web/package.json", r#"{"name":"web"}"#);
+    write(tmp.path(), "web/bin/vitest", FLAKY_VITEST);
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp.path().join("web/bin/vitest");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        tmp.path(),
+        "web/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"bash -c './bin/vitest run'\"\n",
+    );
+    tmp
+}
+
+#[test]
+fn a_bash_c_runner_target_retries_several_failing_tests() {
+    let tmp = flaky_vitest_workspace();
+    let check = aster(tmp.path(), &["check"]);
+    let check_out = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        check.status.success() && check_out.contains("no findings"),
+        "stdout: {check_out}\nstderr: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let results = tmp.path().join("out/results.ndjson");
+    let output = aster(
+        tmp.path(),
+        &[
+            "--no-cache",
+            "--retry-failed",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//web",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let calls = fs::read_to_string(tmp.path().join("vitest.calls")).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "the retry passes: {stderr}\ncalls:\n{calls}"
+    );
+    assert!(
+        stderr.contains("flaky: 2 tests passed on retry"),
+        "{stderr}\ncalls:\n{calls}"
+    );
+    let records = read_records(&results);
+    assert_eq!(target_status(&records, "//web:test"), TargetStatus::Passed);
+    let tests = tests_of(&records);
+    for expected in [
+        ("flaky A", TestOutcome::Fail, 1),
+        ("flaky B", TestOutcome::Fail, 1),
+        ("flaky A", TestOutcome::Pass, 2),
+        ("flaky B", TestOutcome::Pass, 2),
+    ] {
+        assert!(
+            tests.contains(&(expected.0.into(), expected.1, expected.2)),
+            "{expected:?} in {tests:?}\n{stderr}"
+        );
+    }
+    assert_eq!(
+        tests.iter().filter(|(_, _, attempt)| *attempt == 2).count(),
+        2,
+        "{tests:?}"
+    );
+}

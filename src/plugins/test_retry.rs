@@ -780,6 +780,32 @@ mod tests {
     }
 
     #[test]
+    fn a_bash_c_vitest_rerun_of_several_named_tests_keeps_a_capture_plan() {
+        let dir = Path::new("/w/web");
+        let failures = [
+            failure(Some("flaky.test.ts"), None, "flaky A"),
+            failure(Some("flaky.test.ts"), None, "flaky B"),
+        ];
+        let found = one(dir, "bash -c './node_modules/.bin/vitest run'", &failures);
+        let script = shell_words::split(&found).unwrap().pop().unwrap();
+        assert!(script.ends_with("-t '(flaky A$|flaky B$)'"), "{script}");
+        let report_dir = Path::new("/tmp/aster-reports/1");
+        let ctx = crate::test_results::ReportContext {
+            project_dir: dir,
+            working_dir: dir,
+            target_name: "test",
+            command: &found,
+            report_dir,
+        };
+        let registry = crate::plugins::PluginRegistry::with_all_plugins();
+        let plugin = registry.find_by_name("nodejs").unwrap();
+        assert!(
+            crate::plugins::test_reports::plan(plugin, None, &ctx, &Wrappers::default()).is_some(),
+            "{found}"
+        );
+    }
+
+    #[test]
     fn mix_retries_a_balanced_partition_with_only_its_failing_files() {
         let dir = Path::new("/w/shard");
         let original =

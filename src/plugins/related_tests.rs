@@ -109,6 +109,74 @@ fn is_assignment(value: &str) -> bool {
     })
 }
 
+/// Whether `tail` is one plain command. Quote tracking matches the scan
+/// that finds top-level `&&` and `;`: a backslash escapes the next
+/// character, and characters inside quotes are not operators.
+///
+/// Unquoted `|`, `&`, `<`, `>`, `(`, `)`, backtick and newline are refused.
+/// Command substitution (`$(` and backticks) is also refused inside double
+/// quotes, where the shell would still run it. A `$` inside single quotes
+/// is literal (`flaky A$`). Any other `$` is an expansion: refused unless
+/// `allow_expansions`, and an unbalanced `${` is refused even then.
+fn tail_is_plain(tail: &str, allow_expansions: bool) -> bool {
+    let chars: Vec<char> = tail.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut expansions = 0usize;
+    let mut open_brace = 0usize;
+    let mut close_brace = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    quote = None;
+                } else if c == '`'
+                    || chars
+                        .get(i + 1)
+                        .is_some_and(|next| c == '$' && *next == '(')
+                {
+                    return false;
+                } else if c == '$' {
+                    expansions += 1;
+                    if chars.get(i + 1) == Some(&'{') {
+                        open_brace += 1;
+                    }
+                } else if c == '}' {
+                    close_brace += 1;
+                }
+            }
+            Some(_) => unreachable!("only ' and \" open a quote"),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => i += 1,
+                '|' | '&' | '<' | '>' | '(' | ')' | '`' | '\n' => return false,
+                '$' if chars.get(i + 1) == Some(&'(') => return false,
+                '$' => {
+                    expansions += 1;
+                    if chars.get(i + 1) == Some(&'{') {
+                        open_brace += 1;
+                    }
+                }
+                '}' => close_brace += 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        return false;
+    }
+    expansions == 0 || (allow_expansions && open_brace == close_brace)
+}
+
 /// Why a test command is not read as plain arguments, and so is not
 /// narrowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,8 +458,11 @@ impl Delegated {
     /// [`Self::parse`], which treats an expansion as an unknown command.
     ///
     /// Still refused: an expansion in the program position, command
-    /// substitution (`$(...)`, backticks) and an unbalanced `${`, none of
-    /// which leave the shape of the arguments predictable.
+    /// substitution outside single quotes (`$(...)` and backticks, including
+    /// inside double quotes) and an unbalanced `${`, none of which leave the
+    /// shape of the arguments predictable. A `$`, `|` or parenthesis inside
+    /// single quotes is an argument (`-t '(a$|b$)'`), not an expansion or an
+    /// operator.
     pub(crate) fn parse_allowing_expansions(command: &str) -> Option<Self> {
         Self::parse_with(command, true)
     }
@@ -443,13 +514,9 @@ impl Delegated {
         let tail_start = separators.last().map_or(0, |s| s.1);
         let mut head = script[..tail_start].to_string();
         let mut tail = script[tail_start..].trim();
-        // The last command must be a plain one.
-        if tail.is_empty() || tail.contains(['|', '&', '<', '>', '(', ')', '`', '\n']) {
-            return None;
-        }
-        if tail.contains('$')
-            && (!allow_expansions || tail.matches("${").count() != tail.matches('}').count())
-        {
+        // The last command must be a plain one. Quoted metacharacters are
+        // arguments (`-t '(a$|b$)'`), not operators.
+        if tail.is_empty() || !tail_is_plain(tail, allow_expansions) {
             return None;
         }
         if !head.is_empty() {
@@ -1972,6 +2039,42 @@ mod tests {
             "bash -c 'vitest run ${QF:-a'",
             "bash -c 'cd \"$DIR\" && vitest run $QF'",
         ] {
+            assert_eq!(
+                Delegated::parse_allowing_expansions(refused),
+                None,
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_name_pattern_with_shell_metacharacters_stays_one_command() {
+        // What a retry renders for `-t '(a$|b$)'`: the script is single-quoted,
+        // and each embedded quote is `'\''`.
+        let command = "bash -c 'vitest run a.test.js -t '\\''(a$|b$)'\\'''";
+        let script = "vitest run a.test.js -t '(a$|b$)'";
+        assert_eq!(format!("bash -c {}", shell_words::quote(script)), command);
+        let delegated = Delegated::parse_allowing_expansions(command).unwrap();
+        assert_eq!(delegated.command, script);
+        // The `$` anchors are inside single quotes, so they are not expansions.
+        assert_eq!(Delegated::parse(command).unwrap().command, script);
+
+        // Unquoted operators, and command substitution even inside double
+        // quotes, are still not one plain command.
+        for refused in [
+            "bash -c 'mix test | tee log'",
+            "bash -c 'mix test & mix test'",
+            "bash -c 'mix test > log'",
+            "bash -c 'mix test < log'",
+            "bash -c '(cd ../core && mix test)'",
+            "bash -c 'mix test )'",
+            "bash -c 'vitest run `ls`'",
+            "bash -c 'vitest run\nmix test'",
+            "bash -c 'vitest run \"$(ls)\"'",
+            "bash -c 'vitest run \"`ls`\"'",
+            "bash -c 'vitest run ${QF:-a'",
+        ] {
+            assert_eq!(Delegated::parse(refused), None, "{refused}");
             assert_eq!(
                 Delegated::parse_allowing_expansions(refused),
                 None,
