@@ -241,8 +241,9 @@ aster cache status
 Successful build results are reused while their inputs are unchanged.
 Declared outputs are restored from the artifact cache, so a hit does not
 re-run the target. `.aster/cache/cache.json` is obsolete and unused; entries
-live under the cache directory's `index/`, `ac/`, and `cas/`. Force a fresh
-run or clear local index entries with:
+live under the cache directory's `index/`, `ac/`, and `cas/`. Force one run
+with `--no-cache`, or clear cached results so the next run executes. Blobs
+stay on disk until `aster cache prune`.
 
 ```console
 aster build //apps/api --no-cache

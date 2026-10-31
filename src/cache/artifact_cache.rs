@@ -178,30 +178,42 @@ impl ArtifactCache {
             .collect())
     }
 
-    /// Delete every index entry for `project`. Blobs and manifests stay.
-    pub fn invalidate_project(&self, project: &str) -> Result<()> {
+    /// Tombstone every index entry for `project`. Blobs and manifests stay.
+    ///
+    /// A removed marker suppresses the tier fallback until a later
+    /// [`Self::store`]. Returns how many live entries were tombstoned.
+    /// An address this checkout never indexed is left alone, so a remote
+    /// hit can still restore it.
+    pub fn invalidate_project(&self, project: &str) -> Result<usize> {
         let _lock = self.lock_exclusive()?;
-        let path = self.index_path(project);
-        if path.is_file() {
-            fs::remove_file(&path)
-                .with_context(|| format!("Failed to remove {}", path.display()))?;
+        let mut index = self.read_index(project)?;
+        let cleared = tombstone_entries(&mut index, |_| true);
+        if cleared > 0 {
+            self.write_index(project, &index)?;
         }
-        Ok(())
+        Ok(cleared)
     }
 
-    /// Delete the index entry for `address`. Blobs and manifests stay.
-    pub fn remove(&self, address: &str) -> Result<()> {
+    /// Tombstone the index entry for `address`. Blobs and manifests stay.
+    ///
+    /// Returns 1 when a live entry was marked removed, otherwise 0. A
+    /// missing row is not invented: that would hide a remote hit for an
+    /// address this checkout never stored.
+    pub fn remove(&self, address: &str) -> Result<usize> {
         let Some(project) = project_of(address) else {
-            return Ok(());
+            return Ok(0);
         };
         let _lock = self.lock_exclusive()?;
         let mut index = self.read_index(project)?;
-        if let Some(entry) = index.entries.get_mut(address) {
-            entry.removed = true;
-        } else {
-            return Ok(());
+        let Some(entry) = index.entries.get_mut(address) else {
+            return Ok(0);
+        };
+        if entry.removed {
+            return Ok(0);
         }
-        self.write_index(project, &index)
+        entry.removed = true;
+        self.write_index(project, &index)?;
+        Ok(1)
     }
 
     /// Every indexed target, joined to its manifest, in address order.
@@ -280,15 +292,36 @@ impl ArtifactCache {
         Ok(total)
     }
 
-    /// Delete every project index. Manifests and blobs stay for prune.
-    pub fn clear(&self) -> Result<()> {
+    /// Tombstone every project index entry. Manifests and blobs stay for prune.
+    ///
+    /// Deleting the index would let [`Self::lookup`] rebuild it from `ac/`.
+    /// A removed marker suppresses that fallback until a later [`Self::store`].
+    /// Returns how many live entries were tombstoned.
+    pub fn clear(&self) -> Result<usize> {
         let _lock = self.lock_exclusive()?;
         let dir = self.cache_dir.join("index");
-        if dir.is_dir() {
-            fs::remove_dir_all(&dir)
-                .with_context(|| format!("Failed to remove {}", dir.display()))?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read {}", dir.display()))
+            }
+        };
+        let mut cleared = 0usize;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let mut index = read_index_file(&path)?;
+            let marked = tombstone_entries(&mut index, |_| true);
+            if marked > 0 {
+                write_index_file(&path, &index)?;
+                cleared += marked;
+            }
         }
-        Ok(())
+        Ok(cleared)
     }
 
     fn index_path(&self, project: &str) -> PathBuf {
@@ -391,6 +424,19 @@ fn write_index_file(path: &Path, index: &ProjectIndex) -> Result<()> {
     write_result
 }
 
+/// Mark live entries removed. `keep` selects addresses in scope.
+fn tombstone_entries(index: &mut ProjectIndex, mut keep: impl FnMut(&str) -> bool) -> usize {
+    let mut cleared = 0usize;
+    for (address, entry) in &mut index.entries {
+        if entry.removed || !keep(address) {
+            continue;
+        }
+        entry.removed = true;
+        cleared += 1;
+    }
+    cleared
+}
+
 /// `//project:target` → `//project`.
 pub fn project_of(address: &str) -> Option<&str> {
     address.rsplit_once(':').map(|(project, _)| project)
@@ -473,18 +519,80 @@ mod tests {
         cache
             .store("//app", "//app:build", &manifest(&key, "//app:build"))
             .unwrap();
-        cache.remove("//app:build").unwrap();
+        assert_eq!(cache.remove("//app:build").unwrap(), 1);
         assert!(cache
             .lookup("//app", "//app:build", &key)
             .unwrap()
             .is_none());
         assert!(cache.local_store().get_manifest(&key).unwrap().is_some());
+        assert_eq!(cache.remove("//app:build").unwrap(), 0);
 
         cache
             .store("//app", "//app:build", &manifest(&key, "//app:build"))
             .unwrap();
-        cache.invalidate_project("//app").unwrap();
+        assert_eq!(cache.invalidate_project("//app").unwrap(), 1);
         assert!(cache.list_project_entries("//app").unwrap().is_empty());
+        assert!(
+            cache
+                .lookup("//app", "//app:build", &key)
+                .unwrap()
+                .is_none(),
+            "invalidate must not let the local manifest revive the index"
+        );
+        assert!(cache.local_store().get_manifest(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn clear_tombstone_makes_the_next_lookup_miss_until_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = ArtifactCache::new(tmp.path().to_path_buf(), tmp.path());
+        let app_key = "11".repeat(32);
+        let api_key = "22".repeat(32);
+        cache
+            .store("//app", "//app:build", &manifest(&app_key, "//app:build"))
+            .unwrap();
+        cache
+            .store("//api", "//api:build", &manifest(&api_key, "//api:build"))
+            .unwrap();
+
+        assert_eq!(cache.clear().unwrap(), 2);
+        assert!(cache.status(None).unwrap().targets.is_empty());
+        assert!(cache
+            .lookup("//app", "//app:build", &app_key)
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .lookup("//api", "//api:build", &api_key)
+            .unwrap()
+            .is_none());
+        assert!(
+            cache
+                .local_store()
+                .get_manifest(&app_key)
+                .unwrap()
+                .is_some(),
+            "clear leaves the manifest for prune"
+        );
+        assert_eq!(cache.clear().unwrap(), 0);
+
+        cache
+            .store("//app", "//app:build", &manifest(&app_key, "//app:build"))
+            .unwrap();
+        assert_eq!(
+            cache
+                .lookup("//app", "//app:build", &app_key)
+                .unwrap()
+                .expect("store after clear is a hit")
+                .key,
+            app_key
+        );
+        assert!(
+            cache
+                .lookup("//api", "//api:build", &api_key)
+                .unwrap()
+                .is_none(),
+            "a later store must not revive a different tombstone"
+        );
     }
 
     #[test]

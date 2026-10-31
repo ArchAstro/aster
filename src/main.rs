@@ -1601,24 +1601,20 @@ fn run() -> Result<()> {
 
             match command {
                 CacheCommands::Clear { target } => {
-                    if let Some(pattern) = target {
+                    let (removed, scope) = if let Some(pattern) = target {
                         let removed = if pattern.contains(':') {
-                            let before = artifact_cache.status(Some(&pattern))?.targets.len();
-                            artifact_cache.remove(&pattern)?;
-                            before
+                            artifact_cache.remove(&pattern)?
                         } else {
-                            let before = artifact_cache.list_project_entries(&pattern)?.len();
-                            artifact_cache.invalidate_project(&pattern)?;
-                            before
+                            artifact_cache.invalidate_project(&pattern)?
                         };
-                        if output_mode != OutputMode::Quiet {
-                            println!("Cleared {removed} cache entries matching {pattern}");
-                        }
+                        (removed, format!(" matching {pattern}"))
                     } else {
-                        artifact_cache.clear()?;
-                        if output_mode != OutputMode::Quiet {
-                            println!("Cache cleared");
-                        }
+                        (artifact_cache.clear()?, String::new())
+                    };
+                    if output_mode != OutputMode::Quiet {
+                        println!(
+                            "Cleared {removed} cache entries{scope}. Blobs are kept until `aster cache prune`."
+                        );
                     }
                 }
                 CacheCommands::Status { target, inputs } => {

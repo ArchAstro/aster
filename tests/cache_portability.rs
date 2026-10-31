@@ -290,3 +290,201 @@ fn identical_keys_across_checkout_paths_and_machines() {
         "go build was not cacheable: skipped {skipped:?}"
     );
 }
+
+fn package_project(root: &Path, name: &str, counter: &Path) {
+    write(
+        root,
+        &format!("{name}/package.json"),
+        &format!("{{\n  \"name\": \"{name}\",\n  \"scripts\": {{\n    \"build\": \"echo build\"\n  }}\n}}\n"),
+    );
+    let command = format!(
+        "bash -c 'n=$(cat {counter:?} 2>/dev/null || echo 0); echo $((n+1)) > {counter:?}'"
+    );
+    let command = command.replace('\\', "\\\\").replace('"', "\\\"");
+    write(
+        root,
+        &format!("{name}/aster.toml"),
+        &format!(
+            "[targets.deps]\ncommand = \"true\"\n\n[targets.deps.cache]\nenabled = true\nruntime = []\n\n[targets.build]\ncommand = \"{command}\"\n\n[targets.build.cache]\nenabled = true\nruntime = []\noutputs = []\n"
+        ),
+    );
+}
+
+fn aster_output(root: &Path, args: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", root)
+        .args(args)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+fn address_cached(output: &str, address: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.contains(address) && line.contains("(cached)"))
+}
+
+fn read_counter(path: &Path) -> u64 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// `aster cache clear` tombstones local results, so the next build executes.
+///
+/// The second build is a hit. After clear, the same target runs again and
+/// increments its side-effect counter. The following build is a hit again.
+#[test]
+fn cache_clear_forces_next_run_to_execute() {
+    let parent = TempDir::new().unwrap();
+    let root = parent.path().join("ws");
+    let counter = parent.path().join("runs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    package_project(&root, "p", &counter);
+
+    let (ok, first) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "first build failed: {first}");
+    assert!(
+        !first.contains("(cached)"),
+        "first build must execute: {first}"
+    );
+    assert_eq!(read_counter(&counter), 1, "first build should increment");
+
+    let (ok, second) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "second build failed: {second}");
+    assert!(
+        second.contains("(cached)"),
+        "second build should hit the cache: {second}"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        1,
+        "a hit must not re-run the command"
+    );
+
+    let (ok, cleared) = aster_output(&root, &["cache", "clear"]);
+    assert!(ok, "cache clear failed: {cleared}");
+    assert!(
+        cleared.contains("Cleared 2 cache entries"),
+        "clear should report the tombstoned count: {cleared}"
+    );
+    assert!(
+        cleared.contains("aster cache prune"),
+        "clear should say blobs stay until prune: {cleared}"
+    );
+    assert!(
+        root.join(".aster/cache/ac").is_dir(),
+        "clear must leave manifests for prune"
+    );
+
+    let (ok, third) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "build after clear failed: {third}");
+    assert!(
+        !third.contains("(cached)"),
+        "clear must force execution, not a cache hit: {third}"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        2,
+        "the post-clear run must increment the side-effect counter"
+    );
+
+    let (ok, fourth) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "fourth build failed: {fourth}");
+    assert!(
+        fourth.contains("(cached)"),
+        "a run after clear should repopulate the cache: {fourth}"
+    );
+    assert_eq!(
+        read_counter(&counter),
+        2,
+        "the repopulated hit must not re-run"
+    );
+}
+
+/// `cache clear <target>` and `cache clear <project>` miss only that scope.
+#[test]
+fn cache_clear_target_and_project_force_scoped_rerun() {
+    let parent = TempDir::new().unwrap();
+    let root = parent.path().join("ws");
+    let counter_p = parent.path().join("runs-p");
+    let counter_q = parent.path().join("runs-q");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    package_project(&root, "p", &counter_p);
+    package_project(&root, "q", &counter_q);
+
+    for address in ["//p", "//q"] {
+        let (ok, first) = aster_output(&root, &["build", address]);
+        assert!(ok, "{address} first build failed: {first}");
+        let (ok, second) = aster_output(&root, &["build", address]);
+        assert!(ok, "{address} second build failed: {second}");
+        assert!(
+            second.contains("(cached)"),
+            "{address} should be cached before a scoped clear: {second}"
+        );
+    }
+    assert_eq!(read_counter(&counter_p), 1);
+    assert_eq!(read_counter(&counter_q), 1);
+
+    let (ok, cleared) = aster_output(&root, &["cache", "clear", "//p:build"]);
+    assert!(ok, "target clear failed: {cleared}");
+    assert!(
+        cleared.contains("Cleared 1 cache entries matching //p:build"),
+        "target clear should name its scope: {cleared}"
+    );
+
+    let (ok, rerun_p) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "build //p after target clear failed: {rerun_p}");
+    assert!(
+        !address_cached(&rerun_p, "//p:build"),
+        "cache clear //p:build must re-run //p:build: {rerun_p}"
+    );
+    assert_eq!(read_counter(&counter_p), 2);
+
+    let (ok, still_q) = aster_output(&root, &["build", "//q"]);
+    assert!(ok, "build //q after target clear failed: {still_q}");
+    assert!(
+        still_q.contains("(cached)"),
+        "clearing //p:build must leave //q cached: {still_q}"
+    );
+    assert_eq!(read_counter(&counter_q), 1);
+
+    let (ok, warmed) = aster_output(&root, &["build", "//p"]);
+    assert!(
+        ok && warmed.contains("(cached)"),
+        "//p should hit again: {warmed}"
+    );
+
+    let (ok, project_clear) = aster_output(&root, &["cache", "clear", "//p"]);
+    assert!(ok, "project clear failed: {project_clear}");
+    assert!(
+        project_clear.contains("Cleared 2 cache entries matching //p"),
+        "project clear should name its scope: {project_clear}"
+    );
+
+    let (ok, rerun_project) = aster_output(&root, &["build", "//p"]);
+    assert!(ok, "build //p after project clear failed: {rerun_project}");
+    assert!(
+        !rerun_project.contains("(cached)"),
+        "cache clear //p must re-run //p:build: {rerun_project}"
+    );
+    assert_eq!(read_counter(&counter_p), 3);
+
+    let (ok, q_after) = aster_output(&root, &["build", "//q"]);
+    assert!(
+        ok && q_after.contains("(cached)"),
+        "//q must stay cached: {q_after}"
+    );
+    assert_eq!(read_counter(&counter_q), 1);
+}
