@@ -618,6 +618,30 @@ fn a_declared_report_on_a_recognised_runner_is_still_retried() {
         eprintln!("skipping: node is not installed");
         return;
     }
+    // Retrying needs the report to name each test's file; older Node
+    // versions' JUnit reporter does not.
+    let probe = TempDir::new().unwrap();
+    write(
+        probe.path(),
+        "p.test.js",
+        "require('node:test')('p', () => {});\n",
+    );
+    let probed = Command::new("node")
+        .args([
+            "--test",
+            "--test-reporter=junit",
+            "--test-reporter-destination=junit.xml",
+            "p.test.js",
+        ])
+        .current_dir(probe.path())
+        .output();
+    let names_files = probed.is_ok()
+        && fs::read_to_string(probe.path().join("junit.xml"))
+            .is_ok_and(|xml| xml.contains(" file="));
+    if !names_files {
+        eprintln!("skipping: this Node's JUnit reporter does not name test files");
+        return;
+    }
     // The command picks its own reporter and writes JUnit to a file the
     // target declares; the runner is `node --test`, so the rerun is built
     // from it and each attempt is read from the declared file.
