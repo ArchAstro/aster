@@ -177,15 +177,19 @@ cache = { enabled = false }
 
     let child_pid_path = tmp.path().join("app/child.pid");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !child_pid_path.exists() && Instant::now() < deadline {
+    // The shell creates child.pid before `echo` writes to it, so wait for a
+    // complete pid rather than just the file.
+    let read_pid = || {
+        fs::read_to_string(&child_pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    };
+    let mut child_pid = read_pid();
+    while child_pid.is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
+        child_pid = read_pid();
     }
-    assert!(child_pid_path.exists(), "target process never started");
-    let child_pid: i32 = fs::read_to_string(&child_pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let child_pid = child_pid.expect("target process never started");
 
     unsafe {
         libc::kill(aster.id() as i32, libc::SIGTERM);
