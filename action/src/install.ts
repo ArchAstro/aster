@@ -62,7 +62,12 @@ async function latestTag(token: string): Promise<string> {
     { headers },
   );
   if (!response.ok) {
-    throw new Error(`GitHub releases request failed: ${response.status} ${response.statusText}`);
+    const statusLine = `${response.status} ${response.statusText}`.trim();
+    const hint =
+      response.status === 403
+        ? ". Unauthenticated release lookup is rate limited (60/hour). Pin version: to a release tag, or pass env: GITHUB_TOKEN: ${{ github.token }}"
+        : "";
+    throw new Error(`GitHub releases request failed: ${statusLine}${hint}`);
   }
   const releases = (await response.json()) as Release[];
   const stable = releases.find((release) => !release.draft && !release.prerelease);

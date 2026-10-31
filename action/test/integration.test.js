@@ -68,6 +68,108 @@ describe("action integration", () => {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
   });
+
+  it("run input with program prefix and quoted glob", async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "aster-action-run-"));
+    const argvFile = path.join(workspace, "argv.json");
+    const stub = path.join(workspace, "aster-stub.js");
+    fs.writeFileSync(
+      stub,
+      "#!/usr/bin/env node\n" +
+        "const fs = require('node:fs');\n" +
+        "fs.writeFileSync(process.env.ASTER_ARGV_FILE, JSON.stringify(process.argv.slice(2)));\n",
+    );
+    fs.chmodSync(stub, 0o755);
+    const baseEnv = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      RUNNER_TEMP: workspace,
+      RUNNER_TOOL_CACHE: path.join(workspace, "tool-cache"),
+      GITHUB_WORKSPACE: workspace,
+      INPUT_VERSION: "",
+      INPUT_CACHE_MODE: "off",
+      "INPUT_CACHE-MODE": "off",
+      INPUT_ASTER_PATH: stub,
+      "INPUT_ASTER-PATH": stub,
+      INPUT_WORKING_DIRECTORY: "",
+      "INPUT_WORKING-DIRECTORY": "",
+      ASTER_ARGV_FILE: argvFile,
+    };
+    try {
+      const prefixed = await runAction({ ...baseEnv, INPUT_RUN: "aster build //app" }, "", "");
+      assert.notEqual(prefixed.status, 0, prefixed.stdout + prefixed.stderr);
+      assert.match(
+        prefixed.stdout + prefixed.stderr,
+        /run takes aster arguments, not the program name/,
+      );
+      assert.equal(fs.existsSync(argvFile), false);
+
+      const quoted = await runAction({ ...baseEnv, INPUT_RUN: "test 'apps/*'" }, "", "");
+      assert.equal(quoted.status, 0, quoted.stderr || quoted.stdout);
+      assert.deepEqual(JSON.parse(fs.readFileSync(argvFile, "utf8")), ["test", "apps/*"]);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("unauthenticated releases lookup 403 names version pin or GITHUB_TOKEN", async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "aster-action-403-"));
+    const preload = path.join(workspace, "mock-fetch.js");
+    const logFile = path.join(workspace, "fetch.jsonl");
+    fs.writeFileSync(
+      preload,
+      [
+        "const fs = require('node:fs');",
+        "global.fetch = async (url, init) => {",
+        "  const headers = (init && init.headers) || {};",
+        "  fs.appendFileSync(",
+        "    process.env.ASTER_FETCH_LOG,",
+        "    JSON.stringify({ url: String(url), authorization: headers.authorization || '' }) + '\\n',",
+        "  );",
+        "  return { ok: false, status: 403, statusText: 'rate limit exceeded', json: async () => [] };",
+        "};",
+        "",
+      ].join("\n"),
+    );
+    const baseEnv = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      RUNNER_TEMP: workspace,
+      RUNNER_TOOL_CACHE: path.join(workspace, "tool-cache"),
+      GITHUB_WORKSPACE: workspace,
+      INPUT_RUN: "build //app",
+      INPUT_VERSION: "",
+      INPUT_CACHE_MODE: "off",
+      INPUT_ASTER_PATH: "",
+      INPUT_WORKING_DIRECTORY: "",
+      ASTER_FETCH_LOG: logFile,
+      NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+    };
+    try {
+      const unauth = await runAction(baseEnv, "", "");
+      const unauthText = unauth.stdout + unauth.stderr;
+      assert.notEqual(unauth.status, 0, unauthText);
+      assert.match(unauthText, /GitHub releases request failed: 403 rate limit exceeded/);
+      assert.match(unauthText, /rate limited/);
+      assert.match(unauthText, /Pin version:/);
+      assert.match(unauthText, /env: GITHUB_TOKEN/);
+      assert.match(unauthText, /github\.token/);
+      const unauthLog = JSON.parse(fs.readFileSync(logFile, "utf8").trim().split("\n")[0]);
+      assert.equal(unauthLog.authorization, "");
+      assert.match(unauthLog.url, /api\.github\.com\/repos\/ArchAstro\/aster\/releases/);
+
+      fs.writeFileSync(logFile, "");
+      const authed = await runAction({ ...baseEnv, GITHUB_TOKEN: "ghs_test" }, "", "");
+      const authedText = authed.stdout + authed.stderr;
+      assert.notEqual(authed.status, 0, authedText);
+      assert.match(authedText, /Pin version:/);
+      assert.match(authedText, /GITHUB_TOKEN/);
+      const authedLog = JSON.parse(fs.readFileSync(logFile, "utf8").trim().split("\n").pop());
+      assert.equal(authedLog.authorization, "Bearer ghs_test");
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
 });
 
 function runAction(baseEnv, resultsUrl, token) {

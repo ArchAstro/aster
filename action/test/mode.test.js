@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
 const { selectCacheMode } = require("../dist/mode.js");
-const { childEnv, SCOPED_ENV } = require("../dist/run.js");
+const { childEnv, SCOPED_ENV, splitCommand } = require("../dist/run.js");
 
 describe("selectCacheMode", () => {
   it("push to the default branch selects rw", () => {
@@ -109,5 +109,43 @@ describe("child env", () => {
     for (const name of SCOPED_ENV) {
       assert.equal(process.env[name], undefined, `${name} leaked to the parent`);
     }
+  });
+});
+
+describe("splitCommand", () => {
+  it("rejects a leading aster program name", () => {
+    assert.throws(
+      () => splitCommand("aster build //app"),
+      /run takes aster arguments, not the program name/,
+    );
+    assert.throws(
+      () => splitCommand("  aster build //app"),
+      /run takes aster arguments, not the program name/,
+    );
+  });
+
+  it("passes a quoted glob as one argument", () => {
+    assert.deepEqual(splitCommand("test 'apps/*'"), ["test", "apps/*"]);
+    assert.deepEqual(splitCommand('test "apps/*"'), ["test", "apps/*"]);
+    assert.deepEqual(splitCommand("test 'apps/foo bar'"), ["test", "apps/foo bar"]);
+  });
+
+  it("rejects an unbalanced quote", () => {
+    assert.throws(() => splitCommand("test 'apps/*"), /unbalanced quote/);
+    assert.throws(() => splitCommand('test "apps/*'), /unbalanced quote/);
+  });
+
+  it("keeps an unquoted command and a later aster token", () => {
+    assert.deepEqual(splitCommand("run //app:build --no-deps --json"), [
+      "run",
+      "//app:build",
+      "--no-deps",
+      "--json",
+    ]);
+    assert.deepEqual(splitCommand("build //pkg:aster"), ["build", "//pkg:aster"]);
+  });
+
+  it("rejects an empty run input", () => {
+    assert.throws(() => splitCommand("   "), /run input is empty/);
   });
 });
