@@ -230,6 +230,10 @@ Flags:
   --quiet, -q           Suppress per-project output
   --json                Output JSON
   --full-logs           Show full output for failed targets
+  --no-replay           Do not print a cache hit's stored log
+  --cache-dir <DIR>     Artifact cache directory (also --cache-dir=DIR)
+  --test-results[=PATH] Record test results as NDJSON (--test-results or --test-results=PATH)
+  --retry-failed[=N]    Rerun failing tests (bare --retry-failed means 1; also --retry-failed=N)
   --help, -h            Print this usage and exit without running the target
 "#;
 
@@ -288,7 +292,7 @@ pub fn conventional_target_help_name(args: &[String]) -> Option<&str> {
 /// returns `None` so clap handles it.
 pub fn explicit_target_help_name(args: &[String]) -> Option<&str> {
     let (name, suffix) = target_name_and_suffix(args)?;
-    if super::run::parse_run_args(suffix.to_vec()).help {
+    if super::run::parse_run_args(suffix.to_vec()).is_ok_and(|run_args| run_args.help) {
         Some(name)
     } else {
         None

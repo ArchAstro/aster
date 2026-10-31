@@ -127,6 +127,27 @@ fn run() -> Result<()> {
     if cli.skills {
         return print_skills();
     }
+    // Flags after an external target are invisible to clap. Parse them before
+    // `--cache-dir` is exported so that form shares the same early path.
+    // Help requests stay on the existing short-circuit and are not rejected.
+    let parsed_external = match cli.command.as_ref() {
+        Some(Commands::ExternalTarget(args) | Commands::RunTarget { args }) => {
+            match parse_run_args(args.clone()) {
+                Ok(run_args) if run_args.help => None,
+                Ok(run_args) => {
+                    if run_args.cache_dir.is_some() {
+                        cli.cache_dir = run_args.cache_dir.clone();
+                    }
+                    Some(run_args)
+                }
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        _ => None,
+    };
     // `--cache-dir` wins over a pre-existing ASTER_CACHE_DIR. Export it before
     // any thread or child process starts so daemon children share one source
     // of truth. A relative flag is made absolute against cwd.
@@ -235,10 +256,11 @@ fn run() -> Result<()> {
     // Target-command help must work before project selection and outside a workspace.
     // `--help`/`-h` on an external target are ordinary args to clap, not clap's help flag.
     if let Some(args) = target_run_args(&command) {
-        let run_args = parse_run_args(args.clone());
-        if run_args.help {
-            print_run_args_help(&run_args);
-            return Ok(());
+        if let Ok(run_args) = parse_run_args(args.clone()) {
+            if run_args.help {
+                print_run_args_help(&run_args);
+                return Ok(());
+            }
         }
     }
 
@@ -1791,8 +1813,14 @@ fn run() -> Result<()> {
             ServicesCommands::Tls { .. } => unreachable!("TLS commands handled before discovery"),
         },
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
-            // Parse external subcommand args
-            let run_args = parse_run_args(args.clone());
+            // Parsed before `--cache-dir` export, except help requests which return above.
+            let run_args = match parsed_external {
+                Some(run_args) => run_args,
+                None => parse_run_args(args.clone()).unwrap_or_else(|message| {
+                    eprintln!("error: {message}");
+                    std::process::exit(2);
+                }),
+            };
             // Help must not validate, discover, or execute. The check above
             // returns before workspace discovery; this is the same guard if a
             // help request reaches the run arm.
@@ -1828,6 +1856,15 @@ fn run() -> Result<()> {
             }
             if run_args.full_logs {
                 cli.full_logs = true;
+            }
+            if run_args.no_replay {
+                cli.no_replay = true;
+            }
+            if let Some(retry_failed) = run_args.retry_failed {
+                cli.retry_failed = Some(retry_failed);
+            }
+            if let Some(test_results) = run_args.test_results.clone() {
+                cli.test_results = Some(test_results);
             }
             let output_mode = cli.output_mode();
             let full_logs = cli.full_logs();

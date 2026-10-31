@@ -4,7 +4,7 @@
 //! and selecting projects based on flags (--all, --no-deps, --dependents).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::address::ProjectSelector;
 use crate::discovery::DiscoveredProject;
@@ -33,6 +33,13 @@ pub const PARSE_RUN_ARG_FLAGS: &[&str] = &[
     "--full-logs",
     "--lang",
     "--lang=",
+    "--no-replay",
+    "--cache-dir",
+    "--cache-dir=",
+    "--test-results",
+    "--test-results=",
+    "--retry-failed",
+    "--retry-failed=",
     "--help",
     "-h",
 ];
@@ -73,6 +80,16 @@ pub struct RunArgs {
     pub full_logs: bool,
     /// Filter by source language (e.g., "nodejs", "python", "java", "kotlin")
     pub lang: Vec<String>,
+    /// Rerun failing tests up to N times. `None` means the flag was absent
+    /// (env may still apply). Bare `--retry-failed` is `Some(1)`.
+    pub retry_failed: Option<u32>,
+    /// Where to write test results. `None` means the flag was absent.
+    /// `Some(None)` is the default location; `Some(Some(path))` is an explicit file.
+    pub test_results: Option<Option<PathBuf>>,
+    /// Do not print a cache hit's stored log.
+    pub no_replay: bool,
+    /// Artifact cache directory. A relative path is resolved by the CLI against cwd.
+    pub cache_dir: Option<PathBuf>,
     /// `--help` or `-h`: print usage and do not run the target.
     pub help: bool,
 }
@@ -93,25 +110,18 @@ pub fn check_reserved_target(target: &str) -> Option<String> {
     }
 }
 
-/// Parse external subcommand args into RunArgs
+/// Parse external subcommand args into RunArgs.
 ///
 /// Args format: `[target] [projects...] [--no-deps] [--dependents] [--all]`
 ///
-/// Project patterns:
-///   //path/to/project  - exact project match
-///   //path/prefix/...  - all projects under prefix
-///   //...              - all projects (same as --all)
-///   ./...              - all projects under current directory
-///   -//path/...        - exclude from selection
+/// Unknown `--flags` are an error. There is no bare `--` passthrough: a lone
+/// `--` is itself an unexpected argument. `--help` and `-h` set `help` and
+/// win over any argument error, so a help request always prints usage.
 ///
-/// Examples:
-///   ["test"]                     -> target=test, all projects
-///   ["test", "//a", "//b"]       -> target=test, projects a and b (+ deps)
-///   ["test", "--all"]            -> target=test, all projects
-///   ["test", "//a", "--no-deps"] -> target=test, only project a
-///   ["test", "//a", "--dependents"] -> target=test, a + its dependents
-///   ["test", "//...", "-//vendor/..."] -> all projects except under vendor/
-pub fn parse_run_args(args: Vec<String>) -> RunArgs {
+/// `--retry-failed` and `--test-results` require `=` for a value, matching
+/// the clap definitions. Bare `--retry-failed` means 1. Bare `--test-results`
+/// means the default results path.
+pub fn parse_run_args(args: Vec<String>) -> Result<RunArgs, String> {
     let mut target = String::new();
     let mut projects = Vec::new();
     let mut exclusions = Vec::new();
@@ -131,6 +141,12 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut jobs = None;
     let mut expecting_jobs = false;
     let mut help = false;
+    let mut retry_failed = None;
+    let mut test_results = None;
+    let mut no_replay = false;
+    let mut cache_dir = None;
+    let mut expecting_cache_dir = false;
+    let mut error: Option<String> = None;
 
     for arg in args {
         // Before value-taking flags and the unknown-flag arm, so help never runs work.
@@ -141,6 +157,11 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         if expecting_jobs {
             expecting_jobs = false;
             jobs = Some(arg);
+            continue;
+        }
+        if expecting_cache_dir {
+            expecting_cache_dir = false;
+            cache_dir = Some(PathBuf::from(arg));
             continue;
         }
         if expecting_lang {
@@ -172,6 +193,27 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
             "--quiet" | "-q" => quiet = true,
             "--json" => json = true,
             "--full-logs" => full_logs = true,
+            "--no-replay" => no_replay = true,
+            "--retry-failed" => retry_failed = Some(1),
+            _ if arg.starts_with("--retry-failed=") => {
+                let value = &arg["--retry-failed=".len()..];
+                match value.parse::<u32>() {
+                    Ok(count) => retry_failed = Some(count),
+                    Err(_) => {
+                        error.get_or_insert_with(|| {
+                            format!("invalid value '{value}' for '--retry-failed <N>'")
+                        });
+                    }
+                }
+            }
+            "--test-results" => test_results = Some(None),
+            _ if arg.starts_with("--test-results=") => {
+                test_results = Some(Some(PathBuf::from(&arg["--test-results=".len()..])));
+            }
+            "--cache-dir" => expecting_cache_dir = true,
+            _ if arg.starts_with("--cache-dir=") => {
+                cache_dir = Some(PathBuf::from(&arg["--cache-dir=".len()..]));
+            }
             _ if arg == "--lang" => {
                 expecting_lang = true;
             }
@@ -189,7 +231,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
                 use_cwd = true;
             }
             _ if arg.starts_with("--") => {
-                // Unknown flag - ignore for now
+                error.get_or_insert_with(|| format!("unexpected argument '{arg}' found"));
             }
             _ if arg.starts_with("-//") => {
                 // Exclusion pattern (e.g., -//vendor/...)
@@ -214,7 +256,16 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         }
     }
 
-    RunArgs {
+    if expecting_cache_dir {
+        error.get_or_insert_with(|| "a value is required for '--cache-dir <DIR>'".to_string());
+    }
+    if let Some(message) = error {
+        if !help {
+            return Err(message);
+        }
+    }
+
+    Ok(RunArgs {
         target,
         projects,
         exclusions,
@@ -232,7 +283,11 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         full_logs,
         lang,
         help,
-    }
+        retry_failed,
+        test_results,
+        no_replay,
+        cache_dir,
+    })
 }
 
 /// Select initial projects based on args
@@ -447,6 +502,10 @@ fn collect_deps_recursive(addr: &str, graph: &ProjectGraph, collected: &mut Hash
 mod tests {
     use super::*;
 
+    fn parse_ok(args: Vec<String>) -> RunArgs {
+        parse_run_args(args).unwrap()
+    }
+
     #[test]
     fn target_command_usage_lists_every_parse_run_args_flag() {
         let usage = crate::cli::commands::TARGET_COMMAND_USAGE;
@@ -457,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_target_only() {
-        let args = parse_run_args(vec!["test".to_string()]);
+        let args = parse_ok(vec!["test".to_string()]);
 
         assert_eq!(args.target, "test");
         assert!(args.projects.is_empty());
@@ -472,12 +531,12 @@ mod tests {
     #[test]
     fn test_parse_run_args_help_does_not_run() {
         for flag in ["--help", "-h"] {
-            let args = parse_run_args(vec!["build".to_string(), flag.to_string()]);
+            let args = parse_ok(vec!["build".to_string(), flag.to_string()]);
             assert!(args.help, "{flag}");
             assert_eq!(args.target, "build");
         }
 
-        let with_other_flags = parse_run_args(vec![
+        let with_other_flags = parse_ok(vec![
             "build".to_string(),
             "--all".to_string(),
             "--help".to_string(),
@@ -486,17 +545,24 @@ mod tests {
         assert!(with_other_flags.all);
 
         let unknown = parse_run_args(vec!["build".to_string(), "--no-such-flag".to_string()]);
-        assert!(!unknown.help);
-        assert_eq!(unknown.target, "build");
+        assert!(unknown.is_err());
 
-        let short_verbose = parse_run_args(vec!["build".to_string(), "-v".to_string()]);
+        // Help wins over an argument error so usage still prints.
+        let help_with_unknown = parse_ok(vec![
+            "build".to_string(),
+            "--no-such-flag".to_string(),
+            "--help".to_string(),
+        ]);
+        assert!(help_with_unknown.help);
+
+        let short_verbose = parse_ok(vec!["build".to_string(), "-v".to_string()]);
         assert!(!short_verbose.help);
         assert!(short_verbose.verbose);
     }
 
     #[test]
     fn test_parse_run_args_with_projects() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "//services/api".to_string(),
             "//libs/core".to_string(),
@@ -510,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_all_flag() {
-        let args = parse_run_args(vec!["build".to_string(), "--all".to_string()]);
+        let args = parse_ok(vec!["build".to_string(), "--all".to_string()]);
 
         assert_eq!(args.target, "build");
         assert!(args.projects.is_empty());
@@ -519,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_no_deps() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "//a".to_string(),
             "--no-deps".to_string(),
@@ -533,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_dependents() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "lint".to_string(),
             "//libs/core".to_string(),
             "--dependents".to_string(),
@@ -546,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_combined_flags() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "//a".to_string(),
             "--no-deps".to_string(),
@@ -560,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_empty() {
-        let args = parse_run_args(vec![]);
+        let args = parse_ok(vec![]);
 
         assert_eq!(args.target, "");
         assert!(args.projects.is_empty());
@@ -568,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_dot() {
-        let args = parse_run_args(vec!["test".to_string(), ".".to_string()]);
+        let args = parse_ok(vec!["test".to_string(), ".".to_string()]);
 
         assert_eq!(args.target, "test");
         assert!(args.projects.is_empty());
@@ -596,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_warnings_as_errors() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "build".to_string(),
             "--all".to_string(),
             "--warnings-as-errors".to_string(),
@@ -609,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_glob_pattern() {
-        let args = parse_run_args(vec!["test".to_string(), "//src/ts/...".to_string()]);
+        let args = parse_ok(vec!["test".to_string(), "//src/ts/...".to_string()]);
 
         assert_eq!(args.target, "test");
         assert_eq!(args.projects, vec!["//src/ts/..."]);
@@ -617,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_multiple_glob_patterns() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "//src/ts/...".to_string(),
             "//libs/...".to_string(),
@@ -629,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_exclusions() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "//...".to_string(),
             "-//vendor/...".to_string(),
@@ -643,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_relative_glob() {
-        let args = parse_run_args(vec!["test".to_string(), "./...".to_string()]);
+        let args = parse_ok(vec!["test".to_string(), "./...".to_string()]);
 
         assert_eq!(args.target, "test");
         assert_eq!(args.projects, vec!["./..."]);
@@ -651,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_stream_flag() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "run-dev".to_string(),
             ".".to_string(),
             "--stream".to_string(),
@@ -664,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_no_stream_flag() {
-        let args = parse_run_args(vec!["run-dev".to_string(), "--no-stream".to_string()]);
+        let args = parse_ok(vec!["run-dev".to_string(), "--no-stream".to_string()]);
 
         assert_eq!(args.target, "run-dev");
         assert_eq!(args.stream_override, Some(false));
@@ -672,14 +738,14 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_default_stream_override_is_none() {
-        let args = parse_run_args(vec!["test".to_string()]);
+        let args = parse_ok(vec!["test".to_string()]);
 
         assert_eq!(args.stream_override, None);
     }
 
     #[test]
     fn test_parse_run_args_global_flags() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "--all".to_string(),
             "--no-cache".to_string(),
@@ -698,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_global_flags_short() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "-v".to_string(),
             "-q".to_string(),
@@ -712,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_lang_flag() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "--all".to_string(),
             "--lang".to_string(),
@@ -726,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_lang_comma_separated() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "--all".to_string(),
             "--lang".to_string(),
@@ -738,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_lang_equals() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "--all".to_string(),
             "--lang=rust,go".to_string(),
@@ -749,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_with_multiple_lang_flags() {
-        let args = parse_run_args(vec![
+        let args = parse_ok(vec![
             "test".to_string(),
             "--all".to_string(),
             "--lang".to_string(),
@@ -763,9 +829,96 @@ mod tests {
 
     #[test]
     fn test_parse_run_args_lang_default_empty() {
-        let args = parse_run_args(vec!["test".to_string()]);
+        let args = parse_ok(vec!["test".to_string()]);
 
         assert!(args.lang.is_empty());
+    }
+
+    #[test]
+    fn test_parse_run_args_retry_failed_after_target() {
+        let args = parse_ok(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--retry-failed".to_string(),
+        ]);
+
+        assert_eq!(args.target, "test");
+        assert!(args.all);
+        assert_eq!(args.retry_failed, Some(1));
+        assert!(args.test_results.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_args_retry_failed_equals() {
+        let args = parse_ok(vec!["test".to_string(), "--retry-failed=3".to_string()]);
+
+        assert_eq!(args.retry_failed, Some(3));
+    }
+
+    #[test]
+    fn test_parse_run_args_retry_failed_requires_equals() {
+        let args = parse_ok(vec![
+            "test".to_string(),
+            "--retry-failed".to_string(),
+            "//app".to_string(),
+        ]);
+
+        assert_eq!(args.retry_failed, Some(1));
+        assert_eq!(args.projects, vec!["//app"]);
+    }
+
+    #[test]
+    fn test_parse_run_args_test_results_bare_and_equals() {
+        let bare = parse_ok(vec!["test".to_string(), "--test-results".to_string()]);
+        assert_eq!(bare.test_results, Some(None));
+
+        let with_path = parse_ok(vec![
+            "test".to_string(),
+            "--test-results=out/r.ndjson".to_string(),
+        ]);
+        assert_eq!(
+            with_path.test_results,
+            Some(Some(PathBuf::from("out/r.ndjson")))
+        );
+    }
+
+    #[test]
+    fn test_parse_run_args_no_replay_and_cache_dir() {
+        let equals = parse_ok(vec![
+            "test".to_string(),
+            "--no-replay".to_string(),
+            "--cache-dir=DIR".to_string(),
+        ]);
+        assert!(equals.no_replay);
+        assert_eq!(equals.cache_dir, Some(PathBuf::from("DIR")));
+
+        let spaced = parse_ok(vec![
+            "test".to_string(),
+            "--cache-dir".to_string(),
+            "DIR".to_string(),
+        ]);
+        assert_eq!(spaced.cache_dir, Some(PathBuf::from("DIR")));
+        assert!(!spaced.no_replay);
+    }
+
+    #[test]
+    fn test_parse_run_args_rejects_unknown_flag() {
+        let err = parse_run_args(vec![
+            "test".to_string(),
+            "--all".to_string(),
+            "--bogus-flag".to_string(),
+        ])
+        .unwrap_err();
+
+        assert_eq!(err, "unexpected argument '--bogus-flag' found");
+    }
+
+    #[test]
+    fn test_parse_run_args_rejects_invalid_retry_count() {
+        let err =
+            parse_run_args(vec!["test".to_string(), "--retry-failed=x".to_string()]).unwrap_err();
+
+        assert!(err.contains("invalid value 'x'"), "{err}");
     }
 
     mod select_projects_tests {
