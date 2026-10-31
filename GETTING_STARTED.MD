@@ -29,7 +29,7 @@ Commands are in the [Installation](README.md#installation) section.
 To build Aster from source instead, install Rust 1.88 or newer and run:
 
 ```console
-cargo install --git https://github.com/ArchAstro/aster.git --locked
+cargo install --git https://github.com/ArchAstro/aster.git --locked aster
 aster --version
 ```
 
