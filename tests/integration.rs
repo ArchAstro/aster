@@ -1501,6 +1501,204 @@ fn test_affected_requires_git_repo() {
         stderr.contains("git") || stderr.contains("repository"),
         "Expected git error message: {stderr}"
     );
+    assert_eq!(
+        stderr.matches("Not in a git repository").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("class="), "{stderr}");
+    assert!(!stderr.contains("code="), "{stderr}");
+}
+
+fn git_in(path: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn affected_in_shallow_clone_explains_fetch_depth() {
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin");
+    fs::create_dir(&origin).unwrap();
+    git_in(&origin, &["init", "-b", "main"]);
+    git_in(&origin, &["config", "user.email", "test@test.com"]);
+    git_in(&origin, &["config", "user.name", "Test"]);
+    fs::write(origin.join("README"), "a").unwrap();
+    git_in(&origin, &["add", "."]);
+    git_in(&origin, &["commit", "-m", "A"]);
+    git_in(&origin, &["checkout", "-b", "feat"]);
+    fs::write(origin.join("feat.txt"), "c").unwrap();
+    git_in(&origin, &["add", "."]);
+    git_in(&origin, &["commit", "-m", "C"]);
+    git_in(&origin, &["checkout", "main"]);
+    fs::write(origin.join("main.txt"), "b").unwrap();
+    git_in(&origin, &["add", "."]);
+    git_in(&origin, &["commit", "-m", "B"]);
+
+    // A linear depth-1 clone of main still contains origin/main, so the base
+    // has to be a tip whose connecting history was not fetched.
+    let shallow = tmp.path().join("shallow");
+    let url = format!("file://{}", origin.display());
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "-b",
+            "feat",
+            &url,
+            shallow.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    git_in(
+        &shallow,
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            "main:refs/remotes/origin/main",
+        ],
+    );
+    fs::write(shallow.join("aster.toml"), "").unwrap();
+    fs::write(
+        shallow.join("package.json"),
+        r#"{"name":"app","scripts":{"test":"true"}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(&shallow)
+        .args(["affected", "test", "--base=origin/main", "--dry-run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("shallow"), "{stderr}");
+    assert!(stderr.contains("fetch-depth: 0"), "{stderr}");
+    assert!(stderr.contains("git fetch --unshallow"), "{stderr}");
+    assert_eq!(
+        stderr.matches("the clone is shallow").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("fetch-depth: 0").count(), 1, "{stderr}");
+    assert!(!stderr.contains("class="), "{stderr}");
+    assert!(!stderr.contains("class=Merge"), "{stderr}");
+    assert!(!stderr.contains("code="), "{stderr}");
+}
+
+#[test]
+fn affected_in_repo_without_commits_says_so() {
+    let tmp = TempDir::new().unwrap();
+    git_in(tmp.path(), &["init"]);
+    fs::write(tmp.path().join("aster.toml"), "").unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"app","scripts":{"test":"true"}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--dry-run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("no commits yet"), "{stderr}");
+    assert_eq!(stderr.matches("no commits yet").count(), 1, "{stderr}");
+    assert!(!stderr.contains("class="), "{stderr}");
+    assert!(!stderr.contains("code="), "{stderr}");
+}
+
+#[test]
+fn affected_invalid_ref_hides_libgit2_codes_unless_verbose() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "package.json",
+        r#"{"name":"app","scripts":{"test":"true"}}"#,
+    );
+    git_commit(&tmp, "Initial");
+
+    let quiet = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=does-not-exist", "--dry-run"])
+        .output()
+        .unwrap();
+    let quiet_err = String::from_utf8_lossy(&quiet.stderr);
+    assert!(!quiet.status.success(), "{quiet_err}");
+    assert!(quiet_err.contains("does-not-exist"), "{quiet_err}");
+    assert!(!quiet_err.contains("class="), "{quiet_err}");
+    assert!(!quiet_err.contains("code="), "{quiet_err}");
+    assert_eq!(quiet_err.matches("error:").count(), 1, "{quiet_err}");
+
+    let verbose = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args([
+            "affected",
+            "test",
+            "--base=does-not-exist",
+            "--dry-run",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    let verbose_err = String::from_utf8_lossy(&verbose.stderr);
+    assert!(!verbose.status.success(), "{verbose_err}");
+    assert!(verbose_err.contains("class="), "{verbose_err}");
+    assert!(verbose_err.contains("code="), "{verbose_err}");
+}
+
+#[test]
+fn dependency_cycle_is_reported_once() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "a/package.json",
+        r#"{"name": "a", "scripts": {"build": "echo build"}}"#,
+    );
+    write_aster_toml(&tmp, "a/aster.toml", r#"depends_on = ["//b:build"]"#);
+    write_package_json(
+        &tmp,
+        "b/package.json",
+        r#"{"name": "b", "scripts": {"build": "echo build"}}"#,
+    );
+    write_aster_toml(&tmp, "b/aster.toml", r#"depends_on = ["//a:build"]"#);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .arg("graph")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("->"), "{stderr}");
+    assert_eq!(
+        stderr.matches("Dependency cycle detected").count(),
+        1,
+        "{stderr}"
+    );
 }
 
 #[test]

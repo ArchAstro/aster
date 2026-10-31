@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::related::Change;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use git2::{DiffOptions, Repository, StatusOptions};
 
 /// Detector for files affected by git changes
@@ -32,30 +32,65 @@ impl AffectedDetector {
         self.repo.workdir()
     }
 
+    /// An unborn `HEAD` or a repo `git init` created and never committed to.
+    fn require_commits(&self) -> Result<()> {
+        let unborn = matches!(
+            self.repo.head(),
+            Err(err) if err.code() == git2::ErrorCode::UnbornBranch
+        );
+        if unborn || self.repo.is_empty().unwrap_or(false) {
+            bail!("this repository has no commits yet");
+        }
+        Ok(())
+    }
+
+    /// Resolve `name`, turning shallow-history and empty-repo failures into
+    /// a hint instead of a libgit2 rev-parse error.
+    fn revparse<'repo>(&'repo self, name: &str, not_found: String) -> Result<git2::Object<'repo>> {
+        self.require_commits()?;
+        match self.repo.revparse_single(name) {
+            Ok(object) => Ok(object),
+            Err(err) if self.repo.is_shallow() && parent_is_missing(&err) => {
+                Err(shallow_clone_error(name))
+            }
+            Err(err) => Err(anyhow::Error::from(err).context(not_found)),
+        }
+    }
+
+    fn commit_of(&self, name: &str, flag: &str) -> Result<git2::Commit<'_>> {
+        self.revparse(
+            name,
+            format!("Git ref '{name}' not found. Check your --{flag} value."),
+        )?
+        .peel_to_commit()
+        .with_context(|| format!("Could not get commit for ref '{name}'"))
+    }
+
+    fn merge_base_id(
+        &self,
+        base_commit: &git2::Commit<'_>,
+        head_commit: &git2::Commit<'_>,
+        base: &str,
+        head: &str,
+    ) -> Result<git2::Oid> {
+        match self.repo.merge_base(base_commit.id(), head_commit.id()) {
+            Ok(id) => Ok(id),
+            // A shallow clone often has both tips and none of the history
+            // that connects them. Say so instead of "no merge base found".
+            Err(_) if self.repo.is_shallow() => Err(shallow_clone_error(base)),
+            Err(err) => Err(anyhow::Error::from(err).context(format!(
+                "Could not find merge base for '{base}' and '{head}'"
+            ))),
+        }
+    }
+
     /// Get files changed between two git refs
     ///
     /// Returns paths relative to the repository root.
     pub fn changed_files_between_refs(&self, base: &str, head: &str) -> Result<HashSet<PathBuf>> {
-        let base_obj = self
-            .repo
-            .revparse_single(base)
-            .with_context(|| format!("Git ref '{base}' not found. Check your --base value."))?;
-
-        let head_obj = self
-            .repo
-            .revparse_single(head)
-            .with_context(|| format!("Git ref '{head}' not found. Check your --head value."))?;
-
-        let base_commit = base_obj
-            .peel_to_commit()
-            .with_context(|| format!("Could not get commit for ref '{base}'"))?;
-        let head_commit = head_obj
-            .peel_to_commit()
-            .with_context(|| format!("Could not get commit for ref '{head}'"))?;
-        let merge_base_id = self
-            .repo
-            .merge_base(base_commit.id(), head_commit.id())
-            .with_context(|| format!("Could not find merge base for '{base}' and '{head}'"))?;
+        let base_commit = self.commit_of(base, "base")?;
+        let head_commit = self.commit_of(head, "head")?;
+        let merge_base_id = self.merge_base_id(&base_commit, &head_commit, base, head)?;
         let merge_base = self
             .repo
             .find_commit(merge_base_id)
@@ -114,19 +149,9 @@ impl AffectedDetector {
 
     /// The merge base of `base` and `head`, as a tree.
     fn merge_base_tree(&self, base: &str, head: &str) -> Result<git2::Tree<'_>> {
-        let commit = |name: &str, flag: &str| {
-            self.repo
-                .revparse_single(name)
-                .with_context(|| format!("Git ref '{name}' not found. Check your --{flag} value."))?
-                .peel_to_commit()
-                .with_context(|| format!("Could not get commit for ref '{name}'"))
-        };
-        let base_commit = commit(base, "base")?;
-        let head_commit = commit(head, "head")?;
-        let merge_base = self
-            .repo
-            .merge_base(base_commit.id(), head_commit.id())
-            .with_context(|| format!("Could not find merge base for '{base}' and '{head}'"))?;
+        let base_commit = self.commit_of(base, "base")?;
+        let head_commit = self.commit_of(head, "head")?;
+        let merge_base = self.merge_base_id(&base_commit, &head_commit, base, head)?;
         self.repo
             .find_commit(merge_base)
             .context("Could not load merge-base commit")?
@@ -168,9 +193,7 @@ impl AffectedDetector {
     }
 
     fn tree_of(&self, name: &str) -> Result<git2::Tree<'_>> {
-        self.repo
-            .revparse_single(name)
-            .with_context(|| format!("Git ref '{name}' not found"))?
+        self.revparse(name, format!("Git ref '{name}' not found"))?
             .peel_to_tree()
             .with_context(|| format!("Could not get tree for ref '{name}'"))
     }
@@ -298,6 +321,18 @@ impl AffectedDetector {
             }
         }
     }
+}
+
+fn parent_is_missing(err: &git2::Error) -> bool {
+    // `HEAD~1` in a depth-1 clone: "parent 0 does not exist".
+    err.message().contains("does not exist")
+}
+
+fn shallow_clone_error(base: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the clone is shallow, so the merge base with '{base}' cannot be found; \
+         fetch more history (actions/checkout fetch-depth: 0, or git fetch --unshallow)"
+    )
 }
 
 #[cfg(test)]
@@ -568,5 +603,148 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{:#}", result.err().unwrap());
         assert!(err.contains("nonexistent") || err.contains("not found"));
+        assert!(!err.contains("shallow"), "{err}");
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Origin whose `main` and `feat` tips do not share a commit in a depth-1 clone.
+    fn diverged_origin(root: &Path) -> PathBuf {
+        let origin = root.join("origin");
+        fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        git(&origin, &["config", "user.email", "test@test.com"]);
+        git(&origin, &["config", "user.name", "Test"]);
+        fs::write(origin.join("README"), "a").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "A"]);
+        git(&origin, &["checkout", "-b", "feat"]);
+        fs::write(origin.join("feat.txt"), "c").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "C"]);
+        git(&origin, &["checkout", "main"]);
+        fs::write(origin.join("main.txt"), "b").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "B"]);
+        origin
+    }
+
+    fn shallow_feat_clone(root: &Path, origin: &Path) -> PathBuf {
+        let shallow = root.join("shallow");
+        let url = format!("file://{}", origin.display());
+        let output = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "-b",
+                "feat",
+                &url,
+                shallow.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(
+            &shallow,
+            &[
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                "main:refs/remotes/origin/main",
+            ],
+        );
+        shallow
+    }
+
+    #[test]
+    fn shallow_clone_with_unreachable_base_explains_fetch_depth() {
+        let tmp = TempDir::new().unwrap();
+        let origin = diverged_origin(tmp.path());
+        let shallow = shallow_feat_clone(tmp.path(), &origin);
+
+        let err = AffectedDetector::new(&shallow)
+            .unwrap()
+            .changed_files_between_refs("origin/main", "HEAD")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("shallow"), "{message}");
+        assert!(message.contains("fetch-depth: 0"), "{message}");
+        assert!(message.contains("git fetch --unshallow"), "{message}");
+        assert!(!message.contains("class="), "{message}");
+        assert_eq!(
+            message.matches("the clone is shallow").count(),
+            1,
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn shallow_clone_missing_parent_explains_fetch_depth() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        git(&origin, &["config", "user.email", "test@test.com"]);
+        git(&origin, &["config", "user.name", "Test"]);
+        fs::write(origin.join("README"), "a").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "A"]);
+        fs::write(origin.join("README"), "b").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "B"]);
+
+        let shallow = tmp.path().join("shallow");
+        let url = format!("file://{}", origin.display());
+        let output = Command::new("git")
+            .args(["clone", "--depth", "1", &url, shallow.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let err = AffectedDetector::new(&shallow)
+            .unwrap()
+            .changed_files_between_refs("HEAD~1", "HEAD")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("shallow"), "{message}");
+        assert!(message.contains("fetch-depth: 0"), "{message}");
+        assert!(!message.contains("class="), "{message}");
+    }
+
+    #[test]
+    fn unborn_repository_says_it_has_no_commits() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init"]);
+
+        let err = AffectedDetector::new(tmp.path())
+            .unwrap()
+            .changed_files_between_refs("HEAD", "HEAD")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("no commits yet"), "{message}");
+        assert_eq!(message.matches("no commits yet").count(), 1, "{message}");
+        assert!(!message.contains("class="), "{message}");
+        assert!(!message.contains("not found"), "{message}");
     }
 }
