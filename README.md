@@ -163,7 +163,9 @@ aster test 'services/*'
 ```
 
 Dependencies run by default. Use `--no-deps` to omit them or `--dependents` to
-include reverse dependencies.
+include reverse dependencies. A target that no selected project defines fails;
+pass `--allow-empty` to succeed with every project skipped. Projects that omit
+the target are still skipped when at least one selected project defines it.
 
 Run different targets in one dependency-aware invocation:
 

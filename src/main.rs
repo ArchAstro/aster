@@ -1759,7 +1759,7 @@ fn run() -> Result<()> {
             let run_args = parse_run_args(args.clone());
 
             if run_args.target.is_empty() {
-                return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));
+                return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents] [--allow-empty]"));
             }
 
             validate_lang_filter(&run_args.lang)?;
@@ -1868,8 +1868,16 @@ fn run() -> Result<()> {
                         test_results.is_some() || cli.retry_failed() > 0,
                     )?);
 
+            // A missing target must not enter streaming. That path returns
+            // before the empty-target policy, so `--allow-empty` would be ignored
+            // and a multi-project typo would fail for the wrong reason.
+            let none_define_target = !initial.is_empty()
+                && initial
+                    .iter()
+                    .all(|project| !project.targets.contains_key(&run_args.target));
+
             // Handle streaming execution (single project only, output to terminal)
-            if should_stream {
+            if should_stream && !none_define_target {
                 if initial.len() != 1 {
                     return Err(anyhow::anyhow!(
                         "Streaming mode only supports running on a single project.\n\
@@ -1972,6 +1980,21 @@ fn run() -> Result<()> {
             let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
                 return Err(anyhow::anyhow!("{failed} project(s) failed"));
+            }
+
+            // A typo such as `aster tset --all` used to print "skipped (no
+            // target)" and exit 0, so CI stayed green. Fail when every
+            // selected project skipped the target. An empty selection,
+            // including an empty workspace, stays success. `--allow-empty`
+            // restores the old exit code.
+            if !run_args.allow_empty
+                && !results.is_empty()
+                && results.iter().all(|result| result.skipped)
+            {
+                return Err(anyhow::anyhow!(
+                    "target '{}' is not defined in any selected project",
+                    run_args.target
+                ));
             }
         }
     }

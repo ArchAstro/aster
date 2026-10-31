@@ -89,8 +89,15 @@ aster build //libs/core --dependents
 aster test --all --warnings-as-errors
 ```
 
-Only projects exposing the requested target participate. A target named like a
-built-in command can be invoked through the escape hatch:
+Only projects exposing the requested target participate; the rest are skipped.
+If none of the selected projects define the target, the run fails. Pass
+`--allow-empty` to succeed with every project skipped:
+
+```console
+aster tset --all --allow-empty
+```
+
+A target named like a built-in command can be invoked through the escape hatch:
 
 ```console
 aster target services //tools/example
