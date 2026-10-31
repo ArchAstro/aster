@@ -152,8 +152,12 @@ that `aster` binary the same way.
 Aster requires Rust 1.88 or newer.
 
 ```console
-cargo install --git https://github.com/ArchAstro/aster.git --locked
+cargo install --git https://github.com/ArchAstro/aster.git --locked aster
 ```
+
+The package name is required because the workspace also builds `aster-srv`.
+Pin a tagged release with `--tag vX.Y.Z` (for example `--tag v0.30.1`) before
+the package name.
 
 ### Native Linux packages
 
