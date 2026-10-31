@@ -449,6 +449,13 @@ fn normalize_target_dependencies(
             if outside_sparse_cone(sparse_root, dependency) {
                 continue;
             }
+            // Project `depends_on` is a project address. Discovery checks the
+            // project's `:build` target, but that suffix was not written, so
+            // the error names the project.
+            if source.starts_with("project ") {
+                let project = dependency.split(':').next().unwrap_or(dependency);
+                anyhow::bail!("{source} depends on missing project {project}");
+            }
             anyhow::bail!("{source} depends on missing target {dependency}");
         }
     }
@@ -1148,6 +1155,33 @@ depends_on = ["//missing:build"]
         assert!(error
             .to_string()
             .contains("depends on missing target //missing:build"));
+    }
+
+    #[test]
+    fn project_depends_on_names_the_missing_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("p");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name":"p","scripts":{"build":"echo build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("aster.toml"),
+            "depends_on = [\"//nope\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let error = discover_projects(tmp.path(), &setup_registry())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("project //p depends on missing project //nope"),
+            "{error}"
+        );
+        assert!(!error.contains("//nope:build"), "{error}");
     }
 
     #[test]

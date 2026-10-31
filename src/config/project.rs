@@ -107,12 +107,14 @@ pub struct AliasTargetConfig {
     pub depends_on: Vec<String>,
 }
 
-/// Target configuration - supports simple command string, alias, and rich format
+/// Target configuration - supports simple command string, alias, and rich format.
+///
+/// Deserialized by hand, not as an untagged enum: an untagged failure names the
+/// table header instead of the unknown or mistyped key.
 // Parsed config, not a hot value. `workspace_include` pushed `Rich` over
 // clippy's size threshold; boxing it would touch every match.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum TargetConfig {
     /// Simple format: just a command string
     /// e.g., `lint = "npm run lint"`
@@ -282,6 +284,127 @@ pub enum ReportConfigFormat {
     /// `cargo test` console output saved to a file. Console output can miss
     /// tests, so these results are partial.
     Libtest,
+}
+
+/// Every key a `[targets.*]` table accepts. One struct, rather than trying each
+/// variant, so `deny_unknown_fields` fails inside toml's key deserializer and
+/// the span stays on the key line.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetTable {
+    command: Option<String>,
+    depends_on: Option<Vec<String>>,
+    cache: Option<CacheConfig>,
+    capabilities: Option<Vec<String>>,
+    files_glob: Option<String>,
+    stream: Option<bool>,
+    invalidates_cache: Option<bool>,
+    exclusive_resources: Option<Vec<String>>,
+    selected_by: Option<Vec<String>>,
+    retry_setup: Option<String>,
+    report: Option<ReportConfig>,
+    alias: Option<String>,
+}
+
+impl TargetTable {
+    fn has_rich_key(&self) -> bool {
+        self.command.is_some()
+            || self.capabilities.is_some()
+            || self.files_glob.is_some()
+            || self.stream.is_some()
+            || self.cache.is_some()
+            || self.invalidates_cache.is_some()
+            || self.exclusive_resources.is_some()
+            || self.selected_by.is_some()
+            || self.retry_setup.is_some()
+            || self.report.is_some()
+    }
+
+    fn into_target<E: serde::de::Error>(self) -> Result<TargetConfig, E> {
+        let rich_key = self.has_rich_key();
+        let TargetTable {
+            command,
+            depends_on,
+            cache,
+            capabilities,
+            files_glob,
+            stream,
+            invalidates_cache,
+            exclusive_resources,
+            selected_by,
+            retry_setup,
+            report,
+            alias,
+        } = self;
+        if let Some(alias) = alias {
+            if !rich_key {
+                return Ok(TargetConfig::Alias(AliasTargetConfig {
+                    alias,
+                    depends_on: depends_on.unwrap_or_default(),
+                }));
+            }
+            return Err(E::custom(
+                "unknown field `alias`, expected one of `command`, `depends_on`, `cache`, \
+                 `capabilities`, `files_glob`, `stream`, `invalidates_cache`, \
+                 `exclusive_resources`, `selected_by`, `retry_setup`, `report`",
+            ));
+        }
+        if !rich_key && depends_on.is_some() {
+            return Ok(TargetConfig::Dependencies(DependencyTargetConfig {
+                depends_on: depends_on.unwrap_or_default(),
+            }));
+        }
+        let command = command.ok_or_else(|| E::custom("missing field `command`"))?;
+        Ok(TargetConfig::Rich(RichTargetConfig {
+            command,
+            depends_on: depends_on.unwrap_or_default(),
+            capabilities: capabilities.unwrap_or_default(),
+            files_glob,
+            stream: stream.unwrap_or(false),
+            cache,
+            invalidates_cache: invalidates_cache.unwrap_or(false),
+            exclusive_resources: exclusive_resources.unwrap_or_default(),
+            selected_by: selected_by.unwrap_or_default(),
+            retry_setup,
+            report,
+        }))
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TargetVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TargetVisitor {
+            type Value = TargetConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a command string or a target table")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<TargetConfig, E> {
+                Ok(TargetConfig::Simple(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<TargetConfig, E> {
+                Ok(TargetConfig::Simple(value))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<TargetConfig, A::Error> {
+                let table =
+                    TargetTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                table.into_target()
+            }
+        }
+
+        deserializer.deserialize_any(TargetVisitor)
+    }
 }
 
 impl TargetConfig {
@@ -1260,5 +1383,67 @@ cache = { runtime_commands = ["echo v1"] }
         )
         .unwrap();
         assert!(parse_aster_toml(&unknown).is_err());
+    }
+
+    #[test]
+    fn target_table_errors_name_the_key_and_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(&toml_path, "[targets.test]\ncomand = \"echo hi\"\n").unwrap();
+        let error = format!("{:#}", parse_aster_toml(&toml_path).unwrap_err());
+        assert!(
+            error.contains("unknown field `comand`")
+                && error.contains("expected one of `command`, `depends_on`, `cache`")
+                && error.contains("TOML parse error at line 2")
+                && error.contains("comand = \"echo hi\"")
+                && !error.contains("untagged enum"),
+            "{error}"
+        );
+
+        std::fs::write(&toml_path, "[targets.test]\ncommand = 5\n").unwrap();
+        let error = format!("{:#}", parse_aster_toml(&toml_path).unwrap_err());
+        assert!(
+            error.contains("invalid type")
+                && error.contains("string")
+                && error.contains("TOML parse error at line 2")
+                && error.contains("command = 5")
+                && !error.contains("[targets.test]")
+                && !error.contains("untagged enum"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_dependency_only_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml_path = tmp.path().join("aster.toml");
+        std::fs::write(
+            &toml_path,
+            "[targets.gate]\ndepends_on = [\"//app:build\"]\n",
+        )
+        .unwrap();
+        let config = parse_aster_toml(&toml_path).unwrap();
+        assert!(matches!(
+            config.targets.get("gate"),
+            Some(TargetConfig::Dependencies(_))
+        ));
+
+        std::fs::write(
+            &toml_path,
+            "[targets.test]\ncommand = \"true\"\n[targets.test.report]\nformat = \"junit\"\nfiles = [\"junit.xml\"]\n",
+        )
+        .unwrap();
+        let config = parse_aster_toml(&toml_path).unwrap();
+        let TargetConfig::Rich(rich) = config.targets.get("test").unwrap() else {
+            panic!("report target should stay rich");
+        };
+        assert_eq!(
+            rich.report.as_ref().map(|report| report.format),
+            Some(ReportConfigFormat::Junit)
+        );
+        assert_eq!(
+            rich.report.as_ref().map(|report| report.files.as_slice()),
+            Some(["junit.xml".to_string()].as_slice())
+        );
     }
 }
