@@ -1,11 +1,13 @@
 # Linux package repository operations
 
-Aster publishes the exact Linux artifacts from a tagged GitHub release to three
-distribution channels:
+Aster publishes the exact Linux x86-64 artifacts from a tagged GitHub release
+to two distribution channels:
 
 - a signed APT repository on GitHub Pages;
-- a signed Yum/DNF repository on GitHub Pages;
-- the `aster-bin` package in the Arch User Repository.
+- a signed Yum/DNF repository on GitHub Pages.
+
+Arch Linux installs use the release `.pkg.tar.zst` with `pacman -U`. The
+`aster-bin` AUR package is not published until `AUR_PUBLISH_ENABLED` is set.
 
 The release workflow refuses to rebuild packages during publication. RPM
 packages are signed before their clean-container test and GitHub release. The
@@ -32,14 +34,25 @@ Do not enable publication until Pages is publicly reachable. The repository
 workflow regenerates its indexes from every native package attached to every
 GitHub release, so older installable versions survive each deployment.
 
-## One-time AUR setup
+## AUR (not published)
 
-Create a dedicated SSH key pair for release automation. Add the public key to
-the Arch Linux account that will maintain `aster-bin`, and store the private key
-in the `AUR_SSH_PRIVATE_KEY` repository secret.
+The `aster-bin` package is not published until `AUR_PUBLISH_ENABLED` is set.
+Do not treat the AUR as a live install path. The supported Arch install is the
+package attached to the GitHub release:
 
-Set the `AUR_PUBLISH_ENABLED` repository variable to `true`. The next tagged
-release will create or update `ssh://aur@aur.archlinux.org/aster-bin.git`.
+```console
+sudo pacman -U ./aster-VERSION-1-x86_64.pkg.tar.zst
+```
+
+### One-time AUR setup
+
+Publication stays off until `AUR_PUBLISH_ENABLED` is `true`. To prepare that
+later publish, create a dedicated SSH key pair for release automation. Add the
+public key to the Arch Linux account that will maintain `aster-bin`, and store
+the private key in the `AUR_SSH_PRIVATE_KEY` repository secret.
+
+Set `AUR_PUBLISH_ENABLED` to `true` only when that account is ready. The next
+tagged release will create or update `ssh://aur@aur.archlinux.org/aster-bin.git`.
 The workflow pins the published AUR Ed25519 host key and commits only
 `PKGBUILD`, `.SRCINFO`, and the recipe's 0BSD `LICENSE`.
 
