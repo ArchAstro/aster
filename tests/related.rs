@@ -1498,6 +1498,125 @@ fn python_change_selects_test_files_through_imports() {
     );
 }
 
+/// Files named by a narrowed pytest command, in path order.
+fn pytest_files(plan: &Plan) -> Vec<String> {
+    let address = plan
+        .runs()
+        .into_iter()
+        .find(|address| address.ends_with(":test"))
+        .unwrap_or_else(|| panic!("no test target in {plan:#?}"));
+    let commands = plan.commands(address);
+    assert_eq!(commands.len(), 1, "{plan:#?}");
+    let mut files: Vec<String> = commands[0]
+        .split_whitespace()
+        .skip_while(|arg| *arg != "pytest")
+        .skip(1)
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn python_submodule_import_runs_the_package_init() {
+    // Issue 242. A root project must ignore `.aster`: the first plan writes
+    // `.aster/cache`, and an unignored cache file makes the next plan run in full.
+    let ws = Workspace::new(&[
+        (
+            ".gitignore",
+            ".aster\nnode_modules\ntarget\n__pycache__\n.pytest_cache\n",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"pkg\"\nversion = \"0.1\"\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npythonpath = [\".\"]\n",
+        ),
+        ("pkg/__init__.py", "X = 1\n"),
+        ("pkg/core.py", "def add(a, b):\n    return a + b\n"),
+        (
+            "tests/test_x.py",
+            "import pkg\n\ndef test_x():\n    assert pkg.X == 1\n",
+        ),
+        (
+            "tests/test_core.py",
+            "from pkg.core import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+        ),
+    ]);
+    ws.edit(
+        "pkg/__init__.py",
+        "X = 1\n",
+        "X = 1\nraise RuntimeError(\"boom at import\")\n",
+    );
+    assert_eq!(
+        pytest_files(&ws.plan("test")),
+        ["tests/test_core.py", "tests/test_x.py"]
+    );
+
+    // A core-only edit must not select the test that imports the package alone.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("pkg/core.py", "return a + b", "return b + a");
+    assert_eq!(pytest_files(&ws.plan("test")), ["tests/test_core.py"]);
+
+    // `from .core import add` in a sibling, and `import pkg.core as c`, also
+    // run the package `__init__.py`. `pkg/test_rel.py` reaches that init only
+    // through the relative spec.
+    let ws = Workspace::new(&[
+        (
+            ".gitignore",
+            ".aster\nnode_modules\ntarget\n__pycache__\n.pytest_cache\n",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"pkg\"\nversion = \"0.1\"\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npythonpath = [\".\"]\n",
+        ),
+        ("pkg/__init__.py", "X = 1\n"),
+        ("pkg/core.py", "def add(a, b):\n    return a + b\n"),
+        (
+            "pkg/sibling.py",
+            "from .core import add\n\ndef use(n):\n    return add(n, 1)\n",
+        ),
+        (
+            "pkg/test_rel.py",
+            "from .core import add\n\ndef test_rel():\n    assert add(1, 2) == 3\n",
+        ),
+        (
+            "tests/test_alias.py",
+            "import pkg.core as c\n\ndef test_alias():\n    assert c.add(1, 2) == 3\n",
+        ),
+        (
+            "tests/test_x.py",
+            "import pkg\n\ndef test_x():\n    assert pkg.X == 1\n",
+        ),
+        (
+            "tests/test_sibling.py",
+            "from pkg.sibling import use\n\ndef test_sibling():\n    assert use(1) == 2\n",
+        ),
+    ]);
+    ws.edit(
+        "pkg/__init__.py",
+        "X = 1\n",
+        "X = 1\nraise RuntimeError(\"boom at import\")\n",
+    );
+    assert_eq!(
+        pytest_files(&ws.plan("test")),
+        [
+            "pkg/test_rel.py",
+            "tests/test_alias.py",
+            "tests/test_sibling.py",
+            "tests/test_x.py",
+        ]
+    );
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("pkg/core.py", "return a + b", "return b + a");
+    assert_eq!(
+        pytest_files(&ws.plan("test")),
+        [
+            "pkg/test_rel.py",
+            "tests/test_alias.py",
+            "tests/test_sibling.py",
+        ]
+    );
+}
+
 #[test]
 fn python_renamed_import_in_init_reaches_alias_users() {
     // Issue 243: `from .core import sub as minus` must carry a change to
