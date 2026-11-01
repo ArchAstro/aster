@@ -5443,6 +5443,9 @@ fn aster_output(tmp: &TempDir, args: &[&str]) -> std::process::Output {
 }
 
 fn warning_for(path: &std::path::Path) -> String {
+    // Aster reports the canonical workspace path; on macOS the temp dir under
+    // /var resolves to /private/var.
+    let path = fs::canonicalize(path).unwrap();
     format!(
         "[aster] Warning: skipping {}: no [project].name or [tool.poetry].name",
         path.display()
