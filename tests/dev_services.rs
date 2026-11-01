@@ -2414,3 +2414,305 @@ fn services_logs_rejects_unknown_services_and_missing_logs() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no logs found for service 'api'"));
 }
+
+#[test]
+fn services_list_and_ports_report_a_killed_service_as_exited() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let http = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = http.local_addr().unwrap().port();
+    let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let control_port = control.local_addr().unwrap().port();
+    drop((http, control));
+    write_exit_report_workspace(&root, port, control_port);
+    let guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: root.clone(),
+    };
+
+    let started = guard
+        .command()
+        .args(["--json", "services", "up", "--daemon", "--no-watch"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let ready = condition_met(Duration::from_secs(30), || {
+        service_state(&guard, "api").is_some_and(|state| state["state"] == "running")
+            && service_state(&guard, "web").is_some_and(|state| state["state"] == "running")
+            && service_state(&guard, "worker")
+                .is_some_and(|state| state["state"] == "exited" && state["exit"]["code"] == 3)
+            && root.join("web.pid").is_file()
+            && root.join("api.pid").is_file()
+    });
+    assert!(
+        ready,
+        "services did not publish running/exited state\n{}",
+        list_text(&guard)
+    );
+
+    let web_pid = fs::read_to_string(root.join("web.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    unsafe {
+        libc::kill(web_pid, libc::SIGKILL);
+    }
+
+    let killed = condition_met(Duration::from_secs(20), || {
+        service_state(&guard, "web").is_some_and(|state| {
+            state["state"] == "exited"
+                && state["exit"]["signal"] == 9
+                && state["exit"]["name"] == "SIGKILL"
+        }) && service_state(&guard, "api").is_some_and(|state| state["state"] == "running")
+    });
+    assert!(
+        killed,
+        "killed web service was not reported as exited\n{}",
+        list_text(&guard)
+    );
+
+    let listed = guard.command().args(["services", "list"]).output().unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_text = String::from_utf8(listed.stdout).unwrap();
+    let web_line = listed_text
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("web"))
+        .unwrap_or_else(|| panic!("missing web row:\n{listed_text}"));
+    let api_line = listed_text
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("api"))
+        .unwrap_or_else(|| panic!("missing api row:\n{listed_text}"));
+    let worker_line = listed_text
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("worker"))
+        .unwrap_or_else(|| panic!("missing worker row:\n{listed_text}"));
+    assert!(web_line.contains("exited (signal SIGKILL)"), "{web_line}");
+    assert!(worker_line.contains("exited (code 3)"), "{worker_line}");
+    assert!(api_line.contains("running"), "{api_line}");
+    assert!(!api_line.contains("exited"), "{api_line}");
+
+    let listed_json = json_output(&guard, &["services", "list"]);
+    assert_eq!(listed_json["bundles"][0]["state"], "running");
+    assert_eq!(
+        listed_json["bundles"][0]["services"],
+        serde_json::json!(["api", "web", "worker"])
+    );
+    assert_eq!(listed_json["bundles"][0]["ports"]["http"], port);
+    assert_eq!(
+        listed_json["bundles"][0]["service_state"]["web"]["exit"]["name"],
+        "SIGKILL"
+    );
+    assert_eq!(
+        listed_json["bundles"][0]["service_state"]["worker"]["exit"]["code"],
+        3
+    );
+    assert_eq!(
+        listed_json["bundles"][0]["service_state"]["api"]["state"],
+        "running"
+    );
+    assert!(listed_json["bundles"][0].get("group").is_some());
+    assert!(listed_json["bundles"][0].get("supervisor_pid").is_some());
+
+    let ports_text = String::from_utf8(
+        guard
+            .command()
+            .args(["services", "ports"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let web_ports = ports_text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("web"))
+        .unwrap_or_else(|| panic!("missing web ports row:\n{ports_text}"));
+    let worker_ports = ports_text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("worker"))
+        .unwrap_or_else(|| panic!("missing worker ports row:\n{ports_text}"));
+    let api_ports = ports_text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("api"))
+        .unwrap_or_else(|| panic!("missing api ports row:\n{ports_text}"));
+    assert!(
+        web_ports.contains("active, exited (signal SIGKILL)"),
+        "{web_ports}"
+    );
+    assert!(!web_ports.contains("  active  "), "{web_ports}");
+    assert!(
+        worker_ports.contains("active, exited (code 3)"),
+        "{worker_ports}"
+    );
+    assert!(api_ports.contains("active"), "{api_ports}");
+    assert!(!api_ports.contains("exited"), "{api_ports}");
+
+    let ports_json = json_output(&guard, &["services", "ports"]);
+    let instance = &ports_json["instances"][0];
+    assert_eq!(instance["status"], "active");
+    let web_service = instance["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|service| service["name"] == "web")
+        .unwrap();
+    assert_eq!(web_service["service_state"]["state"], "exited");
+    assert_eq!(web_service["service_state"]["exit"]["signal"], 9);
+    assert_eq!(web_service["port"], port);
+
+    let supervisor_pid = listed_json["bundles"][0]["supervisor_pid"]
+        .as_u64()
+        .unwrap() as u32;
+    let (_token_path, token) = wait_for_control_token(control_port, supervisor_pid);
+    let status = control_request(
+        control_port,
+        &serde_json::json!({"command": "status", "token": token}).to_string(),
+    );
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["services"]["web"], "stopped");
+    assert_eq!(status["services"]["worker"], "stopped");
+    assert_eq!(status["services"]["api"], "running");
+    assert_eq!(status["exits"]["web"]["signal"], 9);
+    assert_eq!(status["exits"]["web"]["name"], "SIGKILL");
+    assert_eq!(status["exits"]["worker"]["code"], 3);
+    assert!(status["exits"].get("api").is_none());
+
+    let web_log = guard
+        .command()
+        .args(["services", "logs", "web"])
+        .output()
+        .unwrap();
+    assert!(web_log.status.success(), "{web_log:?}");
+    let web_log = String::from_utf8_lossy(&web_log.stdout);
+    assert!(
+        web_log.contains("process terminated by signal SIGKILL (9)"),
+        "{web_log}"
+    );
+    assert!(
+        !web_log.contains("process exited with code -1"),
+        "{web_log}"
+    );
+    let worker_log = String::from_utf8(
+        guard
+            .command()
+            .args(["services", "logs", "worker"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        worker_log.contains("process exited with code 3"),
+        "{worker_log}"
+    );
+
+    let api_pid = fs::read_to_string(root.join("api.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    unsafe {
+        libc::kill(api_pid, libc::SIGKILL);
+    }
+    let both_dead = condition_met(Duration::from_secs(20), || {
+        service_state(&guard, "api")
+            .is_some_and(|state| state["state"] == "exited" && state["exit"]["name"] == "SIGKILL")
+            && service_state(&guard, "web").is_some_and(|state| state["state"] == "exited")
+            && service_state(&guard, "worker").is_some_and(|state| state["exit"]["code"] == 3)
+    });
+    assert!(
+        both_dead,
+        "both killed services were not reported exited\n{}",
+        list_text(&guard)
+    );
+
+    for entry in fs::read_dir(&guard.runtime_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.starts_with("service-state-") && name.ends_with(".json") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+    let fallback = json_output(&guard, &["services", "list"]);
+    assert_eq!(fallback["bundles"][0]["state"], "running");
+    assert!(fallback["bundles"][0].get("service_state").is_none());
+    let fallback_text = String::from_utf8(
+        guard
+            .command()
+            .args(["services", "list"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        !fallback_text.contains("exited"),
+        "deleted state file should fall back to bundle state:\n{fallback_text}"
+    );
+    assert!(fallback_text.contains("running"), "{fallback_text}");
+}
+
+fn write_exit_report_workspace(root: &Path, port: u16, control_port: u16) {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            "[dev]\ndaemon = true\ncontrol_port = \"control\"\n\n[dev.ports.http]\ndefault = {port}\n\n[dev.ports.control]\ndefault = {control_port}\n\n[dev.services.web]\ntarget = \"//app:web\"\nport = \"http\"\n\n[dev.services.worker]\ntarget = \"//app:worker\"\n\n[dev.services.api]\ntarget = \"//app:api\"\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.web]\ncommand = \"sh -c 'echo $$ > ../web.pid; exec sleep 120'\"\nstream = true\n\n[targets.worker]\ncommand = \"sh -c 'sleep 1; exit 3'\"\nstream = true\n\n[targets.api]\ncommand = \"sh -c 'echo $$ > ../api.pid; exec sleep 120'\"\nstream = true\n",
+    )
+    .unwrap();
+}
+
+fn json_output(guard: &DaemonCliGuard, args: &[&str]) -> serde_json::Value {
+    let output = guard.command().arg("--json").args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "args: {args:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn list_text(guard: &DaemonCliGuard) -> String {
+    let output = guard.command().args(["services", "list"]).output().unwrap();
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn service_state(guard: &DaemonCliGuard, service: &str) -> Option<serde_json::Value> {
+    let output = guard
+        .command()
+        .args(["--json", "services", "list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    report["bundles"]
+        .get(0)?
+        .get("service_state")?
+        .get(service)
+        .cloned()
+}

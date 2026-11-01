@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -7,8 +7,13 @@ use serde::Serialize;
 
 use crate::config::DevWorkspaceConfig;
 
+use super::daemon::list_workspace_bundles;
 use super::port_allocator::{
     workspace_port_allocations, PortAllocationStatus, WorkspacePortAllocation,
+};
+use super::service_report::{
+    format_service_runtime_label, load_published_service_states, ServiceRuntimeState,
+    ServiceRuntimeStatus,
 };
 
 #[derive(Debug, Serialize)]
@@ -37,6 +42,9 @@ pub struct ServicePort {
     pub name: String,
     pub port_name: Option<String>,
     pub port: Option<u16>,
+    /// Present when the supervisor published a state file for this service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_state: Option<ServiceRuntimeState>,
 }
 
 pub fn workspace_ports_report(
@@ -53,9 +61,16 @@ pub fn workspace_ports_report(
         })?
         .to_string_lossy()
         .into_owned();
+    let published = published_states_by_supervisor(workspace_root);
     let instances = workspace_port_allocations(workspace_root)?
         .into_iter()
-        .map(|allocation| report_instance(allocation, config))
+        .map(|allocation| {
+            let states = published
+                .get(&allocation.supervisor_pid)
+                .cloned()
+                .unwrap_or_default();
+            report_instance(allocation, config, &states)
+        })
         .collect();
     Ok(WorkspacePortsReport {
         workspace,
@@ -63,9 +78,30 @@ pub fn workspace_ports_report(
     })
 }
 
+fn published_states_by_supervisor(
+    workspace_root: &Path,
+) -> HashMap<u32, BTreeMap<String, ServiceRuntimeState>> {
+    // Ports stay useful after the daemon socket is unreachable. A missing
+    // bundle list or state file keeps today's lease status.
+    let Ok(bundles) = list_workspace_bundles(workspace_root) else {
+        return HashMap::new();
+    };
+    let published = load_published_service_states(&bundles);
+    bundles
+        .into_iter()
+        .filter_map(|bundle| {
+            published
+                .get(&bundle.bundle_id)
+                .cloned()
+                .map(|states| (bundle.supervisor_pid, states))
+        })
+        .collect()
+}
+
 fn report_instance(
     allocation: WorkspacePortAllocation,
     config: &DevWorkspaceConfig,
+    service_states: &BTreeMap<String, ServiceRuntimeState>,
 ) -> ServicePortInstance {
     // Older manifests have no service metadata. Preserve compatibility by
     // reconstructing their best available mapping from the current config.
@@ -85,10 +121,12 @@ fn report_instance(
                 .as_ref()
                 .and_then(|port_name| allocation.ports.get(port_name))
                 .copied();
+            let service_state = service_states.get(&name).cloned();
             ServicePort {
                 name,
                 port_name,
                 port,
+                service_state,
             }
         })
         .collect::<Vec<_>>();
@@ -128,10 +166,15 @@ pub fn format_workspace_ports(report: &WorkspacePortsReport) -> String {
                 },
                 port_name.clone(),
                 port.to_string(),
-                match instance.status {
-                    ServicePortStatus::Active => "active".to_string(),
-                    ServicePortStatus::Orphaned => "orphaned".to_string(),
-                },
+                format_lease_status(
+                    instance.status,
+                    &instance
+                        .services
+                        .iter()
+                        .filter(|service| service.port_name.as_deref() == Some(port_name))
+                        .map(|service| service.service_state.as_ref())
+                        .collect::<Vec<_>>(),
+                ),
                 instance.supervisor_pid.to_string(),
             ]);
         }
@@ -144,10 +187,7 @@ pub fn format_workspace_ports(report: &WorkspacePortsReport) -> String {
                 service.name.clone(),
                 "-".to_string(),
                 "-".to_string(),
-                match instance.status {
-                    ServicePortStatus::Active => "active".to_string(),
-                    ServicePortStatus::Orphaned => "orphaned".to_string(),
-                },
+                format_lease_status(instance.status, &[service.service_state.as_ref()]),
                 instance.supervisor_pid.to_string(),
             ]);
         }
@@ -193,4 +233,32 @@ pub fn format_workspace_ports(report: &WorkspacePortsReport) -> String {
         .expect("writing to a String cannot fail");
     }
     output
+}
+
+fn format_lease_status(
+    status: ServicePortStatus,
+    states: &[Option<&ServiceRuntimeState>],
+) -> String {
+    let lease = match status {
+        ServicePortStatus::Active => "active",
+        ServicePortStatus::Orphaned => "orphaned",
+    };
+    let exited = states
+        .iter()
+        .flatten()
+        .filter(|state| state.state == ServiceRuntimeStatus::Exited)
+        .copied()
+        .collect::<Vec<_>>();
+    if exited.is_empty() {
+        return lease.to_string();
+    }
+    if exited.len() == 1 {
+        return format!("{lease}, {}", format_service_runtime_label(exited[0]));
+    }
+    let detail = exited
+        .iter()
+        .map(|state| format_service_runtime_label(state))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{lease}, {detail}")
 }

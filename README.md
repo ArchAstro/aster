@@ -1460,6 +1460,16 @@ reattaches, and `r` restarts the focused service through the supervisor. Use
 `services down [group]` to stop them, or `services daemon stop` for all bundles.
 The explicit `--daemon` flag remains a headless one-shot launch.
 
+`services list` prints one row per service. STATE is the bundle state
+(`starting`, `running`, or `stopping`) unless the supervisor has published
+`service-state-<bundle>.json`. A live service then stays `running`, and a
+crashed service shows `exited (code N)` or `exited (signal SIGKILL)` (an
+unnamed signal renders as `exited (signal N)`). `--json` adds `service_state`
+and does not change existing fields. A missing or unreadable state file keeps
+the bundle state. `services ports` keeps the lease status (`active` or
+`orphaned`) and appends that same exit detail, so a dead service is not shown
+as plain `active`.
+
 Service stdout, stderr, and Aster lifecycle messages are also persisted to
 `.aster/logs/<worktree>/<service>/logs.txt` in the workspace. Each service log
 is capped at 10 MiB; Aster truncates it and continues writing when it reaches
@@ -1485,7 +1495,9 @@ aster --json services ports
 Human output maps primary ports to service names and includes all dependency
 ports. JSON returns a stable `workspace`/`instances` object; each instance has
 its supervisor PID, `active` or `orphaned` status, service mappings, and the
-complete named-port map.
+complete named-port map. When the supervisor has published a service exit,
+human STATUS appends it (for example `active, exited (signal SIGKILL)`) and
+JSON adds `service_state` on that service mapping.
 
 Clear stale or orphaned processes from development ports before starting the
 stack again:
