@@ -39,7 +39,12 @@ A runner behind a program listed in `[affected.related] wrappers` (`mise exec
 go -- bun test`, `scripts/with-rust-toolchain cargo test`) is read through the
 wrapper: Aster plans the report on the command the wrapper runs, then writes
 the wrapper back in front, so the flags land after the runner and the console
-output is unchanged. The same reading applies to `--retry-failed`. A runner
+output is unchanged. A pytest `generated xml file` line or a Jest `Test results
+written to` line that names Aster's report directory is omitted from the log, so
+a cache replay does not keep a path to a deleted directory. Pytest's
+`collected N items` header is left as the runner printed it: Aster does not pass
+`-q`, and `--junitxml` alone does not drop that header. The same reading applies
+to `--retry-failed`. A runner
 behind a program that is not listed records no tests; `aster check` reports
 such a target as `uncaptured-test-results`.
 

@@ -1628,3 +1628,228 @@ fn a_bash_c_runner_target_retries_several_failing_tests() {
         "{tests:?}"
     );
 }
+
+/// Fake pytest and Jest binaries. They print the runner's notice only when
+/// Aster's report flag is present, and write a report to that path.
+const FAKE_PYTEST: &str = r#"#!/bin/sh
+report=""
+for arg in "$@"; do
+  case "$arg" in
+    --junitxml=*) report="${arg#--junitxml=}" ;;
+  esac
+done
+printf '%s\n' '============================= test session starts =============================='
+printf '%s\n' 'collected 9 items'
+printf '%s\n' 'tests/test_app.py .........'
+printf '%s\n' '============================== 9 passed in 0.01s =============================='
+if [ -n "$report" ]; then
+  mkdir -p "$(dirname "$report")"
+  printf '%s\n' '<testsuite name="s"><testcase classname="t" name="adds" time="0.001"/></testsuite>' > "$report"
+  printf '%s\n' "- generated xml file: $report -"
+fi
+"#;
+
+const FAKE_JEST: &str = r#"#!/bin/sh
+report=""
+for arg in "$@"; do
+  case "$arg" in
+    --outputFile=*) report="${arg#--outputFile=}" ;;
+  esac
+done
+printf '%s\n' 'PASS src/app.test.js'
+printf '%s\n' 'Tests:       1 passed, 1 total'
+if [ -n "$report" ]; then
+  mkdir -p "$(dirname "$report")"
+  printf '%s\n' '{"testResults":[{"name":"src/app.test.js","status":"passed","assertionResults":[{"ancestorTitles":[],"title":"adds","status":"passed","failureMessages":[]}]}]}' > "$report"
+  printf '%s\n' "Test results written to: $report"
+fi
+"#;
+
+fn notice_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "py/pyproject.toml",
+        "[project]\nname = \"py\"\nversion = \"0.0.0\"\n\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+    );
+    write(tmp.path(), "py/pytest", FAKE_PYTEST);
+    write(
+        tmp.path(),
+        "py/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\ncache = { runtime = [] }\n\n[targets.test]\ncommand = \"./pytest\"\ncache = { runtime = [] }\n",
+    );
+    write(
+        tmp.path(),
+        "js/package.json",
+        "{\"name\":\"js\",\"scripts\":{\"test\":\"jest\"}}\n",
+    );
+    write(tmp.path(), "js/jest", FAKE_JEST);
+    write(
+        tmp.path(),
+        "js/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\ncache = { runtime = [] }\n\n[targets.test]\ncommand = \"./jest\"\ncache = { runtime = [] }\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    for path in ["py/pytest", "js/jest"] {
+        fs::set_permissions(tmp.path().join(path), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    tmp
+}
+
+fn target_log(root: &Path, address: &str) -> String {
+    let text = fs::read_to_string(root.join(".aster/logs/latest.json")).unwrap();
+    let run: serde_json::Value = serde_json::from_str(&text).unwrap();
+    run["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["address"] == address)
+        .unwrap_or_else(|| panic!("no log for {address} in {text}"))["output"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn assert_no_report_notice(log: &str) {
+    for line in log.lines() {
+        assert!(
+            !line.contains("aster-reports")
+                && !line.contains("Test results written to")
+                && !line.contains("generated xml file"),
+            "{line}"
+        );
+    }
+}
+
+/// `^collected [0-9]+ items`, the pytest header the capture comparison may drop.
+fn drop_collected_header(log: &str) -> String {
+    let mut kept = String::new();
+    for line in log.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let header = body
+            .strip_prefix("collected ")
+            .and_then(|rest| rest.strip_suffix(" items"))
+            .is_some_and(|count| !count.is_empty() && count.chars().all(|c| c.is_ascii_digit()));
+        if !header {
+            kept.push_str(line);
+        }
+    }
+    kept
+}
+
+#[test]
+fn capture_does_not_add_report_notices_to_the_log() {
+    let tmp = notice_workspace();
+    let root = tmp.path();
+
+    let plain = aster(root, &["--no-cache", "test", "//py"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain_py = target_log(root, "//py:test");
+
+    let plain_js = aster(root, &["--no-cache", "test", "//js"]);
+    assert!(
+        plain_js.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain_js.stderr)
+    );
+    let plain_js_log = target_log(root, "//js:test");
+
+    let results = root.join("out/results.ndjson");
+    let captured = aster(
+        root,
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//py",
+        ],
+    );
+    let captured_err = String::from_utf8_lossy(&captured.stderr);
+    assert!(captured.status.success(), "{captured_err}");
+    let captured_py = target_log(root, "//py:test");
+    assert_eq!(
+        drop_collected_header(&captured_py),
+        drop_collected_header(&plain_py)
+    );
+    assert_no_report_notice(&captured_py);
+    assert!(captured_py.contains("collected 9 items"), "{captured_py}");
+    let records = read_records(&results);
+    assert_eq!(
+        confidence_of(&records, "//py:test"),
+        Some(Confidence::Complete)
+    );
+    assert!(
+        tests_of(&records).iter().any(|test| test.0 == "adds"),
+        "{records:?}"
+    );
+
+    let js_results = root.join("out/js.ndjson");
+    let captured_js = aster(
+        root,
+        &[
+            "--no-cache",
+            &format!("--test-results={}", js_results.display()),
+            "test",
+            "//js",
+        ],
+    );
+    let captured_js_err = String::from_utf8_lossy(&captured_js.stderr);
+    assert!(captured_js.status.success(), "{captured_js_err}");
+    let captured_js_log = target_log(root, "//js:test");
+    assert_eq!(captured_js_log, plain_js_log);
+    assert_no_report_notice(&captured_js_log);
+    let js_records = read_records(&js_results);
+    assert_eq!(
+        confidence_of(&js_records, "//js:test"),
+        Some(Confidence::Complete)
+    );
+    assert!(
+        tests_of(&js_records).iter().any(|test| test.0 == "adds"),
+        "{js_records:?}"
+    );
+
+    // A captured run stores the filtered log. The next run replays it.
+    for address in ["//py", "//js"] {
+        let first = aster(
+            root,
+            &[
+                &format!(
+                    "--test-results={}",
+                    root.join("cache-first.ndjson").display()
+                ),
+                "test",
+                address,
+            ],
+        );
+        assert!(
+            first.status.success(),
+            "{address}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let replay = aster(
+            root,
+            &[
+                &format!(
+                    "--test-results={}",
+                    root.join("cache-replay.ndjson").display()
+                ),
+                "test",
+                address,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&replay.stderr);
+        assert!(replay.status.success(), "{address}: {stderr}");
+        assert!(
+            stderr.contains("(cached)"),
+            "{address} was not a cache hit: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&replay.stdout);
+        assert_no_report_notice(&stdout);
+        assert_no_report_notice(&target_log(root, &format!("{address}:test")));
+    }
+}

@@ -190,19 +190,70 @@ pub enum ReportFiles {
 }
 
 /// How to turn a command's console output back into what the user expects
-/// to see, when the reporter replaced it.
+/// to see, when the reporter replaced it or added a notice about a file
+/// Aster injected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputRewrite {
     /// Render `go test -json` events as `go test` text; `verbose` when the
     /// command asked for `-v`.
     GoTestJson { verbose: bool },
+    /// Drop runner notices that name Aster's temporary report directory.
+    /// Other lines, including the same notice about a path the user chose,
+    /// stay.
+    DropReportNotices,
 }
+
+/// Directory name under the temp dir that holds one command's report.
+/// Notices that name it are the runner talking about a file Aster added.
+const REPORT_DIR_MARKER: &str = "aster-reports";
 
 /// Rewrite a command's console output for its log.
 pub fn rewrite_output(rewrite: OutputRewrite, output: &str) -> String {
     match rewrite {
         OutputRewrite::GoTestJson { verbose } => gojson::render(output, verbose),
+        OutputRewrite::DropReportNotices => drop_report_notices(output),
     }
+}
+
+/// Remove pytest and Jest notices that name [`REPORT_DIR_MARKER`].
+///
+/// Pytest's junitxml plugin prints `generated xml file: <path>` via
+/// `write_sep`. Jest prints `Test results written to: <path>` when
+/// `--outputFile` is set. Both name the report Aster injected, which is
+/// deleted after the run, so the log must not keep the path.
+fn drop_report_notices(output: &str) -> String {
+    let mut kept = String::with_capacity(output.len());
+    let mut rest = output;
+    while !rest.is_empty() {
+        let (line, next) = split_line(rest);
+        if !is_aster_report_notice(line) {
+            kept.push_str(line);
+        }
+        rest = next;
+    }
+    kept
+}
+
+fn split_line(text: &str) -> (&str, &str) {
+    match text.find(['\n', '\r']) {
+        None => (text, ""),
+        Some(index) => {
+            let end = if text.as_bytes().get(index) == Some(&b'\r')
+                && text.as_bytes().get(index + 1) == Some(&b'\n')
+            {
+                index + 2
+            } else {
+                index + 1
+            };
+            (&text[..end], &text[end..])
+        }
+    }
+}
+
+fn is_aster_report_notice(line: &str) -> bool {
+    let body = line.trim_end_matches(['\r', '\n']);
+    body.contains(REPORT_DIR_MARKER)
+        && (body.contains("generated xml file:") || body.contains("Test results written to:"))
 }
 
 /// How to capture structured results from one test command.
@@ -215,8 +266,8 @@ pub struct ReportPlan {
     pub files: ReportFiles,
     pub format: ReportFormat,
     pub confidence: Confidence,
-    /// Set when the planned command's console output is the report, so the
-    /// log shows a rendering of it instead.
+    /// How to render the command's console output for the log. `None` keeps
+    /// the output as the runner wrote it.
     pub rewrite: Option<OutputRewrite>,
     /// Test files the report names under this directory are recorded
     /// relative to it (Jest names them by absolute path).
@@ -259,7 +310,7 @@ pub fn new_report_dir() -> Result<PathBuf> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let dir = base.join("aster-reports").join(format!(
+    let dir = base.join(REPORT_DIR_MARKER).join(format!(
         "{}-{nanos}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -531,5 +582,45 @@ mod tests {
             quarantined: Vec::new(),
         };
         assert_eq!(report.failures(), 1);
+    }
+
+    #[test]
+    fn drop_report_notices_keeps_every_other_line() {
+        let output = "\
+collected 9 items\n\
+test_app.py .........\n\
+- generated xml file: /tmp/aster-reports/1-2/pytest.xml -\n\
+- generated xml file: /tmp/user/report.xml -\n\
+PASS src/app.test.js\n\
+Test results written to: /var/folders/aster-reports/9/jest.json\n\
+Test results written to: ./jest-results.json\n\
+a failure mentions aster-reports but is not a notice\n";
+        let rewritten = rewrite_output(OutputRewrite::DropReportNotices, output);
+        assert_eq!(
+            rewritten,
+            "\
+collected 9 items\n\
+test_app.py .........\n\
+- generated xml file: /tmp/user/report.xml -\n\
+PASS src/app.test.js\n\
+Test results written to: ./jest-results.json\n\
+a failure mentions aster-reports but is not a notice\n"
+        );
+        // A notice that is the whole output, including a CRLF line, is removed
+        // without leaving a blank line. A user's notice is kept as written.
+        assert_eq!(
+            rewrite_output(
+                OutputRewrite::DropReportNotices,
+                "keep\r\nTest results written to: /tmp/aster-reports/1/jest.json\r\n",
+            ),
+            "keep\r\n"
+        );
+        assert_eq!(
+            rewrite_output(
+                OutputRewrite::DropReportNotices,
+                "- generated xml file: /home/me/out.xml -",
+            ),
+            "- generated xml file: /home/me/out.xml -"
+        );
     }
 }
