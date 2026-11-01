@@ -1406,6 +1406,48 @@ fn rust_macros_are_found_by_name() {
 }
 
 #[test]
+fn rust_macro_called_inside_assert_eq_reaches_the_integration_test() {
+    let ws = Workspace::new(&[
+        (
+            "c/Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("c/src/lib.rs", "pub mod mac;\npub mod text;\npub mod wrap;\n"),
+        (
+            "c/src/mac.rs",
+            "#[macro_export]\nmacro_rules! dbl { ($x:expr) => { $x * 2 }; }\npub fn uses_macro() -> i32 { dbl!(2) }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t_mac() { assert_eq!(super::uses_macro(), 4); }\n}\n",
+        ),
+        ("c/src/text.rs", "pub fn label() -> i32 { 1 }\n"),
+        (
+            "c/src/wrap.rs",
+            "pub fn through_assert() -> i32 {\n    assert_eq!(crate::dbl!(1), 2);\n    1\n}\n\npub fn through_vec() -> Vec<i32> {\n    vec![crate::dbl!(1)]\n}\n\npub fn through_format() -> String {\n    format!(\"{}\", crate::dbl!(1))\n}\n",
+        ),
+        (
+            "c/tests/macro_use.rs",
+            "#[test]\nfn integ_macro() { assert_eq!(c::dbl!(3), 6); }\n",
+        ),
+        (
+            "c/tests/text_use.rs",
+            "#[test]\nfn integ_text() { assert_eq!(c::text::label(), 1); }\n",
+        ),
+        (
+            "c/tests/wrap_use.rs",
+            "#[test]\nfn calls_wrap() {\n    assert_eq!(c::wrap::through_assert(), 1);\n    let _ = c::wrap::through_vec();\n    let _ = c::wrap::through_format();\n}\n",
+        ),
+    ]);
+    ws.edit("c/src/mac.rs", "$x * 2", "$x * 3");
+    assert_eq!(
+        ws.plan("test").commands("//c:test"),
+        [
+            "cargo test --lib -- --exact mac::tests::t_mac",
+            "cargo test --test macro_use -- --exact integ_macro",
+            "cargo test --test wrap_use -- --exact calls_wrap",
+            "cargo test --doc",
+        ]
+    );
+}
+
+#[test]
 fn rust_manifest_change_runs_in_full() {
     let ws = Workspace::new(RUST);
     ws.edit("shop/Cargo.toml", "0.1.0", "0.2.0");

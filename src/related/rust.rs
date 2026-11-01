@@ -1041,6 +1041,20 @@ impl Walker<'_> {
                     receiver = (path.len() == 1).then(|| path[0].clone());
                     flush(self, &mut path);
                 }
+                // `name!(…)` inside another macro's arguments is still
+                // tokens, not a `macro_invocation`. The `!` otherwise
+                // flushes `c::dbl` as a plain path and the call is lost.
+                "!" if token
+                    .next_sibling()
+                    .is_some_and(|next| next.kind() == "token_tree") =>
+                {
+                    // A bare `!(…)` is not a named call. A path before `!`
+                    // is the macro, not a plain reference.
+                    if let Some(name) = path.pop() {
+                        path.clear();
+                        self.facts.owner(owner).members.insert(format!("{name}!"));
+                    }
+                }
                 "token_tree" => {
                     flush(self, &mut path);
                     self.tokens(token, owner);
@@ -1455,5 +1469,34 @@ pub fn open<T: Clone>(seed: T, raw: &str) -> usize {
             def(&facts, "runs").reflects,
             Some("runs the package's binary")
         );
+    }
+
+    #[test]
+    fn a_macro_call_inside_another_macros_arguments_is_a_member() {
+        let source = r#"#[test]
+fn t() {
+    assert_eq!(c::dbl!(3), 6);
+}
+
+pub fn nested() {
+    assert_eq!(c::dbl!(3), 6);
+    let _ = vec![c::dbl!(1), other::plain];
+    let _ = format!("{}", crate::dbl!(2));
+}
+"#;
+        let facts = extract(Path::new("tests/macro_use.rs"), source);
+        let test = def(&facts, "t");
+        assert!(test.members.contains("assert_eq!"));
+        assert!(test.members.contains("dbl!"));
+        assert!(!test.refs.contains("dbl"));
+
+        let nested = def(&facts, "nested");
+        assert!(nested.members.contains("assert_eq!"));
+        assert!(nested.members.contains("vec!"));
+        assert!(nested.members.contains("format!"));
+        assert!(nested.members.contains("dbl!"));
+        assert!(!nested.refs.contains("dbl"));
+        // A path in the same arguments is still a reference.
+        assert!(nested.refs.contains("plain"));
     }
 }
