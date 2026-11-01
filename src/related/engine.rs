@@ -2750,7 +2750,15 @@ impl<'a, 'b> Run<'a, 'b> {
                 match facts.class_of(line) {
                     LineClass::Inert => {}
                     LineClass::Top => self.mark((file, TOP), changed(&span)),
-                    LineClass::Def(def) => self.mark((file, def), changed(&span)),
+                    // `class_of` keeps one definition. A line can hold two,
+                    // and each of them changed. A comment classified as a
+                    // definition whose span does not contain it stays that
+                    // definition.
+                    LineClass::Def(def) => {
+                        for id in facts.seeded_defs(line, def) {
+                            self.mark((file, id), changed(&span));
+                        }
+                    }
                     LineClass::Import(import) => {
                         self.seed_import(file, &facts.imports[import as usize], changed(&span));
                     }
@@ -2778,23 +2786,28 @@ impl<'a, 'b> Run<'a, 'b> {
                         self.seed_import(file, &old.imports[import as usize], changed(&None));
                     }
                     LineClass::Def(def) => {
-                        let removed = &old.defs[def as usize];
-                        let mut survives = false;
-                        for (d, current) in facts.defs.iter().enumerate() {
-                            // Two types may each have a method of the name.
-                            if current.name == removed.name && current.owner == removed.owner {
-                                survives = true;
-                                self.mark((file, d as u32), changed(&None));
+                        // The sibling `class_of` dropped is gone with this
+                        // line too. A comment classified as a definition
+                        // outside that span is still that definition.
+                        for id in old.seeded_defs(line, def) {
+                            let removed = &old.defs[id as usize];
+                            let mut survives = false;
+                            for (d, current) in facts.defs.iter().enumerate() {
+                                // Two types may each have a method of the name.
+                                if current.name == removed.name && current.owner == removed.owner {
+                                    survives = true;
+                                    self.mark((file, d as u32), changed(&None));
+                                }
                             }
-                        }
-                        if !survives {
-                            // The definition is gone; whoever still names
-                            // it is affected.
-                            let member = (removed.kind == DefKind::Method)
-                                .then_some(removed.owner.as_deref());
-                            self.symbol(source.unit, &removed.name, member, NO_DEF, file);
-                            if removed.callback || removed.kind == DefKind::Macro {
-                                self.users(source.unit, NO_DEF);
+                            if !survives {
+                                // The definition is gone; whoever still names
+                                // it is affected.
+                                let member = (removed.kind == DefKind::Method)
+                                    .then_some(removed.owner.as_deref());
+                                self.symbol(source.unit, &removed.name, member, NO_DEF, file);
+                                if removed.callback || removed.kind == DefKind::Macro {
+                                    self.users(source.unit, NO_DEF);
+                                }
                             }
                         }
                     }

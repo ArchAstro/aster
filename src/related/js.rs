@@ -926,6 +926,35 @@ export class Cart extends Base {
     }
 
     #[test]
+    fn two_exports_on_one_line_are_both_leaves() {
+        let source = "export const a = () => 1; export const b = () => 2\n";
+        let facts = extract(Path::new("src/m.js"), source);
+        assert_eq!(
+            facts
+                .defs
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(facts.defs[0].lines, (1, 1));
+        assert_eq!(facts.defs[1].lines, (1, 1));
+        // `class_of` still names one definition; both leaves share the line.
+        assert!(matches!(facts.class_of(1), LineClass::Def(0)));
+        assert_eq!(facts.defs_on_line(1), vec![0, 1]);
+
+        // A method is a definition nested in its class. The method's line
+        // belongs to the method, not the class around it.
+        let nested = "export class Cart {\n  add(item) { return item; }\n}\n";
+        let facts = extract(Path::new("src/m.js"), nested);
+        let add = facts.defs.iter().position(|d| d.name == "add").unwrap();
+        let cart = facts.defs.iter().position(|d| d.name == "Cart").unwrap();
+        let line = facts.defs[add].lines.0;
+        assert!(facts.defs[cart].lines.0 < line && line < facts.defs[cart].lines.1);
+        assert_eq!(facts.defs_on_line(line), vec![add as u32]);
+    }
+
+    #[test]
     fn extracts_tests_and_mocks() {
         let source = r#"import { total } from "../src/cart";
 vi.mock("../src/stock");

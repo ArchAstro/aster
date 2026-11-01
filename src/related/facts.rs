@@ -388,6 +388,50 @@ impl FileFacts {
             .copied()
             .unwrap_or(LineClass::Inert)
     }
+
+    /// Leaf definitions whose span contains 1-based `line`.
+    ///
+    /// A leaf contains no other definition that also contains the line.
+    /// Two definitions on one line share a span, so both are leaves;
+    /// [`Self::class_of`] keeps only the first. A nested definition is the
+    /// only leaf of the lines inside it.
+    pub fn defs_on_line(&self, line: usize) -> Vec<u32> {
+        let hits: Vec<usize> = self
+            .defs
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| def.lines.0 <= line && line <= def.lines.1)
+            .map(|(index, _)| index)
+            .collect();
+        hits.iter()
+            .copied()
+            .filter(|&index| {
+                let span = self.defs[index].lines;
+                !hits.iter().any(|&other| {
+                    let inner = self.defs[other].lines;
+                    other != index && span.0 <= inner.0 && inner.1 <= span.1 && span != inner
+                })
+            })
+            .map(|index| index as u32)
+            .collect()
+    }
+
+    /// Definitions a change to `line` seeds.
+    ///
+    /// `classified` is what [`Self::class_of`] named. When that definition
+    /// is a leaf on the line, every leaf is seeded: two definitions can
+    /// share the line and `class_of` keeps one. An annotation comment is
+    /// classified as the definition it speaks for even when that span does
+    /// not contain the comment; seed that definition alone, not whatever
+    /// outer span happens to contain the comment.
+    pub fn seeded_defs(&self, line: usize, classified: u32) -> Vec<u32> {
+        let on_line = self.defs_on_line(line);
+        if on_line.contains(&classified) {
+            on_line
+        } else {
+            vec![classified]
+        }
+    }
 }
 
 /// Stands for an interpolated part of a path literal.
@@ -510,5 +554,29 @@ mod static_str {
         let leaked: &'static str = Box::leak(text.into_boxed_str());
         set.insert(leaked);
         Ok(Some(leaked))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Def, DefKind, Family, FileFacts};
+
+    #[test]
+    fn defs_on_line_keeps_only_the_innermost() {
+        let mut facts = FileFacts::new(Family::Js);
+        facts.push(Def::new("outer", DefKind::Function, (1, 5)));
+        facts.push(Def::new("inner", DefKind::Function, (3, 3)));
+        facts.push(Def::new("beside", DefKind::Function, (3, 3)));
+        // The outer span contains both one-line definitions. Those two
+        // share a span, so neither contains the other.
+        assert_eq!(facts.defs_on_line(3), vec![1, 2]);
+        assert_eq!(facts.defs_on_line(2), vec![0]);
+        assert!(facts.defs_on_line(6).is_empty());
+        // The classified leaf stands for every sibling on the line.
+        assert_eq!(facts.seeded_defs(3, 1), vec![1, 2]);
+        // A comment classified as `inner` but sitting on a line only the
+        // outer span contains stays `inner`.
+        assert_eq!(facts.seeded_defs(2, 1), vec![1]);
+        assert_eq!(facts.seeded_defs(6, 1), vec![1]);
     }
 }

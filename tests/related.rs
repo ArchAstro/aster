@@ -2557,3 +2557,97 @@ fn adding_or_removing_an_annotation_selects_the_test_it_belongs_to() {
         ["mix test test/shop/writer_test.exs"]
     );
 }
+
+/// A comment before a definition is classified as that definition even
+/// though the definition's span starts on the next line.
+#[test]
+fn an_annotation_comment_before_a_definition_selects_that_definition() {
+    let ws = Workspace::new(&[
+        (
+            "shop/mix.exs",
+            "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+        ),
+        (
+            "shop/test/shop/writer_test.exs",
+            "defmodule Shop.WriterTest do\n  use ExUnit.Case\n\n  # aster: reads shop/priv/prices.json\n  test \"writes\" do\n    File.write!(\"priv/prices.json\", \"{}\")\n  end\nend\n",
+        ),
+        (
+            "shop/test/shop/other_test.exs",
+            "defmodule Shop.OtherTest do\n  use ExUnit.Case\n\n  test \"other\" do\n    assert true\n  end\nend\n",
+        ),
+    ]);
+    ws.edit(
+        "shop/test/shop/writer_test.exs",
+        "# aster: reads shop/priv/prices.json",
+        "# aster: reads shop/priv/*.json",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/writer_test.exs"]
+    );
+}
+
+/// Issue: two exports on one line. Changing `b` must select `b`'s test.
+#[test]
+fn two_definitions_on_one_line_are_both_changed() {
+    let ws = Workspace::new(&[
+        (
+            "pkg/package.json",
+            r#"{"name":"pkg","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "pkg/src/m.js",
+            "export const a = () => 1; export const b = () => 2\n",
+        ),
+        (
+            "pkg/test/a.test.js",
+            "import { a } from \"../src/m\";\nit(\"a\", () => { expect(a()).toBe(1); });\n",
+        ),
+        (
+            "pkg/test/b.test.js",
+            "import { b } from \"../src/m\";\nit(\"b\", () => { expect(b()).toBe(2); });\n",
+        ),
+    ]);
+    ws.edit("pkg/src/m.js", "() => 2", "() => 3");
+    let plan = ws.plan("test");
+    let commands = plan.commands("//pkg:test");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert!(
+        commands[0].starts_with("npm test") && commands[0].contains("test/b.test.js"),
+        "b's test missing from {commands:?}"
+    );
+}
+
+#[test]
+fn removing_the_second_definition_on_a_shared_line_reaches_its_tests() {
+    let ws = Workspace::new(&[
+        (
+            "pkg/package.json",
+            r#"{"name":"pkg","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "pkg/src/m.js",
+            "export const a = () => 1; export const b = () => 2\n",
+        ),
+        (
+            "pkg/test/a.test.js",
+            "import { a } from \"../src/m\";\nit(\"a\", () => { expect(a()).toBe(1); });\n",
+        ),
+        (
+            "pkg/test/b.test.js",
+            "import { b } from \"../src/m\";\nit(\"b\", () => { expect(b()).toBe(2); });\n",
+        ),
+    ]);
+    ws.edit(
+        "pkg/src/m.js",
+        "export const a = () => 1; export const b = () => 2",
+        "export const a = () => 1;",
+    );
+    let plan = ws.plan("test");
+    let commands = plan.commands("//pkg:test");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert!(
+        commands[0].starts_with("npm test") && commands[0].contains("test/b.test.js"),
+        "b's test missing from {commands:?}"
+    );
+}
