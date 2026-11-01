@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::executor::ExecutionResult;
@@ -55,8 +55,8 @@ pub struct ProjectInfo {
     /// Build system used by the project, when distinct from its language
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_system: Option<String>,
-    /// Available targets and their commands
-    pub targets: HashMap<String, String>,
+    /// Available targets and their commands, sorted by target name.
+    pub targets: BTreeMap<String, String>,
 }
 
 /// Graph output for JSON (graph command)
@@ -64,17 +64,18 @@ pub struct ProjectInfo {
 pub struct GraphOutput {
     /// All target addresses in the graph
     pub nodes: Vec<String>,
-    /// Adjacency list: target -> dependencies
-    pub edges: HashMap<String, Vec<String>>,
+    /// Adjacency list: target -> dependencies. Keys and each dependency
+    /// list are sorted so the JSON bytes are stable.
+    pub edges: BTreeMap<String, Vec<String>>,
     /// Target -> workspace-relative globs it reads outside its project
     /// (`[targets.<name>.cache] workspace_include`). These are file-level
     /// dependencies the edges cannot show; a sparse checkout needs them.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub workspace_inputs: HashMap<String, Vec<String>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_inputs: BTreeMap<String, Vec<String>>,
     /// Target -> targets whose runs it joins (`selected_by`). Not edges:
     /// they order nothing and select nothing in the other direction.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub selected_by: HashMap<String, Vec<String>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub selected_by: BTreeMap<String, Vec<String>>,
 }
 
 /// Why command output for JSON
@@ -388,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_project_info_serialization() {
-        let mut targets = HashMap::new();
+        let mut targets = BTreeMap::new();
         targets.insert("test".to_string(), "npm test".to_string());
 
         let info = ProjectInfo {
@@ -407,14 +408,14 @@ mod tests {
 
     #[test]
     fn test_graph_output_serialization() {
-        let mut edges = HashMap::new();
+        let mut edges = BTreeMap::new();
         edges.insert("//a:test".to_string(), vec!["//a:deps".to_string()]);
 
         let output = GraphOutput {
             nodes: vec!["//a:test".to_string(), "//a:deps".to_string()],
             edges,
-            workspace_inputs: HashMap::new(),
-            selected_by: HashMap::new(),
+            workspace_inputs: BTreeMap::new(),
+            selected_by: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&output).unwrap();

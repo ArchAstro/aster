@@ -5054,3 +5054,260 @@ fn init_ignores_aster_state_and_clean_tree_has_no_affected() {
         "node_modules/\n.aster\n"
     );
 }
+
+/// `list --json` and `graph --json` bytes do not depend on hash or directory
+/// order, and a closed stdout ends `build` without a Rust panic.
+#[cfg(unix)]
+#[test]
+fn json_list_and_graph_are_byte_stable_and_closed_pipe_is_quiet() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    // Created out of address order so a stable sort is observable.
+    for name in ["zeta", "alpha", "mid", "beta", "gamma"] {
+        write_package_json(
+            &tmp,
+            &format!("{name}/package.json"),
+            &format!(
+                r#"{{"name":"{name}","scripts":{{"build":"echo build-{name}","test":"echo test-{name}"}}}}"#
+            ),
+        );
+        write_aster_toml(
+            &tmp,
+            &format!("{name}/aster.toml"),
+            r#"
+[targets.deps]
+command = "python3 -c 'open(\"deps-out.txt\",\"w\").write(\"ok\"); print(\"start\"); print(\"x\"*1000000)'"
+cache = { enabled = true, outputs = ["deps-out.txt"] }
+
+[targets.build]
+command = "python3 -c 'open(\"build-out.txt\",\"w\").write(\"ok\"); print(\"build\")'"
+cache = { enabled = true, outputs = ["build-out.txt"] }
+"#,
+        );
+    }
+    write_aster_toml(
+        &tmp,
+        "zeta/aster.toml",
+        r#"
+[targets.deps]
+command = "python3 -c 'open(\"deps-out.txt\",\"w\").write(\"ok\"); print(\"start\"); print(\"x\"*1000000)'"
+cache = { enabled = true, outputs = ["deps-out.txt"] }
+
+[targets.build]
+command = "python3 -c 'open(\"build-out.txt\",\"w\").write(\"ok\"); print(\"build\")'"
+cache = { enabled = true, outputs = ["build-out.txt"] }
+
+[targets.disposition]
+command = "cat /proc/self/status"
+cache = { enabled = false }
+"#,
+    );
+
+    let aster = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command.current_dir(tmp.path());
+        command
+    };
+
+    let mut list_runs = Vec::new();
+    let mut graph_runs = Vec::new();
+    for _ in 0..10 {
+        let list = aster().args(["list", "--json"]).output().unwrap();
+        assert!(
+            list.status.success(),
+            "list failed: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        list_runs.push(list.stdout);
+        let graph = aster().args(["graph", "--json"]).output().unwrap();
+        assert!(
+            graph.status.success(),
+            "graph failed: {}",
+            String::from_utf8_lossy(&graph.stderr)
+        );
+        graph_runs.push(graph.stdout);
+    }
+    for run in &list_runs[1..] {
+        assert_eq!(run, &list_runs[0], "list --json bytes changed between runs");
+    }
+    for run in &graph_runs[1..] {
+        assert_eq!(
+            run, &graph_runs[0],
+            "graph --json bytes changed between runs"
+        );
+    }
+
+    let projects: serde_json::Value = serde_json::from_slice(&list_runs[0]).unwrap();
+    let projects = projects.as_array().expect("list --json is an array");
+    assert!(
+        projects.len() >= 4,
+        "expected at least four projects, got {}",
+        projects.len()
+    );
+    let addresses: Vec<&str> = projects
+        .iter()
+        .map(|project| project["address"].as_str().unwrap())
+        .collect();
+    let mut sorted_addresses = addresses.clone();
+    sorted_addresses.sort();
+    assert_eq!(
+        addresses, sorted_addresses,
+        "projects are not sorted by address"
+    );
+    assert_eq!(
+        addresses,
+        vec!["//alpha", "//beta", "//gamma", "//mid", "//zeta"]
+    );
+    for project in projects {
+        let targets = project["targets"].as_object().expect("targets object");
+        let keys: Vec<&String> = targets.keys().collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys, "target keys are not sorted: {keys:?}");
+        assert!(
+            keys.iter().any(|key| key.as_str() == "build")
+                && keys.iter().any(|key| key.as_str() == "test"),
+            "expected build and test targets: {keys:?}"
+        );
+    }
+
+    let human = aster().args(["list"]).output().unwrap();
+    assert!(human.status.success(), "{human:?}");
+    let human_again = aster().args(["list"]).output().unwrap();
+    assert_eq!(
+        human.stdout, human_again.stdout,
+        "human list output changed between runs"
+    );
+    let human_graph = aster().args(["graph"]).output().unwrap();
+    assert!(human_graph.status.success(), "{human_graph:?}");
+    let human_graph_again = aster().args(["graph"]).output().unwrap();
+    assert_eq!(human_graph.stdout, human_graph_again.stdout);
+
+    let graph: serde_json::Value = serde_json::from_slice(&graph_runs[0]).unwrap();
+    let nodes = graph["nodes"].as_array().expect("nodes");
+    let node_names: Vec<&str> = nodes.iter().map(|node| node.as_str().unwrap()).collect();
+    let mut sorted_nodes = node_names.clone();
+    sorted_nodes.sort();
+    assert_eq!(node_names, sorted_nodes, "graph nodes are not sorted");
+    assert!(node_names.len() >= 4, "expected several graph nodes");
+    let edges = graph["edges"].as_object().expect("edges");
+    let edge_keys: Vec<&String> = edges.keys().collect();
+    let mut sorted_edge_keys = edge_keys.clone();
+    sorted_edge_keys.sort();
+    assert_eq!(edge_keys, sorted_edge_keys, "edge keys are not sorted");
+    for (address, dependencies) in edges {
+        let dependencies = dependencies.as_array().expect("edge list");
+        let names: Vec<&str> = dependencies
+            .iter()
+            .map(|dependency| dependency.as_str().unwrap())
+            .collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(
+            names, sorted_names,
+            "edge list for {address} is not sorted: {names:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let disposition = aster()
+            .args([
+                "run",
+                "//zeta:disposition",
+                "--no-deps",
+                "--json",
+                "--no-cache",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            disposition.status.success(),
+            "disposition probe failed: {}",
+            String::from_utf8_lossy(&disposition.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&disposition.stdout).unwrap();
+        let status = parsed["results"][0]["output"]
+            .as_str()
+            .expect("child status output");
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap_or_else(|| panic!("missing {name} in {status}"))
+                .trim()
+                .to_string()
+        };
+        let bit_set = |mask: &str| {
+            let value = u64::from_str_radix(mask, 16).unwrap();
+            // SIGPIPE is signal 13, bit 12 of the kernel mask.
+            value & (1 << 12) != 0
+        };
+        assert!(
+            !bit_set(&field("SigIgn:")) && !bit_set(&field("SigCgt:")),
+            "spawned target did not keep the default SIGPIPE disposition:\n{status}"
+        );
+    }
+
+    // Cache is explicit so the second `build --all` replays the stored log
+    // on stdout. That log is larger than a pipe buffer, so closing after the
+    // first line interrupts the write. A summary-only write finishes before
+    // the reader can close the pipe.
+    let warm = aster().args(["build", "--all"]).output().unwrap();
+    assert!(
+        warm.status.success(),
+        "warm build failed: {}\n{}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr)
+    );
+
+    let mut child = aster()
+        .args(["build", "--all"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let read = reader.read_line(&mut line);
+        drop(reader);
+        let _ = sender.send((read, line));
+    });
+    let (read, line) = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("aster build produced no stdout line before the pipe was closed");
+    assert!(
+        read.unwrap() > 0,
+        "closed the pipe before any stdout line: {line:?}"
+    );
+    let status = child.wait().unwrap();
+    let stderr = String::from_utf8_lossy(&stderr_thread.join().unwrap()).into_owned();
+    assert!(
+        !stderr.contains("panicked"),
+        "closed pipe panicked: status={status:?} stderr={stderr}"
+    );
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "closed pipe exited with a Rust panic code: {stderr}"
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGPIPE),
+        "closed pipe should die on SIGPIPE, got {status:?}; stderr={stderr}"
+    );
+}

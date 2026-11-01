@@ -341,6 +341,11 @@ pub fn discover_projects(
         }
     }
 
+    // Directory reads are not ordered. Sort after name-collision handling,
+    // which keys by name and does not depend on walk order, so list/graph
+    // output is byte-stable for an identical tree.
+    projects.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
     Ok(projects)
 }
 

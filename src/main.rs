@@ -38,7 +38,7 @@ use aster::git::{
 use aster::graph::{build_graph, build_target_graph, find_cycle, format_path};
 use aster::plugins::PluginRegistry;
 use aster::test_results::detect_run;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Number of characters to show when displaying truncated cache hashes
@@ -70,6 +70,16 @@ fn main() -> ExitCode {
             }
         };
     }
+    // Rust ignores SIGPIPE so a closed stdout becomes a panic. Restore the
+    // default so `aster build | head` ends quietly, like other CLIs. Spawned
+    // children reset SIGPIPE themselves; this changes only this process.
+    #[cfg(unix)]
+    // SAFETY: `signal` takes a signal number and a disposition, not a pointer
+    // we dereference. SIG_DFL is the process-wide Unix default.
+    unsafe {
+        let _ = libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     install_signal_handler();
     let result = run();
     if let Some(signal) = shutdown_signal() {
@@ -451,10 +461,10 @@ fn run() -> Result<()> {
 
             if output_mode == OutputMode::Json {
                 // JSON output: array of ProjectInfo
-                let project_infos: Vec<ProjectInfo> = filtered_projects
+                let mut project_infos: Vec<ProjectInfo> = filtered_projects
                     .iter()
                     .map(|p| {
-                        let targets: HashMap<String, String> = p
+                        let targets: BTreeMap<String, String> = p
                             .targets
                             .iter()
                             .map(|(k, v)| (k.clone(), v.command.clone()))
@@ -469,6 +479,7 @@ fn run() -> Result<()> {
                         }
                     })
                     .collect();
+                project_infos.sort_by(|left, right| left.address.cmp(&right.address));
                 output_json(&project_infos)?;
             } else if output_mode != OutputMode::Quiet {
                 // Normal or Verbose: text output with colors
@@ -548,15 +559,16 @@ fn run() -> Result<()> {
             }
 
             if output_mode == OutputMode::Json {
-                // JSON output: nodes and edges
-                let (nodes, edges) = if let Some(ref addr) = target {
+                // JSON output: nodes and edges. Sort nodes and each edge list
+                // so identical trees emit identical bytes.
+                let (mut nodes, mut edges) = if let Some(ref addr) = target {
                     // Specific target: show its subgraph (target + dependencies)
                     if graph.get(addr).is_none() {
                         return Err(anyhow::anyhow!("Target not found: {addr}"));
                     }
 
                     let mut nodes = vec![addr.clone()];
-                    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+                    let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
                     let deps = graph.dependencies(addr);
                     let dep_addrs: Vec<String> = deps.iter().map(|d| d.address.clone()).collect();
@@ -572,7 +584,7 @@ fn run() -> Result<()> {
                 } else {
                     // Full graph
                     let nodes: Vec<String> = graph.targets().map(|t| t.address.clone()).collect();
-                    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+                    let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
                     for node in graph.targets() {
                         let deps = graph.dependencies(&node.address);
@@ -583,9 +595,17 @@ fn run() -> Result<()> {
 
                     (nodes, edges)
                 };
+                nodes.sort();
+                for dependencies in edges.values_mut() {
+                    dependencies.sort();
+                }
 
-                let workspace_inputs = aster::graph::workspace_inputs(&projects, &nodes);
-                let selected_by = aster::graph::selected_by(&projects, &nodes);
+                let workspace_inputs = aster::graph::workspace_inputs(&projects, &nodes)
+                    .into_iter()
+                    .collect();
+                let selected_by = aster::graph::selected_by(&projects, &nodes)
+                    .into_iter()
+                    .collect();
                 let output = GraphOutput {
                     nodes,
                     edges,
