@@ -183,6 +183,9 @@ struct Index<'a> {
     projects: &'a [DiscoveredProject],
     sources: Vec<Source>,
     by_path: HashMap<PathBuf, u32>,
+    /// Library roots (`src/lib.rs`, or `[lib] path`) and the package
+    /// directories that compile them. A change runs those packages in full.
+    lib_roots: HashMap<PathBuf, Vec<PathBuf>>,
     /// Files of each unit: one file, or every Go file of a directory.
     unit_files: Vec<Vec<u32>>,
     /// Definitions that use each unit.
@@ -1346,6 +1349,7 @@ impl<'a> Index<'a> {
             }
         }
 
+        let lib_roots = resolvers.rust.lib_roots();
         Index {
             projects,
             consumes: consumers::load(projects),
@@ -1354,6 +1358,7 @@ impl<'a> Index<'a> {
             dependents,
             sources,
             by_path,
+            lib_roots,
             unit_files,
             users,
             unit_uses,
@@ -1611,6 +1616,23 @@ impl<'a> Index<'a> {
                     let reason = format!("{} changed", change.path.display());
                     set_full(&mut outcomes, p, true, reason);
                     continue;
+                }
+            }
+            // The library root may live outside the package (`[lib] path`),
+            // so the project that compiles it is not always `owner`. Mark
+            // those packages full, then still seed: a crate that only names
+            // the change in source, with no path edge, keeps the tests that
+            // reach it. `full` is not cleared by seeding.
+            if let Some(packages) = self.lib_roots.get(&change.path) {
+                let reason = format!("{} is the library root", change.path.display());
+                for (i, candidate) in self.projects.iter().enumerate() {
+                    if candidate.plugin_name == "rust"
+                        && packages.contains(&candidate.relative_path)
+                    {
+                        outcomes[i].changed = true;
+                        outcomes[i].product = true;
+                        set_full(&mut outcomes, i, true, reason.clone());
+                    }
                 }
             }
             let indexed = self.by_path.get(&change.path).copied();

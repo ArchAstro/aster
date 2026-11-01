@@ -1416,6 +1416,202 @@ fn rust_manifest_change_runs_in_full() {
         .contains("shop/Cargo.toml changed; running in full"));
 }
 
+/// Issue repro: editing the library root must run the original `cargo test`,
+/// not a narrowed plan that skips tests the edit made uncompilable.
+///
+/// Comment-only edits do not short-circuit before triggers. Inert lines are
+/// skipped only while seeding, and a library root is classified as a trigger
+/// before that. A comment-only library-root edit therefore runs the original
+/// command, matching the README.
+#[test]
+fn rust_library_root_change_runs_the_original_command() {
+    let ws = Workspace::new(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"c\", \"app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "c/Cargo.toml",
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "c/src/lib.rs",
+            "// crate root\npub mod mac;\npub mod text;\n",
+        ),
+        ("c/src/mac.rs", "pub fn from_macro() -> u32 {\n    1\n}\n"),
+        ("c/src/text.rs", "pub fn from_text() -> u32 {\n    2\n}\n"),
+        (
+            "c/tests/macro_use.rs",
+            "use c::mac;\n\n#[test]\nfn integ_macro() {\n    assert_eq!(mac::from_macro(), 1);\n}\n",
+        ),
+        (
+            "c/tests/text_use.rs",
+            "use c::text;\n\n#[test]\nfn integ_text() {\n    assert_eq!(text::from_text(), 2);\n}\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nc = { path = \"../c\" }\n",
+        ),
+        (
+            "app/src/lib.rs",
+            "pub fn uses_c() -> u32 {\n    c::text::from_text()\n}\n",
+        ),
+        (
+            "app/tests/uses.rs",
+            "#[test]\nfn uses_the_crate() {\n    assert_eq!(app::uses_c(), 2);\n}\n",
+        ),
+    ]);
+
+    ws.edit("c/src/lib.rs", "pub mod text;", "mod text;");
+    let plan = ws.plan("test");
+    assert!(
+        plan.commands("//c:test").is_empty(),
+        "library root was narrowed: {plan:#?}"
+    );
+    let notes = plan.notes("//c:test");
+    assert!(
+        notes.contains("src/lib.rs is the library root; running in full"),
+        "{notes}"
+    );
+    assert!(
+        plan.commands("//app:test").is_empty(),
+        "dependent was narrowed: {plan:#?}"
+    );
+    let app_notes = plan.notes("//app:test");
+    assert!(
+        app_notes.contains("running in full"),
+        "dependent was not planned in full: {app_notes}"
+    );
+
+    // A sibling module is not the library root.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("c/src/mac.rs", "1", "3");
+    let plan = ws.plan("test");
+    let commands = plan.commands("//c:test");
+    assert!(
+        commands.iter().any(|command| command.contains("macro_use"))
+            && commands.iter().all(|command| !command.contains("text_use")),
+        "mac.rs was not narrowed: {plan:#?}"
+    );
+    assert!(
+        !plan.notes("//c:test").contains("is the library root"),
+        "{plan:#?}"
+    );
+
+    // Comment-only: still the library root, so the original command runs.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("c/src/lib.rs", "// crate root", "// library root");
+    let plan = ws.plan("test");
+    assert!(
+        plan.commands("//c:test").is_empty(),
+        "comment-only library root was narrowed: {plan:#?}"
+    );
+    assert!(
+        plan.notes("//c:test")
+            .contains("src/lib.rs is the library root; running in full"),
+        "{}",
+        plan.notes("//c:test")
+    );
+
+    // `[lib] path` names the root, not the conventional src/lib.rs.
+    let custom = Workspace::new(&[
+        (
+            "rooted/Cargo.toml",
+            "[package]\nname = \"rooted\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"shared/lib.rs\"\n",
+        ),
+        ("rooted/shared/lib.rs", "pub fn value() -> u32 {\n    1\n}\n"),
+        (
+            "rooted/tests/uses.rs",
+            "#[test]\nfn uses_it() {\n    assert_eq!(rooted::value(), 1);\n}\n",
+        ),
+    ]);
+    custom.edit("rooted/shared/lib.rs", "1", "2");
+    let plan = custom.plan("test");
+    assert!(
+        plan.commands("//rooted:test").is_empty(),
+        "custom library root was narrowed: {plan:#?}"
+    );
+    assert!(
+        plan.notes("//rooted:test")
+            .contains("shared/lib.rs is the library root; running in full"),
+        "{}",
+        plan.notes("//rooted:test")
+    );
+
+    // The root can sit outside the package. The crate that compiles it runs
+    // in full even though no project directory contains the file.
+    let external = Workspace::new(&[
+        (
+            "member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"../shared/lib.rs\"\n",
+        ),
+        ("shared/lib.rs", "pub fn value() -> u32 {\n    1\n}\n"),
+        (
+            "member/tests/uses.rs",
+            "#[test]\nfn uses_it() {\n    assert_eq!(member::value(), 1);\n}\n",
+        ),
+    ]);
+    external.edit("shared/lib.rs", "1", "2");
+    let plan = external.plan("test");
+    assert!(
+        plan.commands("//member:test").is_empty(),
+        "external library root was narrowed: {plan:#?}"
+    );
+    assert!(
+        plan.notes("//member:test")
+            .contains("shared/lib.rs is the library root; running in full"),
+        "{}",
+        plan.notes("//member:test")
+    );
+
+    // `workspace = true` is not a path edge. Seeding still selects the tests
+    // that name the changed library-root function; the library itself runs
+    // in full.
+    let named = Workspace::new(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"lib\", \"user\"]\nresolver = \"2\"\n\n[workspace.dependencies]\nlib = { path = \"lib\" }\n",
+        ),
+        (
+            "lib/Cargo.toml",
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("lib/src/lib.rs", "pub fn value() -> u32 {\n    1\n}\n"),
+        (
+            "user/Cargo.toml",
+            "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlib = { workspace = true }\n",
+        ),
+        (
+            "user/src/lib.rs",
+            "pub fn read() -> u32 {\n    lib::value()\n}\n",
+        ),
+        (
+            "user/tests/reads.rs",
+            "#[test]\nfn reads() {\n    assert_eq!(user::read(), 1);\n}\n",
+        ),
+    ]);
+    named.edit("lib/src/lib.rs", "1", "2");
+    let plan = named.plan("test");
+    assert!(
+        plan.commands("//lib:test").is_empty(),
+        "library root was narrowed: {plan:#?}"
+    );
+    assert!(
+        plan.notes("//lib:test")
+            .contains("lib/src/lib.rs is the library root; running in full"),
+        "{}",
+        plan.notes("//lib:test")
+    );
+    let user = plan.commands("//user:test");
+    assert!(
+        user.iter().any(|command| command.contains("reads"))
+            && user
+                .iter()
+                .all(|command| !command.contains("running in full")),
+        "source-only dependent was not selected: {plan:#?}"
+    );
+}
+
 #[test]
 fn python_change_selects_test_files_through_imports() {
     let ws = Workspace::new(&[
