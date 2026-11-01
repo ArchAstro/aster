@@ -652,6 +652,77 @@ fn go_change_selects_test_functions_by_name() {
     );
 }
 
+/// Issue 241: `init` and `TestMain` are callbacks nothing names. Go tests
+/// live in `_test.go` of the same package directory, so they are not
+/// importers of their own unit. The module is nested so a later plan does
+/// not treat the workspace-root `.aster` cache as a project change.
+#[test]
+fn go_init_change_selects_the_packages_own_external_tests() {
+    if skip_without_go() {
+        return;
+    }
+    let util = [
+        ("m/go.mod", "module example.com/m\n\ngo 1.22\n"),
+        (
+            "m/lib/util/init.go",
+            "package util\n\nvar Registry = map[string]int{}\n\nfunc init() { Registry[\"a\"] = 1 }\n\nfunc Hold(n int) int { return n }\n",
+        ),
+        (
+            "m/lib/util/util_test.go",
+            "package util_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/lib/util\"\n)\n\nfunc TestRegistry(t *testing.T) {\n\tif util.Registry[\"a\"] != 1 {\n\t\tt.Fatal(util.Registry[\"a\"])\n\t}\n}\n",
+        ),
+        (
+            "m/lib/util/local_test.go",
+            "package util\n\nimport \"testing\"\n\nfunc TestLocal(t *testing.T) {\n\tif Registry[\"a\"] != 1 {\n\t\tt.Fatal(Registry[\"a\"])\n\t}\n}\n\nfunc TestUnused(t *testing.T) {}\n\nfunc TestHold(t *testing.T) { Hold(1) }\n\nfunc TestMain(m *testing.M) { m.Run() }\n",
+        ),
+    ];
+    let app = [
+        (
+            "m/app/app.go",
+            "package app\n\nimport \"example.com/m/lib/util\"\n\nfunc Run() int { return util.Registry[\"a\"] }\n",
+        ),
+        (
+            "m/app/app_test.go",
+            "package app\n\nimport \"testing\"\n\nfunc TestRun(t *testing.T) { Run() }\n",
+        ),
+    ];
+    let mut with_app = util.to_vec();
+    with_app.extend(app);
+    let ws = Workspace::new(&with_app);
+    ws.edit("m/lib/util/init.go", "= 1 }", "= 2 }");
+    assert_eq!(
+        ws.plan("test").commands("//m:test"),
+        ["go test -run '^(TestHold|TestLocal|TestRegistry|TestRun|TestUnused)$' ./app ./lib/util"]
+    );
+
+    // A named function still reaches only the tests that name it.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("m/lib/util/init.go", "{ return n }", "{ return n + 0 }");
+    assert_eq!(
+        ws.plan("test").commands("//m:test"),
+        ["go test -run '^(TestHold)$' ./lib/util"]
+    );
+
+    // `TestMain` is a callback in a test file. It reaches the package's
+    // tests, not production importers.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("m/lib/util/local_test.go", "{ m.Run() }", "{ m.Run(); }");
+    assert_eq!(
+        ws.plan("test").commands("//m:test"),
+        ["go test -run '^(TestHold|TestLocal|TestRegistry|TestUnused)$' ./lib/util"]
+    );
+
+    // Nothing imports the package: selection must not fall back to full.
+    let alone = Workspace::new(&util);
+    alone.edit("m/lib/util/init.go", "= 1 }", "= 2 }");
+    let plan = alone.plan("test");
+    assert_eq!(
+        plan.commands("//m:test"),
+        ["go test -run '^(TestHold|TestLocal|TestRegistry|TestUnused)$' ./lib/util"]
+    );
+    assert!(!plan.notes("//m:test").contains("reaches no test"));
+}
+
 #[test]
 fn go_names_are_told_apart_by_package_and_receiver() {
     if skip_without_go() {
