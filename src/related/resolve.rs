@@ -46,6 +46,9 @@ pub struct RustIndex {
     files: HashMap<PathBuf, Vec<(usize, Vec<String>)>>,
     /// Library targets by crate name.
     libs: HashMap<String, usize>,
+    /// Package directory of each library root, relative to the workspace
+    /// root. A `[lib] path` may sit outside that directory.
+    lib_root_packages: HashMap<PathBuf, Vec<PathBuf>>,
     /// What each file re-exports: the path, and whether all of it (`::*`).
     reexports: HashMap<PathBuf, Vec<(String, bool)>>,
 }
@@ -90,6 +93,12 @@ impl RustIndex {
                 }
                 if target.kind == LayoutKind::Lib {
                     index.libs.insert(layout.lib_name.clone(), id);
+                    if let Some(root) = by_module.get(&Vec::new()) {
+                        let packages = index.lib_root_packages.entry(root.clone()).or_default();
+                        if !packages.contains(&dir) {
+                            packages.push(dir.clone());
+                        }
+                    }
                 }
                 index.targets.push(RustTarget {
                     kind: target.kind,
@@ -103,6 +112,24 @@ impl RustIndex {
     /// The targets `file` is compiled into, with its module path in each.
     pub fn owners(&self, file: &Path) -> &[(usize, Vec<String>)] {
         self.files.get(file).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `file` is a library root: the file of a [`LayoutKind::Lib`]
+    /// target whose module path is empty. That is `src/lib.rs`, or the file
+    /// named by `[lib] path`.
+    pub fn is_lib_root(&self, file: &Path) -> bool {
+        self.owners(file).iter().any(|(target, module)| {
+            module.is_empty() && matches!(self.targets[*target].kind, LayoutKind::Lib)
+        })
+    }
+
+    /// Library-root files and the package directories that compile them.
+    pub fn lib_roots(&self) -> HashMap<PathBuf, Vec<PathBuf>> {
+        self.lib_root_packages
+            .iter()
+            .filter(|(file, _)| self.is_lib_root(file))
+            .map(|(file, dirs)| ((*file).clone(), dirs.clone()))
+            .collect()
     }
 
     /// Follow `path` (`crate::a::b::Name`) from `from` as far as modules
