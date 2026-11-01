@@ -471,3 +471,122 @@ fn copy_sources(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
     walk(from, to, std::path::Path::new(""));
 }
+
+/// Planted `*.tmp.<deadpid>.<n>` files stand in for a writer killed during
+/// `put_blob_once` / `write_atomic`. Prune must drop the ones older than the
+/// grace and keep a fresh one. `cache clear` stays index-only.
+#[test]
+fn cache_prune_and_clear_remove_tmp_files_left_by_killed_writers() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    let cache = TempDir::new().unwrap();
+    let cache_dir = cache.path();
+
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    assert!(child.wait().unwrap().success());
+
+    let digest = "ab".repeat(32);
+    let key = "cd0123456789abcd";
+    let old_cas = cache_dir
+        .join("cas")
+        .join("ab")
+        .join(format!("{digest}.zst.tmp.{dead_pid}.1"));
+    let fresh_cas = cache_dir
+        .join("cas")
+        .join("ab")
+        .join(format!("{digest}.zst.tmp.{dead_pid}.2"));
+    let old_ac = cache_dir
+        .join("ac")
+        .join("cd")
+        .join(format!("{key}.json.tmp.{dead_pid}.1"));
+    let fresh_ac = cache_dir
+        .join("ac")
+        .join("cd")
+        .join(format!("{key}.json.tmp.{dead_pid}.2"));
+    for path in [&old_cas, &fresh_cas, &old_ac, &fresh_ac] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
+    fs::write(&old_cas, vec![1u8; 4_096]).unwrap();
+    fs::write(&fresh_cas, vec![2u8; 128]).unwrap();
+    fs::write(&old_ac, b"{\"stale\":true}").unwrap();
+    fs::write(&fresh_ac, b"{\"pending\":true}").unwrap();
+    let index = cache_dir.join("index").join("app.json");
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    fs::write(&index, b"{}").unwrap();
+
+    let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    for path in [&old_cas, &old_ac] {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(ancient).unwrap();
+    }
+
+    let clear = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_CACHE_DIR", cache_dir)
+        .args(["cache", "clear"])
+        .output()
+        .unwrap();
+    assert!(
+        clear.status.success(),
+        "cache clear failed: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&clear.stdout).contains("Cache cleared"),
+        "stdout={}",
+        String::from_utf8_lossy(&clear.stdout)
+    );
+    assert!(!index.exists(), "clear must remove the index");
+    for path in [&old_cas, &fresh_cas, &old_ac, &fresh_ac] {
+        assert!(path.is_file(), "clear must leave {}", path.display());
+    }
+
+    let prune = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env("ASTER_CACHE_DIR", cache_dir)
+        .args(["cache", "prune", "--max-size", "1", "--max-age", "1s"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&prune.stdout).into_owned();
+    assert!(
+        prune.status.success(),
+        "cache prune failed: {} {stdout}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert!(!old_cas.exists(), "stale cas temp must be swept");
+    assert!(!old_ac.exists(), "stale ac temp must be swept");
+    assert!(fresh_cas.is_file(), "fresh cas temp must be kept");
+    assert!(fresh_ac.is_file(), "fresh ac temp must be kept");
+
+    let fresh_bytes =
+        fs::metadata(&fresh_cas).unwrap().len() + fs::metadata(&fresh_ac).unwrap().len();
+    let expected =
+        format!("Pruned 0 manifests, 0 blobs, and 2 temp files ({fresh_bytes} bytes remaining)");
+    assert!(
+        stdout.contains(&expected),
+        "stdout={stdout} expected={expected}"
+    );
+    assert_eq!(
+        fresh_bytes,
+        on_disk_bytes(cache_dir),
+        "bytes remaining must equal on-disk cache size"
+    );
+}
+
+fn on_disk_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata().unwrap().len();
+            }
+        }
+    }
+    total
+}
