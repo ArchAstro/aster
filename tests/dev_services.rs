@@ -2091,6 +2091,60 @@ fn write_daemon_workspace(root: &Path, port: u16, group: Option<&str>) {
     .unwrap();
 }
 
+#[test]
+fn daemon_up_failure_reports_supervisor_cause_and_log_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            "[dev.ports.web]\ndefault = {port}\n\n[dev.services.web]\ntarget = \"//app:web\"\nport = \"web\"\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.web]\ncommand = \"python3 http_server.py {port}\"\nstream = true\n",
+    )
+    .unwrap();
+    let guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: root,
+    };
+
+    let output = guard
+        .command()
+        .args(["services", "up", "--daemon"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cause =
+        format!("configured static service ports are already allocated or listening: web={port}");
+    assert!(stderr.contains(&cause), "{stderr}");
+    let log_path = stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("supervisor startup log: "))
+        .unwrap_or_else(|| panic!("stderr does not name the startup log:\n{stderr}"));
+    let log_path = Path::new(log_path);
+    assert!(
+        log_path.is_file(),
+        "startup log {} is missing\n{stderr}",
+        log_path.display()
+    );
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains(&cause), "{log}");
+    assert!(listener.local_addr().is_ok());
+}
+
 fn write_proxy_daemon_workspace(root: &Path, advertised_port: u16, upstream_port: u16) {
     fs::create_dir_all(root.join(".git")).unwrap();
     for project in ["app", "proxy"] {

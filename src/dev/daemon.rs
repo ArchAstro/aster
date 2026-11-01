@@ -45,6 +45,45 @@ impl std::fmt::Display for DaemonError {
     }
 }
 
+impl DaemonError {
+    /// Client text for a failed launch. [`Display`](std::fmt::Display) stays `message` because that
+    /// value is the wire error and what in-process callers already match.
+    ///
+    /// Non-empty `diagnostics` become an indented `supervisor output:` block of
+    /// the trimmed last 20 lines. `startup_log` is named only when that file
+    /// still exists.
+    pub fn with_diagnostics_display(&self, startup_log: Option<&Path>) -> String {
+        const OUTPUT_LINES: usize = 20;
+        let mut text = self.message.clone();
+        if let Some(lines) = supervisor_output_excerpt(self.diagnostics.as_deref(), OUTPUT_LINES) {
+            text.push_str("\nsupervisor output:\n");
+            for line in lines {
+                text.push_str("  ");
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        if let Some(path) = startup_log.filter(|path| path.is_file()) {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str("supervisor startup log: ");
+            text.push_str(&path.display().to_string());
+        }
+        text
+    }
+}
+
+fn supervisor_output_excerpt(diagnostics: Option<&str>, limit: usize) -> Option<Vec<&str>> {
+    let diagnostics = diagnostics?.trim();
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = diagnostics.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+    Some(lines[start..].to_vec())
+}
+
 impl std::error::Error for DaemonError {}
 
 pub type DaemonResult<T> = Result<T, DaemonError>;
@@ -1188,6 +1227,10 @@ mod platform {
                 if exited.is_none() {
                     let _ = terminate_child(&mut bundle.child);
                 }
+                // Keep startup_log. Clients print its path after StartupFailed;
+                // dropping the bundle entry must not unlink it. stop_keys does
+                // not remove it either, and daemon exit only drops the socket,
+                // readiness socket, and pid file.
                 let diagnostics = tail_file(&bundle.startup_log, 16 * 1024);
                 let message = exited.map_or_else(
                     || "service supervisor readiness timed out".to_string(),
@@ -1303,6 +1346,17 @@ mod platform {
             ));
         }
         Ok(path)
+    }
+
+    pub(super) fn supervisor_startup_log(workspace: &Path, group: Option<&str>) -> Option<PathBuf> {
+        let workspace = workspace.canonicalize().ok()?;
+        if !workspace.is_dir() {
+            return None;
+        }
+        let (group, _) = normalize_group(group).ok()?;
+        let path =
+            runtime_directory().join(format!("supervisor-{}.log", bundle_id(&workspace, &group)));
+        path.is_file().then_some(path)
     }
 
     pub(super) fn bundle_id(workspace: &Path, group: &str) -> String {
@@ -1441,6 +1495,9 @@ mod platform {
     pub(super) fn launch(_: LaunchOptions) -> DaemonResult<LaunchResult> {
         unsupported()
     }
+    pub(super) fn supervisor_startup_log(_: &Path, _: Option<&str>) -> Option<PathBuf> {
+        None
+    }
     pub(super) fn list_workspace(_: &Path) -> DaemonResult<Vec<BundleDescriptor>> {
         unsupported()
     }
@@ -1468,6 +1525,16 @@ pub fn ping_daemon() -> DaemonResult<u32> {
 pub fn launch_bundle(options: LaunchOptions) -> DaemonResult<LaunchResult> {
     platform::launch(options)
 }
+
+/// Startup log for a workspace bundle, when that file still exists.
+///
+/// The daemon writes this under its runtime directory and leaves it in place
+/// after a failed launch. Returns `None` when the file is gone or the
+/// platform has no daemon.
+pub fn supervisor_startup_log(workspace: &Path, group: Option<&str>) -> Option<PathBuf> {
+    platform::supervisor_startup_log(workspace, group)
+}
+
 pub fn attach_bundle(workspace: &Path, group: Option<&str>) -> DaemonResult<PathBuf> {
     platform::attach(workspace, group)
 }
@@ -1511,6 +1578,50 @@ fn protocol_mismatch() -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_supervisor_diagnostics_display_includes_message_and_existing_log_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("supervisor-empty.log");
+        std::fs::write(&log, "").unwrap();
+        let error = DaemonError {
+            code: DaemonErrorCode::StartupFailed,
+            message: "service supervisor exited before readiness: exit status: 1".to_string(),
+            diagnostics: Some(String::new()),
+        };
+        assert_eq!(error.to_string(), error.message);
+
+        let rendered = error.with_diagnostics_display(Some(&log));
+        assert_eq!(
+            rendered,
+            format!(
+                "{}\nsupervisor startup log: {}",
+                error.message,
+                log.display()
+            )
+        );
+        assert!(!rendered.contains("supervisor output:"));
+
+        let missing = temp.path().join("missing.log");
+        assert_eq!(
+            error.with_diagnostics_display(Some(&missing)),
+            error.message
+        );
+
+        let lines: Vec<_> = (1..=25).map(|number| format!("line {number}")).collect();
+        let noisy = DaemonError {
+            code: DaemonErrorCode::StartupFailed,
+            message: error.message.clone(),
+            diagnostics: Some(format!("\n{}\n", lines.join("\n"))),
+        };
+        let excerpt = noisy.with_diagnostics_display(Some(&log));
+        assert!(excerpt.contains("supervisor output:\n"));
+        assert!(!excerpt.contains("line 5"));
+        assert!(excerpt.contains("  line 6"));
+        assert!(excerpt.contains("  line 25"));
+        assert!(excerpt.contains(&format!("supervisor startup log: {}", log.display())));
+        assert_eq!(noisy.to_string(), noisy.message);
+    }
+
     #[test]
     fn omitted_group_has_stable_sentinel() {
         assert_eq!(

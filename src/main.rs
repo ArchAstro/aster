@@ -322,7 +322,20 @@ fn run() -> Result<()> {
                     options.watch = !no_watch;
                     options.use_cache = !cli.no_cache;
                     options.proxy = *proxy;
-                    let result = aster::dev::launch_bundle(options)?;
+                    let result = aster::dev::launch_bundle(options).map_err(|error| {
+                        if error.diagnostics.is_some() {
+                            let startup_log = aster::dev::supervisor_startup_log(
+                                &workspace_root,
+                                group.as_deref(),
+                            );
+                            anyhow::anyhow!(
+                                "{}",
+                                error.with_diagnostics_display(startup_log.as_deref())
+                            )
+                        } else {
+                            anyhow::Error::from(error)
+                        }
+                    })?;
                     let attach_ui = workspace_config.dev.daemon
                         && !daemon
                         && !no_ui
