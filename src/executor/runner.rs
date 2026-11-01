@@ -1345,6 +1345,13 @@ impl<'a> Executor<'a> {
                     result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
                 }
                 let mut retried = false;
+                // A narrowed retry keeps coverage flags and echoes its command,
+                // so its log can show a threshold or a test name that the full
+                // run did not. Keep the command's own console before that append.
+                // Only a failed target with a quarantine list is judged.
+                let console_before_retry =
+                    (quarantine.is_some() && !result.success && !result.skipped)
+                        .then(|| result.output.clone());
                 if let (Some(command), false) = (&retry_command, shutdown_requested()) {
                     let registry = PluginRegistry::with_all_plugins();
                     if let Some(plugin) = registry.find_by_name(&plugin_name) {
@@ -1382,13 +1389,21 @@ impl<'a> Executor<'a> {
                     }
                 }
                 let mut let_through = false;
-                if let (Some(quarantine), Some(command), Some(report), false) = (
+                if let (Some(quarantine), Some(command), Some(report), Some(console), false) = (
                     &quarantine,
                     &quarantine_command,
                     result.tests.as_ref(),
+                    console_before_retry.as_deref(),
                     result.success || result.skipped || shutdown_requested(),
                 ) {
-                    match quarantine.judge(&addr, &plugin_name, command, result.exit_code, report) {
+                    match quarantine.judge(
+                        &addr,
+                        &plugin_name,
+                        command,
+                        result.exit_code,
+                        report,
+                        console,
+                    ) {
                         Verdict::Pass(tests) => {
                             let mut note = format!(
                             "[aster] Quarantine: every failing test is quarantined, so {addr} passes\n"
