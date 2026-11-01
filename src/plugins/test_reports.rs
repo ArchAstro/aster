@@ -4,7 +4,9 @@
 //! [`super::related_tests`] does, and returns how to capture a report from
 //! it. A command the function does not recognise gets no plan and runs as
 //! written. Plans keep the runner's console output unchanged: a reporter is
-//! added alongside the one the user sees, never in place of it.
+//! added alongside the one the user sees, never in place of it. Pytest and
+//! Jest still print a one-line notice naming the report file Aster added;
+//! that line is dropped from the log.
 
 use std::path::{Path, PathBuf};
 
@@ -598,7 +600,13 @@ fn js_flags(
                 "--json".to_string(),
                 format!("--outputFile={}", file.display()),
             ];
-            Some((flags, plan(file, ReportFormat::JestJson)))
+            Some((
+                flags,
+                ReportPlan {
+                    rewrite: Some(OutputRewrite::DropReportNotices),
+                    ..plan(file, ReportFormat::JestJson)
+                },
+            ))
         }
         JsRunner::Bun => {
             if has("--reporter") || has("--reporter-outfile") {
@@ -927,13 +935,13 @@ pub(super) fn pytest(ctx: &ReportContext) -> Option<ReportPlan> {
             );
         (name == "pytest" || name == "py.test") && !is_option_value
     })?;
-    let plan = |command: String, file: std::path::PathBuf| ReportPlan {
+    let plan = |command: String, file: std::path::PathBuf, rewrite| ReportPlan {
         command,
         env: Vec::new(),
         files: ReportFiles::Paths(vec![file]),
         format: ReportFormat::JUnitXml,
         confidence: Confidence::Complete,
-        rewrite: None,
+        rewrite,
         relative_to: None,
         declared: false,
     };
@@ -953,14 +961,20 @@ pub(super) fn pytest(ctx: &ReportContext) -> Option<ReportPlan> {
                 .or_else(|| part.strip_prefix("--junit-xml=")),
         };
         if let Some(path) = existing {
-            return Some(plan(ctx.command.to_string(), ctx.working_dir.join(path)));
+            // The user already chose the report file. Its notice does not
+            // name Aster's directory, so the log is left as written.
+            return Some(plan(
+                ctx.command.to_string(),
+                ctx.working_dir.join(path),
+                None,
+            ));
         }
         i += 1;
     }
 
     let file = ctx.report_dir.join("pytest.xml");
     let command = argv.render_inserting(end, &[format!("--junitxml={}", file.display())]);
-    Some(plan(command, file))
+    Some(plan(command, file, Some(OutputRewrite::DropReportNotices)))
 }
 
 /// `go test`: adds `-json` and renders the events back to `go test` text
@@ -1972,11 +1986,13 @@ test("parent", async (t) => { await t.test("child", () => {}); });
             "pnpm run test-ci --json --outputFile=/tmp/aster-reports/1/jest.json"
         );
         assert_eq!(plan.format, ReportFormat::JestJson);
+        assert_eq!(plan.rewrite, Some(OutputRewrite::DropReportNotices));
         let plan = js(&context(&f, "test", "yarn run bun-test")).unwrap();
         assert_eq!(
             plan.command,
             "yarn run bun-test --reporter=junit --reporter-outfile=/tmp/aster-reports/1/bun.xml"
         );
+        assert_eq!(plan.rewrite, None);
         // A script that is more than the runner gets no flags.
         assert!(js(&context(&f, "test", "pnpm run build-test")).is_none());
     }
@@ -1993,6 +2009,11 @@ test("parent", async (t) => { await t.test("child", () => {}); });
         ] {
             assert!(js(&context(&f, "test", command)).is_none(), "{command}");
         }
+        // A direct Jest command gets the same notice filter as a script.
+        let plan = js(&context(&f, "test", "jest --ci")).unwrap();
+        assert_eq!(plan.rewrite, Some(OutputRewrite::DropReportNotices));
+        assert!(matches!(plan.files, ReportFiles::Paths(_)));
+        assert_ne!(plan.files, ReportFiles::Stdout);
     }
 
     #[test]
@@ -2122,6 +2143,8 @@ test("parent", async (t) => { await t.test("child", () => {}); });
                 ReportFiles::Paths(vec![f.report_dir.join("pytest.xml")])
             );
             assert!(plan.env.is_empty());
+            assert_eq!(plan.rewrite, Some(OutputRewrite::DropReportNotices));
+            assert_ne!(plan.files, ReportFiles::Stdout);
         }
     }
 
@@ -2139,6 +2162,7 @@ test("parent", async (t) => { await t.test("child", () => {}); });
                 plan.files,
                 ReportFiles::Paths(vec![f.project.join("out/report.xml")])
             );
+            assert_eq!(plan.rewrite, None);
         }
     }
 
