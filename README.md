@@ -709,7 +709,10 @@ the tests that reach them, across project boundaries.
   A bare string names a program whose remaining arguments are the wrapped
   command (as with `env`). The table form adds `until`, a word that ends the
   wrapper's own arguments. A program matches by the exact word written in the
-  command, or by file name when the entry has no `/`. Leading `NAME=value`
+  command, by file name when the entry has no `/`, or, when the entry contains
+  `/`, by resolving that word from the project directory and the entry from the
+  workspace root (`../../scripts/wrap` in `libs/core` matches `scripts/wrap`).
+  Leading `NAME=value`
   assignments stay in front. Without an entry the command runs as written;
   Aster does not guess which programs are wrappers. Wrappers apply to
   `--related`, not to `--only-affected-files`. They also apply to test result

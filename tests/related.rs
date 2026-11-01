@@ -2329,6 +2329,89 @@ fn configured_wrapper_programs_stay_in_front_of_the_narrowed_command() {
 }
 
 #[test]
+fn a_root_relative_wrapper_entry_matches_the_wrapper_in_nested_projects() {
+    let ws = Workspace::new(&[
+        (
+            "aster.toml",
+            "[affected.related]\nwrappers = [\"scripts/wrap\"]\n",
+        ),
+        ("scripts/wrap", "#!/bin/sh\nexec \"$@\"\n"),
+        (
+            "libs/core/package.json",
+            r#"{"name":"@libs/core","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "libs/core/aster.toml",
+            "[targets.test]\ncommand = \"../../scripts/wrap npx vitest run\"\n",
+        ),
+        (
+            "libs/core/src/math.ts",
+            "export function add(a: number, b: number) {\n  return a + b;\n}\n",
+        ),
+        (
+            "libs/core/src/math.test.ts",
+            "import { add } from \"./math\";\nit(\"adds\", () => { expect(add(1, 2)).toBe(3); });\n",
+        ),
+        (
+            "libs/other/package.json",
+            r#"{"name":"@libs/other","scripts":{"test":"vitest run"}}"#,
+        ),
+        (
+            "libs/other/aster.toml",
+            "[targets.test]\ncommand = \"../../scripts/wrap npx vitest run\"\n",
+        ),
+        (
+            "libs/other/src/label.ts",
+            "export function label(n: number) {\n  return String(n);\n}\n",
+        ),
+        (
+            "libs/other/src/label.test.ts",
+            "import { label } from \"./label\";\nit(\"labels\", () => { expect(label(1)).toBe(\"1\"); });\n",
+        ),
+    ]);
+    ws.edit("libs/core/src/math.ts", "return a + b;", "return b + a;");
+    ws.edit(
+        "libs/other/src/label.ts",
+        "return String(n);",
+        "return String(n + 0);",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//libs/core:test"),
+        ["../../scripts/wrap npx vitest run src/math.test.ts --coverage.enabled=false"]
+    );
+    assert_eq!(
+        plan.commands("//libs/other:test"),
+        ["../../scripts/wrap npx vitest run src/label.test.ts --coverage.enabled=false"]
+    );
+    assert!(!plan
+        .notes("//libs/core:test")
+        .contains("not a test command Aster can narrow"));
+    assert!(!plan
+        .notes("//libs/other:test")
+        .contains("not a test command Aster can narrow"));
+
+    let output = ws.aster(&["--json", "check", "--rule", "unnarrowable-test-command"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid JSON ({error}): {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let findings = report["findings"].as_array().expect("findings");
+    assert!(
+        findings.is_empty(),
+        "unnarrowable-test-command reported {findings:?}"
+    );
+}
+
+#[test]
 fn an_invalid_wrapper_entry_is_rejected() {
     let ws = Workspace::new(&[(
         "aster.toml",

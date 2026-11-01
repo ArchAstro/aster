@@ -10,7 +10,7 @@
 use super::{FilesListPlan, RelatedTest};
 use crate::executor::quote_command_argument as quote_any;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SHELL_OPERATORS: &[&str] = &["&&", "||", "|", ";", "&", ">", ">>", "<", "2>&1"];
 const INTERPRETERS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "env", "xargs", "sudo"];
@@ -638,6 +638,25 @@ impl Delegated {
 pub(crate) struct Wrappers {
     /// `(program, until)`.
     entries: Vec<(String, Option<String>)>,
+    /// Workspace root for resolving a path-like entry. Unset callers keep
+    /// exact-word and bare-name matching only.
+    workspace_root: Option<PathBuf>,
+}
+
+/// Collapse `.` and `..` without touching the filesystem. The same lexical
+/// normalization `affected_files` uses when a one-liner changes directory.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// A command split into its wrappers and the command they run.
@@ -670,24 +689,77 @@ impl Wrappers {
                     (program.to_string(), until.map(str::to_string))
                 })
                 .collect(),
+            workspace_root: None,
         }
     }
 
+    /// Remember `root` so [`Self::strip_from`] can resolve a path-like entry.
+    pub(crate) fn with_workspace(mut self, root: &Path) -> Self {
+        self.workspace_root = Some(root.to_path_buf());
+        self
+    }
+
     /// Whether the written program word is the configured one: the same
-    /// word, or the same file name when the entry names no directory.
-    fn is_program(entry: &str, word: &str) -> bool {
-        word == entry
-            || (!entry.contains('/')
-                && Path::new(word)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|name| name == entry))
+    /// word, the same file name when the entry names no directory, or, when
+    /// the entry contains `/` and both directories are known, the same path
+    /// after resolving the word from `base_dir` and the entry from
+    /// `workspace_root`.
+    fn is_program(
+        entry: &str,
+        word: &str,
+        base_dir: Option<&Path>,
+        workspace_root: Option<&Path>,
+    ) -> bool {
+        if word == entry {
+            return true;
+        }
+        if !entry.contains('/') {
+            return Path::new(word)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == entry);
+        }
+        let (Some(base_dir), Some(workspace_root)) = (base_dir, workspace_root) else {
+            return false;
+        };
+        normalize(&base_dir.join(word)) == normalize(&workspace_root.join(entry))
     }
 
     /// The command a wrapper runs, when `command` starts with one (after any
     /// `NAME=value` assignments). Wrappers may nest. Words keep their
-    /// quoting, and runs of spaces collapse to one.
+    /// quoting, and runs of spaces collapse to one. Exact-word and bare-name
+    /// matching only: a path-like entry needs [`Self::strip_in`].
     pub(crate) fn strip(&self, command: &str) -> Option<Wrapped> {
+        self.strip_at(command, None, None)
+    }
+
+    /// [`Self::strip`] that also matches a path-like entry against the first
+    /// word resolved from `base_dir` (the project working directory) and the
+    /// entry resolved from `workspace_root`.
+    pub(crate) fn strip_in(
+        &self,
+        command: &str,
+        base_dir: &Path,
+        workspace_root: &Path,
+    ) -> Option<Wrapped> {
+        self.strip_at(command, Some(base_dir), Some(workspace_root))
+    }
+
+    /// [`Self::strip_in`] using the workspace root from [`Self::with_workspace`].
+    /// Falls back to [`Self::strip`] when no root was set.
+    pub(crate) fn strip_from(&self, command: &str, base_dir: &Path) -> Option<Wrapped> {
+        match &self.workspace_root {
+            Some(root) => self.strip_in(command, base_dir, root),
+            None => self.strip(command),
+        }
+    }
+
+    fn strip_at(
+        &self,
+        command: &str,
+        base_dir: Option<&Path>,
+        workspace_root: Option<&Path>,
+    ) -> Option<Wrapped> {
         if self.entries.is_empty() || command.contains("{files}") {
             return None;
         }
@@ -697,7 +769,7 @@ impl Wrappers {
         for _ in 0..Self::MAX_DEPTH {
             let program = words.iter().position(|w| !is_assignment(w))?;
             let found = self.entries.iter().find_map(|(entry, until)| {
-                if !Self::is_program(entry, &words[program]) {
+                if !Self::is_program(entry, &words[program], base_dir, workspace_root) {
                     return None;
                 }
                 match until {
@@ -2193,6 +2265,40 @@ mod tests {
         assert_eq!(
             Wrappers::default().strip("scripts/with-toolchain cargo test"),
             None
+        );
+    }
+
+    #[test]
+    fn a_root_relative_wrapper_matches_from_the_project_directory() {
+        use crate::config::RelatedWrapperConfig;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let core = root.join("libs/core");
+        let wrappers = Wrappers::new(&[RelatedWrapperConfig::Program("scripts/wrap".into())]);
+        let strip = |command: &str, base: &Path| {
+            wrappers
+                .strip_in(command, base, root)
+                .map(|wrapped| (wrapped.prefix, wrapped.command))
+        };
+        assert_eq!(
+            strip("../../scripts/wrap npx vitest run", &core),
+            Some(("../../scripts/wrap ".into(), "npx vitest run".into()))
+        );
+        // Assignments stay in front of the resolved wrapper.
+        assert_eq!(
+            strip("CI=1 ../../scripts/wrap npx vitest run", &core),
+            Some(("CI=1 ../../scripts/wrap ".into(), "npx vitest run".into()))
+        );
+        // The same file name elsewhere is not this wrapper.
+        assert_eq!(strip("other/wrap npx vitest run", root), None);
+        assert_eq!(strip("../../other/wrap npx vitest run", &core), None);
+        // Without a directory, a path-like entry still needs the exact word.
+        assert_eq!(wrappers.strip("../../scripts/wrap npx vitest run"), None);
+        assert_eq!(
+            wrappers
+                .strip("scripts/wrap npx vitest run")
+                .map(|wrapped| wrapped.command),
+            Some("npx vitest run".into())
         );
     }
 

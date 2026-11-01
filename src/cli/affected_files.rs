@@ -19,8 +19,8 @@ use crate::config::RelatedWrapperConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
 use crate::plugins::related_tests::{
-    package_script_aliases, package_script_body, package_script_calls, package_script_runners,
-    Delegated, Wrappers,
+    normalize, package_script_aliases, package_script_body, package_script_calls,
+    package_script_runners, Delegated, Wrappers,
 };
 use crate::plugins::{
     FilesListPlan, FilesListSelection, PluginRegistry, RelatedTest, Target, TargetCapability,
@@ -321,6 +321,8 @@ struct Lookup<'a> {
     /// Targets that join a target's runs (`selected_by`), by its address.
     joiners: HashMap<String, Vec<(String, String)>>,
     wrappers: Wrappers,
+    /// Root the path-like wrapper entries are written relative to.
+    workspace_root: PathBuf,
 }
 
 impl<'a> Lookup<'a> {
@@ -341,7 +343,25 @@ impl<'a> Lookup<'a> {
             by_root: projects.iter().map(|p| (p.root.clone(), p)).collect(),
             joiners,
             wrappers: Wrappers::new(wrappers),
+            workspace_root: workspace_root(projects),
         }
+    }
+
+    /// The directory a target's command runs in.
+    fn command_dir<'b>(owner: &'b DiscoveredProject, def: &'b Target) -> &'b Path {
+        def.working_dir.as_deref().unwrap_or(&owner.root)
+    }
+
+    fn strip_command(
+        &self,
+        owner: &DiscoveredProject,
+        def: &Target,
+    ) -> Option<crate::plugins::related_tests::Wrapped> {
+        self.wrappers.strip_in(
+            &def.command,
+            Self::command_dir(owner, def),
+            &self.workspace_root,
+        )
     }
 
     /// Makes running an `alias` target run the target it aliases too: a
@@ -406,7 +426,7 @@ impl<'a> Lookup<'a> {
     /// project.
     fn runner(&self, owner: &'a DiscoveredProject, def: &Target) -> Option<Runner<'a>> {
         // A configured wrapper program stays in front of the command it runs.
-        let (wrapper, written) = match self.wrappers.strip(&def.command) {
+        let (wrapper, written) = match self.strip_command(owner, def) {
             Some(wrapped) => (Some(wrapped.prefix), wrapped.command),
             None => (None, def.command.clone()),
         };
@@ -418,7 +438,7 @@ impl<'a> Lookup<'a> {
                 wrapper,
             });
         };
-        let base = def.working_dir.as_deref().unwrap_or(&owner.root);
+        let base = Self::command_dir(owner, def);
         let project = match &delegated.dir {
             Some(dir) => *self.by_root.get(&normalize(&base.join(dir)))?,
             None => owner,
@@ -436,18 +456,18 @@ fn address(project: &DiscoveredProject) -> String {
     format!("//{}", project.relative_path.display())
 }
 
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
+/// The workspace root of `projects`, from any project's path relative to it.
+fn workspace_root(projects: &[DiscoveredProject]) -> PathBuf {
+    let Some(project) = projects.first() else {
+        return PathBuf::new();
+    };
+    let mut root = project.root.clone();
+    for component in project.relative_path.components() {
+        if matches!(component, std::path::Component::Normal(_)) {
+            root.pop();
         }
     }
-    out
+    root
 }
 
 /// The test command behind a target and the project whose tests it runs.
@@ -1231,7 +1251,7 @@ pub fn test_targets(
             {
                 continue;
             }
-            let written = match lookup.wrappers.strip(&def.command) {
+            let written = match lookup.strip_command(project, def) {
                 Some(wrapped) => wrapped.command,
                 None => def.command.clone(),
             };
@@ -1390,7 +1410,7 @@ pub fn uncaptured_reason(
 ) -> String {
     use crate::plugins::related_tests::{simple_commands, trailing_commands};
     let lookup = Lookup::new(projects, wrappers);
-    let written = match lookup.wrappers.strip(&def.command) {
+    let written = match lookup.strip_command(project, def) {
         Some(wrapped) => wrapped.command,
         None => def.command.clone(),
     };
