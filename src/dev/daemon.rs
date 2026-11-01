@@ -46,7 +46,7 @@ impl std::fmt::Display for DaemonError {
 }
 
 impl DaemonError {
-    /// Client text for a failed launch. [`Display`] stays `message` because that
+    /// Client text for a failed launch. [`Display`](std::fmt::Display) stays `message` because that
     /// value is the wire error and what in-process callers already match.
     ///
     /// Non-empty `diagnostics` become an indented `supervisor output:` block of
