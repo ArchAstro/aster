@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Aster
-        run: cargo install aster --locked
+        run: cargo install --git https://github.com/ArchAstro/aster.git --locked --tag v0.30.1 aster
 
       - name: Plan native caches
         id: plan
@@ -186,7 +186,7 @@ command. On GitHub Actions that store is the repository's Actions cache.
 [`ArchAstro/aster/action`](../../action/README.md) installs a pinned Aster
 release and runs one command with the cache token scoped to that process.
 
-Use a release tag, not a branch: `ArchAstro/aster/action@v0.21.0`. `version`
+Use a release tag, not a branch: `ArchAstro/aster/action@v0.30.1`. `version`
 empty installs the latest stable release. `cache-mode` defaults to `auto`:
 
 | Event | Ref | Mode |
@@ -244,7 +244,7 @@ jobs:
         # The action installs Aster for the build. Planning needs a binary
         # first; pin the same release the action step uses.
         run: |
-          cargo install aster --locked --version 0.21.0
+          cargo install --git https://github.com/ArchAstro/aster.git --locked --tag v0.30.1 aster
           aster ci cache-plan --github-output
 
       - name: Restore native caches
@@ -255,9 +255,9 @@ jobs:
           restore-keys: ${{ steps.plan.outputs.restore-keys }}
 
       - name: Build and test
-        uses: ArchAstro/aster/action@v0.21.0
+        uses: ArchAstro/aster/action@v0.30.1
         with:
-          version: "0.21.0"
+          version: "0.30.1"
           run: test --all
 
       - name: Save native caches
@@ -329,7 +329,7 @@ requests.
 
 ```yaml
 - name: Install Aster
-  run: cargo install aster --locked --version 0.21.0
+  run: cargo install --git https://github.com/ArchAstro/aster.git --locked --tag v0.30.1 aster
 
 - name: Build and test
   env:
@@ -378,7 +378,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Aster
-        run: cargo install aster --locked
+        run: cargo install --git https://github.com/ArchAstro/aster.git --locked --tag v0.30.1 aster
       - name: Plan lanes
         id: plan
         run: |
@@ -402,7 +402,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install Aster
-        run: cargo install aster --locked
+        run: cargo install --git https://github.com/ArchAstro/aster.git --locked --tag v0.30.1 aster
       - uses: actions/setup-go@v5
         if: contains(matrix.toolchains, 'go')
       - uses: actions/setup-node@v4
