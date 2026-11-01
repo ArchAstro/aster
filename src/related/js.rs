@@ -18,6 +18,14 @@ struct Binding {
     imported: Option<String>,
 }
 
+/// One name in `export { local as exported }` (no `from`).
+struct Exported {
+    local: String,
+    /// The name importers use. Equal to `local` when the clause does not rename.
+    exported: String,
+    lines: (usize, usize),
+}
+
 struct Walker<'a> {
     source: &'a str,
     facts: FileFacts,
@@ -30,6 +38,9 @@ struct Walker<'a> {
     bound: HashSet<String>,
     /// `name.member` accesses waiting to learn what `name` is.
     named_members: Vec<(Owner, String, String)>,
+    /// `export { local as exported }` clauses, resolved once imports are bound.
+    /// A namespace import re-exported this way needs a definition of its own.
+    exported: Vec<Exported>,
 }
 
 /// Objects every JavaScript runtime provides. A member of one is not a
@@ -95,6 +106,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         this_type: None,
         bound: HashSet::new(),
         named_members: Vec::new(),
+        exported: Vec::new(),
     };
     walker.bind(tree.root_node());
     for child in children(tree.root_node()) {
@@ -168,6 +180,16 @@ fn mocked_spec<'a>(node: Node, source: &'a str) -> Option<&'a str> {
         node.child_by_field_name("arguments")?.named_child(0)?,
         source,
     )
+}
+
+/// Specifiers of `export { … }`, with or without `from`.
+fn export_specifiers(node: Node) -> Vec<Node> {
+    children(node)
+        .into_iter()
+        .filter(|child| child.kind() == "export_clause")
+        .flat_map(|clause| children(clause))
+        .filter(|specifier| specifier.child_by_field_name("name").is_some())
+        .collect()
 }
 
 impl Walker<'_> {
@@ -606,6 +628,23 @@ impl Walker<'_> {
             .and_then(|s| string_value(s, self.source))
         {
             self.facts.reexports.push(spec.to_string());
+            // `export { name as alias } from "./mod"`: importers name
+            // `alias`, which stands for `name` in the source module.
+            // `default as X` refers to the name a default export already
+            // carries. A same-name re-export needs no definition: importers
+            // mention the name the source defines.
+            for specifier in export_specifiers(node) {
+                let Some(name) = specifier.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(alias) = specifier.child_by_field_name("alias") else {
+                    continue;
+                };
+                let mut def = Def::new(text(alias, self.source), DefKind::Const, span(specifier));
+                def.refs.insert(text(name, self.source).to_string());
+                def.uses.insert(spec.to_string());
+                self.facts.push(def);
+            }
             return;
         }
         if let Some(declaration) = node.child_by_field_name("declaration") {
@@ -629,25 +668,28 @@ impl Walker<'_> {
             return;
         }
         // `export { a, b as c }`: `c` is another name for `b`.
-        for clause in children(node) {
-            if clause.kind() != "export_clause" {
-                continue;
-            }
-            for specifier in children(clause) {
-                let name = specifier.child_by_field_name("name");
-                let alias = specifier.child_by_field_name("alias");
-                match (name, alias) {
-                    (Some(name), Some(alias)) => {
-                        let mut def =
-                            Def::new(text(alias, self.source), DefKind::Const, span(specifier));
-                        def.refs.insert(text(name, self.source).to_string());
-                        self.facts.push(def);
-                    }
-                    // Exported under its own name: importers find the
-                    // definition itself.
-                    (Some(_), None) => {}
-                    _ => {}
+        for specifier in export_specifiers(node) {
+            let name = specifier.child_by_field_name("name");
+            let alias = specifier.child_by_field_name("alias");
+            match (name, alias) {
+                (Some(name), Some(alias)) => {
+                    let mut def =
+                        Def::new(text(alias, self.source), DefKind::Const, span(specifier));
+                    def.refs.insert(text(name, self.source).to_string());
+                    self.facts.push(def);
                 }
+                // Exported under its own name: importers find the
+                // definition itself, unless this re-exports a namespace.
+                (Some(_), None) => {}
+                _ => {}
+            }
+            if let Some(name) = specifier.child_by_field_name("name") {
+                let exported = specifier.child_by_field_name("alias").unwrap_or(name);
+                self.exported.push(Exported {
+                    local: text(name, self.source).to_string(),
+                    exported: text(exported, self.source).to_string(),
+                    lines: span(specifier),
+                });
             }
         }
     }
@@ -825,6 +867,34 @@ impl Walker<'_> {
                 }
             }
         }
+        // `import * as o from spec; export { o }` (or `export { o as ns }`).
+        // The import alone does not make this file a user of `spec`, so a
+        // change there never reaches importers. Re-exporting the namespace
+        // does: importers use that module, and a definition of the name they
+        // import is what a bare `export { o }` otherwise drops.
+        let exported = std::mem::take(&mut self.exported);
+        for item in exported {
+            let Some(binding) = bindings
+                .iter()
+                .find(|binding| binding.local == item.local && binding.imported.is_none())
+            else {
+                continue;
+            };
+            self.facts.reexports.push(binding.spec.clone());
+            let found = self
+                .facts
+                .defs
+                .iter_mut()
+                .find(|def| def.name == item.exported && def.refs.contains(&item.local));
+            if let Some(def) = found {
+                def.uses.insert(binding.spec.clone());
+                continue;
+            }
+            let mut def = Def::new(item.exported.clone(), DefKind::Const, item.lines);
+            def.refs.insert(item.exported);
+            def.uses.insert(binding.spec.clone());
+            self.facts.push(def);
+        }
     }
 }
 
@@ -953,5 +1023,59 @@ describe("cart", () => {
         assert!(sums.uses.contains("../src/cart"));
         assert!(facts.top.uses.contains("../src/stock"));
         assert!(facts.top.refs.contains("reset"));
+    }
+
+    #[test]
+    fn source_reexports_that_rename_are_definitions_of_the_alias() {
+        let source = r#"export { orig as renamed, other } from "./orig.js";
+export { default as X } from "./mod.js";
+export { kept } from "./kept.js";
+export * as oo from "./star.js";
+export * from "./types";
+"#;
+        let facts = extract(Path::new("src/barrel.js"), source);
+        assert_eq!(
+            facts.reexports,
+            ["./orig.js", "./mod.js", "./kept.js", "./star.js", "./types"]
+        );
+        let renamed = facts.defs.iter().find(|d| d.name == "renamed").unwrap();
+        assert_eq!(renamed.kind, DefKind::Const);
+        assert!(renamed.refs.contains("orig"));
+        assert!(renamed.uses.contains("./orig.js"));
+        assert_eq!(renamed.lines, (1, 1));
+        let x = facts.defs.iter().find(|d| d.name == "X").unwrap();
+        assert!(x.refs.contains("default"));
+        assert!(x.uses.contains("./mod.js"));
+        // Same-name and star re-exports stay edges only: no alias definition.
+        assert!(facts
+            .defs
+            .iter()
+            .all(|d| d.name != "other" && d.name != "kept" && d.name != "oo"));
+        assert_eq!(facts.class_of(1), LineClass::Def(0));
+    }
+
+    #[test]
+    fn a_reexported_namespace_is_a_definition_of_that_binding() {
+        let source = "import * as o from \"./orig.js\";\nexport { o };\n";
+        let facts = extract(Path::new("src/ns.js"), source);
+        assert_eq!(facts.reexports, ["./orig.js"]);
+        let ns = facts.defs.iter().find(|d| d.name == "o").unwrap();
+        assert!(ns.refs.contains("o"));
+        assert!(ns.uses.contains("./orig.js"));
+        assert_eq!(ns.lines, (2, 2));
+        // The import line is still an import; the export line is the definition.
+        assert_eq!(facts.class_of(1), LineClass::Import(0));
+        assert_eq!(facts.class_of(2), LineClass::Def(0));
+        assert_eq!(facts.imports[0].names, ["o"]);
+        assert_eq!(facts.imports[0].specs, ["./orig.js"]);
+
+        // Export before the hoisted import, and a rename of the namespace.
+        let source = "export { o as bundle };\nimport * as o from \"./orig.js\";\n";
+        let facts = extract(Path::new("src/ns.js"), source);
+        assert_eq!(facts.reexports, ["./orig.js"]);
+        let bundle = facts.defs.iter().find(|d| d.name == "bundle").unwrap();
+        assert!(bundle.refs.contains("o"));
+        assert!(bundle.uses.contains("./orig.js"));
+        assert_eq!(facts.class_of(2), LineClass::Import(0));
     }
 }

@@ -2805,3 +2805,157 @@ fn aster_dir_is_never_a_change() {
         "source edit was ignored: {third}"
     );
 }
+
+/// Test files named in the `npm test` command for `address`, in command order.
+fn npm_test_files(plan: &Plan, address: &str) -> Vec<String> {
+    plan.commands(address)
+        .iter()
+        .flat_map(|command| command.split_whitespace())
+        .filter(|part| part.ends_with(".test.js") || part.ends_with(".test.ts"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn js_renamed_and_namespace_reexports_reach_their_importers() {
+    let package = r#"{"name":"p","type":"module","scripts":{"test":"vitest run"}}"#;
+    let ws = Workspace::new(&[
+        ("package.json", package),
+        (
+            "src/orig.js",
+            "export const orig = () => \"o\";\nexport const other = () => \"x\";\n",
+        ),
+        (
+            "src/rn.js",
+            "export { orig as renamed } from \"./orig.js\";\n",
+        ),
+        (
+            "src/ns.js",
+            "import * as o from \"./orig.js\"; export { o };\n",
+        ),
+        (
+            "src/def.js",
+            "export default function build() {\n  return \"d\";\n}\n",
+        ),
+        (
+            "src/as-default.js",
+            "export { default as X } from \"./def.js\";\n",
+        ),
+        ("src/side.js", "export const z = () => 1;\n"),
+        (
+            "test/rn.test.js",
+            "import { renamed } from \"../src/rn.js\";\nimport { test } from \"vitest\";\ntest(\"via rename\", () => renamed());\n",
+        ),
+        (
+            "test/ns.test.js",
+            "import { o } from \"../src/ns.js\";\nimport { test } from \"vitest\";\ntest(\"via namespace\", () => o.orig());\n",
+        ),
+        (
+            "test/direct.test.js",
+            "import { orig } from \"../src/orig.js\";\nimport { test } from \"vitest\";\ntest(\"direct\", () => orig());\n",
+        ),
+        (
+            "test/default.test.js",
+            "import { X } from \"../src/as-default.js\";\nimport { test } from \"vitest\";\ntest(\"default\", () => X());\n",
+        ),
+        (
+            "test/side.test.js",
+            "import { z } from \"../src/side.js\";\nimport { test } from \"vitest\";\ntest(\"side\", () => z());\n",
+        ),
+    ]);
+    ws.edit("src/orig.js", "\"o\"", "\"o2\"");
+    let plan = ws.plan("test");
+    assert_eq!(
+        npm_test_files(&plan, "//:test"),
+        [
+            "test/direct.test.js".to_string(),
+            "test/ns.test.js".to_string(),
+            "test/rn.test.js".to_string(),
+        ]
+    );
+
+    // The same selection when nothing imports `orig` by name.
+    let ws = Workspace::new(&[
+        ("package.json", package),
+        ("src/orig.js", "export const orig = () => \"o\";\n"),
+        (
+            "src/rn.js",
+            "export { orig as renamed } from \"./orig.js\";\n",
+        ),
+        (
+            "src/ns.js",
+            "import * as o from \"./orig.js\"; export { o };\n",
+        ),
+        (
+            "test/rn.test.js",
+            "import { renamed } from \"../src/rn.js\";\nimport { test } from \"vitest\";\ntest(\"via rename\", () => renamed());\n",
+        ),
+        (
+            "test/ns.test.js",
+            "import { o } from \"../src/ns.js\";\nimport { test } from \"vitest\";\ntest(\"via namespace\", () => o.orig());\n",
+        ),
+    ]);
+    ws.edit("src/orig.js", "\"o\"", "\"o2\"");
+    let plan = ws.plan("test");
+    assert_eq!(
+        npm_test_files(&plan, "//:test"),
+        ["test/ns.test.js".to_string(), "test/rn.test.js".to_string()]
+    );
+
+    // A default re-export follows the default export's alias.
+    let ws = Workspace::new(&[
+        ("package.json", package),
+        (
+            "src/def.js",
+            "export default function build() {\n  return \"d\";\n}\n",
+        ),
+        (
+            "src/as-default.js",
+            "export { default as X } from \"./def.js\";\n",
+        ),
+        (
+            "test/default.test.js",
+            "import { X } from \"../src/as-default.js\";\nimport { test } from \"vitest\";\ntest(\"default\", () => X());\n",
+        ),
+        (
+            "test/side.test.js",
+            "import { z } from \"../src/side.js\";\nimport { test } from \"vitest\";\ntest(\"side\", () => z());\n",
+        ),
+        ("src/side.js", "export const z = () => 1;\n"),
+    ]);
+    ws.edit("src/def.js", "\"d\"", "\"d2\"");
+    let plan = ws.plan("test");
+    assert_eq!(
+        npm_test_files(&plan, "//:test"),
+        ["test/default.test.js".to_string()]
+    );
+
+    // An export the namespace test never names still selects it, and not a
+    // test of another module. That over-approximation is the namespace.
+    let ws = Workspace::new(&[
+        ("package.json", package),
+        (
+            "src/orig.js",
+            "export const orig = () => \"o\";\nexport const other = () => \"x\";\n",
+        ),
+        (
+            "src/ns.js",
+            "import * as o from \"./orig.js\"; export { o };\n",
+        ),
+        ("src/side.js", "export const z = () => 1;\n"),
+        (
+            "test/ns.test.js",
+            "import { o } from \"../src/ns.js\";\nimport { test } from \"vitest\";\ntest(\"via namespace\", () => o.orig());\n",
+        ),
+        (
+            "test/side.test.js",
+            "import { z } from \"../src/side.js\";\nimport { test } from \"vitest\";\ntest(\"side\", () => z());\n",
+        ),
+    ]);
+    ws.edit("src/orig.js", "\"x\"", "\"x2\"");
+    let plan = ws.plan("test");
+    assert_eq!(
+        npm_test_files(&plan, "//:test"),
+        ["test/ns.test.js".to_string()]
+    );
+}
