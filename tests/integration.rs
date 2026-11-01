@@ -1140,6 +1140,76 @@ fn list_json_reports_languages_and_build_system_separately() {
 }
 
 #[test]
+fn discovery_skips_git_and_node_modules_without_gitignore() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    assert!(
+        !tmp.path().join(".gitignore").exists(),
+        "fixture must not rely on .gitignore"
+    );
+
+    write_package_json(&tmp, "app/package.json", r#"{"name":"app"}"#);
+    write_aster_toml(
+        &tmp,
+        "app/aster.toml",
+        "[targets]\nbuild = \"sh -c 'echo built'\"\n",
+    );
+    write_package_json(
+        &tmp,
+        "app/node_modules/is-odd/package.json",
+        r#"{"name":"is-odd"}"#,
+    );
+    write_package_json(&tmp, ".git/x/package.json", r#"{"name":"git-x"}"#);
+
+    // Keep a machine-wide gitignore from hiding the fixture and making the
+    // hard skip look true for the wrong reason.
+    let isolated = tmp.path().join("isolated-home");
+    fs::create_dir_all(isolated.join(".config")).unwrap();
+    let aster = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .env("HOME", &isolated)
+            .env("XDG_CONFIG_HOME", isolated.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", isolated.join("no-gitconfig"))
+            .env("GIT_CONFIG_SYSTEM", isolated.join("no-gitconfig"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let list = aster(&["list", "--json"]);
+    assert!(
+        list.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let projects: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let addresses: Vec<&str> = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| project["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(addresses, vec!["//app"], "{projects}");
+
+    let build = aster(&["build", "--all", "--json"]);
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&build.stdout).unwrap();
+    let ran: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(ran, vec!["//app:build"], "{body}");
+    assert_eq!(body["results"][0]["status"], "passed");
+}
+
+#[test]
 fn gradle_and_maven_are_not_language_filters() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

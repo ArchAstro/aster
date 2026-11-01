@@ -996,6 +996,10 @@ ignore = [".agents/**", "docs/generated/**"]
 ```
 
 The root-level `ignore` list separately controls project discovery.
+Discovery always skips `.git` and `node_modules`, even when they are not listed
+in `.gitignore`. Other directories, including `dist/`, `build/`, `target/`, and
+`vendor/`, are discovered unless `.gitignore` or this `ignore` list excludes
+them. Watch mode's built-in ignores do not apply to discovery.
 
 ### Tests that read another project's files
 
@@ -1370,6 +1374,8 @@ debounce_ms = 300
 ```
 
 Built-in ignores cover common VCS, dependency, and build-output directories.
+They apply to watch mode only. Discovery always skips `.git` and
+`node_modules` and otherwise follows `.gitignore` and the root `ignore` list.
 During the cooldown window, only configured `suppress_paths` are dropped; use
 them for generated paths that would otherwise create feedback loops.
 

@@ -1,8 +1,9 @@
 //! Project discovery via WalkBuilder
 //!
 //! Uses the `ignore` crate to traverse the workspace while respecting
-//! .gitignore patterns. Finds projects by their marker files (e.g., package.json)
-//! and merges aster.toml overrides.
+//! .gitignore patterns. `.git` and `node_modules` directories are never
+//! descended into, even when they are not gitignored. Finds projects by their
+//! marker files (e.g., package.json) and merges aster.toml overrides.
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -73,8 +74,12 @@ struct PartialProject {
 /// Discover all projects in the workspace
 ///
 /// Walks the directory tree from workspace_root, respecting .gitignore patterns.
-/// For each marker file found (e.g., package.json), the corresponding plugin
-/// parses the project. If an aster.toml exists, its overrides are merged.
+/// Directories named `.git` or `node_modules` are skipped before descent, so a
+/// missing `.gitignore` cannot turn their contents into projects. Other
+/// directories, including `dist/`, `build/`, `target/`, and `vendor/`, are
+/// left to `.gitignore` and the root `ignore` list. For each marker file found
+/// (e.g., package.json), the corresponding plugin parses the project. If an
+/// aster.toml exists, its overrides are merged.
 ///
 /// Name collisions are resolved by appending the plugin name suffix (e.g., core-nodejs).
 pub fn discover_projects(
@@ -89,10 +94,21 @@ pub fn discover_projects(
 
     // Phase 1: Walk the directory tree and collect project metadata + dependencies
     let walker = WalkBuilder::new(workspace_root)
-        .hidden(false) // Don't skip hidden dirs (except .git itself)
+        .hidden(false) // Hidden dirs can hold projects; .git is skipped below
         .git_ignore(true) // Honor .gitignore
         .git_exclude(true) // Honor .git/info/exclude
         .git_global(true) // Honor global gitignore
+        // .git and node_modules can never be user projects. Skip the
+        // directories themselves so the walker does not depend on .gitignore.
+        // A file with one of these names is left alone.
+        .filter_entry(|entry| {
+            let skipped_dir = entry.file_type().is_some_and(|kind| kind.is_dir())
+                && matches!(
+                    entry.file_name().to_str(),
+                    Some(".git") | Some("node_modules")
+                );
+            !skipped_dir
+        })
         .build();
 
     for entry in walker {
@@ -940,6 +956,81 @@ dependencies { implementation(project(":shared")) }
         // Only the api project should be found, not the one in node_modules
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].metadata.name, "api");
+    }
+
+    #[test]
+    fn discover_skips_git_and_node_modules_without_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name": "app"}"#).unwrap();
+
+        let nested = app.join("node_modules/is-odd");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("package.json"), r#"{"name": "is-odd"}"#).unwrap();
+        // A file with a skipped name is not a directory and is not a project.
+        std::fs::write(tmp.path().join("node_modules"), "not a directory").unwrap();
+
+        let git_project = tmp.path().join(".git/x");
+        std::fs::create_dir_all(&git_project).unwrap();
+        std::fs::write(git_project.join("package.json"), r#"{"name": "git-x"}"#).unwrap();
+
+        for (dir, name) in [
+            ("vendor/lib", "vendor-lib"),
+            ("dist/pkg", "dist-pkg"),
+            ("build/out", "build-out"),
+        ] {
+            let path = tmp.path().join(dir);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("package.json"),
+                format!(r#"{{"name": "{name}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let paths: Vec<String> = projects
+            .iter()
+            .map(|project| project.relative_path.display().to_string())
+            .collect();
+
+        assert!(paths.contains(&"app".to_string()), "{paths:?}");
+        assert!(paths.contains(&"vendor/lib".to_string()), "{paths:?}");
+        assert!(paths.contains(&"dist/pkg".to_string()), "{paths:?}");
+        assert!(paths.contains(&"build/out".to_string()), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.contains("node_modules") || path.starts_with(".git")),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_project_node_modules_stays_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("aster.toml"), "ignore = [\"hidden/**\"]\n").unwrap();
+
+        let hidden = tmp.path().join("hidden/app");
+        std::fs::create_dir_all(hidden.join("node_modules/pkg")).unwrap();
+        std::fs::write(hidden.join("package.json"), r#"{"name": "hidden-app"}"#).unwrap();
+        std::fs::write(
+            hidden.join("node_modules/pkg/package.json"),
+            r#"{"name": "pkg"}"#,
+        )
+        .unwrap();
+
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name": "app"}"#).unwrap();
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].relative_path, PathBuf::from("app"));
     }
 
     #[test]
