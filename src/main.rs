@@ -792,16 +792,21 @@ fn run() -> Result<()> {
 
             // Affected ignores are distinct from discovery ignores: they remove
             // matching Git changes before ownership, rationale, and files-list handling.
+            // `.aster/` is always dropped, including when it is not gitignored.
             let workspace_config = WorkspaceConfig::load(&workspace_root)?;
-            let unfiltered_count = changed_files.len();
-            let changed_files =
-                AffectedIgnore::build(&workspace_config.affected)?.filter(changed_files);
+            let ignore = AffectedIgnore::build(&workspace_config.affected)?;
+            let configured_ignored = changed_files
+                .iter()
+                .filter(|path| ignore.is_configured_ignore(path))
+                .count();
+            let changed_files = ignore.filter(changed_files);
 
             if output_mode == OutputMode::Verbose {
                 eprintln!("[aster] Found {} changed files", changed_files.len());
-                let ignored_count = unfiltered_count - changed_files.len();
-                if ignored_count > 0 {
-                    eprintln!("[aster] Ignored {ignored_count} changed files via affected.ignore");
+                if configured_ignored > 0 {
+                    eprintln!(
+                        "[aster] Ignored {configured_ignored} changed files via affected.ignore"
+                    );
                 }
                 for file in &changed_files {
                     eprintln!("  - {}", file.display());
