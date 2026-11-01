@@ -13,6 +13,30 @@ use crate::executor::command::parse_command;
 use crate::executor::{register_supervised_child, unregister_supervised_child};
 use crate::plugins::Target;
 
+/// How a supervised process left `poll`.
+///
+/// A terminating signal is not an exit code. Mapping it to `-1` hid SIGKILL
+/// behind `process exited with code -1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessExit {
+    Code(i32),
+    #[cfg(unix)]
+    Signal(i32),
+}
+
+impl ProcessExit {
+    fn from_status(status: std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return Self::Signal(signal);
+            }
+        }
+        Self::Code(status.code().unwrap_or(-1))
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct LogEvent {
     pub service: String,
@@ -148,11 +172,8 @@ impl ServiceProcess {
         })
     }
 
-    pub fn poll(&mut self) -> Result<Option<i32>> {
-        Ok(self
-            .child
-            .try_wait()?
-            .map(|status| status.code().unwrap_or(-1)))
+    pub fn poll(&mut self) -> Result<Option<ProcessExit>> {
+        Ok(self.child.try_wait()?.map(ProcessExit::from_status))
     }
 
     pub fn terminate(&mut self, grace: Duration) {

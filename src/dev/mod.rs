@@ -36,7 +36,7 @@ pub use port_report::{format_workspace_ports, workspace_ports_report, WorkspaceP
 pub use runner::attach_dashboard;
 pub use runner::{run_dev, DevOptions};
 pub use service_report::{
-    format_service_bundles, service_bundles_report, ServiceBundleReport, ServiceBundleState,
-    ServiceBundlesReport,
+    format_service_bundles, load_published_service_states, service_bundles_report,
+    ServiceBundleReport, ServiceBundleState, ServiceBundlesReport, ServiceRuntimeState,
 };
 pub use tls::{serve_tls, setup_tls};
