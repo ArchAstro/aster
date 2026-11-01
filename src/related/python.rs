@@ -11,7 +11,12 @@ use tree_sitter::Node;
 /// A name bound by an import, with the modules it may come from.
 struct Binding {
     local: String,
+    /// Alternatives for the bound name. Not parent packages: those are
+    /// [`Self::loads`], so an unresolved submodule stays unresolved.
     specs: Vec<String>,
+    /// Packages this import runs besides `specs` (`pkg` for `from pkg.core
+    /// import add`, `.` for `from .core import add`).
+    loads: Vec<String>,
     imported: Option<String>,
 }
 
@@ -26,6 +31,10 @@ struct Walker<'a> {
     bound: HashSet<String>,
     /// `name.member` accesses waiting to learn what `name` is.
     named_members: Vec<(Owner, String, String)>,
+    /// This file is a package `__init__.py`. Its top-level uses are re-exported,
+    /// so parent-package loads stay off `top` and on the definitions that
+    /// reference the import.
+    package_init: bool,
 }
 
 pub fn extract(path: &Path, source: &str) -> FileFacts {
@@ -46,6 +55,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         instance: None,
         bound: HashSet::new(),
         named_members: Vec::new(),
+        package_init: name == "__init__.py",
     };
     walker.bind(tree.root_node());
     walker.facts.members = true;
@@ -84,6 +94,34 @@ fn prefixes(module: &str) -> Vec<String> {
         out.push(format!("{dots}{current}"));
     }
     out
+}
+
+/// Packages a `from <module> import ...` runs, including `module`.
+///
+/// `prefixes` lists every named parent and keeps leading dots on each.
+/// A dots-only module (`from . import x`) is excluded: the caller already
+/// records that package. A relative module with a name (`from .core import
+/// add`) also records the leading dots alone, which resolve to the package
+/// `__init__.py`. `prefixes` does not emit that spec.
+fn from_modules(module: &str) -> Vec<String> {
+    let dots = module.chars().take_while(|c| *c == '.').count();
+    if dots == module.len() {
+        return Vec::new();
+    }
+    let mut specs = Vec::new();
+    if dots > 0 {
+        specs.push(".".repeat(dots));
+    }
+    specs.extend(prefixes(module));
+    specs
+}
+
+/// Parent packages of `module`, not `module` itself.
+fn parent_packages(module: &str) -> Vec<String> {
+    from_modules(module)
+        .into_iter()
+        .filter(|spec| spec != module)
+        .collect()
 }
 
 fn join(module: &str, name: &str) -> String {
@@ -324,16 +362,22 @@ impl Walker<'_> {
             for name in node.children_by_field_name("name", &mut cursor) {
                 let (module, alias) = self.aliased(name);
                 match alias {
-                    // `import a.b as c` binds the leaf module.
-                    Some(alias) => self.bindings.push(Binding {
-                        local: alias,
-                        specs: vec![module],
-                        imported: None,
-                    }),
+                    // `import a.b as c` binds the leaf. Parents run, but they
+                    // are not alternatives for the bound module.
+                    Some(alias) => {
+                        let loads = parent_packages(&module);
+                        self.bindings.push(Binding {
+                            local: alias,
+                            specs: vec![module],
+                            loads,
+                            imported: None,
+                        });
+                    }
                     // `import a.b` binds `a` and loads every level.
                     None => self.bindings.push(Binding {
                         local: module.split('.').next().unwrap_or(&module).to_string(),
                         specs: prefixes(&module),
+                        loads: Vec::new(),
                         imported: None,
                     }),
                 }
@@ -344,8 +388,17 @@ impl Walker<'_> {
             return;
         };
         let module = text(module, self.source).to_string();
+        let loads = parent_packages(&module);
+        // A wildcard binds no names. Parents still run; they are uses, not
+        // `uses_all` (that list is the module whose names arrive).
         if children(node).iter().any(|c| c.kind() == "wildcard_import") {
-            self.facts.uses_all.push(module);
+            self.facts.uses_all.push(module.clone());
+            // Not on a package `__init__.py`: its top-level uses are re-exported,
+            // and a relative parent that resolves to nothing would make the
+            // package opaque.
+            if !self.package_init {
+                self.facts.top.uses.extend(from_modules(&module));
+            }
             return;
         }
         let mut cursor = node.walk();
@@ -353,7 +406,13 @@ impl Walker<'_> {
         let module_level = node.parent().is_none_or(|parent| parent.kind() == "module");
         for name in node.children_by_field_name("name", &mut cursor) {
             let (imported, alias) = self.aliased(name);
-            let specs = vec![module.clone(), join(&module, &imported)];
+            // `from a.b import n`: `n` is a name in `a.b` or the module `a.b.n`.
+            // Parents are loads, not alternatives, so a missing submodule stays missing.
+            let leaf = join(&module, &imported);
+            let mut specs = vec![module.clone()];
+            if leaf != module {
+                specs.push(leaf);
+            }
             // `from m import name as alias`: the alias is a definition of
             // `name`, so a change to `name` reaches whoever imports the
             // alias. A later `from .wrap import minus as subtract` is its
@@ -367,13 +426,24 @@ impl Walker<'_> {
                     self.facts.push(def);
                 }
             }
-            // `from a import b`: `b` is a name in `a` or the module `a.b`.
             self.bindings.push(Binding {
                 local: alias.unwrap_or_else(|| imported.clone()),
                 specs,
+                loads: loads.clone(),
                 imported: Some(imported),
             });
         }
+    }
+
+    /// Record packages an import runs on the file, except in a package
+    /// `__init__.py`. That file re-exports every top-level use, and a new
+    /// parent spec must not change that set (issue 243) or mark the package
+    /// opaque when the parent does not resolve.
+    fn record_loads(&mut self, loads: &[String]) {
+        if self.package_init {
+            return;
+        }
+        self.facts.top.uses.extend(loads.iter().cloned());
     }
 
     /// `(name, alias)` of `x` or `x as y`.
@@ -447,6 +517,7 @@ impl Walker<'_> {
                     continue;
                 }
                 def.uses.extend(binding.specs.iter().cloned());
+                def.uses.extend(binding.loads.iter().cloned());
                 if let Some(imported) = &binding.imported {
                     def.refs.insert(imported.clone());
                 }
@@ -455,6 +526,7 @@ impl Walker<'_> {
         // An import nothing references still runs the module.
         for binding in &bindings {
             self.facts.top.uses.extend(binding.specs.iter().cloned());
+            self.record_loads(&binding.loads);
         }
     }
 }
@@ -504,8 +576,27 @@ class Cart(Base):
 "#;
         let facts = extract(Path::new("shop/cart.py"), source);
         assert_eq!(facts.uses_all, ["shop.legacy"]);
+        // `from shop.legacy import *` still runs `shop/__init__.py`.
+        assert!(facts.top.uses.contains("shop") && facts.top.uses.contains("shop.legacy"));
+        let money = facts
+            .imports
+            .iter()
+            .find(|import| import.names.iter().any(|name| name == "money"))
+            .unwrap();
+        // The alias binds the leaf. The parent is a use, not an alternative.
+        assert_eq!(money.specs, ["shop.money"]);
+        let stock = facts
+            .imports
+            .iter()
+            .find(|import| import.names.iter().any(|name| name == "hold"))
+            .unwrap();
+        assert!(stock.specs.contains(&".stock".to_string()));
+        assert!(!stock.specs.iter().any(|spec| spec == "."));
         let total = facts.defs.iter().find(|d| d.name == "total").unwrap();
-        assert!(total.uses.contains("shop.money"));
+        // `import shop.money as money` loads the package and the leaf.
+        assert!(total.uses.contains("shop") && total.uses.contains("shop.money"));
+        // `from .stock import hold` loads the enclosing package `__init__.py`.
+        assert!(total.uses.contains("."));
         assert!(total.uses.contains(".stock") && total.uses.contains(".stock.hold"));
         assert!(total.refs.contains("traced") && total.refs.contains("LIMIT"));
         assert_eq!(total.lines.0, 7);
@@ -563,5 +654,15 @@ class Cart(Base):
             "def run():\n    from .core import sub as minus\n    return minus\n",
         );
         assert!(nested.defs.iter().all(|d| d.name != "minus"));
+    }
+
+    #[test]
+    fn package_init_does_not_reexport_a_relative_parent() {
+        let source = "from ..sibling import name\n\ndef value():\n    return name\n";
+        let facts = extract(Path::new("pkg/sub/__init__.py"), source);
+        assert!(!facts.reexports.iter().any(|spec| spec == ".."));
+        assert!(facts.reexports.iter().any(|spec| spec == "..sibling"));
+        let value = facts.defs.iter().find(|d| d.name == "value").unwrap();
+        assert!(value.uses.contains("..") && value.uses.contains("..sibling"));
     }
 }
