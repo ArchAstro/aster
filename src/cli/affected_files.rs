@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::config::RelatedWrapperConfig;
 use crate::discovery::DiscoveredProject;
 use crate::executor::CommandOverride;
+use crate::git::file_owner::owned_files;
 use crate::plugins::related_tests::{
     package_script_aliases, package_script_body, package_script_calls, package_script_runners,
     Delegated, Wrappers,
@@ -144,16 +145,18 @@ pub fn plan_affected_commands(
                         .is_some_and(|t| t.capabilities.contains(&TargetCapability::FilesList))
                 })
                 .collect();
-            let project_files: Vec<PathBuf> = request
-                .changed_files
-                .iter()
-                .filter(|f| f.starts_with(&project.relative_path))
-                .map(|f| {
-                    f.strip_prefix(&project.relative_path)
-                        .unwrap_or(f)
-                        .to_path_buf()
-                })
-                .collect();
+            // The selected set can omit a nested owner. Ownership is decided
+            // against every discovered project, then paths are made relative
+            // to the project that will run the command.
+            let project_files: Vec<PathBuf> =
+                owned_files(project, request.all_projects, request.changed_files)
+                    .into_iter()
+                    .map(|file| {
+                        file.strip_prefix(&project.relative_path)
+                            .unwrap_or(file)
+                            .to_path_buf()
+                    })
+                    .collect();
 
             let narrowing = match outcome {
                 _ if request.declared_inputs.contains(&project_addr) => Narrowing::Full(
