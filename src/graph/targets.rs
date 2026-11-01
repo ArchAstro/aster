@@ -146,11 +146,22 @@ impl TargetGraph {
         let mut in_stack = vec![false; self.graph.node_count()];
         let mut path: Vec<NodeIndex> = Vec::new();
 
-        let result = depth_first_search(&self.graph, self.graph.node_indices(), |event| {
+        // Address order makes the reported rotation stable: the x/y fixture
+        // always prints `//x:build -> //y:build -> //x:build`, independent of
+        // HashMap insertion order. Acyclic graphs are unchanged.
+        let mut starts: Vec<NodeIndex> = self.graph.node_indices().collect();
+        starts.sort_by(|&left, &right| self.graph[left].address.cmp(&self.graph[right].address));
+        let result = depth_first_search(&self.graph, starts, |event| {
             match event {
                 DfsEvent::Discover(node, _) => {
                     in_stack[node.index()] = true;
                     path.push(node);
+                }
+                // A self-edge is a back edge to the node just discovered. The
+                // path still holds only that node, so the cycle is `[addr]`
+                // and Display prints `addr -> addr`.
+                DfsEvent::BackEdge(source, target) if source == target => {
+                    return Control::Break(vec![self.graph[source].address.clone()]);
                 }
                 DfsEvent::TreeEdge(_, target) | DfsEvent::BackEdge(_, target)
                     if in_stack[target.index()] =>
@@ -526,6 +537,43 @@ mod tests {
 
         let cycle = graph.find_cycle();
         assert!(cycle.is_some());
+    }
+
+    #[test]
+    fn self_dependency_is_a_cycle() {
+        let projects = vec![make_project(
+            "m",
+            vec![("build", "echo m", vec!["//m:build"])],
+        )];
+
+        let cycle = build_target_graph(&projects)
+            .find_cycle()
+            .expect("a self-edge is a back edge to the current node");
+        assert_eq!(cycle.cycle, vec!["//m:build".to_string()]);
+        assert_eq!(
+            cycle.to_string(),
+            "Dependency cycle detected: //m:build -> //m:build"
+        );
+    }
+
+    #[test]
+    fn cycle_report_starts_at_the_lexicographically_first_address() {
+        // Project order is the reverse of address order. The reported rotation
+        // still matches the issue fixture.
+        let projects = vec![
+            make_project("y", vec![("build", "echo y", vec!["//x:build"])]),
+            make_project("x", vec![("build", "echo x", vec!["//y:build"])]),
+        ];
+
+        let cycle = build_target_graph(&projects).find_cycle().unwrap();
+        assert_eq!(
+            cycle.cycle,
+            vec!["//x:build".to_string(), "//y:build".to_string()]
+        );
+        assert_eq!(
+            cycle.to_string(),
+            "Dependency cycle detected: //x:build -> //y:build -> //x:build"
+        );
     }
 
     #[test]

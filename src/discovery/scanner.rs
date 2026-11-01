@@ -331,14 +331,11 @@ pub fn discover_projects(
         sparse.then_some(workspace_root),
     )?;
 
-    if !cargo_owners.is_empty()
-        || projects
-            .iter()
-            .any(|project| project.targets.values().any(Target::is_dependency_only))
-    {
-        if let Some(cycle) = crate::graph::build_target_graph(&projects).find_cycle() {
-            anyhow::bail!("Target dependency cycle: {cycle}");
-        }
+    // Every command discovers projects before it runs targets. A target
+    // cycle, including a self-edge, is an error here so build/test/affected/
+    // list/check fail the same way graph and run already do.
+    if let Some(cycle) = crate::graph::build_target_graph(&projects).find_cycle() {
+        anyhow::bail!("{cycle}");
     }
 
     Ok(projects)
@@ -495,6 +492,8 @@ fn normalize_target_dependencies(
                     anyhow::bail!("Dependency-only target //{}:{name} requires missing prerequisite {missing}; include it in the checkout", project.relative_path.display());
                 }
             }
+            // A dependency on this target's own address is a self-cycle, not
+            // an unavailable edge. Keep it so cycle detection can reject it.
             target
                 .depends_on
                 .retain(|dependency| available.contains(dependency));
@@ -1059,6 +1058,36 @@ deploy = "npm run deploy"
             .is_empty());
         // Total: test (detected) + deps (detected) + deploy (custom) + clean (detected) = 4
         assert_eq!(projects[0].targets.len(), 4);
+    }
+
+    #[test]
+    fn discover_projects_rejects_a_self_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let project = tmp.path().join("m");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"m","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        // `//self:build` resolves to `//m:build` and must survive normalization.
+        std::fs::write(
+            project.join("aster.toml"),
+            r#"
+[targets.build]
+command = "echo m"
+depends_on = ["//self:build"]
+"#,
+        )
+        .unwrap();
+
+        let error = discover_projects(tmp.path(), &setup_registry()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("//m:build -> //m:build"),
+            "self-dependency was dropped or not reported: {message}"
+        );
     }
 
     #[test]
