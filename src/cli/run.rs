@@ -33,6 +33,8 @@ pub const PARSE_RUN_ARG_FLAGS: &[&str] = &[
     "--full-logs",
     "--lang",
     "--lang=",
+    "--help",
+    "-h",
 ];
 
 /// Parsed arguments for the run command
@@ -71,6 +73,8 @@ pub struct RunArgs {
     pub full_logs: bool,
     /// Filter by source language (e.g., "nodejs", "python", "java", "kotlin")
     pub lang: Vec<String>,
+    /// `--help` or `-h`: print usage and do not run the target.
+    pub help: bool,
 }
 
 /// Check if a target name conflicts with a reserved command
@@ -126,8 +130,14 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
     let mut expecting_lang = false;
     let mut jobs = None;
     let mut expecting_jobs = false;
+    let mut help = false;
 
     for arg in args {
+        // Before value-taking flags and the unknown-flag arm, so help never runs work.
+        if arg == "--help" || arg == "-h" {
+            help = true;
+            continue;
+        }
         if expecting_jobs {
             expecting_jobs = false;
             jobs = Some(arg);
@@ -221,6 +231,7 @@ pub fn parse_run_args(args: Vec<String>) -> RunArgs {
         json,
         full_logs,
         lang,
+        help,
     }
 }
 
@@ -455,6 +466,32 @@ mod tests {
         assert!(!args.all);
         assert!(!args.use_cwd);
         assert!(!args.warnings_as_errors);
+        assert!(!args.help);
+    }
+
+    #[test]
+    fn test_parse_run_args_help_does_not_run() {
+        for flag in ["--help", "-h"] {
+            let args = parse_run_args(vec!["build".to_string(), flag.to_string()]);
+            assert!(args.help, "{flag}");
+            assert_eq!(args.target, "build");
+        }
+
+        let with_other_flags = parse_run_args(vec![
+            "build".to_string(),
+            "--all".to_string(),
+            "--help".to_string(),
+        ]);
+        assert!(with_other_flags.help);
+        assert!(with_other_flags.all);
+
+        let unknown = parse_run_args(vec!["build".to_string(), "--no-such-flag".to_string()]);
+        assert!(!unknown.help);
+        assert_eq!(unknown.target, "build");
+
+        let short_verbose = parse_run_args(vec!["build".to_string(), "-v".to_string()]);
+        assert!(!short_verbose.help);
+        assert!(short_verbose.verbose);
     }
 
     #[test]

@@ -14,8 +14,7 @@ use aster::cli::affected_files::{
     apply_warnings_as_errors, plan_affected_commands, related_proxies, AffectedRequest,
 };
 use aster::cli::commands::{
-    conventional_target_help_name, external_target_name, external_target_requests_help,
-    print_target_command_usage,
+    conventional_target_help_name, explicit_target_help_name, print_target_command_usage,
 };
 use aster::cli::source_graph;
 use aster::cli::{
@@ -85,9 +84,29 @@ fn main() -> ExitCode {
     }
 }
 
+fn print_run_args_help(run_args: &aster::cli::RunArgs) {
+    let target = if run_args.target.is_empty() {
+        None
+    } else {
+        Some(run_args.target.as_str())
+    };
+    print_target_command_usage(target);
+}
+
+fn target_run_args(command: &Commands) -> Option<&Vec<String>> {
+    match command {
+        Commands::RunTarget { args } | Commands::ExternalTarget(args) => Some(args),
+        _ => None,
+    }
+}
+
 fn run() -> Result<()> {
     let argv: Vec<String> = env::args().skip(1).collect();
-    if let Some(target) = conventional_target_help_name(&argv) {
+    // Before clap: `aster help <name>`, and `aster target <name> --help`/`-h`
+    // (clap may consume that `--help` as the built-in `target` subcommand's flag).
+    if let Some(target) =
+        conventional_target_help_name(&argv).or_else(|| explicit_target_help_name(&argv))
+    {
         print_target_command_usage(Some(target));
         return Ok(());
     }
@@ -205,9 +224,10 @@ fn run() -> Result<()> {
 
     // Target-command help must work before project selection and outside a workspace.
     // `--help`/`-h` on an external target are ordinary args to clap, not clap's help flag.
-    if let Commands::ExternalTarget(args) = &command {
-        if external_target_requests_help(args) {
-            print_target_command_usage(external_target_name(args));
+    if let Some(args) = target_run_args(&command) {
+        let run_args = parse_run_args(args.clone());
+        if run_args.help {
+            print_run_args_help(&run_args);
             return Ok(());
         }
     }
@@ -1753,6 +1773,13 @@ fn run() -> Result<()> {
         Commands::RunTarget { ref args } | Commands::ExternalTarget(ref args) => {
             // Parse external subcommand args
             let run_args = parse_run_args(args.clone());
+            // Help must not validate, discover, or execute. The check above
+            // returns before workspace discovery; this is the same guard if a
+            // help request reaches the run arm.
+            if run_args.help {
+                print_run_args_help(&run_args);
+                return Ok(());
+            }
 
             if run_args.target.is_empty() {
                 return Err(anyhow::anyhow!("No target specified. Usage: aster <target> [projects...] [--all] [--no-deps] [--dependents]"));

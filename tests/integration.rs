@@ -4729,6 +4729,151 @@ fn target_commands_print_usage_for_help() {
 }
 
 #[test]
+fn target_help_flags_print_usage_and_run_nothing() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_package_json(
+        &tmp,
+        "app/package.json",
+        r#"{"name":"app","scripts":{"build":"touch built.marker","test":"touch tested.marker"}}"#,
+    );
+    // Help must not load workspace config.
+    fs::write(tmp.path().join("aster.toml"), "not = [valid").unwrap();
+
+    let project = tmp.path().join("app");
+    let built = project.join("built.marker");
+    let tested = project.join("tested.marker");
+    let outside = TempDir::new().unwrap();
+    let cases: &[(&std::path::Path, &[&str], &str)] = &[
+        (&project, &["build", "--help"], "build"),
+        (&project, &["build", "-h"], "build"),
+        (&project, &["target", "build", "--help"], "build"),
+        (&project, &["target", "build", "-h"], "build"),
+        (&project, &["test", "--help"], "test"),
+        (outside.path(), &["build", "--help"], "build"),
+        (outside.path(), &["target", "build", "--help"], "build"),
+    ];
+
+    for (cwd, args, usage_target) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(cwd)
+            .args(*args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "aster {args:?} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("Usage: aster {usage_target}"))
+                && stdout.contains("--all")
+                && stdout.contains("--no-deps")
+                && stdout.contains("--dependents")
+                && stdout.contains("--lang")
+                && stdout.contains("--jobs")
+                && stdout.contains("--no-cache")
+                && stdout.contains("--stream")
+                && stdout.contains("--warnings-as-errors"),
+            "aster {args:?} stdout missing usage:\n{stdout}"
+        );
+        assert!(
+            !built.exists() && !tested.exists(),
+            "aster {args:?} ran a target (built={}, tested={})",
+            built.exists(),
+            tested.exists()
+        );
+        assert!(
+            !stderr.contains("Not in an aster workspace")
+                && !stderr.contains("No projects specified")
+                && !stderr.contains("Failed to parse"),
+            "aster {args:?} stderr:\n{stderr}"
+        );
+    }
+
+    // Unknown flags stay ignored, and a build without help still runs.
+    fs::remove_file(tmp.path().join("aster.toml")).unwrap();
+    let ran = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(&project)
+        .args(["build", "--no-such-flag", "--no-deps", "--no-cache"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(
+        ran.status.success(),
+        "build with an unknown flag should still run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        built.exists(),
+        "build without --help should write the marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!tested.exists(), "build should not have run tests");
+}
+
+#[test]
+fn target_help_does_not_replace_builtin_help() {
+    let bin = env!("CARGO_BIN_EXE_aster");
+    let run = |args: &[&str]| {
+        let output = Command::new(bin).args(args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status, stdout, stderr)
+    };
+
+    for args in [
+        &["--help", "target", "build"][..],
+        &["-h", "target", "build"],
+    ] {
+        let (status, stdout, stderr) = run(args);
+        assert!(status.success(), "aster {args:?}\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("Usage: aster [OPTIONS]"),
+            "root help expected for {args:?}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("Usage: aster build"),
+            "root help was replaced by target usage for {args:?}:\n{stdout}"
+        );
+    }
+
+    for args in [&["target", "--help"][..], &["target", "--help", "build"]] {
+        let (status, stdout, stderr) = run(args);
+        assert!(status.success(), "aster {args:?}\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("Usage: aster target"),
+            "built-in target help expected for {args:?}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("Usage: aster build"),
+            "built-in target help was replaced for {args:?}:\n{stdout}"
+        );
+    }
+
+    let (status, stdout, stderr) = run(&["check", "--help"]);
+    assert!(status.success(), "aster check --help\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Usage: aster check"),
+        "check help changed:\n{stdout}"
+    );
+
+    let (status, stdout, stderr) = run(&["--jobs", "--help", "target", "build"]);
+    assert!(
+        !status.success(),
+        "--jobs --help should still fail\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--jobs"),
+        "expected clap to reject --jobs, stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Usage: aster build"),
+        "invalid --jobs printed target usage:\n{stdout}"
+    );
+}
+
+#[test]
 fn missing_toolchain_program_is_named_in_failure() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);
