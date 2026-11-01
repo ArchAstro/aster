@@ -101,6 +101,24 @@ pub(crate) fn escape_regex(text: &str) -> String {
     out
 }
 
+/// A test name as a regex fragment for Vitest, Jest, Bun and Node.
+///
+/// Metacharacters are escaped, then each whitespace character is written as
+/// `\s`. JUnit attribute normalisation turns a tab or newline into a space,
+/// so a pattern built from the report name still matches the name the runner
+/// has. The fragment stays end-anchored by the caller.
+fn name_pattern(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in escape_regex(name).chars() {
+        if c.is_whitespace() {
+            out.push_str(r"\s");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `^(a|b)$`, or `^a$` for one name.
 fn anchored_alternation(names: &[String]) -> String {
     match names {
@@ -396,8 +414,10 @@ const NODE_VALUE_FLAGS: &[&str] = &[
 /// Vitest and Jest match `-t` against the describe names and the test
 /// title joined by spaces, so `outer > inner > title` becomes
 /// `outer inner title`. The pattern is anchored at the end only: Vitest
-/// puts the file in front of the full name in some versions. Node matches
-/// each test's own name, and takes one `--test-name-pattern` per name.
+/// puts the file in front of the full name in some versions. Each
+/// whitespace character is `\s`, so a JUnit-normalised space still matches
+/// a tab or newline in the real name. Node matches each test's own name,
+/// and takes one `--test-name-pattern` per name.
 fn js(working_dir: &Path, command: &str, failures: &[&TestCase]) -> Option<Vec<String>> {
     let argv = Argv::parse(command)?;
     if let Some(start) = js_runner(&argv) {
@@ -494,7 +514,7 @@ fn js_selection(
             for name in names {
                 add.push(format!(
                     "--test-name-pattern=(?:^|\\s){}$",
-                    escape_regex(name)
+                    name_pattern(name)
                 ));
             }
         }
@@ -513,7 +533,7 @@ fn js_selection(
             names.dedup();
             let pattern = names
                 .iter()
-                .map(|n| format!("{}$", escape_regex(n)))
+                .map(|n| format!("{}$", name_pattern(n)))
                 .collect::<Vec<_>>()
                 .join("|");
             add.push("-t".to_string());
@@ -775,7 +795,7 @@ mod tests {
         assert_eq!(
             script,
             "vitest run ${FILE:-e2e} --reporter=junit --outputFile.junit=\"${OUT:-/tmp/r.xml}\" \
-             e2e/a.e2e.test.ts -t 'flaky one$'"
+             e2e/a.e2e.test.ts -t 'flaky\\sone$'"
         );
     }
 
@@ -788,7 +808,7 @@ mod tests {
         ];
         let found = one(dir, "bash -c './node_modules/.bin/vitest run'", &failures);
         let script = shell_words::split(&found).unwrap().pop().unwrap();
-        assert!(script.ends_with("-t '(flaky A$|flaky B$)'"), "{script}");
+        assert!(script.ends_with("-t '(flaky\\sA$|flaky\\sB$)'"), "{script}");
         let report_dir = Path::new("/tmp/aster-reports/1");
         let ctx = crate::test_results::ReportContext {
             project_dir: dir,
@@ -924,7 +944,7 @@ mod tests {
         assert_eq!(
             one(dir, "vitest run --coverage", &failures),
             "vitest run --coverage src/math.test.ts src/other.test.ts -t \
-             '(math adds \\(1\\+1\\) \\[x\\] returns 2$|top-level \\$ test$)'"
+             '(math\\sadds\\s\\(1\\+1\\)\\s\\[x\\]\\sreturns\\s2$|top-level\\s\\$\\stest$)'"
         );
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -935,9 +955,45 @@ mod tests {
                 "npx jest -t old src/old.test.ts",
                 &failures[..1]
             ),
-            "npx jest src/math.test.ts -t 'math adds \\(1\\+1\\) \\[x\\] returns 2$'"
+            "npx jest src/math.test.ts -t 'math\\sadds\\s\\(1\\+1\\)\\s\\[x\\]\\sreturns\\s2$'"
         );
         assert_eq!(build(dir, "vitest run --bail 1", &failures), None);
+    }
+
+    #[test]
+    fn a_name_with_whitespace_uses_a_whitespace_class() {
+        let dir = Path::new("/w");
+        let space = [failure(Some("src/names.test.ts"), None, "with tab")];
+        assert_eq!(
+            one(dir, "vitest run", &space),
+            "vitest run src/names.test.ts -t 'with\\stab$'"
+        );
+        // A tab or newline in the report name is the same class as a space.
+        let tab = [failure(Some("src/names.test.ts"), None, "with\ttab")];
+        assert_eq!(
+            one(dir, "vitest run", &tab),
+            "vitest run src/names.test.ts -t 'with\\stab$'"
+        );
+        let newline = [failure(Some("src/names.test.ts"), None, "with\nline")];
+        assert_eq!(
+            one(dir, "vitest run", &newline),
+            "vitest run src/names.test.ts -t 'with\\sline$'"
+        );
+        // Each name stays end-anchored, so a plain space does not select a
+        // different test.
+        let both = [
+            failure(Some("src/names.test.ts"), None, "with tab"),
+            failure(Some("src/names.test.ts"), None, "with space"),
+        ];
+        assert_eq!(
+            one(dir, "jest", &both),
+            "jest src/names.test.ts -t '(with\\sspace$|with\\stab$)'"
+        );
+        let node = [failure(Some("tests/a.test.mjs"), None, "with tab")];
+        assert_eq!(
+            one(dir, "node --test", &node),
+            "node --test '--test-name-pattern=(?:^|\\s)with\\stab$' tests/a.test.mjs"
+        );
     }
 
     #[test]
@@ -958,7 +1014,7 @@ mod tests {
         let bun = [failure(Some("a.test.ts"), Some("math"), "adds up")];
         assert_eq!(
             rerun("mise exec go -- bun test --timeout=60000", &bun).unwrap(),
-            ["mise exec go -- bun test --timeout=60000 a.test.ts -t 'adds up$'"]
+            ["mise exec go -- bun test --timeout=60000 a.test.ts -t 'adds\\sup$'"]
         );
         let go = [failure(None, Some("example.com/app"), "TestFlaky")];
         let rerun_go = rerun("mise exec go@1.24 -- go test ./...", &go).unwrap();
@@ -996,7 +1052,7 @@ mod tests {
         let failures = [failure(Some("a.test.ts"), Some("math"), "adds up")];
         assert_eq!(
             one(dir, "bun test --timeout 5000", &failures),
-            "bun test --timeout 5000 a.test.ts -t 'adds up$'"
+            "bun test --timeout 5000 a.test.ts -t 'adds\\sup$'"
         );
     }
 
@@ -1025,15 +1081,15 @@ mod tests {
         let failures = [failure(Some("a.test.ts"), None, "suite > case")];
         assert_eq!(
             one(tmp.path(), "pnpm test", &failures),
-            "pnpm test a.test.ts -t 'suite case$'"
+            "pnpm test a.test.ts -t 'suite\\scase$'"
         );
         assert_eq!(
             one(tmp.path(), "npm run test", &failures),
-            "npm run test -- a.test.ts -t 'suite case$'"
+            "npm run test -- a.test.ts -t 'suite\\scase$'"
         );
         assert_eq!(
             one(tmp.path(), "npm test", &failures),
-            "npm test -- a.test.ts -t 'suite case$'"
+            "npm test -- a.test.ts -t 'suite\\scase$'"
         );
         assert_eq!(build(tmp.path(), "pnpm ci", &failures), None);
     }
@@ -1054,7 +1110,7 @@ mod tests {
                 "node --test --test-name-pattern=old tests/old.test.mjs",
                 &failures
             ),
-            "node --test '--test-name-pattern=(?:^|\\s)it \\(works\\)$' \
+            "node --test '--test-name-pattern=(?:^|\\s)it\\s\\(works\\)$' \
              '--test-name-pattern=(?:^|\\s)second$' tests/a.test.mjs"
         );
         // A chained package script is not a direct `node --test`.
