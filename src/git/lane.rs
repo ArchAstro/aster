@@ -26,11 +26,14 @@ pub fn find_lane<'a>(
         }
     })?;
     // Matrix fields share the row with the fields Aster writes.
+    // A lane has no `lane` key — the table name is the lane — so the
+    // advice is always to rename the matrix field, never to set it on the lane.
     for key in lane.matrix.keys() {
         if MATRIX_ROW_KEYS.contains(&key.as_str()) {
+            let reserved = MATRIX_ROW_KEYS.join(", ");
             return Err(anyhow!(
-                "affected lane '{lane_name}' matrix field '{key}' is reserved; \
-                 set the lane's own `{key}` instead, or rename the field"
+                "affected lane '{lane_name}' matrix field '{key}' is reserved \
+                 (reserved: {reserved}); rename it"
             ));
         }
     }
