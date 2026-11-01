@@ -260,6 +260,11 @@ fn watch_ignores_non_input_file_changes() {
     write(&tmp, "libs/core/package.json", &nodejs_package("core"));
     write(&tmp, "libs/core/src/index.ts", "export const x = 1;\n");
     write(&tmp, "libs/core/README.md", "# core\n");
+    write(
+        &tmp,
+        "libs/core/aster.toml",
+        "\n[targets.build]\ncommand = \"echo core built\"\n\n[targets.build.cache]\nexclude = [\"README.md\"]\n",
+    );
 
     let mut cmd = Command::new(aster_bin());
     cmd.current_dir(tmp.path())
@@ -274,7 +279,7 @@ fn watch_ignores_non_input_file_changes() {
 
     drain_startup_events(&rx);
 
-    // Touch a file the build target's cache_inputs does NOT cover. The watcher
+    // Touch a file the build target's cache.exclude removes. The watcher
     // must not emit a change banner or rebuild.
     fs::write(tmp.path().join("libs/core/README.md"), "# core edited\n").unwrap();
 
@@ -285,7 +290,7 @@ fn watch_ignores_non_input_file_changes() {
 
     assert!(
         !observed.iter().any(|l| l.contains("change:")),
-        "README.md edit should not trigger watch cycle"
+        "README.md edit excluded from cache inputs should not trigger watch cycle"
     );
 }
 

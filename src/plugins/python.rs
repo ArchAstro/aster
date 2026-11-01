@@ -442,8 +442,10 @@ impl LanguagePlugin for PythonPlugin {
             };
         }
 
-        let mut inputs = super::CacheInputs {
-            source_globs: vec!["src/**/*.py".to_string(), "**/*.py".to_string()],
+        // Test data and tool configs are not `*.py`. `deps` stays lockfile-only
+        // above, including `.venv/pyvenv.cfg`.
+        super::CacheInputs {
+            source_globs: vec![super::PROJECT_FILES_GLOB.to_string()],
             config_files: vec![
                 "pyproject.toml".to_string(),
                 "poetry.lock".to_string(),
@@ -456,15 +458,7 @@ impl LanguagePlugin for PythonPlugin {
             path_env_vars: vec!["PYTHONPATH".to_string()],
             runtime_commands: vec!["python --version".to_string()],
             ..Default::default()
-        };
-
-        if target_name == "test" {
-            inputs.source_globs.push("tests/**/*.py".to_string());
-            inputs.source_globs.push("*_test.py".to_string());
-            inputs.source_globs.push("test_*.py".to_string());
         }
-
-        inputs
     }
 
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {

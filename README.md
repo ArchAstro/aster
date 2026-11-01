@@ -430,6 +430,8 @@ rest) with `aster ci cache-plan`, and share the artifact cache through
 
 Every cache key includes `platform:<os>-<arch>` (for example `platform:linux-x86_64`), so an artifact built on one OS and CPU architecture is never restored on another.
 
+Go, Node.js, Elixir, Rust, and Python targets other than `deps` hash every non-ignored file in the project. A change to testdata, a `//go:embed` file, a `.mjs` / `.css` / `.vue` module, Elixir `priv` or `test/support`, or a tool config (`vite.config.js`, `rustfmt.toml`, `clippy.toml`) misses the cache. `exclude` removes paths from that set and wins over the default. `deps` stays limited to lockfiles and toolchain files, so a source edit does not reinstall dependencies. The hasher skips tool caches (`node_modules`, `.venv`, `__pycache__`, `.pytest_cache`) at any depth, and `target`, `_build`, `deps`, `dist`, and `build` only at the project root, so `src/build` stays an input. Declared `[targets.*.cache] outputs` are not inputs either. `include` can name a file inside one of those directories. A build does not invalidate itself.
+
 `include`, `exclude`, and `env` extend a target's detected cache inputs.
 An `env` name ending in `*` matches every variable that starts with the name
 without that `*`, sorted by name. `FOO_*` hashes `FOO_A` and `FOO_B` and

@@ -305,8 +305,10 @@ impl LanguagePlugin for RustPlugin {
             };
         }
 
-        let mut inputs = super::CacheInputs {
-            source_globs: vec!["src/**/*.rs".to_string(), "build.rs".to_string()],
+        // include_str! assets, tests, benches, and rustfmt/clippy configs are
+        // not `src/**/*.rs`. `deps` stays lockfile-only above.
+        super::CacheInputs {
+            source_globs: vec![super::PROJECT_FILES_GLOB.to_string()],
             config_files: vec![
                 "Cargo.toml".to_string(),
                 "Cargo.lock".to_string(),
@@ -317,15 +319,7 @@ impl LanguagePlugin for RustPlugin {
             path_env_vars: vec!["CARGO_TARGET_DIR".to_string()],
             runtime_commands: vec!["rustc -vV".to_string()],
             ..Default::default()
-        };
-
-        // Add test files for test target
-        if target_name == "test" {
-            inputs.source_globs.push("tests/**/*.rs".to_string());
-            inputs.source_globs.push("benches/**/*.rs".to_string());
         }
-
-        inputs
     }
 
     fn workspace_cache_inputs(
@@ -812,7 +806,7 @@ version = "0.1.0"
         let plugin = RustPlugin;
         let inputs = plugin.cache_inputs("build");
 
-        assert!(inputs.source_globs.contains(&"src/**/*.rs".to_string()));
+        assert_eq!(inputs.source_globs, vec!["**/*".to_string()]);
         assert!(inputs.config_files.contains(&"Cargo.toml".to_string()));
         assert!(inputs.config_files.contains(&"Cargo.lock".to_string()));
         assert!(inputs.env_vars.contains(&"RUSTFLAGS".to_string()));
@@ -824,12 +818,13 @@ version = "0.1.0"
     }
 
     #[test]
-    fn test_cache_inputs_test_includes_test_files() {
+    fn test_cache_inputs_cover_tests_and_benches() {
         let plugin = RustPlugin;
         let inputs = plugin.cache_inputs("test");
 
-        assert!(inputs.source_globs.contains(&"tests/**/*.rs".to_string()));
-        assert!(inputs.source_globs.contains(&"benches/**/*.rs".to_string()));
+        // tests/ and benches/ are project files, not a separate glob list.
+        assert_eq!(inputs.source_globs, vec!["**/*".to_string()]);
+        assert!(plugin.cache_inputs("deps").source_globs.is_empty());
     }
 
     #[test]
