@@ -2662,3 +2662,75 @@ fn adding_or_removing_an_annotation_selects_the_test_it_belongs_to() {
         ["mix test test/shop/writer_test.exs"]
     );
 }
+
+/// `.aster/` is Aster's own state. A run must not make an unchanged tree look
+/// affected when that directory is not gitignored.
+#[test]
+fn aster_dir_is_never_a_change() {
+    let ws = Workspace::new(&[
+        ("package.json", r#"{"name":"app","private":true}"#),
+        ("aster.toml", "[targets.test]\ncommand = \"true\"\n"),
+        ("src/app.js", "export const answer = 1;\n"),
+    ]);
+    assert!(
+        !ws.root().join(".gitignore").exists(),
+        "fixture must not gitignore .aster"
+    );
+
+    let dry_run = || {
+        let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "affected failed: {stdout}\n{stderr}"
+        );
+        stdout
+    };
+
+    let first = dry_run();
+    assert!(
+        first.contains("No projects affected"),
+        "clean tree selected a project: {first}"
+    );
+
+    let tested = ws.aster(&["test", "--all"]);
+    assert!(
+        tested.status.success(),
+        "test --all failed: {}\n{}",
+        String::from_utf8_lossy(&tested.stdout),
+        String::from_utf8_lossy(&tested.stderr)
+    );
+    assert!(
+        ws.root().join(".aster/logs/latest.json").is_file(),
+        "test --all did not write .aster state, so a second dry-run would be vacuous"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(ws.root())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let porcelain = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        porcelain.lines().any(|line| line.contains(".aster")),
+        "git did not report .aster, so the ignore is untested:\n{porcelain}"
+    );
+
+    let second = dry_run();
+    assert!(
+        second.contains("No projects affected"),
+        ".aster state selected a project:\n{second}\ngit status:\n{porcelain}"
+    );
+
+    ws.edit("src/app.js", "answer = 1", "answer = 2");
+    let third = dry_run();
+    assert!(
+        third.contains("//:test") && third.contains("affected"),
+        "source edit should still select the project: {third}"
+    );
+    assert!(
+        !third.contains("No projects affected"),
+        "source edit was ignored: {third}"
+    );
+}

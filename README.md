@@ -1052,6 +1052,8 @@ Workspace-relative files can be excluded from affected analysis in the root
 ignore = [".agents/**", "docs/generated/**"]
 ```
 
+Paths under `.aster/` are ignored by change detection even when they are not gitignored.
+
 The root-level `ignore` list separately controls project discovery.
 
 ### Tests that read another project's files
