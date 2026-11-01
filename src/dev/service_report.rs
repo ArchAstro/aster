@@ -75,7 +75,8 @@ pub enum ServiceRuntimeExit {
 /// Path of `service-state-<bundle_id>.json` in the daemon runtime directory.
 ///
 /// The directory rule matches `daemon.rs` `runtime_directory`: an explicit
-/// `ASTER_DAEMON_RUNTIME_DIR`, otherwise the per-uid temp directory.
+/// `ASTER_DAEMON_RUNTIME_DIR`, then `$XDG_RUNTIME_DIR/aster-daemon-v1`, then
+/// `/tmp/aster-daemon-v1-<uid>`, independent of `$TMPDIR`.
 pub fn published_service_state_path(bundle_id: &str) -> Option<PathBuf> {
     if !bundle_id_is_file_safe(bundle_id) {
         return None;
@@ -138,13 +139,17 @@ fn signal_name_is_display_safe(name: &str) -> bool {
 }
 
 fn daemon_runtime_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("ASTER_DAEMON_RUNTIME_DIR") {
+    if let Some(path) = std::env::var_os("ASTER_DAEMON_RUNTIME_DIR").filter(|path| !path.is_empty())
+    {
         return PathBuf::from(path);
     }
     #[cfg(unix)]
     {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty()) {
+            return PathBuf::from(runtime).join("aster-daemon-v1");
+        }
         let uid = unsafe { libc::geteuid() };
-        std::env::temp_dir().join(format!("aster-daemon-v1-{uid}"))
+        PathBuf::from(format!("/tmp/aster-daemon-v1-{uid}"))
     }
     #[cfg(not(unix))]
     std::env::temp_dir().join("aster-daemon-v1")
