@@ -228,7 +228,9 @@ mod platform {
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{
+        DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+    };
     use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -481,22 +483,17 @@ mod platform {
                     )
                 })?;
             let directory = runtime_directory();
+            let socket = directory.join(SOCKET_NAME);
+            validate_socket_path(&socket)?;
             match fs::symlink_metadata(&directory) {
                 Ok(metadata) => validate_runtime_metadata(&directory, &metadata)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match fs::create_dir(&directory) {
-                        Ok(()) => {
-                            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-                                .map_err(internal("failed to secure daemon runtime directory"))?;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(error) => {
-                            return Err(daemon_error(
-                                DaemonErrorCode::Internal,
-                                format!("failed to create daemon runtime directory: {error}"),
-                            ));
-                        }
-                    }
+                    create_private_directory(&directory).map_err(|error| {
+                        daemon_error(
+                            DaemonErrorCode::Internal,
+                            format!("failed to create daemon runtime directory: {error}"),
+                        )
+                    })?;
                     validate_runtime_metadata(
                         &directory,
                         &fs::symlink_metadata(&directory)
@@ -517,7 +514,7 @@ mod platform {
                 }));
             ensure_secure_directory(&attach_directory)?;
             Ok(Self {
-                socket: directory.join(SOCKET_NAME),
+                socket,
                 instance_lock: directory.join(INSTANCE_LOCK_NAME),
                 startup_lock: directory.join(STARTUP_LOCK_NAME),
                 pid: directory.join(PID_NAME),
@@ -530,23 +527,66 @@ mod platform {
     }
 
     fn runtime_directory() -> PathBuf {
-        if let Some(path) = std::env::var_os("ASTER_DAEMON_RUNTIME_DIR") {
+        resolve_runtime_directory(
+            std::env::var_os("ASTER_DAEMON_RUNTIME_DIR"),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+        )
+    }
+
+    pub(super) fn resolve_runtime_directory(
+        override_dir: Option<std::ffi::OsString>,
+        xdg_runtime_dir: Option<std::ffi::OsString>,
+    ) -> PathBuf {
+        if let Some(path) = override_dir.filter(|path| !path.is_empty()) {
             return PathBuf::from(path);
         }
+        if let Some(runtime) = xdg_runtime_dir.filter(|runtime| !runtime.is_empty()) {
+            return PathBuf::from(runtime).join("aster-daemon-v1");
+        }
         let uid = unsafe { libc::geteuid() };
-        std::env::temp_dir().join(format!("aster-daemon-v1-{uid}"))
+        PathBuf::from(format!("/tmp/aster-daemon-v1-{uid}"))
+    }
+
+    /// `sockaddr_un.sun_path` must also hold a trailing NUL. Rust's standard
+    /// library rejects a path whose bytes-with-NUL exceed that field.
+    pub(super) fn unix_socket_path_limit() -> usize {
+        std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+            - 1
+    }
+
+    fn validate_socket_path(path: &Path) -> DaemonResult<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let limit = unix_socket_path_limit();
+        let length = path.as_os_str().as_bytes().len();
+        if length > limit {
+            return Err(daemon_error(
+                DaemonErrorCode::EndpointCollision,
+                format!(
+                    "daemon socket path {} is {length} bytes, which exceeds the SUN_LEN limit of {limit}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_private_directory(path: &Path) -> std::io::Result<()> {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn ensure_secure_directory(path: &Path) -> DaemonResult<()> {
         match fs::symlink_metadata(path) {
             Ok(metadata) => validate_runtime_metadata(path, &metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(path) {
-                    Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                        .map_err(internal("failed to secure daemon directory"))?,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(internal("failed to create daemon directory")(error)),
-                }
+                create_private_directory(path)
+                    .map_err(internal("failed to create daemon directory"))?;
                 validate_runtime_metadata(
                     path,
                     &fs::symlink_metadata(path)
@@ -1526,17 +1566,108 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn daemon_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(unix)]
+    struct DaemonRuntimeEnv {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl DaemonRuntimeEnv {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("ASTER_DAEMON_RUNTIME_DIR");
+            std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", path);
+            Self { previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DaemonRuntimeEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", value),
+                None => std::env::remove_var("ASTER_DAEMON_RUNTIME_DIR"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn runtime_directory_rejects_insecure_permissions() {
         use std::os::unix::fs::PermissionsExt;
+        let _env_lock = daemon_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("ASTER_DAEMON_RUNTIME_DIR", &runtime);
+        let _env = DaemonRuntimeEnv::set(&runtime);
         let error = platform::RuntimePaths::secure().err().unwrap();
-        std::env::remove_var("ASTER_DAEMON_RUNTIME_DIR");
         assert_eq!(error.code, DaemonErrorCode::InsecureRuntimeDirectory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_directory_uses_xdg_or_fixed_tmp_not_temp_dir() {
+        let ignored_tmpdir = PathBuf::from("/var/tmp/job-12345");
+        let xdg = platform::resolve_runtime_directory(None, Some("/run/user/1000".into()));
+        assert_eq!(xdg, PathBuf::from("/run/user/1000/aster-daemon-v1"));
+        assert!(!xdg.starts_with(&ignored_tmpdir));
+
+        let fallback = platform::resolve_runtime_directory(None, None);
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            fallback,
+            PathBuf::from(format!("/tmp/aster-daemon-v1-{uid}"))
+        );
+        assert!(!fallback.starts_with(&ignored_tmpdir));
+        assert_ne!(
+            fallback,
+            ignored_tmpdir.join(format!("aster-daemon-v1-{uid}"))
+        );
+
+        assert_eq!(
+            platform::resolve_runtime_directory(
+                Some("/custom/daemon".into()),
+                Some("/run/user/1000".into())
+            ),
+            PathBuf::from("/custom/daemon")
+        );
+        assert_eq!(
+            platform::resolve_runtime_directory(Some(std::ffi::OsString::new()), None),
+            fallback
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn too_long_runtime_directory_fails_before_startup_wait() {
+        let _env_lock = daemon_env_lock();
+        let limit = platform::unix_socket_path_limit();
+        let runtime = PathBuf::from(format!("/{}", "a".repeat(limit)));
+        let socket = runtime.join("daemon.sock");
+        let _env = DaemonRuntimeEnv::set(&runtime);
+        let started = std::time::Instant::now();
+        let error = platform::RuntimePaths::secure()
+            .err()
+            .expect("over-long socket path must fail");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "length check waited {elapsed:?} instead of failing immediately"
+        );
+        assert_eq!(error.code, DaemonErrorCode::EndpointCollision);
+        assert!(
+            error.message.contains(&socket.display().to_string()),
+            "{error:?}"
+        );
+        assert!(
+            error.message.contains("SUN_LEN") && error.message.contains(&limit.to_string()),
+            "{error:?}"
+        );
     }
 
     #[cfg(unix)]

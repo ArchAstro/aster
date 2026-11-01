@@ -1460,6 +1460,16 @@ reattaches, and `r` restarts the focused service through the supervisor. Use
 `services down [group]` to stop them, or `services daemon stop` for all bundles.
 The explicit `--daemon` flag remains a headless one-shot launch.
 
+The per-user daemon keeps its socket, pid, and log in `$XDG_RUNTIME_DIR/aster-daemon-v1`
+when `XDG_RUNTIME_DIR` is set, and otherwise in `/tmp/aster-daemon-v1-<uid>`. That
+directory is independent of `$TMPDIR`, mode 0700, and owned by the effective user,
+so workspaces started with different temporary directories share one daemon.
+`ASTER_DAEMON_RUNTIME_DIR` selects another directory with the same ownership rules.
+`<dir>/daemon.sock` must fit the platform Unix socket path limit (`SUN_LEN`, about
+104 bytes on macOS). A path that is too long fails immediately and names the path
+and that limit, instead of waiting out daemon startup. Dynamic port leases live in
+`$HOME/.cache/aster/port-leases-v1`; see [Concurrency across local workspaces](#concurrency-across-local-workspaces).
+
 Service stdout, stderr, and Aster lifecycle messages are also persisted to
 `.aster/logs/<worktree>/<service>/logs.txt` in the workspace. Each service log
 is capped at 10 MiB; Aster truncates it and continues writing when it reaches
@@ -1729,6 +1739,15 @@ State lives in `$HOME/.cache/aster/execution-v1`, independent of a job's
 isolated tests or independently managed budgets. Callers using different state
 directories, users, machines, or older Aster binaries do not share a bound.
 Do not delete active lockfiles: OS locks attach to their inodes.
+
+Dynamic dev-service ports share leases the same way, in
+`$HOME/.cache/aster/port-leases-v1` (created mode 0700). If `HOME` is unset,
+leases fall back to `/tmp/aster-port-leases-v1-<euid>`, a fixed `/tmp` path rather
+than `$TMPDIR`. `ASTER_PORT_LEASE_DIR` selects another directory. Workspaces
+started with different temporary directories and the same home therefore allocate
+disjoint dynamic ports. The per-user service daemon uses
+`$XDG_RUNTIME_DIR/aster-daemon-v1` or `/tmp/aster-daemon-v1-<uid>`, overridable
+with `ASTER_DAEMON_RUNTIME_DIR`; see [Development services](#development-services).
 
 `exclusive_resources` retains its existing within-invocation behavior for bare
 names. Explicit scopes additionally coordinate independent Aster processes:

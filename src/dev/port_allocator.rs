@@ -61,24 +61,7 @@ pub(crate) struct WorkspacePortAllocation {
 impl PortAllocator {
     pub(crate) fn lock() -> Result<Self> {
         let directory = lease_directory();
-        fs::create_dir_all(&directory).with_context(|| {
-            format!(
-                "failed to create port lease directory {}",
-                directory.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).with_context(
-                || {
-                    format!(
-                        "failed to secure port lease directory {}",
-                        directory.display()
-                    )
-                },
-            )?;
-        }
+        ensure_lease_directory(&directory)?;
         let allocation_lock = open_lock(&directory.join("allocation.lock"))?;
         allocation_lock
             .lock_exclusive()
@@ -417,15 +400,76 @@ fn port_is_available(port: u16) -> Result<bool> {
     }
 }
 
-fn lease_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("ASTER_PORT_LEASE_DIR") {
-        return PathBuf::from(path);
+fn ensure_lease_directory(directory: &Path) -> Result<()> {
+    if let Some(parent) = directory.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create port lease directory {}",
+                    directory.display()
+                )
+            })?;
+        }
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create port lease directory {}",
+                    directory.display()
+                )
+            });
+        }
     }
     #[cfg(unix)]
-    let identity = unsafe { libc::geteuid() }.to_string();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to secure port lease directory {}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Shared port leases. `$TMPDIR` must not split them across workspaces.
+fn lease_directory() -> PathBuf {
+    resolve_lease_directory(
+        std::env::var_os("ASTER_PORT_LEASE_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn resolve_lease_directory(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = override_dir.filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = home.filter(|home| !home.is_empty()) {
+        return PathBuf::from(home).join(".cache/aster/port-leases-v1");
+    }
+    #[cfg(unix)]
+    {
+        let euid = unsafe { libc::geteuid() };
+        PathBuf::from(format!("/tmp/aster-port-leases-v1-{euid}"))
+    }
     #[cfg(not(unix))]
-    let identity = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
-    std::env::temp_dir().join(format!("aster-port-leases-v1-{identity}"))
+    {
+        let identity = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
+        PathBuf::from(format!("aster-port-leases-v1-{identity}"))
+    }
 }
 
 #[cfg(test)]
@@ -440,5 +484,36 @@ mod tests {
 
         drop(listener);
         assert!(port_is_available(port).unwrap());
+    }
+
+    #[test]
+    fn lease_directory_uses_home_cache_not_temp_dir() {
+        let home = PathBuf::from("/srv/home/ada");
+        let ignored_tmpdir = PathBuf::from("/var/tmp/job-12345");
+        let path = resolve_lease_directory(None, Some(home.clone().into()));
+        assert_eq!(path, home.join(".cache/aster/port-leases-v1"));
+        assert!(!path.starts_with(&ignored_tmpdir));
+        assert_ne!(path, ignored_tmpdir.join("aster-port-leases-v1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_directory_falls_back_to_fixed_tmp_when_home_is_unset() {
+        let ignored_tmpdir = PathBuf::from("/var/tmp/job-12345");
+        let path = resolve_lease_directory(None, None);
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(
+            path,
+            PathBuf::from(format!("/tmp/aster-port-leases-v1-{euid}"))
+        );
+        assert!(!path.starts_with(&ignored_tmpdir));
+        assert_eq!(
+            resolve_lease_directory(Some("/custom/leases".into()), None),
+            PathBuf::from("/custom/leases")
+        );
+        assert_eq!(
+            resolve_lease_directory(Some(std::ffi::OsString::new()), Some("/home/ada".into())),
+            PathBuf::from("/home/ada/.cache/aster/port-leases-v1")
+        );
     }
 }
