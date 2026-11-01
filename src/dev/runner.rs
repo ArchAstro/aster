@@ -22,7 +22,11 @@ use crate::watch::WorkspaceIgnore;
 use super::dashboard::{Dashboard, DashboardAction, ServiceState, TerminalGuard};
 use super::log_files::ServiceLogFiles;
 use super::plan::{DevPlan, ServicePlan};
-use super::process::{LogEvent, ProcessLogSenders, ServiceProcess};
+use super::process::{LogEvent, ProcessExit, ProcessLogSenders, ServiceProcess};
+use super::service_report::{
+    daemon_bundle_id_from_env, published_service_state_path, ServiceRuntimeExit,
+    ServiceRuntimeState, ServiceRuntimeStatus,
+};
 #[cfg(unix)]
 use super::session::{ServiceSpec, SessionClient, SessionCommand, SessionEvent, SessionServer};
 
@@ -35,6 +39,7 @@ pub struct DevOptions {
 
 struct Runtime {
     process: Option<ServiceProcess>,
+    exit: Option<ServiceRuntimeExit>,
 }
 
 enum StartOutcome {
@@ -115,8 +120,19 @@ pub fn run_dev(
     let mut runtimes: HashMap<String, Runtime> = plan
         .services
         .iter()
-        .map(|service| (service.name.clone(), Runtime { process: None }))
+        .map(|service| {
+            (
+                service.name.clone(),
+                Runtime {
+                    process: None,
+                    exit: None,
+                },
+            )
+        })
         .collect();
+    // Replace any state file left by a previous supervisor for this bundle
+    // before services start, and remove it again when this supervisor exits.
+    let service_state_file = PublishedServiceState::start();
     let projects = Arc::new(projects);
     let (start_tx, start_rx) = mpsc::channel::<StartResult>();
     let mut active_start: Option<ActiveStart> = None;
@@ -170,8 +186,10 @@ pub fn run_dev(
                 let runtime = runtimes
                     .get_mut(&result.service)
                     .expect("start result service exists");
+                let publish_running = matches!(result.outcome, StartOutcome::Running(_));
                 match result.outcome {
                     StartOutcome::Running(process) => {
+                        runtime.exit = None;
                         runtime.process = Some(process);
                         set_service_state(
                             &mut dashboard,
@@ -189,6 +207,11 @@ pub fn run_dev(
                             &result.service,
                             ServiceState::Stopped,
                         );
+                    }
+                }
+                if publish_running {
+                    if let Some(file) = &service_state_file {
+                        file.write(&runtimes);
                     }
                 }
                 suppress_until = Instant::now() + Duration::from_millis(700);
@@ -230,14 +253,18 @@ pub fn run_dev(
                 }
             }
 
+            let mut service_state_changed = false;
             for service in &plan.services {
                 let runtime = runtimes.get_mut(&service.name).expect("runtime exists");
                 let exited = runtime
                     .process
                     .as_mut()
                     .and_then(|process| process.poll().ok().flatten());
-                if let Some(code) = exited {
+                if let Some(exit) = exited {
                     runtime.process.take();
+                    let recorded = recorded_exit(exit);
+                    emit_system(&system_tx, &service.name, exit_log_line(&recorded), true);
+                    runtime.exit = Some(recorded);
                     set_service_state(
                         &mut dashboard,
                         #[cfg(unix)]
@@ -245,13 +272,13 @@ pub fn run_dev(
                         &service.name,
                         ServiceState::Stopped,
                     );
-                    emit_system(
-                        &system_tx,
-                        &service.name,
-                        format!("process exited with code {code}"),
-                        true,
-                    );
+                    service_state_changed = true;
                     needs_draw = true;
+                }
+            }
+            if service_state_changed {
+                if let Some(file) = &service_state_file {
+                    file.write(&runtimes);
                 }
             }
 
@@ -324,23 +351,30 @@ pub fn run_dev(
                 while let Ok(request) = rx.try_recv() {
                     let response = match request.command.as_str() {
                         "status" => {
-                            let services = plan
-                                .services
-                                .iter()
-                                .map(|service| {
-                                    let running = runtimes
-                                        .get(&service.name)
-                                        .and_then(|runtime| runtime.process.as_ref())
-                                        .is_some();
-                                    (
-                                        service.name.clone(),
-                                        serde_json::Value::String(
-                                            if running { "running" } else { "stopped" }.to_string(),
-                                        ),
-                                    )
-                                })
-                                .collect::<serde_json::Map<_, _>>();
-                            serde_json::json!({"ok": true, "services": services})
+                            let mut services = serde_json::Map::new();
+                            let mut exits = serde_json::Map::new();
+                            for service in &plan.services {
+                                let runtime = runtimes.get(&service.name);
+                                let running = runtime
+                                    .and_then(|runtime| runtime.process.as_ref())
+                                    .is_some();
+                                services.insert(
+                                    service.name.clone(),
+                                    serde_json::Value::String(
+                                        if running { "running" } else { "stopped" }.to_string(),
+                                    ),
+                                );
+                                if !running {
+                                    if let Some(exit) =
+                                        runtime.and_then(|runtime| runtime.exit.clone())
+                                    {
+                                        if let Ok(value) = serde_json::to_value(&exit) {
+                                            exits.insert(service.name.clone(), value);
+                                        }
+                                    }
+                                }
+                            }
+                            serde_json::json!({"ok": true, "services": services, "exits": exits})
                         }
                         "list_services" => serde_json::json!({
                             "ok": true,
@@ -1075,6 +1109,21 @@ mod tests {
             &mut identities
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_name_table_names_the_documented_signals_and_leaves_the_rest_numeric() {
+        assert_eq!(super::signal_name(libc::SIGHUP), Some("SIGHUP"));
+        assert_eq!(super::signal_name(libc::SIGINT), Some("SIGINT"));
+        assert_eq!(super::signal_name(libc::SIGQUIT), Some("SIGQUIT"));
+        assert_eq!(super::signal_name(libc::SIGKILL), Some("SIGKILL"));
+        assert_eq!(super::signal_name(libc::SIGTERM), Some("SIGTERM"));
+        assert_eq!(super::signal_name(libc::SIGSEGV), Some("SIGSEGV"));
+        assert_eq!(super::signal_name(libc::SIGABRT), Some("SIGABRT"));
+        assert_eq!(super::signal_name(libc::SIGPIPE), Some("SIGPIPE"));
+        assert_eq!(super::signal_name(libc::SIGUSR1), None);
+        assert_eq!(super::signal_name(0), None);
+    }
 }
 
 fn drain_logs(
@@ -1121,6 +1170,142 @@ fn emit_system(
         line: line.into(),
         stderr,
     });
+}
+
+fn recorded_exit(exit: ProcessExit) -> ServiceRuntimeExit {
+    match exit {
+        ProcessExit::Code(code) => ServiceRuntimeExit::Code { code },
+        #[cfg(unix)]
+        ProcessExit::Signal(signal) => ServiceRuntimeExit::Signal {
+            signal,
+            name: signal_name(signal).map(str::to_string),
+        },
+    }
+}
+
+fn exit_log_line(exit: &ServiceRuntimeExit) -> String {
+    match exit {
+        ServiceRuntimeExit::Code { code } => format!("process exited with code {code}"),
+        ServiceRuntimeExit::Signal {
+            signal,
+            name: Some(name),
+        } => format!("process terminated by signal {name} ({signal})"),
+        ServiceRuntimeExit::Signal { signal, name: None } => {
+            format!("process terminated by signal {signal}")
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<&'static str> {
+    match signal {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        _ => None,
+    }
+}
+
+struct PublishedServiceState {
+    path: std::path::PathBuf,
+}
+
+impl PublishedServiceState {
+    fn start() -> Option<Self> {
+        let bundle_id = daemon_bundle_id_from_env()?;
+        let path = published_service_state_path(&bundle_id)?;
+        let publication = Self { path };
+        publication.write(&HashMap::new());
+        Some(publication)
+    }
+
+    fn write(&self, runtimes: &HashMap<String, Runtime>) {
+        write_published_service_state(&self.path, &service_state_document(runtimes));
+    }
+}
+
+impl Drop for PublishedServiceState {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn service_state_document(
+    runtimes: &HashMap<String, Runtime>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut names = runtimes.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut document = serde_json::Map::new();
+    for name in names {
+        let Some(state) = runtimes.get(&name).and_then(Runtime::published_state) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::to_value(state) {
+            document.insert(name, value);
+        }
+    }
+    document
+}
+
+impl Runtime {
+    fn published_state(&self) -> Option<ServiceRuntimeState> {
+        if self.process.is_some() {
+            return Some(ServiceRuntimeState {
+                state: ServiceRuntimeStatus::Running,
+                exit: None,
+            });
+        }
+        self.exit.clone().map(|exit| ServiceRuntimeState {
+            state: ServiceRuntimeStatus::Exited,
+            exit: Some(exit),
+        })
+    }
+}
+
+fn write_published_service_state(
+    path: &Path,
+    document: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("service-state.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(document)?;
+        bytes.push(b'\n');
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        eprintln!(
+            "[services] failed to publish service state {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn print_plan(plan: &DevPlan) {

@@ -224,7 +224,9 @@ fn run() -> Result<()> {
             ServicesCommands::List => {
                 let workspace_config = WorkspaceConfig::load(&workspace_root)?;
                 let bundles = aster::dev::list_workspace_bundles(&workspace_root)?;
-                let report = aster::dev::service_bundles_report(&workspace_root, bundles)?;
+                let published = aster::dev::load_published_service_states(&bundles);
+                let report =
+                    aster::dev::service_bundles_report(&workspace_root, bundles, &published)?;
                 if output_mode == OutputMode::Json {
                     output_json(&report)?;
                 } else if output_mode != OutputMode::Quiet {
