@@ -176,16 +176,20 @@ cache = { enabled = false }
         .unwrap();
 
     let child_pid_path = tmp.path().join("app/child.pid");
+    // `echo $$ > child.pid` creates the file before writing the pid. A poll
+    // that stops at existence can read that empty file under suite load.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !child_pid_path.exists() && Instant::now() < deadline {
+    let child_pid = loop {
+        if let Ok(pid) = fs::read_to_string(&child_pid_path)
+            .unwrap_or_default()
+            .trim()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "target process never started");
         std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(child_pid_path.exists(), "target process never started");
-    let child_pid: i32 = fs::read_to_string(&child_pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
 
     unsafe {
         libc::kill(aster.id() as i32, libc::SIGTERM);
