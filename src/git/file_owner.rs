@@ -4,46 +4,61 @@
 //! transitive dependents.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
 
-/// Map changed files to the projects that own them
+/// Map changed files to the projects that own them.
 ///
-/// A project owns a file if the file path starts with the project's relative_path.
-/// Projects are sorted by path length (longest first) to match most specific project
-/// (e.g., services/api/submodule matches before services/api).
-///
-/// Files that don't belong to any project (e.g., workspace root files like README.md)
-/// are ignored.
+/// A file belongs to the project with the longest `relative_path` that
+/// contains it. A nested project therefore wins over its parent and over the
+/// workspace root. A file that no project contains is ignored.
 pub fn files_to_projects(
     changed_files: &HashSet<PathBuf>,
     projects: &[DiscoveredProject],
 ) -> HashSet<String> {
-    // Sort projects by path length (longest first) to match most specific
-    let mut sorted_projects: Vec<_> = projects.iter().collect();
-    sorted_projects.sort_by(|a, b| {
-        let len_a = a.relative_path.as_os_str().len();
-        let len_b = b.relative_path.as_os_str().len();
-        len_b.cmp(&len_a)
-    });
-
     let mut affected = HashSet::new();
-
     for file in changed_files {
-        // Find which project owns this file
-        for project in &sorted_projects {
-            if file.starts_with(&project.relative_path) {
-                let address = format!("//{}", project.relative_path.display());
-                affected.insert(address);
-                break; // File belongs to most specific project
-            }
+        if let Some(owner) = most_specific_owner(projects, file) {
+            affected.insert(format!("//{}", owner.relative_path.display()));
         }
-        // If no project owns the file, it's ignored (workspace root file)
     }
-
     affected
+}
+
+/// Changed files whose most specific owner is `project`.
+///
+/// Paths stay workspace-relative and keep the order of `changed_files`.
+/// `projects` must be the full discovered set: a selected subset can omit a
+/// nested owner (a lane or language filter) and would hand its files to a
+/// shorter prefix, including the root's empty path.
+pub fn owned_files<'a>(
+    project: &DiscoveredProject,
+    projects: &[DiscoveredProject],
+    changed_files: impl IntoIterator<Item = &'a PathBuf>,
+) -> Vec<&'a PathBuf> {
+    changed_files
+        .into_iter()
+        .filter(|file| {
+            most_specific_owner(projects, file)
+                .is_some_and(|owner| owner.relative_path == project.relative_path)
+        })
+        .collect()
+}
+
+/// The project with the longest `relative_path` that contains `file`.
+///
+/// An empty `relative_path` is the workspace root and contains every file, so
+/// it owns a file only when no nested project does.
+fn most_specific_owner<'a>(
+    projects: &'a [DiscoveredProject],
+    file: &Path,
+) -> Option<&'a DiscoveredProject> {
+    projects
+        .iter()
+        .filter(|project| file.starts_with(&project.relative_path))
+        .max_by_key(|project| project.relative_path.as_os_str().len())
 }
 
 /// Expand directly affected projects to include all their dependents
@@ -181,6 +196,80 @@ mod tests {
         assert!(affected.contains("//services/api/submodule"));
         // Should NOT match services/api
         assert!(!affected.contains("//services/api"));
+    }
+
+    #[test]
+    fn test_files_to_projects_root_owns_only_files_outside_nested_projects() {
+        let projects = vec![
+            make_project("root", "", vec![]),
+            make_project("pkg", "pkg", vec![]),
+        ];
+        let changed: HashSet<PathBuf> = vec![
+            PathBuf::from("root.js"),
+            PathBuf::from("pkg/x.js"),
+            PathBuf::from("docs/guide.js"),
+        ]
+        .into_iter()
+        .collect();
+
+        let affected = files_to_projects(&changed, &projects);
+
+        assert!(affected.contains("//"));
+        assert!(affected.contains("//pkg"));
+        assert_eq!(affected.len(), 2);
+    }
+
+    #[test]
+    fn test_files_to_projects_nested_only_change_does_not_select_root() {
+        let projects = vec![
+            make_project("root", "", vec![]),
+            make_project("pkg", "pkg", vec![]),
+        ];
+        let changed: HashSet<PathBuf> = vec![PathBuf::from("pkg/x.js")].into_iter().collect();
+
+        let affected = files_to_projects(&changed, &projects);
+
+        assert_eq!(affected, HashSet::from(["//pkg".to_string()]));
+    }
+
+    #[test]
+    fn owned_files_gives_each_project_only_the_files_it_owns() {
+        let projects = vec![
+            make_project("root", "", vec![]),
+            make_project("pkg", "pkg", vec![]),
+            make_project("nested", "pkg/nested", vec![]),
+            make_project("api", "services/api", vec![]),
+            make_project("api-other", "services/api-other", vec![]),
+        ];
+        let changed = vec![
+            PathBuf::from("root.js"),
+            PathBuf::from("docs/guide.js"),
+            PathBuf::from("pkg/x.js"),
+            PathBuf::from("pkg/nested/y.js"),
+            PathBuf::from("services/api/main.rs"),
+            PathBuf::from("services/api-other/main.rs"),
+        ];
+
+        let names = |project: &DiscoveredProject| {
+            owned_files(project, &projects, &changed)
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(&projects[0]), vec!["root.js", "docs/guide.js"]);
+        assert_eq!(names(&projects[1]), vec!["pkg/x.js"]);
+        assert_eq!(names(&projects[2]), vec!["pkg/nested/y.js"]);
+        assert_eq!(names(&projects[3]), vec!["services/api/main.rs"]);
+        assert_eq!(names(&projects[4]), vec!["services/api-other/main.rs"]);
+    }
+
+    #[test]
+    fn owned_files_ignores_files_no_project_contains() {
+        let projects = vec![make_project("pkg", "pkg", vec![])];
+        let changed = vec![PathBuf::from("root.js")];
+
+        assert!(owned_files(&projects[0], &projects, &changed).is_empty());
     }
 
     #[test]

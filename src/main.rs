@@ -31,6 +31,7 @@ use aster::executor::{
     collect_selected_targets, collect_target_deps, compute_target_levels, install_signal_handler,
     parse_target_address, shutdown_signal, CommandOverride, Executor,
 };
+use aster::git::file_owner::owned_files;
 use aster::git::{
     affected_with_dependents, files_to_projects, find_lane, select_affected_lane,
     select_by_declared_inputs, AffectedDetector, AffectedIgnore,
@@ -1255,11 +1256,11 @@ fn run() -> Result<()> {
                     let mut files_per_project: HashMap<String, Vec<String>> = HashMap::new();
                     for project in &projects {
                         let project_addr = format!("//{}", project.relative_path.display());
-                        let project_files: Vec<String> = changed_files
-                            .iter()
-                            .filter(|f| f.starts_with(&project.relative_path))
-                            .map(|f| f.to_string_lossy().to_string())
-                            .collect();
+                        let project_files: Vec<String> =
+                            owned_files(project, &projects, &changed_files)
+                                .into_iter()
+                                .map(|file| file.to_string_lossy().into_owned())
+                                .collect();
                         if !project_files.is_empty() {
                             files_per_project.insert(project_addr, project_files);
                         }
