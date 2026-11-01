@@ -36,6 +36,18 @@ impl Workspace {
             .unwrap()
     }
 
+    /// A git checkout, so discovery stops at this directory rather than a
+    /// parent workspace. The issue repro has no root `aster.toml` until the
+    /// `[check]` step.
+    fn init_git(&self) {
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(self.tmp.path())
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+    }
+
     /// `aster --json check <args>`: the exit status and the parsed report.
     fn check(&self, args: &[&str]) -> (i32, Value) {
         let mut all = vec!["--json", "check"];
@@ -323,13 +335,81 @@ fn test_targets_that_no_entry_reaches_are_orphans() {
     let (_, report) = ws.check(&["--rule", "orphan-test-target", "--entry", "test-ci"]);
     assert!(places(&report, "orphan-test-target").contains(&"//shop:test-smoke".to_string()));
 
-    // Without lanes the rule is skipped, and says so.
+    // Without lanes and without an entry the rule is skipped, and says how
+    // to set one. It does not claim an entry cannot exist.
     let (_, report) = files("").check(&["--rule", "orphan-test-target"]);
     assert!(findings(&report, "orphan-test-target").is_empty());
-    assert!(report["skipped"][0]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("no [affected.lanes]"));
+    let reason = report["skipped"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("no entry target"), "{reason}");
+    assert!(reason.contains("[check] entries"), "{reason}");
+    assert!(!reason.contains("no [affected.lanes]"), "{reason}");
+}
+
+/// Issue #251: `--entry` and `[check] entries` are roots when the workspace
+/// has no `[affected.lanes]`.
+#[test]
+fn entries_without_lanes_drive_orphan_and_stale_allow_rules() {
+    let ws = Workspace::new(&[
+        (
+            "a/package.json",
+            r#"{"name":"a","scripts":{"test":"vitest run","test:slow":"vitest run --slow"}}"#,
+        ),
+        (
+            "a/aster.toml",
+            "[targets.test-orphan]\ncommand = \"vitest run --project orphan\"\n",
+        ),
+    ]);
+    ws.init_git();
+
+    let (status, report) = ws.check(&["--entry", "test", "--rule", "orphan-test-target"]);
+    assert_eq!(status, 0, "orphan findings are warnings: {report}");
+    assert_eq!(report["version"], 1);
+    assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+    let orphans = places(&report, "orphan-test-target");
+    assert!(
+        orphans.contains(&"//a:test-orphan".to_string()),
+        "{orphans:?} {report}"
+    );
+    assert!(
+        !orphans.contains(&"//a:test".to_string()),
+        "the entry itself is reached: {orphans:?}"
+    );
+    assert_eq!(report["summary"]["errors"], 0);
+
+    let (status, report) = ws.check(&["--rule", "orphan-test-target"]);
+    assert_eq!(status, 0, "{report}");
+    assert!(
+        findings(&report, "orphan-test-target").is_empty(),
+        "{report}"
+    );
+    let reason = report["skipped"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("no entry target is known"), "{reason}");
+    assert!(reason.contains("[check] entries"), "{reason}");
+    assert!(reason.contains("--entry"), "{reason}");
+    assert!(reason.contains("target"), "{reason}");
+    assert!(!reason.contains("there is no CI entry"), "{reason}");
+
+    ws.write(
+        "aster.toml",
+        "[check]\nentries = [\"test\"]\nallow_orphans = [\"//a:does-not-exist\"]\n",
+    );
+    let (status, report) = ws.check(&[
+        "--rule",
+        "orphan-test-target",
+        "--rule",
+        "stale-allow-orphan",
+    ]);
+    assert_eq!(status, 1, "a stale allow is an error: {report}");
+    assert!(
+        places(&report, "orphan-test-target").contains(&"//a:test-orphan".to_string()),
+        "{report}"
+    );
+    let stale = findings(&report, "stale-allow-orphan");
+    assert_eq!(stale.len(), 1, "{report}");
+    assert_eq!(stale[0]["target"], "//a:does-not-exist");
+    assert_eq!(stale[0]["severity"], "error");
+    assert_eq!(report["summary"]["errors"], 1);
+    assert_eq!(report["version"], 1);
 }
 
 #[test]
