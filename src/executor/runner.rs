@@ -4393,6 +4393,9 @@ mod tests {
         let mut gen_target = target("touch gen_ran", vec![]);
         gen_target.cache = Some(CacheConfig {
             enabled: Some(true),
+            // The marker only records that the command ran. Hashing it would
+            // make the post-run key differ, so the second run could not hit.
+            exclude: vec!["gen_ran".to_string()],
             ..Default::default()
         });
         let mut project = make_project_with_targets(

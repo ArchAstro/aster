@@ -333,7 +333,9 @@ fn checkout(dir: &Path) {
         r#"
 [targets.build]
 command = "bash -c 'mkdir -p out && echo hi > out/file.txt && echo ran >> runs.txt'"
-cache = { enabled = true, outputs = ["out/**"] }
+# runs.txt only counts executions. It is not an input: hashing it would
+# make the post-run key differ, so the result would never be stored.
+cache = { enabled = true, outputs = ["out/**"], exclude = ["runs.txt"] }
 "#,
     )
     .unwrap();
@@ -451,7 +453,9 @@ cache = {{ enabled = true, outputs = ["out/**"] }}
 
 [targets.lint]
 command = "bash -c 'echo lint >> {}'"
-cache = {{ enabled = true, outputs = [] }}
+# Build's declared output is not a lint input. Without this exclude, restoring
+# out/ changes lint's key after the shared lookup and forces a second one.
+cache = {{ enabled = true, outputs = [], exclude = ["out/**"] }}
 "#,
             root.path().join("runs.txt").display(),
             root.path().join("runs.txt").display(),
@@ -459,17 +463,23 @@ cache = {{ enabled = true, outputs = [] }}
     )
     .unwrap();
 
-    run_targets(&dir, &gateway.url, &["//app:build", "//app:lint"]);
+    let first_out = run_targets(&dir, &gateway.url, &["//app:build", "//app:lint"]);
     let first = gateway.lookups.load(Ordering::Relaxed);
-    assert!(first >= 1, "the level must look up at least once");
+    assert!(
+        first >= 1,
+        "the level must look up at least once: {}",
+        String::from_utf8_lossy(&first_out.stderr)
+    );
 
     std::fs::remove_dir_all(dir.join("app/out")).ok();
     std::fs::remove_dir_all(dir.join(".aster")).ok();
-    run_targets(&dir, &gateway.url, &["//app:build", "//app:lint"]);
+    let second_out = run_targets(&dir, &gateway.url, &["//app:build", "//app:lint"]);
     let second = gateway.lookups.load(Ordering::Relaxed) - first;
     assert_eq!(
-        second, 1,
-        "two targets at one level share one lookup, got {second}"
+        second,
+        1,
+        "two targets at one level share one lookup, got {second}: {}",
+        String::from_utf8_lossy(&second_out.stderr)
     );
 }
 

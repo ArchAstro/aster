@@ -229,7 +229,9 @@ fn checkout(dir: &Path) {
         r#"
 [targets.build]
 command = "bash -c 'mkdir -p out && echo hi > out/file.txt && echo ran >> runs.txt'"
-cache = { enabled = true, outputs = ["out/**"] }
+# runs.txt only counts executions. Hashing it would change the key after the
+# command writes it, so the result would never be stored or restored.
+cache = { enabled = true, outputs = ["out/**"], exclude = ["runs.txt"] }
 "#,
     )
     .unwrap();
