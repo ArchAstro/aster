@@ -418,8 +418,13 @@ A hit restores declared `outputs` from the artifact cache and skips execution.
 `{"cache_dir","targets":[{"address","key","created_at","outputs","output_bytes","exit_code"}]}`;
 human output prints the same fields as a table. `aster cache clear //proj`
 drops that project's index (`ArtifactCache::invalidate_project`);
-`aster cache clear //proj:target` drops one address. Blobs stay until
-`aster cache prune`. `.aster/cache/cache.json` is obsolete and unused. Clean
+`aster cache clear //proj:target` drops one address. `aster cache clear`
+removes every project index and nothing else. Blobs, manifests, and leftover
+`*.tmp.*` files from a killed writer stay until `aster cache prune`. Prune
+deletes `cas/` and `ac/` temp files older than one hour (the same grace as an
+in-flight blob) and counts every remaining temp file in the size it enforces
+and in `bytes remaining`. Reclaiming that disk is `aster cache prune`, not
+`aster cache clear`. `.aster/cache/cache.json` is obsolete and unused. Clean
 targets invalidate the project's cache after succeeding.
 
 `aster init` adds `.aster/` to the workspace `.gitignore` when that directory

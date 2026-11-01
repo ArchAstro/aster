@@ -23,8 +23,9 @@ use chrono::Utc;
 use console::style;
 
 use crate::cache::{
-    pack, project_of, prune_if_over_cap, resolve_cache_dir, restore, ArtifactCache, CacheHasher,
-    Digest, Manifest, PruneLimits, RuntimeInputCache, MANIFEST_SCHEMA_VERSION,
+    format_prune_summary, pack, project_of, prune_if_over_cap, resolve_cache_dir, restore,
+    ArtifactCache, CacheHasher, Digest, Manifest, PruneLimits, RuntimeInputCache,
+    MANIFEST_SCHEMA_VERSION,
 };
 use crate::cli::OutputMode;
 use crate::config::CacheConfig;
@@ -77,10 +78,7 @@ fn auto_prune_cache(workspace_root: &Path, output_mode: OutputMode) {
     };
     match prune_if_over_cap(workspace_root, limits) {
         Ok(Some(stats)) if output_mode != OutputMode::Quiet => {
-            eprintln!(
-                "[aster] Pruned {} manifests and {} blobs ({} bytes remaining)",
-                stats.manifests_removed, stats.blobs_removed, stats.bytes_remaining
-            );
+            eprintln!("[aster] {}", format_prune_summary(&stats));
         }
         Ok(_) => {}
         Err(error) => {
