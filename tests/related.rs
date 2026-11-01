@@ -1499,6 +1499,69 @@ fn python_change_selects_test_files_through_imports() {
 }
 
 #[test]
+fn python_renamed_import_in_init_reaches_alias_users() {
+    // Issue 243: `from .core import sub as minus` must carry a change to
+    // `sub` through to `from pkg import minus`, even when another test
+    // names `sub` directly. `test_add.py` is the named user of the
+    // unaliased re-export, so editing `add` must not fall back to every
+    // user of the module.
+    let ws = Workspace::new(&[
+        (
+            ".gitignore",
+            ".aster\nnode_modules\ntarget\n__pycache__\n.pytest_cache\n",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"pkg\"\nversion = \"0.1\"\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npythonpath = [\".\"]\n",
+        ),
+        (
+            "pkg/__init__.py",
+            "from .core import sub as minus\nfrom .core import add\n",
+        ),
+        (
+            "pkg/core.py",
+            "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n",
+        ),
+        (
+            "tests/test_minus.py",
+            "from pkg import minus\n\n\ndef test_minus():\n    assert minus(3, 1) == 2\n",
+        ),
+        (
+            "tests/test_sub.py",
+            "from pkg.core import sub\n\n\ndef test_sub():\n    assert sub(3, 1) == 2\n",
+        ),
+        (
+            "tests/test_add.py",
+            "from pkg import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+        ),
+    ]);
+    ws.edit("pkg/core.py", "return a - b", "return a - b + 1");
+    assert_eq!(
+        ws.plan("test").commands("//:test"),
+        ["pytest tests/test_minus.py tests/test_sub.py"]
+    );
+
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit("pkg/core.py", "return a + b", "return b + a");
+    assert_eq!(
+        ws.plan("test").commands("//:test"),
+        ["pytest tests/test_add.py"]
+    );
+
+    // Changing the alias import itself still seeds the alias definition.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit(
+        "pkg/__init__.py",
+        "from .core import sub as minus",
+        "from .core import sub as minus  # keep",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//:test"),
+        ["pytest tests/test_minus.py"]
+    );
+}
+
+#[test]
 fn wrapper_targets_narrow_their_test_prerequisite() {
     let mut files = ELIXIR.to_vec();
     files.push((
