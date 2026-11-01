@@ -9,7 +9,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::cache::matcher::TargetInputMatcher;
+use crate::cache::matcher::{
+    is_unhashed_cache_dir, pattern_names_cache_dir, specific_input_patterns, TargetInputMatcher,
+};
 use crate::cache::runtime::RuntimeInputCache;
 use crate::cache::CACHE_SCHEMA_VERSION;
 use crate::config::CacheConfig;
@@ -481,15 +483,24 @@ impl CacheHasher {
             return Ok(Vec::new());
         }
 
-        // Walk once. The ignore crate never visits gitignored directories
-        // (node_modules, target, .venv), so a matching glob cannot pull them
-        // into the key. Symlinks are not followed: a cycle or a link outside
-        // the project must not be hashed. Hidden files stay visible because
-        // a glob can name them on purpose. Nested project roots are pruned by
-        // their path relative to the root: the walker joins entry names onto
-        // the root exactly as given, so comparing relative paths works whether
-        // the root is canonical, a symlink, or a platform alias like /var.
+        // Walk once. The ignore crate never visits gitignored directories,
+        // so a matching glob cannot pull them into the key. Symlinks are not
+        // followed: a cycle or a link outside the project must not be hashed.
+        // Hidden files stay visible because a glob can name them on purpose.
+        // Nested project roots are pruned by their path relative to the root:
+        // the walker joins entry names onto the root exactly as given, so
+        // comparing relative paths works whether the root is canonical, a
+        // symlink, or a platform alias like /var.
+        //
+        // Tool-cache directories are pruned even when they are not gitignored.
+        // A build writes them; hashing them would miss on the next run.
+        // `target`, `_build`, `deps`, `dist`, and `build` are pruned only at
+        // the project root, so `src/build` and an embedded `internal/dist`
+        // stay inputs. A config file or `include` that names a pruned
+        // directory is still walked; the matcher then keeps only that file.
+        // Declared outputs are dropped by the matcher, including `bin/app`.
         let excluded = self.excluded_relative_dirs();
+        let specific = specific_input_patterns(plugin_inputs, user_config);
         let root = self.project_root.clone();
         let mut file_hashes = Vec::new();
 
@@ -504,7 +515,24 @@ impl CacheHasher {
                 let Ok(rel) = entry.path().strip_prefix(&root) else {
                     return true;
                 };
-                !excluded.iter().any(|dir| rel.starts_with(dir))
+                if excluded.iter().any(|dir| rel.starts_with(dir)) {
+                    return false;
+                }
+                // The root's own name can be `build` or `dist`. Only children
+                // of the project are tool caches.
+                if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    return true;
+                }
+                let Some(name) = entry.file_name().to_str() else {
+                    return true;
+                };
+                if !is_unhashed_cache_dir(name, entry.depth() == 1) {
+                    return true;
+                }
+                let dir_rel = rel.to_string_lossy().replace('\\', "/");
+                specific
+                    .iter()
+                    .any(|pattern| pattern_names_cache_dir(pattern, &dir_rel))
             })
             .build();
 
@@ -1965,5 +1993,202 @@ mod tests {
 
         // Restore permissions so the temp dir can be removed.
         let _ = std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644));
+    }
+
+    fn project_file_inputs() -> CacheInputs {
+        CacheInputs {
+            source_globs: vec!["**/*".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn hash_key(tmp: &TempDir, inputs: &CacheInputs, config: Option<&CacheConfig>) -> String {
+        CacheHasher::new(tmp.path(), tmp.path())
+            .compute_hash(
+                inputs,
+                config,
+                "build",
+                &[],
+                &HashMap::new(),
+                &RuntimeInputCache::new(tmp.path()),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn non_source_files_change_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let files = [
+            "testdata/want.txt",
+            "hello.txt",
+            "src/mod.mjs",
+            "src/app.css",
+            "vite.config.js",
+            ".clippy.toml",
+            "priv/static/app.js",
+        ];
+        for path in files {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "v1").unwrap();
+        }
+        let inputs = project_file_inputs();
+        let before = hash_key(&tmp, &inputs, None);
+        for path in files {
+            std::fs::write(tmp.path().join(path), "v2").unwrap();
+            let after = hash_key(&tmp, &inputs, None);
+            assert_ne!(before, after, "{path} must miss the cache");
+            std::fs::write(tmp.path().join(path), "v1").unwrap();
+            assert_eq!(hash_key(&tmp, &inputs, None), before, "{path} restored");
+        }
+    }
+
+    #[test]
+    fn user_exclude_removes_a_project_file_from_the_key() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("testdata")).unwrap();
+        std::fs::write(tmp.path().join("testdata/want.txt"), "v1").unwrap();
+        std::fs::write(tmp.path().join("src.mjs"), "v1").unwrap();
+        let inputs = project_file_inputs();
+        let config = CacheConfig {
+            exclude: vec!["testdata/**".to_string()],
+            ..Default::default()
+        };
+        let before = hash_key(&tmp, &inputs, Some(&config));
+        std::fs::write(tmp.path().join("testdata/want.txt"), "v2").unwrap();
+        assert_eq!(
+            hash_key(&tmp, &inputs, Some(&config)),
+            before,
+            "user exclude wins over the project-wide glob"
+        );
+        std::fs::write(tmp.path().join("src.mjs"), "v2").unwrap();
+        assert_ne!(
+            hash_key(&tmp, &inputs, Some(&config)),
+            before,
+            "an unexcluded file still misses"
+        );
+    }
+
+    #[test]
+    fn declared_outputs_do_not_change_the_key() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("hello.txt"), "hello").unwrap();
+        let inputs = project_file_inputs();
+        let config = CacheConfig {
+            outputs: Some(vec!["bin/app".to_string(), "generated/**".to_string()]),
+            ..Default::default()
+        };
+        let before = hash_key(&tmp, &inputs, Some(&config));
+        std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("generated")).unwrap();
+        std::fs::write(tmp.path().join("bin/app"), "binary").unwrap();
+        std::fs::write(tmp.path().join("generated/out.txt"), "out").unwrap();
+        assert_eq!(
+            hash_key(&tmp, &inputs, Some(&config)),
+            before,
+            "declared outputs must not miss a no-op rerun"
+        );
+        std::fs::write(tmp.path().join("bin/app"), "rebuilt").unwrap();
+        assert_eq!(hash_key(&tmp, &inputs, Some(&config)), before);
+
+        let without_outputs = hash_key(&tmp, &inputs, None);
+        std::fs::write(tmp.path().join("bin/app"), "again").unwrap();
+        assert_ne!(
+            hash_key(&tmp, &inputs, None),
+            without_outputs,
+            "without a declared output, the written file is an input"
+        );
+    }
+
+    #[test]
+    fn tool_caches_do_not_change_the_key_even_when_not_gitignored() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("hello.txt"), "hello").unwrap();
+        let inputs = project_file_inputs();
+        let before = hash_key(&tmp, &inputs, None);
+        for path in [
+            "node_modules/pkg/index.js",
+            "target/debug/app",
+            "_build/dev/lib/app.beam",
+            "deps/phoenix/mix.exs",
+            ".venv/lib/pkg/__init__.py",
+            "__pycache__/app.cpython-312.pyc",
+            "dist/out.js",
+            "build/out.js",
+            ".pytest_cache/v/cache",
+            "pkg.egg-info/PKG-INFO",
+            ".aster/cache/ac/key.json",
+            ".git/HEAD",
+        ] {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "v1").unwrap();
+        }
+        assert_eq!(
+            hash_key(&tmp, &inputs, None),
+            before,
+            "tool caches and Aster's own cache must not enter the key"
+        );
+        std::fs::write(tmp.path().join("node_modules/pkg/index.js"), "v2").unwrap();
+        std::fs::write(tmp.path().join("dist/out.js"), "v2").unwrap();
+        assert_eq!(hash_key(&tmp, &inputs, None), before);
+        std::fs::write(tmp.path().join("hello.txt"), "changed").unwrap();
+        assert_ne!(hash_key(&tmp, &inputs, None), before);
+
+        std::fs::create_dir_all(tmp.path().join("src/build")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("internal/dist")).unwrap();
+        std::fs::write(tmp.path().join("src/build/widget.ts"), "widget").unwrap();
+        std::fs::write(tmp.path().join("internal/dist/asset.txt"), "asset").unwrap();
+        let with_nested = hash_key(&tmp, &inputs, None);
+        assert_ne!(
+            with_nested, before,
+            "a source file under a nested build or dist directory is an input"
+        );
+        std::fs::write(tmp.path().join("src/build/widget.ts"), "widget-2").unwrap();
+        assert_ne!(hash_key(&tmp, &inputs, None), with_nested);
+    }
+
+    #[test]
+    fn include_can_name_a_file_inside_a_root_output_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
+        std::fs::write(tmp.path().join("dist/keep.txt"), "v1").unwrap();
+        std::fs::write(tmp.path().join("dist/other.txt"), "v1").unwrap();
+        let inputs = project_file_inputs();
+        let config = CacheConfig {
+            include: vec!["dist/keep.txt".to_string()],
+            ..Default::default()
+        };
+        let before = hash_key(&tmp, &inputs, Some(&config));
+        std::fs::write(tmp.path().join("dist/other.txt"), "v2").unwrap();
+        assert_eq!(hash_key(&tmp, &inputs, Some(&config)), before);
+        std::fs::write(tmp.path().join("dist/keep.txt"), "v2").unwrap();
+        assert_ne!(hash_key(&tmp, &inputs, Some(&config)), before);
+    }
+
+    #[test]
+    fn deps_still_hashes_venv_config_when_not_gitignored() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".venv/lib")).unwrap();
+        std::fs::write(tmp.path().join(".venv/pyvenv.cfg"), "version = 3.12\n").unwrap();
+        std::fs::write(tmp.path().join(".venv/lib/pkg.py"), "x = 1\n").unwrap();
+        let inputs = CacheInputs {
+            source_globs: vec![],
+            config_files: vec![".venv/pyvenv.cfg".to_string()],
+            ..Default::default()
+        };
+        let before = hash_key(&tmp, &inputs, None);
+        std::fs::write(tmp.path().join(".venv/lib/pkg.py"), "x = 2\n").unwrap();
+        assert_eq!(
+            hash_key(&tmp, &inputs, None),
+            before,
+            "a venv library is not a deps input"
+        );
+        std::fs::write(tmp.path().join(".venv/pyvenv.cfg"), "version = 3.13\n").unwrap();
+        assert_ne!(
+            hash_key(&tmp, &inputs, None),
+            before,
+            "deps must still see .venv/pyvenv.cfg"
+        );
     }
 }

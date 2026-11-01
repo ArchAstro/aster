@@ -21,6 +21,9 @@ pub const DEFAULT_IGNORE_GLOBS: &[&str] = &[
     "**/.next/**",
     "**/.turbo/**",
     "**/.venv/**",
+    "**/.pytest_cache/**",
+    "**/__pycache__/**",
+    "**/*.egg-info/**",
     "**/.elixir_ls/**",
     "**/.aster/**",
     "**/.DS_Store",
@@ -85,6 +88,8 @@ mod tests {
         assert!(wi.is_ignored(Path::new(".git/HEAD")));
         assert!(wi.is_ignored(Path::new("libs/core/target/debug/app")));
         assert!(wi.is_ignored(Path::new("services/platform/_build/dev/lib/x.beam")));
+        assert!(wi.is_ignored(Path::new("src/__pycache__/app.pyc")));
+        assert!(wi.is_ignored(Path::new(".pytest_cache/v/nodeids")));
         assert!(!wi.is_ignored(Path::new("services/api/src/main.ts")));
     }
 

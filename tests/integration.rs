@@ -5624,3 +5624,172 @@ testpaths = ["tests"]
         "a failed discovery must not print a JSON project list"
     );
 }
+
+/// Go and Node projects whose commands only read fixtures. No compiler.
+fn read_fixture_workspace(tmp: &TempDir) {
+    setup_workspace(tmp);
+    write_fixture(tmp, "goapp/go.mod", "module example.com/goapp\n\ngo 1.22\n");
+    write_fixture(tmp, "goapp/testdata/want.txt", "want-v1\n");
+    write_fixture(tmp, "goapp/hello.txt", "hello-v1\n");
+    write_fixture(tmp, "goapp/notes.txt", "notes-v1\n");
+    write_aster_toml(
+        tmp,
+        "goapp/aster.toml",
+        r#"
+[targets.deps]
+command = "true"
+
+[targets.deps.cache]
+runtime = []
+
+[targets.build]
+command = "sh -c 'mkdir -p bin && cat testdata/want.txt hello.txt > bin/app'"
+
+[targets.build.cache]
+runtime = []
+outputs = ["bin/app"]
+exclude = ["notes.txt"]
+"#,
+    );
+
+    write_package_json(
+        tmp,
+        "web/package.json",
+        r#"{"name":"web","scripts":{"build":"echo build"}}"#,
+    );
+    write_fixture(tmp, "web/src/mod.mjs", "export const n = 1\n");
+    write_fixture(tmp, "web/src/app.css", "body { color: black }\n");
+    write_fixture(tmp, "web/vite.config.js", "export default {}\n");
+    write_aster_toml(
+        tmp,
+        "web/aster.toml",
+        r#"
+[targets.deps]
+command = "true"
+
+[targets.deps.cache]
+runtime = []
+
+[targets.build]
+command = "sh -c 'mkdir -p dist && cat src/mod.mjs src/app.css vite.config.js > dist/out.txt'"
+
+[targets.build.cache]
+runtime = []
+outputs = ["dist/**"]
+"#,
+    );
+}
+
+fn aster_build_json(tmp: &TempDir) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["build", "//goapp", "//web", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "aster build failed: {stderr}\n{stdout}"
+    );
+    serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("aster build printed non-JSON ({error}): {stdout}\n{stderr}")
+    })
+}
+
+fn cached_by_address(json: &serde_json::Value) -> std::collections::BTreeMap<String, bool> {
+    json["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|result| {
+            (
+                result["address"].as_str().expect("address").to_string(),
+                result["cached"].as_bool().expect("cached"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn default_cache_keys_cover_files_targets_read() {
+    let tmp = TempDir::new().unwrap();
+    read_fixture_workspace(&tmp);
+
+    let first = cached_by_address(&aster_build_json(&tmp));
+    assert!(
+        first.values().all(|cached| !cached),
+        "the first run must execute: {first:?}"
+    );
+    assert!(tmp.path().join("goapp/bin/app").is_file());
+    assert!(tmp.path().join("web/dist/out.txt").is_file());
+
+    let warm = cached_by_address(&aster_build_json(&tmp));
+    assert!(
+        warm.values().all(|cached| *cached),
+        "a no-op rerun after outputs exist must hit: {warm:?}"
+    );
+
+    write_fixture(&tmp, "goapp/notes.txt", "notes-v2\n");
+    let excluded = cached_by_address(&aster_build_json(&tmp));
+    assert!(
+        excluded.values().all(|cached| *cached),
+        "user exclude must win: {excluded:?}"
+    );
+
+    for (path, missed, still_cached, other) in [
+        (
+            "goapp/testdata/want.txt",
+            "//goapp:build",
+            "//goapp:deps",
+            "//web:build",
+        ),
+        (
+            "goapp/hello.txt",
+            "//goapp:build",
+            "//goapp:deps",
+            "//web:build",
+        ),
+        (
+            "web/src/mod.mjs",
+            "//web:build",
+            "//web:deps",
+            "//goapp:build",
+        ),
+        (
+            "web/src/app.css",
+            "//web:build",
+            "//web:deps",
+            "//goapp:build",
+        ),
+        (
+            "web/vite.config.js",
+            "//web:build",
+            "//web:deps",
+            "//goapp:build",
+        ),
+    ] {
+        write_fixture(&tmp, path, "changed\n");
+        let run = cached_by_address(&aster_build_json(&tmp));
+        assert_eq!(
+            run.get(missed),
+            Some(&false),
+            "{path} must miss {missed}: {run:?}"
+        );
+        assert_eq!(
+            run.get(still_cached),
+            Some(&true),
+            "{path} must not rerun {still_cached}: {run:?}"
+        );
+        assert_eq!(
+            run.get(other),
+            Some(&true),
+            "{path} must not rerun {other}: {run:?}"
+        );
+        let again = cached_by_address(&aster_build_json(&tmp));
+        assert!(
+            again.values().all(|cached| *cached),
+            "no-op after {path} changed outputs must hit: {again:?}"
+        );
+    }
+}

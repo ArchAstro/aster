@@ -635,7 +635,8 @@ pub struct AffectedLaneConfig {
 /// Watch-mode configuration controlling fs-event ignore and suppression behavior.
 ///
 /// Built-in defaults always apply (`.git/`, `node_modules/`, `target/`, `_build/`,
-/// `.next/`, `dist/`, `.turbo/`, `.venv/`, `.elixir_ls/`). User patterns extend
+/// `.next/`, `dist/`, `.turbo/`, `.venv/`, `__pycache__/`, `.pytest_cache/`,
+/// `*.egg-info/`, `.elixir_ls/`). User patterns extend
 /// them — they never replace the defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -228,8 +228,10 @@ impl LanguagePlugin for ElixirPlugin {
             };
         }
 
-        let mut inputs = super::CacheInputs {
-            source_globs: vec!["lib/**/*.ex".to_string(), "lib/**/*.exs".to_string()],
+        // priv/, test/support, and other files Mix reads are not `lib/**/*.ex`.
+        // `deps` stays lockfile-only above.
+        super::CacheInputs {
+            source_globs: vec![super::PROJECT_FILES_GLOB.to_string()],
             config_files: vec![
                 "mix.exs".to_string(),
                 "mix.lock".to_string(),
@@ -238,13 +240,7 @@ impl LanguagePlugin for ElixirPlugin {
             env_vars: vec!["MIX_ENV".to_string()],
             runtime_commands: vec!["elixir --version".to_string()],
             ..Default::default()
-        };
-
-        if target_name == "test" {
-            inputs.source_globs.push("test/**/*.exs".to_string());
         }
-
-        inputs
     }
 
     fn native_caches(&self, ctx: &TargetContext) -> Vec<NativeCache> {
