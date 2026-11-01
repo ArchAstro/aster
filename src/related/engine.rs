@@ -2927,14 +2927,25 @@ impl<'a, 'b> Run<'a, 'b> {
             return;
         }
         // Tests written beside the code they test use it without importing
-        // anything.
+        // anything. Rust keeps those in the non-test file. A Go unit is the
+        // package directory, and its tests live in `_test.go` (including an
+        // external `package x_test`), so a callback such as `init` or
+        // `TestMain` never names them. Only the test functions: a helper in
+        // the same file is not a name `go test -run` can take, and marking
+        // it would make that package run in full.
         let beside: Vec<DefId> = ix.unit_files[unit as usize]
             .iter()
             .flat_map(|&file| {
                 let defs = &ix.sources[file as usize].facts.defs;
                 (0..defs.len() as u32).map(move |def| (file, def))
             })
-            .filter(|id| !ix.sources[id.0 as usize].facts.is_test_file && ix.is_test(*id))
+            .filter(|id| {
+                let facts = &ix.sources[id.0 as usize].facts;
+                if facts.family == Family::Go && facts.is_test_file {
+                    return facts.defs[id.1 as usize].is_test();
+                }
+                !facts.is_test_file && ix.is_test(*id)
+            })
             .collect();
         for &user in ix.users[unit as usize].iter().chain(&beside) {
             if user != from && (!from_test || ix.is_test(user)) {
