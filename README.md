@@ -1591,7 +1591,10 @@ daemon by default. Ordinary `aster services up` still opens the dashboard, but
 reattaches, and `r` restarts the focused service through the supervisor. Use
 `--no-ui` for a detached launch, `services list` to inspect worktree bundles,
 `services down [group]` to stop them, or `services daemon stop` for all bundles.
-The explicit `--daemon` flag remains a headless one-shot launch.
+The explicit `--daemon` flag remains a headless one-shot launch. If that
+launch fails before the supervisor is ready, the error includes the supervisor's
+startup output and the path of the retained startup log in the daemon runtime
+directory, not under `.aster/logs`.
 
 Services belong to the workspace directory that started them. Removing, renaming,
 or replacing that directory shuts down its services through the supervisor's
