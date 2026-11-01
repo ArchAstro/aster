@@ -7,6 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2066,6 +2067,119 @@ impl Drop for DaemonCliGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+fn write_cold_start_daemon_workspace(root: &Path) {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev]\ndaemon = true\n\n[dev.services.worker]\ntarget = \"//app:worker\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        "[targets.worker]\ncommand = \"sleep 60\"\nstream = true\n",
+    )
+    .unwrap();
+}
+
+/// Racing first-start clients must attach to one bundle. The runtime directory
+/// is created only by those clients, so a 0755 window fails this test.
+#[test]
+fn cold_start_clients_share_one_daemon_bundle() {
+    const ROUNDS: usize = 5;
+    const CLIENTS: usize = 3;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    write_cold_start_daemon_workspace(&root);
+
+    for round in 0..ROUNDS {
+        let runtime_dir = temp.path().join(format!("runtime-{round}"));
+        let lease_dir = temp.path().join(format!("leases-{round}"));
+        assert!(
+            !runtime_dir.exists(),
+            "round {round} runtime directory must not exist yet"
+        );
+        let guard = DaemonCliGuard {
+            runtime_dir: runtime_dir.clone(),
+            lease_dir: lease_dir.clone(),
+            cwd: root.clone(),
+        };
+        let barrier = Arc::new(Barrier::new(CLIENTS));
+        let mut handles = Vec::new();
+        for _ in 0..CLIENTS {
+            let barrier = Arc::clone(&barrier);
+            let runtime_dir = runtime_dir.clone();
+            let lease_dir = lease_dir.clone();
+            let cwd = root.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                Command::new(env!("CARGO_BIN_EXE_aster"))
+                    .args(["services", "up", "--no-ui", "--no-watch"])
+                    .current_dir(&cwd)
+                    .env("ASTER_DAEMON_RUNTIME_DIR", &runtime_dir)
+                    .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+                    .output()
+                    .expect("spawn aster services up")
+            }));
+        }
+        let outputs: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("client thread"))
+            .collect();
+        let texts: Vec<String> = outputs
+            .iter()
+            .map(|output| {
+                assert!(
+                    output.status.success(),
+                    "round {round} client exited {}: stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            })
+            .collect();
+        let started = texts.iter().filter(|text| text.contains("Started")).count();
+        let attached = texts
+            .iter()
+            .filter(|text| text.contains("Already running"))
+            .count();
+        assert_eq!(
+            (started, attached),
+            (1, CLIENTS - 1),
+            "round {round} statuses: {texts:?}"
+        );
+        let mode = fs::symlink_metadata(&runtime_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "round {round} runtime mode is {mode:o}");
+
+        let listed = guard
+            .command()
+            .args(["--json", "services", "list"])
+            .output()
+            .unwrap();
+        assert!(
+            listed.status.success(),
+            "round {round} list failed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(
+            listed["bundles"].as_array().map(Vec::len),
+            Some(1),
+            "round {round}: {listed}"
+        );
+        assert_eq!(
+            listed["bundles"][0]["services"],
+            serde_json::json!(["worker"])
+        );
     }
 }
 

@@ -228,7 +228,9 @@ mod platform {
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{
+        DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+    };
     use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -481,35 +483,9 @@ mod platform {
                     )
                 })?;
             let directory = runtime_directory();
-            match fs::symlink_metadata(&directory) {
-                Ok(metadata) => validate_runtime_metadata(&directory, &metadata)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match fs::create_dir(&directory) {
-                        Ok(()) => {
-                            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-                                .map_err(internal("failed to secure daemon runtime directory"))?;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(error) => {
-                            return Err(daemon_error(
-                                DaemonErrorCode::Internal,
-                                format!("failed to create daemon runtime directory: {error}"),
-                            ));
-                        }
-                    }
-                    validate_runtime_metadata(
-                        &directory,
-                        &fs::symlink_metadata(&directory)
-                            .map_err(internal("failed to inspect daemon runtime directory"))?,
-                    )?;
-                }
-                Err(error) => {
-                    return Err(daemon_error(
-                        DaemonErrorCode::InsecureRuntimeDirectory,
-                        format!("failed to inspect {}: {error}", directory.display()),
-                    ))
-                }
-            }
+            // mkdir applies 0700 before the directory is visible. create_dir
+            // then chmod leaves a 0755 window that a racing client rejects.
+            ensure_secure_directory(&directory)?;
             let runtime_id = bundle_id(&directory, "runtime");
             let attach_directory = PathBuf::from("/tmp")
                 .join(format!("aster-s-{}-{runtime_id}", unsafe {
@@ -541,9 +517,8 @@ mod platform {
         match fs::symlink_metadata(path) {
             Ok(metadata) => validate_runtime_metadata(path, &metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(path) {
-                    Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                        .map_err(internal("failed to secure daemon directory"))?,
+                match fs::DirBuilder::new().mode(0o700).create(path) {
+                    Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(internal("failed to create daemon directory")(error)),
                 }
