@@ -1,5 +1,8 @@
 //! Host execution admission for the CLI. File locks, not PID files or clocks,
 //! own capacity. An exec'd command supervisor retains them if its scheduler dies.
+//! The authority holder removes family directories whose owner and borrow locks
+//! are free. A family that has not created those locks yet is kept until the
+//! directory is older than ten minutes, so a concurrent acquire is not deleted.
 
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
@@ -14,6 +17,9 @@ use std::time::Duration;
 const CONTEXT_ENV: &str = "ASTER_EXECUTION_CONTEXT";
 const SPEC_ENV: &str = "ASTER_EXECUTION_SPEC";
 const INTERNAL_COMMAND: &str = "__aster_execute";
+/// Longer than the window in which acquire creates a family directory and its
+/// lock files, and short enough that a killed acquire does not leak forever.
+const STALE_FAMILY_GRACE: Duration = Duration::from_secs(10 * 60);
 static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Enable host admission when embedding the executor in an executable which
@@ -53,6 +59,120 @@ fn try_lock(file: &File) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+fn open_existing(path: &Path) -> std::io::Result<Option<File>> {
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+enum LockPresence {
+    Missing,
+    Free,
+    Held,
+}
+
+/// `None` means skip this family: the lock file could not be inspected.
+/// A free lock is pushed onto `held` and stays locked until that vector is dropped.
+fn inspect_lock(path: &Path, held: &mut Vec<File>) -> Option<LockPresence> {
+    let Some(file) = open_existing(path).ok()? else {
+        return Some(LockPresence::Missing);
+    };
+    match try_lock(&file) {
+        Ok(true) => {
+            held.push(file);
+            Some(LockPresence::Free)
+        }
+        Ok(false) => Some(LockPresence::Held),
+        Err(_) => None,
+    }
+}
+
+fn directory_older_than_grace(path: &Path) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    modified.elapsed().is_ok_and(|age| age > STALE_FAMILY_GRACE)
+}
+
+fn reclaim_stale_family(path: &Path) -> Result<()> {
+    // Hold owner across the borrow check and the removal. Dropping it first
+    // lets acquire lock owner and create an unlocked borrow, which then looks
+    // dead. Acquire does not hold authority.lock.
+    let mut held = Vec::new();
+    let Some(owner) = inspect_lock(&path.join("owner.lock"), &mut held) else {
+        return Ok(());
+    };
+    if matches!(owner, LockPresence::Held) {
+        return Ok(());
+    }
+    let Some(borrow) = inspect_lock(&path.join("borrow.lock"), &mut held) else {
+        return Ok(());
+    };
+    if matches!(borrow, LockPresence::Held) {
+        return Ok(());
+    }
+    let both_free = matches!((owner, borrow), (LockPresence::Free, LockPresence::Free));
+    // A missing lock file is not immediate proof of death: acquire creates the
+    // directory before either file. Keep it inside the grace period.
+    if !both_free && !directory_older_than_grace(path) {
+        return Ok(());
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale execution family {}", path.display()))
+        }
+    }
+    drop(held);
+    Ok(())
+}
+
+fn sweep_stale_families(directory: &Path) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read execution directory {}", directory.display()))
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read execution directory {}", directory.display()))
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("family-") {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat execution family {}", path.display()))
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        reclaim_stale_family(&path)?;
+    }
+    Ok(())
 }
 
 fn wait() -> Result<()> {
@@ -118,6 +238,11 @@ impl Host {
         }
         let epoch = open_lock(&directory.join("epoch.lock"))?;
         let idle = try_lock(&epoch)?;
+        // Lock tests decide liveness, so this runs on a busy epoch too. Hold
+        // authority.lock across the sweep so a new invocation cannot pass
+        // configured() until it finishes. An acquire already past that point
+        // does not hold this lock; missing lock files use the grace period.
+        sweep_stale_families(&directory)?;
         let settings = directory.join("capacity");
         let previous = match fs::read_to_string(&settings) {
             Ok(text) => Some(
@@ -495,4 +620,216 @@ fn supervise() -> Result<i32> {
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    fn host() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn family(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn touch_locks(path: &Path) {
+        open_lock(&path.join("owner.lock")).unwrap();
+        open_lock(&path.join("borrow.lock")).unwrap();
+    }
+
+    fn set_directory_mtime(path: &Path, time: SystemTime) {
+        File::open(path)
+            .unwrap_or_else(|error| panic!("open {}: {error}", path.display()))
+            .set_modified(time)
+            .unwrap_or_else(|error| panic!("set mtime {}: {error}", path.display()));
+    }
+
+    /// Holds an exclusive flock in another process. Same-process flock does not
+    /// conflict on every Unix, and production holders are other processes.
+    struct HeldLock(std::process::Child);
+
+    impl HeldLock {
+        fn exclusive(path: &Path) -> Self {
+            let mut child = Command::new("python3")
+                .arg("-u")
+                .arg("-c")
+                .arg(
+                    "import fcntl, os, sys, time\n\
+fd = os.open(sys.argv[1], os.O_RDWR)\n\
+fcntl.flock(fd, fcntl.LOCK_EX)\n\
+sys.stdout.buffer.write(b'held\\n')\n\
+sys.stdout.buffer.flush()\n\
+time.sleep(120)\n",
+                )
+                .arg(path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("python3 is required to hold a lock from another process");
+            let mut stdout = child.stdout.take().unwrap();
+            let mut buf = [0; 5];
+            stdout
+                .read_exact(&mut buf)
+                .expect("lock holder did not acquire the lock");
+            assert_eq!(&buf, b"held\n");
+            Self(child)
+        }
+    }
+
+    impl Drop for HeldLock {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn sweep_removes_dead_families_and_keeps_held_locks() {
+        let dir = host();
+        let dead = family(dir.path(), "family-dead");
+        touch_locks(&dead);
+        let owned = family(dir.path(), "family-owned");
+        touch_locks(&owned);
+        let borrowed = family(dir.path(), "family-borrowed");
+        touch_locks(&borrowed);
+        let owner_only = family(dir.path(), "family-owner-only");
+        open_lock(&owner_only.join("owner.lock")).unwrap();
+        set_directory_mtime(
+            &owner_only,
+            SystemTime::now() - Duration::from_secs(11 * 60),
+        );
+        let _owner = HeldLock::exclusive(&owned.join("owner.lock"));
+        let _borrow = HeldLock::exclusive(&borrowed.join("borrow.lock"));
+        let _owner_only = HeldLock::exclusive(&owner_only.join("owner.lock"));
+
+        sweep_stale_families(dir.path()).unwrap();
+
+        assert!(!dead.exists(), "dead family was kept");
+        assert!(owned.exists(), "live owner.lock was removed");
+        assert!(borrowed.exists(), "live borrow.lock was removed");
+        assert!(
+            owner_only.exists(),
+            "held owner.lock was removed because borrow.lock was missing and old"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_a_recent_family_without_lock_files_until_the_grace_period() {
+        let dir = host();
+        let fresh = family(dir.path(), "family-fresh");
+        let partial = family(dir.path(), "family-partial");
+        open_lock(&partial.join("owner.lock")).unwrap();
+        sweep_stale_families(dir.path()).unwrap();
+        assert!(fresh.exists(), "family without lock files was removed");
+        assert!(
+            partial.exists(),
+            "family whose borrow.lock was not created yet was removed"
+        );
+
+        let stale_at = SystemTime::now() - Duration::from_secs(11 * 60);
+        set_directory_mtime(&fresh, stale_at);
+        set_directory_mtime(&partial, stale_at);
+        sweep_stale_families(dir.path()).unwrap();
+        assert!(
+            !fresh.exists(),
+            "family without lock files survived the grace period"
+        );
+        assert!(
+            !partial.exists(),
+            "old family with a missing lock file was kept"
+        );
+    }
+
+    #[test]
+    fn sweep_leaves_admission_lock_files_untouched() {
+        let dir = host();
+        let dead = family(dir.path(), "family-dead");
+        touch_locks(&dead);
+        let kept = [
+            "slot-0.lock",
+            "slot-1.lock",
+            "epoch.lock",
+            "authority.lock",
+            "resource-abc.lock",
+            "capacity",
+            "family-not-a-dir",
+        ];
+        for name in kept {
+            fs::write(dir.path().join(name), name).unwrap();
+        }
+
+        sweep_stale_families(dir.path()).unwrap();
+
+        assert!(!dead.exists());
+        for name in kept {
+            let path = dir.path().join(name);
+            assert_eq!(
+                fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}")),
+                name.as_bytes(),
+                "{name} was removed or rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn two_threads_wait_for_authority_lock_before_sweeping() {
+        let dir = host();
+        let dead = family(dir.path(), "family-dead");
+        touch_locks(&dead);
+        let authority = dir.path().join("authority.lock");
+        open_lock(&authority).unwrap();
+        let holder = HeldLock::exclusive(&authority);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = dir.path().to_path_buf();
+            let entered = Arc::clone(&entered);
+            let blocked = Arc::clone(&blocked);
+            handles.push(std::thread::spawn(move || {
+                let authority = open_lock(&path.join("authority.lock")).unwrap();
+                entered.fetch_add(1, Ordering::SeqCst);
+                let mut reported = false;
+                while !try_lock(&authority).unwrap() {
+                    if !reported {
+                        blocked.fetch_add(1, Ordering::SeqCst);
+                        reported = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                sweep_stale_families(&path).unwrap();
+                drop(authority);
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while blocked.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sweep threads did not block on authority.lock (started {})",
+                entered.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dead.exists(),
+            "sweep removed a family while another process held authority.lock"
+        );
+        drop(holder);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            !dead.exists(),
+            "sweep did not run after authority.lock was released"
+        );
+    }
 }
