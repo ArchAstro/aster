@@ -673,6 +673,231 @@ stream = true
     after_release.terminate();
 }
 
+fn write_delayed_bind_workspace(root: &Path, start: u16, end: u16) {
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev]
+daemon = true
+
+[dev.ports.http]
+allocation = "dynamic"
+range = [{start}, {end}]
+preferred = {start}
+
+[dev.services.web]
+target = "//app:dev"
+port = "http"
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh -c 'sleep 1; exec python3 http_server.py {port}'"
+stream = true
+"#,
+    )
+    .unwrap();
+}
+
+fn aster_in(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+    command.args(args).current_dir(root);
+    command
+}
+
+fn shared_runtime_command(mut command: Command, home: &Path, tmp: &Path, xdg: &Path) -> Command {
+    command
+        .env("HOME", home)
+        .env("TMPDIR", tmp)
+        .env("XDG_RUNTIME_DIR", xdg)
+        .env_remove("ASTER_PORT_LEASE_DIR")
+        .env_remove("ASTER_DAEMON_RUNTIME_DIR");
+    command
+}
+
+fn launch_delayed_service(root: &Path, home: &Path, tmp: &Path, xdg: &Path) -> u16 {
+    let output = shared_runtime_command(
+        aster_in(root, &["--json", "services", "up", "--no-ui", "--no-watch"]),
+        home,
+        tmp,
+        xdg,
+    )
+    .output()
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "services up failed in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        root.display()
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("launch output was not JSON: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    report["bundle"]["ports"]["http"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing http port in {report}\nstderr:\n{stderr}")) as u16
+}
+
+/// Stops the isolated daemon even when an assertion panics.
+struct IsolatedDaemon {
+    xdg: std::path::PathBuf,
+    home: std::path::PathBuf,
+    tmp: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl Drop for IsolatedDaemon {
+    fn drop(&mut self) {
+        let _ = shared_runtime_command(
+            aster_in(&self.root, &["services", "daemon", "stop"]),
+            &self.home,
+            &self.tmp,
+            &self.xdg,
+        )
+        .output();
+        let _ = fs::remove_dir_all(&self.xdg);
+    }
+}
+
+#[test]
+fn dynamic_ports_do_not_collide_across_different_tmpdirs() {
+    let home = tempfile::tempdir().unwrap();
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let workspace_a = tempfile::tempdir().unwrap();
+    let workspace_b = tempfile::tempdir().unwrap();
+    let (start, _) = reserve_consecutive_dynamic_bundles();
+    let end = start + 1;
+    // A short shared runtime dir keeps the socket under SUN_LEN and away from
+    // any daemon the user already has under $XDG_RUNTIME_DIR or /tmp.
+    let xdg = std::path::PathBuf::from(format!("/tmp/aster-e2e-{}-{start}", std::process::id()));
+    fs::create_dir_all(&xdg).unwrap();
+    fs::set_permissions(&xdg, fs::Permissions::from_mode(0o700)).unwrap();
+    write_delayed_bind_workspace(workspace_a.path(), start, end);
+    write_delayed_bind_workspace(workspace_b.path(), start, end);
+    let _cleanup = IsolatedDaemon {
+        xdg: xdg.clone(),
+        home: home.path().to_path_buf(),
+        tmp: tmp_b.path().to_path_buf(),
+        root: workspace_b.path().to_path_buf(),
+    };
+
+    let home_path = home.path().to_path_buf();
+    let xdg_path = xdg.clone();
+    let root_a = workspace_a.path().to_path_buf();
+    let root_b = workspace_b.path().to_path_buf();
+    let tmp_a_path = tmp_a.path().to_path_buf();
+    let tmp_b_path = tmp_b.path().to_path_buf();
+    let first =
+        thread::spawn(move || launch_delayed_service(&root_a, &home_path, &tmp_a_path, &xdg_path));
+    let home_path = home.path().to_path_buf();
+    let xdg_path = xdg.clone();
+    let second =
+        thread::spawn(move || launch_delayed_service(&root_b, &home_path, &tmp_b_path, &xdg_path));
+    let port_a = first.join().expect("first launch thread panicked");
+    let port_b = second.join().expect("second launch thread panicked");
+    assert_ne!(port_a, port_b, "dynamic ports collided across TMPDIR");
+    assert!(
+        (start..=end).contains(&port_a),
+        "{port_a} outside {start}..={end}"
+    );
+    assert!(
+        (start..=end).contains(&port_b),
+        "{port_b} outside {start}..={end}"
+    );
+
+    let bound = condition_met(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", port_a)).is_ok()
+            && TcpStream::connect(("127.0.0.1", port_b)).is_ok()
+    });
+    if !bound {
+        let runtime = xdg.join("aster-daemon-v1");
+        panic!(
+            "ports {port_a} and {port_b} did not both accept a connection\nruntime {}:\n{}\ndaemon log:\n{}",
+            runtime.display(),
+            fs::read_dir(&runtime)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+            fs::read_to_string(runtime.join("daemon.log")).unwrap_or_default()
+        );
+    }
+
+    let lease_dir = home.path().join(".cache/aster/port-leases-v1");
+    assert_eq!(
+        allocation_manifest_count(&lease_dir),
+        2,
+        "leases were not shared under {}",
+        lease_dir.display()
+    );
+    let lease_mode = fs::metadata(&lease_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(lease_mode, 0o700, "lease directory mode was {lease_mode:o}");
+    let euid = unsafe { libc::geteuid() };
+    assert!(!tmp_a
+        .path()
+        .join(format!("aster-port-leases-v1-{euid}"))
+        .exists());
+    assert!(!tmp_b
+        .path()
+        .join(format!("aster-port-leases-v1-{euid}"))
+        .exists());
+    let socket = xdg.join("aster-daemon-v1/daemon.sock");
+    assert!(
+        socket.exists(),
+        "daemon socket missing at {}",
+        socket.display()
+    );
+    assert!(!tmp_a
+        .path()
+        .join(format!("aster-daemon-v1-{euid}"))
+        .exists());
+    assert!(!tmp_b
+        .path()
+        .join(format!("aster-daemon-v1-{euid}"))
+        .exists());
+
+    let stop = shared_runtime_command(
+        aster_in(
+            workspace_b.path(),
+            &["--json", "services", "daemon", "stop"],
+        ),
+        home.path(),
+        tmp_b.path(),
+        &xdg,
+    )
+    .output()
+    .unwrap();
+    let stop_stdout = String::from_utf8_lossy(&stop.stdout);
+    let stop_stderr = String::from_utf8_lossy(&stop.stderr);
+    assert!(
+        stop.status.success(),
+        "daemon stop failed\nstdout:\n{stop_stdout}\nstderr:\n{stop_stderr}"
+    );
+    let stopped: serde_json::Value = serde_json::from_str(stop_stdout.trim())
+        .unwrap_or_else(|error| panic!("daemon stop output was not JSON: {error}\n{stop_stdout}"));
+    assert_eq!(stopped["stopped"], 2, "{stopped}");
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", port_a)).is_err()
+            && TcpStream::connect(("127.0.0.1", port_b)).is_err()
+            && !socket.exists()
+    });
+}
+
 #[test]
 fn optional_service_proxy_preserves_the_advertised_port_end_to_end() {
     let temp = tempfile::tempdir().unwrap();
