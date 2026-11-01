@@ -52,6 +52,22 @@ boundary and can later hold workspace-wide settings for affected-project
 analysis, watch mode, and development services. Cache and logs live under
 `.aster/` and stay out of Git.
 
+Before the first `aster list`, add installed dependencies and build outputs to
+`.gitignore`. Discovery always skips `.git` and `node_modules` even without
+this file, but `dist/`, `build/`, `target/`, and `vendor/` are still discovered
+when they contain a project marker and are not ignored:
+
+```gitignore
+node_modules/
+dist/
+build/
+target/
+```
+
+```console
+printf '%s\n' 'node_modules/' 'dist/' 'build/' 'target/' >> .gitignore
+```
+
 ## 3. Add the shared library
 
 Create `packages/core/package.json`:
@@ -260,17 +276,11 @@ aster cache clear
 
 ## 8. Run only what changed
 
-Ignore build output before the first commit. `aster init` already added
-`.aster/` to `.gitignore`. Append `dist/` and `node_modules/` so `git add .`
-does not commit build artifacts or installed dependencies:
-
-```gitignore
-dist/
-node_modules/
-```
+The `.gitignore` created before `aster list` already lists `node_modules/` and
+build outputs, and `aster init` added `.aster/`. Commit that ignore file with
+the projects so installed dependencies and build artifacts stay out of Git:
 
 ```console
-printf '%s\n' 'dist/' 'node_modules/' >> .gitignore
 git add .
 git commit -m "create Aster demo"
 ```
@@ -313,12 +323,14 @@ Ctrl-C to stop.
 For a real repository:
 
 1. Run `aster init` once at the Git root. Init adds `.aster/` to `.gitignore`.
-2. Run `aster list` to review automatically detected projects and targets.
-3. Add a project-level `aster.toml` only where you need custom commands,
+2. Add `node_modules/` and build outputs (`dist/`, `build/`, `target/`) to
+   `.gitignore` before the first `aster list`.
+3. Run `aster list` to review automatically detected projects and targets.
+4. Add a project-level `aster.toml` only where you need custom commands,
    dependency edges, caching inputs or outputs, aliases, or file capabilities.
-4. Start with a narrow command such as `aster test //path/to/project`, then
+5. Start with a narrow command such as `aster test //path/to/project`, then
    expand to `--all` or `aster affected` after the graph looks correct.
-5. Add the verified command to CI. With `--retry-failed --test-results`,
+6. Add the verified command to CI. With `--retry-failed --test-results`,
    Aster retries only failing tests and records every result; see
    [Test tracking](docs/test-tracking.md) to send them to aster-srv for flake
    detection and quarantine.
