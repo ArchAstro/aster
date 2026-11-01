@@ -1794,7 +1794,7 @@ fn run() -> Result<()> {
                     unreachable!("handled before workspace discovery")
                 }
                 CacheCommands::Prune { max_size, max_age } => {
-                    use aster::cache::{prune_cache, PruneLimits};
+                    use aster::cache::{format_prune_summary, prune_cache, PruneLimits};
                     use aster::config::WorkspaceConfig;
 
                     let workspace = WorkspaceConfig::load(&workspace_root)?;
@@ -1807,12 +1807,7 @@ fn run() -> Result<()> {
                     if output_mode == OutputMode::Json {
                         output_json(&stats)?;
                     } else if output_mode != OutputMode::Quiet {
-                        outln!(
-                            "Pruned {} manifests and {} blobs ({} bytes remaining)",
-                            stats.manifests_removed,
-                            stats.blobs_removed,
-                            stats.bytes_remaining
-                        );
+                        outln!("{}", format_prune_summary(&stats));
                     }
                 }
             }

@@ -202,11 +202,15 @@ impl LocalStore {
     }
 
     /// Drop old and least-recently-used manifests, then delete blobs no
-    /// surviving manifest references.
+    /// surviving manifest references. Also delete `*.tmp.*` files under
+    /// `cas/` and `ac/` older than `UNREFERENCED_BLOB_GRACE`.
     ///
     /// Manifest mtime is the access time (`get_manifest` touches it). Age is
-    /// applied first. Size is the sum of on-disk `cas/**/*.zst` lengths;
-    /// oldest manifests are removed until that sum is at or under `max_size`.
+    /// applied first. Size is the sum of on-disk `cas/**/*.zst` lengths plus
+    /// leftover temp files; oldest manifests are removed until that sum is at
+    /// or under `max_size`. A temp file younger than the grace counts toward
+    /// that sum and is never deleted. Stale temp files are removed before the
+    /// size check so they do not evict a manifest that would otherwise fit.
     /// `None` disables that limit. An exclusive `cache.lock` is held for the
     /// whole scan, manifest delete, and blob sweep so a blob is unlinked only
     /// after every surviving manifest has been decoded. Writers hold the same
@@ -222,6 +226,13 @@ impl LocalStore {
 
     fn prune_locked(&self, max_size: Option<u64>, max_age: Option<Duration>) -> Result<PruneStats> {
         let now = SystemTime::now();
+        let grace_cutoff = now.checked_sub(UNREFERENCED_BLOB_GRACE);
+        // A killed writer leaves `*.tmp.*` next to the blob or manifest it
+        // was renaming into place. Sweep those before size accounting so a
+        // stale temp does not evict a manifest the cap would otherwise keep.
+        // A file newer than the grace is a live or just-killed writer: keep
+        // it, but count its bytes.
+        let tmp_files_removed = self.sweep_stale_tmp_files(grace_cutoff)?;
         let mut manifests = self.scan_manifests()?;
         manifests.sort_by(|left, right| {
             left.modified
@@ -261,11 +272,15 @@ impl LocalStore {
         if let Some(max_size) = max_size {
             // Survivors are oldest-first. Drop from the front until the
             // on-disk bytes that would remain after the sweep fit. Orphans
-            // are not in that total: the sweep deletes them. A blob shared
-            // with a newer manifest stays referenced, so it is never deleted.
+            // are not in that total: the sweep deletes them. Fresh temp files
+            // are: they are never deleted. A blob shared with a newer
+            // manifest stays referenced, so it is never deleted.
             let blob_sizes = self.blob_sizes()?;
+            let tmp_bytes = self.tmp_bytes()?;
             let mut index = 0;
-            while index < survivors.len() && remaining_bytes(&blob_sizes, &referenced) > max_size {
+            while index < survivors.len()
+                && remaining_bytes(&blob_sizes, &referenced).saturating_add(tmp_bytes) > max_size
+            {
                 index += 1;
                 referenced.clear();
                 for entry in &survivors[index..] {
@@ -294,18 +309,20 @@ impl LocalStore {
             }
         }
 
-        let grace_cutoff = now.checked_sub(UNREFERENCED_BLOB_GRACE);
         let blobs_removed = self.sweep_unreferenced_blobs(&referenced, grace_cutoff)?;
         Ok(PruneStats {
             manifests_removed,
             blobs_removed,
+            tmp_files_removed,
             bytes_remaining: self.cas_bytes()?,
         })
     }
 
-    /// On-disk size of every `cas/**/*.zst` blob.
+    /// On-disk size of every `cas/**/*.zst` blob plus leftover `*.tmp.*`
+    /// files under `cas/` and `ac/`.
     pub fn cas_bytes(&self) -> Result<u64> {
-        Ok(self.blob_sizes()?.into_values().sum())
+        let blobs = self.blob_sizes()?.into_values().sum::<u64>();
+        Ok(blobs.saturating_add(self.tmp_bytes()?))
     }
 
     fn blob_sizes(&self) -> Result<HashMap<Digest, u64>> {
@@ -410,6 +427,70 @@ impl LocalStore {
         Ok(found)
     }
 
+    /// `*.tmp.*` files under `cas/*/` and `ac/*/`, the names [`temp_path`]
+    /// writes before an atomic rename.
+    fn tmp_files(&self) -> Result<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        for root_name in ["cas", "ac"] {
+            let root = self.cache_dir.join(root_name);
+            if !root.exists() {
+                continue;
+            }
+            for shard in read_dir_files(&root)? {
+                if !shard.path.is_dir() {
+                    continue;
+                }
+                for entry in read_dir_files(&shard.path)? {
+                    if !entry.path.is_file() {
+                        continue;
+                    }
+                    let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if name.contains(".tmp.") {
+                        found.push(entry.path);
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn tmp_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for path in self.tmp_files()? {
+            let len = match fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Failed to stat {}", path.display()))
+                }
+            };
+            total = total.saturating_add(len);
+        }
+        Ok(total)
+    }
+
+    fn sweep_stale_tmp_files(&self, grace_cutoff: Option<SystemTime>) -> Result<u64> {
+        let mut removed = 0u64;
+        for path in self.tmp_files()? {
+            // A live writer keeps updating mtime. Never delete a temp newer
+            // than the grace, even if its process has already exited.
+            if written_after(&path, grace_cutoff) {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to remove temp file {}", path.display()))
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     fn acquire_lock(&self, mode: LockMode) -> Result<File> {
         let lock_path = self.cache_dir.join("cache.lock");
         fs::create_dir_all(&self.cache_dir)
@@ -482,7 +563,9 @@ pub struct PruneStats {
     pub manifests_removed: u64,
     /// Blob files removed because no surviving manifest referenced them.
     pub blobs_removed: u64,
-    /// On-disk size of remaining `cas/**/*.zst` files.
+    /// `*.tmp.*` files removed because they were older than the grace period.
+    pub tmp_files_removed: u64,
+    /// On-disk size of remaining blobs plus remaining `*.tmp.*` files.
     pub bytes_remaining: u64,
 }
 
@@ -1167,5 +1250,141 @@ mod tests {
             store.has_blob(&digest),
             "re-put blob is in the grace window"
         );
+    }
+
+    fn plant_tmp(dir: &Path, root: &str, shard: &str, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(root).join(shard).join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn prune_sweeps_stale_tmp_keeps_fresh_held_open_tmp_and_counts_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let pid = std::process::id();
+        let fresh_cas = plant_tmp(
+            dir.path(),
+            "cas",
+            "ab",
+            &format!("{}.zst.tmp.{pid}.1", "ab".repeat(32)),
+            b"live-writer",
+        );
+        let stale_cas = plant_tmp(
+            dir.path(),
+            "cas",
+            "ab",
+            &format!("{}.zst.tmp.1.2", "cd".repeat(32)),
+            &[7u8; 64],
+        );
+        let fresh_ac = plant_tmp(
+            dir.path(),
+            "ac",
+            "cd",
+            &format!("cd0123456789abcd.json.tmp.{pid}.1"),
+            br#"{"pending":true}"#,
+        );
+        let stale_ac = plant_tmp(
+            dir.path(),
+            "ac",
+            "cd",
+            "cd0123456789abcd.json.tmp.1.2",
+            br#"{"stale":true}"#,
+        );
+        let ancient = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        filetime_set(&stale_cas, ancient);
+        filetime_set(&stale_ac, ancient);
+        let mut held = OpenOptions::new().append(true).open(&fresh_cas).unwrap();
+        let fresh_bytes =
+            fs::metadata(&fresh_cas).unwrap().len() + fs::metadata(&fresh_ac).unwrap().len();
+
+        let stats = store
+            .prune(Some(1), Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(fresh_cas.is_file(), "fresh cas temp must survive");
+        assert!(fresh_ac.is_file(), "fresh ac temp must survive");
+        assert!(!stale_cas.exists(), "stale cas temp must be swept");
+        assert!(!stale_ac.exists(), "stale ac temp must be swept");
+        assert_eq!(stats.tmp_files_removed, 2);
+        assert_eq!(stats.blobs_removed, 0);
+        assert_eq!(stats.bytes_remaining, fresh_bytes);
+        assert_eq!(store.cas_bytes().unwrap(), fresh_bytes);
+        held.write_all(b"!").unwrap();
+        assert!(
+            fs::metadata(&fresh_cas).unwrap().len() > b"live-writer".len() as u64,
+            "held-open writer must still own the temp file"
+        );
+    }
+
+    #[test]
+    fn prune_counts_fresh_tmp_bytes_toward_max_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let blob = Digest::of_bytes(b"referenced-blob");
+        store.put_blob(&blob, &b"referenced-blob"[..]).unwrap();
+        let key = "ee0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(key, std::slice::from_ref(&blob)))
+            .unwrap();
+        let blob_len = fs::metadata(store.blob_path(&blob).unwrap()).unwrap().len();
+        let fresh = plant_tmp(
+            dir.path(),
+            "cas",
+            "ab",
+            &format!("{}.zst.tmp.{}.1", "ab".repeat(32), std::process::id()),
+            &vec![9u8; 8_192],
+        );
+        let tmp_len = fs::metadata(&fresh).unwrap().len();
+        assert!(tmp_len > blob_len);
+
+        let stats = store.prune(Some(blob_len), None).unwrap();
+        assert_eq!(
+            stats.manifests_removed, 1,
+            "fresh temp bytes must force eviction"
+        );
+        assert!(store.get_manifest(key).unwrap().is_none());
+        assert!(fresh.is_file(), "fresh temp is never deleted");
+        assert_eq!(stats.tmp_files_removed, 0);
+        // The blob is still inside the grace window, so the sweep keeps it.
+        assert_eq!(stats.bytes_remaining, blob_len + tmp_len);
+    }
+
+    #[test]
+    fn prune_does_not_evict_a_fitting_manifest_for_a_stale_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path().to_path_buf());
+        let blob = Digest::of_bytes(b"keep-me");
+        store.put_blob(&blob, &b"keep-me"[..]).unwrap();
+        let key = "ef0123456789abcdef";
+        store
+            .put_manifest(&sample_manifest(key, std::slice::from_ref(&blob)))
+            .unwrap();
+        let blob_len = fs::metadata(store.blob_path(&blob).unwrap()).unwrap().len();
+        let stale = plant_tmp(
+            dir.path(),
+            "ac",
+            "ef",
+            "ef0123456789abcdef.json.tmp.1.9",
+            &vec![1u8; 8_192],
+        );
+        filetime_set(
+            &stale,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        );
+        let before = store.cas_bytes().unwrap();
+        assert!(
+            before > blob_len,
+            "stale temp must be in the size before prune"
+        );
+
+        let stats = store.prune(Some(blob_len), None).unwrap();
+        assert_eq!(stats.manifests_removed, 0);
+        assert!(store.get_manifest(key).unwrap().is_some());
+        assert!(store.has_blob(&blob));
+        assert!(!stale.exists());
+        assert_eq!(stats.tmp_files_removed, 1);
+        assert_eq!(stats.bytes_remaining, blob_len);
     }
 }
