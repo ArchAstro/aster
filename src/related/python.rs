@@ -349,12 +349,28 @@ impl Walker<'_> {
             return;
         }
         let mut cursor = node.walk();
+        // A direct child of the module, not an import inside a function.
+        let module_level = node.parent().is_none_or(|parent| parent.kind() == "module");
         for name in node.children_by_field_name("name", &mut cursor) {
             let (imported, alias) = self.aliased(name);
+            let specs = vec![module.clone(), join(&module, &imported)];
+            // `from m import name as alias`: the alias is a definition of
+            // `name`, so a change to `name` reaches whoever imports the
+            // alias. A later `from .wrap import minus as subtract` is its
+            // own def naming `minus`, so the chain follows without a
+            // second pass. A function-local rename is not an export.
+            if node.kind() == "import_from_statement" && module_level {
+                if let Some(alias_name) = alias.clone().filter(|alias| alias != &imported) {
+                    let mut def = Def::new(alias_name, DefKind::Const, span(node));
+                    def.refs.insert(imported.clone());
+                    def.uses.extend(specs.iter().cloned());
+                    self.facts.push(def);
+                }
+            }
             // `from a import b`: `b` is a name in `a` or the module `a.b`.
             self.bindings.push(Binding {
                 local: alias.unwrap_or_else(|| imported.clone()),
-                specs: vec![module.clone(), join(&module, &imported)],
+                specs,
                 imported: Some(imported),
             });
         }
@@ -446,7 +462,7 @@ impl Walker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::related::facts::LineClass;
+    use crate::related::facts::{DefKind, LineClass};
 
     #[test]
     fn tells_instance_members_from_other_values() {
@@ -523,5 +539,29 @@ class Cart(Base):
         assert!(facts.defs[0].uses.contains("shop.cart.total"));
         assert!(facts.defs[0].refs.contains("cart"));
         assert!(facts.dynamic.is_some());
+    }
+
+    #[test]
+    fn renamed_from_import_defines_the_alias() {
+        let source = "from .core import sub as minus\nfrom .core import add\n";
+        let facts = extract(Path::new("pkg/__init__.py"), source);
+        let minus = facts.defs.iter().find(|d| d.name == "minus").unwrap();
+        assert_eq!(minus.kind, DefKind::Const);
+        assert!(minus.refs.contains("sub"));
+        assert!(!minus.refs.contains("minus"));
+        assert!(minus.uses.contains(".core") && minus.uses.contains(".core.sub"));
+        assert_eq!(minus.lines, (1, 1));
+        // The alias line is a definition; the unaliased import stays an import.
+        assert!(matches!(facts.class_of(1), LineClass::Def(_)));
+        assert!(matches!(facts.class_of(2), LineClass::Import(_)));
+        assert!(facts.defs.iter().all(|d| d.name != "add"));
+        // `import a as b` is not this re-export, and a local rename is not either.
+        let imported = extract(Path::new("pkg/core.py"), "import shop.money as money\n");
+        assert!(imported.defs.iter().all(|d| d.name != "money"));
+        let nested = extract(
+            Path::new("pkg/core.py"),
+            "def run():\n    from .core import sub as minus\n    return minus\n",
+        );
+        assert!(nested.defs.iter().all(|d| d.name != "minus"));
     }
 }
