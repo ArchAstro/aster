@@ -1002,17 +1002,25 @@ fn run() -> Result<()> {
                         eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
                     }
                 }
-                // A lane, or --all, runs the target only where it is defined.
-                // Without either, an affected project that lacks the target is
-                // still reported, as before.
-                if lane_config.is_some() || all {
-                    affected_addrs.retain(|addr| {
-                        projects.iter().any(|p| {
-                            format!("//{}", p.relative_path.display()) == *addr
-                                && p.targets.contains_key(&target)
-                        })
-                    });
+                // Every mode runs the target only where it is defined. Dependents,
+                // declared inputs, related proxies, and lane selection have already
+                // chosen this primary set. Target-dependency closure runs later,
+                // from the projects that remain, so a dependency target in another
+                // project is not dropped here.
+                let defines_target: HashSet<String> = projects
+                    .iter()
+                    .filter(|project| project.targets.contains_key(&target))
+                    .map(|project| format!("//{}", project.relative_path.display()))
+                    .collect();
+                if defines_target.is_empty() {
+                    return Err(anyhow::anyhow!("no project defines target '{target}'"));
                 }
+                let had_affected = !affected_addrs.is_empty();
+                affected_addrs.retain(|addr| defines_target.contains(addr));
+                // Lanes and --all already omitted projects that lack the target
+                // and keep their existing empty-selection message.
+                let missing_among_affected =
+                    had_affected && affected_addrs.is_empty() && lane.is_none() && !all;
 
                 // Primary projects are the affected ones (only these run the requested target)
                 let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
@@ -1048,10 +1056,29 @@ fn run() -> Result<()> {
                         continue;
                     }
                     if output_mode == OutputMode::Json {
-                        let output = build_execution_output(&[]);
-                        output_json(&output)?;
+                        if missing_among_affected && dry_run {
+                            let empty = DryRunOutput {
+                                target: target.clone(),
+                                base: base.clone(),
+                                head: head.clone(),
+                                targets: Vec::new(),
+                                count: 0,
+                                skipped: Vec::new(),
+                                toolchains: Vec::new(),
+                            };
+                            output_json(&empty)?;
+                        } else {
+                            let output = build_execution_output(&[]);
+                            output_json(&output)?;
+                        }
                     } else if output_mode != OutputMode::Quiet {
-                        println!("No projects affected");
+                        if missing_among_affected {
+                            println!(
+                                "No projects define target '{target}' among the affected projects"
+                            );
+                        } else {
+                            println!("No projects affected");
+                        }
                     }
                     return Ok(());
                 }

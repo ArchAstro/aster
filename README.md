@@ -535,6 +535,11 @@ aster affected test --dry-run
 Aster compares `HEAD` with the merge base of `HEAD` and `--base`, then includes
 uncommitted changes. CI must fetch enough history for the merge base to exist.
 
+Only projects that define the target are selected. A target no project in the
+workspace defines is an error (`no project defines target '<name>'`). When some
+projects define it but none of the affected ones do, the run exits 0 and says
+`No projects define target '<name>' among the affected projects`.
+
 ### Running only the affected files
 
 ```console

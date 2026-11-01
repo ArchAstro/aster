@@ -1507,7 +1507,11 @@ fn test_affected_requires_git_repo() {
 fn test_affected_no_changes() {
     let tmp = TempDir::new().unwrap();
     setup_git_repo(&tmp);
-    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "true"}}"#,
+    );
     git_commit(&tmp, "Initial commit");
 
     // No changes since last commit
@@ -1523,6 +1527,178 @@ fn test_affected_no_changes() {
         stdout.contains("No projects affected"),
         "Expected 'No projects affected': {stdout}"
     );
+}
+
+/// Issue 247: a typo'd target must not plan or pass, and a real target is
+/// planned only for projects that define it.
+#[test]
+fn affected_rejects_a_target_no_project_defines_and_plans_only_defining_projects() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_package_json(
+        &tmp,
+        "a/package.json",
+        r#"{"name": "a", "scripts": {"test": "true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "b/package.json",
+        r#"{"name": "b", "scripts": {"build": "true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "c/package.json",
+        r#"{"name": "c", "scripts": {"lint": "true"}}"#,
+    );
+    // `check` depends on a target in b, which does not define `check` itself.
+    write_aster_toml(
+        &tmp,
+        "a/aster.toml",
+        "[targets.check]\ncommand = \"true\"\ndepends_on = [\"//b:build\"]\n",
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        "[affected.lanes.both]\ninclude = [\"//a\", \"//b\"]\n",
+    );
+    git_commit(&tmp, "Initial commit");
+    fs::write(tmp.path().join("a/changed.txt"), "changed").unwrap();
+    fs::write(tmp.path().join("b/changed.txt"), "changed").unwrap();
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let unknown = "no project defines target 'tset'";
+    for args in [
+        &["affected", "tset", "--base=HEAD", "--dry-run"][..],
+        &["--json", "affected", "tset", "--base=HEAD", "--dry-run"][..],
+        &["affected", "tset", "--base=HEAD"][..],
+        &["--json", "affected", "tset", "--base=HEAD"][..],
+    ] {
+        let output = run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "unknown target should fail for {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(unknown),
+            "expected {unknown:?} for {args:?}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("//a:tset") && !stdout.contains("SKIP") && !stderr.contains("SKIP"),
+            "unknown target still planned a run for {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    let planned = run(&["--json", "affected", "test", "--base=HEAD", "--dry-run"]);
+    assert!(
+        planned.status.success(),
+        "planning test failed: {planned:?}"
+    );
+    let planned_json: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    let addresses: Vec<&str> = planned_json["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["address"].as_str().unwrap())
+        .collect();
+    assert!(
+        addresses.contains(&"//a:test"),
+        "expected //a:test in {addresses:?}"
+    );
+    assert!(
+        addresses
+            .iter()
+            .all(|address| !address.starts_with("//b:") && !address.starts_with("//c:")),
+        "plan included a project that does not define test: {addresses:?}"
+    );
+    assert_eq!(
+        addresses
+            .iter()
+            .filter(|address| address.ends_with(":test"))
+            .copied()
+            .collect::<Vec<_>>(),
+        vec!["//a:test"]
+    );
+
+    let absent = run(&["affected", "lint", "--base=HEAD"]);
+    let absent_stdout = String::from_utf8_lossy(&absent.stdout);
+    let absent_stderr = String::from_utf8_lossy(&absent.stderr);
+    assert!(
+        absent.status.success(),
+        "lint defined elsewhere should exit 0\nstdout:\n{absent_stdout}\nstderr:\n{absent_stderr}"
+    );
+    assert!(
+        absent_stdout.contains("No projects define target 'lint' among the affected projects"),
+        "missing among affected: {absent_stdout}"
+    );
+
+    let absent_plan = run(&["--json", "affected", "lint", "--base=HEAD", "--dry-run"]);
+    assert!(
+        absent_plan.status.success(),
+        "empty lint plan failed: {absent_plan:?}"
+    );
+    let absent_json: serde_json::Value = serde_json::from_slice(&absent_plan.stdout).unwrap();
+    assert_eq!(absent_json["targets"], serde_json::json!([]));
+    assert_eq!(absent_json["count"], 0);
+
+    // Dependency closure still pulls //b:build even though b does not define check.
+    let closure = run(&["--json", "affected", "check", "--base=HEAD", "--dry-run"]);
+    assert!(closure.status.success(), "check plan failed: {closure:?}");
+    let closure_json: serde_json::Value = serde_json::from_slice(&closure.stdout).unwrap();
+    let closure_addresses: Vec<&str> = closure_json["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["address"].as_str().unwrap())
+        .collect();
+    assert!(
+        closure_addresses.contains(&"//a:check"),
+        "expected //a:check in {closure_addresses:?}"
+    );
+    assert!(
+        closure_addresses.contains(&"//b:build"),
+        "dependency target //b:build was dropped: {closure_addresses:?}"
+    );
+    assert!(
+        !closure_addresses.contains(&"//b:check"),
+        "b does not define check: {closure_addresses:?}"
+    );
+
+    // Lanes and --all already selected only projects that define the target.
+    for args in [
+        &["--json", "affected", "test", "--all", "--dry-run"][..],
+        &[
+            "--json",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--dry-run",
+            "--lane",
+            "both",
+        ][..],
+    ] {
+        let output = run(args);
+        assert!(output.status.success(), "{args:?} failed: {output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let listed: Vec<&str> = json["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["address"].as_str().unwrap())
+            .collect();
+        assert!(
+            listed.contains(&"//a:test")
+                && listed.iter().all(|address| !address.starts_with("//b:")),
+            "{args:?} changed defining-project selection: {listed:?}"
+        );
+    }
 }
 
 #[test]
@@ -1763,8 +1939,16 @@ ignore = [".agents/**"]
 fn test_affected_detects_uncommitted_changes() {
     let tmp = TempDir::new().unwrap();
     setup_git_repo(&tmp);
-    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"test": "true"}}"#,
+    );
     git_commit(&tmp, "Initial commit");
 
     // Make uncommitted change to one project
@@ -1796,8 +1980,16 @@ fn test_affected_detects_uncommitted_changes() {
 fn test_affected_detects_committed_changes() {
     let tmp = TempDir::new().unwrap();
     setup_git_repo(&tmp);
-    write_package_json(&tmp, "services/api/package.json", r#"{"name": "api"}"#);
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_package_json(
+        &tmp,
+        "services/api/package.json",
+        r#"{"name": "api", "scripts": {"test": "true"}}"#,
+    );
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"test": "true"}}"#,
+    );
     git_commit(&tmp, "Initial commit");
 
     // Make change and commit
@@ -1837,11 +2029,15 @@ fn test_affected_with_dependents_flag() {
     setup_git_repo(&tmp);
 
     // api depends on core
-    write_package_json(&tmp, "libs/core/package.json", r#"{"name": "core"}"#);
+    write_package_json(
+        &tmp,
+        "libs/core/package.json",
+        r#"{"name": "core", "scripts": {"test": "true"}}"#,
+    );
     write_package_json(
         &tmp,
         "services/api/package.json",
-        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}}"#,
+        r#"{"name": "api", "dependencies": {"core": "file:../../libs/core"}, "scripts": {"test": "true"}}"#,
     );
     git_commit(&tmp, "Initial commit");
 
