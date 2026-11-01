@@ -7,6 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2413,4 +2414,93 @@ fn services_logs_rejects_unknown_services_and_missing_logs() {
         .unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no logs found for service 'api'"));
+}
+
+#[test]
+fn concurrent_ports_readers_survive_a_stale_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    fs::create_dir_all(&lease_dir).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let workspace = root.canonicalize().unwrap();
+
+    const ROUNDS: usize = 12;
+    const READERS: usize = 6;
+    let mut completed = 0;
+    let mut attempts = 0;
+    while completed < ROUNDS {
+        attempts += 1;
+        assert!(
+            attempts <= ROUNDS + 8,
+            "could not keep a free port long enough to remove a stale manifest"
+        );
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            continue;
+        }
+
+        let manifest = lease_dir.join("allocation-1-1-0.json");
+        let body = serde_json::json!({
+            "version": 1,
+            "supervisor_pid": 1,
+            "workspace_root": workspace.to_string_lossy(),
+            "ports": { "http": port },
+            "services": {}
+        });
+        fs::write(&manifest, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        assert_eq!(
+            allocation_manifest_count(&lease_dir),
+            1,
+            "round {completed}"
+        );
+
+        let barrier = Arc::new(Barrier::new(READERS));
+        let mut handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let barrier = Arc::clone(&barrier);
+            let lease_dir = lease_dir.clone();
+            let root = root.to_path_buf();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                Command::new(env!("CARGO_BIN_EXE_aster"))
+                    .args(["services", "ports"])
+                    .current_dir(root)
+                    .env("ASTER_PORT_LEASE_DIR", lease_dir)
+                    .output()
+                    .unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let output = handle.join().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "round {completed} exited {:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status
+            );
+            assert!(
+                !stdout.contains("failed to remove stale allocation manifest")
+                    && !stderr.contains("failed to remove stale allocation manifest"),
+                "round {completed} printed an allocation error\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        if allocation_manifest_count(&lease_dir) == 0 {
+            completed += 1;
+            continue;
+        }
+        // Another process took the port after we released it, so the manifest
+        // is orphaned rather than stale. That is not this race; try again.
+        if TcpStream::connect(("127.0.0.1", port)).is_ok()
+            || TcpListener::bind(("0.0.0.0", port)).is_err()
+        {
+            let _ = fs::remove_file(&manifest);
+            continue;
+        }
+        panic!("round {completed} left the stale manifest in place");
+    }
 }

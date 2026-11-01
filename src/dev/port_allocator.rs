@@ -227,12 +227,7 @@ pub(crate) fn workspace_port_allocations(
         } else if occupied {
             Some(PortAllocationStatus::Orphaned)
         } else {
-            fs::remove_file(&path).with_context(|| {
-                format!(
-                    "failed to remove stale allocation manifest {}",
-                    path.display()
-                )
-            })?;
+            remove_stale_manifest(&path)?;
             None
         };
 
@@ -287,15 +282,25 @@ pub(crate) fn prune_workspace_manifests(workspace_root: &Path) -> Result<()> {
             }
         }
         if !leased && all_available {
-            fs::remove_file(&path).with_context(|| {
-                format!(
-                    "failed to remove stale allocation manifest {}",
-                    path.display()
-                )
-            })?;
+            remove_stale_manifest(&path)?;
         }
     }
     Ok(())
+}
+
+/// Remove a crash-left manifest. A concurrent reader may already have removed
+/// it; that is success. Other errors keep the existing context message.
+fn remove_stale_manifest(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove stale allocation manifest {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn write_manifest(directory: &Path, manifest: &AllocationManifest) -> Result<PathBuf> {
@@ -431,6 +436,57 @@ fn lease_directory() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    fn lease_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct LeaseEnv {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl LeaseEnv {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("ASTER_PORT_LEASE_DIR");
+            std::env::set_var("ASTER_PORT_LEASE_DIR", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for LeaseEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ASTER_PORT_LEASE_DIR", value),
+                None => std::env::remove_var("ASTER_PORT_LEASE_DIR"),
+            }
+        }
+    }
+
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    fn write_stale_manifest(lease_dir: &Path, workspace: &Path, port: u16) -> PathBuf {
+        let workspace_root = workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let path = lease_dir.join("allocation-1-1-0.json");
+        let body = serde_json::json!({
+            "version": 1,
+            "supervisor_pid": 1,
+            "workspace_root": workspace_root,
+            "ports": { "http": port }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        path
+    }
 
     #[test]
     fn availability_probe_rejects_and_then_releases_external_listener() {
@@ -440,5 +496,208 @@ mod tests {
 
         drop(listener);
         assert!(port_is_available(port).unwrap());
+    }
+
+    #[test]
+    fn remove_stale_manifest_ignores_not_found_and_reports_other_errors() {
+        let missing = std::env::temp_dir().join(format!(
+            "aster-missing-allocation-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!missing.exists());
+        remove_stale_manifest(&missing).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let directory = temp.path().join("leases");
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("allocation-1-1-0.json");
+            fs::write(&path, b"{}").unwrap();
+            let _restore = DirectoryModeGuard::lock(&directory);
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let error = remove_stale_manifest(&path).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!(
+                    "failed to remove stale allocation manifest {}",
+                    path.display()
+                )),
+                "{message}"
+            );
+            assert!(
+                message.to_ascii_lowercase().contains("permission denied"),
+                "{message}"
+            );
+            assert!(path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    struct DirectoryModeGuard<'a> {
+        path: &'a Path,
+    }
+
+    #[cfg(unix)]
+    impl<'a> DirectoryModeGuard<'a> {
+        fn lock(path: &'a Path) -> Self {
+            Self { path }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DirectoryModeGuard<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_manifest_removal_still_fails_when_the_lease_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = lease_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let lease_dir = temp.path().join("leases");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&lease_dir).unwrap();
+        let _lease_env = LeaseEnv::set(&lease_dir);
+        let _restore = DirectoryModeGuard::lock(&lease_dir);
+
+        let mut proved = false;
+        for _ in 0..8 {
+            fs::set_permissions(&lease_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let port = free_port();
+            if !port_is_available(port).unwrap() {
+                continue;
+            }
+            let path = write_stale_manifest(&lease_dir, &workspace, port);
+            // Lock files must already exist: a non-writable directory should fail
+            // on unlink, not on creating the probe files.
+            fs::write(lease_dir.join(format!("{port}.lock")), b"").unwrap();
+            fs::write(lease_dir.join("allocation.lock"), b"").unwrap();
+            fs::set_permissions(&lease_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let allocations = workspace_port_allocations(&workspace);
+            let pruned = prune_workspace_manifests(&workspace);
+            fs::set_permissions(&lease_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+            match (allocations, pruned) {
+                (Err(allocations_error), Err(prune_error)) => {
+                    for (label, error) in [
+                        ("workspace_port_allocations", allocations_error),
+                        ("prune_workspace_manifests", prune_error),
+                    ] {
+                        let message = format!("{error:#}");
+                        assert!(
+                            message.contains(&format!(
+                                "failed to remove stale allocation manifest {}",
+                                path.display()
+                            )),
+                            "{label}: {message}"
+                        );
+                        assert!(
+                            message.to_ascii_lowercase().contains("permission denied"),
+                            "{label}: {message}"
+                        );
+                    }
+                    assert!(path.exists());
+                    proved = true;
+                    break;
+                }
+                (Ok(_), Ok(_)) => {
+                    let _ = fs::remove_file(&path);
+                }
+                (allocations, pruned) => panic!(
+                    "expected permission denied from both removers, or a skipped occupied port: {allocations:?} / {pruned:?}"
+                ),
+            }
+        }
+        assert!(
+            proved,
+            "port stayed occupied, so removal was never attempted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_manifests_skips_a_manifest_whose_read_returns_not_found() {
+        let _env_lock = lease_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let lease_dir = temp.path().join("leases");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&lease_dir).unwrap();
+        let _lease_env = LeaseEnv::set(&lease_dir);
+        let workspace_root = canonical_workspace(&workspace).unwrap();
+        // A directory entry that vanishes before open is NotFound. A dangling
+        // symlink is that error without a scheduler race.
+        std::os::unix::fs::symlink(
+            lease_dir.join("missing-allocation.json"),
+            lease_dir.join("allocation-2-1-0.json"),
+        )
+        .unwrap();
+
+        assert!(workspace_manifests(&workspace_root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_reader_and_prune_tolerate_a_removed_stale_manifest() {
+        let _env_lock = lease_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let lease_dir = temp.path().join("leases");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&lease_dir).unwrap();
+        let _lease_env = LeaseEnv::set(&lease_dir);
+
+        let mut removed_a_stale_manifest = false;
+        for _ in 0..8 {
+            let port = free_port();
+            if !port_is_available(port).unwrap() {
+                continue;
+            }
+            let path = write_stale_manifest(&lease_dir, &workspace, port);
+            let barrier = Arc::new(Barrier::new(2));
+            let reader_workspace = workspace.clone();
+            let pruner_workspace = workspace.clone();
+            let reader_barrier = Arc::clone(&barrier);
+            let pruner_barrier = Arc::clone(&barrier);
+            let reader = std::thread::spawn(move || {
+                reader_barrier.wait();
+                workspace_port_allocations(&reader_workspace)
+            });
+            let pruner = std::thread::spawn(move || {
+                pruner_barrier.wait();
+                prune_workspace_manifests(&pruner_workspace)
+            });
+            // Same-process flock on {port}.lock can make one caller see the
+            // other's probe as an active lease. That is not a supervisor, and
+            // separate processes do not share that conflict. Both calls must
+            // still succeed, and a free port's manifest must be gone.
+            reader.join().unwrap().unwrap();
+            pruner.join().unwrap().unwrap();
+            if !path.exists() {
+                removed_a_stale_manifest = true;
+                continue;
+            }
+            if !port_is_available(port).unwrap() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            panic!("stale manifest was not removed from {}", path.display());
+        }
+        assert!(
+            removed_a_stale_manifest,
+            "never raced removal of a manifest whose port was free"
+        );
     }
 }
