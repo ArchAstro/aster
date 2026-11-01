@@ -648,6 +648,93 @@ fn test_cycle_shows_path() {
     );
 }
 
+/// Issue 255: a target cycle is an error for every command, before any
+/// target command runs. Canonical e2e for target-cycle discovery.
+#[test]
+fn target_dependency_cycles_fail_every_command() {
+    let cycle = "//x:build -> //y:build -> //x:build";
+    let commands: &[&[&str]] = &[
+        &["build", "--all"],
+        &["build", "//x"],
+        &["affected", "build"],
+        &["list"],
+        &["graph"],
+        &["check"],
+    ];
+
+    let xy = TempDir::new().unwrap();
+    setup_git_repo(&xy);
+    for (name, dependency) in [("x", "//y:build"), ("y", "//x:build")] {
+        write_package_json(
+            &xy,
+            &format!("{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
+        write_aster_toml(
+            &xy,
+            &format!("{name}/aster.toml"),
+            &format!("[targets.build]\ncommand = \"touch ran\"\ndepends_on = [\"{dependency}\"]\n"),
+        );
+    }
+    git_commit(&xy, "cycle");
+    assert_cycle_rejects_every_command(&xy, commands, cycle);
+
+    let self_dep = TempDir::new().unwrap();
+    setup_git_repo(&self_dep);
+    write_package_json(
+        &self_dep,
+        "m/package.json",
+        r#"{"name":"m","version":"1.0.0"}"#,
+    );
+    write_aster_toml(
+        &self_dep,
+        "m/aster.toml",
+        "[targets.build]\ncommand = \"touch ran\"\ndepends_on = [\"//m:build\"]\n",
+    );
+    git_commit(&self_dep, "self-dependency");
+    let self_commands: Vec<Vec<&str>> = commands
+        .iter()
+        .map(|args| {
+            args.iter()
+                .map(|arg| if *arg == "//x" { "//m" } else { *arg })
+                .collect()
+        })
+        .collect();
+    let self_args: Vec<&[&str]> = self_commands.iter().map(Vec::as_slice).collect();
+    assert_cycle_rejects_every_command(&self_dep, &self_args, "//m:build -> //m:build");
+}
+
+fn assert_cycle_rejects_every_command(tmp: &TempDir, commands: &[&[&str]], cycle: &str) {
+    for args in commands {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(*args)
+            .env("ASTER_CACHE_DIR", tmp.path().join(".aster-cache"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{args:?} succeeded\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains(cycle),
+            "{args:?} missing {cycle:?} on stderr: {stderr}"
+        );
+        assert!(
+            !marker_written(tmp),
+            "{args:?} ran a target command: marker file exists"
+        );
+    }
+}
+
+fn marker_written(tmp: &TempDir) -> bool {
+    ["x/ran", "y/ran", "m/ran", "ran"]
+        .iter()
+        .any(|path| tmp.path().join(path).exists())
+}
+
 #[test]
 fn test_verbose_output() {
     let tmp = TempDir::new().unwrap();
