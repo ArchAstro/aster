@@ -293,9 +293,10 @@ impl LanguagePlugin for GoPlugin {
             };
         }
 
-        // Go test files (*_test.go) are already included by **/*.go
+        // Testdata, //go:embed files, and tool configs are not `*.go`.
+        // `deps` stays lockfile-only above so a source edit does not re-download.
         super::CacheInputs {
-            source_globs: vec!["**/*.go".to_string()],
+            source_globs: vec![super::PROJECT_FILES_GLOB.to_string()],
             config_files: vec!["go.mod".to_string(), "go.sum".to_string()],
             env_vars: vec![
                 "GOOS".to_string(),

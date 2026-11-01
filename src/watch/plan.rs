@@ -318,13 +318,14 @@ mod tests {
         )
         .unwrap();
 
-        // Node plugin's build inputs include src/**/*.ts; readme shouldn't match.
+        // Node hashes every project file, including a readme and a stylesheet.
         let ts_owners = plan.owners_of(Path::new("/repo/libs/core/src/foo.ts"));
         assert_eq!(ts_owners.len(), 1);
         assert_eq!(ts_owners[0].address, "//libs/core:build");
 
         let md_owners = plan.owners_of(Path::new("/repo/libs/core/README.md"));
-        assert!(md_owners.is_empty());
+        assert_eq!(md_owners.len(), 1);
+        assert_eq!(md_owners[0].address, "//libs/core:build");
     }
 
     #[test]
@@ -470,10 +471,51 @@ mod tests {
         assert!(!a.uses_fallback, "nodejs plugin provides inputs");
         assert!(b.uses_fallback);
 
-        // Non-input file in A: no match.
-        assert!(plan.owners_of(Path::new("/repo/a/README.md")).is_empty());
-        // Same filename in B: matches because B is in fallback mode.
+        // A project file matches A's globs. B matches the same name only
+        // because it declared no inputs and falls back to the project dir.
+        assert_eq!(plan.owners_of(Path::new("/repo/a/README.md")).len(), 1);
         assert_eq!(plan.owners_of(Path::new("/repo/b/README.md")).len(), 1);
+    }
+
+    #[test]
+    fn declared_output_does_not_own_a_watch_target() {
+        let mut projects = vec![mk_project(
+            "libs/core",
+            "/repo/libs/core",
+            &[("build", vec![])],
+        )];
+        projects[0].targets.get_mut("build").unwrap().cache = Some(crate::config::CacheConfig {
+            outputs: Some(vec!["bin/app".to_string(), "generated/**".to_string()]),
+            ..Default::default()
+        });
+        let graph = build_target_graph(&projects);
+        let plan = WatchPlan::build(
+            &["//libs/core:build".to_string()],
+            &projects,
+            &graph,
+            &registry(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.owners_of(Path::new("/repo/libs/core/src/foo.ts"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            plan.owners_of(Path::new("/repo/libs/core/src/build/widget.ts"))
+                .len(),
+            1
+        );
+        assert!(plan
+            .owners_of(Path::new("/repo/libs/core/bin/app"))
+            .is_empty());
+        assert!(plan
+            .owners_of(Path::new("/repo/libs/core/generated/out.txt"))
+            .is_empty());
+        assert!(plan
+            .owners_of(Path::new("/repo/libs/core/build/out.js"))
+            .is_empty());
     }
 
     #[test]

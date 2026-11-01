@@ -624,15 +624,10 @@ impl LanguagePlugin for NodeJsPlugin {
             };
         }
 
-        let mut inputs = super::CacheInputs {
-            source_globs: vec![
-                "src/**/*.ts".to_string(),
-                "src/**/*.tsx".to_string(),
-                "src/**/*.js".to_string(),
-                "src/**/*.jsx".to_string(),
-                "lib/**/*.ts".to_string(),
-                "lib/**/*.js".to_string(),
-            ],
+        // `.mjs`, `.css`, `.vue`, and tool configs (vite.config.js) are not
+        // under src/**/*.{ts,tsx,js,jsx}. `deps` stays lockfile-only above.
+        super::CacheInputs {
+            source_globs: vec![super::PROJECT_FILES_GLOB.to_string()],
             config_files: vec![
                 "package.json".to_string(),
                 "package-lock.json".to_string(),
@@ -643,19 +638,7 @@ impl LanguagePlugin for NodeJsPlugin {
             env_vars: vec!["NODE_ENV".to_string()],
             runtime_commands: vec!["node --version".to_string()],
             ..Default::default()
-        };
-
-        // Add test files for test target
-        if target_name == "test" {
-            inputs.source_globs.push("test/**/*.ts".to_string());
-            inputs.source_globs.push("test/**/*.js".to_string());
-            inputs.source_globs.push("__tests__/**/*.ts".to_string());
-            inputs.source_globs.push("__tests__/**/*.js".to_string());
-            inputs.source_globs.push("**/*.test.ts".to_string());
-            inputs.source_globs.push("**/*.spec.ts".to_string());
         }
-
-        inputs
     }
 
     fn workspace_cache_inputs(

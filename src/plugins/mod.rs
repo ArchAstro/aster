@@ -44,13 +44,23 @@ pub struct NativeCache {
     pub shared: bool,
 }
 
+/// Every file under the project.
+///
+/// Go, Node, Elixir, Rust, and Python use this for every target except
+/// `deps`. The hasher still omits gitignored paths, nested projects, tool
+/// caches, and declared outputs, so the glob does not hash a build's own
+/// artifacts.
+pub const PROJECT_FILES_GLOB: &str = "**/*";
+
 /// Cache inputs provided by a language plugin
 ///
 /// Defines the files and environment variables that should be included
 /// in the cache key for targets of this language type.
 #[derive(Debug, Clone, Default)]
 pub struct CacheInputs {
-    /// Glob patterns for source files (e.g., ["src/**/*.ts", "lib/**/*.ts"])
+    /// Glob patterns for source files. Language plugins other than `deps`
+    /// use [`PROJECT_FILES_GLOB`] so a testdata file, embed, or tool config
+    /// misses the cache.
     pub source_globs: Vec<String>,
     /// Specific config/lock files to include (e.g., ["package.json", "package-lock.json"])
     pub config_files: Vec<String>,
@@ -502,6 +512,27 @@ mod tests {
                     "{} cache_inputs({target_name}) tracks CI: {:?}",
                     plugin.name(),
                     inputs.env_vars
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inferred_languages_hash_every_project_file_except_deps() {
+        let registry = PluginRegistry::with_all_plugins();
+        for name in ["go", "nodejs", "elixir", "rust", "python"] {
+            let plugin = registry
+                .find_by_name(name)
+                .unwrap_or_else(|| panic!("{name} plugin missing"));
+            assert!(
+                plugin.cache_inputs("deps").source_globs.is_empty(),
+                "{name} deps must stay lockfile-only"
+            );
+            for target_name in ["build", "test", "lint", "format", "check"] {
+                assert_eq!(
+                    plugin.cache_inputs(target_name).source_globs,
+                    vec![super::PROJECT_FILES_GLOB.to_string()],
+                    "{name} cache_inputs({target_name})"
                 );
             }
         }

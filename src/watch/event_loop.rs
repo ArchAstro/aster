@@ -745,8 +745,31 @@ mod tests {
     }
 
     #[test]
-    fn non_input_file_is_noop() {
-        let f = two_project_fixture();
+    fn user_exclude_file_is_noop() {
+        let mut projects = vec![mk_project(
+            "libs/core",
+            "/repo/libs/core",
+            &[("build", vec![])],
+        )];
+        projects[0].targets.get_mut("build").unwrap().cache = Some(crate::config::CacheConfig {
+            exclude: vec!["README.md".to_string()],
+            ..Default::default()
+        });
+        let graph = build_target_graph(&projects);
+        let plan = WatchPlan::build(
+            &["//libs/core:build".to_string()],
+            &projects,
+            &graph,
+            &registry(),
+        )
+        .unwrap();
+        let ignore = WorkspaceIgnore::build(&WatchWorkspaceConfig::default()).unwrap();
+        let f = Fixture {
+            plan,
+            graph,
+            workspace_root: PathBuf::from("/repo"),
+            ignore,
+        };
         let e = modify("/repo/libs/core/README.md");
         let (pending, triggers) = run_event(&f, &e, not_suppressed());
 
@@ -831,18 +854,18 @@ mod tests {
             paths: vec![
                 PathBuf::from("/repo/libs/core/src/a.ts"),
                 PathBuf::from("/repo/services/api/src/main.ts"),
-                PathBuf::from("/repo/libs/core/README.md"), // filtered
+                PathBuf::from("/repo/libs/core/README.md"),
             ],
             attrs: Default::default(),
         };
         let (pending, triggers) = run_event(&f, &event, not_suppressed());
 
-        // Both input files own targets; README is filtered out. api:build
-        // appears both as its own owner and as core:build's dependent.
+        // Every project file owns a target. api:build appears both as its
+        // own owner and as core:build's dependent.
         assert!(pending.contains("//libs/core:build"));
         assert!(pending.contains("//services/api:build"));
         assert_eq!(pending.len(), 2);
-        assert_eq!(triggers.len(), 2); // 2 kept, 1 filtered
+        assert_eq!(triggers.len(), 3);
     }
 
     #[test]
@@ -882,8 +905,8 @@ mod tests {
     }
 
     #[test]
-    fn test_only_target_fires_for_test_file() {
-        // A file only matched by :test (e.g. *.test.ts) should not fire :build.
+    fn project_file_fires_build_and_test() {
+        // A non-source file is an input of every non-deps target.
         let workspace_root = PathBuf::from("/repo");
         let projects = vec![mk_project(
             "libs/core",
@@ -909,15 +932,12 @@ mod tests {
             ignore,
         };
 
-        // nodejs test plugin inputs include test/**/*.ts and **/*.test.ts,
-        // but not src/**/*.ts for :test alone. Actually both cover src/, but
-        // test covers **/*.test.ts exclusively.
         let e = modify("/repo/libs/core/test/foo.test.ts");
         let (pending, _) = run_event(&f, &e, not_suppressed());
         assert!(pending.contains("//libs/core:test"));
         assert!(
-            !pending.contains("//libs/core:build"),
-            "a test-only path should not fire :build"
+            pending.contains("//libs/core:build"),
+            "a project file is an input of build as well as test"
         );
     }
 
@@ -1328,9 +1348,9 @@ mod tests {
         };
         let (tx, shutdown, dispatches, handle) = spawn_loop_with_fixture(f, opts, None);
 
-        // Only send events that don't match any target's cache_inputs.
-        send_modify(&tx, "/repo/libs/core/README.md");
-        send_modify(&tx, "/repo/services/api/CHANGELOG.md");
+        // Tooling directories are ignored before cache inputs are consulted.
+        send_modify(&tx, "/repo/libs/core/node_modules/leftpad/index.js");
+        send_modify(&tx, "/repo/services/api/dist/out.js");
 
         // Wait past debounce window and verify no dispatch occurred.
         std::thread::sleep(Duration::from_millis(200));
