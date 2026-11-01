@@ -154,16 +154,29 @@ pub fn discover_projects(
             continue;
         }
 
-        // Parse the project using the plugin
-        let mut metadata = plugin
-            .parse_project(workspace_root, &config_path)
-            .with_context(|| {
-                format!(
-                    "Failed to parse {} project at {}",
-                    plugin.name(),
+        // Parse the project using the plugin. A pyproject.toml that has no
+        // project name is tool config (ruff, a uv virtual workspace root),
+        // not a project: warn and keep walking. Every other parse failure,
+        // including invalid TOML and other plugins, still aborts discovery.
+        let mut metadata = match plugin.parse_project(workspace_root, &config_path) {
+            Ok(metadata) => metadata,
+            Err(error) if crate::plugins::python::is_not_a_project(&error) => {
+                eprintln!(
+                    "[aster] Warning: skipping {}: no [project].name or [tool.poetry].name",
                     config_path.display()
-                )
-            })?;
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to parse {} project at {}",
+                        plugin.name(),
+                        config_path.display()
+                    )
+                });
+            }
+        };
 
         // Parse dependencies
         let mut dependencies = plugin.parse_dependencies(&config_path).with_context(|| {
@@ -2064,5 +2077,121 @@ end
         assert_eq!(app.dependencies.len(), 1);
         assert_eq!(app.dependencies[0].path, Path::new("//gems/shared"));
         assert_eq!(app.targets["test"].command, "bundle exec rake test");
+    }
+
+    #[test]
+    fn skips_pyproject_without_a_project_name_and_keeps_other_parse_errors_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.ruff]\nline-length = 100\n",
+        )
+        .unwrap();
+        let svc = tmp.path().join("svc");
+        std::fs::create_dir(&svc).unwrap();
+        std::fs::write(svc.join("package.json"), r#"{"name":"svc"}"#).unwrap();
+        let poetry = tmp.path().join("poetry-app");
+        std::fs::create_dir(&poetry).unwrap();
+        std::fs::write(
+            poetry.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"poetry-app\"\n",
+        )
+        .unwrap();
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        let addresses: Vec<String> = projects
+            .iter()
+            .map(|project| format!("//{}", project.relative_path.display()))
+            .collect();
+        assert!(addresses.contains(&"//svc".to_string()));
+        assert!(addresses.contains(&"//poetry-app".to_string()));
+        assert!(
+            !projects
+                .iter()
+                .any(|project| project.relative_path.as_os_str().is_empty()),
+            "a nameless root pyproject.toml must not become a project: {addresses:?}"
+        );
+
+        std::fs::write(tmp.path().join("pyproject.toml"), "[\n").unwrap();
+        let error = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to parse python project"),
+            "{error:#}"
+        );
+
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.ruff]\nline-length = 100\n",
+        )
+        .unwrap();
+        std::fs::write(svc.join("package.json"), "{").unwrap();
+        let error = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to parse nodejs project"),
+            "other plugins' parse failures stay fatal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn uv_virtual_workspace_root_is_skipped_and_member_dependencies_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.uv.workspace]\nmembers = [\"pkg\", \"lib\"]\n",
+        )
+        .unwrap();
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        std::fs::write(lib.join("pyproject.toml"), "[project]\nname = \"lib\"\n").unwrap();
+        std::fs::write(
+            lib.join("aster.toml"),
+            "[targets.build]\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("pyproject.toml"),
+            r#"
+[project]
+name = "pkg"
+dependencies = ["lib"]
+
+[tool.uv.sources]
+lib = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"#,
+        )
+        .unwrap();
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        assert!(
+            !projects
+                .iter()
+                .any(|project| project.relative_path.as_os_str().is_empty()),
+            "uv virtual workspace root must not be a project"
+        );
+        let pkg_project = projects
+            .iter()
+            .find(|project| project.relative_path == Path::new("pkg"))
+            .expect("member pkg");
+        assert!(
+            pkg_project.dependencies.iter().any(|dependency| {
+                dependency.name == "lib" && dependency.path == Path::new("//lib")
+            }),
+            "workspace dependency was not resolved: {:?}",
+            pkg_project.dependencies
+        );
+        assert!(
+            pkg_project.targets["test"]
+                .depends_on
+                .contains(&"//lib:build".to_string()),
+            "resolved workspace dependency did not become a target edge: {:?}",
+            pkg_project.targets["test"].depends_on
+        );
     }
 }
