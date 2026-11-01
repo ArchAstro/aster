@@ -309,22 +309,34 @@ alias = "build"
     assert_eq!(gate_count(&runtime, "release"), 1);
     assert_eq!(gate_count(&runtime, "build"), 6);
 
-    // An API break in the dependency must fail the actual dependent compilation
-    // and the member's public result, never replay a stale successful forward.
+    // An API break in the dependency must fail the workspace compilation.
+    // The member entry does not run after that gate fails, so its public
+    // result is blocked rather than a failure or a stale successful forward.
     fs::write(&basis, "pub fn renamed_answer() -> usize { 1 }\n").unwrap();
     let output = aster(&repo, &runtime, &["run", "//crates/app:build", "--json"]);
     assert!(!output.status.success(), "broken workspace passed");
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    for address in ["//:build", "//crates/app:build"] {
-        assert!(
-            value["results"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|result| { result["address"] == address && result["status"] == "failed" }),
-            "missing failure for {address}: {value}"
-        );
-    }
+    let results = value["results"].as_array().unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|result| { result["address"] == "//:build" && result["status"] == "failed" }),
+        "missing compilation failure for //:build: {value}"
+    );
+    assert!(
+        results.iter().any(|result| {
+            result["address"] == "//crates/app:build"
+                && result["status"] == "blocked"
+                && result["cached"] == false
+                && result["exit_code"].is_null()
+                && result["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("//:build"))
+        }),
+        "member result should be blocked by the failed workspace build, not a success: {value}"
+    );
+    assert_eq!(value["summary"]["failed"], 1);
+    assert_eq!(value["summary"]["blocked"], 1);
     assert!(String::from_utf8_lossy(&output.stdout).contains("cannot find function"));
     assert_eq!(gate_count(&runtime, "build"), 7);
 }
@@ -771,7 +783,8 @@ cache = { enabled = true, runtime = [] }
     assert_eq!(gate_count(&runtime, "consumer"), 2);
 
     // Replacing the prerequisite with a failing command must invalidate its
-    // old cache entry and propagate failure through the commandless target.
+    // old cache entry. The commandless entry and its consumer never run, so
+    // they are blocked by that failure rather than counted as failures.
     write_file(
         &repo,
         "owner/aster.toml",
@@ -784,14 +797,39 @@ cache = { enabled = true, runtime = [] }
     let output = aster(&repo, &runtime, &["run", "//consumer:work", "--json"]);
     assert!(!output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let results = value["results"].as_array().unwrap();
     assert!(
-        value["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|result| result["address"] == "//entry:work" && result["status"] == "failed"),
-        "{value}"
+        results.iter().any(|result| {
+            result["address"] == "//owner:work"
+                && result["status"] == "failed"
+                && result["exit_code"] == 7
+                && result["cached"] == false
+        }),
+        "owner failure did not replace the cached success: {value}"
     );
+    assert!(
+        results.iter().any(|result| {
+            result["address"] == "//entry:work"
+                && result["status"] == "blocked"
+                && result["cached"] == false
+                && result["exit_code"].is_null()
+                && result["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("//owner:work"))
+        }),
+        "commandless entry should be blocked by the failed prerequisite, not cached or passed: {value}"
+    );
+    assert!(
+        results.iter().any(|result| {
+            result["address"] == "//consumer:work"
+                && result["status"] == "blocked"
+                && result["cached"] == false
+                && result["exit_code"].is_null()
+        }),
+        "consumer should not run or hit cache after the prerequisite failed: {value}"
+    );
+    assert_eq!(value["summary"]["failed"], 1);
+    assert_eq!(value["summary"]["blocked"], 2);
     assert_eq!(gate_count(&runtime, "owner"), 3);
     assert_eq!(gate_count(&runtime, "consumer"), 2);
 
