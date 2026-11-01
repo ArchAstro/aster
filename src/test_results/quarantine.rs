@@ -19,7 +19,11 @@
 //!    and there is at least one;
 //! 3. it exited with its runner's "tests failed" code, not a crash, a
 //!    compile error, a timeout or a signal;
-//! 4. `ASTER_QUARANTINE` is not `off`.
+//! 4. its captured console log does not show a non-test failure (a coverage
+//!    threshold or an unhandled error; see `NON_TEST_FAILURE_MARKERS`). A
+//!    log cut at the capture cap can drop that line; Aster does not claim to
+//!    see past the cap;
+//! 5. `ASTER_QUARANTINE` is not `off`.
 //!
 //! Quarantined tests still run and their results are still uploaded.
 
@@ -38,6 +42,24 @@ use crate::test_results::Confidence;
 
 /// The repository's own list, at the workspace root.
 pub const REPO_FILE: &str = "aster-quarantine.toml";
+
+/// Substrings of a runner console line that mean the process failed for a
+/// reason other than a test case. Matched case-insensitively; the whole
+/// line is what [`Quarantine::judge`] names.
+///
+/// The exit code cannot tell these apart from a failed test: Jest, pytest
+/// and Vitest all exit 1. The phrases are the runners' own messages:
+///
+/// - Jest: `Jest: "global" coverage threshold for lines (100%) not met`
+/// - pytest-cov: `FAIL Required test coverage of N% not reached`
+/// - Vitest: `ERROR: Coverage for lines (..%) does not meet global threshold`
+/// - Vitest: `Vitest caught N unhandled error` and `Unhandled error`
+const NON_TEST_FAILURE_MARKERS: &[&str] = &[
+    "coverage threshold for ",
+    "fail required test coverage of ",
+    "does not meet global threshold",
+    "unhandled error",
+];
 
 /// How long a cached server list may stand in for the server.
 const CACHE_HOURS: i64 = 24;
@@ -298,7 +320,9 @@ impl Quarantine {
     /// Whether a failed target may pass. `plugin` names the target's
     /// project plugin, `command` is the target's one command as written
     /// (several commands are never judged), `exit_code` its last exit code,
-    /// and `report` its results after retries.
+    /// `report` its results after retries, and `output` the captured console
+    /// log. A line in `output` that matches `NON_TEST_FAILURE_MARKERS`
+    /// refuses a pass: the exit code cannot tell that line from a test failure.
     pub fn judge(
         &self,
         address: &str,
@@ -306,6 +330,7 @@ impl Quarantine {
         command: &str,
         exit_code: Option<i32>,
         report: &TestReport,
+        output: &str,
     ) -> Verdict {
         let failing = last_failures(&report.cases);
         let mut quarantined = Vec::new();
@@ -335,7 +360,12 @@ impl Quarantine {
         }
         let codes = tests_failed_codes(plugin, &report.capture, command);
         match exit_code {
-            Some(code) if codes.contains(&code) => Verdict::Pass(quarantined),
+            Some(code) if codes.contains(&code) => match non_test_failure(output) {
+                Some(line) => Verdict::Fail(format!(
+                    "{of} are quarantined, but the runner also reported {line}, which is not a test failure"
+                )),
+                None => Verdict::Pass(quarantined),
+            },
             _ if codes.is_empty() => Verdict::Fail(format!(
                 "{of} are quarantined, but Aster cannot tell this runner's test failures from \
                  other errors by its exit code"
@@ -379,6 +409,24 @@ impl Quarantine {
             parts.join(", ")
         }
     }
+}
+
+/// The first console line that reports a failure other than a test case.
+///
+/// Aster's own lines are not the runner: a `$ command` echo can contain a
+/// retried test's name (`-t 'unhandled error$'`), and `[aster]` notes are ours.
+fn non_test_failure(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("$ ") || trimmed.starts_with("[aster]") {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        NON_TEST_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+            .then_some(trimmed)
+    })
 }
 
 /// The tests whose last attempt failed, once each.
@@ -591,7 +639,7 @@ mod tests {
             case("flaky", TestOutcome::Fail, 1),
             case("fine", TestOutcome::Pass, 1),
         ]);
-        let Verdict::Pass(tests) = q.judge(ADDRESS, "elixir", MIX, Some(2), &only_flaky) else {
+        let Verdict::Pass(tests) = q.judge(ADDRESS, "elixir", MIX, Some(2), &only_flaky, "") else {
             panic!("expected a pass");
         };
         assert_eq!(tests[0].name, "flaky");
@@ -602,7 +650,7 @@ mod tests {
             case("real", TestOutcome::Error, 1),
         ]);
         assert!(matches!(
-            q.judge(ADDRESS, "elixir", MIX, Some(2), &also_real),
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &also_real, ""),
             Verdict::Fail(why) if why.contains("1 of 2")
         ));
         // A retry that fixed the other failure leaves only the quarantined one.
@@ -613,12 +661,12 @@ mod tests {
             case("real", TestOutcome::Pass, 2),
         ]);
         assert!(matches!(
-            q.judge(ADDRESS, "elixir", MIX, Some(2), &retried),
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &retried, ""),
             Verdict::Pass(tests) if tests.len() == 1
         ));
         let unrelated = report(vec![case("real", TestOutcome::Fail, 1)]);
         assert_eq!(
-            q.judge(ADDRESS, "elixir", MIX, Some(2), &unrelated),
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &unrelated, ""),
             Verdict::Untouched
         );
     }
@@ -629,7 +677,7 @@ mod tests {
         let mut partial = report(vec![case("flaky", TestOutcome::Fail, 1)]);
         partial.confidence = Confidence::Partial;
         assert!(matches!(
-            q.judge(ADDRESS, "elixir", MIX, Some(2), &partial),
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &partial, ""),
             Verdict::Fail(why) if why.contains("partial")
         ));
         let failed = report(vec![case("flaky", TestOutcome::Fail, 1)]);
@@ -637,7 +685,7 @@ mod tests {
         for code in [Some(1), Some(137), None] {
             assert!(
                 matches!(
-                    q.judge(ADDRESS, "elixir", MIX, code, &failed),
+                    q.judge(ADDRESS, "elixir", MIX, code, &failed, ""),
                     Verdict::Fail(_)
                 ),
                 "{code:?}"
@@ -647,9 +695,92 @@ mod tests {
         cargo.capture = "libtest".into();
         // cargo test: 101 for failed tests; a different code is not.
         assert!(matches!(
-            q.judge(ADDRESS, "rust", "cargo test", Some(1), &cargo),
+            q.judge(ADDRESS, "rust", "cargo test", Some(1), &cargo, ""),
             Verdict::Fail(why) if why.contains("101")
         ));
+    }
+
+    #[test]
+    fn a_non_test_failure_in_the_console_is_not_excused() {
+        let q = Quarantine::new(None, vec![entry("flaky")]);
+        let mut failed = report(vec![
+            case("flaky", TestOutcome::Fail, 1),
+            case("fine", TestOutcome::Pass, 1),
+        ]);
+        failed.capture = "jest-json".into();
+        let markers = [
+            r#"Jest: "global" coverage threshold for lines (100%) not met: 80%"#,
+            "FAIL Required test coverage of 80% not reached. Total coverage: 70.00%",
+            "ERROR: Coverage for lines (70%) does not meet global threshold (100%)",
+            "Vitest caught 1 unhandled error during the test run",
+            "Unhandled error",
+        ];
+        for marker in markers {
+            let output = format!("noise\n{marker}\nmore\n");
+            match q.judge(
+                ADDRESS,
+                "nodejs",
+                "jest --coverage",
+                Some(1),
+                &failed,
+                &output,
+            ) {
+                Verdict::Fail(why) => {
+                    assert!(why.contains(marker), "{why}");
+                    assert!(why.contains("not a test failure"), "{why}");
+                    assert!(why.contains("the runner also reported"), "{why}");
+                }
+                other => panic!("expected fail for {marker}, got {other:?}"),
+            }
+        }
+        // The same report with no marker still passes.
+        assert!(matches!(
+            q.judge(
+                ADDRESS,
+                "nodejs",
+                "jest --coverage",
+                Some(1),
+                &failed,
+                "Tests: 1 failed, 1 passed\n"
+            ),
+            Verdict::Pass(tests) if tests.len() == 1
+        ));
+        // A truncated log whose marker was dropped is not claimed as seen.
+        // Aster's command echo and its own notes are not the runner.
+        assert!(non_test_failure("[aster] log truncated: 12 bytes omitted\n").is_none());
+        assert!(non_test_failure("$ jest --coverage -t 'unhandled error$'\n").is_none());
+        assert_eq!(
+            non_test_failure("$ jest -t 'unhandled error$'\nVitest caught 1 unhandled error\n"),
+            Some("Vitest caught 1 unhandled error")
+        );
+        // Partial results and a real failure keep their own reasons.
+        let mut partial = failed.clone();
+        partial.confidence = Confidence::Partial;
+        let marked = r#"Jest: "global" coverage threshold for lines (100%) not met"#;
+        assert!(matches!(
+            q.judge(ADDRESS, "nodejs", "jest --coverage", Some(1), &partial, marked),
+            Verdict::Fail(why) if why.contains("partial") && !why.contains("not a test failure")
+        ));
+        let also_real = report(vec![
+            case("flaky", TestOutcome::Fail, 1),
+            case("real", TestOutcome::Fail, 1),
+        ]);
+        assert!(matches!(
+            q.judge(ADDRESS, "nodejs", "jest --coverage", Some(1), &also_real, marked),
+            Verdict::Fail(why) if why.contains("the others still fail")
+        ));
+        let unrelated = report(vec![case("real", TestOutcome::Fail, 1)]);
+        assert_eq!(
+            q.judge(
+                ADDRESS,
+                "nodejs",
+                "jest --coverage",
+                Some(1),
+                &unrelated,
+                marked
+            ),
+            Verdict::Untouched
+        );
     }
 
     #[test]

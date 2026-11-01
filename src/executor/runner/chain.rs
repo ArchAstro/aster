@@ -127,6 +127,10 @@ fn run_step(
         return (result, None);
     };
     result.tests = read_test_report(job.address, &[Some(plan.clone())], &[raw], started);
+    // Same as the single-command path: a narrowed retry's log is not the
+    // step's own console. Only a failed step with a quarantine list is judged.
+    let console_before_retry =
+        (job.quarantine.is_some() && !result.success).then(|| result.output.clone());
     if !result.success && job.max_retries > 0 && !shutdown_requested() {
         {
             let plugin = job.plugin;
@@ -152,15 +156,19 @@ fn run_step(
             );
         }
     }
-    if let (Some(quarantine), Some(report), false) =
-        (job.quarantine, result.tests.as_ref(), result.success)
-    {
+    if let (Some(quarantine), Some(report), Some(console), false) = (
+        job.quarantine,
+        result.tests.as_ref(),
+        console_before_retry.as_deref(),
+        result.success,
+    ) {
         match quarantine.judge(
             job.address,
             job.plugin_name,
             &step.leaf,
             result.exit_code,
             report,
+            console,
         ) {
             Verdict::Pass(tests) => {
                 let mut note = format!(
