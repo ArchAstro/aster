@@ -230,6 +230,7 @@ Flags:
   --quiet, -q           Suppress per-project output
   --json                Output JSON
   --full-logs           Show full output for failed targets
+  --help, -h            Print this usage and exit without running the target
 "#;
 
 /// Target names `aster help <name>` recognizes without loading a workspace.
@@ -275,6 +276,57 @@ pub fn conventional_target_help_name(args: &[String]) -> Option<&str> {
         return None;
     }
     Some(*name)
+}
+
+/// `aster target <name> … --help`/`-h` before clap parse.
+///
+/// The `target` subcommand is built-in, so clap may treat `--help` as that
+/// subcommand's help flag and never reach target execution. This must run
+/// before `Cli::parse`. Help is recognized only after both `target` and the
+/// target name (`aster target build --help`). Earlier `--help`/`-h` — root
+/// help, `aster target --help`, or a flag value such as `--jobs --help` —
+/// returns `None` so clap handles it.
+pub fn explicit_target_help_name(args: &[String]) -> Option<&str> {
+    let (name, suffix) = target_name_and_suffix(args)?;
+    if super::run::parse_run_args(suffix.to_vec()).help {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// `target <name> [suffix…]` with `<name>` and the following args.
+///
+/// Global value flags (`--jobs`, `--cache-dir`) are skipped the same way as
+/// [`positional_tokens`], so their values are not the target name and a
+/// `--help` used as a value is not target help.
+fn target_name_and_suffix(args: &[String]) -> Option<(&str, &[String])> {
+    let mut skip_next = false;
+    let mut saw_command = false;
+    for (index, arg) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--" {
+            return None;
+        }
+        if arg.starts_with('-') {
+            if matches!(arg.as_str(), "--jobs" | "--cache-dir") {
+                skip_next = true;
+            }
+            continue;
+        }
+        if !saw_command {
+            if arg != "target" {
+                return None;
+            }
+            saw_command = true;
+            continue;
+        }
+        return Some((arg.as_str(), &args[index..]));
+    }
+    None
 }
 
 fn is_conventional_target(name: &str) -> bool {
@@ -1283,6 +1335,43 @@ mod tests {
         assert_eq!(
             external_target_name(&args(&["test", "--help"])),
             Some("test")
+        );
+    }
+
+    #[test]
+    fn explicit_target_help_names_the_target_and_leaves_builtin_help() {
+        let args = |tokens: &[&str]| {
+            tokens
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            explicit_target_help_name(&args(&["target", "build", "--help"])),
+            Some("build")
+        );
+        assert_eq!(
+            explicit_target_help_name(&args(&["target", "build", "-h"])),
+            Some("build")
+        );
+        assert_eq!(
+            explicit_target_help_name(&args(&["--quiet", "target", "list", "--help"])),
+            Some("list")
+        );
+        assert_eq!(
+            explicit_target_help_name(&args(&["target", "--jobs", "4", "build", "--help"])),
+            Some("build")
+        );
+        assert!(explicit_target_help_name(&args(&["target", "--help"])).is_none());
+        assert!(explicit_target_help_name(&args(&["target", "build"])).is_none());
+        assert!(explicit_target_help_name(&args(&["check", "--help"])).is_none());
+        assert!(explicit_target_help_name(&args(&["build", "--help"])).is_none());
+        // Help before the target name belongs to clap, including when it is a flag value.
+        assert!(explicit_target_help_name(&args(&["--help", "target", "build"])).is_none());
+        assert!(explicit_target_help_name(&args(&["-h", "target", "build"])).is_none());
+        assert!(explicit_target_help_name(&args(&["target", "--help", "build"])).is_none());
+        assert!(
+            explicit_target_help_name(&args(&["--jobs", "--help", "target", "build"])).is_none()
         );
     }
 }
