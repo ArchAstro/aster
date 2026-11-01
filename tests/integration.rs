@@ -2381,10 +2381,46 @@ fn matrix_rejects_reserved_fields_and_a_workspace_without_lanes() {
     );
     let output = run(&tmp);
     assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("matrix field 'name' is reserved"),
+        stderr.contains("matrix field 'name' is reserved"),
         "{output:?}"
     );
+    assert!(
+        stderr.contains("reserved: lane, name, target, toolchains"),
+        "{output:?}"
+    );
+    assert!(!stderr.contains("set the lane's own"), "{output:?}");
+
+    // `lane` is reserved too, and a lane has no `lane` key to set instead.
+    // Issue #253: [affected.lanes.ci] include=["//a"], matrix = { lane = "x" }.
+    write_package_json(
+        &tmp,
+        "a/package.json",
+        r#"{"name":"a","scripts":{"test":"true"}}"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "aster.toml",
+        "[affected.lanes.ci]\ninclude = [\"//a\"]\nmatrix = { lane = \"x\" }\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(["affected", "test", "--base=HEAD", "--matrix"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("matrix field 'lane' is reserved"),
+        "{output:?}"
+    );
+    assert!(
+        stderr.contains("reserved: lane, name, target, toolchains"),
+        "{output:?}"
+    );
+    assert!(stderr.contains("rename it"), "{output:?}");
+    assert!(!stderr.contains("set the lane's own"), "{output:?}");
 }
 
 #[test]
