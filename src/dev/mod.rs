@@ -17,9 +17,9 @@ mod tls;
 pub use daemon::read_accepted_line;
 pub use daemon::{
     attach_bundle, launch_bundle, list_workspace_bundles, ping_daemon, stop_all_bundles,
-    stop_workspace_bundles, BundleDescriptor, BundleState, DaemonError, DaemonErrorCode,
-    DaemonResult, LaunchOptions, LaunchResult, LaunchStatus, DEFAULT_GROUP, PROTOCOL_VERSION,
-    SUPERVISOR_ENV,
+    stop_workspace_bundles, supervisor_startup_log, BundleDescriptor, BundleState, DaemonError,
+    DaemonErrorCode, DaemonResult, LaunchOptions, LaunchResult, LaunchStatus, DEFAULT_GROUP,
+    PROTOCOL_VERSION, SUPERVISOR_ENV,
 };
 #[doc(hidden)]
 pub use daemon::{is_internal_serve_invocation, register_supervisor_ready, serve_from_environment};
