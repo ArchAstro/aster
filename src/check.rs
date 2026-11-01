@@ -467,19 +467,13 @@ fn orphans(
     report: &mut Report,
 ) -> Result<()> {
     let lanes = &config.affected.lanes;
-    if lanes.is_empty() {
-        report.skipped.push(Skipped {
-            rule: ORPHAN,
-            reason: "the workspace has no [affected.lanes], so there is no CI entry to reach \
-                     targets from"
-                .into(),
-        });
-        return Ok(());
-    }
     let mut global: Vec<String> = config.check.entries.clone();
     global.extend(options.entries.iter().cloned());
     global.sort();
     global.dedup();
+    // Entries are enough on their own. Lanes are one more way to name an
+    // entry (`target`) and to limit which projects are roots, not a
+    // prerequisite for `[check] entries` or `--entry`.
     let any_lane_target = lanes.values().any(|lane| lane.target.is_some());
     if global.is_empty() && !any_lane_target {
         report.skipped.push(Skipped {
@@ -496,21 +490,30 @@ fn orphans(
         .collect();
     let mut admitted: HashSet<String> = HashSet::new();
     let mut roots: Vec<(String, String)> = Vec::new();
-    let mut names: Vec<&String> = lanes.keys().collect();
-    names.sort();
-    for name in names {
-        let lane = &lanes[name];
-        let members = select_affected_lane(name, &config.affected, all.clone(), projects)?;
-        let entries: Vec<String> = match &lane.target {
-            Some(target) => vec![target.clone()],
-            None => global.clone(),
-        };
-        for project in &members {
-            for entry in &entries {
+    if lanes.is_empty() {
+        for project in &all {
+            for entry in &global {
                 roots.push((project.clone(), entry.clone()));
             }
         }
-        admitted.extend(members);
+        admitted.clone_from(&all);
+    } else {
+        let mut names: Vec<&String> = lanes.keys().collect();
+        names.sort();
+        for name in names {
+            let lane = &lanes[name];
+            let members = select_affected_lane(name, &config.affected, all.clone(), projects)?;
+            let entries: Vec<String> = match &lane.target {
+                Some(target) => vec![target.clone()],
+                None => global.clone(),
+            };
+            for project in &members {
+                for entry in &entries {
+                    roots.push((project.clone(), entry.clone()));
+                }
+            }
+            admitted.extend(members);
+        }
     }
     let roots_by_addr: HashMap<String, PathBuf> = projects
         .iter()
@@ -605,6 +608,8 @@ fn orphans(
         }
         let why = if admitted.contains(&test.project) {
             "no entry target depends on it or is joined by it with `selected_by`"
+        } else if lanes.is_empty() {
+            "no `[check] entries` or `--entry` is a root of its project"
         } else {
             "its project is in no [affected.lanes] entry"
         };
