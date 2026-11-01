@@ -1441,7 +1441,20 @@ impl<'a> Executor<'a> {
 
                 // A pass that needed a retry or the quarantine is not a
                 // clean pass to replay from the cache: the next run should
-                // see the flake again. Failures are never stored.
+                // see the flake again. Failures are never stored. A package
+                // script chain retries and quarantines inside chain::run, so
+                // those passes are on the report rather than the flags above.
+                // store_success is the only store path, including remote upload.
+                retried = retried
+                    || result
+                        .tests
+                        .as_ref()
+                        .is_some_and(|tests| !tests.flaky().is_empty());
+                let_through = let_through
+                    || result
+                        .tests
+                        .as_ref()
+                        .is_some_and(|tests| !tests.quarantined.is_empty());
                 let clean_pass =
                     result.success && result.exit_code == Some(0) && !retried && !let_through;
                 if !clean_pass {
