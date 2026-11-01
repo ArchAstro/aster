@@ -187,6 +187,10 @@ struct Index<'a> {
     unit_files: Vec<Vec<u32>>,
     /// Definitions that use each unit.
     users: Vec<Vec<DefId>>,
+    /// Definitions that load each unit through `import()` or `require()`
+    /// and therefore hold its module object. Static imports are not here:
+    /// they name what they use, and file-top `loaded` also records them.
+    dynamic_users: Vec<Vec<DefId>>,
     /// Units each unit's files use.
     unit_uses: Vec<Vec<u32>>,
     /// For each project, the units its test runner loads before every
@@ -722,6 +726,9 @@ impl<'a> Index<'a> {
             }
         }
         let mut sources = Vec::with_capacity(ordered.len());
+        // Definitions that dynamically load each unit. Filled in the loop
+        // below, where `resolve` is in scope; static imports stay out.
+        let mut dynamic_users: Vec<Vec<DefId>> = vec![Vec::new(); unit_files.len()];
         for (i, path) in ordered.iter().enumerate() {
             let file = &facts[*path];
             let family = file.family;
@@ -800,6 +807,23 @@ impl<'a> Index<'a> {
                     .any(|spec| missing(std::slice::from_ref(spec)));
             let mut uses: Vec<Vec<u32>> = file.defs.iter().map(|d| uses_of(d, false)).collect();
             uses.push(uses_of(&file.top, true));
+            // `import()` and `require()` record the specifier on the
+            // enclosing definition. The file top's `loaded` set also holds
+            // static import specifiers (so a string lint skips them) and
+            // top-level mocks; indexing those would select every importer.
+            for (d, def) in file.defs.iter().enumerate() {
+                if def.loaded.is_empty() {
+                    continue;
+                }
+                let mut units = BTreeSet::new();
+                for spec in &def.loaded {
+                    units.extend(resolve(path, family, spec));
+                }
+                units.remove(&file_unit[i]);
+                for unit in expand(units) {
+                    dynamic_users[unit as usize].push((i as u32, d as u32));
+                }
+            }
             let via: Vec<Vec<u32>> = file
                 .defs
                 .iter()
@@ -1356,6 +1380,7 @@ impl<'a> Index<'a> {
             by_path,
             unit_files,
             users,
+            dynamic_users,
             unit_uses,
             preloads,
             unit_opaque,
@@ -2866,6 +2891,9 @@ impl<'a, 'b> Run<'a, 'b> {
             for alias in &def.aliases {
                 referenced |= self.symbol(source.unit, alias, member, id, id.0);
             }
+            // A dynamic loader holds the module object, so any member is
+            // reachable even when another file already names this one.
+            self.dynamic_users(source.unit, id);
             // Nothing names it, so something reaches it another way: a
             // framework callback, a macro expansion, reflection.
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
@@ -2913,6 +2941,19 @@ impl<'a, 'b> Run<'a, 'b> {
             }
         }
         found
+    }
+
+    /// Mark every definition that loads `unit` through `import()` or
+    /// `require()`. Unlike [`Self::users`], this runs even when something
+    /// already names the definition: the loader does not have to.
+    fn dynamic_users(&mut self, unit: u32, from: DefId) {
+        let ix = self.ix;
+        let from_test = ix.is_test(from);
+        for &user in &ix.dynamic_users[unit as usize] {
+            if user != from && (!from_test || ix.is_test(user)) {
+                self.mark(user, Why::Via(from));
+            }
+        }
     }
 
     /// Mark every definition that uses `unit`.
