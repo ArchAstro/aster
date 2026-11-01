@@ -268,6 +268,126 @@ pub(crate) fn chain_for_target(
     }
 }
 
+/// The inner command of a package-exec step `--related` already wrapped
+/// (`npm exec -c 'vitest run …'`, `pnpm exec vitest run …`), and the launcher
+/// that wrapped it. `None` when `command` is not that form.
+fn package_exec_step(command: &str) -> Option<(String, String)> {
+    let argv = Argv::parse(command)?;
+    let parts = &argv.parts[argv.program..];
+    let launcher = std::path::Path::new(parts.first()?).file_name()?.to_str()?;
+    match (
+        launcher,
+        parts.get(1).map(String::as_str),
+        parts.get(2).map(String::as_str),
+    ) {
+        ("npm", Some("exec"), Some("-c")) if parts.len() == 4 => {
+            Some(("npm".to_string(), parts[3].clone()))
+        }
+        ("pnpm", Some("exec"), _) if parts.len() >= 3 => {
+            let marker = "pnpm exec ";
+            let at = command.find(marker)?;
+            let rest = &command[at + marker.len()..];
+            let assignments = argv.parts[..argv.program].join(" ");
+            let inner = if assignments.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{assignments} {rest}")
+            };
+            Some(("pnpm".to_string(), inner))
+        }
+        _ => None,
+    }
+}
+
+/// A chain `--related` has already split into package-exec steps
+/// (`npm exec -c 'vitest run …'`, then `npm exec -c 'echo done'`).
+/// Each runner step is planned from the command inside the wrapper, and the
+/// other steps stay as written. `None` when the commands are not that shape,
+/// or a runner step cannot be planned: the caller then plans each command
+/// on its own.
+pub(crate) fn expanded_steps(
+    plugin: &dyn LanguagePlugin,
+    project_dir: &Path,
+    working_dir: &Path,
+    target_name: &str,
+    commands: &[String],
+    wrappers: &Wrappers,
+    new_dir: &mut dyn FnMut() -> Option<PathBuf>,
+) -> Option<ChainPlan> {
+    if commands.len() < 2 {
+        return None;
+    }
+    let mut launcher = None;
+    let mut prefix = None;
+    let mut inners = Vec::new();
+    for command in commands {
+        let (step_prefix, bare) = match wrappers.strip(command) {
+            Some(wrapped) => (wrapped.prefix, wrapped.command),
+            None => (String::new(), command.clone()),
+        };
+        match &prefix {
+            None => prefix = Some(step_prefix),
+            Some(existing) if existing != &step_prefix => return None,
+            _ => {}
+        }
+        let (step_launcher, inner) = package_exec_step(&bare)?;
+        match &launcher {
+            None => launcher = Some(step_launcher),
+            Some(existing) if existing != &step_launcher => return None,
+            _ => {}
+        }
+        inners.push(inner);
+    }
+    let launcher = launcher?;
+    let prefix = prefix.unwrap_or_default();
+    let mut steps = Vec::new();
+    let abort = |steps: &[ChainStep]| {
+        for (_, dir) in steps.iter().filter_map(|step| step.plan.as_ref()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
+    for inner in inners {
+        if !is_js_runner(&inner) {
+            steps.push(ChainStep {
+                leaf: inner,
+                plan: None,
+            });
+            continue;
+        }
+        let Some(dir) = new_dir() else {
+            abort(&steps);
+            return None;
+        };
+        let step_ctx = ReportContext {
+            project_dir,
+            working_dir,
+            target_name,
+            command: &inner,
+            report_dir: &dir,
+        };
+        match plan(plugin, None, &step_ctx, wrappers) {
+            Some(plan) => {
+                steps.push(ChainStep {
+                    leaf: inner,
+                    plan: Some((plan, dir)),
+                });
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(&dir);
+                abort(&steps);
+                return None;
+            }
+        }
+    }
+    if !steps.iter().any(|step| step.plan.is_some()) {
+        return None;
+    }
+    Some(ChainPlan {
+        launch: Launch { prefix, launcher },
+        steps,
+    })
+}
+
 /// Plan for a test command whatever the project's language: the runners
 /// that are recognised by their command alone (`mix test`, `go test`,
 /// `pytest`), directly or inside a shell one-liner. A shard project, for

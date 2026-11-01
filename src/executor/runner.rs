@@ -2688,10 +2688,11 @@ impl Invocation {
     }
 }
 
-/// The step-by-step capture of a target whose one command is a package script
-/// chain that no single report plan covers. `None` for any other target, a
-/// target with a declared report, or a chain with a step Aster cannot plan
-/// (the target is then uncaptured, which `aster check` reports).
+/// The step-by-step capture of a package script chain, either the target's
+/// one command or the steps `--related` already split it into. `None` for
+/// any other target, a target with a declared report, or a chain with a
+/// step Aster cannot plan (the target is then uncaptured, which `aster
+/// check` reports).
 pub(crate) fn plan_chain(
     plugin: &dyn LanguagePlugin,
     declared: Option<&crate::config::ReportConfig>,
@@ -2702,9 +2703,23 @@ pub(crate) fn plan_chain(
     wrappers: &Wrappers,
 ) -> Option<crate::plugins::test_reports::ChainPlan> {
     use crate::plugins::test_reports::{self, Chain};
-    let [command] = commands else {
-        return None;
-    };
+    // A narrowed chain is several `npm exec -c` / `pnpm exec` steps. A
+    // declared report names files the target command writes, not each step.
+    if commands.len() != 1 {
+        if declared.is_some() {
+            return None;
+        }
+        return test_reports::expanded_steps(
+            plugin,
+            project_dir,
+            working_dir,
+            target_name,
+            commands,
+            wrappers,
+            &mut || test_results::new_report_dir().ok(),
+        );
+    }
+    let command = &commands[0];
     let probe = test_results::new_report_dir().ok()?;
     let context = ReportContext {
         project_dir,
