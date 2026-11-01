@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -520,6 +521,170 @@ fn a_failing_step_of_a_chain_stops_it_and_leaves_the_results_partial() {
     );
 }
 
+/// A one-step package script `vitest run`, launched by `npm run test`.
+/// The runner is a shell script in `node_modules/.bin`, so the chain is
+/// planned and retried without a real Vitest. It fails until `marker`
+/// exists (outside the project's cache inputs), writes the JUnit file
+/// Aster asks for, and appends every invocation to `vitest.runs`.
+fn flaky_vitest_script_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "app/package.json",
+        r#"{"name":"app","scripts":{"test":"vitest run"}}"#,
+    );
+    write(
+        tmp.path(),
+        "app/node_modules/.bin/vitest",
+        r#"#!/bin/sh
+set -u
+here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+root=$(CDPATH= cd -- "$here/../../.." && pwd)
+printf '%s\n' "$*" >> "$root/vitest.runs"
+out=""
+for arg in "$@"; do
+  case "$arg" in
+    --outputFile.junit=*) out=${arg#--outputFile.junit=} ;;
+  esac
+done
+if [ -f "$root/marker" ]; then
+  status=0
+  body='<testcase classname="src/flaky.test.ts" name="flaky" time="0.001"/>'
+else
+  status=1
+  : > "$root/marker"
+  body='<testcase classname="src/flaky.test.ts" name="flaky" time="0.001"><failure message="fails on the first run">fails on the first run</failure></testcase>'
+fi
+if [ -n "$out" ]; then
+  mkdir -p "$(dirname "$out")"
+  printf '%s\n' "<testsuite name=\"src/flaky.test.ts\">$body</testsuite>" > "$out"
+fi
+exit "$status"
+"#,
+    );
+    let bin = tmp.path().join("app/node_modules/.bin/vitest");
+    let mut perms = fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&bin, perms).unwrap();
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"npm run test\"\n",
+    );
+    tmp
+}
+
+fn vitest_runs(root: &Path) -> usize {
+    fs::read_to_string(root.join("vitest.runs"))
+        .map(|text| text.lines().filter(|line| !line.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn target_was_cached(output: &Output, address: &str) -> bool {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.lines()
+        .any(|line| line.contains(address) && line.contains("(cached)"))
+}
+
+#[test]
+fn a_flaky_pass_in_a_package_script_target_is_not_cached() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("npm") {
+        eprintln!("skipping: npm is not installed");
+        return;
+    }
+    let tmp = flaky_vitest_script_workspace();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .env_remove("ASTER_TEST_RESULTS")
+            .env_remove("GITHUB_RUN_ID")
+            .env_remove("ASTER_RETRY_FAILED")
+            .env_remove("ASTER_SRV_URL")
+            .env_remove("ASTER_SRV_TOKEN")
+            .env("ASTER_REMOTE_CACHE", "none")
+            .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let first = run(&["--retry-failed", "test", "//app"]);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(stderr.contains("flaky: 1 test passed on retry"), "{stderr}");
+    assert_eq!(vitest_runs(tmp.path()), 2, "the failing run and its retry");
+
+    // The marker is not a cache input. Removing it must not be what misses
+    // the cache: the flaky pass itself must not have been stored.
+    fs::remove_file(tmp.path().join("marker")).unwrap();
+    let second = run(&["test", "//app"]);
+    let again = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        !target_was_cached(&second, "//app:test"),
+        "flaky package-script pass was cached: {again}"
+    );
+    assert!(
+        vitest_runs(tmp.path()) > 2,
+        "the fake runner did not run again: {again}"
+    );
+}
+
+#[test]
+fn a_first_attempt_package_script_pass_is_still_cached() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("npm") {
+        eprintln!("skipping: npm is not installed");
+        return;
+    }
+    let tmp = flaky_vitest_script_workspace();
+    fs::write(tmp.path().join("marker"), "x").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .env_remove("ASTER_TEST_RESULTS")
+            .env_remove("GITHUB_RUN_ID")
+            .env_remove("ASTER_RETRY_FAILED")
+            .env_remove("ASTER_SRV_URL")
+            .env_remove("ASTER_SRV_TOKEN")
+            .env("ASTER_REMOTE_CACHE", "none")
+            .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+            .args(["test", "//app"])
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(!stderr.contains("flaky:"), "{stderr}");
+    assert_eq!(vitest_runs(tmp.path()), 1, "{stderr}");
+    let second = run();
+    let again = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{again}");
+    assert!(
+        target_was_cached(&second, "//app:test"),
+        "a first-attempt pass was not cached: {again}"
+    );
+    assert_eq!(
+        vitest_runs(tmp.path()),
+        1,
+        "a cached pass reran the fake runner: {again}"
+    );
+}
+
 /// A chain `node --test a && node --test b && node post.js`: step 2 holds a
 /// test that always fails (quarantined in the first scenario), optionally with
 /// a second, real failure.
@@ -603,6 +768,39 @@ fn a_quarantined_failure_in_a_chain_step_is_excused_and_the_chain_continues() {
         .collect();
     assert_eq!(quarantined, ["known flaky b"]);
     assert!(tests_of(&records).contains(&("stable a".into(), TestOutcome::Pass, 1)));
+
+    // A pass the quarantine let through inside the chain is not stored.
+    // Quarantine applies only when results are captured, and the run above
+    // used --no-cache, so this pair is what can cache.
+    let tmp = quarantine_chain_workspace(false);
+    let results = tmp.path().join("out/results.ndjson");
+    let args = [
+        format!("--test-results={}", results.display()),
+        "test".to_string(),
+        "//app".to_string(),
+    ];
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let first = aster(tmp.path(), &args);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{stderr}");
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    assert!(tmp.path().join("post.ran").exists(), "the chain continued");
+    fs::remove_file(tmp.path().join("post.ran")).unwrap();
+    let second = aster(tmp.path(), &args);
+    let again = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{again}");
+    assert!(
+        !target_was_cached(&second, "//app:test"),
+        "quarantine pass was cached: {again}"
+    );
+    assert!(
+        tmp.path().join("post.ran").exists(),
+        "the chain did not run again: {again}"
+    );
 
     // Another failure in the same step is not quarantined: the target fails
     // and the chain stops.
