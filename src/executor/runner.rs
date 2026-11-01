@@ -314,7 +314,7 @@ impl<'a> Executor<'a> {
     /// Read test commands through the `[affected.related] wrappers` programs
     /// when planning report capture and retries.
     pub fn with_wrappers(mut self, wrappers: &[crate::config::RelatedWrapperConfig]) -> Self {
-        self.wrappers = Wrappers::new(wrappers);
+        self.wrappers = Wrappers::new(wrappers).with_workspace(self.workspace_root);
         self
     }
 

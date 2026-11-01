@@ -227,7 +227,15 @@ pub fn run(
             || enabled(UNRETRYABLE)
             || enabled(STALE_ALLOW_NO_RESULTS)
         {
-            uncaptured(projects, registry, config, &tests, &enabled, &mut report);
+            uncaptured(
+                root,
+                projects,
+                registry,
+                config,
+                &tests,
+                &enabled,
+                &mut report,
+            );
         }
         if enabled(ORPHAN) || enabled(STALE_ALLOW) {
             orphans(
@@ -293,6 +301,7 @@ pub fn run(
 /// declares its report is captured by definition. Applies to every test
 /// target, entry targets included, whether or not `--related` can narrow it.
 fn uncaptured(
+    root: &Path,
     projects: &[DiscoveredProject],
     registry: &PluginRegistry,
     config: &WorkspaceConfig,
@@ -301,7 +310,7 @@ fn uncaptured(
     report: &mut Report,
 ) {
     let wrapper_config = &config.affected.related.wrappers;
-    let wrappers = Wrappers::new(wrapper_config);
+    let wrappers = Wrappers::new(wrapper_config).with_workspace(root);
     let allowed: HashSet<&str> = config
         .check
         .allow_no_test_results
@@ -837,7 +846,7 @@ command = "pytest -x"
         let unquarantinable = by_rule(UNQUARANTINABLE);
         let unretryable = by_rule(UNRETRYABLE);
 
-        let wrappers = Wrappers::new(&config.affected.related.wrappers);
+        let wrappers = Wrappers::new(&config.affected.related.wrappers).with_workspace(root);
         let tests = test_targets(
             &projects,
             &config.affected.related.wrappers,

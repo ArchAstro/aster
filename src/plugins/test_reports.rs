@@ -78,7 +78,7 @@ pub(crate) fn plan(
     let direct = |ctx: &ReportContext| {
         plan_direct(plugin, ctx).or_else(|| plan_in_one_liner(plugin, ctx, wrappers))
     };
-    if let Some(wrapped) = wrappers.strip(ctx.command) {
+    if let Some(wrapped) = wrappers.strip_from(ctx.command, ctx.working_dir) {
         let inner = ReportContext {
             command: &wrapped.command,
             ..*ctx
@@ -98,11 +98,11 @@ fn plan_in_one_liner(
     wrappers: &Wrappers,
 ) -> Option<ReportPlan> {
     let delegated = Delegated::parse_allowing_expansions(ctx.command)?;
-    let wrapped = wrappers.strip(&delegated.command)?;
     let working_dir = match &delegated.dir {
         Some(dir) => ctx.working_dir.join(dir),
         None => ctx.working_dir.to_path_buf(),
     };
+    let wrapped = wrappers.strip_from(&delegated.command, &working_dir)?;
     let inner = ReportContext {
         working_dir: &working_dir,
         command: &wrapped.command,
@@ -183,7 +183,7 @@ pub(crate) fn chain(
     wrappers: &Wrappers,
     new_dir: &mut dyn FnMut() -> Option<PathBuf>,
 ) -> Chain {
-    let (prefix, inner) = match wrappers.strip(ctx.command) {
+    let (prefix, inner) = match wrappers.strip_from(ctx.command, ctx.working_dir) {
         Some(wrapped) => (wrapped.prefix, wrapped.command),
         None => (String::new(), ctx.command.to_string()),
     };
