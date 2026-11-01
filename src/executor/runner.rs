@@ -620,12 +620,16 @@ impl<'a> Executor<'a> {
         let host = match Host::configured() {
             Ok(host) => host,
             Err(error) => {
+                // This returns before progress or failure details, so human and
+                // quiet modes would otherwise report only the summary.
+                let message = format!("Execution admission: {error:#}");
+                if self.output_mode != OutputMode::Json {
+                    eprintln!("[aster] {message}");
+                }
                 return targets_to_run
                     .iter()
-                    .map(|address| {
-                        execution_failure(address, format!("Execution admission: {error:#}"))
-                    })
-                    .collect()
+                    .map(|address| execution_failure(address, message.clone()))
+                    .collect();
             }
         };
         let show_progress = matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose);

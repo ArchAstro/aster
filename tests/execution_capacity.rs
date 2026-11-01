@@ -6,7 +6,8 @@
 //! workspaces and invocations; equal/different host keys; same/different workspace
 //! keys; cold/warm cache; normal/failure/waiting cancellation/scheduler SIGKILL;
 //! recursive nested siblings; workspace/state symlink aliases; inherited/new
-//! resources; captured/streaming first/second interruption of stubborn children.
+//! resources; captured/streaming first/second interruption of stubborn children;
+//! conflicting `--jobs` in human/quiet/json, plus a same-jobs control.
 //! Fidelity: production CLI, scheduler, flock, process groups, Git affected
 //! selection, and socket barriers. Python commands replace expensive compilers,
 //! not the admission or lifecycle code. The test closes their inherited FDs.
@@ -788,4 +789,180 @@ fn nested_workspace_with_its_own_home_and_jobs_runs_its_targets() {
         nested.contains(r#""passed":2,"failed":0"#),
         "nested targets did not pass: {nested}"
     );
+}
+
+/// A second invocation whose `--jobs` disagrees with the active capacity fails
+/// before its target starts. Human and quiet modes print the admission reason;
+/// JSON keeps that reason only in `results[].output`.
+///
+/// Canonical proof for the conflicting-jobs human diagnostic. Fidelity: production
+/// CLI, real flock host state, and the file's socket barrier (a python stand-in
+/// for a long build). Not proven here: Windows (admission is disabled).
+#[test]
+fn conflicting_jobs_failure_names_the_reason_in_human_output() {
+    let f = Fixture::new();
+    let root = f.root.path().join("ws");
+    fs::create_dir(&root).unwrap();
+    // Workspace boundary without a parent `.git` or `aster.toml` winning the walk.
+    fs::write(root.join("aster.toml"), "name = 'ws'\n").unwrap();
+    let probe = aster::executor::quote_command_argument(
+        &f.root.path().join("probe.py").display().to_string(),
+    );
+    let port = f.listener.local_addr().unwrap().port();
+    for name in ["p1", "p2", "p3"] {
+        let dir = root.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("package.json"), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+        let command = format!("python3 {probe} {port} {name} normal");
+        fs::write(
+            dir.join("aster.toml"),
+            format!(
+                "name = '{name}'\n[targets.build]\ncommand = {command:?}\ncache = {{ enabled = false }}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    const REASON: &str =
+        "host execution capacity is 2 while another invocation is active; requested 3";
+
+    let mut holder = {
+        let mut command = f.command(&root, 2);
+        command.args(["--jobs", "2", "build", "//p1", "//p2"]);
+        Run::spawn(command)
+    };
+    let first = f.started();
+    let second = f.started();
+    assert!(
+        matches!(first.label.as_str(), "p1" | "p2") && matches!(second.label.as_str(), "p1" | "p2"),
+        "holder admitted unexpected targets: {} {}",
+        first.label,
+        second.label
+    );
+    assert_ne!(first.label, second.label);
+
+    let conflict = |args: &[&str]| {
+        let mut command = f.command(&root, 2);
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let deadline = Instant::now() + BUDGET;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("conflicting invocation did not exit: {}", args.join(" "));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut out = String::new();
+        let mut err = String::new();
+        stdout.read_to_string(&mut out).unwrap();
+        stderr.read_to_string(&mut err).unwrap();
+        (status.success(), out, err)
+    };
+
+    let (ok, _stdout, stderr) = conflict(&["--jobs", "3", "build", "//p3"]);
+    assert!(!ok, "human conflict should fail: {stderr}");
+    assert!(
+        stderr.contains(REASON),
+        "human stderr missing admission reason: {stderr}"
+    );
+    assert!(
+        !stderr.contains("START"),
+        "conflict reported a target start: {stderr}"
+    );
+
+    let (ok, stdout, stderr) = conflict(&["--jobs", "3", "--json", "build", "//p3"]);
+    assert!(!ok, "json conflict should fail: {stderr}\n{stdout}");
+    assert!(
+        !stderr.contains(REASON),
+        "json mode printed the admission reason on stderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("json stdout was not the execution document: {error}\n{stdout}")
+    });
+    assert!(
+        json.get("results").and_then(|v| v.as_array()).is_some() && json.get("summary").is_some(),
+        "json schema changed: {stdout}"
+    );
+    let outputs: Vec<_> = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|result| result["output"].as_str())
+        .collect();
+    assert!(
+        outputs.iter().any(|output| output.contains(REASON)),
+        "json results[].output missing admission reason: {stdout}"
+    );
+    assert_eq!(
+        json["summary"]["failed"].as_u64(),
+        Some(1),
+        "json failure count changed: {stdout}"
+    );
+
+    let (ok, _stdout, stderr) = conflict(&["--jobs", "3", "-q", "build", "//p3"]);
+    assert!(!ok, "quiet conflict should fail: {stderr}");
+    assert!(
+        stderr.contains(REASON),
+        "quiet mode lost the admission reason: {stderr}"
+    );
+    assert!(
+        !stderr.contains("FAILED") && !stderr.contains("START"),
+        "quiet mode printed per-target noise: {stderr}"
+    );
+
+    // None of the conflicting invocations may have started //p3.
+    f.remains_blocked();
+
+    // Same --jobs waits for a free slot and must not print the conflict reason.
+    let mut same = {
+        let mut command = f.command(&root, 2);
+        command.args(["--jobs", "2", "build", "//p3"]);
+        Run::spawn(command)
+    };
+    let deadline = Instant::now() + BUDGET;
+    let mut seen = String::new();
+    loop {
+        assert!(
+            matches!(f.listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "same-jobs target started before a slot was free"
+        );
+        match same.1.try_recv() {
+            Ok(line) => {
+                assert!(
+                    !line.contains("while another invocation is active"),
+                    "same jobs printed a capacity conflict: {line}"
+                );
+                seen.push_str(&line);
+                seen.push('\n');
+                if line.contains("Waiting for execution admission:") {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(error) => panic!("same-jobs invocation exited before admission: {error}; {seen}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-jobs invocation did not reach admission: {seen}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    first.release();
+    second.release();
+    let started = f.started();
+    assert_eq!(started.label, "p3");
+    started.release();
+    assert!(same.finish(), "same-jobs run failed after a slot freed");
+    assert!(holder.finish(), "holder failed after releasing its targets");
 }
