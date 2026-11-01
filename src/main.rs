@@ -88,7 +88,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", render_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -107,6 +107,55 @@ fn target_run_args(command: &Commands) -> Option<&Vec<String>> {
     match command {
         Commands::RunTarget { args } | Commands::ExternalTarget(args) => Some(args),
         _ => None,
+    }
+}
+
+/// Render an error for stderr. `{:#}` includes the cause chain. libgit2 appends
+/// `; class=...; code=...`; hide that tail unless `-v` / `--verbose`.
+fn render_error(err: &anyhow::Error) -> String {
+    let rendered = format!("{err:#}");
+    if verbose_requested() {
+        rendered
+    } else {
+        strip_libgit2_suffix(&rendered)
+    }
+}
+
+fn verbose_requested() -> bool {
+    env::args()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--verbose")
+}
+
+/// Drop git2's `; class=Name (n)` and `; code=Name (n)` suffixes.
+fn strip_libgit2_suffix(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(idx) = next_libgit2_suffix(rest) {
+        out.push_str(&rest[..idx]);
+        let marker_len = if rest[idx..].starts_with("; class=") {
+            "; class=".len()
+        } else {
+            "; code=".len()
+        };
+        let after = &rest[idx + marker_len..];
+        rest = match after.find(')') {
+            Some(end) => &after[end + 1..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+fn next_libgit2_suffix(message: &str) -> Option<usize> {
+    let class = message.find("; class=");
+    let code = message.find("; code=");
+    match (class, code) {
+        (Some(class), Some(code)) => Some(class.min(code)),
+        (Some(class), None) => Some(class),
+        (None, Some(code)) => Some(code),
+        (None, None) => None,
     }
 }
 
@@ -399,7 +448,7 @@ fn run() -> Result<()> {
         ) {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("error: {error:#}");
+                eprintln!("error: {}", render_error(&error));
                 2
             }
         };
@@ -554,8 +603,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = graph.find_cycle() {
-                eprintln!("error: {cycle}");
-                return Err(anyhow::anyhow!("Dependency cycle detected"));
+                return Err(anyhow::anyhow!("{cycle}"));
             }
 
             if output_mode == OutputMode::Json {
@@ -812,8 +860,7 @@ fn run() -> Result<()> {
             let dependents = dependents && !all;
 
             // Create affected detector from workspace (requires git)
-            let detector = AffectedDetector::new(&workspace_root)
-                .context("Not in a git repository. The 'affected' command requires git.")?;
+            let detector = AffectedDetector::new(&workspace_root)?;
 
             // Get changed files
             let changed_files = if all {
@@ -867,8 +914,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = find_cycle(&graph) {
-                eprintln!("error: {cycle}");
-                return Err(anyhow::anyhow!("Dependency cycle detected"));
+                return Err(anyhow::anyhow!("{cycle}"));
             }
 
             // Keep a copy of directly affected for rationale tracking in dry-run
@@ -1499,8 +1545,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = target_graph.find_cycle() {
-                eprintln!("error: {cycle}");
-                return Err(anyhow::anyhow!("Dependency cycle detected"));
+                return Err(anyhow::anyhow!("{cycle}"));
             }
 
             let mut invalid_targets = Vec::new();
@@ -1844,8 +1889,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = find_cycle(&graph) {
-                eprintln!("error: {cycle}");
-                return Err(anyhow::anyhow!("Dependency cycle detected"));
+                return Err(anyhow::anyhow!("{cycle}"));
             }
 
             // Select initial projects
@@ -3344,5 +3388,25 @@ mod init_gitignore_tests {
                 "rewrote earlier lines of {existing:?}: {updated:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_format_tests {
+    use super::strip_libgit2_suffix;
+
+    #[test]
+    fn strips_class_and_code_from_a_libgit2_tail() {
+        let raw = "no merge base found; class=Merge (22); code=NotFound (-3)";
+        assert_eq!(strip_libgit2_suffix(raw), "no merge base found");
+    }
+
+    #[test]
+    fn keeps_the_cause_chain_around_the_suffix() {
+        let raw = "Git ref 'HEAD' not found. Check your --base value.: revspec 'HEAD' not found; class=Reference (4); code=NotFound (-3)";
+        assert_eq!(
+            strip_libgit2_suffix(raw),
+            "Git ref 'HEAD' not found. Check your --base value.: revspec 'HEAD' not found"
+        );
     }
 }
