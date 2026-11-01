@@ -141,6 +141,52 @@ fn reserve_consecutive_dynamic_bundles() -> (u16, u16) {
     panic!("could not find two consecutive free dynamic port bundles");
 }
 
+/// A window below the ephemeral range. Parallel tests bind with port 0 in
+/// that range, and `dynamic_port_bundles_are_distinct_propagated_and_released`
+/// can claim the first free pair after this probe releases it. A two-port
+/// range then has no collision-free bundle, and the supervisor exits before
+/// readiness.
+fn reserve_dynamic_port_window(width: u16) -> u16 {
+    let ephemeral_start = 32_768u16;
+    let last = ephemeral_start.saturating_sub(width);
+    for start in 30_000..last {
+        let end = start + width - 1;
+        let listeners = (start..=end)
+            .map(|port| TcpListener::bind(("127.0.0.1", port)))
+            .collect::<Result<Vec<_>, _>>();
+        if let Ok(listeners) = listeners {
+            drop(listeners);
+            return start;
+        }
+    }
+    panic!("could not reserve {width} consecutive dynamic ports below {ephemeral_start}");
+}
+
+fn runtime_log_text(xdg: &Path) -> String {
+    let runtime = xdg.join("aster-daemon-v1");
+    let mut paths = fs::read_dir(&runtime)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.is_empty() {
+        return format!("no logs in {}\n", runtime.display());
+    }
+    paths
+        .iter()
+        .map(|path| {
+            format!(
+                "--- {} ---\n{}\n",
+                path.display(),
+                fs::read_to_string(path).unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
 fn http_get(port: u16) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -737,8 +783,9 @@ fn launch_delayed_service(root: &Path, home: &Path, tmp: &Path, xdg: &Path) -> u
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "services up failed in {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        root.display()
+        "services up failed in {}\nstdout:\n{stdout}\nstderr:\n{stderr}\nruntime logs:\n{}",
+        root.display(),
+        runtime_log_text(xdg)
     );
     let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
         panic!("launch output was not JSON: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}")
@@ -776,8 +823,8 @@ fn dynamic_ports_do_not_collide_across_different_tmpdirs() {
     let tmp_b = tempfile::tempdir().unwrap();
     let workspace_a = tempfile::tempdir().unwrap();
     let workspace_b = tempfile::tempdir().unwrap();
-    let (start, _) = reserve_consecutive_dynamic_bundles();
-    let end = start + 1;
+    let start = reserve_dynamic_port_window(32);
+    let end = start + 31;
     // A short shared runtime dir keeps the socket under SUN_LEN and away from
     // any daemon the user already has under $XDG_RUNTIME_DIR or /tmp.
     let xdg = std::path::PathBuf::from(format!("/tmp/aster-e2e-{}-{start}", std::process::id()));
