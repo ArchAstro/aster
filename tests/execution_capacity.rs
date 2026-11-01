@@ -5,9 +5,10 @@
 //! Integration matrix: run/affected/streaming; one/multiple ready targets; one/two
 //! workspaces and invocations; equal/different host keys; same/different workspace
 //! keys; cold/warm cache; normal/failure/waiting cancellation/scheduler SIGKILL;
-//! recursive nested siblings; workspace/state symlink aliases; inherited/new
-//! resources; captured/streaming first/second interruption of stubborn children;
-//! conflicting `--jobs` in human/quiet/json, plus a same-jobs control.
+//! every admitted group SIGKILLed (stale family cleanup); recursive nested siblings;
+//! workspace/state symlink aliases; inherited/new resources; captured/streaming
+//! first/second interruption of stubborn children; conflicting `--jobs` in
+//! human/quiet/json, plus a same-jobs control.
 //! Fidelity: production CLI, scheduler, flock, process groups, Git affected
 //! selection, and socket barriers. Python commands replace expensive compilers,
 //! not the admission or lifecycle code. The test closes their inherited FDs.
@@ -965,4 +966,248 @@ fn conflicting_jobs_failure_names_the_reason_in_human_output() {
     started.release();
     assert!(same.finish(), "same-jobs run failed after a slot freed");
     assert!(holder.finish(), "holder failed after releasing its targets");
+}
+
+fn child_pids(parent: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .expect("ps");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let ppid = parts.next()?.parse::<u32>().ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+fn process_group(pid: u32) -> i32 {
+    unsafe { libc::getpgid(pid as i32) }
+}
+
+fn sigkill_not_self_group(pid: u32) {
+    let group = process_group(pid);
+    let mine = unsafe { libc::getpgrp() };
+    if group > 1 && group != mine {
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+fn wait_until_dead(pids: &[u32]) {
+    let deadline = Instant::now() + BUDGET;
+    for pid in pids {
+        loop {
+            let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
+            if !alive || process_state(*pid).contains('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pid {pid} survived SIGKILL");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn process_state(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output();
+    output
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn lock_is_free(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return false;
+    };
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+fn wait_until_free(path: &Path) {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        if lock_is_free(path) {
+            return;
+        }
+        assert!(
+            path.exists(),
+            "lock disappeared before it was free: {}",
+            path.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "lock stayed held: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn family_dirs(host: &Path) -> Vec<PathBuf> {
+    let mut dirs = fs::read_dir(host)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("family-"))
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+/// Canonical proof that a killed admitted run does not leak its family directory.
+///
+/// Fidelity: real `aster work`, real flocks, real SIGKILL of the scheduler,
+/// supervisor, and target groups. The next invocation on the same
+/// ASTER_EXECUTION_DIR removes the stale family and leaves a concurrently live
+/// run's family in place. Not proven here: NFS locks.
+#[test]
+fn killed_admitted_run_leaves_no_family_dir_after_next_invocation() {
+    let f = Fixture::new();
+    let killed_ws = f.workspace("killed", "", "normal");
+    let live_ws = f.workspace("live", "", "normal");
+    let next_ws = f.workspace("next", "", "normal");
+    let host = f.root.path().join("host");
+    let work = |root: &Path| {
+        let mut command = f.command(root, 1);
+        command.args(["work", ".", "--quiet"]);
+        Run::spawn(command)
+    };
+
+    let mut killed = work(&killed_ws);
+    let killed_target = f.started();
+    assert_eq!(killed_target.label, "killed");
+    let stale = {
+        let families = family_dirs(&host);
+        assert_eq!(
+            families.len(),
+            1,
+            "admitted run did not create one family dir"
+        );
+        families.into_iter().next().unwrap()
+    };
+
+    // Reach configured() while the first family is still live, then wait. This
+    // invocation must not be the one that sweeps after the kill.
+    let mut live = work(&live_ws);
+    live.waiting(&f.listener);
+
+    let scheduler = killed.0.id();
+    let supervisors = child_pids(scheduler);
+    assert!(
+        !supervisors.is_empty(),
+        "execution supervisor was not spawned"
+    );
+    let mut targets = Vec::new();
+    for supervisor in &supervisors {
+        targets.extend(child_pids(*supervisor));
+    }
+    assert!(!targets.is_empty(), "admitted target was not spawned");
+    let supervisor = supervisors[0];
+    let target = targets[0];
+    assert_ne!(
+        process_group(supervisor),
+        process_group(target),
+        "target was not in its own process group"
+    );
+    assert_ne!(
+        process_group(supervisor),
+        unsafe { libc::getpgrp() },
+        "supervisor stayed in the test process group"
+    );
+
+    // Kill the scheduler before its supervisor. A live scheduler would drop the
+    // family directory itself; a live supervisor would remove it after the target
+    // died. Neither destructor may run.
+    assert_eq!(unsafe { libc::kill(scheduler as i32, libc::SIGKILL) }, 0);
+    for pid in &supervisors {
+        sigkill_not_self_group(*pid);
+    }
+    for pid in &targets {
+        sigkill_not_self_group(*pid);
+    }
+    let _ = killed.0.wait();
+    let mut killed_pids = vec![scheduler];
+    killed_pids.extend(supervisors);
+    killed_pids.extend(targets);
+    wait_until_dead(&killed_pids);
+    assert!(
+        stale.is_dir(),
+        "killed run's family dir was removed before the next invocation"
+    );
+    wait_until_free(&stale.join("owner.lock"));
+    wait_until_free(&stale.join("borrow.lock"));
+    assert!(
+        stale.is_dir(),
+        "family dir disappeared while its locks were released"
+    );
+
+    let live_target = f.started();
+    assert_eq!(live_target.label, "live");
+    let families = family_dirs(&host);
+    assert!(
+        families.contains(&stale),
+        "the invocation that was already waiting swept the killed family: {families:?}"
+    );
+    let live_family = families
+        .iter()
+        .find(|path| *path != &stale)
+        .cloned()
+        .expect("live run did not create a family dir");
+
+    let preserved = ["authority.lock", "epoch.lock", "capacity", "slot-0.lock"];
+    let before: Vec<_> = preserved
+        .iter()
+        .map(|name| {
+            let path = host.join(name);
+            (
+                *name,
+                fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}")),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut next = work(&next_ws);
+    next.waiting(&f.listener);
+    assert!(!stale.exists(), "next invocation left the stale family dir");
+    assert!(
+        live_family.is_dir(),
+        "next invocation removed a live run's family dir"
+    );
+    for (name, bytes) in before {
+        let path = host.join(name);
+        assert!(path.exists(), "{name} was removed by the sweep");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "{name} was rewritten by the sweep"
+        );
+    }
+
+    live_target.release();
+    assert!(live.finish());
+    let next_target = f.started();
+    assert_eq!(next_target.label, "next");
+    next_target.release();
+    assert!(next.finish());
 }
