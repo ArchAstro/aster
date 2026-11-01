@@ -335,8 +335,34 @@ All of these, after retries:
    nextest 100, pytest, `go test`, Jest, Vitest, `bun test` and `node --test`
    1. A crash, compile error, timeout or signal exits otherwise and still
    fails. Gradle, Maven and `cargo test` use one code for test failures and
-   compile errors, so their targets never pass this way.
-4. `ASTER_QUARANTINE` is not `off`.
+   compile errors, so their targets never pass this way. That code does not
+   distinguish a coverage-threshold failure or an unhandled error from a
+   failed test; those are caught from the console log, below.
+4. The captured console log has no line for a failure that is not a test
+   case. Aster matches these phrases, ignoring case, and names the matched
+   line in the target's log (`the runner also reported …, which is not a
+   test failure`):
+
+   - `coverage threshold for ` — Jest, when a coverage threshold is not met
+     (`Jest: "global" coverage threshold for lines (100%) not met`)
+   - `FAIL Required test coverage of ` — pytest-cov `--cov-fail-under`
+     (`FAIL Required test coverage of N% not reached`)
+   - `does not meet global threshold` — Vitest coverage thresholds
+     (`ERROR: Coverage for lines (..%) does not meet global threshold`)
+   - `unhandled error` — Vitest (`Vitest caught N unhandled error`,
+     `Unhandled error`)
+
+   The scan is that command's own console, not a later `--retry-failed`
+   rerun: a narrowed rerun can miss a threshold the full run met, or print
+   one the full run did not. Lines Aster adds (`$ command`, `[aster] …`) are
+   not scanned, so a test name in a retry command is not a marker.
+
+   The captured log stops at 16 MiB. When it was cut, it ends with
+   `[aster] log truncated: N bytes omitted`. A marker past that cap is not
+   seen, so a quarantined-only failure can still pass. Aster does not claim
+   to detect a non-test failure whose line was dropped. `--full-logs` changes
+   only what is printed, not this scan.
+5. `ASTER_QUARANTINE` is not `off`.
 
 A target that runs several commands, or whose results are not captured (no
 `--test-results` and no `--retry-failed`), is never judged. When some failures

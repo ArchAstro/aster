@@ -1853,3 +1853,164 @@ fn capture_does_not_add_report_notices_to_the_log() {
         assert_no_report_notice(&target_log(root, &format!("{address}:test")));
     }
 }
+
+/// A stand-in for `jest` at the process boundary: it writes the `--outputFile`
+/// JSON (one quarantined failure, one pass) and exits 1. `@@NOTICE@@` is the
+/// optional console line (a coverage threshold, or nothing).
+const QUARANTINE_FAKE_JEST: &str = r#"#!/bin/sh
+out=""
+prev=""
+retry=0
+for arg in "$@"; do
+  case "$arg" in
+    --outputFile=*) out="${arg#--outputFile=}" ;;
+    --outputFile) prev=1 ;;
+    -t|-t*) retry=1 ;;
+    *)
+      if [ "$prev" = 1 ]; then
+        out="$arg"
+        prev=""
+      fi
+      ;;
+  esac
+done
+echo "$*" >> jest.calls
+if [ -n "$out" ]; then
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'JSON'
+{"numFailedTests":1,"success":false,"testResults":[{"name":"math.test.js","status":"failed","assertionResults":[{"ancestorTitles":[],"title":"known flake","status":"failed","failureMessages":["flake"]},{"ancestorTitles":[],"title":"passes","status":"passed","failureMessages":[]}]}]}
+JSON
+fi
+# A narrowed retry keeps --coverage. Its threshold line is not the full run's.
+if [ "$retry" = 1 ]; then
+  printf '%s\n' 'Jest: "global" coverage threshold for lines (100%) not met: 12%'
+fi
+@@NOTICE@@
+exit 1
+"#;
+
+fn quarantine_jest_workspace(console_line: Option<&str>) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "app/package.json", r#"{"name":"app"}"#);
+    let notice = match console_line {
+        Some(line) => format!("printf '%s\\n' '{}'", line.replace('\'', "'\\''")),
+        None => "true".to_string(),
+    };
+    write(
+        tmp.path(),
+        "app/bin/jest",
+        &QUARANTINE_FAKE_JEST.replace("@@NOTICE@@", &notice),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp.path().join("app/bin/jest");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    // Aster executes the program directly, so the command names the stand-in
+    // by absolute path. A relative `bin/jest` would be resolved against the
+    // parent process, not the project directory.
+    let command = format!("{} --coverage", bin.display());
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        &format!(
+            "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = {}\n",
+            serde_json::to_string(&command).unwrap()
+        ),
+    );
+    write(
+        tmp.path(),
+        "aster-quarantine.toml",
+        "[[test]]\nname = \"known flake\"\ntarget = \"//app\"\nreason = \"known flake\"\nexpires = 2999-01-01\n",
+    );
+    tmp
+}
+
+fn run_quarantine_jest(tmp: &TempDir) -> Output {
+    run_quarantine_jest_with(tmp, &[])
+}
+
+fn run_quarantine_jest_with(tmp: &TempDir, extra: &[&str]) -> Output {
+    let results = tmp.path().join("out/results.ndjson");
+    let results_arg = format!("--test-results={}", results.display());
+    let mut args = vec!["--no-cache", results_arg.as_str()];
+    args.extend(extra);
+    args.extend(["test", "//app"]);
+    Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("GITHUB_RUN_ID")
+        .env_remove("ASTER_RETRY_FAILED")
+        .env_remove("ASTER_SRV_URL")
+        .env_remove("ASTER_SRV_TOKEN")
+        .env_remove("ASTER_QUARANTINE")
+        .env_remove("GITHUB_ACTIONS")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .args(&args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn quarantine_does_not_excuse_a_coverage_threshold_failure() {
+    let threshold = r#"Jest: "global" coverage threshold for lines (100%) not met: 80%"#;
+    let tmp = quarantine_jest_workspace(Some(threshold));
+    let output = run_quarantine_jest(&tmp);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("FAIL //app:test"), "{stderr}");
+    assert!(
+        stderr.contains("the runner also reported") && stderr.contains(threshold),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not a test failure"), "{stderr}");
+
+    // Vitest's unhandled error and pytest-cov's fail-under use the same scan.
+    for line in [
+        "Vitest caught 1 unhandled error during the test run",
+        "FAIL Required test coverage of 80% not reached. Total coverage: 70.00%",
+    ] {
+        let tmp = quarantine_jest_workspace(Some(line));
+        let output = run_quarantine_jest(&tmp);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{line}: {stderr}");
+        assert!(stderr.contains("FAIL //app:test"), "{line}: {stderr}");
+        assert!(
+            stderr.contains("the runner also reported") && stderr.contains(line),
+            "{line}: {stderr}"
+        );
+    }
+
+    // No non-test line: the quarantined failure still passes.
+    let tmp = quarantine_jest_workspace(None);
+    let output = run_quarantine_jest(&tmp);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    assert!(!stderr.contains("not a test failure"), "{stderr}");
+}
+
+#[test]
+fn a_threshold_line_from_a_narrowed_retry_does_not_fail_the_target() {
+    // The full run has only the quarantined failure. The retry keeps
+    // --coverage, prints a threshold line, and echoes `-t 'known flake$'`.
+    let tmp = quarantine_jest_workspace(None);
+    let output = run_quarantine_jest_with(&tmp, &["--retry-failed"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let calls = fs::read_to_string(tmp.path().join("app/jest.calls")).unwrap_or_default();
+    assert!(
+        calls.lines().nth(1).is_some_and(|line| line.contains("-t")),
+        "retry did not narrow:\n{calls}\n{stderr}"
+    );
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("(quarantined: 1)"), "{stderr}");
+    assert!(!stderr.contains("not a test failure"), "{stderr}");
+
+    // The full run's own threshold still fails, retry or not.
+    let threshold = r#"Jest: "global" coverage threshold for lines (100%) not met: 80%"#;
+    let tmp = quarantine_jest_workspace(Some(threshold));
+    let output = run_quarantine_jest_with(&tmp, &["--retry-failed"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(threshold), "{stderr}");
+    assert!(stderr.contains("not a test failure"), "{stderr}");
+}
