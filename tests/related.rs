@@ -2805,3 +2805,125 @@ fn aster_dir_is_never_a_change() {
         "source edit was ignored: {third}"
     );
 }
+
+/// Issue layout: one test reaches `up` through `import()`, another imports it
+/// statically. A change must select both, and still select the dynamic test
+/// when the static importer is absent.
+fn dynamic_import_workspace(ext: &str, static_importer: bool) -> Vec<(String, String)> {
+    let mut files = vec![
+        (
+            "package.json".to_string(),
+            r#"{"name":"p","type":"module","scripts":{"test":"vitest run"}}"#.to_string(),
+        ),
+        (
+            format!("src/str.{ext}"),
+            "export const up = (s) => s.toUpperCase()\n".to_string(),
+        ),
+        (
+            format!("src/dyn.{ext}"),
+            "export const lazy = () => import('./str.js')\n".to_string(),
+        ),
+        (
+            format!("test/dyn.test.{ext}"),
+            format!(
+                "import {{ test, expect }} from 'vitest'\nimport {{ lazy }} from '../src/dyn.{ext}'\ntest('dyn', async () => expect((await lazy()).up('b')).toBe('B'))\n"
+            ),
+        ),
+        // Nobody loads this module dynamically. Name-based narrowing must hold.
+        (
+            format!("src/plain.{ext}"),
+            "export const shout = (s) => s.toUpperCase()\nexport const whisper = (s) => s.toLowerCase()\n"
+                .to_string(),
+        ),
+        (
+            format!("test/shout.test.{ext}"),
+            format!(
+                "import {{ shout }} from '../src/plain.{ext}'\nit('shouts', () => {{ expect(shout('a')).toBe('A'); }});\n"
+            ),
+        ),
+        (
+            format!("test/whisper.test.{ext}"),
+            format!(
+                "import {{ whisper }} from '../src/plain.{ext}'\nit('whispers', () => {{ expect(whisper('A')).toBe('a'); }});\n"
+            ),
+        ),
+    ];
+    if static_importer {
+        files.push((
+            format!("test/static.test.{ext}"),
+            format!(
+                "import {{ test, expect }} from 'vitest'\nimport {{ up }} from '../src/str.{ext}'\ntest('static', () => expect(up('a')).toBe('A'))\n"
+            ),
+        ));
+    }
+    files
+}
+
+fn owned(files: &[(String, String)]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect()
+}
+
+fn command_names(plan: &Plan, address: &str) -> String {
+    plan.commands(address).join("\n")
+}
+
+#[test]
+fn js_dynamic_import_edge_survives_a_static_importer() {
+    for ext in ["js", "ts"] {
+        let with_static = dynamic_import_workspace(ext, true);
+        let ws = Workspace::new(&owned(&with_static));
+        ws.edit(&format!("src/str.{ext}"), "toUpperCase()", "toLowerCase()");
+        let plan = ws.plan("test");
+        let command = command_names(&plan, "//:test");
+        assert!(
+            command.contains(&format!("test/dyn.test.{ext}"))
+                && command.contains(&format!("test/static.test.{ext}")),
+            "{ext}: both tests should be selected: {plan:#?}"
+        );
+        assert!(
+            !command.contains("shout.test") && !command.contains("whisper.test"),
+            "{ext}: an unrelated module must stay out: {plan:#?}"
+        );
+        let notes = plan.notes("//:test");
+        assert!(
+            notes.contains("lazy") && notes.contains(&format!("src/dyn.{ext}")),
+            "{ext}: the dynamic import should explain the selection:\n{notes}"
+        );
+        let graph = ws.aster(&["graph", "--source", "--commit", "HEAD"]);
+        let graph_text = String::from_utf8_lossy(&graph.stdout);
+        assert!(
+            graph.status.success(),
+            "graph failed: {graph_text}\n{}",
+            String::from_utf8_lossy(&graph.stderr)
+        );
+        assert!(
+            graph_text.contains("lazy") && graph_text.contains(&format!("test/dyn.test.{ext}")),
+            "{ext}: source graph should keep the dynamic edge:\n{graph_text}"
+        );
+
+        // Without the static importer, the dynamic test is still the one selected.
+        let without_static = dynamic_import_workspace(ext, false);
+        let ws = Workspace::new(&owned(&without_static));
+        ws.edit(&format!("src/str.{ext}"), "toUpperCase()", "toLowerCase()");
+        let plan = ws.plan("test");
+        assert_eq!(
+            plan.commands("//:test"),
+            [format!(
+                "npm test -- test/dyn.test.{ext} --coverage.enabled=false"
+            )]
+        );
+    }
+
+    // A module nobody loads dynamically keeps name-based narrowing.
+    let files = dynamic_import_workspace("js", true);
+    let ws = Workspace::new(&owned(&files));
+    ws.edit("src/plain.js", "s.toUpperCase()", "s.toLocaleUpperCase()");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//:test"),
+        ["npm test -- test/shout.test.js --coverage.enabled=false"]
+    );
+}
