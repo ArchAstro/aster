@@ -1,6 +1,6 @@
 //! Python language plugin for pyproject.toml parsing
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -81,6 +81,34 @@ struct PoetryDepTable {
     git: Option<String>,
 }
 
+/// A `pyproject.toml` that parsed, but declares no project name.
+///
+/// Direct `parse_project` callers still receive this as an error, with the
+/// same message as before. Discovery downcasts it and skips the file instead
+/// of aborting the walk. TOML syntax errors are ordinary `anyhow` errors and
+/// stay fatal.
+#[derive(Debug)]
+struct NotAProject {
+    path: PathBuf,
+}
+
+impl std::fmt::Display for NotAProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Could not find project name in {}. Expected [project].name or [tool.poetry].name",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for NotAProject {}
+
+/// Whether `error` is a parsed marker that is not a Python project.
+pub(crate) fn is_not_a_project(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NotAProject>().is_some()
+}
+
 /// Python plugin for discovering and parsing pyproject.toml projects
 pub struct PythonPlugin;
 
@@ -112,11 +140,8 @@ impl LanguagePlugin for PythonPlugin {
                     .and_then(|t| t.poetry.as_ref())
                     .and_then(|p| p.name.clone())
             })
-            .ok_or_else(|| {
-                anyhow!(
-                    "Could not find project name in {}. Expected [project].name or [tool.poetry].name",
-                    config_path.display()
-                )
+            .ok_or_else(|| NotAProject {
+                path: config_path.to_path_buf(),
             })?;
 
         Ok(ProjectMetadata {
@@ -837,10 +862,9 @@ version = "1.0.0"
         let result = plugin.parse_project(tmp.path(), &pyproject);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Could not find project name"));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Could not find project name"));
+        assert!(is_not_a_project(&error));
     }
 
     #[test]

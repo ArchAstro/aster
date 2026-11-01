@@ -5311,3 +5311,191 @@ cache = { enabled = false }
         "closed pipe should die on SIGPIPE, got {status:?}; stderr={stderr}"
     );
 }
+
+fn aster_output(tmp: &TempDir, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(tmp.path())
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn warning_for(path: &std::path::Path) -> String {
+    format!(
+        "[aster] Warning: skipping {}: no [project].name or [tool.poetry].name",
+        path.display()
+    )
+}
+
+/// A pyproject.toml with no project name is tool config, not a failed project.
+///
+/// Covers a ruff-only root beside a Node project, a uv virtual workspace root
+/// whose member dependencies still resolve, and a malformed file that still
+/// aborts discovery. Canonical end-to-end for issue 257.
+#[test]
+fn tool_config_pyproject_is_skipped_not_fatal() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_pyproject_toml(&tmp, "pyproject.toml", "[tool.ruff]\nline-length = 100\n");
+    write_package_json(&tmp, "svc/package.json", r#"{"name":"svc"}"#);
+    write_aster_toml(
+        &tmp,
+        "svc/aster.toml",
+        "[targets.build]\ncommand = \"sh -c 'echo svc-built > built.txt'\"\n",
+    );
+
+    let list = aster_output(&tmp, &["list", "--json"]);
+    let list_stderr = String::from_utf8_lossy(&list.stderr);
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list.status.success(),
+        "aster list --json failed: {list_stderr}"
+    );
+    assert!(
+        list_stderr.contains(&warning_for(&tmp.path().join("pyproject.toml"))),
+        "missing stderr warning: {list_stderr}"
+    );
+    assert!(
+        !list_stdout.contains("Warning"),
+        "warning leaked into --json stdout: {list_stdout}"
+    );
+    let projects: Vec<serde_json::Value> =
+        serde_json::from_str(&list_stdout).expect("list --json stdout must be JSON");
+    let addresses: Vec<&str> = projects
+        .iter()
+        .map(|project| project["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(addresses, vec!["//svc"]);
+
+    let graph = aster_output(&tmp, &["graph"]);
+    assert!(
+        graph.status.success(),
+        "aster graph failed: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    assert!(String::from_utf8_lossy(&graph.stdout).contains("//svc"));
+
+    let build = aster_output(&tmp, &["build", "//svc"]);
+    let build_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(
+        build.status.success(),
+        "aster build //svc failed: {build_out}"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("svc/built.txt")).unwrap(),
+        "svc-built\n"
+    );
+
+    let check = aster_output(&tmp, &["check"]);
+    let check_stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        check.status.success(),
+        "aster check failed: {check_stderr}{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    assert!(
+        !check_stderr.contains("Failed to discover projects"),
+        "{check_stderr}"
+    );
+    assert!(check_stderr.contains(&warning_for(&tmp.path().join("pyproject.toml"))));
+
+    let uv = TempDir::new().unwrap();
+    setup_workspace(&uv);
+    write_pyproject_toml(
+        &uv,
+        "pyproject.toml",
+        "[tool.uv.workspace]\nmembers = [\"pkg\"]\n",
+    );
+    // The root lists only pkg, matching a uv virtual workspace. lib is a
+    // second member so pkg's `{ workspace = true }` dependency has a project
+    // to resolve to. Aster does not read `[tool.uv.workspace].members`; it
+    // matches discovered project names.
+    write_pyproject_toml(&uv, "lib/pyproject.toml", "[project]\nname = \"lib\"\n");
+    write_aster_toml(
+        &uv,
+        "lib/aster.toml",
+        "[targets.build]\ncommand = \"true\"\n",
+    );
+    write_pyproject_toml(
+        &uv,
+        "pkg/pyproject.toml",
+        r#"
+[project]
+name = "pkg"
+dependencies = ["lib"]
+
+[tool.uv.sources]
+lib = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"#,
+    );
+
+    let uv_list = aster_output(&uv, &["list", "--json"]);
+    let uv_stderr = String::from_utf8_lossy(&uv_list.stderr);
+    let uv_stdout = String::from_utf8_lossy(&uv_list.stdout);
+    assert!(
+        uv_list.status.success(),
+        "uv workspace list failed: {uv_stderr}"
+    );
+    assert!(uv_stderr.contains(&warning_for(&uv.path().join("pyproject.toml"))));
+    assert!(!uv_stdout.contains("Warning"));
+    let uv_projects: Vec<serde_json::Value> =
+        serde_json::from_str(&uv_stdout).expect("uv list --json stdout must be JSON");
+    let mut uv_addresses: Vec<&str> = uv_projects
+        .iter()
+        .map(|project| project["address"].as_str().unwrap())
+        .collect();
+    uv_addresses.sort();
+    assert_eq!(uv_addresses, vec!["//lib", "//pkg"]);
+
+    let uv_graph = aster_output(&uv, &["graph"]);
+    assert!(
+        uv_graph.status.success(),
+        "uv graph failed: {}",
+        String::from_utf8_lossy(&uv_graph.stderr)
+    );
+    let uv_graph_json = aster_output(&uv, &["graph", "--json"]);
+    let graph_stderr = String::from_utf8_lossy(&uv_graph_json.stderr);
+    let graph_stdout = String::from_utf8_lossy(&uv_graph_json.stdout);
+    assert!(
+        uv_graph_json.status.success(),
+        "uv graph --json failed: {graph_stderr}"
+    );
+    assert!(!graph_stdout.contains("Warning"));
+    let graph_value: serde_json::Value =
+        serde_json::from_str(&graph_stdout).expect("graph --json stdout must be JSON");
+    let edges = graph_value["edges"]["//pkg:test"]
+        .as_array()
+        .expect("//pkg:test edges");
+    assert!(
+        edges.iter().any(|edge| edge == "//lib:build"),
+        "workspace dependency was not resolved: {graph_stdout}"
+    );
+
+    let broken = TempDir::new().unwrap();
+    setup_workspace(&broken);
+    write_pyproject_toml(&broken, "pyproject.toml", "[\n");
+    write_package_json(&broken, "svc/package.json", r#"{"name":"svc"}"#);
+    let failed = aster_output(&broken, &["list", "--json"]);
+    let failed_stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        !failed.status.success(),
+        "malformed pyproject.toml should fail discovery: {failed_stderr}"
+    );
+    assert!(
+        failed_stderr.contains("Failed to discover projects")
+            && failed_stderr.contains("Failed to parse python project"),
+        "existing parse error was not preserved: {failed_stderr}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&failed.stdout))
+            .is_err(),
+        "a failed discovery must not print a JSON project list"
+    );
+}
