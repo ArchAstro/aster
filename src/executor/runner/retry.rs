@@ -45,7 +45,9 @@ pub(super) struct RetryJob<'a> {
 /// Nothing is retried when the failure is not attributable to tests: no
 /// failing test in the report, a command killed by a signal, or a runner
 /// that cannot select single tests. A failing `retry_setup` skips its
-/// retry and keeps the failure as it stood.
+/// retry and keeps the failure as it stood. A retry that exits 0 while a
+/// selected test is still failing does not replace the target's exit code
+/// with 0.
 pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bool {
     if result.success
         || result.skipped
@@ -65,6 +67,10 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
     let mut cases = report.cases;
     let mut confidence = report.confidence;
     let mut ran_any = false;
+    // Kept when a retry exits 0 without clearing the failure. A Vitest run
+    // that executes zero tests exits 0; that must not become the target's
+    // exit code while it is still failed.
+    let failing_exit = result.exit_code;
     for round in 2..=job.max_retries + 1 {
         if shutdown_requested() {
             break;
@@ -157,13 +163,40 @@ pub(super) fn rerun_failures(job: &RetryJob, result: &mut ExecutionResult) -> bo
                 None => confidence = Confidence::Partial,
             }
         }
-        result.exit_code = last_exit;
+        // A selected test the runner only skipped was filtered out, not
+        // run. Recording that skip would look like a retry attempt.
+        let not_run: Vec<&str> = failing
+            .iter()
+            .filter(|test| reported_only_as_skip(&retried, test))
+            .map(|test| test.name.as_str())
+            .collect();
+        if !not_run.is_empty() {
+            append_log(
+                result,
+                &format!("[aster] Retry did not run: {}\n", not_run.join(", ")),
+                &[],
+            );
+        }
 
         // Tests that were selected, and any others that failed.
         let still_failing = merge_attempt(&mut cases, retried, &failing, round);
         if still_failing.is_empty() {
+            result.exit_code = last_exit;
             result.success = commands_ok;
+            // A failed target must not record the retry's exit 0. A runner
+            // that executed nothing (Vitest exits 0 when `-t` matched no
+            // test) is the case this keeps.
+            if !result.success && result.exit_code == Some(0) {
+                result.exit_code = failing_exit;
+            }
             break;
+        }
+        // A retry that ran nothing exits 0. That must not replace the
+        // target's failing exit code while tests are still failing.
+        if last_exit == Some(0) {
+            result.exit_code = failing_exit;
+        } else {
+            result.exit_code = last_exit;
         }
         // A retry that failed and named no test again would loop on a
         // failure the report cannot explain; keep going only while it can.
@@ -203,9 +236,10 @@ fn unique_failures(cases: &[TestCase]) -> Vec<TestCase> {
 
 /// Record a retry's cases as attempt `round` of the tests they rerun
 /// (numbered after the attempts already recorded for each test). Cases of
-/// tests that were neither selected nor failing are not recorded. Returns
-/// the tests that still fail: selected tests that did not pass, and any
-/// other that failed.
+/// tests that were neither selected nor failing are not recorded. A selected
+/// test reported only as skipped was not run, so that skip is not an
+/// attempt. Returns the tests that still fail: selected tests that did not
+/// pass, and any other that failed.
 fn merge_attempt(
     cases: &mut Vec<TestCase>,
     retried: Vec<TestCase>,
@@ -228,7 +262,13 @@ fn merge_attempt(
         }
     }
     for mut case in retried {
-        if !case.outcome.is_failure() && !selected.iter().any(|test| same_test(test, &case)) {
+        let selected_test = selected.iter().any(|test| same_test(test, &case));
+        // A skip of a selected test means `-t` filtered it out. That is not
+        // an attempt, and the test stays in `still_failing` above.
+        if case.outcome == TestOutcome::Skip && selected_test {
+            continue;
+        }
+        if !case.outcome.is_failure() && !selected_test {
             continue;
         }
         let previous = cases
@@ -240,6 +280,20 @@ fn merge_attempt(
         cases.push(case);
     }
     still_failing
+}
+
+/// Whether `test` appears in `retried` and every such report is a skip.
+fn reported_only_as_skip(retried: &[TestCase], test: &TestCase) -> bool {
+    let mut saw_skip = false;
+    let mut saw_run = false;
+    for case in retried.iter().filter(|case| same_test(case, test)) {
+        if case.outcome == TestOutcome::Skip {
+            saw_skip = true;
+        } else {
+            saw_run = true;
+        }
+    }
+    saw_skip && !saw_run
 }
 
 fn remove_report_dirs(captures: &[Vec<Option<(ReportPlan, PathBuf)>>]) {
@@ -478,6 +532,39 @@ mod tests {
         let still = merge_attempt(&mut cases, Vec::new(), &selected, 2);
         assert_eq!(still.len(), 1);
         assert_eq!(cases.len(), 1);
+    }
+
+    #[test]
+    fn a_selected_skip_is_not_an_attempt_and_still_fails() {
+        let mut cases = vec![
+            case("with tab", TestOutcome::Fail, 1),
+            case("with space", TestOutcome::Fail, 1),
+        ];
+        let selected = unique_failures(&cases);
+        let still = merge_attempt(
+            &mut cases,
+            vec![
+                case("with tab", TestOutcome::Skip, 1),
+                case("with space", TestOutcome::Pass, 1),
+                case("other", TestOutcome::Skip, 1),
+            ],
+            &selected,
+            2,
+        );
+        assert_eq!(still.len(), 1);
+        assert_eq!(still[0].name, "with tab");
+        let recorded: Vec<_> = cases
+            .iter()
+            .map(|c| (c.name.as_str(), c.outcome, c.attempt))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                ("with tab", TestOutcome::Fail, 1),
+                ("with space", TestOutcome::Fail, 1),
+                ("with space", TestOutcome::Pass, 2),
+            ]
+        );
     }
 
     #[test]

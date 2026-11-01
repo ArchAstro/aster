@@ -1853,3 +1853,217 @@ fn capture_does_not_add_report_notices_to_the_log() {
         assert_no_report_notice(&target_log(root, &format!("{address}:test")));
     }
 }
+
+/// A stand-in for `vitest` whose real test names include a tab. The JUnit
+/// report normalises that tab to a space, the way an XML attribute does.
+/// `-t` is matched as a JavaScript regular expression against the real name,
+/// and a test the pattern misses is reported skipped. `VITEST_NEVER_MATCH=1`
+/// makes every `-t` miss, which is what Vitest does when the pattern cannot
+/// see the tab.
+const WHITESPACE_VITEST: &str = r#"#!/usr/bin/env python3
+import os
+import re
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+out = None
+pattern = None
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg.startswith("--outputFile.junit="):
+        out = arg.split("=", 1)[1]
+    elif arg == "-t" and i + 1 < len(args):
+        i += 1
+        pattern = args[i]
+    i += 1
+
+# Real name, then the name JUnit will store (tab/newline become a space).
+tests = [
+    ("with\ttab", "with tab"),
+    ("with space", "with space"),
+    ("other", "other"),
+]
+
+def selected(real):
+    if pattern is None:
+        return True
+    if os.environ.get("VITEST_NEVER_MATCH") == "1":
+        return False
+    return re.search(pattern, real) is not None
+
+ran = []
+failed = False
+cases = []
+for real, reported in tests:
+    if not selected(real):
+        cases.append(
+            '<testcase classname="src/names.test.ts" name="%s"><skipped/></testcase>' % reported
+        )
+        continue
+    ran.append(real)
+    if pattern is None and real != "other":
+        failed = True
+        cases.append(
+            '<testcase classname="src/names.test.ts" name="%s"><failure message="fail">boom</failure></testcase>'
+            % reported
+        )
+    else:
+        cases.append(
+            '<testcase classname="src/names.test.ts" name="%s"/>' % reported
+        )
+
+log_dir = Path.cwd()
+with (log_dir / "vitest.calls").open("a") as fh:
+    fh.write(" ".join(args) + "\n")
+with (log_dir / "ran.log").open("a") as fh:
+    fh.write(repr(ran) + "\n")
+
+if out:
+    path = Path(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '<testsuites><testsuite name="src/names.test.ts" tests="%d">%s</testsuite></testsuites>'
+        % (len(cases), "".join(cases))
+    )
+
+sys.exit(1 if failed else 0)
+"#;
+
+fn whitespace_vitest_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(tmp.path(), "web/package.json", r#"{"name":"web"}"#);
+    write(tmp.path(), "web/bin/vitest", WHITESPACE_VITEST);
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp.path().join("web/bin/vitest");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        tmp.path(),
+        "web/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"bin/vitest run\"\n",
+    );
+    tmp
+}
+
+fn run_whitespace_retry(tmp: &TempDir, never_match: bool) -> (Output, Vec<Record>) {
+    let results = tmp.path().join("out/results.ndjson");
+    let results_arg = format!("--test-results={}", results.display());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aster"));
+    cmd.current_dir(tmp.path())
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("GITHUB_RUN_ID")
+        .env_remove("ASTER_RETRY_FAILED")
+        .env_remove("GITHUB_ACTIONS")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .args([
+            "--no-cache",
+            "--retry-failed",
+            &results_arg,
+            "test",
+            "//web",
+        ]);
+    if never_match {
+        cmd.env("VITEST_NEVER_MATCH", "1");
+    } else {
+        cmd.env_remove("VITEST_NEVER_MATCH");
+    }
+    let output = cmd.output().unwrap();
+    let records = fs::read_to_string(&results)
+        .map(|text| parse_ndjson(&text).unwrap())
+        .unwrap_or_default();
+    (output, records)
+}
+
+fn target_exit(records: &[Record], address: &str) -> Option<i32> {
+    records.iter().find_map(|record| match record {
+        Record::Target(target) if target.address == address => target.exit_code,
+        _ => None,
+    })
+}
+
+#[test]
+fn a_test_name_with_a_tab_is_retried_and_a_failed_target_keeps_its_exit_code() {
+    let tmp = whitespace_vitest_workspace();
+    let (output, records) = run_whitespace_retry(&tmp, false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the tab name matches \\s and the retry passes: {stderr}"
+    );
+    assert!(
+        stderr.contains("PASS //web:test") && stderr.contains("flaky: 2 tests passed on retry"),
+        "{stderr}"
+    );
+    assert_eq!(target_status(&records, "//web:test"), TargetStatus::Passed);
+    assert_eq!(target_exit(&records, "//web:test"), Some(0));
+    let tests = tests_of(&records);
+    for expected in [
+        ("with tab", TestOutcome::Fail, 1),
+        ("with tab", TestOutcome::Pass, 2),
+        ("with space", TestOutcome::Fail, 1),
+        ("with space", TestOutcome::Pass, 2),
+        ("other", TestOutcome::Pass, 1),
+    ] {
+        assert!(
+            tests.contains(&(expected.0.into(), expected.1, expected.2)),
+            "{expected:?} in {tests:?}"
+        );
+    }
+    assert_eq!(tests.len(), 5, "{tests:?}");
+    assert!(
+        !tests
+            .iter()
+            .any(|(_, outcome, _)| *outcome == TestOutcome::Skip),
+        "{tests:?}"
+    );
+    let calls = fs::read_to_string(tmp.path().join("web/vitest.calls")).unwrap();
+    assert!(
+        calls.contains(r"with\stab$") && calls.contains(r"with\sspace$"),
+        "retry pattern must treat the normalised space as \\s: {calls}"
+    );
+    let ran = fs::read_to_string(tmp.path().join("web/ran.log")).unwrap();
+    let mut lines = ran.lines();
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.contains(r"with\ttab") && line.contains("other")),
+        "{ran}"
+    );
+    let retry = lines.next().unwrap_or("");
+    assert!(
+        retry.contains(r"with\ttab") && retry.contains("with space") && !retry.contains("other"),
+        "the plain-space pattern must not select a different test: {ran}"
+    );
+
+    // The pattern never matches, so Vitest reports the selected tests skipped
+    // and exits 0. That skip is not an attempt, and the failed target keeps
+    // a non-zero exit code.
+    let missed = whitespace_vitest_workspace();
+    let (output, records) = run_whitespace_retry(&missed, true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(target_status(&records, "//web:test"), TargetStatus::Failed);
+    let exit_code = target_exit(&records, "//web:test");
+    assert_ne!(exit_code, Some(0), "{records:?}");
+    assert_eq!(exit_code, Some(1), "{stderr}");
+    let tests = tests_of(&records);
+    assert!(
+        tests.iter().all(|(_, _, attempt)| *attempt == 1),
+        "a filtered skip is not attempt 2: {tests:?}"
+    );
+    assert!(
+        !tests
+            .iter()
+            .any(|(_, outcome, attempt)| { *outcome == TestOutcome::Skip && *attempt == 2 }),
+        "{tests:?}"
+    );
+    assert!(
+        stderr.contains("[aster] Retry did not run: with tab, with space")
+            || fs::read_to_string(missed.path().join(".aster/logs/latest.json"))
+                .unwrap_or_default()
+                .contains("[aster] Retry did not run: with tab, with space"),
+        "{stderr}"
+    );
+}
