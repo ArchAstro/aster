@@ -103,7 +103,7 @@ pub fn format_service_runtime_label(state: &ServiceRuntimeState) -> String {
         ServiceRuntimeStatus::Exited => match &state.exit {
             Some(ServiceRuntimeExit::Code { code }) => format!("exited (code {code})"),
             Some(ServiceRuntimeExit::Signal {
-                signal,
+                signal: _,
                 name: Some(name),
             }) if signal_name_is_display_safe(name) => {
                 format!("exited (signal {name})")
