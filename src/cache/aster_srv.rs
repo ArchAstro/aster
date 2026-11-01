@@ -294,26 +294,25 @@ impl AsterSrvBackend {
         bearer: Option<&str>,
         proxy: Option<&str>,
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        let mut request = self
-            .agent
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("User-Agent", USER_AGENT);
-        if let Some(token) = bearer {
-            request = request.header("Authorization", &format!("Bearer {token}"));
-        }
-        if let Some(proxy) = proxy {
-            request = request.header("Proxy-Authorization", &format!("Bearer {proxy}"));
-        }
-        request.send(payload).map_err(|error| {
-            let error = anyhow::Error::new(error);
-            let error = redact(error);
-            if format!("{error:#}").contains("timeout") {
-                DisablingFailure(error).into()
-            } else {
-                error
+        // A signal during the blocking call is this process, not the remote.
+        // ureq returns that as `io: Interrupted` and does not restart it.
+        // Retrying keeps one EINTR from failing a lookup; a timeout still
+        // disables, because it is not an interrupt.
+        retrying_interrupt(|| {
+            let mut request = self
+                .agent
+                .post(url)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", USER_AGENT);
+            if let Some(token) = bearer {
+                request = request.header("Authorization", &format!("Bearer {token}"));
             }
+            if let Some(proxy) = proxy {
+                request = request.header("Proxy-Authorization", &format!("Bearer {proxy}"));
+            }
+            request.send(payload)
         })
+        .map_err(transport_failure)
     }
 
     fn decode_post(
@@ -370,13 +369,14 @@ impl AsterSrvBackend {
     /// Stream `url` into `writer`, returning the sha256 of the bytes written.
     fn stream_get(&self, url: &str, writer: &mut dyn Write) -> Result<String> {
         let url = self.blob_url(url);
-        let response = self
-            .blob_agent
-            .get(url)
-            .header("User-Agent", USER_AGENT)
-            .call()
-            .map_err(|error| redact(anyhow::Error::new(error)))
-            .context("cannot download remote blob")?;
+        let response = retrying_interrupt(|| {
+            self.blob_agent
+                .get(&url)
+                .header("User-Agent", USER_AGENT)
+                .call()
+        })
+        .map_err(|error| redact(anyhow::Error::new(error)))
+        .context("cannot download remote blob")?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             bail!("remote blob download returned {status}");
@@ -408,7 +408,7 @@ impl AsterSrvBackend {
         let file = spool.reopen().context("reopen upload spool")?;
         let response = self
             .blob_agent
-            .put(url)
+            .put(&url)
             .header("User-Agent", USER_AGENT)
             .header("Content-Type", "application/octet-stream")
             .send(file)
@@ -630,13 +630,51 @@ fn non_empty(value: Option<&str>) -> Option<String> {
     }
 }
 
-/// Drop query strings. Signed URLs carry credentials there, and ureq names
-/// the URL in a transport error.
+/// How many times a cache call is repeated after `EINTR`.
+///
+/// One signal during a blocked read is common when other tests install
+/// process-wide handlers. A few retries cover that without turning a
+/// stuck gateway into a long wait: a timeout is not an interrupt, so it
+/// still returns on the first attempt.
+const INTERRUPT_ATTEMPTS: usize = 4;
+
+fn interrupted(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted
+    )
+}
+
+fn retrying_interrupt<T>(
+    mut call: impl FnMut() -> Result<T, ureq::Error>,
+) -> Result<T, ureq::Error> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match call() {
+            Ok(value) => return Ok(value),
+            Err(error) if interrupted(&error) && attempt < INTERRUPT_ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn transport_failure(error: ureq::Error) -> anyhow::Error {
+    let error = redact(anyhow::Error::new(error));
+    if format!("{error:#}").contains("timeout") {
+        DisablingFailure(error).into()
+    } else {
+        error
+    }
+}
+
 fn redact(error: anyhow::Error) -> anyhow::Error {
     let text = redact_text(&format!("{error:#}"));
     anyhow::anyhow!("{text}")
 }
 
+/// Drop query strings. Signed URLs carry credentials there, and ureq names
+/// the URL in a transport error.
 fn redact_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -782,109 +820,128 @@ mod tests {
                     if shutdown_c.load(Ordering::Relaxed) {
                         break;
                     }
-                    let Ok(mut stream) = stream else { break };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut reader = BufReader::new(&stream);
-                    let mut request = String::new();
-                    if reader.read_line(&mut request).is_err() || request.is_empty() {
-                        continue;
-                    }
-                    let mut content_length = 0usize;
-                    let mut proxy_auth = String::new();
-                    let mut auth = String::new();
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty()
-                        {
-                            break;
+                    let Ok(stream) = stream else { break };
+                    // One connection per thread. The lookup delay is inside
+                    // the handler; if the client aborts (timeout or EINTR)
+                    // the accept loop must still answer the follow-up lookup.
+                    let base = base.clone();
+                    let lookups_c = Arc::clone(&lookups_c);
+                    let uploads_c = Arc::clone(&uploads_c);
+                    let commits_c = Arc::clone(&commits_c);
+                    let objects_c = Arc::clone(&objects_c);
+                    let manifests_c = Arc::clone(&manifests_c);
+                    let status_c = Arc::clone(&status_c);
+                    let refuse_c = Arc::clone(&refuse_c);
+                    let delay_c = Arc::clone(&delay_c);
+                    let proxy_seen_c = Arc::clone(&proxy_seen_c);
+                    let auth_seen_c = Arc::clone(&auth_seen_c);
+                    thread::spawn(move || {
+                        let mut stream = stream;
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut reader = BufReader::new(&stream);
+                        let mut request = String::new();
+                        if reader.read_line(&mut request).is_err() || request.is_empty() {
+                            return;
                         }
-                        let lower = line.to_ascii_lowercase();
-                        if let Some(value) = lower.strip_prefix("content-length:") {
-                            content_length = value.trim().parse().unwrap_or(0);
+                        let mut content_length = 0usize;
+                        let mut proxy_auth = String::new();
+                        let mut auth = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).is_err()
+                                || line == "\r\n"
+                                || line.is_empty()
+                            {
+                                break;
+                            }
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                            if let Some(value) = lower.strip_prefix("proxy-authorization:") {
+                                proxy_auth = value.trim().to_string();
+                            }
+                            if let Some(value) = lower.strip_prefix("authorization:") {
+                                auth = value.trim().to_string();
+                            }
                         }
-                        if let Some(value) = lower.strip_prefix("proxy-authorization:") {
-                            proxy_auth = value.trim().to_string();
+                        let mut body = vec![0_u8; content_length];
+                        if content_length > 0 {
+                            use std::io::Read as _;
+                            if reader.read_exact(&mut body).is_err() {
+                                return;
+                            }
                         }
-                        if let Some(value) = lower.strip_prefix("authorization:") {
-                            auth = value.trim().to_string();
-                        }
-                    }
-                    let mut body = vec![0_u8; content_length];
-                    if content_length > 0 {
-                        use std::io::Read as _;
-                        if reader.read_exact(&mut body).is_err() {
-                            continue;
-                        }
-                    }
-                    let path = request.split_whitespace().nth(1).unwrap_or("");
-                    let method = request.split_whitespace().next().unwrap_or("");
-                    if path.starts_with("/objects/") {
-                        let digest = path.trim_start_matches("/objects/");
-                        let payload = if method == "PUT" {
-                            objects_c.lock().unwrap().insert(digest.to_string(), body);
-                            Vec::new()
-                        } else {
-                            objects_c
-                                .lock()
-                                .unwrap()
-                                .get(digest)
-                                .cloned()
-                                .unwrap_or_default()
-                        };
-                        let status = if method == "GET"
-                            && payload.is_empty()
-                            && !objects_c.lock().unwrap().contains_key(digest)
-                        {
-                            404
-                        } else {
-                            200
-                        };
-                        let response = format!(
+                        let path = request.split_whitespace().nth(1).unwrap_or("");
+                        let method = request.split_whitespace().next().unwrap_or("");
+                        if path.starts_with("/objects/") {
+                            let digest = path.trim_start_matches("/objects/");
+                            let payload = if method == "PUT" {
+                                objects_c.lock().unwrap().insert(digest.to_string(), body);
+                                Vec::new()
+                            } else {
+                                objects_c
+                                    .lock()
+                                    .unwrap()
+                                    .get(digest)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            };
+                            let status = if method == "GET"
+                                && payload.is_empty()
+                                && !objects_c.lock().unwrap().contains_key(digest)
+                            {
+                                404
+                            } else {
+                                200
+                            };
+                            let response = format!(
                             "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.write_all(&payload);
-                        continue;
-                    }
-                    proxy_seen_c.lock().unwrap().push(proxy_auth.clone());
-                    auth_seen_c.lock().unwrap().push(auth);
-                    if refuse_c.load(Ordering::Relaxed) {
-                        let payload = br#"{"error":"the token is not valid"}"#;
-                        let response = format!(
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(&payload);
+                            return;
+                        }
+                        proxy_seen_c.lock().unwrap().push(proxy_auth.clone());
+                        auth_seen_c.lock().unwrap().push(auth);
+                        if refuse_c.load(Ordering::Relaxed) {
+                            let payload = br#"{"error":"the token is not valid"}"#;
+                            let response = format!(
                             "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.write_all(payload);
-                        continue;
-                    }
-                    if path == "/v1/cache/lookup" {
-                        let asked = serde_json::from_slice::<Value>(&body)
-                            .ok()
-                            .and_then(|request| request["keys"].as_array().map(Vec::len))
-                            .unwrap_or(0) as u64;
-                        thread::sleep(Duration::from_millis(
-                            asked * delay_c.load(Ordering::Relaxed),
-                        ));
-                    }
-                    let (status, payload, extra_headers) = route(
-                        path,
-                        &body,
-                        &base,
-                        &lookups_c,
-                        &uploads_c,
-                        &commits_c,
-                        &objects_c,
-                        &manifests_c,
-                        &status_c,
-                    );
-                    let response = format!(
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(payload);
+                            return;
+                        }
+                        if path == "/v1/cache/lookup" {
+                            let asked = serde_json::from_slice::<Value>(&body)
+                                .ok()
+                                .and_then(|request| request["keys"].as_array().map(Vec::len))
+                                .unwrap_or(0) as u64;
+                            thread::sleep(Duration::from_millis(
+                                asked * delay_c.load(Ordering::Relaxed),
+                            ));
+                        }
+                        let (status, payload, extra_headers) = route(
+                            path,
+                            &body,
+                            &base,
+                            &lookups_c,
+                            &uploads_c,
+                            &commits_c,
+                            &objects_c,
+                            &manifests_c,
+                            &status_c,
+                        );
+                        let response = format!(
                         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
                         payload.len()
                     );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.write_all(&payload);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(&payload);
+                    });
                 }
             });
             Self {
@@ -1286,6 +1343,57 @@ mod tests {
         let summary = stats.snapshot().unwrap();
         assert_eq!((summary.hits, summary.misses, summary.failures), (3, 0, 1));
         assert_eq!(summary.disabled, None, "{summary}");
+    }
+
+    /// A signal can abort the client's batch while the stand-in is still
+    /// delaying that request. The next connection has to be answered anyway,
+    /// or the follow-up lookup misses and the run looks like a cache miss.
+    #[test]
+    fn an_in_flight_lookup_does_not_block_the_next_connection() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let fake = Fake::spawn();
+        fake.lookup_ms_per_key.store(2_000, Ordering::Relaxed);
+        let addr = fake.url.trim_start_matches("http://").to_string();
+        let (sent, sent_rx) = mpsc::channel();
+        let slow_addr = addr.clone();
+        let slow = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(slow_addr).unwrap();
+            let body = br#"{"keys":["a"]}"#;
+            let request = format!(
+                "POST /v1/cache/lookup HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            sent.send(()).unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+        });
+        sent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The handler reads the body and then sleeps. Give it that moment.
+        thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        stream
+            .write_all(b"GET /objects/missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = [0_u8; 12];
+        stream
+            .read_exact(&mut buf)
+            .expect("follow-up must not wait on the in-flight lookup");
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "follow-up waited {:?}",
+            started.elapsed()
+        );
+        drop(stream);
+        slow.join().unwrap();
     }
 
     /// A lookup of one target that times out still stops the run's remote
