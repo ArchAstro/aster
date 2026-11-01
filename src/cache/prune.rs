@@ -10,6 +10,17 @@ use std::time::Duration;
 use super::local::{LocalStore, PruneStats};
 use super::resolve_cache_dir;
 
+/// Human summary of one prune. Auto-prune prefixes this with `[aster] `.
+pub fn format_prune_summary(stats: &PruneStats) -> String {
+    format!(
+        "Pruned {} manifests, {} blobs, and {} temp files ({} bytes remaining)",
+        stats.manifests_removed,
+        stats.blobs_removed,
+        stats.tmp_files_removed,
+        stats.bytes_remaining
+    )
+}
+
 /// Default cap used when neither the flag nor workspace config sets a size.
 pub const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 /// Default age used when neither the flag nor workspace config sets an age.
@@ -139,7 +150,7 @@ pub fn prune_if_over_cap(workspace_root: &Path, limits: PruneLimits) -> Result<O
         return Ok(None);
     }
     let stats = store.prune(Some(max_size), limits.max_age)?;
-    if stats.manifests_removed == 0 && stats.blobs_removed == 0 {
+    if stats.manifests_removed == 0 && stats.blobs_removed == 0 && stats.tmp_files_removed == 0 {
         return Ok(None);
     }
     Ok(Some(stats))
@@ -179,6 +190,17 @@ mod tests {
             .unwrap();
         assert_eq!(limits.max_size, Some(1024));
         assert_eq!(limits.max_age, None);
+
+        let summary = format_prune_summary(&PruneStats {
+            manifests_removed: 1,
+            blobs_removed: 2,
+            tmp_files_removed: 3,
+            bytes_remaining: 4,
+        });
+        assert_eq!(
+            summary,
+            "Pruned 1 manifests, 2 blobs, and 3 temp files (4 bytes remaining)"
+        );
     }
 
     fn sample(key: &str, digest: &Digest) -> Manifest {

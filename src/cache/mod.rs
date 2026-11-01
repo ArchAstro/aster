@@ -41,7 +41,10 @@ pub use login::{
 };
 pub use matcher::TargetInputMatcher;
 pub use outputs::{pack, restore};
-pub use prune::{prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE, DEFAULT_MAX_SIZE};
+pub use prune::{
+    format_prune_summary, prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE,
+    DEFAULT_MAX_SIZE,
+};
 pub use remote_stats::{RemoteStats, RemoteSummary};
 pub use runtime::RuntimeInputCache;
 pub use signature::SIGNATURE_KEY_ENV;
