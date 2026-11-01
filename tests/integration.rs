@@ -5624,3 +5624,109 @@ testpaths = ["tests"]
         "a failed discovery must not print a JSON project list"
     );
 }
+
+/// Issue repro: a root project and `pkg/` both lint with `{files}`. The root
+/// receives only files no nested project owns.
+#[test]
+fn only_affected_files_gives_the_root_project_only_files_no_nested_project_owns() {
+    let tmp = TempDir::new().unwrap();
+    setup_git_repo(&tmp);
+    write_fixture(&tmp, ".gitignore", ".aster\nnode_modules\ntarget\n");
+    write_package_json(&tmp, "package.json", r#"{"name":"root","private":true}"#);
+    write_package_json(
+        &tmp,
+        "pkg/package.json",
+        r#"{"name":"pkg","scripts":{"lint":"echo pkg"}}"#,
+    );
+    let lint = "\
+[targets.lint]
+command = \"echo eslint {files}\"
+capabilities = [\"files_list\"]
+files_glob = \"**/*.js\"
+";
+    write_aster_toml(&tmp, "aster.toml", lint);
+    write_aster_toml(&tmp, "pkg/aster.toml", lint);
+    write_fixture(&tmp, "pkg/x.js", "1\n");
+    write_fixture(&tmp, "root.js", "1\n");
+    git_commit(&tmp, "init");
+
+    let dry_run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args([
+                "affected",
+                "lint",
+                "--base=HEAD",
+                "--only-affected-files",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "dry-run failed: stdout={stdout} stderr={stderr}"
+        );
+        stdout
+    };
+
+    // A change that touches only the nested project must not select the root.
+    write_fixture(&tmp, "pkg/x.js", "1\n2\n");
+    let nested_only = dry_run();
+    assert!(
+        block(&nested_only, "//:lint").is_none(),
+        "a nested-only change must not select the root: {nested_only}"
+    );
+    let pkg = block(&nested_only, "//pkg:lint")
+        .unwrap_or_else(|| panic!("nested change should select //pkg:lint: {nested_only}"));
+    assert!(
+        pkg.contains("command: echo eslint x.js"),
+        "nested lint should receive x.js: {pkg}"
+    );
+
+    // Both files change. Root receives only root.js; pkg still receives x.js.
+    write_fixture(&tmp, "root.js", "1\n2\n");
+    let stdout = dry_run();
+    let root = block(&stdout, "//:lint")
+        .unwrap_or_else(|| panic!("root should be selected for root.js: {stdout}"));
+    assert!(
+        root.contains("- root.js"),
+        "root file list should list root.js: {root}\n{stdout}"
+    );
+    assert!(
+        !root.contains("pkg/"),
+        "root must not list a nested project's file: {root}\n{stdout}"
+    );
+    assert!(
+        root.contains("command: echo eslint root.js"),
+        "root command should be echo eslint root.js: {root}\n{stdout}"
+    );
+    let pkg = block(&stdout, "//pkg:lint")
+        .unwrap_or_else(|| panic!("pkg should still be selected: {stdout}"));
+    assert!(
+        pkg.contains("- pkg/x.js"),
+        "dry-run should list the nested file under //pkg:lint: {pkg}\n{stdout}"
+    );
+    assert!(
+        pkg.contains("command: echo eslint x.js"),
+        "//pkg:lint should show x.js: {pkg}\n{stdout}"
+    );
+    assert!(
+        !pkg.contains("root.js"),
+        "pkg must not receive the root file: {pkg}\n{stdout}"
+    );
+}
+
+/// The dry-run block for one target address, from its header through the
+/// line before the next target.
+fn block<'a>(stdout: &'a str, address: &str) -> Option<&'a str> {
+    let header = format!("  {address}  (");
+    let start = stdout.find(&header)?;
+    let rest = &stdout[start..];
+    let end = rest[header.len()..]
+        .find("\n  //")
+        .map(|index| index + header.len())
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
