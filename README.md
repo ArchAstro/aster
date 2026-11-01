@@ -1189,10 +1189,12 @@ rejected when the configuration loads, so it never reaches this rule.
 
 **Entry targets.** `orphan-test-target` needs to know which targets CI
 requests. The entries are the `--entry` flags, `[check] entries` in the root
-`aster.toml`, and the `target` of each `[affected.lanes]` entry. The rule is
-skipped, and says so, when the workspace has no lanes, and when it has lanes
-but no entry target is known. A project is a root of the reachability search
-only where some lane admits it. This is a reachability check over the
+`aster.toml`, and the `target` of each `[affected.lanes]` entry. Without
+lanes, those `--entry` flags and `[check] entries` are roots in every
+project. With lanes, a project is a root only where some lane admits it, and
+a lane with no `target` of its own uses the same entries. The rule is
+skipped, and says so, when no entry is known: set `[check] entries`, pass
+`--entry`, or give a lane a `target`. This is a reachability check over the
 declared graph, so it cannot know about a CI step outside Aster that runs a
 target by name; add that target to `entries`.
 
