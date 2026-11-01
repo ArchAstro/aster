@@ -150,6 +150,8 @@ mod tests {
             tests,
             input_hash: Some("h".into()),
             interrupted: false,
+            blocked: false,
+            run_wall_ms: None,
         }
     }
 

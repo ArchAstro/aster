@@ -215,6 +215,8 @@ pub struct ExecutionSummary {
     pub passed: usize,
     /// Number of targets that failed
     pub failed: usize,
+    /// Number of targets that did not run because a prerequisite failed
+    pub blocked: usize,
     /// Number of targets that were skipped
     pub skipped: usize,
     /// Number of targets that hit cache
@@ -244,11 +246,17 @@ pub fn print_summary(
         .iter()
         .filter(|r| r.success && !r.skipped && !r.cached)
         .count();
-    let failed = results.iter().filter(|r| !r.success).count();
+    let failed = results.iter().filter(|r| !r.success && !r.blocked).count();
+    let blocked = results.iter().filter(|r| r.blocked).count();
     let total = results.len();
-    let total_duration: u128 = results.iter().map(|r| r.duration_ms).sum();
+    let total_duration = summary_duration_ms(results);
     let cached_summary = if cached > 0 {
         format!(", {cached} cached")
+    } else {
+        String::new()
+    };
+    let blocked_summary = if blocked > 0 {
+        format!(", {blocked} blocked")
     } else {
         String::new()
     };
@@ -261,11 +269,14 @@ pub fn print_summary(
 
     if mode == OutputMode::Quiet {
         // Single line summary for quiet mode
+        let mut parts = vec![format!("{passed} passed{cached_summary}")];
         if failed > 0 {
-            eprintln!("{passed} passed{cached_summary}, {failed} failed");
-        } else {
-            eprintln!("{passed} passed{cached_summary}");
+            parts.push(format!("{failed} failed"));
         }
+        if blocked > 0 {
+            parts.push(format!("{blocked} blocked"));
+        }
+        eprintln!("{}", parts.join(", "));
         return;
     }
 
@@ -273,11 +284,11 @@ pub fn print_summary(
     println!("\n=== Summary ===");
     if skipped > 0 {
         println!(
-            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed, {skipped} skipped (no target)"
+            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed{blocked_summary}, {skipped} skipped (no target)"
         );
     } else {
         println!(
-            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed"
+            "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed{blocked_summary}"
         );
     }
     println!("Total time: {total_duration}ms");
@@ -301,7 +312,14 @@ pub fn print_summary(
 
     if failed > 0 {
         println!("\nFailed projects:");
-        for result in results.iter().filter(|r| !r.success) {
+        for result in results.iter().filter(|r| !r.success && !r.blocked) {
+            println!("  - {}", result.address);
+        }
+    }
+
+    if blocked > 0 {
+        println!("\nBlocked projects:");
+        for result in results.iter().filter(|r| r.blocked) {
             println!("  - {}", result.address);
         }
     }
@@ -326,6 +344,8 @@ pub fn build_execution_output_with_cache(
                 "skipped".to_string()
             } else if r.cached {
                 "cached".to_string()
+            } else if r.blocked {
+                "blocked".to_string()
             } else if r.success {
                 "passed".to_string()
             } else {
@@ -359,8 +379,9 @@ pub fn build_execution_output_with_cache(
         .iter()
         .filter(|r| r.success && !r.skipped && !r.cached)
         .count();
-    let failed = results.iter().filter(|r| !r.success).count();
-    let total_duration: u128 = results.iter().map(|r| r.duration_ms).sum();
+    let failed = results.iter().filter(|r| !r.success && !r.blocked).count();
+    let blocked = results.iter().filter(|r| r.blocked).count();
+    let total_duration = summary_duration_ms(results);
 
     ExecutionOutput {
         results: target_results,
@@ -368,12 +389,22 @@ pub fn build_execution_output_with_cache(
             total,
             passed,
             failed,
+            blocked,
             skipped,
             cached,
             duration_ms: total_duration,
             cache_summary,
         },
     }
+}
+
+/// Wall-clock time of the run when the executor recorded it, otherwise the
+/// sum of per-target durations.
+fn summary_duration_ms(results: &[ExecutionResult]) -> u128 {
+    results
+        .iter()
+        .find_map(|result| result.run_wall_ms)
+        .unwrap_or_else(|| results.iter().map(|result| result.duration_ms).sum())
 }
 
 #[cfg(test)]
@@ -459,6 +490,7 @@ mod tests {
             total: 10,
             passed: 8,
             failed: 1,
+            blocked: 0,
             skipped: 1,
             cached: 0,
             duration_ms: 5000,
@@ -485,6 +517,8 @@ mod tests {
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             },
             ExecutionResult {
                 address: "//b:test".to_string(),
@@ -498,6 +532,8 @@ mod tests {
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             },
             ExecutionResult {
                 address: "//c:test".to_string(),
@@ -511,6 +547,8 @@ mod tests {
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             },
         ];
 
@@ -519,6 +557,7 @@ mod tests {
         assert_eq!(output.summary.total, 3);
         assert_eq!(output.summary.passed, 1);
         assert_eq!(output.summary.failed, 1);
+        assert_eq!(output.summary.blocked, 0);
         assert_eq!(output.summary.skipped, 1);
         assert_eq!(output.summary.duration_ms, 150);
 
@@ -530,6 +569,51 @@ mod tests {
         assert_eq!(output.results[2].exit_code, None);
         let json = serde_json::to_value(&output).unwrap();
         assert!(json["results"][0].get("tests").is_none());
+    }
+
+    #[test]
+    fn blocked_targets_are_not_failures_and_wall_clock_replaces_the_sum() {
+        let mut blocked = ExecutionResult {
+            address: "//after:build".to_string(),
+            success: false,
+            skipped: false,
+            cached: false,
+            output: "Blocked: prerequisite target(s) failed: //bad:build".to_string(),
+            log: Vec::new(),
+            duration_ms: 0,
+            exit_code: None,
+            tests: None,
+            input_hash: None,
+            interrupted: false,
+            blocked: true,
+            run_wall_ms: Some(30),
+        };
+        let failed = ExecutionResult {
+            address: "//bad:build".to_string(),
+            success: false,
+            skipped: false,
+            cached: false,
+            output: String::new(),
+            log: Vec::new(),
+            duration_ms: 100,
+            exit_code: Some(9),
+            tests: None,
+            input_hash: None,
+            interrupted: false,
+            blocked: false,
+            run_wall_ms: Some(30),
+        };
+        let output = build_execution_output(&[failed, blocked.clone()]);
+        assert_eq!(output.summary.failed, 1);
+        assert_eq!(output.summary.blocked, 1);
+        assert_eq!(output.summary.duration_ms, 30);
+        assert_eq!(output.results[1].status, "blocked");
+
+        blocked.run_wall_ms = None;
+        blocked.duration_ms = 40;
+        let untimed = build_execution_output(&[blocked]);
+        assert_eq!(untimed.summary.duration_ms, 40);
+        assert_eq!(untimed.summary.failed, 0);
     }
 
     #[test]
@@ -567,6 +651,8 @@ mod tests {
             }),
             input_hash: None,
             interrupted: false,
+            blocked: false,
+            run_wall_ms: None,
         };
         let json = serde_json::to_value(build_execution_output(&[result])).unwrap();
         let tests = &json["results"][0]["tests"];

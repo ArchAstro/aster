@@ -48,6 +48,8 @@ pub(super) fn run(job: &ChainJob, chain: &ChainPlan) -> ExecutionResult {
         tests: None,
         input_hash: None,
         interrupted: false,
+        blocked: false,
+        run_wall_ms: None,
     };
     let mut cases = Vec::new();
     let mut quarantined = Vec::new();

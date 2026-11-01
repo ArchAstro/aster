@@ -1435,9 +1435,13 @@ fn run() -> Result<()> {
                 }
 
                 // Return error if any failed (for exit code)
-                let failed = results.iter().filter(|r| !r.success).count();
+                let failed = results.iter().filter(|r| !r.success && !r.blocked).count();
+                let blocked = results.iter().filter(|r| r.blocked).count();
                 if failed > 0 {
                     return Err(anyhow::anyhow!("{failed} project(s) failed"));
+                }
+                if blocked > 0 {
+                    return Err(anyhow::anyhow!("{blocked} project(s) blocked"));
                 }
             }
             if matrix_rows {
@@ -1547,10 +1551,18 @@ fn run() -> Result<()> {
                 print_heterogeneous_summary(&results, output_mode);
             }
 
-            // Return error if any failed (for exit code)
-            let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
+            // Return error if any failed (for exit code). Blocked dependents
+            // are not failures of their own, but still make the run fail.
+            let failed = results
+                .iter()
+                .filter(|r| !r.success && !r.skipped && !r.blocked)
+                .count();
+            let blocked = results.iter().filter(|r| r.blocked).count();
             if failed > 0 {
                 return Err(anyhow::anyhow!("{failed} target(s) failed"));
+            }
+            if blocked > 0 {
+                return Err(anyhow::anyhow!("{blocked} target(s) blocked"));
             }
         }
         Commands::Project { command } => {
@@ -1964,10 +1976,15 @@ fn run() -> Result<()> {
                 print_summary(&results, &run_args.target, output_mode, false);
             }
 
-            // Return error if any failed (for exit code)
-            let failed = results.iter().filter(|r| !r.success).count();
+            // Return error if any failed (for exit code). Blocked dependents
+            // are not failures of their own, but still make the run fail.
+            let failed = results.iter().filter(|r| !r.success && !r.blocked).count();
+            let blocked = results.iter().filter(|r| r.blocked).count();
             if failed > 0 {
                 return Err(anyhow::anyhow!("{failed} project(s) failed"));
+            }
+            if blocked > 0 {
+                return Err(anyhow::anyhow!("{blocked} project(s) blocked"));
             }
         }
     }
@@ -2438,23 +2455,32 @@ fn print_heterogeneous_summary(
         .iter()
         .filter(|r| r.success && !r.skipped && !r.cached)
         .count();
-    let failed = results.iter().filter(|r| !r.success && !r.skipped).count();
+    let failed = results
+        .iter()
+        .filter(|r| !r.success && !r.skipped && !r.blocked)
+        .count();
+    let blocked = results.iter().filter(|r| r.blocked).count();
     let skipped = results.iter().filter(|r| r.skipped).count();
     let cached_summary = if cached > 0 {
         format!(", {cached} cached")
     } else {
         String::new()
     };
+    let blocked_summary = if blocked > 0 {
+        format!(", {blocked} blocked")
+    } else {
+        String::new()
+    };
 
     if output_mode == OutputMode::Quiet {
-        println!("{passed} passed{cached_summary}, {failed} failed");
+        println!("{passed} passed{cached_summary}, {failed} failed{blocked_summary}");
         return;
     }
 
     println!();
     println!(
-        "{} {} passed{}, {} failed{}",
-        if failed > 0 {
+        "{} {} passed{}, {} failed{}{}",
+        if failed > 0 || blocked > 0 {
             style("✗").red()
         } else {
             style("✓").green()
@@ -2462,6 +2488,7 @@ fn print_heterogeneous_summary(
         passed,
         cached_summary,
         failed,
+        blocked_summary,
         if skipped > 0 {
             format!(", {skipped} skipped")
         } else {

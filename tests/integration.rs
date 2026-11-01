@@ -416,6 +416,137 @@ cache = { enabled = false }
 }
 
 #[test]
+fn blocked_dependents_are_reported_blocked_and_total_time_is_wall_clock() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    let project = |name: &str, command: &str, depends_on: &str| {
+        write_package_json(
+            &tmp,
+            &format!("{name}/package.json"),
+            &format!(r#"{{"name":"{name}"}}"#),
+        );
+        let depends = if depends_on.is_empty() {
+            String::new()
+        } else {
+            format!("depends_on = [\"{depends_on}\"]\n")
+        };
+        write_aster_toml(
+            &tmp,
+            &format!("{name}/aster.toml"),
+            &format!(
+                "[targets.build]\ncommand = \"{command}\"\n{depends}cache = {{ enabled = false }}\n"
+            ),
+        );
+    };
+    project("bad", "sh -c 'exit 9'", "");
+    project("after", "touch should-not-run", "//bad:build");
+    project("left", "sleep 1", "");
+    project("right", "sleep 1", "");
+
+    let run = |json: bool| {
+        let mut args = vec!["--jobs", "4", "--no-cache"];
+        if json {
+            args.push("--json");
+        }
+        args.extend(["build", "--all"]);
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .env("CI", "1")
+            .args(&args)
+            .output()
+            .unwrap()
+    };
+
+    let started = std::time::Instant::now();
+    let human = run(false);
+    let elapsed_ms = started.elapsed().as_millis();
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        !human.status.success(),
+        "blocked run should fail\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 project(s) failed"),
+        "stderr should count only the real failure: {stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("1 failed") && line.contains("1 blocked")),
+        "summary should show 1 failed and 1 blocked: {stdout}"
+    );
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.contains("START") && line.contains("//after:build")),
+        "blocked target must not be announced with START: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("START") && line.contains("//bad:build")),
+        "CI progress should still announce targets that start: {stderr}"
+    );
+    assert!(!tmp.path().join("after/should-not-run").exists());
+    let total_time = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Total time: ")?.strip_suffix("ms"))
+        .and_then(|ms| ms.trim().parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("missing Total time: {stdout}"));
+    assert!(
+        total_time + 1000 >= elapsed_ms && elapsed_ms + 1000 >= total_time,
+        "Total time {total_time}ms should be within ~1s of elapsed {elapsed_ms}ms"
+    );
+
+    let json_run = run(true);
+    let json_stdout = String::from_utf8_lossy(&json_run.stdout);
+    let json_stderr = String::from_utf8_lossy(&json_run.stderr);
+    assert!(
+        !json_run.status.success(),
+        "json run should fail\nstdout: {json_stdout}\nstderr: {json_stderr}"
+    );
+    assert!(
+        json_stderr.contains("1 project(s) failed"),
+        "json stderr should count only the real failure: {json_stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&json_run.stdout)
+        .unwrap_or_else(|error| panic!("stdout was not JSON ({error}): {json_stdout}"));
+    assert_eq!(json["summary"]["failed"], 1);
+    assert_eq!(json["summary"]["blocked"], 1);
+    let results = json["results"].as_array().expect("results array");
+    let after = results
+        .iter()
+        .find(|result| result["address"] == "//after:build")
+        .expect("//after:build result");
+    assert_eq!(after["status"], "blocked");
+    assert!(after["exit_code"].is_null());
+    let bad = results
+        .iter()
+        .find(|result| result["address"] == "//bad:build")
+        .expect("//bad:build result");
+    assert_eq!(bad["status"], "failed");
+    assert_eq!(bad["exit_code"], 9);
+    let parallel: Vec<u128> = results
+        .iter()
+        .filter(|result| {
+            result["address"] == "//left:build" || result["address"] == "//right:build"
+        })
+        .map(|result| result["duration_ms"].as_u64().unwrap() as u128)
+        .collect();
+    assert!(
+        parallel.len() == 2 && parallel.iter().all(|duration| *duration >= 500),
+        "parallel sleeps should have run: {parallel:?}\n{json_stdout}"
+    );
+    let wall = json["summary"]["duration_ms"].as_u64().unwrap() as u128;
+    let sum: u128 = parallel.iter().sum();
+    assert!(
+        wall < sum,
+        "summary.duration_ms {wall} should be below the sum of parallel durations {sum}"
+    );
+}
+
+#[test]
 fn test_list_shows_projects() {
     let tmp = TempDir::new().unwrap();
     setup_workspace(&tmp);

@@ -133,6 +133,29 @@ pub struct ExecutionResult {
     /// A process was running when Aster received SIGINT or SIGTERM. The output
     /// is what it had written by then.
     pub interrupted: bool,
+    /// The target did not run because a prerequisite failed or was blocked.
+    ///
+    /// Not a failure of this target. `success` is false and `exit_code` is
+    /// `None`. Set only when a dependency is already in the failed-or-blocked set.
+    pub blocked: bool,
+    /// Wall-clock duration of the executor run that produced this result.
+    ///
+    /// Set on every result of a timed run so summaries can report elapsed time
+    /// without changing [`Executor::execute`]'s return type. `None` for results
+    /// built outside a timed run; summaries then sum [`Self::duration_ms`].
+    pub run_wall_ms: Option<u128>,
+}
+
+/// Attach one run's elapsed wall time to every result.
+fn with_run_wall_clock(
+    mut results: Vec<ExecutionResult>,
+    started: Instant,
+) -> Vec<ExecutionResult> {
+    let wall_ms = started.elapsed().as_millis();
+    for result in &mut results {
+        result.run_wall_ms = Some(wall_ms);
+    }
+    results
 }
 
 fn execution_failure(address: &str, output: String) -> ExecutionResult {
@@ -148,6 +171,8 @@ fn execution_failure(address: &str, output: String) -> ExecutionResult {
         tests: None,
         input_hash: None,
         interrupted: false,
+        blocked: false,
+        run_wall_ms: None,
     }
 }
 
@@ -350,7 +375,11 @@ impl<'a> Executor<'a> {
         _graph: &ProjectGraph,
         primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, None, primary_projects)
+        let started = Instant::now();
+        with_run_wall_clock(
+            self.execute_internal(target, projects, None, primary_projects),
+            started,
+        )
     }
 
     /// Execute a target with command overrides for specific targets
@@ -364,7 +393,11 @@ impl<'a> Executor<'a> {
         command_overrides: &HashMap<String, CommandOverride>,
         primary_projects: Option<&HashSet<String>>,
     ) -> Vec<ExecutionResult> {
-        self.execute_internal(target, projects, Some(command_overrides), primary_projects)
+        let started = Instant::now();
+        with_run_wall_clock(
+            self.execute_internal(target, projects, Some(command_overrides), primary_projects),
+            started,
+        )
     }
 
     /// Execute a target with streaming output (for long-running processes like dev servers)
@@ -491,30 +524,32 @@ impl<'a> Executor<'a> {
         projects: &[&DiscoveredProject],
         no_deps: bool,
     ) -> Vec<ExecutionResult> {
-        if projects.is_empty() || primary_targets.is_empty() {
-            return Vec::new();
-        }
+        let started = Instant::now();
+        let results = if projects.is_empty() || primary_targets.is_empty() {
+            Vec::new()
+        } else {
+            let project_map: HashMap<String, &DiscoveredProject> = projects
+                .iter()
+                .map(|p| (format!("//{}", p.relative_path.display()), *p))
+                .collect();
 
-        let project_map: HashMap<String, &DiscoveredProject> = projects
-            .iter()
-            .map(|p| (format!("//{}", p.relative_path.display()), *p))
-            .collect();
-
-        let mut targets_to_run: HashSet<String> = primary_targets.clone();
-        if !no_deps {
-            for addr in primary_targets {
-                collect_target_deps(addr, &project_map, &mut targets_to_run);
+            let mut targets_to_run: HashSet<String> = primary_targets.clone();
+            if !no_deps {
+                for addr in primary_targets {
+                    collect_target_deps(addr, &project_map, &mut targets_to_run);
+                }
+                collect_selected_targets(&project_map, &mut targets_to_run);
             }
-            collect_selected_targets(&project_map, &mut targets_to_run);
-        }
 
-        let target_label = primary_targets
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "watch".to_string());
+            let target_label = primary_targets
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "watch".to_string());
 
-        self.execute_target_set(&targets_to_run, &project_map, None, &target_label)
+            self.execute_target_set(&targets_to_run, &project_map, None, &target_label)
+        };
+        with_run_wall_clock(results, started)
     }
 
     /// Internal execution method that supports optional command overrides
@@ -804,8 +839,7 @@ impl<'a> Executor<'a> {
                 }
 
                 if show_progress {
-                    progress.add_running(&target_addr);
-                    progress.mark_complete(&target_addr, false, false, 0);
+                    progress.mark_blocked(&target_addr);
                 }
                 failed_or_blocked.insert(target_addr.clone());
                 queue.complete(&target_addr);
@@ -828,6 +862,8 @@ impl<'a> Executor<'a> {
                         tests: None,
                         input_hash: None,
                         interrupted: false,
+                        blocked: true,
+                        run_wall_ms: None,
                     },
                 ));
             }
@@ -950,6 +986,8 @@ impl<'a> Executor<'a> {
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             });
             return true;
         }
@@ -973,6 +1011,8 @@ impl<'a> Executor<'a> {
                             tests: None,
                             input_hash: None,
                             interrupted: false,
+                            blocked: false,
+                            run_wall_ms: None,
                         };
                         if show_progress {
                             progress.mark_skipped(target_addr);
@@ -998,6 +1038,8 @@ impl<'a> Executor<'a> {
                             tests: None,
                             input_hash: None,
                             interrupted: false,
+                            blocked: false,
+                            run_wall_ms: None,
                         };
                         if show_progress {
                             progress.mark_skipped(target_addr);
@@ -1024,6 +1066,8 @@ impl<'a> Executor<'a> {
                         tests: None,
                         input_hash: None,
                         interrupted: false,
+                        blocked: false,
+                        run_wall_ms: None,
                     };
                     if show_progress {
                         progress.mark_skipped(target_addr);
@@ -1288,6 +1332,8 @@ impl<'a> Executor<'a> {
                         tests: None,
                         input_hash: None,
                         interrupted: false,
+                        blocked: false,
+                        run_wall_ms: None,
                     };
                     let _ = tx_clone.send(result.clone());
                     return result;
@@ -1551,6 +1597,8 @@ impl<'a> Executor<'a> {
                     tests: None,
                     input_hash: None,
                     interrupted: false,
+                    blocked: false,
+                    run_wall_ms: None,
                 });
             }
         });
@@ -1567,7 +1615,9 @@ impl<'a> Executor<'a> {
             .iter()
             .map(|r| TargetLog {
                 address: r.address.clone(),
-                status: if r.skipped {
+                status: if r.blocked {
+                    "blocked".to_string()
+                } else if r.skipped {
                     "skipped".to_string()
                 } else if r.success {
                     "passed".to_string()
@@ -1611,8 +1661,9 @@ impl<'a> Executor<'a> {
                 eprintln!();
             }
 
-            // Print "FAILED //project:target" in red
-            let header = format!("{} {}", style("FAILED").red().bold(), result.address);
+            // Blocked dependents never ran; do not announce them as failures.
+            let label = if result.blocked { "BLOCKED" } else { "FAILED" };
+            let header = format!("{} {}", style(label).red().bold(), result.address);
             if progress.is_enabled() {
                 progress.println(&header);
             } else {
@@ -2386,6 +2437,8 @@ fn cached_result(
         tests: None,
         input_hash,
         interrupted: false,
+        blocked: false,
+        run_wall_ms: None,
     }
 }
 
@@ -2872,6 +2925,8 @@ fn run_invocations(
         tests: None,
         input_hash: None,
         interrupted: false,
+        blocked: false,
+        run_wall_ms: None,
     };
     let mut raw_outputs = Vec::new();
     for invocation in invocations {
@@ -3035,6 +3090,8 @@ fn run_command(
         tests: None,
         input_hash: None,
         interrupted: false,
+        blocked: false,
+        run_wall_ms: None,
     };
 
     let parsed = match parse_command(command) {
@@ -3116,6 +3173,8 @@ fn run_command(
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             };
         }
     };
@@ -3145,6 +3204,8 @@ fn run_command(
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             };
         }
     };
@@ -3185,6 +3246,8 @@ fn run_command(
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             }
         }
         Err(error) => {
@@ -3201,6 +3264,8 @@ fn run_command(
                 tests: None,
                 input_hash: None,
                 interrupted: false,
+                blocked: false,
+                run_wall_ms: None,
             }
         }
     }
@@ -4526,6 +4591,8 @@ mod tests {
             tests: None,
             input_hash: None,
             interrupted: false,
+            blocked: false,
+            run_wall_ms: None,
         };
 
         assert_eq!(result.address, "//test:build");
