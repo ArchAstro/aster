@@ -43,6 +43,8 @@ pub struct ProgressDisplay {
     skipped: Arc<AtomicUsize>,
     cached: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
+    /// Targets that never started because a prerequisite failed
+    blocked: Arc<AtomicUsize>,
     /// Targets that passed only on a retry, by address: how many tests
     flaky: HashMap<String, usize>,
     quarantined: HashMap<String, usize>,
@@ -87,6 +89,7 @@ impl ProgressDisplay {
             skipped: Arc::new(AtomicUsize::new(0)),
             cached: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicUsize::new(0)),
+            blocked: Arc::new(AtomicUsize::new(0)),
             flaky: HashMap::new(),
             quarantined: HashMap::new(),
         }
@@ -117,7 +120,11 @@ impl ProgressDisplay {
         let failed = self.failed.load(Ordering::SeqCst);
         let cached = self.cached.load(Ordering::SeqCst);
         let running = self.running.load(Ordering::SeqCst);
-        let completed = passed + failed + cached + self.skipped.load(Ordering::SeqCst);
+        let completed = passed
+            + failed
+            + cached
+            + self.skipped.load(Ordering::SeqCst)
+            + self.blocked.load(Ordering::SeqCst);
         let remaining = total.saturating_sub(completed).saturating_sub(running);
 
         let mut parts = Vec::new();
@@ -144,6 +151,15 @@ impl ProgressDisplay {
 
         if failed > 0 {
             parts.push(format!("{} {}", style(failed).red(), style("failed").red()));
+        }
+
+        let blocked = self.blocked.load(Ordering::SeqCst);
+        if blocked > 0 {
+            parts.push(format!(
+                "{} {}",
+                style(blocked).yellow(),
+                style("blocked").yellow()
+            ));
         }
 
         if remaining > 0 {
@@ -231,6 +247,15 @@ impl ProgressDisplay {
             let msg = format!("{} {}", style("SKIP").yellow(), address);
             let _ = self.multi.println(msg);
         }
+    }
+
+    /// Count a target that never started because a prerequisite failed.
+    ///
+    /// Does not print START. The target is complete for the progress total
+    /// without being a failure of its own.
+    pub fn mark_blocked(&mut self, _address: &str) {
+        self.blocked.fetch_add(1, Ordering::SeqCst);
+        self.refresh_status();
     }
 
     /// Mark a target as cached.
@@ -426,8 +451,9 @@ impl ProgressDisplay {
             let passed = self.passed.load(Ordering::SeqCst);
             let failed = self.failed.load(Ordering::SeqCst);
             let cached = self.cached.load(Ordering::SeqCst);
+            let blocked = self.blocked.load(Ordering::SeqCst);
 
-            let status_icon = if failed > 0 {
+            let status_icon = if failed > 0 || blocked > 0 {
                 style("✗").red()
             } else {
                 style("✓").green()
@@ -442,6 +468,10 @@ impl ProgressDisplay {
 
             if failed > 0 {
                 parts.push(format!("{} failed", style(failed).red()));
+            }
+
+            if blocked > 0 {
+                parts.push(format!("{} blocked", style(blocked).yellow()));
             }
 
             bar.finish_with_message(format!("{} {}", status_icon, parts.join(", ")));

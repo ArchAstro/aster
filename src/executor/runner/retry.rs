@@ -383,6 +383,8 @@ mod tests {
             }),
             input_hash: None,
             interrupted: false,
+            blocked: false,
+            run_wall_ms: None,
         }
     }
 
