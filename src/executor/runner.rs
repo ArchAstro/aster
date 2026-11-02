@@ -1079,11 +1079,12 @@ impl<'a> Executor<'a> {
                 match lookup {
                     CacheLookup::Hit { manifest, log } => {
                         let result = cached_result(target_addr, &manifest, log, input_hash.clone());
-                        // Same channel as live captured output: `aster logs`
-                        // prints `ExecutionResult.output`, and a hit replays
-                        // that stored log here unless `--no-replay` is set.
-                        // JSON keeps the log on the result and does not print it.
-                        if self.output_mode != OutputMode::Json && !self.no_replay {
+                        // Quiet callers (including the service dashboard) own
+                        // log delivery. Keep the stored log on the result, but
+                        // replay it to the terminal only in human output modes.
+                        if matches!(self.output_mode, OutputMode::Normal | OutputMode::Verbose)
+                            && !self.no_replay
+                        {
                             print_replayed_log(&result.output);
                         }
                         if show_progress {

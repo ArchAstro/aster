@@ -271,6 +271,22 @@ fn cache_hit_replays_stored_log_and_exit_status() {
         "json mode must not print the log: {json_text}"
     );
 
+    let quiet_mode = run(&["--quiet"]);
+    assert!(quiet_mode.status.success(), "{quiet_mode:?}");
+    let quiet_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&quiet_mode.stdout),
+        String::from_utf8_lossy(&quiet_mode.stderr)
+    );
+    assert!(
+        quiet_output.contains("1 cached"),
+        "quiet mode must still report the hit: {quiet_output}"
+    );
+    assert!(
+        !quiet_output.contains("hello"),
+        "quiet mode must not replay target output: {quiet_output}"
+    );
+
     let quiet = run(&["--no-replay"]);
     assert!(quiet.status.success(), "no-replay run failed: {quiet:?}");
     let quiet_text = format!(
