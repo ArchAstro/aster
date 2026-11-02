@@ -1415,6 +1415,93 @@ stream = true
 }
 
 #[test]
+fn cached_prerequisite_output_is_delivered_only_through_service_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        root.join("aster.toml"),
+        "[dev.services.web]\ntarget = \"//app:dev\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.prepare]
+command = "sh -c 'echo PREREQUISITE_STDOUT; echo PREREQUISITE_STDERR >&2; echo ran >> ../runs'"
+cache = { enabled = true, include = ["package.json"], outputs = [] }
+
+[targets.dev]
+command = "echo SERVICE_STARTED"
+depends_on = ["//self:prepare"]
+stream = true
+"#,
+    )
+    .unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+        command
+            .current_dir(root)
+            .env("ASTER_EXECUTION_DIR", root.join("execution"))
+            .env("ASTER_CACHE_DIR", root.join("cache"))
+            .env("ASTER_PORT_LEASE_DIR", root.join("leases"));
+        command
+    };
+
+    // Populate the real cache in a separate CLI process, including both streams.
+    let warm = command().args(["run", "//app:prepare"]).output().unwrap();
+    assert!(warm.status.success(), "{warm:?}");
+
+    // The foreground supervisor must route cached logs through its service
+    // channel. Line-oriented output exposes that routing without a terminal.
+    let stdout = root.join("stdout");
+    let stderr = root.join("stderr");
+    let mut aster = command()
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .stdout(fs::File::create(&stdout).unwrap())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let started = condition_met(Duration::from_secs(10), || {
+        occurrences(&stdout, "SERVICE_STARTED") == 1
+    });
+    unsafe {
+        libc::kill(aster.id() as i32, libc::SIGTERM);
+    }
+    let status = aster.wait().unwrap();
+    let output = fs::read_to_string(&stdout).unwrap();
+    let errors = fs::read_to_string(&stderr).unwrap();
+    assert!(started, "service did not start: {output}\n{errors}");
+    assert_eq!(status.code(), Some(143), "{output}\n{errors}");
+
+    // A hit must not rerun the prerequisite or duplicate its raw stdout. Both
+    // original streams remain available in the service channel and durable log.
+    assert_eq!(fs::read_to_string(root.join("runs")).unwrap(), "ran\n");
+    assert!(
+        output.contains("[web] | [cached] //app:prepare"),
+        "{output}"
+    );
+    for marker in ["PREREQUISITE_STDOUT", "PREREQUISITE_STDERR"] {
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains(marker))
+            .collect();
+        assert_eq!(lines, [format!("[web] | [//app:prepare] {marker}")]);
+        assert!(!errors.contains(marker), "{errors}");
+    }
+    let logs = command()
+        .args(["services", "logs", "web"])
+        .output()
+        .unwrap();
+    assert!(logs.status.success(), "{logs:?}");
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(logs.contains("PREREQUISITE_STDOUT"), "{logs}");
+    assert!(logs.contains("PREREQUISITE_STDERR"), "{logs}");
+}
+
+#[test]
 fn dev_does_not_start_a_service_after_shutdown_interrupts_its_prerequisite() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
