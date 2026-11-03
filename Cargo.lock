@@ -190,6 +190,7 @@ dependencies = [
  "roxmltree",
  "rustls",
  "rustls-pemfile",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -269,6 +269,16 @@ fn run() -> Result<()> {
     let workspace_root = find_workspace_root(&cwd).context(
         "Not in an aster workspace (no aster.toml or .git found). Run 'aster init' to create one.",
     )?;
+    // Pin service ownership before discovery or planning can overlap retirement.
+    let service_workspace_identity = matches!(
+        command,
+        Commands::Services {
+            command: ServicesCommands::Up { .. }
+        }
+    )
+    .then(|| same_file::Handle::from_path(&workspace_root))
+    .transpose()
+    .context("failed to open service workspace")?;
 
     // Daemon inspection and worktree shutdown need configuration for stable
     // reporting, but do not require project/plugin discovery.
@@ -319,6 +329,9 @@ fn run() -> Result<()> {
                     !daemon_supervisor && (*daemon || (workspace_config.dev.daemon && !dry_run));
                 if use_daemon {
                     let mut options = aster::dev::LaunchOptions::new(&workspace_root)?;
+                    options.workspace_identity = std::sync::Arc::new(
+                        service_workspace_identity.expect("services up captured its workspace"),
+                    );
                     options.group.clone_from(group);
                     options.watch = !no_watch;
                     options.use_cache = !cli.no_cache;
@@ -1787,6 +1800,7 @@ fn run() -> Result<()> {
                 )?;
                 aster::dev::run_dev(
                     &workspace_root,
+                    service_workspace_identity.expect("services up captured its workspace"),
                     projects,
                     graph,
                     plan,
