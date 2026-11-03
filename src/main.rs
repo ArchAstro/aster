@@ -71,8 +71,9 @@ fn main() -> ExitCode {
         };
     }
     // Rust ignores SIGPIPE so a closed stdout becomes a panic. Restore the
-    // default so `aster build | head` ends quietly, like other CLIs. Spawned
-    // children reset SIGPIPE themselves; this changes only this process.
+    // default so `aster build | head` ends quietly, like other CLIs. The TLS
+    // server restores SIG_IGN at dispatch: a disconnected peer must not kill it.
+    // Spawned commands retain their own default SIGPIPE disposition.
     #[cfg(unix)]
     // SAFETY: `signal` takes a signal number and a disposition, not a pointer
     // we dereference. SIG_DFL is the process-wide Unix default.
@@ -394,6 +395,15 @@ fn run() -> Result<()> {
                 aster::dev::setup_tls(&workspace_root, &workspace_config.dev, edge)
             }
             TlsCommands::Serve { edge } => {
+                // Unlike CLI output, a broken TLS connection is local to one
+                // client. Restore Rust's ignored SIGPIPE before Tokio starts,
+                // so socket writes return errors instead of killing the edge.
+                #[cfg(unix)]
+                // SAFETY: SIG_IGN is a valid process-wide signal disposition;
+                // no TLS worker threads have been started yet.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                }
                 aster::dev::serve_tls(&workspace_root, &workspace_config.dev, edge)
             }
         };

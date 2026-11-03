@@ -369,6 +369,125 @@ printf 'private-key' > "$key"
 }
 
 #[test]
+fn tls_edge_keeps_serving_after_client_disconnects_and_sigpipe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cert_dir = tmp.path().join(".aster/tls/edge");
+    fs::create_dir_all(&cert_dir).unwrap();
+    let certified = generate_simple_self_signed(vec!["app.example.test".into()]).unwrap();
+    fs::write(cert_dir.join("cert.pem"), certified.cert.pem()).unwrap();
+    fs::write(
+        cert_dir.join("key.pem"),
+        certified.signing_key.serialize_pem(),
+    )
+    .unwrap();
+
+    // Run the production TLS command with a real HTTP upstream and TLS clients.
+    // Python's standard library supplies the peer that resets its TCP socket;
+    // the temporary certificate needs no system CA setup.
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import http.server, os, pathlib, signal, socket, ssl, struct, subprocess, sys, tempfile, threading, time
+
+class Upstream(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'edge still serves requests' if self.path == '/health' else b'x' * (8 * 1024 * 1024)
+        try:
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The proxy can cancel the upstream request after its client resets.
+    def log_message(self, *args):
+        pass
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+reservation = socket.socket()
+reservation.bind(('127.0.0.1', 0))
+port = reservation.getsockname()[1]
+pathlib.Path('aster.toml').write_text(f'''
+[dev.ports]
+https = {port}
+upstream = {server.server_port}
+[dev.services.edge]
+port = "https"
+tls_proxy = {{ certificate_hosts = ["app.example.test"], open_host = "app.example.test", routes = [{{ host = "app.example.test", upstream_port = "upstream" }}] }}
+''')
+context = ssl.create_default_context(cafile='.aster/tls/edge/cert.pem')
+
+def connect():
+    return context.wrap_socket(socket.create_connection(('127.0.0.1', port), timeout=5),
+                               server_hostname='app.example.test')
+
+def assert_healthy():
+    with connect() as client:
+        client.sendall(b'GET /health HTTP/1.1\r\nHost: app.example.test\r\nConnection: close\r\n\r\n')
+        response = b''
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+    assert b'200 OK' in response and response.endswith(b'edge still serves requests'), response
+
+with tempfile.TemporaryFile(mode='w+') as log:
+    reservation.close()
+    edge = subprocess.Popen([sys.argv[1], 'services', 'tls', 'serve', 'edge'], stdout=log, stderr=log)
+    try:
+        # Readiness precedes the fault, so a startup failure cannot stand in for it.
+        deadline = time.monotonic() + 8
+        while True:
+            assert edge.poll() is None, f'TLS edge exited before readiness: {edge.returncode}'
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                    break
+            except ConnectionRefusedError:
+                assert time.monotonic() < deadline, 'TLS edge did not listen'
+                time.sleep(.05)
+        assert_healthy()
+
+        # Reset real connections immediately after requesting a response larger
+        # than the socket buffer. Fresh requests must reach the same edge process.
+        for attempt in range(16):
+            with connect() as client:
+                client.sendall(b'GET /large HTTP/1.1\r\nHost: app.example.test\r\nConnection: close\r\n\r\n')
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            assert_healthy()
+            assert edge.poll() is None, f'TLS edge exited after disconnect {attempt}: {edge.returncode}'
+
+        # Socket cancellation can avoid a SIGPIPE-producing write, depending on
+        # OS and debug/release timing. Inject that same OS fault explicitly too,
+        # so both platforms prove the server survives it and still proxies TLS.
+        os.kill(edge.pid, signal.SIGPIPE)
+        assert_healthy()
+        assert edge.poll() is None, f'TLS edge exited after SIGPIPE: {edge.returncode}'
+    except BaseException:
+        log.seek(0)
+        print(f'TLS edge exit status: {edge.poll()}\n{log.read()}', file=sys.stderr)
+        raise
+    finally:
+        if edge.poll() is None:
+            edge.terminate()
+        edge.wait(timeout=5)
+        server.shutdown()
+        server.server_close()
+"#,
+            env!("CARGO_BIN_EXE_aster"),
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "TLS disconnect proof failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn suffix_route_issues_and_caches_exact_sni_certificate_through_real_tls() {
     // Setup: two real loopback HTTP services, a static frontend certificate,
     // and a fake mkcert issuer for a nested site hostname.
