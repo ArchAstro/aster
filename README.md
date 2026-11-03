@@ -1460,6 +1460,15 @@ reattaches, and `r` restarts the focused service through the supervisor. Use
 `services down [group]` to stop them, or `services daemon stop` for all bundles.
 The explicit `--daemon` flag remains a headless one-shot launch.
 
+Services belong to the workspace directory that started them. Removing, renaming,
+or replacing that directory shuts down its services through the supervisor's
+normal child cleanup, including headless and `--no-watch` runs. Reusing the same
+path starts a new bundle; other workspaces keep running. This does not manage
+servers launched outside Aster, or wait for shutdown before files are removed.
+After upgrading, restart existing bundles to pick up this behavior. The shared
+daemon also adopts the new launch behavior when it next starts; it exits normally
+once all its bundles have stopped.
+
 Service stdout, stderr, and Aster lifecycle messages are also persisted to
 `.aster/logs/<worktree>/<service>/logs.txt` in the workspace. Each service log
 is capped at 10 MiB; Aster truncates it and continues writing when it reaches

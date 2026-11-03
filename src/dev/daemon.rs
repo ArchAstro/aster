@@ -87,6 +87,8 @@ pub struct LaunchResult {
 #[derive(Clone, Debug)]
 pub struct LaunchOptions {
     pub workspace: PathBuf,
+    /// Keep the selected directory alive across daemon startup and admission.
+    pub workspace_identity: std::sync::Arc<same_file::Handle>,
     pub group: Option<String>,
     pub watch: bool,
     pub use_cache: bool,
@@ -99,6 +101,13 @@ pub struct LaunchOptions {
 
 impl LaunchOptions {
     pub fn new(workspace: impl Into<PathBuf>) -> DaemonResult<Self> {
+        let workspace = workspace.into();
+        let workspace_identity = same_file::Handle::from_path(&workspace).map_err(|error| {
+            daemon_error(
+                DaemonErrorCode::InvalidPath,
+                format!("failed to open service workspace: {error}"),
+            )
+        })?;
         let executable = std::env::current_exe().map_err(|error| {
             daemon_error(
                 DaemonErrorCode::InvalidPath,
@@ -106,7 +115,8 @@ impl LaunchOptions {
             )
         })?;
         Ok(Self {
-            workspace: workspace.into(),
+            workspace,
+            workspace_identity: std::sync::Arc::new(workspace_identity),
             group: None,
             watch: true,
             use_cache: true,
@@ -130,6 +140,8 @@ enum Operation {
     Ping,
     Launch {
         workspace: PathBuf,
+        #[serde(default)]
+        workspace_identity: Option<(u64, u64)>,
         group: Option<String>,
         watch: bool,
         use_cache: bool,
@@ -258,6 +270,7 @@ mod platform {
 
     struct ManagedBundle {
         descriptor: BundleDescriptor,
+        workspace_identity: same_file::Handle,
         child: Child,
         startup_log: PathBuf,
         ready_deadline: Instant,
@@ -337,6 +350,10 @@ mod platform {
         ensure_daemon(&paths, &options.executable)?;
         let operation = Operation::Launch {
             workspace: options.workspace,
+            workspace_identity: Some((
+                options.workspace_identity.dev(),
+                options.workspace_identity.ino(),
+            )),
             group: options.group,
             watch: options.watch,
             use_cache: options.use_cache,
@@ -510,6 +527,11 @@ mod platform {
                     ))
                 }
             }
+            // The daemon detaches from the caller's cwd. Preserve relative
+            // overrides by resolving them before spawning it.
+            let directory = directory
+                .canonicalize()
+                .map_err(internal("failed to resolve daemon runtime directory"))?;
             let runtime_id = bundle_id(&directory, "runtime");
             let attach_directory = PathBuf::from("/tmp")
                 .join(format!("aster-s-{}-{runtime_id}", unsafe {
@@ -704,6 +726,9 @@ mod platform {
             .map_err(internal("failed to clone daemon log"))?;
         let mut command = Command::new(executable);
         command
+            .current_dir("/")
+            .env("ASTER_DAEMON_RUNTIME_DIR", &paths.directory)
+            .env_remove("ARCHASTRO_AGENT_PROCESS")
             .env(SERVE_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -843,8 +868,8 @@ mod platform {
                     }
                 }
             }
-            drain_readiness(&ready, &mut bundles)?;
             reap_and_timeout(&mut bundles)?;
+            drain_readiness(&ready, &mut bundles)?;
             if stopping_all && bundles.is_empty() {
                 return Ok(());
             }
@@ -913,6 +938,7 @@ mod platform {
             ),
             Operation::Launch {
                 workspace,
+                workspace_identity: expected_workspace,
                 group,
                 watch,
                 use_cache,
@@ -933,6 +959,27 @@ mod platform {
                     workspace: workspace.clone(),
                     group: group.clone(),
                 };
+                let workspace_identity = same_file::Handle::from_path(&workspace)
+                    .map_err(internal("failed to open service workspace"))?;
+                if expected_workspace.is_some_and(|expected| {
+                    expected != (workspace_identity.dev(), workspace_identity.ino())
+                }) {
+                    return write_error(
+                        &mut stream,
+                        daemon_error(
+                            DaemonErrorCode::InvalidPath,
+                            "service workspace was replaced before launch",
+                        ),
+                    );
+                }
+                if bundles
+                    .get(&key)
+                    .is_some_and(|bundle| bundle.workspace_identity != workspace_identity)
+                {
+                    // A launch can arrive before the old supervisor observes
+                    // retirement. Never attach a replacement checkout to it.
+                    stop_keys(bundles, vec![key.clone()]);
+                }
                 if let Some(bundle) = bundles.get_mut(&key) {
                     if bundle.proxy != proxy {
                         let running_mode = if bundle.proxy { "with" } else { "without" };
@@ -993,6 +1040,7 @@ mod platform {
                     key,
                     ManagedBundle {
                         descriptor,
+                        workspace_identity,
                         child,
                         startup_log,
                         ready_deadline: Instant::now() + START_TIMEOUT,
@@ -1177,11 +1225,16 @@ mod platform {
     fn reap_and_timeout(bundles: &mut HashMap<BundleKey, ManagedBundle>) -> DaemonResult<()> {
         let mut remove = Vec::new();
         for (key, bundle) in bundles.iter_mut() {
+            // Also fence startup: the child may still be discovering projects
+            // when this directory is retired. The broker owns that child.
+            let workspace_current = same_file::Handle::from_path(&key.workspace)
+                .is_ok_and(|current| current == bundle.workspace_identity);
             let exited = bundle
                 .child
                 .try_wait()
                 .map_err(internal("failed to reap service supervisor"))?;
-            if exited.is_some()
+            if !workspace_current
+                || exited.is_some()
                 || (bundle.descriptor.state == BundleState::Starting
                     && Instant::now() >= bundle.ready_deadline)
             {
@@ -1190,7 +1243,14 @@ mod platform {
                 }
                 let diagnostics = tail_file(&bundle.startup_log, 16 * 1024);
                 let message = exited.map_or_else(
-                    || "service supervisor readiness timed out".to_string(),
+                    || {
+                        if workspace_current {
+                            "service supervisor readiness timed out".to_string()
+                        } else {
+                            "service workspace was removed, replaced or became inaccessible"
+                                .to_string()
+                        }
+                    },
                     |status| format!("service supervisor exited before readiness: {status}"),
                 );
                 let error = DaemonError {

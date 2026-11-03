@@ -1998,6 +1998,7 @@ type LaunchReceiver = std::sync::mpsc::Receiver<aster::dev::DaemonResult<aster::
 fn spawn_launch(workspace: &Path) -> LaunchReceiver {
     let options = aster::dev::LaunchOptions {
         workspace: workspace.to_path_buf(),
+        workspace_identity: std::sync::Arc::new(same_file::Handle::from_path(workspace).unwrap()),
         group: None,
         watch: false,
         use_cache: true,
@@ -2444,6 +2445,282 @@ fn daemon_cli_isolates_worktrees_and_supports_global_stop() {
             && TcpStream::connect(("127.0.0.1", first_port)).is_err()
             && TcpStream::connect(("127.0.0.1", second_port)).is_err()
     });
+}
+
+#[test]
+fn daemon_rejects_retired_workspace_while_launch_waits_for_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    write_daemon_workspace(&root, port, None);
+    let guard = DaemonCliGuard {
+        runtime_dir: temp.path().join("runtime"),
+        lease_dir: temp.path().join("leases"),
+        cwd: temp.path().to_path_buf(),
+    };
+    let _environment = DaemonEnvGuard::set(&guard.runtime_dir, &guard.lease_dir);
+    fs::create_dir(&guard.runtime_dir).unwrap();
+    fs::set_permissions(&guard.runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(guard.runtime_dir.join("startup.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+
+    // The client selects A before starting its thread. The real startup lock
+    // prevents admission until after a different directory B occupies the path.
+    let launch = spawn_launch(&root);
+    fs::rename(&root, temp.path().join("retired")).unwrap();
+    write_daemon_workspace(&root, port, None);
+    fs2::FileExt::unlock(&lock).unwrap();
+    let result = await_launch(launch, &guard.runtime_dir, "retired workspace launch");
+    assert_eq!(
+        result.unwrap_err().code,
+        aster::dev::DaemonErrorCode::InvalidPath
+    );
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+#[test]
+fn workspace_replacement_during_discovery_cannot_inherit_services() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    write_daemon_workspace(&root, port, None);
+    let config_path = root.join("aster.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("daemon = true", "daemon = false");
+    fs::remove_file(&config_path).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&config_path)
+        .status()
+        .unwrap()
+        .success());
+    let mut supervisor = OwnedBundle::launch(&root, &temp.path().join("leases"));
+
+    // A real configuration read pauses startup before discovery. Opening the
+    // writer proves the CLI has opened the old directory's configuration FIFO.
+    let mut writer = None;
+    wait_until(Duration::from_secs(5), || {
+        writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&config_path)
+            .ok();
+        writer.is_some()
+    });
+    fs::rename(&root, temp.path().join("retired")).unwrap();
+    write_daemon_workspace(&root, port, None);
+    fs::write(root.join("aster.toml"), &config).unwrap();
+    let mut writer = writer.unwrap();
+    writer.write_all(config.as_bytes()).unwrap();
+    drop(writer);
+
+    // Discovery may finish using the replacement's files, but ownership stays
+    // with the original directory and the supervisor must exit without launch.
+    assert!(
+        condition_met(Duration::from_secs(5), || supervisor
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "startup survived workspace replacement; service listening: {}",
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    );
+    assert!(supervisor.child.wait().unwrap().success());
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+#[test]
+fn services_stop_when_workspace_directory_disappears() {
+    // Both entry points own their children even when source watching is off.
+    for (daemon, watch) in [(false, false), (false, true), (true, false), (true, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("removed");
+        let sibling = temp.path().join("retained");
+        let ports = [
+            TcpListener::bind(("127.0.0.1", 0)).unwrap(),
+            TcpListener::bind(("127.0.0.1", 0)).unwrap(),
+        ];
+        let removed_port = ports[0].local_addr().unwrap().port();
+        let retained_port = ports[1].local_addr().unwrap().port();
+        drop(ports);
+        write_daemon_workspace(&root, removed_port, None);
+        write_daemon_workspace(&sibling, retained_port, None);
+        let mut guard = DaemonCliGuard {
+            runtime_dir: temp.path().join("runtime"),
+            lease_dir: temp.path().join("leases"),
+            cwd: root.clone(),
+        };
+
+        let mut foreground = None;
+        if !daemon {
+            let config = root.join("aster.toml");
+            fs::write(
+                &config,
+                fs::read_to_string(&config)
+                    .unwrap()
+                    .replace("daemon = true", "daemon = false"),
+            )
+            .unwrap();
+            let mut command = guard.command();
+            command.args(["services", "up", "--no-ui"]);
+            if !watch {
+                command.arg("--no-watch");
+            }
+            foreground = Some(OwnedBundle {
+                child: command
+                    .process_group(0)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+                lease_dir: guard.lease_dir.clone(),
+                released: false,
+            });
+        } else {
+            let mut command = guard.command();
+            command.args(["services", "up", "--daemon"]);
+            if !watch {
+                command.arg("--no-watch");
+            }
+            let up = command.output().unwrap();
+            assert!(up.status.success(), "{up:?}");
+        }
+        guard.cwd = sibling.clone();
+        let up = guard
+            .command()
+            .args(["services", "up", "--daemon", "--no-watch"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{up:?}");
+        wait_until(Duration::from_secs(10), || {
+            http_get(removed_port).is_ok() && http_get(retained_port).is_ok()
+        });
+        let daemon_pid = fs::read_to_string(guard.runtime_dir.join("daemon.pid")).unwrap();
+
+        // Rename is ArchDev's retirement boundary; direct deletion must work too.
+        if watch {
+            fs::rename(&root, temp.path().join(".cleanup-trash")).unwrap();
+        } else {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        assert!(
+            condition_met(Duration::from_secs(10), || TcpStream::connect((
+                "127.0.0.1",
+                removed_port
+            ))
+            .is_err()),
+            "service survived workspace removal: daemon={daemon}, watch={watch}"
+        );
+        if let Some(bundle) = foreground.as_mut() {
+            wait_until(Duration::from_secs(5), || {
+                bundle.try_wait().unwrap().is_some()
+            });
+            assert!(bundle.child.wait().unwrap().success());
+        }
+        assert!(http_get(retained_port).unwrap().contains("200 OK"));
+        assert_eq!(
+            fs::read_to_string(guard.runtime_dir.join("daemon.pid")).unwrap(),
+            daemon_pid
+        );
+    }
+}
+
+#[test]
+fn daemon_replaces_stale_bundle_when_workspace_path_is_reused() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("reused");
+    let sibling = temp.path().join("retained");
+    let ports: Vec<_> = (0..3)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect();
+    let old_port = ports[0].local_addr().unwrap().port();
+    let new_port = ports[1].local_addr().unwrap().port();
+    let sibling_port = ports[2].local_addr().unwrap().port();
+    drop(ports);
+    write_daemon_workspace(&root, old_port, None);
+    write_daemon_workspace(&sibling, sibling_port, None);
+    let mut guard = DaemonCliGuard {
+        // Pinning this relative runtime before detaching must survive the cwd change.
+        runtime_dir: "../runtime".into(),
+        lease_dir: temp.path().join("leases"),
+        cwd: root.clone(),
+    };
+    let up = guard
+        .command()
+        .env("ARCHASTRO_AGENT_PROCESS", "workspace-lifetime-proof")
+        .args(["--json", "services", "up", "--daemon", "--no-watch"])
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{up:?}");
+    let old: serde_json::Value = serde_json::from_slice(&up.stdout).unwrap();
+    let supervisor_environment = Command::new("ps")
+        .args(["eww", "-p", &old["bundle"]["supervisor_pid"].to_string()])
+        .output()
+        .unwrap();
+    assert!(supervisor_environment.status.success());
+    assert!(String::from_utf8_lossy(&supervisor_environment.stdout)
+        .contains("ARCHASTRO_AGENT_PROCESS=workspace-lifetime-proof"));
+    guard.runtime_dir = temp.path().join("runtime");
+    guard.cwd = sibling.clone();
+    let up = guard
+        .command()
+        .args(["services", "up", "--daemon", "--no-watch"])
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{up:?}");
+    wait_until(Duration::from_secs(10), || {
+        http_get(old_port).is_ok() && http_get(sibling_port).is_ok()
+    });
+    let daemon_pid = fs::read_to_string(guard.runtime_dir.join("daemon.pid")).unwrap();
+
+    // Keep the old directory alive and immediately launch from a different one at
+    // the same path. Path equality must not attach us to the retired service.
+    fs::rename(&root, temp.path().join("retired")).unwrap();
+    write_daemon_workspace(&root, new_port, None);
+    guard.cwd = root.clone();
+    let up = guard
+        .command()
+        .args(["--json", "services", "up", "--daemon", "--no-watch"])
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{up:?}");
+    let replacement: serde_json::Value = serde_json::from_slice(&up.stdout).unwrap();
+    assert_eq!(replacement["status"], "started");
+    assert_ne!(
+        replacement["bundle"]["supervisor_pid"],
+        old["bundle"]["supervisor_pid"]
+    );
+    wait_until(Duration::from_secs(10), || {
+        http_get(new_port).is_ok() && TcpStream::connect(("127.0.0.1", old_port)).is_err()
+    });
+    assert!(http_get(sibling_port).unwrap().contains("200 OK"));
+    assert_eq!(
+        fs::read_to_string(guard.runtime_dir.join("daemon.pid")).unwrap(),
+        daemon_pid
+    );
+
+    // Only workspace supervisors inherit the caller's ownership marker.
+    let environment = Command::new("ps")
+        .args(["eww", "-p", daemon_pid.trim()])
+        .output()
+        .unwrap();
+    assert!(environment.status.success());
+    assert!(!String::from_utf8_lossy(&environment.stdout)
+        .contains("ARCHASTRO_AGENT_PROCESS=workspace-lifetime-proof"));
 }
 
 #[test]

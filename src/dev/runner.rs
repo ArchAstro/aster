@@ -55,6 +55,7 @@ struct ActiveStart {
 
 pub fn run_dev(
     workspace_root: &Path,
+    workspace_identity: same_file::Handle,
     projects: Vec<DiscoveredProject>,
     graph: TargetGraph,
     plan: DevPlan,
@@ -146,6 +147,14 @@ pub fn run_dev(
                 .as_ref()
                 .is_some_and(|control| control.shutdown.load(Ordering::SeqCst))
         {
+            // Workspace lifetime applies to headless and --no-watch runs too.
+            // Exit through the normal shutdown path, which owns every child.
+            match same_file::Handle::from_path(workspace_root) {
+                Ok(current) if current == workspace_identity => {}
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error).context("failed to inspect service workspace"),
+            }
             needs_draw |= drain_logs(
                 &log_rx,
                 &system_rx,
