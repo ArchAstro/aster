@@ -9,9 +9,10 @@ module witnesses {
 
   pure def editing(ds: Set[int]): Changes = { edits: ds, comments: Set(), trailing: Set() }
   pure val everything: Selection = { full: true, tests: shop.testUnits }
-  pure val pr349: Rules = { callbackClauses: false, schemaTop: false, routeNothing: true }
-  pure val pr347: Rules = { callbackClauses: true, schemaTop: false, routeNothing: false }
-  pure val pr348: Rules = { callbackClauses: false, schemaTop: true, routeNothing: false }
+  pure val pr349: Rules = { callbackClauses: true, schemaTop: false, routeNothing: true }
+  // Main before #347 merged.
+  pure val before347: Rules = { callbackClauses: false, schemaTop: false, routeNothing: false }
+  pure val pr348: Rules = { callbackClauses: true, schemaTop: true, routeNothing: false }
 
   // D1. Monotonic fails: adding an edit that reaches a test turns a full run into a narrow one.
   run monotoneWitness = init.then({
@@ -67,12 +68,12 @@ module witnesses {
     state' = state,
   })
 
-  // D7. Message clauses (#347): a clause with a literal tag is reached by senders of that tag
+  // D7. Message clauses (#347, merged): a clause with a literal tag is reached by senders of that tag
   // (and senders of computed messages), not by every user of the module.
   run messageClauseWitness = init.then(all {
-    assert(selectTests(workers, mainRules, editing(Set(31))).tests == Set(102, 111, 112)),
-    assert(selectTests(workers, pr347, editing(Set(31))).tests == Set(102, 112)),
-    assert(selectTests(workers, pr347, editing(Set(33))).tests == Set(112)),
+    assert(selectTests(workers, before347, editing(Set(31))).tests == Set(102, 111, 112)),
+    assert(selectTests(workers, mainRules, editing(Set(31))).tests == Set(102, 112)),
+    assert(selectTests(workers, mainRules, editing(Set(33))).tests == Set(112)),
     state' = state,
   })
 
@@ -86,7 +87,7 @@ module witnesses {
     }
   })
 
-  // D9. Each of the three rules removes a fan-out, and a change whose fan-out is
+  // D9. Each of the three rules (#347 is on main now, #348 and #349 are open) removes a fan-out, and a change whose fan-out is
   // now empty "reaches no test", so the fallback turns a narrow selection into a full
   // run. Customer is reached only by a struct user; nothing sends tag 6.
   run narrowedToNothingRunsEverythingWitness = init.then(all {
@@ -94,8 +95,8 @@ module witnesses {
     all {
       assert(selectTests(shopQuiet, mainRules, editing(Set(62))).full == false),
       assert(selectTests(shopQuiet, pr348, editing(Set(62))) == everything),
-      assert(selectTests(quietWorkers, mainRules, editing(Set(33))).full == false),
-      assert(selectTests(quietWorkers, pr347, editing(Set(33))).full),
+      assert(selectTests(quietWorkers, before347, editing(Set(33))).full == false),
+      assert(selectTests(quietWorkers, mainRules, editing(Set(33))).full),
       assert(selectTests(shopQuiet, mainRules, editing(Set(81))).full == false),
       assert(selectTests(shopQuiet, pr349, editing(Set(81))).full),
       state' = state,
