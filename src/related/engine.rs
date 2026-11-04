@@ -87,6 +87,10 @@ pub struct Outcome {
     /// Dependencies this project consumes without importing them, for which
     /// only the definitions that use them run, and how each was found.
     pub narrowed: Vec<String>,
+    /// Targets whose definition in the project's `aster.toml` changed, with
+    /// why. They run as written; the project's other targets keep their
+    /// narrowing.
+    pub changed_targets: BTreeMap<String, String>,
     /// The reason in `full` says nothing about what dependents observe.
     blind: bool,
 }
@@ -478,6 +482,48 @@ pub(super) fn owner(projects: &[DiscoveredProject], path: &Path) -> Option<usize
         .filter(|(_, p)| path.starts_with(&p.relative_path))
         .max_by_key(|(_, p)| p.relative_path.as_os_str().len())
         .map(|(i, _)| i)
+}
+
+/// What a change to an `aster.toml` means, read as TOML.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigChange {
+    /// Both sides parse to the same value: comments, whitespace, key order.
+    Unchanged,
+    /// Only these `targets.<name>` tables differ (added or changed).
+    Targets(BTreeSet<String>),
+    /// Anything else, or either side unreadable.
+    Other,
+}
+
+fn config_change(old: Option<&str>, new: Option<&str>) -> ConfigChange {
+    let (Some(old), Some(new)) = (old, new) else {
+        return ConfigChange::Other;
+    };
+    let (Ok(mut old), Ok(mut new)) = (old.parse::<toml::Table>(), new.parse::<toml::Table>())
+    else {
+        return ConfigChange::Other;
+    };
+    if old == new {
+        return ConfigChange::Unchanged;
+    }
+    let tables = |config: &mut toml::Table| match config.remove("targets") {
+        None => Some(toml::Table::new()),
+        Some(toml::Value::Table(table)) => Some(table),
+        Some(_) => None,
+    };
+    let (Some(old_targets), Some(new_targets)) = (tables(&mut old), tables(&mut new)) else {
+        return ConfigChange::Other;
+    };
+    // Every key outside `targets` must be identical.
+    if old != new {
+        return ConfigChange::Other;
+    }
+    let changed = new_targets
+        .iter()
+        .filter(|(name, def)| old_targets.get(*name) != Some(def))
+        .map(|(name, _)| name.clone())
+        .collect();
+    ConfigChange::Targets(changed)
 }
 
 /// Files whose change says nothing about which code is affected: manifests,
@@ -1602,16 +1648,38 @@ impl<'a> Index<'a> {
                 }
             }
             if let Some(p) = project {
+                let relative = change
+                    .path
+                    .strip_prefix(&self.projects[p].relative_path)
+                    .unwrap_or(&change.path);
+                if relative == Path::new("aster.toml") {
+                    let root = self.projects[p].relative_path.as_os_str().is_empty();
+                    match config_change(change.old_source.as_deref(), change.new_source.as_deref())
+                    {
+                        // Nothing a test can observe, like prose.
+                        ConfigChange::Unchanged => continue,
+                        // Only changed targets differ: they run as written
+                        // while the rest of the project keeps its selection.
+                        // The workspace root config stays all-or-nothing.
+                        ConfigChange::Targets(names) if !root => {
+                            outcomes[p].changed = true;
+                            outcomes[p].product = true;
+                            for name in names {
+                                let reason =
+                                    format!("{} changed target {name}", change.path.display());
+                                outcomes[p].changed_targets.insert(name, reason);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 outcomes[p].changed = true;
                 // Sources count through the definitions they affect; any
                 // other file may be part of what the project provides.
                 if !self.by_path.contains_key(&change.path) && !is_prose(&change.path) {
                     outcomes[p].product = true;
                 }
-                let relative = change
-                    .path
-                    .strip_prefix(&self.projects[p].relative_path)
-                    .unwrap_or(&change.path);
                 if is_trigger(&self.projects[p], relative) {
                     let reason = format!("{} changed", change.path.display());
                     set_full(&mut outcomes, p, true, reason);
@@ -3167,5 +3235,54 @@ impl<'a, 'b> Run<'a, 'b> {
             }
         }
         found
+    }
+}
+
+#[cfg(test)]
+mod config_change_tests {
+    use super::{config_change, ConfigChange};
+
+    const BASE: &str = "depends_on = [\"//a\"]\n[targets.test]\ncommand = \"mix test\"\n[targets.build]\ncommand = \"mix compile\"\n";
+
+    fn change(new: &str) -> ConfigChange {
+        config_change(Some(BASE), Some(new))
+    }
+
+    #[test]
+    fn comments_whitespace_and_order_are_unchanged() {
+        let reordered = "# note\ndepends_on = [\"//a\"]\n\n[targets.build]\ncommand = \"mix compile\"\n\n[targets.test]\ncommand = \"mix test\"\n";
+        assert_eq!(change(reordered), ConfigChange::Unchanged);
+    }
+
+    #[test]
+    fn a_target_table_difference_names_the_target() {
+        let edited = BASE.replace("mix test", "mix test --cover");
+        assert_eq!(
+            change(&edited),
+            ConfigChange::Targets(["test".to_string()].into())
+        );
+        let added = format!("{BASE}[targets.lint]\ncommand = \"true\"\n");
+        assert_eq!(
+            change(&added),
+            ConfigChange::Targets(["lint".to_string()].into())
+        );
+        // A removed target needs nothing.
+        let removed = "depends_on = [\"//a\"]\n[targets.test]\ncommand = \"mix test\"\n";
+        assert_eq!(change(removed), ConfigChange::Targets(Default::default()));
+    }
+
+    #[test]
+    fn anything_else_is_other() {
+        assert_eq!(change(&BASE.replace("//a", "//b")), ConfigChange::Other);
+        assert_eq!(change(&format!("[consumes]\n{BASE}")), ConfigChange::Other);
+        assert_eq!(change(&format!("unknown = 1\n{BASE}")), ConfigChange::Other);
+        assert_eq!(change("[targets.test"), ConfigChange::Other);
+        assert_eq!(
+            config_change(Some("[oops"), Some(BASE)),
+            ConfigChange::Other
+        );
+        assert_eq!(config_change(None, Some(BASE)), ConfigChange::Other);
+        assert_eq!(config_change(Some(BASE), None), ConfigChange::Other);
+        assert_eq!(change("targets = 1\n"), ConfigChange::Other);
     }
 }

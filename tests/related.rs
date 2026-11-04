@@ -2139,7 +2139,7 @@ fn shard_projects_run_in_full_when_the_sharded_project_does() {
 }
 
 #[test]
-fn shard_projects_run_in_full_when_their_own_files_change() {
+fn shard_projects_run_as_written_when_their_own_target_changes() {
     let ws = Workspace::new(&sharded());
     ws.edit(
         "shop/lib/shop/pricing.ex",
@@ -2155,7 +2155,7 @@ fn shard_projects_run_in_full_when_their_own_files_change() {
     assert!(plan.commands("//shop-shard-1:test-ci").is_empty());
     assert!(plan
         .notes("//shop-shard-1:test-ci")
-        .contains("shop-shard-1/aster.toml changed; running in full"));
+        .contains("shop-shard-1/aster.toml changed target test-ci; running as written"));
     // The other shard still narrows: to nothing, as the one selected file
     // is not in its partition.
     assert!(
@@ -3349,4 +3349,102 @@ fn js_renamed_and_namespace_reexports_reach_their_importers() {
         npm_test_files(&plan, "//:test"),
         ["test/ns.test.js".to_string()]
     );
+}
+
+/// The Elixir fixture with a project `aster.toml` declaring a wrapper and a
+/// second target next to the `test` target the Mix plugin provides.
+fn shop_with_targets() -> Vec<(&'static str, &'static str)> {
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "shop/aster.toml",
+        "[targets.test-ci]\ncommand = \"true\"\ndepends_on = [\"//self:test\"]\n\n[targets.check]\ncommand = \"mix credo\"\n",
+    ));
+    files
+}
+
+// Canonical end-to-end proof for aster.toml semantic comparison: a real
+// scratch git repo, the real `aster` binary, `affected --related --dry-run`.
+#[test]
+fn a_comment_only_edit_of_a_project_config_selects_nothing() {
+    let ws = Workspace::new(&shop_with_targets());
+    // Comments, blank lines and key order are not configuration.
+    ws.write(
+        "shop/aster.toml",
+        "# reordered and annotated\n\n[targets.check]\ncommand = \"mix credo\"\n\n[targets.test-ci]\ndepends_on = [\"//self:test\"]\ncommand = \"true\"\n",
+    );
+    let plan = ws.plan("test-ci");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
+}
+
+#[test]
+fn a_changed_target_runs_as_written_while_its_sibling_stays_narrowed() {
+    let ws = Workspace::new(&shop_with_targets());
+    // Test code changed, so `test` is narrowed to the tests that reach it...
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    // ...and `test-ci` itself was redefined, so it must run as written.
+    ws.edit(
+        "shop/aster.toml",
+        "command = \"true\"",
+        "command = \"echo hi\"",
+    );
+    let plan = ws.plan("test-ci");
+    assert!(plan.commands("//shop:test-ci").is_empty(), "{plan:#?}");
+    assert!(
+        plan.notes("//shop:test-ci")
+            .contains("shop/aster.toml changed target test-ci; running as written"),
+        "{plan:#?}"
+    );
+    assert!(
+        !plan
+            .notes("//shop:test-ci")
+            .contains("changed target test;"),
+        "{plan:#?}"
+    );
+    let output = ws.aster(&[
+        "affected",
+        "test-ci",
+        "--base=HEAD",
+        "--related",
+        "--dry-run",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("command: mix test test/shop/tax_test.exs"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_changed_target_alone_leaves_the_test_target_without_work() {
+    let ws = Workspace::new(&shop_with_targets());
+    ws.edit("shop/aster.toml", "mix credo", "mix credo --strict");
+    let plan = ws.plan("check");
+    assert!(
+        plan.notes("//shop:check")
+            .contains("shop/aster.toml changed target check; running as written"),
+        "{plan:#?}"
+    );
+    // The sibling test target has no test to run.
+    let plan = ws.plan("test");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
+}
+
+#[test]
+fn a_changed_project_dependency_runs_the_project_in_full() {
+    let mut files = shop_with_targets();
+    files.push(("lib2/package.json", r#"{"name":"lib2","private":true}"#));
+    files.push(("lib2/aster.toml", "[targets.build]\ncommand = \"true\"\n"));
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/aster.toml",
+        "[targets.test-ci]",
+        "depends_on = [\"//lib2\"]\n\n[targets.test-ci]",
+    );
+    let plan = ws.plan("test");
+    assert!(
+        plan.notes("//shop:test")
+            .contains("shop/aster.toml changed"),
+        "{plan:#?}"
+    );
+    assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
 }
