@@ -326,6 +326,16 @@ impl Walker<'_> {
                 let attribute = child
                     .child_by_field_name("operand")
                     .and_then(|operand| call_name(operand, self.source));
+                if attribute == Some("behaviour") {
+                    let named = child
+                        .child_by_field_name("operand")
+                        .and_then(|operand| arguments(operand).first().copied())
+                        .filter(|a| a.kind() == "alias");
+                    if let Some(named) = named {
+                        let full = self.expand(text(named, self.source));
+                        self.facts.behaviours.push(full);
+                    }
+                }
                 if attribute == Some("impl") {
                     pending_impl = true;
                     self.inert.push((child.start_byte(), child.end_byte()));

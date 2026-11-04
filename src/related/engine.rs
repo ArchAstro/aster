@@ -3115,14 +3115,15 @@ impl<'a, 'b> Run<'a, 'b> {
             // Nothing names it, so something reaches it another way: a
             // framework callback, a macro expansion, reflection.
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
-            // An Elixir function nothing names is called through a module a
-            // caller holds (`mod.name(args)`), not by every user of its file.
+            // An Elixir function nothing names is called by no analysed code:
+            // it reaches nothing. (A caller that names the module would have
+            // named the function.)
             let held = unnamed
                 && !def.callback
                 && def.kind == DefKind::Function
                 && source.facts.family == Family::Elixir;
             if held {
-                self.dispatchers(id, &def.name);
+                // no edge
             } else if def.callback || def.kind == DefKind::Macro || unnamed {
                 match def.accepts.as_deref().filter(|_| def.callback) {
                     // A message clause is reached by what can send its message.
@@ -3131,7 +3132,7 @@ impl<'a, 'b> Run<'a, 'b> {
                 }
             }
             if def.dispatched_to && ix.declared.contains(&def.name) {
-                self.dispatchers(id, &def.name);
+                self.dispatchers(id, &def.name, &source.facts.behaviours);
             }
             // Users of a type or trait reach its implementation without
             // naming it. With static types that takes a call nothing
@@ -3171,11 +3172,14 @@ impl<'a, 'b> Run<'a, 'b> {
     }
 
     /// Mark the Elixir definitions that call `name` on a value holding a
-    /// module, in the project of callback `from`. A behaviour of the
-    /// application is called as `mod.name(args)` with `mod` read from
-    /// configuration or an argument, so no code names the module that
-    /// implements it. The function's name is all that does.
-    fn dispatchers(&mut self, from: DefId, name: &str) {
+    /// module and name one of the `behaviours` that `from` implements, in
+    /// the project of callback `from`. A behaviour of the application is
+    /// called as `mod.name(args)` with `mod` read from configuration or an
+    /// argument, so no code names the module that implements it. Its
+    /// callers name the behaviour (an alias, a call, a struct) or hold the
+    /// module in a place that does. A call that only shares the name does
+    /// not count.
+    fn dispatchers(&mut self, from: DefId, name: &str, behaviours: &[String]) {
         let ix = self.ix;
         let origin = &ix.sources[from.0 as usize];
         let from_test = ix.is_test(from);
@@ -3188,7 +3192,10 @@ impl<'a, 'b> Run<'a, 'b> {
             {
                 continue;
             }
-            self.mark(candidate, Why::Via(from));
+            let names = |def: &super::facts::Def| behaviours.iter().any(|b| def.uses.contains(b));
+            if names(ix.def(candidate)) || names(&other.facts.top) {
+                self.mark(candidate, Why::Via(from));
+            }
         }
     }
 

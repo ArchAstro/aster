@@ -3135,7 +3135,7 @@ const DISPATCHED: &[(&str, &str)] = &[
     ),
     (
         "app/lib/app/dispatch.ex",
-        "defmodule App.Dispatch do\n  def notify(message) do\n    mod = Application.get_env(:app, :notifier)\n    mod.deliver(message)\n  end\nend\n",
+        "defmodule App.Dispatch do\n  alias App.Notifier\n\n  def notify(message) do\n    mod = Application.get_env(:app, :notifier)\n    Notifier.check(mod)\n    mod.deliver(message)\n  end\nend\n",
     ),
     (
         "app/lib/app/unrelated.ex",
@@ -3174,30 +3174,36 @@ fn a_new_elixir_function_nothing_calls_selects_no_test() {
         "  def tax(amount)",
         "  def free?(amount), do: amount == 0\n\n  def tax(amount)",
     );
+    // No analysed code calls it: no test is selected for it.
     let plan = ws.plan("test");
-    assert!(plan.runs().is_empty(), "{plan:#?}");
+    assert!(
+        plan.notes("//shop:test").contains("reaches no test"),
+        "{plan:#?}"
+    );
 }
 
 #[test]
-fn an_elixir_function_called_through_a_module_variable_selects_its_callers() {
-    let mut files = ELIXIR.to_vec();
+fn a_call_that_only_shares_a_behaviours_function_name_selects_nothing() {
+    let mut files = DISPATCHED.to_vec();
+    // Calls `deliver` on a value but names neither the behaviour nor the
+    // implementation.
     files.push((
-        "shop/lib/shop/checkout.ex",
-        "defmodule Shop.Checkout do\n  def free?(mod, amount), do: mod.free?(amount)\nend\n",
+        "app/lib/app/other.ex",
+        "defmodule App.Other do\n  def run(x), do: x.deliver(1)\nend\n",
     ));
     files.push((
-        "shop/test/shop/checkout_test.exs",
-        "defmodule Shop.CheckoutTest do\n  use ExUnit.Case\n\n  test \"free\" do\n    assert Shop.Checkout.free?(Shop.Pricing, 0)\n  end\nend\n",
+        "app/test/app/other_test.exs",
+        "defmodule App.OtherTest do\n  use ExUnit.Case\n\n  test \"run\" do\n    assert App.Other.run(%{deliver: 1})\n  end\nend\n",
     ));
     let ws = Workspace::new(&files);
     ws.edit(
-        "shop/lib/shop/pricing.ex",
-        "  def tax(amount)",
-        "  def free?(amount), do: amount == 0\n\n  def tax(amount)",
+        "app/lib/app/notifier/email.ex",
+        "{:email, message}",
+        "{:mail, message}",
     );
     assert_eq!(
-        ws.plan("test").commands("//shop:test"),
-        ["mix test test/shop/checkout_test.exs"]
+        ws.plan("test").commands("//app:test"),
+        ["mix test test/app/dispatch_test.exs"]
     );
 }
 

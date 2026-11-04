@@ -295,6 +295,8 @@ pub struct FileFacts {
     pub modules: Vec<String>,
     /// Elixir behaviour callbacks declared here (`@callback name(args)`).
     pub declared: BTreeSet<String>,
+    /// Elixir behaviours this file's modules implement (`@behaviour X`).
+    pub behaviours: Vec<String>,
     /// Import statements outside every definition.
     pub imports: Vec<ImportLine>,
     /// Go imports as `(alias, path)`; the qualifier of an unaliased import
@@ -360,6 +362,7 @@ impl FileFacts {
             uses_all: Vec::new(),
             modules: Vec::new(),
             declared: BTreeSet::new(),
+            behaviours: Vec::new(),
             imports: Vec::new(),
             go_imports: Vec::new(),
             line_class: Vec::new(),
