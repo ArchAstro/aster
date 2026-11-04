@@ -33,13 +33,13 @@ labelled with the name the model gives it:
 | `callback`, `macro`, `unnamed` | every user of the unit |
 | `top-members`, `top-fanout` | the unit's definitions, and every user of the unit |
 | `route-request` | definitions holding a path literal the route serves |
-| `route-fallback` | every user of the router unit, when no literal does |
+| `route-fallback` | every user of the router unit, when no literal does (off since #349: `routeNothing`) |
 | reflection | definitions that list modules at run time reach every non-test change |
 | fallback | a changed file whose edits alone reach no test runs the project in full |
 
-`Rules` holds the three pull requests as switches (`callbackClauses` for #347,
-which is merged and on in `mainRules`; `schemaTop` for #348 and `routeNothing`
-for #349, which are open), so each can be compared with main.
+`Rules` holds the three pull requests as switches (`callbackClauses` for #347
+and `routeNothing` for #349, which are on in `mainRules`; `schemaTop` for #348,
+which is open), so each can be compared with main.
 
 `execEdges` is the run-time oracle: what may execute what, written from how
 Elixir runs code and not from the analysis. Preload, run-time-built paths and

@@ -9,10 +9,11 @@ module witnesses {
 
   pure def editing(ds: Set[int]): Changes = { edits: ds, comments: Set(), trailing: Set() }
   pure val everything: Selection = { full: true, tests: shop.testUnits }
-  pure val pr349: Rules = { callbackClauses: true, schemaTop: false, routeNothing: true }
+  // Main before #349.
+  pure val before349: Rules = { callbackClauses: true, schemaTop: false, routeNothing: false }
   // Main before #347 merged.
-  pure val before347: Rules = { callbackClauses: false, schemaTop: false, routeNothing: false }
-  pure val pr348: Rules = { callbackClauses: true, schemaTop: true, routeNothing: false }
+  pure val before347: Rules = { callbackClauses: false, schemaTop: false, routeNothing: true }
+  pure val pr348: Rules = { callbackClauses: true, schemaTop: true, routeNothing: true }
 
   // D1. Monotonic fails: adding an edit that reaches a test turns a full run into a narrow one.
   run monotoneWitness = init.then({
@@ -27,10 +28,12 @@ module witnesses {
     }
   })
 
-  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and a route nothing requests.
+  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and (before #349)
+  // a route nothing requests.
   run unstatedFanoutWitness = init.then(all {
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(13))) == Set("top-fanout")),
-    assert(unstatedFanout(shopQuiet, mainRules, editing(Set(81))) == Set("route-fallback")),
+    assert(unstatedFanout(shopQuiet, before349, editing(Set(81))) == Set("route-fallback")),
+    assert(unstatedFanout(shopQuiet, mainRules, editing(Set(81))) == Set()),
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(10))) == Set()),
     state' = state,
   })
@@ -38,8 +41,8 @@ module witnesses {
   // D3. The fallback for a change that reaches no test is a full run, so the route rule of
   // #349 does not select "nothing" for an unrequested route: the file then reaches no test.
   run routeNothingWitness = init.then(all {
-    assert(selectTests(shopQuiet, mainRules, editing(Set(81))) == { full: false, tests: Set(109) }),
-    assert(selectTests(shopQuiet, pr349, editing(Set(81))) == everything),
+    assert(selectTests(shopQuiet, before349, editing(Set(81))) == { full: false, tests: Set(109) }),
+    assert(selectTests(shopQuiet, mainRules, editing(Set(81))) == everything),
     state' = state,
   })
 
@@ -87,7 +90,7 @@ module witnesses {
     }
   })
 
-  // D9. Each of the three rules (#347 is on main now, #348 and #349 are open) removes a fan-out, and a change whose fan-out is
+  // D9. Each of the three rules (#347 and #349 are on in `mainRules`, #348 is open) removes a fan-out, and a change whose fan-out is
   // now empty "reaches no test", so the fallback turns a narrow selection into a full
   // run. Customer is reached only by a struct user; nothing sends tag 6.
   run narrowedToNothingRunsEverythingWitness = init.then(all {
@@ -97,8 +100,8 @@ module witnesses {
       assert(selectTests(shopQuiet, pr348, editing(Set(62))) == everything),
       assert(selectTests(quietWorkers, before347, editing(Set(33))).full == false),
       assert(selectTests(quietWorkers, mainRules, editing(Set(33))).full),
-      assert(selectTests(shopQuiet, mainRules, editing(Set(81))).full == false),
-      assert(selectTests(shopQuiet, pr349, editing(Set(81))).full),
+      assert(selectTests(shopQuiet, before349, editing(Set(81))).full == false),
+      assert(selectTests(shopQuiet, mainRules, editing(Set(81))).full),
       state' = state,
     }
   })
