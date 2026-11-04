@@ -850,6 +850,17 @@ How a change is followed:
   the same file or a file that imports it, or holds its name as an atom
   (`apply/3`, `{Module, :function, args}`). A module that only appears in a
   function head's parameter patterns is matched against, not used.
+- A module named only for its data shape is not a call into it: the module
+  argument of `belongs_to`, `has_one`, `has_many`, `many_to_many`,
+  `embeds_one` and `embeds_many`, and a struct literal `%Mod{}` in a function
+  body. The definition that holds it depends on `Mod`'s top-level code (its
+  `schema`, `defstruct`, field list), so a change there selects it, and a
+  change inside one of `Mod`'s functions does not. `use`, `import`,
+  `require`, `@behaviour` and an explicit `Mod.fun(...)` stay dependencies on
+  the module's functions. The index does not see an association preloaded by
+  name (`Repo.preload(order, :customer)`), so code that runs a schema's
+  functions that way, such as a per-row privacy check, is selected only
+  through the calls, `use` options and aliases that name the schema.
 - A route declaration (a module-level call given a path and a module, such
   as `get "/orders/:id", OrderController, :show`, nested in
   `scope "/api" do … end`) is reached by request, not by name. When its

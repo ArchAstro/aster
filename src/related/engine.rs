@@ -160,6 +160,9 @@ struct Source {
     ghost: bool,
     /// Units each definition uses; the last entry is the top-level code.
     uses: Vec<Vec<u32>>,
+    /// Units each definition depends on for their data shape only (see
+    /// `Def::schema_uses`); the last entry is the top-level code.
+    schema: Vec<Vec<u32>>,
     /// Units whose users reach each definition (see `Def::via`).
     via: Vec<Vec<u32>>,
     /// Qualified calls of each definition, resolved to units; the last
@@ -194,6 +197,10 @@ struct Index<'a> {
     unit_files: Vec<Vec<u32>>,
     /// Definitions that use each unit.
     users: Vec<Vec<DefId>>,
+    /// Definitions that depend on each unit's data shape only. A change to
+    /// the unit's top-level code reaches them; a change to a function does
+    /// not.
+    schema_users: Vec<Vec<DefId>>,
     /// Units each unit's files use.
     unit_uses: Vec<Vec<u32>>,
     /// For each project, the units its test runner loads before every
@@ -849,6 +856,22 @@ impl<'a> Index<'a> {
                     .any(|spec| missing(std::slice::from_ref(spec)));
             let mut uses: Vec<Vec<u32>> = file.defs.iter().map(|d| uses_of(d, false)).collect();
             uses.push(uses_of(&file.top, true));
+            let schema: Vec<Vec<u32>> = file
+                .defs
+                .iter()
+                .chain([&file.top])
+                .zip(&uses)
+                .map(|(def, used)| {
+                    let mut units: BTreeSet<u32> = def
+                        .schema_uses
+                        .iter()
+                        .flat_map(|spec| resolve(path, family, spec))
+                        .collect();
+                    units.remove(&file_unit[i]);
+                    units.retain(|unit| !used.contains(unit));
+                    units.into_iter().collect()
+                })
+                .collect();
             let via: Vec<Vec<u32>> = file
                 .defs
                 .iter()
@@ -1061,7 +1084,7 @@ impl<'a> Index<'a> {
                 .flat_map(|spec| resolve(path, family, spec))
                 .collect();
             let linked = (calls, loose, opaque, preloaded, late, implicit, brought);
-            sources.push((uses, via, linked, imports, file_unit[i]));
+            sources.push((uses, schema, via, linked, imports, file_unit[i]));
         }
 
         let mut facts = facts;
@@ -1073,6 +1096,7 @@ impl<'a> Index<'a> {
                     path,
                     (
                         uses,
+                        schema,
                         via,
                         (calls, loose, opaque, preloaded, late, implicit, brought),
                         imports,
@@ -1096,6 +1120,7 @@ impl<'a> Index<'a> {
                         path,
                         unit,
                         uses,
+                        schema,
                         via,
                         calls,
                         imports,
@@ -1110,6 +1135,7 @@ impl<'a> Index<'a> {
             .collect();
 
         let mut users: Vec<Vec<DefId>> = vec![Vec::new(); unit_files.len()];
+        let mut schema_users: Vec<Vec<DefId>> = vec![Vec::new(); unit_files.len()];
         let mut unit_uses: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); unit_files.len()];
         for source in &sources {
             unit_uses[source.unit as usize].extend(source.uses.iter().flatten().copied());
@@ -1300,6 +1326,9 @@ impl<'a> Index<'a> {
                 for unit in units {
                     users[*unit as usize].push(id);
                 }
+                for unit in &source.schema[d] {
+                    schema_users[*unit as usize].push(id);
+                }
                 let def = if id.1 == TOP {
                     &source.facts.top
                 } else {
@@ -1380,7 +1409,7 @@ impl<'a> Index<'a> {
             let Some(dependent) = source.project else {
                 continue;
             };
-            for unit in source.uses.iter().flatten() {
+            for unit in source.uses.iter().chain(&source.schema).flatten() {
                 for &file in &unit_files[*unit as usize] {
                     let used = &sources[file as usize];
                     if let Some(dependency) = used.project {
@@ -1407,6 +1436,7 @@ impl<'a> Index<'a> {
             lib_roots,
             unit_files,
             users,
+            schema_users,
             unit_uses,
             preloads,
             unit_opaque,
@@ -2952,7 +2982,10 @@ impl<'a, 'b> Run<'a, 'b> {
         let facts = &ix.sources[file as usize].facts;
         let uses = |def: &super::facts::Def| {
             import.names.iter().any(|name| def.refs.contains(name))
-                || import.specs.iter().any(|spec| def.uses.contains(spec))
+                || import
+                    .specs
+                    .iter()
+                    .any(|spec| def.uses.contains(spec) || def.schema_uses.contains(spec))
         };
         let mut users: Vec<u32> = facts
             .defs
@@ -2982,6 +3015,27 @@ impl<'a, 'b> Run<'a, 'b> {
                     self.mark((id.0, d as u32), Why::Via(id));
                 }
                 self.users(source.unit, id);
+                // The file's top-level code holds its schema and struct, which
+                // the definitions that only build on its shape depend on. Code
+                // that merely reaches the top level (an atom in a `use`
+                // option naming a function) leaves the shape as it was; a
+                // change to it, or to a macro that expands into it, does not.
+                let reshaped = match self.affected.get(&id) {
+                    Some(Why::Via(from)) => {
+                        *from != NO_DEF
+                            && from.0 != USERS
+                            && from.1 != TOP
+                            && ix.def(*from).kind == DefKind::Macro
+                    }
+                    _ => true,
+                };
+                if reshaped {
+                    for &user in &ix.schema_users[source.unit as usize] {
+                        if user != id && (!ix.is_test(id) || ix.is_test(user)) {
+                            self.mark(user, Why::Via(id));
+                        }
+                    }
+                }
                 continue;
             }
             let def = &source.facts.defs[id.1 as usize];

@@ -75,6 +75,13 @@ pub struct Def {
     /// Unresolved specifiers of the files it draws names from: import
     /// specifiers, module names, package paths.
     pub uses: BTreeSet<String>,
+    /// Specifiers of files the definition depends on only for their data
+    /// shape: an Elixir schema association (`belongs_to :a, Mod`) or a
+    /// struct literal (`%Mod{}`). A change to the other file's top-level
+    /// code (its `schema`, `defstruct`, field list) reaches this
+    /// definition; a change to one of its functions does not.
+    #[serde(default)]
+    pub schema_uses: BTreeSet<String>,
     /// String literals that could name a file.
     pub strings: Vec<String>,
     /// The 1-based line each of [`Self::strings`] starts on.
@@ -164,6 +171,7 @@ impl Def {
             calls: BTreeSet::new(),
             atoms: BTreeSet::new(),
             uses: BTreeSet::new(),
+            schema_uses: BTreeSet::new(),
             strings: Vec::new(),
             string_lines: Vec::new(),
             reads: Vec::new(),

@@ -20,6 +20,17 @@ const DEFINERS: &[&str] = &[
     "defnp",
 ];
 const MODULE_DEFINERS: &[&str] = &["defmodule", "defprotocol", "defimpl"];
+/// Ecto macros whose module argument names the shape of another schema:
+/// the association loads or casts rows of that schema, and calls none of
+/// its functions.
+const SCHEMA_MACROS: &[&str] = &[
+    "belongs_to",
+    "has_one",
+    "has_many",
+    "many_to_many",
+    "embeds_one",
+    "embeds_many",
+];
 const TEST_MACROS: &[&str] = &["test", "property", "feature"];
 /// Attributes that never change behaviour: documentation and types.
 const INERT_ATTRIBUTES: &[&str] = &[
@@ -247,6 +258,15 @@ impl Walker<'_> {
         self.facts.owner(owner).uses.insert(full);
     }
 
+    /// A module named only for its data shape (see [`Def::schema_uses`]).
+    fn shape_mention(&mut self, owner: Owner, module: &str) {
+        if module.starts_with("__") {
+            return;
+        }
+        let full = self.expand(module);
+        self.facts.owner(owner).schema_uses.insert(full);
+    }
+
     /// Walk the statements of a module body or the file.
     fn block(&mut self, node: Node, scope: Scope, module: Option<&str>) {
         let mut pending_impl = false;
@@ -323,6 +343,20 @@ impl Walker<'_> {
                 return;
             }
             "call" => {}
+            "struct" => {
+                // `%Mod{}` builds or matches the struct: it needs `Mod`'s
+                // field list, not its functions.
+                for child in children(node) {
+                    if child.kind() == "alias" {
+                        if !scope.pattern {
+                            self.shape_mention(scope.owner, text(child, self.source));
+                        }
+                    } else {
+                        self.node(child, scope, module);
+                    }
+                }
+                return;
+            }
             _ => {
                 for child in children(node) {
                     self.node(child, scope, module);
@@ -514,10 +548,22 @@ impl Walker<'_> {
             _ => {}
         }
         self.facts.owner(scope.owner).refs.insert(name.to_string());
+        let association = SCHEMA_MACROS.contains(&name);
         for child in children(node) {
-            if child.kind() != "identifier" {
-                self.node(child, scope, module);
+            if child.kind() == "identifier" {
+                continue;
             }
+            if association && child.kind() == "arguments" {
+                for arg in children(child) {
+                    if arg.kind() == "alias" {
+                        self.shape_mention(scope.owner, text(arg, self.source));
+                    } else {
+                        self.node(arg, scope, module);
+                    }
+                }
+                continue;
+            }
+            self.node(child, scope, module);
         }
     }
 
@@ -687,6 +733,27 @@ end
         let changeset = facts.defs.iter().find(|d| d.name == "changeset").unwrap();
         assert!(changeset.uses.contains("Shop.Line"));
         assert!(!changeset.callback);
+    }
+
+    #[test]
+    fn associations_and_struct_literals_name_a_shape_not_a_call() {
+        let source = "defmodule Shop.Order do\n  use Ecto.Schema\n  alias Shop.Billing.Invoice\n\n  schema \"orders\" do\n    belongs_to :customer, Shop.Customer\n    has_many :invoices, Invoice, foreign_key: :order_id\n    embeds_one :address, Shop.Address\n  end\n\n  @behaviour Shop.Placeable\n\n  def blank, do: %Shop.Line{}\n  def total(%Shop.Cart{} = cart), do: Shop.Pricing.sum(cart)\nend\n";
+        let facts = extract(Path::new("lib/shop/order.ex"), source);
+        let shape: Vec<&str> = facts.top.schema_uses.iter().map(String::as_str).collect();
+        assert_eq!(
+            shape,
+            ["Shop.Address", "Shop.Billing.Invoice", "Shop.Customer"]
+        );
+        assert!(!facts.top.uses.contains("Shop.Customer"));
+        // A behaviour is implemented, so its functions are used.
+        assert!(facts.top.uses.contains("Shop.Placeable"));
+        let blank = facts.defs.iter().find(|d| d.name == "blank").unwrap();
+        assert!(blank.schema_uses.contains("Shop.Line"));
+        assert!(!blank.uses.contains("Shop.Line"));
+        // A struct pattern in a head is matched, not used at all.
+        let total = facts.defs.iter().find(|d| d.name == "total").unwrap();
+        assert!(total.schema_uses.is_empty());
+        assert!(total.uses.contains("Shop.Pricing"));
     }
 
     #[test]

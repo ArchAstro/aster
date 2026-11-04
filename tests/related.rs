@@ -211,6 +211,133 @@ fn elixir_change_selects_the_tests_that_reach_the_function() {
     );
 }
 
+/// An order belongs to a customer. `place` uses only the order; its test
+/// has no other link to the customer. `Labeler.label` calls
+/// `Customer.label`, and its test does reach the customer's function.
+const ECTO_SCHEMAS: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/customer.ex",
+        "defmodule Shop.Customer do\n  use Ecto.Schema\n  use Shop.Policy, view: {:local, :visible?}\n\n  schema \"customers\" do\n    field :name, :string\n  end\n\n  def label(customer), do: customer.name\n\n  def audit(customer), do: {:audited, customer.name}\n\n  def visible?(customer), do: customer.name != nil\nend\n",
+    ),
+    (
+        "shop/lib/shop/order.ex",
+        "defmodule Shop.Order do\n  use Ecto.Schema\n\n  schema \"orders\" do\n    belongs_to :customer, Shop.Customer\n  end\n\n  def place(order), do: {:placed, order}\nend\n",
+    ),
+    (
+        "shop/lib/shop/labeler.ex",
+        "defmodule Shop.Labeler do\n  def label(order), do: Shop.Customer.label(order.customer)\nend\n",
+    ),
+    (
+        "shop/test/shop/order_test.exs",
+        "defmodule Shop.OrderTest do\n  use ExUnit.Case\n\n  test \"place\" do\n    assert {:placed, _} = Shop.Order.place(%{})\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/label_test.exs",
+        "defmodule Shop.LabelTest do\n  use ExUnit.Case\n\n  test \"label\" do\n    assert Shop.Labeler.label(%{customer: %{name: \"a\"}}) == \"a\"\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof: an Ecto association is a dependency on the
+/// other schema's shape, not on every function of its module.
+#[test]
+fn elixir_association_depends_on_the_schema_not_the_functions_of_the_target() {
+    // `audit` is a function nothing names, so every definition that calls
+    // into `Shop.Customer` is selected: `Labeler.label` does. `Shop.Order`
+    // only has `belongs_to :customer`, which used to count as a call into
+    // every function of the customer.
+    let ws = Workspace::new(ECTO_SCHEMAS);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "{:audited, customer.name}",
+        "{:audited, customer.name, 1}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs"]
+    );
+
+    // The explicit call `Customer.label(...)` in a function body selects
+    // the function and its test, and still not the order's test.
+    let ws = Workspace::new(ECTO_SCHEMAS);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "customer.name\n",
+        "customer.name <> \"!\"\n",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs"]
+    );
+
+    // `visible?` is named by an atom in the customer's `use` options, so the
+    // customer's own top level runs it. That reaches the customer's
+    // callers, but leaves the customer's shape, and the order, alone.
+    let ws = Workspace::new(ECTO_SCHEMAS);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "customer.name != nil",
+        "not is_nil(customer.name)",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs"]
+    );
+
+    // A change to the customer's schema reaches the order, hence its test.
+    let ws = Workspace::new(ECTO_SCHEMAS);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "field :name, :string",
+        "field :name, :string\n    field :email, :string",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs test/shop/order_test.exs"]
+    );
+}
+
+#[test]
+fn elixir_struct_literal_depends_on_the_struct_not_the_functions() {
+    let files = [
+        ECTO_SCHEMAS[0],
+        ECTO_SCHEMAS[1],
+        ECTO_SCHEMAS[3],
+        ECTO_SCHEMAS[5],
+        (
+            "shop/lib/shop/report.ex",
+            "defmodule Shop.Report do\n  def blank, do: %Shop.Customer{}\nend\n",
+        ),
+        (
+            "shop/test/shop/report_test.exs",
+            "defmodule Shop.ReportTest do\n  use ExUnit.Case\n\n  test \"blank\" do\n    assert Shop.Report.blank()\n  end\nend\n",
+        ),
+    ];
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "{:audited, customer.name}",
+        "{:audited, customer.name, 1}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs"]
+    );
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/lib/shop/customer.ex",
+        "field :name, :string",
+        "field :name, :string\n    field :email, :string",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/label_test.exs test/shop/report_test.exs"]
+    );
+}
+
 #[test]
 fn comment_only_change_runs_no_tests() {
     let ws = Workspace::new(ELIXIR);
