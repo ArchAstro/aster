@@ -33,13 +33,13 @@ labelled with the name the model gives it:
 | `callback`, `macro`, `unnamed` | every user of the unit, narrowed by #353 and #347: a function nothing calls in a file with no `use` reaches nothing unless it is the edit; a lifecycle callback goes to what may start the process; a message clause to what may send its tag |
 | `top-members`, `top-fanout` | the unit's definitions, and every user of the unit |
 | `route-request` | definitions holding a path literal the route serves |
-| `route-fallback` | every user of the router unit, when no literal does |
+| `route-fallback` | every user of the router unit, when no literal does (off since #349: `routeNothing`) |
 | reflection | definitions that list modules at run time reach every non-test change |
 
 `Rules` holds pull requests as switches. `callbackClauses` (#347), `deadSilent`
-and `processStarters` (#353) are on in `mainRules`, and `fullFallback`, the
-"reaches no test, run in full" check #354 removed, is off. `schemaTop` (#348)
-and `routeNothing` (#349) are open and off. Each switch is a small guard in
+and `processStarters` (#353), and `routeNothing` (#349) are on in `mainRules`, and
+`fullFallback`, the "reaches no test, run in full" check #354 removed, is off.
+`schemaTop` (#348) is open and off. Each switch is a small guard in
 `usersOf` / `callbackUsers` / `fanRule` / `linksFrom`, so the old rule is one
 `.with(..)` away.
 

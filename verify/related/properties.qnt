@@ -26,9 +26,9 @@ module properties {
   pure val editable: Set[int] = shop.kindOf.keys()
   pure val allRules: Set[Rules] = Set(
     mainRules,
+    mainRules.with("routeNothing", false),
     mainRules.with("schemaTop", true),
-    mainRules.with("routeNothing", true),
-    mainRules.with("schemaTop", true).with("routeNothing", true),
+    mainRules.with("schemaTop", true).with("routeNothing", false),
     mainRules.with("fullFallback", true),
     mainRules.with("callbackClauses", false).with("deadSilent", false).with("processStarters", false))
 

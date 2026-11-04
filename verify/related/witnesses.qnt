@@ -12,10 +12,10 @@ module witnesses {
   pure def editing(ds: Set[int]): Changes = { edits: ds, comments: Set(), trailing: Set() }
   pure val nothing: Selection = { full: false, tests: Set() }
   // Main with one open pull request applied.
-  pure val pr349: Rules = mainRules.with("routeNothing", true)
   pure val pr348: Rules = mainRules.with("schemaTop", true)
   // Main before each merged pull request.
   pure val before347: Rules = mainRules.with("callbackClauses", false)
+  pure val before349: Rules = mainRules.with("routeNothing", false)
   pure val before353: Rules = mainRules.with("deadSilent", false).with("processStarters", false)
   pure val before354: Rules = mainRules.with("fullFallback", true)
 
@@ -34,21 +34,22 @@ module witnesses {
     }
   })
 
-  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and a route
-  // nothing requests. Both still fire on main.
+  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and (before #349)
+  // a route nothing requests. Top-level fan-out still fires on main.
   run unstatedFanoutWitness = init.then(all {
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(13))) == Set("top-fanout")),
-    assert(unstatedFanout(shopQuiet, mainRules, editing(Set(81))) == Set("route-fallback")),
+    assert(unstatedFanout(shopQuiet, before349, editing(Set(81))) == Set("route-fallback")),
+    assert(unstatedFanout(shopQuiet, mainRules, editing(Set(81))) == Set()),
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(10))) == Set()),
     state' = state,
   })
 
-  // D3 (fixed by #354). With #349's rule an unrequested route reaches nothing, and the change
-  // selects nothing; before #354 the fallback turned that into a full run.
+  // D3 (fixed by #354). With #349's rule (on in `mainRules`) an unrequested route reaches
+  // nothing, and the change selects nothing; before #354 the fallback turned that into a full run.
   run routeNothingWitness = init.then(all {
-    assert(selectTests(shopQuiet, mainRules, editing(Set(81))) == { full: false, tests: Set(109) }),
-    assert(selectTests(shopQuiet, pr349, editing(Set(81))) == nothing),
-    assert(selectTests(shopQuiet, pr349.with("fullFallback", true), editing(Set(81))).full),
+    assert(selectTests(shopQuiet, before349, editing(Set(81))) == { full: false, tests: Set(109) }),
+    assert(selectTests(shopQuiet, mainRules, editing(Set(81))) == nothing),
+    assert(selectTests(shopQuiet, mainRules.with("fullFallback", true), editing(Set(81))).full),
     state' = state,
   })
 

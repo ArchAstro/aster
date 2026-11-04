@@ -86,10 +86,11 @@ module scenarios {
   run routeRequestRun = init.then(build(shopQuiet, mainRules)).then(change(edit80)).then(selectNow(expect_shopQuiet_edit80))
     .then(all { assert(state.selection == picked(Set(103))), state' = state })
 
-  // No code requests /s2/:id, so on main the route reaches every user of the router.
+  // No analysed code requests /s2/:id, so the route reaches nothing further (#349) and the
+  // change reaches no test.
   /// @conformance
   run routeFallbackRun = init.then(build(shopQuiet, mainRules)).then(change(edit81)).then(selectNow(expect_shopQuiet_edit81))
-    .then(all { assert(state.selection == picked(Set(109))), state' = state })
+    .then(all { assert(state.selection == noSelection), state' = state })
 
   // Code that lists modules at run time is reached by any change to a non-test file.
   /// @conformance

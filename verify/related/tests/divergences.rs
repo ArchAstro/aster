@@ -144,15 +144,17 @@ const ROUTER_REPO: [(&str, &str); 5] = [
     ),
 ];
 
-/// D2b. A route no code requests fans out to every user of its router (main).
+/// D2b, D3 (fixed by #349). A route no code requests reaches nothing further.
 ///
-/// ArchAstro/aster#349 removes this; see D3 for what replaces it.
+/// Before ArchAstro/aster#349 it fanned out to every user of its router, here
+/// `router_test`. The change now reaches no test and selects nothing.
 #[test]
-fn a_route_nothing_requests_selects_users_of_the_router_module() {
+fn a_route_nothing_requests_selects_nothing() {
     let ws = Workspace::from_files(&ROUTER_REPO).unwrap();
     ws.edit("shop/lib/order_controller.ex", "do: conn", "do: {conn, 1}")
         .unwrap();
-    assert_eq!(narrow(&ws.plan().unwrap()), ["test/router_test.exs"]);
+    let plan = ws.plan().unwrap();
+    assert_eq!(plan, Plan::default(), "{plan:?}");
 }
 
 /// D5 (fixed by #354). A reflecting test counts as reaching a change.

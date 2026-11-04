@@ -2981,8 +2981,8 @@ fn a_controller_change_selects_the_tests_that_request_its_routes() {
 /// Canonical e2e: a scratch git repo with a Phoenix-style router. One test
 /// requests the orders route by path; another uses the endpoint through
 /// `ConnCase` but names no path. A route whose path no code names (users) is
-/// called only from outside the analysed source, so changing it selects
-/// nothing; the named route selects only the test that requests it.
+/// called only from outside the analysed source, so changing it reaches no
+/// test and the project is skipped; the named route selects only the test that requests it.
 #[test]
 fn a_route_no_analysed_code_requests_reaches_no_test_through_the_router() {
     let mut files = WEB.to_vec();
@@ -3006,11 +3006,9 @@ fn a_route_no_analysed_code_requests_reaches_no_test_through_the_router() {
         "{conn, id}",
         "{conn, id, :ok}",
     );
-    assert!(
-        ws.plan("test").commands("//web:test").is_empty(),
-        "{:#?}",
-        ws.plan("test")
-    );
+    let plan = ws.plan("test");
+    assert_eq!(plan.skipped, ["//web:test"], "{plan:#?}");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
     // Changing the controller of the requested route selects only test A.
     let ws = Workspace::new(&files);
     ws.edit("web/lib/web/orders.ex", "{conn, id}", "{conn, id, :ok}");
