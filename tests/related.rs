@@ -3213,7 +3213,7 @@ fn a_call_that_only_shares_a_behaviours_function_name_selects_nothing() {
     // Calls `deliver` on a value but names neither the behaviour nor the
     // implementation.
     files.push((
-        "app/lib/app/other.ex",
+        "app/lib/other/other.ex",
         "defmodule App.Other do\n  def run(x), do: x.deliver(1)\nend\n",
     ));
     files.push((

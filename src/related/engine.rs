@@ -151,6 +151,10 @@ const NO_DEF: DefId = (u32::MAX, u32::MAX);
 /// only test files count.
 const USERS: u32 = u32::MAX - 1;
 
+/// Most definitions that may call a callback name for a caller beside its
+/// declaration to count without naming the behaviour.
+const MAX_BESIDE: usize = 4;
+
 struct Source {
     path: PathBuf,
     facts: FileFacts,
@@ -226,6 +230,8 @@ struct Index<'a> {
     dispatched: HashMap<String, Vec<DefId>>,
     /// Behaviour callbacks the workspace declares, by name.
     declared: HashSet<String>,
+    /// The directories that hold a file declaring each behaviour callback.
+    declared_in: HashMap<String, Vec<PathBuf>>,
     /// For each Elixir module a config file names, the atoms of that file:
     /// the keys that may hold it.
     config_keys: HashMap<String, BTreeSet<String>>,
@@ -1192,6 +1198,13 @@ impl<'a> Index<'a> {
             .iter()
             .flat_map(|source| source.facts.declared.iter().cloned())
             .collect();
+        let mut declared_in: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for source in &sources {
+            for name in &source.facts.declared {
+                let dir = source.path.parent().unwrap_or(Path::new("")).to_path_buf();
+                declared_in.entry(name.clone()).or_default().push(dir);
+            }
+        }
         let mut config_keys: HashMap<String, BTreeSet<String>> = HashMap::new();
         for source in &sources {
             let in_config = source.path.components().any(|c| c.as_os_str() == "config");
@@ -1456,6 +1469,7 @@ impl<'a> Index<'a> {
             path_defs,
             dispatched,
             declared,
+            declared_in,
             config_keys,
             downstream,
         }
@@ -3205,8 +3219,16 @@ impl<'a, 'b> Run<'a, 'b> {
         let from_test = ix.is_test(from);
         for &candidate in ix.dispatched.get(name).into_iter().flatten() {
             let other = &ix.sources[candidate.0 as usize];
+            // The behaviour is often declared in a project the implementation
+            // depends on, and called there.
+            let related_projects = match (origin.project, other.project) {
+                (Some(a), Some(b)) => {
+                    a == b || ix.downstream[a].contains(&b) || ix.downstream[b].contains(&a)
+                }
+                (a, b) => a == b,
+            };
             if candidate == from
-                || other.project != origin.project
+                || !related_projects
                 || other.facts.family != origin.facts.family
                 || (from_test && !ix.is_test(candidate))
             {
@@ -3216,7 +3238,19 @@ impl<'a, 'b> Run<'a, 'b> {
                 behaviours.iter().any(|b| def.uses.contains(b))
                     || def.atoms.iter().any(|a| keys.contains(a))
             };
-            if names(ix.def(candidate)) || names(&other.facts.top) {
+            // Or the name is rare enough to be the behaviour's own and the
+            // caller sits beside the file that declares the callback: the
+            // code that drives a behaviour lives next to it. A common name
+            // (`run`, `get`) is never taken on its own.
+            let beside = ix
+                .dispatched
+                .get(name)
+                .is_some_and(|v| v.len() <= MAX_BESIDE)
+                && ix
+                    .declared_in
+                    .get(name)
+                    .is_some_and(|dirs| dirs.iter().any(|dir| other.path.starts_with(dir)));
+            if beside || names(ix.def(candidate)) || names(&other.facts.top) {
                 self.mark(candidate, Why::Via(from));
             }
         }
