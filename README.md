@@ -965,9 +965,10 @@ Where the source graph cannot see, Aster runs more:
   `test/test_helper.exs`, `go.mod`, `pyproject.toml`, `aster.toml`, …) run
   their project in full, and every project downstream of it. A
   workspace-level lockfile does the same for every project beneath it.
-- A project runs in full when a non-source file nothing names changed, when
-  a changed source file reaches no test at all, or when the project imports
-  Python modules by computed name.
+- A project runs in full when a non-source file nothing names changed, or
+  when the project imports Python modules by computed name. A changed source
+  file that reaches no test selects nothing for its project: the walk
+  followed every reference, so no test can observe it.
 - Inside the set `--dependents` would select, a project runs in full when
   it depends on an affected project in another language, on one Aster does
   not analyse (Ruby, JVM), or on one it never imports from: such a
