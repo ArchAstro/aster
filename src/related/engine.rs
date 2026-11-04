@@ -1431,6 +1431,76 @@ impl<'a> Index<'a> {
         facts.is_test_file || (id.1 != TOP && facts.defs[id.1 as usize].in_test)
     }
 
+    /// Tests written beside the code they test use it without importing
+    /// anything. Rust keeps those in the non-test file. A Go unit is the
+    /// package directory, and its tests live in `_test.go` (including an
+    /// external `package x_test`), so a callback such as `init` or
+    /// `TestMain` never names them. Only the test functions: a helper in
+    /// the same file is not a name `go test -run` can take, and marking
+    /// it would make that package run in full.
+    fn beside(&self, unit: u32) -> Vec<DefId> {
+        self.unit_files[unit as usize]
+            .iter()
+            .flat_map(|&file| {
+                let defs = &self.sources[file as usize].facts.defs;
+                (0..defs.len() as u32).map(move |def| (file, def))
+            })
+            .filter(|id| {
+                let facts = &self.sources[id.0 as usize].facts;
+                if facts.family == Family::Go && facts.is_test_file {
+                    return facts.defs[id.1 as usize].is_test();
+                }
+                !facts.is_test_file && self.is_test(*id)
+            })
+            .collect()
+    }
+
+    /// Whether `candidate`, which uses `unit` or belongs to it, may send a
+    /// message tagged `tag` to a process running the unit's callbacks.
+    fn may_send(&self, candidate: DefId, unit: u32, tag: &str) -> bool {
+        let def = self.def(candidate);
+        if def.sends_any || def.sends.contains(tag) {
+            return true;
+        }
+        if !def.sends.is_empty() {
+            return false;
+        }
+        let source = &self.sources[candidate.0 as usize];
+        if source.unit == unit {
+            return false;
+        }
+        let index = if candidate.1 == TOP {
+            source.facts.defs.len()
+        } else {
+            candidate.1 as usize
+        };
+        let files = &self.unit_files[unit as usize];
+        let modules = |name: &String| {
+            files
+                .iter()
+                .any(|&f| self.sources[f as usize].facts.modules.contains(name))
+        };
+        let defines = |function: &String| {
+            files.iter().any(|&f| {
+                self.sources[f as usize]
+                    .facts
+                    .defs
+                    .iter()
+                    .any(|d| d.kind == DefKind::Function && d.name == *function)
+            })
+        };
+        let mut called = false;
+        for (called_unit, function) in &source.calls[index] {
+            if *called_unit == unit {
+                called = true;
+                if !defines(function) {
+                    return true;
+                }
+            }
+        }
+        def.bare.iter().any(modules) || source.imports.contains(&unit) || !called
+    }
+
     /// Whether definition `id` refers to `name` of `unit`. The caller has
     /// already established that `id` uses `unit` or belongs to it.
     fn refers(&self, id: DefId, unit: u32, name: &str) -> bool {
@@ -2918,9 +2988,19 @@ impl<'a, 'b> Run<'a, 'b> {
                     LineClass::Def(def) => {
                         let removed = &old.defs[def as usize];
                         let mut survives = false;
+                        // Two types may each have a method of the name. A
+                        // message clause is told from its siblings by the
+                        // tag it accepts, when one of them still has it.
+                        let same = |current: &super::facts::Def| {
+                            current.name == removed.name && current.owner == removed.owner
+                        };
+                        let kept_tag = removed.accepts.is_some()
+                            && facts
+                                .defs
+                                .iter()
+                                .any(|c| same(c) && c.accepts == removed.accepts);
                         for (d, current) in facts.defs.iter().enumerate() {
-                            // Two types may each have a method of the name.
-                            if current.name == removed.name && current.owner == removed.owner {
+                            if same(current) && (!kept_tag || current.accepts == removed.accepts) {
                                 survives = true;
                                 self.mark((file, d as u32), changed(&None));
                             }
@@ -3008,7 +3088,11 @@ impl<'a, 'b> Run<'a, 'b> {
             // framework callback, a macro expansion, reflection.
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
             if def.callback || def.kind == DefKind::Macro || unnamed {
-                self.users(source.unit, id);
+                match def.accepts.as_deref().filter(|_| def.callback) {
+                    // A message clause is reached by what can send its message.
+                    Some(tag) => self.senders(source.unit, id, tag),
+                    None => self.users(source.unit, id),
+                }
             }
             // Users of a type or trait reach its implementation without
             // naming it. With static types that takes a call nothing
@@ -3053,6 +3137,39 @@ impl<'a, 'b> Run<'a, 'b> {
         found
     }
 
+    /// Mark the definitions that may send `tag` to the message clause
+    /// `from` of `unit`, instead of every user of the unit.
+    ///
+    /// A definition sends the clause's message when it sends that tag or
+    /// one it cannot tell. One that sends only other tags does not. One
+    /// with no send of its own reaches the clause through the functions it
+    /// calls, which are linked by name, unless it names the unit in a way
+    /// that is not a call to a function the unit defines (a struct, a
+    /// registered name, an import): it may send in a way not seen here.
+    fn senders(&mut self, unit: u32, from: DefId, tag: &str) {
+        let ix = self.ix;
+        let from_test = ix.is_test(from);
+        let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
+            let defs = ix.sources[f as usize].facts.defs.len() as u32;
+            (0..defs).map(move |d| (f, d))
+        });
+        let candidates: Vec<DefId> = ix.users[unit as usize]
+            .iter()
+            .copied()
+            .chain(local)
+            .chain(ix.beside(unit))
+            .collect();
+        let mut seen: HashSet<DefId> = HashSet::new();
+        for user in candidates {
+            if user == from || (from_test && !ix.is_test(user)) || !seen.insert(user) {
+                continue;
+            }
+            if ix.may_send(user, unit, tag) {
+                self.mark(user, Why::Via(from));
+            }
+        }
+    }
+
     /// Mark every definition that uses `unit`.
     fn users(&mut self, unit: u32, from: DefId) {
         let ix = self.ix;
@@ -3064,27 +3181,7 @@ impl<'a, 'b> Run<'a, 'b> {
         if !self.users_seen.insert((unit, from_test)) {
             return;
         }
-        // Tests written beside the code they test use it without importing
-        // anything. Rust keeps those in the non-test file. A Go unit is the
-        // package directory, and its tests live in `_test.go` (including an
-        // external `package x_test`), so a callback such as `init` or
-        // `TestMain` never names them. Only the test functions: a helper in
-        // the same file is not a name `go test -run` can take, and marking
-        // it would make that package run in full.
-        let beside: Vec<DefId> = ix.unit_files[unit as usize]
-            .iter()
-            .flat_map(|&file| {
-                let defs = &ix.sources[file as usize].facts.defs;
-                (0..defs.len() as u32).map(move |def| (file, def))
-            })
-            .filter(|id| {
-                let facts = &ix.sources[id.0 as usize].facts;
-                if facts.family == Family::Go && facts.is_test_file {
-                    return facts.defs[id.1 as usize].is_test();
-                }
-                !facts.is_test_file && ix.is_test(*id)
-            })
-            .collect();
+        let beside = ix.beside(unit);
         for &user in ix.users[unit as usize].iter().chain(&beside) {
             if user != from && (!from_test || ix.is_test(user)) {
                 self.edge(node, user);

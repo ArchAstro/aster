@@ -916,6 +916,20 @@ How a change is followed:
 - A definition nothing names is assumed to be called another way: a
   callback (`handle_call`, `mount`, anything marked `@impl`), a macro, a
   route. It affects every definition that uses its file.
+- An Elixir message clause (`handle_call`, `handle_cast`, `handle_info`,
+  `handle_continue`, a channel's `handle_in`, a state machine's
+  `handle_event/4`) whose message pattern starts with a literal
+  (`{:tag, ...}`, `:tag`, `"event"`) is reached only by definitions that may
+  send that tag: `GenServer.call/cast`, `:gen_statem` calls, `send/2`,
+  `Process.send_after`, `:timer.send_after`, `Phoenix.PubSub.broadcast`, a
+  channel test's `push/3`, and `{:continue, tag}` or `{:next_event, ...}`
+  return values. A sender whose message is not a literal, or that
+  broadcasts, may send any tag. A user of the module with no send of its own
+  is reached through the functions it calls, unless it names the module
+  otherwise (a struct, a registered name, an import). A clause that matches
+  any message, a system message (`:DOWN`, `:EXIT`, `:timeout`, sockets), and
+  a state-function state machine or LiveView callback keep the rule above:
+  every definition that uses its file.
 - Elixir code that lists modules at run time
   (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
   `:code.all_loaded()`) can call into any of them, so it is affected by
