@@ -3170,12 +3170,11 @@ impl<'a, 'b> Run<'a, 'b> {
             }
             let def = &source.facts.defs[id.1 as usize];
             if let Some(route) = &def.route {
-                // A route is reached by requests for its path. When no code
-                // names the path, anything that goes through the router
-                // may reach it.
-                if !self.requests(route, id) {
-                    self.users(source.unit, id);
-                }
+                // A route is reached by requests for its path. When no
+                // analysed code names the path, its callers are outside the
+                // analysed source (HTTP clients, shell scripts, browsers), so
+                // nothing further is reached.
+                self.requests(route, id);
                 continue;
             }
             let member = (def.kind == DefKind::Method).then_some(def.owner.as_deref());
