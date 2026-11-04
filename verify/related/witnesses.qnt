@@ -1,6 +1,8 @@
-// Divergences the model finds between the rules and the stated invariants,
-// each pinned to a fixed repo. These pass while the divergence exists: if one
-// fails, the engine's rule changed and the PR description needs updating.
+// Where the rules meet the stated invariants, each pinned to a fixed repo. Some
+// are divergences the model found that main has since fixed (D1, D3, D5, D7:
+// #353 and #354); they are written as the behaviour that now holds, with the old
+// rule one switch away. The rest still hold on main. If one fails, the engine's
+// rule changed and the model's switches need updating.
 //
 // Run with `quint test --main witnesses --match 'Witness$' witnesses.qnt`.
 module witnesses {
@@ -8,26 +10,32 @@ module witnesses {
   import repos.* from "./repos"
 
   pure def editing(ds: Set[int]): Changes = { edits: ds, comments: Set(), trailing: Set() }
-  pure val everything: Selection = { full: true, tests: shop.testUnits }
-  pure val pr349: Rules = { callbackClauses: true, schemaTop: false, routeNothing: true }
-  // Main before #347 merged.
-  pure val before347: Rules = { callbackClauses: false, schemaTop: false, routeNothing: false }
-  pure val pr348: Rules = { callbackClauses: true, schemaTop: true, routeNothing: false }
+  pure val nothing: Selection = { full: false, tests: Set() }
+  // Main with one open pull request applied.
+  pure val pr349: Rules = mainRules.with("routeNothing", true)
+  pure val pr348: Rules = mainRules.with("schemaTop", true)
+  // Main before each merged pull request.
+  pure val before347: Rules = mainRules.with("callbackClauses", false)
+  pure val before353: Rules = mainRules.with("deadSilent", false).with("processStarters", false)
+  pure val before354: Rules = mainRules.with("fullFallback", true)
 
-  // D1. Monotonic fails: adding an edit that reaches a test turns a full run into a narrow one.
+  // D1 (fixed by #354). A superset of edits selects a superset of tests. With the
+  // "reaches no test, run in full" check, the larger change selected fewer.
   run monotoneWitness = init.then({
     val small = editing(Set(90))
     val big = editing(Set(90, 91))
     all {
-      assert(selectTests(shopQuiet, mainRules, small) == everything),
+      assert(selectTests(shopQuiet, mainRules, small) == nothing),
       assert(selectTests(shopQuiet, mainRules, big) == { full: false, tests: Set(110) }),
-      assert(not(monotone(shopQuiet, mainRules, small, big))),
-      assert(monotonePrecise(shopQuiet, mainRules, small, big)),
+      assert(monotone(shopQuiet, mainRules, small, big)),
+      assert(selectTests(shopQuiet, before354, small).full),
+      assert(not(monotone(shopQuiet, before354, small, big))),
       state' = state,
     }
   })
 
-  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and a route nothing requests.
+  // D2. Unit-wide fan-out outside "callback, macro or unnamed": top-level code, and a route
+  // nothing requests. Both still fire on main.
   run unstatedFanoutWitness = init.then(all {
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(13))) == Set("top-fanout")),
     assert(unstatedFanout(shopQuiet, mainRules, editing(Set(81))) == Set("route-fallback")),
@@ -35,28 +43,39 @@ module witnesses {
     state' = state,
   })
 
-  // D3. The fallback for a change that reaches no test is a full run, so the route rule of
-  // #349 does not select "nothing" for an unrequested route: the file then reaches no test.
+  // D3 (fixed by #354). With #349's rule an unrequested route reaches nothing, and the change
+  // selects nothing; before #354 the fallback turned that into a full run.
   run routeNothingWitness = init.then(all {
     assert(selectTests(shopQuiet, mainRules, editing(Set(81))) == { full: false, tests: Set(109) }),
-    assert(selectTests(shopQuiet, pr349, editing(Set(81))) == everything),
+    assert(selectTests(shopQuiet, pr349, editing(Set(81))) == nothing),
+    assert(selectTests(shopQuiet, pr349.with("fullFallback", true), editing(Set(81))).full),
     state' = state,
   })
 
-  // D4. Reflection reaches everything, so a change that no test names still selects the reflecting test
-  // and still falls back to a full run: the reflecting test is not counted when asking whether a change reaches a test.
-  run reflectionDoesNotCountWitness = init.then(all {
-    assert(selectTests(shop, mainRules, editing(Set(90))) == everything),
-    assert(reachedTests(shop, reach(shop, mainRules, seeds(shop, editing(Set(90)))).nodes).contains(105)),
+  // D5 (fixed by #354). The reflecting test is selected for a change nothing else reaches,
+  // and there is no fallback to a full run.
+  run reflectionWitness = init.then(all {
+    assert(selectTests(shop, mainRules, editing(Set(90))) == { full: false, tests: Set(105) }),
+    assert(selectTests(shop, before354, editing(Set(90))).full),
     state' = state,
   })
 
-  // D5. Schema shape (#348): a function change reaches a struct user on main, not once shape-only uses wait for the top.
+  // #353. A function nothing calls, in a file that registers no callbacks, reaches nothing
+  // unless it is the edit; lifecycle callbacks are reached by what may start the process.
+  run deadFunctionWitness = init.then(all {
+    // `unused` is edited: it keeps the unnamed rule and reaches the users of Pricing.
+    assert(selectTests(shopQuiet, mainRules, editing(Set(12))).tests == Set(101)),
+    // `blank` (builds %Order{}) is dead: editing `legacy` no longer reaches the tests of Cart.
+    assert(selectTests(shopQuiet, before353, editing(Set(52))).tests == Set(101, 106, 108)),
+    assert(selectTests(shopQuiet, mainRules, editing(Set(52))).tests == Set(108)),
+    state' = state,
+  })
+
+  // #348 (open). Struct users wait for the target's top-level code. On the shop the struct
+  // users are dead functions, so main already selects the same tests.
   run schemaShapeWitness = init.then(all {
-    assert(selectTests(shopQuiet, mainRules, editing(Set(52))).tests == Set(101, 106, 108)),
-    assert(selectTests(shopQuiet, pr348, editing(Set(52))).tests == Set(108)),
-    // The unit's top-level code still reaches the shape user.
-    assert(selectTests(shopQuiet, pr348, editing(Set(51))).tests.contains(101)),
+    assert(selectTests(shopQuiet, pr348, editing(Set(52))) == selectTests(shopQuiet, mainRules, editing(Set(52)))),
+    assert(selectTests(shopQuiet, pr348, editing(Set(51))).tests.contains(108)),
     state' = state,
   })
 
@@ -68,13 +87,18 @@ module witnesses {
     state' = state,
   })
 
-  // D7. Message clauses (#347, merged): a clause with a literal tag is reached by senders of that tag
-  // (and senders of computed messages), not by every user of the module.
+  // D7 (#347 and #354). A clause with a literal tag is reached by senders of that tag and of
+  // computed messages. When nobody sends the tag the change selects nothing; before #354 it ran in full.
   run messageClauseWitness = init.then(all {
-    assert(selectTests(workers, before347, editing(Set(31))).tests == Set(102, 111, 112)),
-    assert(selectTests(workers, mainRules, editing(Set(31))).tests == Set(102, 112)),
-    assert(selectTests(workers, mainRules, editing(Set(33))).tests == Set(112)),
-    state' = state,
+    val quietWorkers = workers.with("sendsAny", Set())
+    all {
+      assert(selectTests(workers, before347, editing(Set(31))).tests == Set(102, 111, 112)),
+      assert(selectTests(workers, mainRules, editing(Set(31))).tests == Set(102, 112)),
+      assert(selectTests(workers, mainRules, editing(Set(33))).tests == Set(112)),
+      assert(selectTests(quietWorkers, mainRules, editing(Set(33))) == nothing),
+      assert(selectTests(quietWorkers, before354, editing(Set(33))).full),
+      state' = state,
+    }
   })
 
   // D8. A change to a trailing comment alone selects tests: the line it ends is code.
@@ -82,23 +106,7 @@ module witnesses {
     val ch = { edits: Set(), comments: Set(), trailing: Set(10) }
     all {
       assert(selectTests(shopQuiet, mainRules, ch) == { full: false, tests: Set(101) }),
-      assert(selectTests(shopQuiet, mainRules, { edits: Set(), comments: Set(1), trailing: Set() }) == { full: false, tests: Set() }),
-      state' = state,
-    }
-  })
-
-  // D9. Each of the three rules (#347 is on main now, #348 and #349 are open) removes a fan-out, and a change whose fan-out is
-  // now empty "reaches no test", so the fallback turns a narrow selection into a full
-  // run. Customer is reached only by a struct user; nothing sends tag 6.
-  run narrowedToNothingRunsEverythingWitness = init.then(all {
-    val quietWorkers = workers.with("sendsAny", Set())
-    all {
-      assert(selectTests(shopQuiet, mainRules, editing(Set(62))).full == false),
-      assert(selectTests(shopQuiet, pr348, editing(Set(62))) == everything),
-      assert(selectTests(quietWorkers, before347, editing(Set(33))).full == false),
-      assert(selectTests(quietWorkers, mainRules, editing(Set(33))).full),
-      assert(selectTests(shopQuiet, mainRules, editing(Set(81))).full == false),
-      assert(selectTests(shopQuiet, pr349, editing(Set(81))).full),
+      assert(selectTests(shopQuiet, mainRules, { edits: Set(), comments: Set(1), trailing: Set() }) == nothing),
       state' = state,
     }
   })

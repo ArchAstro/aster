@@ -30,16 +30,18 @@ labelled with the name the model gives it:
 | Rule | Reaches |
 |---|---|
 | `named` | definitions that name the one reached |
-| `callback`, `macro`, `unnamed` | every user of the unit |
+| `callback`, `macro`, `unnamed` | every user of the unit, narrowed by #353 and #347: a function nothing calls in a file with no `use` reaches nothing unless it is the edit; a lifecycle callback goes to what may start the process; a message clause to what may send its tag |
 | `top-members`, `top-fanout` | the unit's definitions, and every user of the unit |
 | `route-request` | definitions holding a path literal the route serves |
 | `route-fallback` | every user of the router unit, when no literal does |
 | reflection | definitions that list modules at run time reach every non-test change |
-| fallback | a changed file whose edits alone reach no test runs the project in full |
 
-`Rules` holds the three pull requests as switches (`callbackClauses` for #347,
-which is merged and on in `mainRules`; `schemaTop` for #348 and `routeNothing`
-for #349, which are open), so each can be compared with main.
+`Rules` holds pull requests as switches. `callbackClauses` (#347), `deadSilent`
+and `processStarters` (#353) are on in `mainRules`, and `fullFallback`, the
+"reaches no test, run in full" check #354 removed, is off. `schemaTop` (#348)
+and `routeNothing` (#349) are open and off. Each switch is a small guard in
+`usersOf` / `callbackUsers` / `fanRule` / `linksFrom`, so the old rule is one
+`.with(..)` away.
 
 `execEdges` is the run-time oracle: what may execute what, written from how
 Elixir runs code and not from the analysis. Preload, run-time-built paths and
@@ -55,7 +57,7 @@ Checked on random repos by `npm run quint:properties`:
 2. Precision: each reached definition has a witness path of modelled edges,
    and each fan-out comes from a definition of the right kind.
 3. A comment-only change selects nothing.
-4. Monotonic, among selections that are not a full run.
+4. Monotonic: a superset of edits selects a superset of tests (with `fullFallback` off).
 5. Tests missed by the analysis are missed only through a carve-out.
 
 Properties that do not hold are pinned in `witnesses.qnt` (`npm run quint:test`)

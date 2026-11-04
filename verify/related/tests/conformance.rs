@@ -10,7 +10,7 @@ use aster_related_model::shop::Shop;
 /// the model computes for the same repo and edit.
 ///
 /// Fixed scenarios cover each rule (named, callback, macro, unnamed, top-level,
-/// route, schema shape, reflection, the full-run fallback, comments, carve-outs);
+/// route, schema shape, reflection, a change that reaches no test, comments, carve-outs);
 /// 40 more lay pseudo-random references over the same definitions.
 #[test]
 fn selection_matches_model_for_generated_elixir_repos() {
@@ -48,7 +48,7 @@ fn selection_matches_model_for_generated_elixir_repos() {
     let names: Vec<&str> = outcomes.iter().map(|(name, _)| name.as_str()).collect();
     for expected in [
         "scenarios.namedChainRun",
-        "scenarios.nonMonotoneRun",
+        "scenarios.monotoneRun",
         "scenarios.generated40Run",
     ] {
         assert!(

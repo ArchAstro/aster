@@ -26,10 +26,11 @@ module properties {
   pure val editable: Set[int] = shop.kindOf.keys()
   pure val allRules: Set[Rules] = Set(
     mainRules,
-    { callbackClauses: true, schemaTop: true, routeNothing: false },
-    { callbackClauses: true, schemaTop: false, routeNothing: true },
-    { callbackClauses: true, schemaTop: true, routeNothing: true },
-    { callbackClauses: false, schemaTop: false, routeNothing: false })
+    mainRules.with("schemaTop", true),
+    mainRules.with("routeNothing", true),
+    mainRules.with("schemaTop", true).with("routeNothing", true),
+    mainRules.with("fullFallback", true),
+    mainRules.with("callbackClauses", false).with("deadSilent", false).with("processStarters", false))
 
   var repo: Repo
   var rules: Rules
@@ -72,8 +73,8 @@ module properties {
   val soundness = sound(repo, sel, big)
   // Every selected test has a witness path of modelled edges.
   val precision = witnessed(repo, rules, big) and linksJustified(repo, rules, big)
-  // A superset of edits selects a superset of tests, unless it narrows a full run.
-  val monotonic = monotonePrecise(repo, rules, small, big)
+  // A superset of edits selects a superset of tests (without the full-run fallback #354 removed).
+  val monotonic = (if (rules.fullFallback) monotonePrecise(repo, rules, small, big) else monotone(repo, rules, small, big))
   // Edits to comments alone select nothing.
   val commentsOnly =
     selectTests(repo, rules, { edits: Set(), comments: repo.unitOf.keys().map(d => unit(repo, d)), trailing: Set() }) == noSelection
