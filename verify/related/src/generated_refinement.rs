@@ -156,7 +156,6 @@ pub const RETRIEVE: &[&str] = &[
     "name:edit90_10",
     "name:edit90_91",
     "name:edit91",
-    "name:everything",
     "name:expect_shopQuiet_commentOnly",
     "name:expect_shopQuiet_edit10",
     "name:expect_shopQuiet_edit1010",

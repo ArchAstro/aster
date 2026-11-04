@@ -25,7 +25,6 @@ module scenarios {
   pure val edit1010: Changes = editing(Set(1010))
   pure val commentOnly: Changes = { edits: Set(), comments: Set(1, 2, 101), trailing: Set() }
   pure def picked(ts: Set[int]): Selection = { full: false, tests: ts }
-  pure val everything: Selection = { full: true, tests: shop.testUnits }
 
   pure val expect_shopQuiet_commentOnly: Selection = selectTests(shopQuiet, mainRules, commentOnly)
   pure val expect_shopQuiet_edit10: Selection = selectTests(shopQuiet, mainRules, edit10)
@@ -75,10 +74,12 @@ module scenarios {
   run topLevelRun = init.then(build(shopQuiet, mainRules)).then(change(edit13)).then(selectNow(expect_shopQuiet_edit13))
     .then(all { assert(state.selection == picked(Set(101))), state' = state })
 
-  // A change in Order's functions reaches code that only builds `%Order{}`, on main.
+  // `legacy` is edited and nothing names it, so it reaches the users of Order. `blank`, which
+  // builds `%Order{}`, is a function nothing calls in a file that registers no callbacks:
+  // it reaches nothing.
   /// @conformance
   run schemaShapeRun = init.then(build(shopQuiet, mainRules)).then(change(edit52)).then(selectNow(expect_shopQuiet_edit52))
-    .then(all { assert(state.selection == picked(Set(101, 106, 108))), state' = state })
+    .then(all { assert(state.selection == picked(Set(108))), state' = state })
 
   // The controller action is named by its route; the test that requests the path is selected.
   /// @conformance
@@ -105,16 +106,16 @@ module scenarios {
   run twoEditsRun = init.then(build(shopQuiet, mainRules)).then(change(edit10_31)).then(selectNow(expect_shopQuiet_edit10_31))
     .then(all { assert(state.selection == picked(Set(101, 102))), state' = state })
 
-  // helper is reached by `run`, which nothing uses: the change reaches no test, so the project runs in full.
+  // helper is reached by `run`, which nothing uses: the change reaches no test and selects nothing.
   /// @conformance
-  run unreachedRun = init.then(build(shopQuiet, mainRules)).then(change(edit90)).then(selectNow(expect_shopQuiet_edit90))
-    .then(all { assert(state.selection == everything), state' = state })
+  run deadChangeRun = init.then(build(shopQuiet, mainRules)).then(change(edit90)).then(selectNow(expect_shopQuiet_edit90))
+    .then(all { assert(state.selection == noSelection), state' = state })
 
-  // Adding an edit that reaches a test turns the full run into a narrow one.
+  // Adding an edit that reaches a test adds that test to the selection and removes none.
   /// @conformance
-  run nonMonotoneRun = init.then(build(shopQuiet, mainRules))
+  run monotoneRun = init.then(build(shopQuiet, mainRules))
     .then(change(edit90)).then(selectNow(expect_shopQuiet_edit90))
-    .then(all { assert(state.selection == everything), state' = state })
+    .then(all { assert(state.selection == noSelection), state' = state })
     .then(change(edit90_91)).then(selectNow(expect_shopQuiet_edit90_91))
     .then(all { assert(state.selection == picked(Set(110))), state' = state })
 
@@ -137,10 +138,10 @@ module scenarios {
   run trailingCommentRun = init.then(build(shopQuiet, mainRules)).then(change(trailingOnly)).then(selectNow(expect_shopQuiet_trailingOnly))
     .then(all { assert(state.selection == picked(Set(101))), state' = state })
 
-  // One changed file that reaches a test does not excuse another that reaches none.
+  // A file whose edit reaches no test adds nothing to what the other file reaches.
   /// @conformance
   run twoFilesRun = init.then(build(shopQuiet, mainRules)).then(change(edit90_10)).then(selectNow(expect_shopQuiet_edit90_10))
-    .then(all { assert(state.selection == everything), state' = state })
+    .then(all { assert(state.selection == picked(Set(101))), state' = state })
 
   pure val edit31w: Changes = editing(Set(31))
   pure val expect_workers_edit31: Selection = selectTests(workers, mainRules, edit31w)
