@@ -2978,20 +2978,45 @@ fn a_controller_change_selects_the_tests_that_request_its_routes() {
     );
 }
 
+/// Canonical e2e: a scratch git repo with a Phoenix-style router. One test
+/// requests the orders route by path; another uses the endpoint through
+/// `ConnCase` but names no path. A route whose path no code names (users) is
+/// called only from outside the analysed source, so changing it selects
+/// nothing; the named route selects only the test that requests it.
 #[test]
-fn a_route_no_code_requests_by_path_selects_everything_behind_the_router() {
+fn a_route_no_analysed_code_requests_reaches_no_test_through_the_router() {
     let mut files = WEB.to_vec();
-    files.retain(|(path, _)| *path != "web/test/web/order_test.exs");
-    // The only test of the orders route builds its path at run time.
+    files.retain(|(path, _)| {
+        *path != "web/test/web/order_test.exs" && *path != "web/test/web/user_test.exs"
+    });
+    // Test A requests the orders route by a path literal.
     files.push((
         "web/test/web/order_test.exs",
-        "defmodule Web.OrderTest do\n  use Web.ConnCase\n\n  test \"shows\", %{conn: conn} do\n    assert get(conn, Enum.join([\"\", \"api\", \"orders\", \"7\"], \"/\"))\n  end\nend\n",
+        "defmodule Web.OrderTest do\n  use Web.ConnCase\n\n  test \"shows\", %{conn: conn} do\n    assert get(conn, \"/api/orders/#{7}\")\n  end\nend\n",
     ));
+    // Test B goes through the endpoint but names no path.
+    files.push((
+        "web/test/web/endpoint_test.exs",
+        "defmodule Web.EndpointTest do\n  use Web.ConnCase\n\n  test \"boots\", %{conn: conn} do\n    assert conn\n  end\nend\n",
+    ));
+    let ws = Workspace::new(&files);
+    // Changing the controller of the route nothing requests selects no test.
+    ws.edit(
+        "web/lib/web/user_controller.ex",
+        "{conn, id}",
+        "{conn, id, :ok}",
+    );
+    assert!(
+        ws.plan("test").commands("//web:test").is_empty(),
+        "{:#?}",
+        ws.plan("test")
+    );
+    // Changing the controller of the requested route selects only test A.
     let ws = Workspace::new(&files);
     ws.edit("web/lib/web/orders.ex", "{conn, id}", "{conn, id, :ok}");
     assert_eq!(
         ws.plan("test").commands("//web:test"),
-        ["mix test test/web/order_test.exs test/web/user_test.exs"]
+        ["mix test test/web/order_test.exs"]
     );
 }
 

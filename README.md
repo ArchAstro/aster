@@ -856,8 +856,9 @@ How a change is followed:
   controller is affected, the definitions that hold a matching path literal
   are affected: `"/api/orders/#{id}"` and `~p"/api/orders/#{id}"` match, and
   so does a shorter base such as `"/api/orders"` that code may extend. If no
-  code names a route's path, everything that goes through the router is
-  affected instead.
+  analysed code names a route's path, nothing further is affected: its
+  callers (HTTP clients, shell scripts, browsers) are outside the analysed
+  source, and API calls do not create dependencies.
 - Methods, and functions of an Elixir `defimpl`, are reached through a
   value, so their callers need not import their file. They are matched by
   name, against member accesses (`value.name`) in the changed project and
