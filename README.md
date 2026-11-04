@@ -932,9 +932,33 @@ How a change is followed:
   every definition that uses its file.
 - Elixir code that lists modules at run time
   (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
-  `:code.all_loaded()`) can call into any of them, so it is affected by
-  every source change in its own project and in the projects that one
-  depends on.
+  `:code.all_loaded()`) can call into any of them, but only sees what a
+  listing shows: which modules exist, what they export, which attributes
+  they carry. So it is affected by a source change in its own project or in
+  a project that one depends on only when the change:
+  - touches code outside every function (attributes, `use`, `defstruct`,
+    the `defmodule` line), or edits a macro, a callback, a protocol
+    implementation or a route;
+  - edits a function whose name is dispatched on somewhere in the workspace
+    (an atom such as `function_exported?(module, :run, 0)`, or
+    `module.run()` on a value), including adding or removing it; or
+  - cannot be compared with its old text (a deleted or unparsed file).
+
+  An edit inside the body of any other function does not reach it. Two
+  carve-outs keep the old behaviour of "every source change":
+  - A file that also calls a function picked by a computed name
+    (`apply(module, name, args)`) or reads what a module exports
+    (`module.__info__(:functions)`, `module.module_info(:exports)`).
+  - A file that uses a module through code it cannot see into. A listing is
+    dropped only when the file loads the modules (`Code.ensure_all_loaded/1`,
+    as a test helper does before the suite) and calls nothing else on them:
+    no call on a value, no module outside `Enum`, `Stream`, `Map`, `List`,
+    `Keyword`, `MapSet`, `Application`, `Code`, `Kernel`, no `use` or
+    `import` of another module. Loading early is not observable by a test.
+
+  Not covered: a function that receives the listed modules in another file
+  and dispatches on a name no atom spells out, for instance a name read
+  from configuration and passed in through `apply/3` in that other file.
 - A file that is not source maps to the definitions whose string literals
   name it (by path from anywhere, by bare file name within its own
   project), to the Go declaration that embeds it (`//go:embed`), to the Go

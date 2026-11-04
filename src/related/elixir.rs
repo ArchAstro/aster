@@ -1241,4 +1241,37 @@ end
         assert_eq!(bare("b"), ["Shop.Pool"]);
         assert_eq!(bare("c"), ["Shop.Room"]);
     }
+
+    fn reflection_of(source: &str) -> Vec<Option<&'static str>> {
+        let facts = extract(Path::new("lib/shop/registry.ex"), source);
+        facts.defs.iter().map(|d| d.reflects).collect()
+    }
+
+    #[test]
+    fn listing_modules_is_told_apart_by_what_the_file_does_with_them() {
+        let list = "defmodule Shop.Registry do\n  def modules do\n    Application.spec(:shop, :modules)\n  end\n";
+        // Probing exports is the plain reason.
+        let probe = format!("{list}  def audit, do: Enum.filter(modules(), &function_exported?(&1, :tax, 1))\nend\n");
+        assert_eq!(reflection_of(&probe)[0], Some(LISTS_MODULES));
+        // Applying a function picked at run time is the broad one.
+        let apply =
+            format!("{list}  def run(name), do: Enum.each(modules(), &apply(&1, name, []))\nend\n");
+        assert_eq!(reflection_of(&apply)[0], Some(LISTS_AND_APPLIES));
+        let info =
+            format!("{list}  def fns, do: Enum.map(modules(), & &1.__info__(:functions))\nend\n");
+        assert_eq!(reflection_of(&info)[0], Some(LISTS_AND_APPLIES));
+        // `apply` with the name written out is an atom the index follows.
+        let named =
+            format!("{list}  def run, do: Enum.each(modules(), &apply(&1, :tax, [1]))\nend\n");
+        assert_eq!(reflection_of(&named)[0], Some(LISTS_MODULES));
+    }
+
+    #[test]
+    fn a_file_that_only_loads_what_it_lists_does_not_reflect() {
+        let loads = "defmodule Shop.Preload do\n  def load, do: Application.spec(:shop, :modules) |> Code.ensure_all_loaded()\nend\n";
+        assert_eq!(reflection_of(loads), [None]);
+        // Anything else done with the modules keeps it.
+        let looks = "defmodule Shop.Preload do\n  def load do\n    mods = Application.spec(:shop, :modules)\n    Code.ensure_all_loaded(mods)\n    Enum.filter(mods, &Shop.Check.worker?/1)\n  end\nend\n";
+        assert_eq!(reflection_of(looks), [Some(LISTS_MODULES)]);
+    }
 }

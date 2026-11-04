@@ -369,23 +369,177 @@ end
     );
 }
 
-#[test]
-fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
+/// A shop whose registry lists every module of the app, the way an
+/// architecture test or a schema registry does, and what it then does with
+/// the modules it finds.
+fn shop_with_registry(registry_body: &str) -> Workspace {
     let mut files = ELIXIR.to_vec();
-    // Reaches every module's functions without naming one of them.
+    let registry = format!(
+        "defmodule Shop.Registry do\n  def modules do\n    {{:ok, modules}} = :application.get_key(:shop, :modules)\n    modules\n  end\n\n{registry_body}end\n"
+    );
+    let registry: &'static str = Box::leak(registry.into_boxed_str());
+    files.push(("shop/lib/shop/registry.ex", registry));
     files.push((
-        "shop/test/shop/modules_test.exs",
-        "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"every module answers\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    for module <- modules, do: assert(module.module_info(:module) == module)\n  end\nend\n",
+        "shop/test/shop/registry_test.exs",
+        "defmodule Shop.RegistryTest do\n  use ExUnit.Case\n\n  test \"every module is listed\" do\n    assert Shop.Registry.audit() != nil\n  end\nend\n",
     ));
-    let ws = Workspace::new(&files);
-    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    Workspace::new(&files)
+}
+
+#[test]
+fn a_registry_that_only_probes_modules_is_not_rerun_by_a_price_change() {
+    // Setup: the registry lists the shop's modules and asks whether each one
+    // exports `tax/1`. It never calls into them.
+    let ws = shop_with_registry(
+        "  def audit do\n    Enum.filter(modules(), &function_exported?(&1, :tax, 1))\n  end\n",
+    );
+
+    // Action: the body of `sum/1` changes. No module is added, no function
+    // appears or disappears, no attribute moves, and the registry never asks
+    // for `sum`.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+
+    // Outcome: the cart test reaches `sum/1` through `Cart.total/1`. The
+    // registry test only sees which modules exist and what they export, which
+    // did not change.
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//shop:test"),
-        ["mix test test/shop/modules_test.exs test/shop/tax_test.exs"]
+        ["mix test test/shop/cart_test.exs"],
+        "{}",
+        plan.notes("//shop:test")
+    );
+}
+
+#[test]
+fn a_registry_that_probes_modules_is_rerun_when_a_module_changes_shape() {
+    let ws = shop_with_registry(
+        "  def audit do\n    Enum.filter(modules(), &function_exported?(&1, :tax, 1))\n  end\n",
+    );
+
+    // Action: a struct is declared on `Shop.Pricing`, which changes what the
+    // module exports (`__struct__/0`) outside any function body.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "  def sum(items)",
+        "  defstruct rate: 0.2\n\n  def sum(items)",
+    );
+
+    // Outcome: the registry test runs, with the note that explains why,
+    // beside the tests that reach the module through the file.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/cart_test.exs test/shop/registry_test.exs test/shop/tax_test.exs"]
     );
     let notes = plan.notes("//shop:test");
     assert!(notes.contains("lists modules at run time"), "{notes}");
+}
+
+#[test]
+fn a_registry_that_probes_a_function_by_name_is_rerun_when_that_function_is_removed() {
+    let ws = shop_with_registry(
+        "  def audit do\n    Enum.filter(modules(), &function_exported?(&1, :tax, 1))\n  end\n",
+    );
+
+    // Action: `tax/1` is deleted. The registry names it only as an atom.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "\n  def tax(amount), do: amount * 0.2\n",
+        "\n",
+    );
+
+    // Outcome: the registry test runs because the registry asks for `:tax`.
+    let plan = ws.plan("test");
+    let commands = plan.commands("//shop:test");
+    assert!(
+        commands[0].contains("test/shop/registry_test.exs"),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn a_registry_that_calls_what_it_finds_is_rerun_when_the_called_function_changes() {
+    // Setup: the registry calls `tax/1` on every module that exports it,
+    // through a value (`module.tax(100)`), so no source names `Shop.Pricing`.
+    let ws = shop_with_registry(
+        "  def audit do\n    for module <- modules(), function_exported?(module, :tax, 1), do: module.tax(100)\n  end\n",
+    );
+
+    // Action: only the body of `tax/1` changes.
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+
+    // Outcome: the registry test runs; what it calls changed.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/registry_test.exs test/shop/tax_test.exs"]
+    );
+}
+
+#[test]
+fn a_registry_that_applies_a_computed_name_is_rerun_by_any_body_edit() {
+    // Setup: the registry applies whichever function name it was handed, so
+    // no atom in the source says which function it reaches.
+    let ws = shop_with_registry(
+        "  def audit do\n    name = Application.get_env(:shop, :audited)\n    for module <- modules(), do: apply(module, name, [100])\n  end\n",
+    );
+
+    // Action: a body edit in a module the registry could reach.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+
+    // Outcome: the registry test runs together with the tests that name
+    // `sum/1`, and the plan says why.
+    let plan = ws.plan("test");
+    let commands = plan.commands("//shop:test");
+    assert!(
+        commands[0].contains("test/shop/registry_test.exs"),
+        "{commands:?}"
+    );
+    let notes = plan.notes("//shop:test");
+    assert!(notes.contains("computed name"), "{notes}");
+}
+
+#[test]
+fn a_code_preload_helper_that_only_loads_modules_does_not_rerun_its_callers() {
+    // Setup: a helper lists the app's modules and loads them, as a
+    // test_helper does before the suite. It looks at nothing inside them.
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "shop/lib/shop/preload.ex",
+        "defmodule Shop.Preload do\n  def load do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    Code.ensure_all_loaded(modules)\n  end\nend\n",
+    ));
+    files.push((
+        "shop/test/shop/boot_test.exs",
+        "defmodule Shop.BootTest do\n  use ExUnit.Case\n\n  test \"boots\" do\n    assert Shop.Preload.load() == :ok\n  end\nend\n",
+    ));
+    let ws = Workspace::new(&files);
+
+    // Action: a struct is declared, which is a shape change that reaches any
+    // code that looks at modules.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "  def sum(items)",
+        "  defstruct rate: 0.2\n\n  def sum(items)",
+    );
+
+    // Outcome: loading a module early is not something a test can observe,
+    // so the boot test stays out of the plan.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/cart_test.exs test/shop/tax_test.exs"],
+        "{}",
+        plan.notes("//shop:test")
+    );
 }
 
 #[test]
