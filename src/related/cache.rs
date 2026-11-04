@@ -28,8 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const ROOT: &str = "related-facts";
 
 /// Bump when the stored shape of facts changes without any extractor source
-/// changing. Facts that carry `aster:` annotations are format 2.
-const FORMAT: &str = "facts-format-2";
+/// changing. Facts that carry `aster:` annotations are format 2; a reflection reason that tells
+/// computed-name calls apart is format 3.
+const FORMAT: &str = "facts-format-3";
 
 /// Everything that decides what facts a given source text yields.
 fn build_id() -> String {

@@ -9,6 +9,7 @@ use super::resolve::{Resolvers, Workspace};
 use super::{elixir, go, js, python, rust};
 use crate::discovery::DiscoveredProject;
 use crate::graph::ProjectGraph;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -1694,6 +1695,8 @@ impl<'a> Index<'a> {
             };
 
         let mut run = Run::new(self, false);
+        // Built when the first change needs it.
+        let dynamic = OnceCell::new();
         // Changed sources that belong to their project's own language, with
         // the project that owns them.
         let mut own_sources: Vec<(&Change, usize)> = Vec::new();
@@ -1781,7 +1784,7 @@ impl<'a> Index<'a> {
                     let before = run.affected.len();
                     run.seed(change, file);
                     if run.affected.len() > before {
-                        self.seed_reflection(&mut run, change, file);
+                        self.seed_reflection(&mut run, change, file, &dynamic);
                     }
                     let family = self.sources[file as usize].facts.family;
                     match project {
@@ -1895,7 +1898,13 @@ impl<'a> Index<'a> {
     /// Mark the definitions that list modules at run time. They reach the
     /// changed code without naming it, from the project that holds it or
     /// from any project that depends on that one.
-    fn seed_reflection(&self, run: &mut Run, change: &Change, file: u32) {
+    fn seed_reflection(
+        &self,
+        run: &mut Run,
+        change: &Change,
+        file: u32,
+        dynamic: &OnceCell<HashSet<String>>,
+    ) {
         let changed = &self.sources[file as usize];
         if changed.facts.is_test_file {
             return;
@@ -1903,6 +1912,14 @@ impl<'a> Index<'a> {
         let Some(project) = changed.project else {
             return;
         };
+        // Code that only lists modules does not see an edit inside a function
+        // body; see `reflection_sees`.
+        let seen = changed.facts.family != Family::Elixir
+            || self.reflection_sees(
+                change,
+                file,
+                dynamic.get_or_init(|| self.dispatched_names()),
+            );
         for (other, source) in self.sources.iter().enumerate() {
             let reaches = source.facts.family == changed.facts.family
                 && source
@@ -1914,10 +1931,74 @@ impl<'a> Index<'a> {
             let defs = source.facts.defs.iter().enumerate();
             let top = std::iter::once((TOP as usize, &source.facts.top));
             for (def, how) in defs.chain(top).filter_map(|(i, d)| Some((i, d.reflects?))) {
+                if how == super::elixir::LISTS_MODULES && !seen {
+                    continue;
+                }
                 let why = format!("{} changed, and this {how}", change.path.display());
                 run.mark((other as u32, def as u32), Why::Changed(why));
             }
         }
+    }
+
+    /// Whether an edit to an Elixir source file can be seen by code that
+    /// lists modules at run time without naming them.
+    ///
+    /// Listing sees which modules exist, what they export and which
+    /// attributes they carry; calling what it finds reaches a function by
+    /// the name it is called with. So it is not affected by an edit inside
+    /// a function body unless that function's name is dispatched on
+    /// somewhere in the project (`module.run()`, `:run`, `apply(m, :run, [])`),
+    /// which `dynamic` holds. It is affected by:
+    ///
+    /// - code outside every definition (attributes, `use`, `defstruct`, the
+    ///   `defmodule` line), which decides what a module exports and carries;
+    /// - a macro, a callback, a protocol implementation or a route, which
+    ///   the compiler or a framework invokes without a call to follow;
+    /// - a definition whose name is dispatched on, including one that was
+    ///   added or removed (`function_exported?(module, :run, 0)`);
+    /// - a file that cannot be compared (deleted, unparsed, no old text).
+    fn reflection_sees(&self, change: &Change, file: u32, dynamic: &HashSet<String>) -> bool {
+        let facts = &self.sources[file as usize].facts;
+        if change.deleted || change.new_lines.is_none() || facts.parse_error {
+            return true;
+        }
+        let old = change
+            .old_source
+            .as_ref()
+            .map(|old| extract(facts.family, &change.path, old));
+        let sees = |facts: &FileFacts, lines: &Option<Vec<(usize, usize)>>| {
+            lines.iter().flatten().any(|&(start, end)| {
+                (start..=end).any(|line| match facts.class_of(line) {
+                    LineClass::Inert => false,
+                    LineClass::Top | LineClass::Import(_) => true,
+                    LineClass::Def(def) => {
+                        let def = &facts.defs[def as usize];
+                        def.kind == DefKind::Macro
+                            || def.callback
+                            || def.route.is_some()
+                            || !def.via.is_empty()
+                            || dynamic.contains(def.name.as_str())
+                    }
+                })
+            })
+        };
+        match old {
+            Some(old) if !old.parse_error => {
+                sees(facts, &change.new_lines) || sees(&old, &change.old_lines)
+            }
+            _ => true,
+        }
+    }
+
+    /// Names that code in the workspace dispatches on at run time: atoms,
+    /// and functions called on a value, in any Elixir definition.
+    fn dispatched_names(&self) -> HashSet<String> {
+        self.sources
+            .iter()
+            .filter(|source| source.facts.family == Family::Elixir)
+            .flat_map(|source| source.facts.defs.iter().chain([&source.facts.top]))
+            .flat_map(|def| def.atoms.iter().cloned())
+            .collect()
     }
 
     /// Every definition `run` marked, each with the one it was reached

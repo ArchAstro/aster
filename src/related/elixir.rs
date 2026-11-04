@@ -71,6 +71,12 @@ struct Walker<'a> {
     impl_of: Vec<String>,
     /// Path prefixes and module prefixes of the enclosing route scopes.
     route_scopes: Vec<(String, Option<String>)>,
+    /// Some call in the file picks a function by a computed name.
+    applies: bool,
+    /// Some call in the file looks inside a module (see [`inspects_module`]).
+    inspects: bool,
+    /// Some call in the file loads modules (see [`loads_module`]).
+    loads: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +110,9 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         inert: Vec::new(),
         impl_of: Vec::new(),
         route_scopes: Vec::new(),
+        applies: false,
+        inspects: false,
+        loads: false,
     };
     walker.collect_aliases(tree.root_node());
     let scope = Scope {
@@ -114,9 +123,102 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     };
     walker.block(tree.root_node(), scope, None);
     let mut facts = walker.facts;
+    if walker.loads && !walker.inspects {
+        // Loading what it lists is all the file does with it, and a test
+        // cannot tell a module that was loaded early from one loaded on use.
+        for def in facts.defs.iter_mut().chain([&mut facts.top]) {
+            if def.reflects == Some(LISTS_MODULES) {
+                def.reflects = None;
+            }
+        }
+    }
+    if walker.applies {
+        for def in facts.defs.iter_mut().chain([&mut facts.top]) {
+            if def.reflects == Some(LISTS_MODULES) {
+                def.reflects = Some(LISTS_AND_APPLIES);
+            }
+        }
+    }
     facts.classify_lines(source, &walker.inert);
     super::annotations::apply(&mut facts, &tree, source);
     facts
+}
+
+/// Why a definition that lists modules is affected by a change to the
+/// module's shape (what it exports, its attributes, its macros) but not by
+/// an edit inside a function body.
+pub const LISTS_MODULES: &str = "lists modules at run time";
+/// A definition that lists modules and also calls what it finds by a name
+/// computed at run time (`apply(module, name, args)`) or reads what modules
+/// export (`module.__info__(:functions)`). Nothing in its source names the
+/// functions it reaches, so every source change in the project reaches it.
+pub const LISTS_AND_APPLIES: &str =
+    "lists modules at run time and calls what it finds by a computed name";
+
+/// Modules whose functions never look inside a module they are given.
+const OPAQUE_MODULES: &[&str] = &[
+    "Application",
+    "Code",
+    "Enum",
+    "Kernel",
+    "Keyword",
+    "List",
+    "Map",
+    "MapSet",
+    "Path",
+    "Stream",
+    ":application",
+    ":code",
+    ":lists",
+    ":maps",
+    "__MODULE__",
+];
+/// Functions that look inside a module: what it exports, or how it is built.
+const INSPECTORS: &[&str] = &[
+    "function_exported?",
+    "macro_exported?",
+    "module_info",
+    "__info__",
+    "behaviour_info",
+    "apply",
+];
+
+/// Whether a call looks inside a module, or hands one to code this file
+/// cannot see into. Calling a function on a value does, and so does calling
+/// any module outside [`OPAQUE_MODULES`].
+fn inspects_module(receiver: Option<&str>, function: &str) -> bool {
+    INSPECTORS.contains(&function)
+        || receiver.is_some_and(|module| !OPAQUE_MODULES.contains(&module))
+}
+
+/// Whether a call loads a module without looking at it.
+fn loads_module(receiver: &str, function: &str) -> bool {
+    receiver == "Code"
+        && matches!(
+            function,
+            "ensure_loaded" | "ensure_all_loaded" | "ensure_loaded!" | "ensure_all_loaded!"
+        )
+}
+
+/// Whether a call picks a function of another module by a name that is not
+/// written in the source, or reads the functions a module exports.
+fn applies_by_computed_name(
+    receiver: Option<&str>,
+    function: &str,
+    call: Node,
+    source: &str,
+) -> bool {
+    let args = arguments(call);
+    match (receiver, function) {
+        (None | Some(":erlang" | "Kernel"), "apply") => args.len() == 3 && args[1].kind() != "atom",
+        (_, "__info__") => args
+            .first()
+            .is_none_or(|a| !matches!(text(*a, source), ":module" | ":attributes" | ":compile")),
+        (_, "module_info") => args
+            .first()
+            .is_none_or(|a| !matches!(text(*a, source), ":module" | ":attributes" | ":compile")),
+        _ => false,
+    }
 }
 
 /// Whether a remote call lists modules at run time: every module of an
@@ -408,8 +510,12 @@ impl Walker<'_> {
                     let receiver = text(left, self.source);
                     let receiver_module = self.expand(receiver);
                     self.send_site(scope.owner, Some(&receiver_module), &function, node);
+                    self.applies |=
+                        applies_by_computed_name(Some(receiver), &function, node, self.source);
+                    self.inspects |= inspects_module(Some(receiver), &function);
+                    self.loads |= loads_module(receiver, &function);
                     if lists_modules(receiver, &function, node, self.source) {
-                        self.facts.owner(scope.owner).reflects = Some("lists modules at run time");
+                        self.facts.owner(scope.owner).reflects = Some(LISTS_MODULES);
                     }
                     if left.kind() == "alias" {
                         // `Module.function(...)`.
@@ -559,12 +665,15 @@ impl Walker<'_> {
             return;
         }
 
+        self.applies |= applies_by_computed_name(None, name, node, self.source);
+        self.inspects |= inspects_module(None, name);
         match name {
             // Already recorded; the directive itself is not a use.
             "alias" => return,
             "use" | "import" => {
                 // Everything in the file can call what these bring in.
                 for arg in arguments(node) {
+                    self.inspects |= !OPAQUE_MODULES.contains(&text(arg, self.source));
                     if arg.kind() == "alias" {
                         let full = self.expand(text(arg, self.source));
                         self.facts.uses_all.push(full);
