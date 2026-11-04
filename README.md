@@ -930,6 +930,23 @@ How a change is followed:
   any message, a system message (`:DOWN`, `:EXIT`, `:timeout`, sockets), and
   a state-function state machine or LiveView callback keep the rule above:
   every definition that uses its file.
+- An Elixir router `pipeline` is a definition of its own: the plugs in its
+  body run for the routes in the scopes that `pipe_through` it, so a change
+  to a plug (or to the pipeline) reaches those routes, and from them the
+  tests that request their paths. It does not reach the rest of the router,
+  nor the endpoint and test cases that go through it. A `pipe_through` the
+  index cannot attribute to a route (outside a scope, or in a scope whose
+  path is computed) or a router function that names the pipeline sends the
+  change to the router's file-level code, which every user of the router
+  sees. A pipeline nothing pipes through runs for no route; a macro from
+  another file that pipes through it by a name written only there is not
+  seen. A `plug` outside a pipeline runs for every route.
+- An Elixir `@impl` of a behaviour the workspace declares (`@callback
+  deliver(...)`), other than a framework's (`init`, `call`, `handle_*`, ...),
+  is also reached by the definitions of its project that call that name on a
+  value (`mod.deliver(msg)`, `apply(mod, :deliver, args)`): the module is
+  read from configuration or an argument, so no code names it. A common
+  name (`get`) makes many definitions callers.
 - Elixir code that lists modules at run time
   (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
   `:code.all_loaded()`) can call into any of them, so it is affected by

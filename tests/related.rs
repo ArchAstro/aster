@@ -2835,6 +2835,334 @@ fn a_route_no_code_requests_by_path_selects_everything_behind_the_router() {
     );
 }
 
+/// A Phoenix-shaped web app whose router has two pipelines. Only the
+/// `:threaded` one runs `Web.LoadThread`. One request test per route and a
+/// unit test of the plug.
+const PIPELINES: &[(&str, &str)] = &[
+    (
+        "web/mix.exs",
+        "defmodule Web.MixProject do\n  use Mix.Project\n  def project, do: [app: :web, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "web/lib/web/router.ex",
+        r#"defmodule Web.Router do
+  use Web, :router
+
+  pipeline :open do
+    plug :accepts, ["json"]
+  end
+
+  pipeline :threaded do
+    plug :accepts, ["json"]
+    plug Web.LoadThread
+  end
+
+  scope "/api/pings", Web do
+    pipe_through :open
+    get "/", PingController, :show
+  end
+
+  scope "/api/threads", Web do
+    pipe_through [:threaded]
+    get "/:id", ThreadController, :show
+  end
+end
+"#,
+    ),
+    (
+        "web/lib/web/endpoint.ex",
+        "defmodule Web.Endpoint do\n  use Phoenix.Endpoint, otp_app: :web\n\n  plug Web.Router\nend\n",
+    ),
+    (
+        "web/lib/web/load_thread.ex",
+        "defmodule Web.LoadThread do\n  def init(opts), do: opts\n\n  def call(conn, _opts), do: Map.put(conn, :thread, conn.params[\"id\"])\nend\n",
+    ),
+    (
+        "web/lib/web/ping_controller.ex",
+        "defmodule Web.PingController do\n  def show(conn, _params), do: conn\nend\n",
+    ),
+    (
+        "web/lib/web/thread_controller.ex",
+        "defmodule Web.ThreadController do\n  def show(conn, _params), do: conn\nend\n",
+    ),
+    (
+        "web/test/support/conn_case.ex",
+        "defmodule Web.ConnCase do\n  use ExUnit.CaseTemplate\n\n  using do\n    quote do\n      @endpoint Web.Endpoint\n    end\n  end\nend\n",
+    ),
+    (
+        "web/test/web/ping_test.exs",
+        "defmodule Web.PingTest do\n  use Web.ConnCase\n\n  test \"pings\", %{conn: conn} do\n    assert get(conn, \"/api/pings\")\n  end\nend\n",
+    ),
+    (
+        "web/test/web/thread_test.exs",
+        "defmodule Web.ThreadTest do\n  use Web.ConnCase\n\n  test \"shows\", %{conn: conn} do\n    assert get(conn, \"/api/threads/#{7}\")\n  end\nend\n",
+    ),
+    (
+        "web/test/web/load_thread_test.exs",
+        "defmodule Web.LoadThreadTest do\n  use ExUnit.Case\n\n  test \"assigns\" do\n    assert Web.LoadThread.call(%{params: %{\"id\" => 1}}, []).thread == 1\n  end\nend\n",
+    ),
+];
+
+/// Change `Web.LoadThread.call` in `files` and list the tests selected.
+fn plug_change_selects(files: &[(&'static str, &'static str)]) -> Vec<String> {
+    let ws = Workspace::new(files);
+    ws.edit(
+        "web/lib/web/load_thread.ex",
+        "conn.params[\"id\"]",
+        "conn.params[\"id\"] || 0",
+    );
+    ws.plan("test").commands("//web:test").to_vec()
+}
+
+/// Canonical end-to-end proof for plug dispatch: a plug runs in the
+/// pipelines that list it, so its change selects the tests that request
+/// those pipelines' routes, not every test that goes through the router.
+#[test]
+fn a_plug_change_selects_the_tests_that_request_the_routes_behind_its_pipeline() {
+    // Setup: a scratch git repo with a router (an open pipeline and a
+    // threaded one that plugs `Web.LoadThread`), a request test per route,
+    // and a unit test of the plug.
+    //
+    // Action: change the plug's `call`, a callback nothing invokes by name.
+    // The router names the plug, but only inside the `:threaded` pipeline,
+    // which only `/api/threads` pipes through.
+    //
+    // Outcome: the test that requests that route runs, and so does the
+    // plug's own test. The ping test goes through the same router and
+    // endpoint and does not.
+    assert_eq!(
+        plug_change_selects(PIPELINES),
+        ["mix test test/web/load_thread_test.exs test/web/thread_test.exs"]
+    );
+}
+
+#[test]
+fn a_plug_change_graph_runs_through_its_pipeline_to_the_routes_only() {
+    let ws = Workspace::new(PIPELINES);
+    ws.edit(
+        "web/lib/web/load_thread.ex",
+        "conn.params[\"id\"]",
+        "conn.params[\"id\"] || 0",
+    );
+    let output = ws.aster(&["graph", "--source", "--ext", "ex"]);
+    let graph = String::from_utf8_lossy(&output.stdout);
+    assert!(graph.contains("pipeline threaded"), "{graph}");
+    assert!(graph.contains("route /api/threads/:id"), "{graph}");
+    assert!(!graph.contains("route /api/pings"), "{graph}");
+    assert!(!graph.contains("ping_test.exs"), "{graph}");
+}
+
+/// The tests every router-level reading selects: the plug's own, and the
+/// request tests of every route.
+const WHOLE_ROUTER: [&str; 1] =
+    ["mix test test/web/load_thread_test.exs test/web/ping_test.exs test/web/thread_test.exs"];
+
+#[test]
+fn a_pipeline_behind_a_scope_with_a_computed_path_reaches_the_whole_router() {
+    // The scope's path is built at run time, so no request path matches the
+    // route it holds. Nothing names it, and anything that goes through the
+    // router may reach it.
+    let router = r#"defmodule Web.Router do
+  use Web, :router
+
+  pipeline :open do
+    plug :accepts, ["json"]
+  end
+
+  pipeline :threaded do
+    plug Web.LoadThread
+  end
+
+  scope "/api/pings", Web do
+    pipe_through :open
+    get "/", PingController, :show
+  end
+
+  scope "/api/#{Web.prefix()}", Web do
+    pipe_through [:threaded]
+    get "/threads/:id", ThreadController, :show
+  end
+end
+"#;
+    let files = with(PIPELINES, &[("web/lib/web/router.ex", router)]);
+    assert_eq!(plug_change_selects(&files), WHOLE_ROUTER);
+}
+
+#[test]
+fn a_pipeline_no_scope_pipes_through_reaches_no_route() {
+    // Nothing in the router pipes through `:threaded`, so the plug runs
+    // for no request: only the plug's own test is affected.
+    let router = r#"defmodule Web.Router do
+  use Web, :router
+
+  pipeline :threaded do
+    plug Web.LoadThread
+  end
+
+  scope "/api/pings", Web do
+    get "/", PingController, :show
+  end
+
+  scope "/api/threads", Web do
+    get "/:id", ThreadController, :show
+  end
+end
+"#;
+    let files = with(PIPELINES, &[("web/lib/web/router.ex", router)]);
+    assert_eq!(
+        plug_change_selects(&files),
+        ["mix test test/web/load_thread_test.exs"]
+    );
+}
+
+#[test]
+fn a_pipeline_a_router_function_names_reaches_the_whole_router() {
+    // The router builds its pipe_through list at run time, from a function
+    // that names the pipeline.
+    let router = r#"defmodule Web.Router do
+  use Web, :router
+
+  pipeline :threaded do
+    plug Web.LoadThread
+  end
+
+  def piped, do: [:threaded]
+
+  scope "/api/pings", Web do
+    pipe_through piped()
+    get "/", PingController, :show
+  end
+
+  scope "/api/threads", Web do
+    get "/:id", ThreadController, :show
+  end
+end
+"#;
+    let files = with(PIPELINES, &[("web/lib/web/router.ex", router)]);
+    assert_eq!(plug_change_selects(&files), WHOLE_ROUTER);
+}
+
+#[test]
+fn a_plug_listed_outside_a_pipeline_reaches_the_whole_router() {
+    // A plug at the top of the router runs for every request.
+    let router = r#"defmodule Web.Router do
+  use Web, :router
+
+  plug Web.LoadThread
+
+  scope "/api/pings", Web do
+    get "/", PingController, :show
+  end
+
+  scope "/api/threads", Web do
+    get "/:id", ThreadController, :show
+  end
+end
+"#;
+    let files = with(PIPELINES, &[("web/lib/web/router.ex", router)]);
+    assert_eq!(plug_change_selects(&files), WHOLE_ROUTER);
+}
+
+#[test]
+fn a_pipeline_edit_selects_the_requests_of_its_routes() {
+    let ws = Workspace::new(PIPELINES);
+    ws.edit(
+        "web/lib/web/router.ex",
+        "plug :accepts, [\"json\"]\n    plug Web.LoadThread",
+        "plug :accepts, [\"html\"]\n    plug Web.LoadThread",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//web:test"),
+        ["mix test test/web/thread_test.exs"]
+    );
+}
+
+/// A supervisor that starts a worker from a child spec, with a test of the
+/// supervisor and an unrelated test.
+const SUPERVISED: &[(&str, &str)] = &[
+    (
+        "app/mix.exs",
+        "defmodule App.MixProject do\n  use Mix.Project\n  def project, do: [app: :app, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "app/lib/app/worker.ex",
+        "defmodule App.Worker do\n  use GenServer\n\n  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)\n\n  @impl true\n  def init(arg), do: {:ok, arg}\nend\n",
+    ),
+    (
+        "app/lib/app/supervisor.ex",
+        "defmodule App.Supervisor do\n  use Supervisor\n\n  def start_link(arg), do: Supervisor.start_link(__MODULE__, arg)\n\n  @impl true\n  def init(_arg), do: Supervisor.init([{App.Worker, []}], strategy: :one_for_one)\nend\n",
+    ),
+    (
+        "app/lib/app/unrelated.ex",
+        "defmodule App.Unrelated do\n  def one, do: 1\nend\n",
+    ),
+    (
+        "app/test/app/supervisor_test.exs",
+        "defmodule App.SupervisorTest do\n  use ExUnit.Case\n\n  test \"starts\" do\n    assert {:ok, _} = App.Supervisor.start_link([])\n  end\nend\n",
+    ),
+    (
+        "app/test/app/unrelated_test.exs",
+        "defmodule App.UnrelatedTest do\n  use ExUnit.Case\n\n  test \"one\" do\n    assert App.Unrelated.one() == 1\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_genserver_started_from_a_child_spec_reaches_the_tests_of_its_supervisor() {
+    let ws = Workspace::new(SUPERVISED);
+    ws.edit("app/lib/app/worker.ex", "{:ok, arg}", "{:ok, [arg]}");
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        ["mix test test/app/supervisor_test.exs"]
+    );
+}
+
+/// A behaviour with an implementation chosen by a module variable: the
+/// caller names neither the implementation nor the behaviour.
+const DISPATCHED: &[(&str, &str)] = &[
+    (
+        "app/mix.exs",
+        "defmodule App.MixProject do\n  use Mix.Project\n  def project, do: [app: :app, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "app/lib/app/notifier.ex",
+        "defmodule App.Notifier do\n  @callback deliver(term) :: :ok\nend\n",
+    ),
+    (
+        "app/lib/app/notifier/email.ex",
+        "defmodule App.Notifier.Email do\n  @behaviour App.Notifier\n\n  @impl true\n  def deliver(message), do: {:email, message}\nend\n",
+    ),
+    (
+        "app/lib/app/dispatch.ex",
+        "defmodule App.Dispatch do\n  def notify(message) do\n    mod = Application.get_env(:app, :notifier)\n    mod.deliver(message)\n  end\nend\n",
+    ),
+    (
+        "app/lib/app/unrelated.ex",
+        "defmodule App.Unrelated do\n  def one, do: 1\nend\n",
+    ),
+    (
+        "app/test/app/dispatch_test.exs",
+        "defmodule App.DispatchTest do\n  use ExUnit.Case\n\n  test \"notifies\" do\n    assert App.Dispatch.notify(1)\n  end\nend\n",
+    ),
+    (
+        "app/test/app/unrelated_test.exs",
+        "defmodule App.UnrelatedTest do\n  use ExUnit.Case\n\n  test \"one\" do\n    assert App.Unrelated.one() == 1\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_behaviour_called_through_a_variable_reaches_the_tests_of_its_caller() {
+    let ws = Workspace::new(DISPATCHED);
+    ws.edit(
+        "app/lib/app/notifier/email.ex",
+        "{:email, message}",
+        "{:mail, message}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        ["mix test test/app/dispatch_test.exs"]
+    );
+}
+
 #[test]
 fn a_wrapper_in_a_project_with_its_own_code_does_not_follow_other_projects() {
     let mut files = sharded();

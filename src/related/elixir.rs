@@ -2,9 +2,10 @@
 //! mentions (through `alias`), and ExUnit tests.
 
 use super::facts::{
-    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner, WILDCARD,
+    children, parse, span, text, Def, DefKind, Family, FileFacts, ImportLine, Owner, ANY_PIPELINE,
+    WILDCARD,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -20,6 +21,8 @@ const DEFINERS: &[&str] = &[
     "defnp",
 ];
 const MODULE_DEFINERS: &[&str] = &["defmodule", "defprotocol", "defimpl"];
+/// Calls inside a router scope that declare no route.
+const NOT_ROUTES: &[&str] = &["alias", "import", "require", "use", "scope", "plug"];
 const TEST_MACROS: &[&str] = &["test", "property", "feature"];
 /// Attributes that never change behaviour: documentation and types.
 const INERT_ATTRIBUTES: &[&str] = &[
@@ -70,7 +73,18 @@ struct Walker<'a> {
     /// The protocol and type of the `defimpl` being walked.
     impl_of: Vec<String>,
     /// Path prefixes and module prefixes of the enclosing route scopes.
-    route_scopes: Vec<(String, Option<String>)>,
+    route_scopes: Vec<RouteScope>,
+}
+
+/// A `scope` of a router being walked.
+struct RouteScope {
+    prefix: String,
+    alias: Option<String>,
+    /// Pipelines the scope pipes through so far, [`ANY_PIPELINE`] when one
+    /// is named another way than an atom.
+    pipes: BTreeSet<String>,
+    /// The scope's path is computed, so which routes it holds is unknown.
+    opaque: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -318,6 +332,9 @@ impl Walker<'_> {
                     continue;
                 }
                 if attribute.is_some_and(|a| INERT_ATTRIBUTES.contains(&a)) {
+                    if matches!(attribute, Some("callback" | "macrocallback")) {
+                        self.declare_callback(child);
+                    }
                     self.inert.push((child.start_byte(), child.end_byte()));
                     continue;
                 }
@@ -334,6 +351,30 @@ impl Walker<'_> {
             if child.kind() != "comment" {
                 pending_impl = false;
             }
+        }
+    }
+
+    /// Record the name a `@callback name(args) :: type` attribute declares.
+    fn declare_callback(&mut self, attribute: Node) {
+        let Some(mut head) = attribute
+            .child_by_field_name("operand")
+            .and_then(|operand| arguments(operand).first().copied())
+        else {
+            return;
+        };
+        while head.kind() == "binary_operator" {
+            let Some(left) = head.child_by_field_name("left") else {
+                return;
+            };
+            head = left;
+        }
+        let name = match head.kind() {
+            "call" => call_name(head, self.source),
+            "identifier" => Some(text(head, self.source)),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.facts.declared.insert(name.to_string());
         }
     }
 
@@ -422,7 +463,9 @@ impl Walker<'_> {
                         // `value.function(...)` or `value.field`: whatever
                         // the value is decides at run time.
                         self.node(left, scope, module);
-                        self.facts.owner(scope.owner).atoms.insert(function);
+                        let owner = self.facts.owner(scope.owner);
+                        owner.dispatched.insert(function.clone());
+                        owner.atoms.insert(function);
                     }
                     for child in children(node) {
                         if Some(child) != target {
@@ -440,12 +483,21 @@ impl Walker<'_> {
             return;
         };
 
-        if scope.module_level
-            && scope.owner == Owner::Top
-            && module.is_some()
-            && self.route(node, scope, module)
-        {
-            return;
+        if scope.module_level && scope.owner == Owner::Top && module.is_some() {
+            let handled = match name {
+                "pipe_through" => self.pipe_through(node),
+                "pipeline" => self.pipeline(node, module),
+                _ => self.route(node, scope, module),
+            };
+            if handled {
+                return;
+            }
+            // Something else in a scope may be a route the index cannot
+            // read: the pipelines piped through so far may reach it.
+            if !self.route_scopes.is_empty() && !NOT_ROUTES.contains(&name) {
+                let piped = self.pipes_in_scope();
+                self.facts.top.atoms.extend(piped);
+            }
         }
 
         if MODULE_DEFINERS.contains(&name) && scope.module_level {
@@ -509,6 +561,11 @@ impl Walker<'_> {
                     def.accepts = self.accepted_tag(&defined, *head);
                 }
             }
+            // A framework calls the callbacks it names; any other `@impl`
+            // is a behaviour of the application, called through a module
+            // a caller holds. A `defimpl` is reached through its protocol.
+            def.dispatched_to =
+                scope.in_impl && self.impl_of.is_empty() && !CALLBACKS.contains(&defined.as_str());
             if name == "defdelegate" {
                 // Delegates to a function of the same name unless `as:`
                 // (an atom, picked up by the walk) says otherwise.
@@ -584,6 +641,16 @@ impl Walker<'_> {
             _ => {}
         }
         self.send_site(scope.owner, None, name, node);
+        if name == "apply" {
+            // `apply(mod, :function, args)` calls whatever `mod` holds.
+            if let Some(function) = arguments(node).get(1).filter(|a| a.kind() == "atom") {
+                let function = text(*function, self.source).trim_start_matches(':');
+                self.facts
+                    .owner(scope.owner)
+                    .dispatched
+                    .insert(function.to_string());
+            }
+        }
         self.facts.owner(scope.owner).refs.insert(name.to_string());
         for child in children(node) {
             if child.kind() != "identifier" {
@@ -757,6 +824,7 @@ impl Walker<'_> {
     /// Returns whether `node` was one of these.
     fn route(&mut self, node: Node, scope: Scope, module: Option<&str>) -> bool {
         let args = arguments(node);
+        let block = children(node).into_iter().find(|c| c.kind() == "do_block");
         let Some(path) = args
             .first()
             .filter(|a| a.kind() == "string")
@@ -766,13 +834,36 @@ impl Walker<'_> {
             })
             .filter(|p| !p.contains(WILDCARD))
         else {
-            return false;
+            // A scope whose path is computed still holds routes, behind
+            // pipelines the index cannot attribute to any of them.
+            let Some(block) = block.filter(|_| call_name(node, self.source) == Some("scope"))
+            else {
+                return false;
+            };
+            for child in children(node) {
+                if child != block {
+                    self.node(child, scope, module);
+                }
+            }
+            self.route_scopes.push(RouteScope {
+                prefix: String::new(),
+                alias: None,
+                pipes: BTreeSet::new(),
+                opaque: true,
+            });
+            self.block(block, scope, module);
+            self.route_scopes.pop();
+            return true;
         };
         let target = args.get(1).filter(|a| a.kind() == "alias");
-        let block = children(node).into_iter().find(|c| c.kind() == "do_block");
         if let Some(block) = block {
             let alias = target.map(|a| self.expand(text(*a, self.source)));
-            self.route_scopes.push((path, alias));
+            self.route_scopes.push(RouteScope {
+                prefix: path,
+                alias,
+                pipes: BTreeSet::new(),
+                opaque: false,
+            });
             self.block(block, scope, module);
             self.route_scopes.pop();
             return true;
@@ -781,8 +872,8 @@ impl Walker<'_> {
             return false;
         };
         let mut pattern = String::new();
-        for (prefix, _) in &self.route_scopes {
-            pattern.push_str(prefix.trim_end_matches('/'));
+        for frame in &self.route_scopes {
+            pattern.push_str(frame.prefix.trim_end_matches('/'));
         }
         pattern.push_str(&path);
         let named = self.expand(text(*target, self.source));
@@ -792,7 +883,7 @@ impl Walker<'_> {
         let prefix: Vec<&str> = self
             .route_scopes
             .iter()
-            .filter_map(|(_, alias)| alias.as_deref())
+            .filter_map(|frame| frame.alias.as_deref())
             .collect();
         let mut def = Def::new(format!("route {pattern}"), DefKind::Function, span(node));
         def.uses.insert(named.clone());
@@ -800,6 +891,7 @@ impl Walker<'_> {
             def.uses.insert(format!("{}.{named}", prefix.join(".")));
         }
         def.route = Some(pattern);
+        def.pipes = self.pipes_in_scope();
         let owner = self.facts.push(def);
         let inner = Scope {
             owner,
@@ -810,6 +902,79 @@ impl Walker<'_> {
         // Remaining arguments: the action atom, options.
         for arg in args.iter().skip(2) {
             self.node(*arg, inner, module);
+        }
+        true
+    }
+
+    /// The pipelines a route written here runs: those piped through by the
+    /// scopes around it so far.
+    fn pipes_in_scope(&self) -> BTreeSet<String> {
+        let mut pipes = BTreeSet::new();
+        for frame in &self.route_scopes {
+            if frame.opaque {
+                pipes.insert(ANY_PIPELINE.to_string());
+            }
+            pipes.extend(frame.pipes.iter().cloned());
+        }
+        pipes
+    }
+
+    /// `pipe_through :name` or `pipe_through [:a, :b]` inside a scope.
+    /// Returns whether `node` was one.
+    fn pipe_through(&mut self, node: Node) -> bool {
+        if self.route_scopes.is_empty() {
+            return false;
+        }
+        let mut names = BTreeSet::new();
+        for arg in arguments(node) {
+            let items = if arg.kind() == "list" {
+                children(arg).into_iter().filter(|c| c.is_named()).collect()
+            } else {
+                vec![arg]
+            };
+            for item in items {
+                match item.kind() {
+                    "atom" => {
+                        names.insert(text(item, self.source).trim_start_matches(':').to_string());
+                    }
+                    _ => {
+                        names.insert(ANY_PIPELINE.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(frame) = self.route_scopes.last_mut() {
+            frame.pipes.extend(names);
+        }
+        true
+    }
+
+    /// `pipeline :name do … end` in a router: a definition holding the
+    /// plugs, reached by the routes that pipe through it rather than by
+    /// everything that goes through the router. Returns whether `node` was
+    /// one.
+    fn pipeline(&mut self, node: Node, module: Option<&str>) -> bool {
+        let Some(block) = children(node).into_iter().find(|c| c.kind() == "do_block") else {
+            return false;
+        };
+        let Some(name) = arguments(node)
+            .first()
+            .filter(|a| a.kind() == "atom")
+            .map(|a| text(*a, self.source).trim_start_matches(':').to_string())
+        else {
+            return false;
+        };
+        let mut def = Def::new(format!("pipeline {name}"), DefKind::Function, span(node));
+        def.pipeline = Some(name);
+        let owner = self.facts.push(def);
+        let inner = Scope {
+            owner,
+            in_impl: false,
+            module_level: false,
+            pattern: false,
+        };
+        for child in children(block) {
+            self.node(child, inner, module);
         }
         true
     }
@@ -937,8 +1102,11 @@ end
             Some("/api/v1/orgs/:org/invites")
         );
         assert!(routes[1].uses.contains("ShopWeb.Api.Invites.Create"));
-        // Pipelines stay file-level code: a plug serves every route.
-        assert!(facts.top.uses.contains("ShopWeb.Auth"));
+        // A pipeline is a definition of its own, reached by the routes that
+        // pipe through it.
+        let pipeline = facts.defs.iter().find(|d| d.pipeline.is_some()).unwrap();
+        assert!(pipeline.uses.contains("ShopWeb.Auth"));
+        assert!(!facts.top.uses.contains("ShopWeb.Auth"));
         assert!(!facts.top.uses.contains("ShopWeb.MemberController"));
     }
 
@@ -1131,5 +1299,127 @@ end
         };
         assert_eq!(bare("b"), ["Shop.Pool"]);
         assert_eq!(bare("c"), ["Shop.Room"]);
+    }
+
+    #[test]
+    fn pipelines_are_definitions_and_routes_record_the_ones_they_run() {
+        let source = r#"defmodule ShopWeb.Router do
+  use ShopWeb, :router
+
+  pipeline :api do
+    plug :accepts, ["json"]
+    plug ShopWeb.Auth
+  end
+
+  pipeline :admin do
+    plug ShopWeb.Admin
+  end
+
+  scope "/api", ShopWeb do
+    get "/health", HealthController, :show
+
+    scope "/orders" do
+      pipe_through [:api, :admin]
+      get "/", OrderController, :index
+    end
+
+    pipe_through :api
+    get "/users", UserController, :index
+  end
+
+  scope "/x/#{prefix()}", ShopWeb do
+    get "/y", YController, :show
+  end
+end
+"#;
+        let facts = extract(Path::new("lib/shop_web/router.ex"), source);
+        let pipelines: Vec<(&str, Vec<&String>)> = facts
+            .defs
+            .iter()
+            .filter(|d| d.pipeline.is_some())
+            .map(|d| (d.name.as_str(), d.uses.iter().collect()))
+            .collect();
+        assert_eq!(
+            pipelines,
+            [
+                ("pipeline api", vec![&"ShopWeb.Auth".to_string()]),
+                ("pipeline admin", vec![&"ShopWeb.Admin".to_string()]),
+            ]
+        );
+        // The plugs belong to the pipeline, not to the file.
+        assert!(!facts.top.uses.contains("ShopWeb.Auth"));
+        let pipes = |route: &str| -> Vec<&str> {
+            facts
+                .defs
+                .iter()
+                .find(|d| d.route.as_deref() == Some(route))
+                .unwrap()
+                .pipes
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        // `pipe_through` applies to the routes written after it.
+        assert!(pipes("/api/health").is_empty());
+        assert_eq!(pipes("/api/orders/"), ["admin", "api"]);
+        assert_eq!(pipes("/api/users"), ["api"]);
+        // A scope with a computed path could hold any pipeline's routes.
+        assert_eq!(pipes("/y"), ["*"]);
+    }
+
+    #[test]
+    fn a_pipe_through_the_index_cannot_read_stays_in_the_file_level_code() {
+        let source = "defmodule ShopWeb.Router do\n  pipeline :api do\n    plug ShopWeb.Auth\n  end\n\n  scope \"/api\", ShopWeb do\n    pipe_through [:api]\n    custom_route \"/x/#{y}\", XController\n    get \"/z\", ZController, :show\n  end\n\n  pipe_through pipes()\nend\n";
+        let facts = extract(Path::new("lib/shop_web/router.ex"), source);
+        // A call in a scope the index cannot read as a route may be one.
+        assert!(facts.top.atoms.contains("api"));
+        // Outside a scope the call is ordinary code that names `pipes`.
+        assert!(facts.top.refs.contains("pipes"));
+    }
+
+    #[test]
+    fn callbacks_are_declared_and_called_through_values() {
+        let source = r#"defmodule Shop.Notifier do
+  @callback deliver(term) :: :ok
+  @callback ping :: :ok
+  @macrocallback build(term) :: Macro.t()
+end
+
+defmodule Shop.Email do
+  @behaviour Shop.Notifier
+
+  @impl true
+  def deliver(message), do: message
+
+  @impl GenServer
+  def init(arg), do: {:ok, arg}
+
+  def notify(mod, message) do
+    mod.deliver(message)
+    apply(mod, :ping, [])
+  end
+end
+
+defimpl Shop.Protocol, for: Map do
+  @impl true
+  def render(map), do: map
+end
+"#;
+        let facts = extract(Path::new("lib/shop/email.ex"), source);
+        let declared: Vec<&str> = facts.declared.iter().map(String::as_str).collect();
+        assert_eq!(declared, ["build", "deliver", "ping"]);
+        let by_name = |name: &str| facts.defs.iter().find(|d| d.name == name).unwrap();
+        // An application behaviour is called through a module a caller
+        // holds; a framework's callback and a protocol function are not.
+        assert!(by_name("deliver").dispatched_to);
+        assert!(!by_name("init").dispatched_to);
+        assert!(!by_name("render").dispatched_to);
+        assert!(by_name("render").callback);
+        let notify: Vec<&str> = by_name("notify")
+            .dispatched
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(notify, ["deliver", "ping"]);
     }
 }

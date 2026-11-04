@@ -4,7 +4,7 @@
 use super::annotations;
 use super::cache::FactsCache;
 use super::consumers::{self, Consume};
-use super::facts::{DefKind, Family, FileFacts, LineClass};
+use super::facts::{DefKind, Family, FileFacts, LineClass, ANY_PIPELINE};
 use super::resolve::{Resolvers, Workspace};
 use super::{elixir, go, js, python, rust};
 use crate::discovery::DiscoveredProject;
@@ -221,6 +221,11 @@ struct Index<'a> {
     mentions: Vec<Vec<Vec<u32>>>,
     /// Definitions that hold a URL path literal.
     path_defs: Vec<DefId>,
+    /// By function name, the Elixir definitions that call it on a value
+    /// holding a module.
+    dispatched: HashMap<String, Vec<DefId>>,
+    /// Behaviour callbacks the workspace declares, by name.
+    declared: HashSet<String>,
     /// For each project, itself and every project that depends on it.
     downstream: Vec<HashSet<usize>>,
     /// For each project, the projects that depend on it directly.
@@ -1180,6 +1185,23 @@ impl<'a> Index<'a> {
                 path_defs.push((f as u32, TOP));
             }
         }
+        let declared: HashSet<String> = sources
+            .iter()
+            .flat_map(|source| source.facts.declared.iter().cloned())
+            .collect();
+        let mut dispatched: HashMap<String, Vec<DefId>> = HashMap::new();
+        for (f, source) in sources.iter().enumerate() {
+            let defs = source.facts.defs.iter().chain([&source.facts.top]);
+            for (d, def) in defs.enumerate() {
+                let id = match d == source.facts.defs.len() {
+                    true => (f as u32, TOP),
+                    false => (f as u32, d as u32),
+                };
+                for name in &def.dispatched {
+                    dispatched.entry(name.clone()).or_default().push(id);
+                }
+            }
+        }
         let mut unit_types: HashMap<(u32, String), bool> = HashMap::new();
         let mut types: HashMap<(Family, String), TypeLinks> = HashMap::new();
         for source in &sources {
@@ -1417,6 +1439,8 @@ impl<'a> Index<'a> {
             held_by,
             mentions,
             path_defs,
+            dispatched,
+            declared,
             downstream,
         }
     }
@@ -3065,6 +3089,10 @@ impl<'a, 'b> Run<'a, 'b> {
                 continue;
             }
             let def = &source.facts.defs[id.1 as usize];
+            if let Some(name) = &def.pipeline {
+                self.pipeline(id, name);
+                continue;
+            }
             if let Some(route) = &def.route {
                 // A route is reached by requests for its path. When no code
                 // names the path, anything that goes through the router
@@ -3094,6 +3122,9 @@ impl<'a, 'b> Run<'a, 'b> {
                     None => self.users(source.unit, id),
                 }
             }
+            if def.dispatched_to && ix.declared.contains(&def.name) {
+                self.dispatchers(id, &def.name);
+            }
             // Users of a type or trait reach its implementation without
             // naming it. With static types that takes a call nothing
             // names; a named call is matched as one.
@@ -3102,6 +3133,54 @@ impl<'a, 'b> Run<'a, 'b> {
                     self.users(*unit, id);
                 }
             }
+        }
+    }
+
+    /// Mark what runs the plugs of router pipeline `name`: the routes that
+    /// pipe through it, not everything that goes through the router.
+    ///
+    /// The router's file-level code stands in for what cannot be told
+    /// apart: a `pipe_through` outside any scope the index reads, or a
+    /// function of the router that names the pipeline. A pipeline nothing
+    /// pipes through runs for no route. A macro defined in another file
+    /// that pipes through it by a name written only there is not seen.
+    fn pipeline(&mut self, id: DefId, name: &str) {
+        let facts = &self.ix.sources[id.0 as usize].facts;
+        let mut named = facts.top.atoms.contains(name) || facts.top.atoms.contains(ANY_PIPELINE);
+        for (d, def) in facts.defs.iter().enumerate() {
+            let target = (id.0, d as u32);
+            if def.route.is_some() {
+                if def.pipes.contains(name) || def.pipes.contains(ANY_PIPELINE) {
+                    self.mark(target, Why::Via(id));
+                }
+            } else if target != id && def.atoms.contains(name) {
+                named = true;
+            }
+        }
+        if named {
+            self.mark((id.0, TOP), Why::Via(id));
+        }
+    }
+
+    /// Mark the Elixir definitions that call `name` on a value holding a
+    /// module, in the project of callback `from`. A behaviour of the
+    /// application is called as `mod.name(args)` with `mod` read from
+    /// configuration or an argument, so no code names the module that
+    /// implements it. The function's name is all that does.
+    fn dispatchers(&mut self, from: DefId, name: &str) {
+        let ix = self.ix;
+        let origin = &ix.sources[from.0 as usize];
+        let from_test = ix.is_test(from);
+        for &candidate in ix.dispatched.get(name).into_iter().flatten() {
+            let other = &ix.sources[candidate.0 as usize];
+            if candidate == from
+                || other.project != origin.project
+                || other.facts.family != origin.facts.family
+                || (from_test && !ix.is_test(candidate))
+            {
+                continue;
+            }
+            self.mark(candidate, Why::Via(from));
         }
     }
 

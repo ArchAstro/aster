@@ -94,6 +94,21 @@ pub struct Def {
     /// declaration (`/orgs/:org/members`). Requests reach it by path, not
     /// by name.
     pub route: Option<String>,
+    /// An Elixir `@impl` of a behaviour other than a framework's: callers
+    /// reach it through a module they hold in a variable, so [`Self::callback`]
+    /// alone does not say who calls it.
+    pub dispatched_to: bool,
+    /// Functions called on a value that holds a module
+    /// (`mod.deliver(message)`, `apply(mod, :deliver, args)`): a callback
+    /// of that name may be what runs. Only Elixir fills this.
+    pub dispatched: BTreeSet<String>,
+    /// The router pipelines this route runs, by name, from the
+    /// `pipe_through` of the scopes around it. [`ANY_PIPELINE`] when the
+    /// scopes cannot be told apart.
+    pub pipes: BTreeSet<String>,
+    /// The name of the Elixir router pipeline this definition declares:
+    /// the plugs in its body run for the routes that pipe through it.
+    pub pipeline: Option<String>,
     /// URL-like string literals (`/orgs/\0/members`, with `\0` standing
     /// for an interpolated part): the requests this definition may send.
     pub paths: Vec<String>,
@@ -169,6 +184,9 @@ pub type Reason = &'static str;
 /// A super type that cannot be named: a mixin call, a type from elsewhere.
 pub const ANY_TYPE: &str = "*";
 
+/// A route that may run any pipeline of its router.
+pub const ANY_PIPELINE: &str = "*";
+
 impl Def {
     pub fn new(name: impl Into<String>, kind: DefKind, lines: (usize, usize)) -> Self {
         Self {
@@ -187,6 +205,10 @@ impl Def {
             callback: false,
             via: Vec::new(),
             route: None,
+            dispatched_to: false,
+            dispatched: BTreeSet::new(),
+            pipes: BTreeSet::new(),
+            pipeline: None,
             paths: Vec::new(),
             reflects: None,
             in_test: false,
@@ -271,6 +293,8 @@ pub struct FileFacts {
     pub uses_all: Vec<String>,
     /// Elixir modules defined here, or the Go package name.
     pub modules: Vec<String>,
+    /// Elixir behaviour callbacks declared here (`@callback name(args)`).
+    pub declared: BTreeSet<String>,
     /// Import statements outside every definition.
     pub imports: Vec<ImportLine>,
     /// Go imports as `(alias, path)`; the qualifier of an unaliased import
@@ -335,6 +359,7 @@ impl FileFacts {
             reexports: Vec::new(),
             uses_all: Vec::new(),
             modules: Vec::new(),
+            declared: BTreeSet::new(),
             imports: Vec::new(),
             go_imports: Vec::new(),
             line_class: Vec::new(),
