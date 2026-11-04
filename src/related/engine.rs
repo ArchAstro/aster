@@ -150,6 +150,45 @@ const NO_DEF: DefId = (u32::MAX, u32::MAX);
 /// unit, taken together. The second half is the unit doubled, plus one when
 /// only test files count.
 const USERS: u32 = u32::MAX - 1;
+/// Functions that start a process, or hand a module to one that will.
+const STARTERS: &[&str] = &[
+    "start",
+    "start_link",
+    "start_child",
+    "start_supervised",
+    "start_supervised!",
+    "start_link_supervised!",
+    "child_spec",
+    "init",
+];
+/// Modules whose start functions run another module's `init`.
+const STARTING_MODULES: &[&str] = &[
+    "GenServer",
+    ":gen_server",
+    ":gen_statem",
+    "GenStateMachine",
+    "Supervisor",
+    "DynamicSupervisor",
+    "Task.Supervisor",
+    "Agent",
+    ":proc_lib",
+];
+/// The `GenServer` callbacks that take a message.
+const MESSAGE_CALLBACKS: &[&str] = &[
+    "handle_call",
+    "handle_cast",
+    "handle_info",
+    "handle_continue",
+];
+/// Callbacks of a process's life: started once, not by a message.
+const LIFECYCLE: &[&str] = &[
+    "init",
+    "terminate",
+    "code_change",
+    "start_link",
+    "start",
+    "child_spec",
+];
 
 struct Source {
     path: PathBuf,
@@ -698,9 +737,59 @@ impl<'a> Index<'a> {
         // Go specifiers resolve to a directory, the others to a file; both
         // are unit keys.
         let unit_of = |path: &Path| -> Option<u32> { unit_ids.get(path).copied() };
+        let index_of: HashMap<String, usize> = projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (address(p), i))
+            .collect();
+        let downstream: Vec<HashSet<usize>> = projects
+            .iter()
+            .enumerate()
+            .map(|(i, project)| {
+                let mut seen = HashSet::from([i]);
+                let mut queue = VecDeque::from([address(project)]);
+                while let Some(current) = queue.pop_front() {
+                    for dependent in graph.dependents(&current) {
+                        if let Some(&j) = index_of.get(&dependent) {
+                            if seen.insert(j) {
+                                queue.push_back(dependent);
+                            }
+                        }
+                    }
+                }
+                seen
+            })
+            .collect();
+
+        // A module name can be defined by several projects (two fixture
+        // modules of one name). A project calls its own copy, and failing
+        // that one in a project it depends on; the copy of a project it does
+        // not depend on is not in its program. Where no copy is reachable
+        // as declared, every one is kept, as the dependencies may be
+        // undeclared.
+        let project_of = |path: &Path| owner(projects, path);
         let resolve = |from: &Path, family: Family, spec: &str| -> Vec<u32> {
-            resolvers
-                .resolve(&ws, from, family, spec)
+            let mut targets = resolvers.resolve(&ws, from, family, spec);
+            if family == Family::Elixir && targets.len() > 1 {
+                if let Some(here) = project_of(from) {
+                    let own: Vec<PathBuf> = targets
+                        .iter()
+                        .filter(|t| project_of(t) == Some(here))
+                        .cloned()
+                        .collect();
+                    let upstream: Vec<PathBuf> = targets
+                        .iter()
+                        .filter(|t| project_of(t).is_some_and(|p| downstream[p].contains(&here)))
+                        .cloned()
+                        .collect();
+                    if !own.is_empty() {
+                        targets = own;
+                    } else if !upstream.is_empty() {
+                        targets = upstream;
+                    }
+                }
+            }
+            targets
                 .iter()
                 .filter_map(|target| unit_of(target))
                 .collect()
@@ -1339,30 +1428,6 @@ impl<'a> Index<'a> {
             }
         }
 
-        let index_of: HashMap<String, usize> = projects
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (address(p), i))
-            .collect();
-        let downstream = projects
-            .iter()
-            .enumerate()
-            .map(|(i, project)| {
-                let mut seen = HashSet::from([i]);
-                let mut queue = VecDeque::from([address(project)]);
-                while let Some(current) = queue.pop_front() {
-                    for dependent in graph.dependents(&current) {
-                        if let Some(&j) = index_of.get(&dependent) {
-                            if seen.insert(j) {
-                                queue.push_back(dependent);
-                            }
-                        }
-                    }
-                }
-                seen
-            })
-            .collect();
-
         let dependents = projects
             .iter()
             .map(|project| {
@@ -1457,12 +1522,13 @@ impl<'a> Index<'a> {
 
     /// Whether `candidate`, which uses `unit` or belongs to it, may send a
     /// message tagged `tag` to a process running the unit's callbacks.
-    fn may_send(&self, candidate: DefId, unit: u32, tag: &str) -> bool {
+    fn may_send(&self, candidate: DefId, unit: u32, tag: Option<&str>) -> bool {
         let def = self.def(candidate);
-        if def.sends_any || def.sends.contains(tag) {
+        // With no tag, any message at all counts.
+        if def.sends_any || tag.map_or(!def.sends.is_empty(), |tag| def.sends.contains(tag)) {
             return true;
         }
-        if !def.sends.is_empty() {
+        if tag.is_some() && !def.sends.is_empty() {
             return false;
         }
         let source = &self.sources[candidate.0 as usize];
@@ -1494,6 +1560,58 @@ impl<'a> Index<'a> {
             if *called_unit == unit {
                 called = true;
                 if !defines(function) {
+                    return true;
+                }
+            }
+        }
+        def.bare.iter().any(modules) || source.imports.contains(&unit) || !called
+    }
+
+    /// Whether a definition may start a process of the module of `unit`,
+    /// which is what runs its `init` and `terminate` callbacks.
+    ///
+    /// A process of a module starts through a call that names the module
+    /// (`GenServer.start_link(__MODULE__, ...)`, a child specification
+    /// `{Module, arg}`, `Module.start_link/1`). So a definition may start
+    /// one when it starts a process in the unit's own code, names the module
+    /// other than as the receiver of a call, imports it, calls a start
+    /// function or one the unit does not define (a macro expands it), or
+    /// does not call the unit at all (it names it some other way). One that
+    /// only calls ordinary functions of the unit reaches the callback
+    /// through the functions it calls, which are linked by name.
+    fn may_start(&self, candidate: DefId, unit: u32) -> bool {
+        let def = self.def(candidate);
+        let source = &self.sources[candidate.0 as usize];
+        if source.unit == unit {
+            return def.calls.iter().any(|(module, function)| {
+                STARTERS.contains(&function.as_str()) && STARTING_MODULES.contains(&module.as_str())
+            });
+        }
+        let index = if candidate.1 == TOP {
+            source.facts.defs.len()
+        } else {
+            candidate.1 as usize
+        };
+        let files = &self.unit_files[unit as usize];
+        let modules = |name: &String| {
+            files
+                .iter()
+                .any(|&f| self.sources[f as usize].facts.modules.contains(name))
+        };
+        let defines = |function: &String| {
+            files.iter().any(|&f| {
+                self.sources[f as usize]
+                    .facts
+                    .defs
+                    .iter()
+                    .any(|d| d.kind == DefKind::Function && d.name == *function)
+            })
+        };
+        let mut called = false;
+        for (called_unit, function) in &source.calls[index] {
+            if *called_unit == unit {
+                called = true;
+                if STARTERS.contains(&function.as_str()) || !defines(function) {
                     return true;
                 }
             }
@@ -3072,11 +3190,33 @@ impl<'a, 'b> Run<'a, 'b> {
             }
             // Nothing names it, so something reaches it another way: a
             // framework callback, a macro expansion, reflection.
-            let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
+            // A function that is itself the edit keeps this rule, so that a
+            // change nothing calls still selects its module's users rather
+            // than reaching no test. One that only calls what changed, and
+            // that nothing calls, runs in no test.
+            let edited = matches!(self.affected.get(&id), Some(Why::Changed(_)));
+            let dead = source.facts.unnamed_is_dead && !edited;
+            let unnamed = !referenced && !def.is_test() && !ix.is_test(id) && !dead;
             if def.callback || def.kind == DefKind::Macro || unnamed {
                 match def.accepts.as_deref().filter(|_| def.callback) {
                     // A message clause is reached by what can send its message.
-                    Some(tag) => self.senders(source.unit, id, tag),
+                    Some(tag) => self.senders(source.unit, id, Some(tag)),
+                    // A lifecycle callback runs once the process is started.
+                    None if def.callback
+                        && source.facts.family == Family::Elixir
+                        && LIFECYCLE.contains(&def.name.as_str()) =>
+                    {
+                        self.starters(source.unit, id)
+                    }
+                    // A clause that matches any message is reached by
+                    // whatever sends one, and by what starts the process,
+                    // which then gets the runtime's own messages.
+                    None if def.callback
+                        && source.facts.family == Family::Elixir
+                        && MESSAGE_CALLBACKS.contains(&def.name.as_str()) =>
+                    {
+                        self.senders(source.unit, id, None)
+                    }
                     None => self.users(source.unit, id),
                 }
             }
@@ -3132,7 +3272,7 @@ impl<'a, 'b> Run<'a, 'b> {
     /// calls, which are linked by name, unless it names the unit in a way
     /// that is not a call to a function the unit defines (a struct, a
     /// registered name, an import): it may send in a way not seen here.
-    fn senders(&mut self, unit: u32, from: DefId, tag: &str) {
+    fn senders(&mut self, unit: u32, from: DefId, tag: Option<&str>) {
         let ix = self.ix;
         let from_test = ix.is_test(from);
         let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
@@ -3150,7 +3290,33 @@ impl<'a, 'b> Run<'a, 'b> {
             if user == from || (from_test && !ix.is_test(user)) || !seen.insert(user) {
                 continue;
             }
-            if ix.may_send(user, unit, tag) {
+            if ix.may_send(user, unit, tag) || (tag.is_none() && ix.may_start(user, unit)) {
+                self.mark(user, Why::Via(from));
+            }
+        }
+    }
+
+    /// Mark the definitions that may start a process of `unit`, instead of
+    /// every user of it (see [`Index::may_start`]).
+    fn starters(&mut self, unit: u32, from: DefId) {
+        let ix = self.ix;
+        let from_test = ix.is_test(from);
+        let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
+            let defs = ix.sources[f as usize].facts.defs.len() as u32;
+            (0..defs).map(move |d| (f, d))
+        });
+        let candidates: Vec<DefId> = ix.users[unit as usize]
+            .iter()
+            .copied()
+            .chain(local)
+            .chain(ix.beside(unit))
+            .collect();
+        let mut seen: HashSet<DefId> = HashSet::new();
+        for user in candidates {
+            if user == from || (from_test && !ix.is_test(user)) || !seen.insert(user) {
+                continue;
+            }
+            if ix.may_start(user, unit) {
                 self.mark(user, Why::Via(from));
             }
         }
@@ -3218,7 +3384,10 @@ impl<'a, 'b> Run<'a, 'b> {
                 if from_test && !ix.is_test(candidate) {
                     continue;
                 }
-                if candidate != from && ix.refers(candidate, unit, name) {
+                if candidate == from {
+                    continue;
+                }
+                if ix.refers(candidate, unit, name) {
                     found = true;
                     self.mark(candidate, Why::Via(from));
                 }
