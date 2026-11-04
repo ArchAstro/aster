@@ -496,6 +496,166 @@ end
     );
 }
 
+/// A chat service: a room process, a notifier that messages it, an admin
+/// module with one function nothing calls, and one test per module.
+const CHAT: &[(&str, &str)] = &[
+    (
+        "chat/mix.exs",
+        "defmodule Chat.MixProject do\n  use Mix.Project\n  def project, do: [app: :chat, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "chat/lib/chat/room.ex",
+        r#"defmodule Chat.Room do
+  use GenServer
+
+  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
+
+  def notify(pid, note), do: GenServer.cast(pid, {:note, note})
+
+  @impl true
+  def init(arg), do: {:ok, arg}
+
+  @impl true
+  def handle_cast({:note, note}, state), do: {:noreply, [note | state]}
+end
+"#,
+    ),
+    (
+        "chat/lib/chat/notifier.ex",
+        "defmodule Chat.Notifier do\n  alias Chat.Room\n\n  def ping(pid), do: Room.notify(pid, :ping)\nend\n",
+    ),
+    (
+        "chat/lib/chat/admin.ex",
+        "defmodule Chat.Admin do\n  def rename(thread, name), do: Map.put(thread, :name, name)\n\n  # Nothing in the workspace calls this.\n  def archive(thread), do: Map.put(thread, :archived, Chat.Pricing.fee(1))\nend\n",
+    ),
+    (
+        "chat/lib/chat/pricing.ex",
+        "defmodule Chat.Pricing do\n  def fee(n), do: n * 2\nend\n",
+    ),
+    (
+        "chat/lib/chat/billing.ex",
+        "defmodule Chat.Billing do\n  def charge(n), do: n + Chat.Pricing.fee(n)\nend\n",
+    ),
+    (
+        "chat/test/chat/billing_test.exs",
+        "defmodule Chat.BillingTest do\n  use ExUnit.Case\n\n  test \"charge\" do\n    assert Chat.Billing.charge(1) == 3\n  end\nend\n",
+    ),
+    (
+        "chat/test/chat/start_test.exs",
+        "defmodule Chat.StartTest do\n  use ExUnit.Case\n\n  test \"a room starts\" do\n    pid = start_supervised!({Chat.Room, []})\n    assert Process.alive?(pid)\n  end\nend\n",
+    ),
+    (
+        "chat/test/chat/notifier_test.exs",
+        "defmodule Chat.NotifierTest do\n  use ExUnit.Case\n\n  test \"ping\" do\n    assert Chat.Notifier.ping(self()) == :ok\n  end\nend\n",
+    ),
+    (
+        "chat/test/chat/admin_test.exs",
+        "defmodule Chat.AdminTest do\n  use ExUnit.Case\n\n  test \"rename\" do\n    assert Chat.Admin.rename(%{}, \"a\") == %{name: \"a\"}\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof that a definition is followed only by the code
+/// that can run it: an `init` callback by what starts the process, and a
+/// function nothing calls by nothing.
+#[test]
+fn a_room_init_runs_for_what_starts_a_room_and_a_function_nobody_calls_runs_for_nothing() {
+    // Phase 1: change `Chat.Room.init/1`. A test that starts the room runs,
+    // since it names the module in a child specification. The notifier only
+    // casts to a room that already runs and starts none, so its test does
+    // not, and neither does the admin test.
+    let ws = Workspace::new(CHAT);
+    ws.edit("chat/lib/chat/room.ex", "{:ok, arg}", "{:ok, [arg]}");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//chat:test"),
+        ["mix test test/chat/start_test.exs"]
+    );
+
+    // Phase 2: change `Chat.Pricing.fee/1`. `Chat.Admin.archive/1` calls it,
+    // but nothing calls `archive`, and the module registers no callbacks, so
+    // no test can run it. Only the billing test, which calls `fee` through
+    // `charge`, is selected; the admin test merely uses the module.
+    let ws = Workspace::new(CHAT);
+    ws.edit("chat/lib/chat/pricing.ex", "n * 2", "n * 3");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//chat:test"),
+        ["mix test test/chat/billing_test.exs"]
+    );
+
+    // Phase 3: a module that registers callbacks keeps the broad rule. The
+    // same function in a module with a behaviour is assumed to be called by
+    // the framework, so the users of the module run as well.
+    let mut files = CHAT.to_vec();
+    files[3].1 = "defmodule Chat.Admin do\n  @behaviour Chat.Policy\n\n  def rename(thread, name), do: Map.put(thread, :name, name)\n\n  def archive(thread), do: Map.put(thread, :archived, Chat.Pricing.fee(1))\nend\n";
+    let ws = Workspace::new(&files);
+    ws.edit("chat/lib/chat/pricing.ex", "n * 2", "n * 3");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//chat:test"),
+        ["mix test test/chat/admin_test.exs test/chat/billing_test.exs"]
+    );
+}
+
+/// Two projects each define `Shop.Fixtures`; the web project depends on the
+/// core project and its fixture calls core code, the core fixture does not.
+const FIXTURES: &[(&str, &str)] = &[
+    (
+        "core/mix.exs",
+        "defmodule Core.MixProject do\n  use Mix.Project\n  def project, do: [app: :core, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "core/lib/shop/orders.ex",
+        "defmodule Shop.Orders do\n  def place(n), do: %{placed: n}\nend\n",
+    ),
+    (
+        "core/test/support/fixtures.ex",
+        "defmodule Shop.Fixtures do\n  def order, do: %{placed: 0}\nend\n",
+    ),
+    (
+        "core/test/shop/units_test.exs",
+        "defmodule Shop.UnitsTest do\n  use ExUnit.Case\n  import Shop.Fixtures\n\n  test \"an order\" do\n    assert order() == %{placed: 0}\n  end\nend\n",
+    ),
+    (
+        "web/mix.exs",
+        "defmodule Web.MixProject do\n  use Mix.Project\n  def project, do: [app: :web, version: \"0.1.0\"]\nend\n",
+    ),
+    ("web/aster.toml", "depends_on = [\"//core\"]\n"),
+    (
+        "web/test/support/fixtures.ex",
+        "defmodule Shop.Fixtures do\n  def order, do: Shop.Orders.place(1)\nend\n",
+    ),
+    (
+        "web/test/shop/checkout_test.exs",
+        "defmodule Shop.CheckoutTest do\n  use ExUnit.Case\n  import Shop.Fixtures\n\n  test \"checkout\" do\n    assert order() == %{placed: 1}\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof that a call is followed only into projects that
+/// can make it: a core test never runs a fixture from the web project that
+/// depends on core, though both define a module of the same name.
+#[test]
+fn a_core_test_does_not_run_the_web_fixture_that_shares_its_module_name() {
+    // Phase 1: change `Shop.Orders.place/1` in core. The web fixture calls
+    // it, so the web checkout test runs. The core test imports a
+    // `Shop.Fixtures` of its own, which calls nothing of core's.
+    let ws = Workspace::new(FIXTURES);
+    ws.edit(
+        "core/lib/shop/orders.ex",
+        "%{placed: n}",
+        "%{placed: n + 0}",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//web:test"),
+        ["mix test test/shop/checkout_test.exs"]
+    );
+    assert!(
+        !plan.runs().contains(&"//core:test"),
+        "the core test must not be selected: {plan:#?}"
+    );
+}
+
 #[test]
 fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
     let mut files = ELIXIR.to_vec();
@@ -3689,4 +3849,129 @@ fn a_changed_project_dependency_runs_the_project_in_full() {
         "{plan:#?}"
     );
     assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
+}
+
+const PIPELINE: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/pipeline.ex",
+        "defmodule Shop.Pipeline do\n  def helper(x), do: x\n  def used(x), do: x\nend\n",
+    ),
+    (
+        "shop/lib/dead.ex",
+        "defmodule Shop.Dead do\n  def run(x), do: Shop.Pipeline.helper(x)\nend\n",
+    ),
+    (
+        "shop/test/pipeline_test.exs",
+        "defmodule Shop.PipelineTest do\n  use ExUnit.Case\n\n  test \"used\" do\n    assert Shop.Pipeline.used(1) == 1\n  end\nend\n",
+    ),
+    (
+        "shop/test/other_test.exs",
+        "defmodule Shop.OtherTest do\n  use ExUnit.Case\n\n  test \"other\" do\n    assert 1 == 1\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof that the choice between a narrow and a full
+/// run depends on the whole change, and a change nothing can observe never
+/// widens it.
+#[test]
+fn a_change_that_reaches_no_test_selects_nothing_and_never_more_than_a_smaller_change() {
+    // Setup: `helper` is called only by `Dead.run`, which no test reaches;
+    // `used` is called by one test; a second test touches neither.
+    //
+    // Phase 1: edit only `helper`. Nothing can observe it, so the project
+    // is skipped. Before, "reaches no test" ran both tests.
+    let ws = Workspace::new(PIPELINE);
+    ws.edit(
+        "shop/lib/pipeline.ex",
+        "helper(x), do: x",
+        "helper(x), do: x + 0",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(plan.skipped, ["//shop:test"], "{plan:#?}");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
+
+    // Phase 2: edit `used` as well. The larger change selects the one test
+    // that calls `used`, which is a subset of what any smaller change ran.
+    ws.edit(
+        "shop/lib/pipeline.ex",
+        "used(x), do: x",
+        "used(x), do: x + 0",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/pipeline_test.exs"]
+    );
+
+    // Phase 3: a change the index cannot follow still runs in full. A new
+    // file nothing names is data to the project, whatever else changes.
+    ws.write("shop/priv/rules.json", "{}\n");
+    ws.git(&["add", "-A"]);
+    let plan = ws.plan("test");
+    assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
+    assert!(
+        plan.notes("//shop:test")
+            .contains("priv/rules.json is not named by any source file"),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn a_reflecting_test_counts_as_reaching_the_change() {
+    // Setup: a test lists the application's modules, so any code change
+    // reaches it; `unused` is named by no test.
+    let files = [
+        PIPELINE[0],
+        (
+            "shop/lib/a.ex",
+            "defmodule Shop.A do\n  def unused(x), do: x\nend\n",
+        ),
+        (
+            "shop/test/modules_test.exs",
+            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert is_list(modules)\n  end\nend\n",
+        ),
+        PIPELINE[4],
+    ];
+    let ws = Workspace::new(&files);
+
+    // Action: edit the unused function.
+    ws.edit("shop/lib/a.ex", "do: x", "do: x + 0");
+
+    // Outcome: the reflecting test runs, and the unrelated test does not.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/modules_test.exs"]
+    );
+}
+
+#[test]
+fn a_message_clause_nobody_sends_selects_nothing() {
+    // Setup: `:audit` is handled by a clause that no test sends. The
+    // `:reset` sender is the only test.
+    let files = [
+        COUNTER[0],
+        (
+            "shop/lib/shop/counter.ex",
+            "defmodule Shop.Counter do\n  use GenServer\n\n  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)\n\n  def reset(pid), do: GenServer.call(pid, :reset)\n\n  @impl true\n  def handle_call(:reset, _from, _state), do: {:reply, :reset, 0}\n\n  def handle_call(:audit, _from, state), do: {:reply, state, state}\nend\n",
+        ),
+        COUNTER[3],
+    ];
+    let ws = Workspace::new(&files);
+
+    // Action: change the `:audit` clause.
+    ws.edit(
+        "shop/lib/shop/counter.ex",
+        "{:reply, state, state}",
+        "{:reply, 1, state}",
+    );
+
+    // Outcome: no sender can reach it, so the project is skipped rather
+    // than run in full.
+    let plan = ws.plan("test");
+    assert_eq!(plan.skipped, ["//shop:test"], "{plan:#?}");
 }

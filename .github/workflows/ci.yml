@@ -121,6 +121,36 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  related-model:
+    name: Related-test model
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verify/related
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: clippy, rustfmt
+      - run: npm ci
+      - name: Generated files match the model
+        run: npm run check
+      - name: Model typechecks; scenarios and divergence witnesses hold
+        run: |
+          npm run typecheck
+          npm run quint:test
+      - name: Properties hold on random repos
+        run: npm run quint:properties
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build the aster binary under test
+        run: cargo build --locked --bin aster --manifest-path ../../Cargo.toml
+      - name: The engine selects what the model says
+        run: cargo test --locked
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

@@ -44,6 +44,9 @@ const INERT_ATTRIBUTES: &[&str] = &[
     "callback",
     "macrocallback",
 ];
+/// Modules whose `use` brings in no call to a function of the using module:
+/// a verification DSL, a schema DSL, generated protobuf code.
+const INERT_USES: &[&str] = &["ExVerify", "Ecto.Schema", "Protobuf", "Bitwise"];
 /// Callbacks the runtime invokes; nothing calls them by name.
 const CALLBACKS: &[&str] = &[
     "init",
@@ -82,6 +85,8 @@ struct Walker<'a> {
     impl_of: Vec<String>,
     /// Path prefixes and module prefixes of the enclosing route scopes.
     route_scopes: Vec<(String, Option<String>)>,
+    /// The file registers a callback module or expands into calls.
+    hooks: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +120,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         inert: Vec::new(),
         impl_of: Vec::new(),
         route_scopes: Vec::new(),
+        hooks: false,
     };
     walker.collect_aliases(tree.root_node());
     let scope = Scope {
@@ -124,6 +130,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         pattern: false,
     };
     walker.block(tree.root_node(), scope, None);
+    walker.facts.unnamed_is_dead = !walker.hooks && !walker.facts.parse_error;
     let mut facts = walker.facts;
     facts.classify_lines(source, &walker.inert);
     super::annotations::apply(&mut facts, &tree, source);
@@ -332,6 +339,9 @@ impl Walker<'_> {
                 let attribute = child
                     .child_by_field_name("operand")
                     .and_then(|operand| call_name(operand, self.source));
+                if attribute.is_some_and(|a| ["behaviour", "impl", "derive"].contains(&a)) {
+                    self.hooks = true;
+                }
                 if attribute == Some("impl") {
                     pending_impl = true;
                     self.inert.push((child.start_byte(), child.end_byte()));
@@ -482,6 +492,9 @@ impl Walker<'_> {
             return;
         }
 
+        if ["defimpl", "defprotocol"].contains(&name) {
+            self.hooks = true;
+        }
         if MODULE_DEFINERS.contains(&name) && scope.module_level {
             let args = arguments(node);
             let declared = args
@@ -619,6 +632,12 @@ impl Walker<'_> {
         }
         self.send_site(scope.owner, None, name, node);
         self.facts.owner(scope.owner).refs.insert(name.to_string());
+        if name == "use" && scope.module_level {
+            let used = arguments(node)
+                .first()
+                .map(|arg| self.expand(text(*arg, self.source)));
+            self.hooks |= !used.is_some_and(|used| INERT_USES.contains(&used.as_str()));
+        }
         let association = SCHEMA_MACROS.contains(&name);
         for child in children(node) {
             if child.kind() == "identifier" {
@@ -1202,5 +1221,33 @@ end
         // A module named as a value may be a registered name.
         assert_eq!(bare("d"), ["Shop.Pool"]);
         assert_eq!(bare("c"), ["Shop.Room"]);
+    }
+
+    #[test]
+    fn a_file_that_registers_no_callbacks_is_the_only_one_whose_unnamed_functions_are_dead() {
+        let dead = |source: &str| extract(Path::new("lib/shop/a.ex"), source).unnamed_is_dead;
+        assert!(dead(
+            "defmodule Shop.A do\n  import Ecto.Query\n  def a, do: 1\nend\n"
+        ));
+        // A behaviour, `@impl`, `use`, a derive, a protocol or its
+        // implementation can each make the runtime or a macro call a
+        // function by a name nothing in the workspace writes.
+        assert!(!dead(
+            "defmodule Shop.A do\n  @behaviour Shop.P\n  def a, do: 1\nend\n"
+        ));
+        assert!(!dead(
+            "defmodule Shop.A do\n  @impl true\n  def a, do: 1\nend\n"
+        ));
+        assert!(!dead(
+            "defmodule Shop.A do\n  use Shop.Macros\n  def a, do: 1\nend\n"
+        ));
+        assert!(!dead(
+            "defmodule Shop.A do\n  @derive Jason.Encoder\n  defstruct [:a]\nend\n"
+        ));
+        assert!(!dead(
+            "defimpl Shop.P, for: Shop.A do\n  def a(_), do: 1\nend\n"
+        ));
+        // A file that does not parse is not understood.
+        assert!(!dead("defmodule Shop.A do\n  def a(, do: 1\nend\n"));
     }
 }

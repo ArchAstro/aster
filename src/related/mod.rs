@@ -22,8 +22,8 @@
 //!
 //! The analysis is syntactic, so it over-approximates, and where it cannot
 //! see it runs more: manifests, lockfiles and tool configuration run their
-//! project in full, as do files no source names, changes that reach no
-//! test, and projects that load code by computed names. Within the declared
+//! project in full, as do files no source names and projects that load code
+//! by computed names. A change whose walk reaches no test selects nothing. Within the declared
 //! project graph, a dependency the source graph cannot explain (another
 //! language, a language that is not analysed, no import at all) is honoured
 //! at project level, as `--dependents` would, unless the dependent says in
