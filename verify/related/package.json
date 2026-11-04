@@ -1,0 +1,15 @@
+{
+  "name": "aster-related-model",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "compile": "quint-refinements compile scenarios.qnt --artifact quint-refinements.json --rust src/generated_refinement.rs",
+    "check": "quint-refinements compile scenarios.qnt --artifact quint-refinements.json --rust src/generated_refinement.rs --check",
+    "typecheck": "quint typecheck model.qnt && quint typecheck repos.qnt && quint typecheck scenarios.qnt && quint typecheck witnesses.qnt && quint typecheck properties.qnt",
+    "quint:test": "quint test --main scenarios --match 'Run$' --max-samples=1 scenarios.qnt && quint test --main witnesses --match 'Witness$' --max-samples=1 witnesses.qnt",
+    "quint:properties": "quint run properties.qnt --main properties --init start --step step --max-samples 150 --max-steps 1 --invariant allHold"
+  },
+  "devDependencies": {
+    "quint-refinements": "github:ArchAstro/quint-refinements#6229384ee53f07ac192f8f4365dcca89efe0a242"
+  }
+}

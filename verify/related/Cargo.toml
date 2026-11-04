@@ -1,0 +1,18 @@
+[package]
+name = "aster-related-model"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Checks the related-test selection engine against its Quint model"
+
+# Not a member of the aster workspace: it has its own lockfile and CI job
+# (see .github/workflows/ci.yml, "Related-test model").
+[workspace]
+
+[dependencies]
+# crates.io has no quint-refinements release yet; the npm compiler in
+# package.json is pinned to the same commit.
+quint-refinements = { git = "https://github.com/ArchAstro/quint-refinements", rev = "6229384ee53f07ac192f8f4365dcca89efe0a242" }
+serde_json = "1.0"
+tempfile = "3"
