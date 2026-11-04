@@ -381,6 +381,121 @@ fn framework_callback_change_selects_users_of_the_module() {
     );
 }
 
+/// A GenServer with one clause per message. Each message has a wrapper
+/// that sends it and a test that calls the wrapper; a third test sends a
+/// message it builds at run time.
+const COUNTER: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/counter.ex",
+        r#"defmodule Shop.Counter do
+  use GenServer
+
+  @step 1
+
+  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
+
+  def bump(pid, n), do: GenServer.call(pid, {:bump, n})
+
+  def reset(pid), do: GenServer.call(pid, :reset)
+
+  @impl true
+  def init(arg), do: {:ok, arg}
+
+  @impl true
+  def handle_call({:bump, n}, _from, state), do: {:reply, :bumped, state + n * @step}
+
+  def handle_call(:reset, _from, _state), do: {:reply, :reset, 0}
+end
+"#,
+    ),
+    (
+        "shop/test/shop/bump_test.exs",
+        "defmodule Shop.BumpTest do\n  use ExUnit.Case\n\n  test \"bump\" do\n    {:ok, pid} = Shop.Counter.start_link(0)\n    assert Shop.Counter.bump(pid, 2) == :bumped\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/reset_test.exs",
+        "defmodule Shop.ResetTest do\n  use ExUnit.Case\n\n  test \"reset\" do\n    {:ok, pid} = Shop.Counter.start_link(0)\n    assert Shop.Counter.reset(pid) == :reset\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/dynamic_test.exs",
+        "defmodule Shop.DynamicTest do\n  use ExUnit.Case\n\n  test \"any message\" do\n    {:ok, pid} = Shop.Counter.start_link(0)\n    message = Enum.random([:reset])\n    assert GenServer.call(pid, message) == :reset\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof for callback-clause dispatch: a message
+/// reaches only the clauses its tag can match.
+#[test]
+fn changing_one_handle_call_clause_selects_only_the_tests_that_send_its_message() {
+    // A scratch git repo whose GenServer has two `handle_call` clauses.
+    // Phase 1: change the `{:bump, n}` clause. The test that bumps runs,
+    // and so does the test sending a message built at run time, since it
+    // may be a bump. The test that resets does not: it sends `:reset`.
+    let ws = Workspace::new(COUNTER);
+    ws.edit(
+        "shop/lib/shop/counter.ex",
+        ":bumped, state",
+        ":added, state",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/bump_test.exs test/shop/dynamic_test.exs"]
+    );
+
+    // Phase 2: the same for the `:reset` clause.
+    let ws = Workspace::new(COUNTER);
+    ws.edit("shop/lib/shop/counter.ex", ":reset, 0}", ":cleared, 0}");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/dynamic_test.exs test/shop/reset_test.exs"]
+    );
+
+    // Phase 3: code outside the clauses still propagates. A module
+    // attribute belongs to the whole module, so every sender is reached.
+    let ws = Workspace::new(COUNTER);
+    ws.edit("shop/lib/shop/counter.ex", "@step 1", "@step 2");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/bump_test.exs test/shop/dynamic_test.exs test/shop/reset_test.exs"]
+    );
+
+    // Phase 4: a clause that matches every message is reached by every
+    // sender.
+    let mut files = COUNTER.to_vec();
+    files[1].1 = r#"defmodule Shop.Counter do
+  use GenServer
+
+  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
+
+  def bump(pid, n), do: GenServer.call(pid, {:bump, n})
+
+  def reset(pid), do: GenServer.call(pid, :reset)
+
+  @impl true
+  def handle_call({:bump, n}, _from, state), do: {:reply, :bumped, state + n}
+
+  def handle_call(other, _from, _state), do: {:reply, other, 0}
+end
+"#;
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/lib/shop/counter.ex",
+        "{:reply, other, 0}",
+        "{:reply, :other, 0}",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/bump_test.exs test/shop/dynamic_test.exs test/shop/reset_test.exs"]
+    );
+}
+
 #[test]
 fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
     let mut files = ELIXIR.to_vec();

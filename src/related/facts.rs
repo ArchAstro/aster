@@ -151,6 +151,22 @@ pub struct Def {
     /// module from outside the workspace holds nothing declared in it, so
     /// the index keeps these only where the specifier resolves.
     pub outside: BTreeSet<(String, String)>,
+    /// A message callback clause (`handle_call`, `handle_cast`,
+    /// `handle_info`, `handle_continue`, a channel's `handle_in`) whose
+    /// message pattern starts with a literal: the tag it accepts, written
+    /// `a:name` for an atom and `s:text` for a string. `None` when any
+    /// message can match it. Only Elixir fills this.
+    pub accepts: Option<String>,
+    /// Tags of the messages this definition sends with a literal head
+    /// (`GenServer.call(pid, {:tag, x})`), in the same form as
+    /// [`Self::accepts`].
+    pub sends: BTreeSet<String>,
+    /// Sends a message whose head is not a literal, or hands one to a
+    /// broadcast: it may send any message.
+    pub sends_any: bool,
+    /// Modules named other than as the receiver of a call (`%Mod{}`, an
+    /// argument, a child spec). Only Elixir fills this.
+    pub bare: BTreeSet<String>,
 }
 
 /// A fixed explanation. An alias keeps serde from tying the lifetime of
@@ -193,6 +209,10 @@ impl Def {
             members: BTreeSet::new(),
             typed: BTreeSet::new(),
             outside: BTreeSet::new(),
+            accepts: None,
+            sends: BTreeSet::new(),
+            sends_any: false,
+            bare: BTreeSet::new(),
         }
     }
 
