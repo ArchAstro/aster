@@ -141,6 +141,63 @@ fn call_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
     (target.kind() == "identifier").then(|| text(target, source))
 }
 
+/// The tag of a message written as a literal atom or string, or as a tuple
+/// led by one: `a:name` or `s:text`. `None` when the head is computed.
+fn literal_tag(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "atom" | "quoted_atom" => Some(format!(
+            "a:{}",
+            text(node, source).trim_start_matches(':').trim_matches('"')
+        )),
+        "string" => {
+            let parts = children(node);
+            let plain = parts
+                .iter()
+                .all(|p| p.kind() == "quoted_content" || p.kind() == "\"");
+            let content: String = parts
+                .iter()
+                .filter(|p| p.kind() == "quoted_content")
+                .map(|p| text(*p, source))
+                .collect();
+            (plain && !content.contains('\\')).then(|| format!("s:{content}"))
+        }
+        "tuple" => {
+            let first = children(node).into_iter().find(|c| c.is_named())?;
+            matches!(first.kind(), "atom" | "quoted_atom" | "string")
+                .then(|| literal_tag(first, source))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The tag a message pattern requires, looking through `pattern = name`
+/// and `name = pattern`. `None` when it can match a message of any head.
+fn pattern_tag(node: Node, source: &str) -> Option<String> {
+    if node.kind() == "binary_operator"
+        && node
+            .child_by_field_name("operator")
+            .is_some_and(|o| text(o, source) == "=")
+    {
+        let left = node.child_by_field_name("left")?;
+        let right = node.child_by_field_name("right")?;
+        return pattern_tag(left, source).or_else(|| pattern_tag(right, source));
+    }
+    literal_tag(node, source)
+}
+
+/// Whether a call receives its first argument from a `|>`.
+fn piped(call: Node, source: &str) -> bool {
+    let Some(parent) = call.parent() else {
+        return false;
+    };
+    parent.kind() == "binary_operator"
+        && parent.child_by_field_name("right") == Some(call)
+        && parent
+            .child_by_field_name("operator")
+            .is_some_and(|op| text(op, source) == "|>")
+}
+
 fn arguments(node: Node) -> Vec<Node> {
     children(node)
         .into_iter()
@@ -288,7 +345,10 @@ impl Walker<'_> {
             }
             "alias" => {
                 if !scope.pattern {
-                    self.mention(scope.owner, text(node, self.source));
+                    let named = text(node, self.source);
+                    self.mention(scope.owner, named);
+                    let full = self.expand(named);
+                    self.facts.owner(scope.owner).bare.insert(full);
                 }
                 return;
             }
@@ -324,6 +384,9 @@ impl Walker<'_> {
             }
             "call" => {}
             _ => {
+                if node.kind() == "tuple" {
+                    self.implicit_message(node, scope.owner);
+                }
                 for child in children(node) {
                     self.node(child, scope, module);
                 }
@@ -343,6 +406,8 @@ impl Walker<'_> {
                 Some((left, right)) if right.kind() == "identifier" => {
                     let function = text(right, self.source).to_string();
                     let receiver = text(left, self.source);
+                    let receiver_module = self.expand(receiver);
+                    self.send_site(scope.owner, Some(&receiver_module), &function, node);
                     if lists_modules(receiver, &function, node, self.source) {
                         self.facts.owner(scope.owner).reflects = Some("lists modules at run time");
                     }
@@ -439,6 +504,11 @@ impl Walker<'_> {
             };
             let mut def = Def::new(defined.clone(), kind, span(node));
             def.callback = scope.in_impl || CALLBACKS.contains(&defined.as_str());
+            if name == "def" {
+                if let Some(head) = arguments(node).first() {
+                    def.accepts = self.accepted_tag(&defined, *head);
+                }
+            }
             if name == "defdelegate" {
                 // Delegates to a function of the same name unless `as:`
                 // (an atom, picked up by the walk) says otherwise.
@@ -513,12 +583,147 @@ impl Walker<'_> {
             }
             _ => {}
         }
+        self.send_site(scope.owner, None, name, node);
         self.facts.owner(scope.owner).refs.insert(name.to_string());
         for child in children(node) {
             if child.kind() != "identifier" {
                 self.node(child, scope, module);
             }
         }
+    }
+
+    /// Record the message a call sends, when it is one that delivers a
+    /// message to a process callback. `module` is the expanded receiver of
+    /// a remote call, `None` for a bare call.
+    fn send_site(&mut self, owner: Owner, module: Option<&str>, function: &str, call: Node) {
+        let args = arguments(call);
+        // `pid |> GenServer.call(msg)` leaves the first argument out.
+        let skipped = usize::from(piped(call, self.source));
+        let message = |index: usize| args.get(index.wrapping_sub(skipped)).copied();
+        let index = match (module, function) {
+            (
+                Some("GenServer" | ":gen_server" | ":gen_statem" | "GenStateMachine"),
+                "call" | "cast" | "send_request",
+            ) => 1,
+            (Some("Process" | ":erlang" | "Kernel"), "send") | (None, "send") => 1,
+            (Some("Process"), "send_after") => 1,
+            (Some(":erlang"), "send_after" | "start_timer") => 2,
+            (Some(":timer"), "send_after" | "send_interval") => {
+                if args.len() + skipped == 2 {
+                    1
+                } else {
+                    2
+                }
+            }
+            (Some("Phoenix.PubSub"), "broadcast" | "broadcast!" | "local_broadcast") => 2,
+            (Some("Phoenix.PubSub"), "broadcast_from" | "broadcast_from!") => 3,
+            // Phoenix.ChannelTest's `push(socket, "event", payload)`.
+            (None, "push") => 1,
+            // Delivery to every subscriber, or to nodes: anything may go.
+            (_, "broadcast" | "broadcast!" | "broadcast_from" | "broadcast_from!")
+            | (_, "local_broadcast" | "direct_broadcast" | "abcast" | "multi_call")
+            | (Some("Registry"), "dispatch") => {
+                self.facts.owner(owner).sends_any = true;
+                return;
+            }
+            _ => return,
+        };
+        let tag = message(index).and_then(|node| literal_tag(node, self.source));
+        let def = self.facts.owner(owner);
+        match tag {
+            Some(tag) => {
+                def.sends.insert(tag);
+            }
+            None => def.sends_any = true,
+        }
+    }
+
+    /// Return values that deliver a message to the process itself:
+    /// `{:continue, term}` and a state machine's `{:next_event, type,
+    /// content}` and event timeouts.
+    fn implicit_message(&mut self, tuple: Node, owner: Owner) {
+        let items: Vec<Node> = children(tuple)
+            .into_iter()
+            .filter(|c| c.is_named())
+            .collect();
+        let Some(head) = items.first().filter(|h| h.kind() == "atom") else {
+            return;
+        };
+        let wanted = match text(*head, self.source) {
+            ":continue" => 2,
+            ":next_event" | ":state_timeout" | ":event_timeout" => 3,
+            ":generic_timeout" => 4,
+            _ => return,
+        };
+        if items.len() != wanted {
+            return;
+        }
+        let tag = items.last().and_then(|n| literal_tag(*n, self.source));
+        let def = self.facts.owner(owner);
+        match tag {
+            Some(tag) => {
+                def.sends.insert(tag);
+            }
+            None => def.sends_any = true,
+        }
+    }
+
+    /// The tag a message callback clause accepts, from its head: the first
+    /// message pattern of `handle_call(pattern, from, state)`.
+    fn accepted_tag(&self, name: &str, head: Node) -> Option<String> {
+        let mut head = head;
+        while head.kind() == "binary_operator" {
+            head = head.child_by_field_name("left")?;
+        }
+        let args = arguments(head);
+        let index = match (name, args.len()) {
+            ("handle_call" | "handle_in", 3) | ("handle_cast" | "handle_info", 2) => 0,
+            ("handle_continue", 2) => 0,
+            // A state machine's `handle_event(type, content, state, data)`;
+            // a LiveView's takes three.
+            ("handle_event", 4) => 1,
+            _ => return None,
+        };
+        let tag = pattern_tag(*args.get(index)?, self.source)?;
+        // Messages the runtime sends, not any process.
+        const SYSTEM: &[&str] = &[
+            "a:DOWN",
+            "a:EXIT",
+            "a:UP",
+            "a:timeout",
+            "a:nodeup",
+            "a:nodedown",
+            "a:tcp",
+            "a:tcp_closed",
+            "a:tcp_error",
+            "a:tcp_passive",
+            "a:udp",
+            "a:udp_passive",
+            "a:ssl",
+            "a:ssl_closed",
+            "a:ssl_error",
+            "a:ssl_passive",
+            "a:inet_async",
+            "a:inet_reply",
+            "a:gun_up",
+            "a:gun_down",
+            "a:gun_data",
+            "a:gun_response",
+            "a:gun_ws",
+            "a:gun_error",
+            "a:gun_upgrade",
+            "a:gun_inform",
+            "a:gun_push",
+            "a:gun_trailers",
+            "a:gun_tunnel_up",
+            "a:gun_tunnel_down",
+            "a:system",
+            "a:internal",
+            "a:cast",
+            "a:info",
+            "a:call",
+        ];
+        (!SYSTEM.contains(&tag.as_str())).then_some(tag)
     }
 
     /// The text of a string or sigil when it reads as a URL path, with each
@@ -810,5 +1015,121 @@ end
             .top
             .calls
             .contains(&("Shop.Cart".to_string(), "new".to_string())));
+    }
+
+    fn def_named<'a>(facts: &'a FileFacts, name: &str, nth: usize) -> &'a Def {
+        facts
+            .defs
+            .iter()
+            .filter(|d| d.name == name)
+            .nth(nth)
+            .unwrap()
+    }
+
+    #[test]
+    fn message_clauses_record_the_tag_they_accept() {
+        let source = r#"defmodule Shop.Room do
+  use GenServer
+  def handle_call({:join, user}, _from, state) when is_map(user), do: {:reply, :ok, state}
+  def handle_call(:leave, _from, state), do: {:reply, :ok, state}
+  def handle_call({:tag, _} = msg, _from, state), do: {:reply, msg, state}
+  def handle_call(msg, _from, state), do: {:reply, msg, state}
+  def handle_call(%{kind: :map}, _from, state), do: {:reply, :ok, state}
+  def handle_call(@attr, _from, state), do: {:reply, :ok, state}
+  def handle_cast({tag, _}, state), do: {:noreply, state}
+  def handle_info({:DOWN, _, _, _, _}, state), do: {:noreply, state}
+  def handle_info(:tick, state), do: {:noreply, state}
+  def handle_continue({:load, id}, state), do: {:noreply, state}
+  def handle_in("new_msg", payload, socket), do: {:noreply, socket}
+  def handle_in("room:" <> id, payload, socket), do: {:noreply, socket}
+  def handle_event(:cast, {:poke, n}, state, data), do: {:keep_state, data}
+  def handle_event("click", params, socket), do: {:noreply, socket}
+end
+"#;
+        let facts = extract(Path::new("lib/shop/room.ex"), source);
+        let tags: Vec<Option<&str>> = facts.defs.iter().map(|d| d.accepts.as_deref()).collect();
+        assert_eq!(
+            tags,
+            [
+                Some("a:join"),
+                Some("a:leave"),
+                Some("a:tag"),
+                None,
+                None,
+                None,
+                None,
+                // The runtime sends :DOWN; no sender names it.
+                None,
+                Some("a:tick"),
+                Some("a:load"),
+                Some("s:new_msg"),
+                None,
+                Some("a:poke"),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn send_sites_record_literal_tags_and_unknown_messages() {
+        let source = r#"defmodule Shop.Client do
+  alias Phoenix.PubSub
+
+  def literal(pid), do: GenServer.call(pid, {:join, 1})
+  def atom(pid), do: GenServer.cast(pid, :leave)
+  def statem(pid), do: :gen_statem.cast(pid, {:poke, 1})
+  def timer, do: Process.send_after(self(), :tick, 10)
+  def kernel(pid), do: send(pid, {:ping, self()})
+  def piped(pid), do: pid |> GenServer.call({:piped, 1})
+  def pubsub, do: PubSub.broadcast(Shop.PubSub, "t", {:event, 1})
+  def computed(pid, msg), do: GenServer.call(pid, msg)
+  def built(pid, id), do: GenServer.call(pid, {id, 1})
+  def fanout(topic), do: ShopWeb.Endpoint.broadcast(topic, "ev", %{})
+  def push_event(socket), do: push(socket, "new_msg", %{})
+  def interpolated(socket, n), do: push(socket, "ev#{n}", %{})
+  def next(state), do: {:noreply, state, {:continue, :load}}
+  def reply(from), do: GenServer.reply(from, :ok)
+  def unrelated(list), do: Enum.map(list, &(&1 + 1))
+end
+"#;
+        let facts = extract(Path::new("lib/shop/client.ex"), source);
+        let sent = |name: &str| {
+            let def = def_named(&facts, name, 0);
+            (
+                def.sends.iter().map(String::as_str).collect::<Vec<_>>(),
+                def.sends_any,
+            )
+        };
+        assert_eq!(sent("literal"), (vec!["a:join"], false));
+        assert_eq!(sent("atom"), (vec!["a:leave"], false));
+        assert_eq!(sent("statem"), (vec!["a:poke"], false));
+        assert_eq!(sent("timer"), (vec!["a:tick"], false));
+        assert_eq!(sent("kernel"), (vec!["a:ping"], false));
+        assert_eq!(sent("piped"), (vec!["a:piped"], false));
+        assert_eq!(sent("pubsub"), (vec!["a:event"], false));
+        assert_eq!(sent("computed"), (vec![], true));
+        assert_eq!(sent("built"), (vec![], true));
+        assert_eq!(sent("fanout"), (vec![], true));
+        assert_eq!(sent("push_event"), (vec!["s:new_msg"], false));
+        assert_eq!(sent("interpolated"), (vec![], true));
+        assert_eq!(sent("next"), (vec!["a:load"], false));
+        assert_eq!(sent("reply"), (vec![], false));
+        assert_eq!(sent("unrelated"), (vec![], false));
+    }
+
+    #[test]
+    fn modules_are_bare_unless_they_only_receive_a_call() {
+        let source = "defmodule Shop.User do\n  alias Shop.{Room, Pool}\n  def a(), do: Room.join(1)\n  def b(), do: {Room.join(1), %Pool{}}\n  def c(pid), do: GenServer.call(Room, pid)\nend\n";
+        let facts = extract(Path::new("lib/shop/user.ex"), source);
+        assert!(def_named(&facts, "a", 0).bare.is_empty());
+        let bare = |name: &str| {
+            def_named(&facts, name, 0)
+                .bare
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bare("b"), ["Shop.Pool"]);
+        assert_eq!(bare("c"), ["Shop.Room"]);
     }
 }
