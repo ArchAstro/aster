@@ -3183,6 +3183,31 @@ fn a_new_elixir_function_nothing_calls_selects_no_test() {
 }
 
 #[test]
+fn a_behaviour_registered_in_config_reaches_the_callers_that_read_the_key() {
+    let mut files = DISPATCHED.to_vec();
+    // The dispatcher names neither the behaviour nor the implementation; it
+    // reads the key that config sets to the implementation.
+    files.push((
+        "app/lib/app/dispatch.ex",
+        "defmodule App.Dispatch do\n  def notify(message) do\n    mod = Application.get_env(:app, :notifier)\n    mod.deliver(message)\n  end\nend\n",
+    ));
+    files.push((
+        "app/config/config.exs",
+        "import Config\n\nconfig :app, notifier: App.Notifier.Email\n",
+    ));
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "app/lib/app/notifier/email.ex",
+        "{:email, message}",
+        "{:mail, message}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        ["mix test test/app/dispatch_test.exs"]
+    );
+}
+
+#[test]
 fn a_call_that_only_shares_a_behaviours_function_name_selects_nothing() {
     let mut files = DISPATCHED.to_vec();
     // Calls `deliver` on a value but names neither the behaviour nor the

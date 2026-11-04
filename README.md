@@ -945,7 +945,8 @@ How a change is followed:
   deliver(...)`), other than a framework's (`init`, `call`, `handle_*`, ...),
   is also reached by the definitions of its project that call that name on a
   value (`mod.deliver(msg)`, `apply(mod, :deliver, args)`) and name the
-  behaviour module (an alias or a call): the module they hold comes from
+  behaviour module (an alias or a call) or an atom key that a `config` file
+  sets alongside the implementing module: the module they hold comes from
   configuration or an argument, so no code names the implementation. A call
   that only shares the name does not count.
 - An Elixir function nothing names reaches nothing: a caller that held its

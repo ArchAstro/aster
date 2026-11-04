@@ -226,6 +226,9 @@ struct Index<'a> {
     dispatched: HashMap<String, Vec<DefId>>,
     /// Behaviour callbacks the workspace declares, by name.
     declared: HashSet<String>,
+    /// For each Elixir module a config file names, the atoms of that file:
+    /// the keys that may hold it.
+    config_keys: HashMap<String, BTreeSet<String>>,
     /// For each project, itself and every project that depends on it.
     downstream: Vec<HashSet<usize>>,
     /// For each project, the projects that depend on it directly.
@@ -1189,6 +1192,18 @@ impl<'a> Index<'a> {
             .iter()
             .flat_map(|source| source.facts.declared.iter().cloned())
             .collect();
+        let mut config_keys: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for source in &sources {
+            let in_config = source.path.components().any(|c| c.as_os_str() == "config");
+            if source.facts.family == Family::Elixir && in_config {
+                for module in &source.facts.top.uses {
+                    config_keys
+                        .entry(module.clone())
+                        .or_default()
+                        .extend(source.facts.top.atoms.iter().cloned());
+                }
+            }
+        }
         let mut dispatched: HashMap<String, Vec<DefId>> = HashMap::new();
         for (f, source) in sources.iter().enumerate() {
             let defs = source.facts.defs.iter().chain([&source.facts.top]);
@@ -1441,6 +1456,7 @@ impl<'a> Index<'a> {
             path_defs,
             dispatched,
             declared,
+            config_keys,
             downstream,
         }
     }
@@ -3132,7 +3148,7 @@ impl<'a, 'b> Run<'a, 'b> {
                 }
             }
             if def.dispatched_to && ix.declared.contains(&def.name) {
-                self.dispatchers(id, &def.name, &source.facts.behaviours);
+                self.dispatchers(id, &def.name, source);
             }
             // Users of a type or trait reach its implementation without
             // naming it. With static types that takes a call nothing
@@ -3172,16 +3188,20 @@ impl<'a, 'b> Run<'a, 'b> {
     }
 
     /// Mark the Elixir definitions that call `name` on a value holding a
-    /// module and name one of the `behaviours` that `from` implements, in
-    /// the project of callback `from`. A behaviour of the application is
-    /// called as `mod.name(args)` with `mod` read from configuration or an
-    /// argument, so no code names the module that implements it. Its
-    /// callers name the behaviour (an alias, a call, a struct) or hold the
-    /// module in a place that does. A call that only shares the name does
-    /// not count.
-    fn dispatchers(&mut self, from: DefId, name: &str, behaviours: &[String]) {
+    /// module and name how they get it, in the project of callback `from`.
+    /// A behaviour of the application is called as `mod.name(args)` with
+    /// `mod` read from configuration or an argument, so no code names the
+    /// module that implements it. Its callers name the behaviour (an alias,
+    /// a call) or a config key that a config file sets to the implementing
+    /// module (`config :app, key: Impl` read by `Application.get_env`). A
+    /// call that only shares the name does not count.
+    fn dispatchers(&mut self, from: DefId, name: &str, origin: &Source) {
         let ix = self.ix;
-        let origin = &ix.sources[from.0 as usize];
+        let mut keys: BTreeSet<&String> = BTreeSet::new();
+        for module in &origin.facts.modules {
+            keys.extend(ix.config_keys.get(module).into_iter().flatten());
+        }
+        let behaviours = &origin.facts.behaviours;
         let from_test = ix.is_test(from);
         for &candidate in ix.dispatched.get(name).into_iter().flatten() {
             let other = &ix.sources[candidate.0 as usize];
@@ -3192,7 +3212,10 @@ impl<'a, 'b> Run<'a, 'b> {
             {
                 continue;
             }
-            let names = |def: &super::facts::Def| behaviours.iter().any(|b| def.uses.contains(b));
+            let names = |def: &super::facts::Def| {
+                behaviours.iter().any(|b| def.uses.contains(b))
+                    || def.atoms.iter().any(|a| keys.contains(a))
+            };
             if names(ix.def(candidate)) || names(&other.facts.top) {
                 self.mark(candidate, Why::Via(from));
             }
