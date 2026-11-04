@@ -145,10 +145,11 @@ module scenarios {
   pure val edit31w: Changes = editing(Set(31))
   pure val expect_workers_edit31: Selection = selectTests(workers, mainRules, edit31w)
 
-  // On main a message clause is reached by every user of the module, whatever it sends.
+  // A message clause with a literal tag is reached by senders of that tag and of computed
+  // messages (#347), not by every user of the module.
   /// @conformance
   run messageClauseRun = init.then(build(workers, mainRules)).then(change(edit31w)).then(selectNow(expect_workers_edit31))
-    .then(all { assert(state.selection == picked(Set(102, 111, 112))), state' = state })
+    .then(all { assert(state.selection == picked(Set(102, 112))), state' = state })
 
   // ---- Generated repos -------------------------------------------------------
   // Seeds 1 to 40 of `genRepo` and `genChange` (universe.qnt): the shop with a

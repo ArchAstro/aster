@@ -37,9 +37,9 @@ labelled with the name the model gives it:
 | reflection | definitions that list modules at run time reach every non-test change |
 | fallback | a changed file whose edits alone reach no test runs the project in full |
 
-`Rules` holds the three open pull requests as switches (`callbackClauses` for
-#347, `schemaTop` for #348, `routeNothing` for #349), so each can be compared
-with main.
+`Rules` holds the three pull requests as switches (`callbackClauses` for #347,
+which is merged and on in `mainRules`; `schemaTop` for #348 and `routeNothing`
+for #349, which are open), so each can be compared with main.
 
 `execEdges` is the run-time oracle: what may execute what, written from how
 Elixir runs code and not from the analysis. Preload, run-time-built paths and

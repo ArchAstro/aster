@@ -26,9 +26,10 @@ module properties {
   pure val editable: Set[int] = shop.kindOf.keys()
   pure val allRules: Set[Rules] = Set(
     mainRules,
-    { callbackClauses: false, schemaTop: true, routeNothing: false },
-    { callbackClauses: false, schemaTop: false, routeNothing: true },
-    { callbackClauses: false, schemaTop: true, routeNothing: true })
+    { callbackClauses: true, schemaTop: true, routeNothing: false },
+    { callbackClauses: true, schemaTop: false, routeNothing: true },
+    { callbackClauses: true, schemaTop: true, routeNothing: true },
+    { callbackClauses: false, schemaTop: false, routeNothing: false })
 
   var repo: Repo
   var rules: Rules

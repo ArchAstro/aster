@@ -10,11 +10,11 @@
 // "route" (a router declaration), "top" (module-level code of a unit) and
 // "test" (an ExUnit test).
 //
-// Rules that open pull requests change are small switches in `Rules`, so each
-// one can be compared with the rule on main:
-//   callbackClauses  ArchAstro/aster#347
-//   schemaTop        ArchAstro/aster#348
-//   routeNothing     ArchAstro/aster#349
+// Rules that pull requests change are small switches in `Rules`, so each one can
+// be compared with the rule on main:
+//   callbackClauses  ArchAstro/aster#347 (merged: on in `mainRules`)
+//   schemaTop        ArchAstro/aster#348 (open)
+//   routeNothing     ArchAstro/aster#349 (open)
 module related {
   type Pair = { from: int, to: int }
   type Request = { id: int, path: List[int] }
@@ -66,7 +66,7 @@ module related {
   type Selection = { full: bool, tests: Set[int] }
   type State = { repo: Repo, rules: Rules, changes: Changes, selection: Selection }
 
-  pure val mainRules: Rules = { callbackClauses: false, schemaTop: false, routeNothing: false }
+  pure val mainRules: Rules = { callbackClauses: true, schemaTop: false, routeNothing: false }
   pure val noChanges: Changes = { edits: Set(), comments: Set(), trailing: Set() }
   pure val noSelection: Selection = { full: false, tests: Set() }
   pure val emptyRepo: Repo = {
