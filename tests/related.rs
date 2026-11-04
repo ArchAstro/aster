@@ -3563,3 +3563,128 @@ fn a_changed_project_dependency_runs_the_project_in_full() {
     );
     assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
 }
+
+const PIPELINE: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/pipeline.ex",
+        "defmodule Shop.Pipeline do\n  def helper(x), do: x\n  def used(x), do: x\nend\n",
+    ),
+    (
+        "shop/lib/dead.ex",
+        "defmodule Shop.Dead do\n  def run(x), do: Shop.Pipeline.helper(x)\nend\n",
+    ),
+    (
+        "shop/test/pipeline_test.exs",
+        "defmodule Shop.PipelineTest do\n  use ExUnit.Case\n\n  test \"used\" do\n    assert Shop.Pipeline.used(1) == 1\n  end\nend\n",
+    ),
+    (
+        "shop/test/other_test.exs",
+        "defmodule Shop.OtherTest do\n  use ExUnit.Case\n\n  test \"other\" do\n    assert 1 == 1\n  end\nend\n",
+    ),
+];
+
+/// Canonical end-to-end proof that the choice between a narrow and a full
+/// run depends on the whole change, and a change nothing can observe never
+/// widens it.
+#[test]
+fn a_change_that_reaches_no_test_selects_nothing_and_never_more_than_a_smaller_change() {
+    // Setup: `helper` is called only by `Dead.run`, which no test reaches;
+    // `used` is called by one test; a second test touches neither.
+    //
+    // Phase 1: edit only `helper`. Nothing can observe it, so the project
+    // is skipped. Before, "reaches no test" ran both tests.
+    let ws = Workspace::new(PIPELINE);
+    ws.edit(
+        "shop/lib/pipeline.ex",
+        "helper(x), do: x",
+        "helper(x), do: x + 0",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(plan.skipped, ["//shop:test"], "{plan:#?}");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
+
+    // Phase 2: edit `used` as well. The larger change selects the one test
+    // that calls `used`, which is a subset of what any smaller change ran.
+    ws.edit(
+        "shop/lib/pipeline.ex",
+        "used(x), do: x",
+        "used(x), do: x + 0",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/pipeline_test.exs"]
+    );
+
+    // Phase 3: a change the index cannot follow still runs in full. A new
+    // file nothing names is data to the project, whatever else changes.
+    ws.write("shop/priv/rules.json", "{}\n");
+    ws.git(&["add", "-A"]);
+    let plan = ws.plan("test");
+    assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
+    assert!(
+        plan.notes("//shop:test")
+            .contains("priv/rules.json is not named by any source file"),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn a_reflecting_test_counts_as_reaching_the_change() {
+    // Setup: a test lists the application's modules, so any code change
+    // reaches it; `unused` is named by no test.
+    let files = [
+        PIPELINE[0],
+        (
+            "shop/lib/a.ex",
+            "defmodule Shop.A do\n  def unused(x), do: x\nend\n",
+        ),
+        (
+            "shop/test/modules_test.exs",
+            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert is_list(modules)\n  end\nend\n",
+        ),
+        PIPELINE[4],
+    ];
+    let ws = Workspace::new(&files);
+
+    // Action: edit the unused function.
+    ws.edit("shop/lib/a.ex", "do: x", "do: x + 0");
+
+    // Outcome: the reflecting test runs, and the unrelated test does not.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/modules_test.exs"]
+    );
+}
+
+#[test]
+fn a_message_clause_nobody_sends_selects_nothing() {
+    // Setup: `:audit` is handled by a clause that no test sends. The
+    // `:reset` sender is the only test.
+    let files = [
+        COUNTER[0],
+        (
+            "shop/lib/shop/counter.ex",
+            "defmodule Shop.Counter do\n  use GenServer\n\n  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)\n\n  def reset(pid), do: GenServer.call(pid, :reset)\n\n  @impl true\n  def handle_call(:reset, _from, _state), do: {:reply, :reset, 0}\n\n  def handle_call(:audit, _from, state), do: {:reply, state, state}\nend\n",
+        ),
+        COUNTER[3],
+    ];
+    let ws = Workspace::new(&files);
+
+    // Action: change the `:audit` clause.
+    ws.edit(
+        "shop/lib/shop/counter.ex",
+        "{:reply, state, state}",
+        "{:reply, 1, state}",
+    );
+
+    // Outcome: no sender can reach it, so the project is skipped rather
+    // than run in full.
+    let plan = ws.plan("test");
+    assert_eq!(plan.skipped, ["//shop:test"], "{plan:#?}");
+}

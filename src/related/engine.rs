@@ -1837,12 +1837,10 @@ impl<'a> Index<'a> {
             }
         }
 
-        for (change, project) in &own_sources {
+        for (_, project) in &own_sources {
             if outcomes[*project].full.is_some() {
                 continue;
             }
-            let file = self.by_path[&change.path];
-            let source = &self.sources[file as usize];
             let dynamic = self
                 .sources
                 .iter()
@@ -1853,23 +1851,11 @@ impl<'a> Index<'a> {
                 set_full(&mut outcomes, *project, false, reason);
                 continue;
             }
-            if source.facts.is_test_file && !source.ghost {
-                continue;
-            }
-            // A change that reaches no test at all is not understood.
-            let unreached = if source.facts.loads_by_import {
-                run.validate();
-                run.seeded.contains(&file) && !run.covered.contains(&file)
-            } else {
-                let mut probe = Run::new(self, true);
-                probe.seed(change, file);
-                probe.drain();
-                !probe.affected.is_empty() && !probe.hit_test
-            };
-            if unreached {
-                let reason = format!("{} reaches no test", change.path.display());
-                set_full(&mut outcomes, *project, false, reason);
-            }
+            // A change whose reach the index followed completely and that
+            // hits no test selects nothing here: nothing can observe it.
+            // The cases the index cannot follow (unindexed files, triggers,
+            // preloaded files, computed loads, the dynamic check above) are
+            // decided from the whole change set, not per file.
         }
 
         let base_product: Vec<bool> = outcomes.iter().map(|o| o.product).collect();
