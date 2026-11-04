@@ -506,6 +506,15 @@ impl<'a> RelatedPlanner<'a> {
         name: &str,
         def: &Target,
     ) -> Result<Narrowed<'a>> {
+        // A target whose own definition changed may do anything now.
+        if let Some(reason) = self
+            .related
+            .projects
+            .get(&address(owner))
+            .and_then(|outcome| outcome.changed_targets.get(name))
+        {
+            return Ok(Narrowed::AsWritten(reason.clone()));
+        }
         let Some(runner) = self.lookup.runner(owner, def) else {
             return Ok(Narrowed::NotRunner);
         };

@@ -256,6 +256,20 @@ impl AffectedDetector {
         };
         let mut changes = changes.into_inner();
         for change in &mut changes {
+            if change.path.file_name().is_some_and(|n| n == "aster.toml") {
+                // The related engine compares both sides as TOML, so a
+                // comment or a key order change is not a config change.
+                if change.deleted || change.new_lines.is_some() {
+                    change.old_source = blob(&base_tree, &change.path);
+                }
+                if !change.deleted {
+                    change.new_source = match &head_tree {
+                        Some(head_tree) => blob(head_tree, &change.path),
+                        None => self.workdir_text(&change.path),
+                    };
+                }
+                continue;
+            }
             if crate::related::Family::of(&change.path).is_none() {
                 continue;
             }
@@ -274,6 +288,11 @@ impl AffectedDetector {
             }
         }
         Ok(changes)
+    }
+
+    /// A working-tree file as text, when the repository has a working tree.
+    fn workdir_text(&self, path: &Path) -> Option<String> {
+        std::fs::read_to_string(self.repo.workdir()?.join(path)).ok()
     }
 
     /// Get all affected files based on base ref and optional head ref
