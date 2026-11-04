@@ -2643,12 +2643,21 @@ impl<'a> Index<'a> {
                             {
                                 continue;
                             }
-                            let matches = named.len() <= actual.len()
-                                && named
-                                    .iter()
-                                    .rev()
-                                    .zip(actual.iter().rev())
-                                    .all(|(a, b)| *a == b.as_ref());
+                            // A relative path names a file where it resolves:
+                            // from the workspace root, the project or the
+                            // file's directory. Only a suffix of the file's
+                            // path beyond that is a guess, and it stays inside
+                            // the project, its dependencies and unowned files.
+                            let resolves = named.len() >= 2
+                                && self.places(source, token, &named).contains(&change.path);
+                            let matches = resolves
+                                || (self.may_name_by_suffix(source, &change.path)
+                                    && named.len() <= actual.len()
+                                    && named
+                                        .iter()
+                                        .rev()
+                                        .zip(actual.iter().rev())
+                                        .all(|(a, b)| *a == b.as_ref()));
                             if matches {
                                 mentioned.insert(change.path.clone());
                                 run.mark(
@@ -2731,6 +2740,33 @@ impl<'a> Index<'a> {
 }
 
 impl Index<'_> {
+    /// Whether a path literal in `source` may name `file` by a suffix of its
+    /// path alone. The literal then names no base it resolves from, so it
+    /// can only be about a file the code can see: one of its own project, of
+    /// a project it depends on (directly or not), or outside every project.
+    fn may_name_by_suffix(&self, source: &Source, file: &Path) -> bool {
+        let (Some(from), Some(to)) = (source.project, owner(self.projects, file)) else {
+            return true;
+        };
+        if from == to {
+            return true;
+        }
+        // `from` depends on `to` when it is among `to`'s transitive dependents.
+        let mut seen = HashSet::from([to]);
+        let mut queue = vec![to];
+        while let Some(project) = queue.pop() {
+            for &dependent in &self.dependents[project] {
+                if dependent == from {
+                    return true;
+                }
+                if seen.insert(dependent) {
+                    queue.push(dependent);
+                }
+            }
+        }
+        false
+    }
+
     /// The workspace paths `token` can mean in the test file `source`: from
     /// the workspace root or the project root, where tests run, or from the
     /// file's own directory when it is written relative (`../data`).

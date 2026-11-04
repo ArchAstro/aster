@@ -3848,3 +3848,75 @@ fn a_message_clause_nobody_sends_selects_nothing() {
     let plan = ws.plan("test");
     assert_eq!(plan.skipped, ["//shop:test"], "{plan:#?}");
 }
+
+#[test]
+fn a_fixture_string_naming_lib_billing_ex_does_not_select_another_projects_billing_file() {
+    // Setup: two projects with no dependency between them. `ledger` is
+    // Elixir and owns `lib/billing.ex`. `archive` is Rust; one test writes a
+    // fake review comment that mentions `lib/billing.ex` as data, one reads
+    // the ledger's file for real, and one reads a file of its own project.
+    let files = [
+        (
+            "ledger/mix.exs",
+            "defmodule Ledger.MixProject do\n  use Mix.Project\n  def project, do: [app: :ledger, version: \"0.1.0\"]\nend\n",
+        ),
+        (
+            "ledger/lib/billing.ex",
+            "defmodule Ledger.Billing do\n  def total(items), do: Enum.sum(items)\nend\n",
+        ),
+        (
+            "archive/Cargo.toml",
+            "[package]\nname = \"archive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("archive/src/lib.rs", "pub fn archived() {}\n"),
+        ("archive/lib/notes.ex", "defmodule Notes do\nend\n"),
+        (
+            "archive/tests/comments.rs",
+            "#[test]\nfn a_review_comment_fixture_is_only_data() {\n    let comment = r#\"{\"path\": \"lib/billing.ex\", \"body\": \"nit\"}\"#;\n    assert!(comment.contains(\"nit\"));\n}\n",
+        ),
+        (
+            "archive/tests/reads_ledger.rs",
+            "#[test]\nfn reads_the_ledger_source() {\n    let text = std::fs::read_to_string(\"../ledger/lib/billing.ex\").unwrap();\n    assert!(text.contains(\"Billing\"));\n}\n",
+        ),
+        (
+            "archive/tests/reads_own.rs",
+            "#[test]\nfn reads_its_own_notes() {\n    let text = std::fs::read_to_string(\"lib/notes.ex\").unwrap();\n    assert!(text.contains(\"Notes\"));\n}\n",
+        ),
+    ];
+    let ws = Workspace::new(&files);
+
+    // Action: the ledger's billing file changes.
+    ws.edit(
+        "ledger/lib/billing.ex",
+        "def total",
+        "@doc false\n  def probe, do: :ok\n\n  def total",
+    );
+
+    // Outcome: only the test whose path resolves to that file is selected;
+    // the fixture string "lib/billing.ex" matched it by suffix before.
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//archive:test"),
+        [
+            "cargo test --test reads_ledger -- --exact reads_the_ledger_source",
+            "cargo test --doc"
+        ]
+    );
+
+    // Action: the archive's own file changes; a literal that resolves from
+    // the project root still selects its reader.
+    ws.git(&["checkout", "-q", "."]);
+    ws.edit(
+        "archive/lib/notes.ex",
+        "defmodule Notes",
+        "# changed\ndefmodule Notes",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//archive:test"),
+        [
+            "cargo test --test reads_own -- --exact reads_its_own_notes",
+            "cargo test --doc"
+        ]
+    );
+}

@@ -965,7 +965,7 @@ How a change is followed:
   every source change in its own project and in the projects that one
   depends on.
 - A file that is not source maps to the definitions whose string literals
-  name it (by path from anywhere, by bare file name within its own
+  name it (by path where the path resolves, by bare file name within its own
   project), to the Go declaration that embeds it (`//go:embed`), to the Go
   tests beside its `testdata/`, or to the test that owns its
   `__snapshots__` file. Prose (`.md`, `.txt`, …) that nothing names selects
@@ -1160,6 +1160,30 @@ selected_by = ["//services/gateway:test-ci"]
 - **Under `--related`** the joining target is narrowed as if the target it
   joins depended on it: to the tests the change reaches in its project, or
   skipped when none does.
+
+### How a path literal names a file
+
+A string literal names a changed file in two ways:
+
+1. **It resolves to it.** A literal with two or more components resolves from
+   the workspace root, from the project directory, and, when it starts with
+   `./` or `../`, from the directory of the file that holds it. The literal
+   names the file when one of those paths is the file. A project or the
+   workspace root is the base wherever the code runs, so this holds across
+   projects and languages (`"../ledger/lib/billing.ex"`).
+2. **It is a suffix of the file's path** (`"lib/billing.ex"` for
+   `ledger/lib/billing.ex`), for code that runs from a directory the analysis
+   cannot see. Aster counts this only when the file is in the literal's own
+   project, in a project that project depends on (directly or through other
+   projects), or in no project. A suffix that would reach into an unrelated
+   project is not a reference: a Rust test whose fixture string is
+   `"lib/billing.ex"` is not selected when another project's `lib/billing.ex`
+   changes.
+
+Neither rule inspects the surrounding syntax, so fixture JSON, `json!` and
+temporary-repo builders need no special case. A project that really reads a
+sibling's files without depending on it names them by path (rule 1) or
+declares them with `aster: reads` below.
 
 ### Correcting which paths a test reads
 
