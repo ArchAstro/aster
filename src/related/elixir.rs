@@ -1186,7 +1186,7 @@ end
 
     #[test]
     fn modules_are_bare_unless_they_only_receive_a_call() {
-        let source = "defmodule Shop.User do\n  alias Shop.{Room, Pool}\n  def a(), do: Room.join(1)\n  def b(), do: {Room.join(1), %Pool{}}\n  def c(pid), do: GenServer.call(Room, pid)\nend\n";
+        let source = "defmodule Shop.User do\n  alias Shop.{Room, Pool}\n  def a(), do: Room.join(1)\n  def b(), do: {Room.join(1), %Pool{}}\n  def c(pid), do: GenServer.call(Room, pid)\n  def d(), do: {Room.join(1), Pool}\nend\n";
         let facts = extract(Path::new("lib/shop/user.ex"), source);
         assert!(def_named(&facts, "a", 0).bare.is_empty());
         let bare = |name: &str| {
@@ -1196,7 +1196,11 @@ end
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        assert_eq!(bare("b"), ["Shop.Pool"]);
+        // A struct literal needs the module's fields, not its functions.
+        assert!(bare("b").is_empty());
+        assert!(def_named(&facts, "b", 0).schema_uses.contains("Shop.Pool"));
+        // A module named as a value may be a registered name.
+        assert_eq!(bare("d"), ["Shop.Pool"]);
         assert_eq!(bare("c"), ["Shop.Room"]);
     }
 }
