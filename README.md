@@ -1021,11 +1021,19 @@ files = ["test/support/gateway_harness.ex"] # sources that use it without naming
   path inside the dependency's directory: `Path.expand("../../gateway", __DIR__)`,
   `"services/gateway/configs/a.yaml"`, `"//services/gateway"`. A relative
   path is resolved against the file and against the project directory.
-  Paths inside nested projects belong to those projects.
+  Paths inside nested projects belong to those projects. A counted
+  definition is selected only when a changed file (a deleted file, or the
+  old path of a rename, included) equals or lies beneath a path it names, as
+  with `aster: reads`: a definition naming `services/gateway/configs` runs
+  for a change under `configs/`, not for one in `internal/`, while one
+  naming `services/gateway` runs for any change in the gateway. A change
+  that only reaches the dependency through its own dependencies has no file
+  to compare, so every counted definition is selected.
 - **`files`** lists sources as globs relative to the project (`//` starts at
   the workspace root). A pattern that matches no source file voids the
   entry. An empty list states that no source of the project uses the
-  dependency, so a change to it never selects the project.
+  dependency, so a change to it never selects the project. A listed source
+  is selected by any change in the dependency, since it names no path.
 - **Each counted definition selects the tests that reach it** through the
   project's own source graph: a helper that names the gateway selects the
   tests that use the helper. The tests that run, and the project's shards,
@@ -1044,7 +1052,10 @@ of all use. It cannot see paths assembled from pieces
 (`Path.join(root, "services", "gateway")`), taken from environment
 variables or configuration, written in files that are not source (shell
 scripts, JSON), or kept in a helper of a project the dependent does not
-contain. List such sources in `files`. A dependency with no entry, or with
+contain. It also reads only the path a definition names: a test that runs a
+dependency's package by naming a subdirectory but loads sibling directories
+through imports is not selected by changes to those siblings. List such
+sources in `files`, or add `aster: reads` for the wider path. A dependency with no entry, or with
 no definition that names it, runs the dependent in full.
 
 The analysis is syntactic and resolves names, not types, so it mostly errs

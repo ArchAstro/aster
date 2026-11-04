@@ -2410,10 +2410,14 @@ fn change_gateway(ws: &Workspace) {
     ws.edit("gateway/main.go", "return 1", "return 2");
 }
 
+fn change_gateway_config(ws: &Workspace) {
+    ws.edit("gateway/configs/a.yaml", "name: a", "name: b");
+}
+
 #[test]
 fn cross_language_dependent_runs_only_the_tests_that_consume_the_dependency() {
     let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
-    change_gateway(&ws);
+    change_gateway_config(&ws);
     let plan = ws.plan("test");
     // The helper that names the gateway's directory reaches the test that
     // uses it, as does the library module that names its configs; the test
@@ -2437,8 +2441,80 @@ fn cross_language_dependent_runs_only_the_tests_that_consume_the_dependency() {
         "{notes}"
     );
     assert!(
-        notes.contains("names gateway/configs/a.yaml in //gateway, which changed"),
+        notes.contains("test/direct_test.exs: gateway/configs/a.yaml changed"),
         "{notes}"
+    );
+}
+
+#[test]
+fn inferred_consumers_are_selected_only_by_changes_beneath_the_path_they_name() {
+    // Phase 1: a change inside the dependency but outside every directory
+    // the tests name. Only the helper that names the dependency's root
+    // directory covers it; configs/ and configs/a.yaml do not.
+    let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
+    change_gateway(&ws);
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//platform:test"),
+        ["mix test test/gateway_test.exs"],
+        "{plan:#?}"
+    );
+    let notes = plan.notes("//platform:test");
+    assert!(
+        notes.contains("runs the tests reaching 1 definition(s) naming a path in //gateway"),
+        "{notes}"
+    );
+    assert!(!notes.contains("gateway/configs"), "{notes}");
+
+    // Phase 2: a new file under configs/ is covered by the directory that
+    // assets.ex names and by the root, not by the test naming a.yaml.
+    let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
+    ws.write("gateway/configs/b.yaml", "name: b\n");
+    assert_eq!(
+        ws.plan("test").commands("//platform:test"),
+        ["mix test test/assets_test.exs test/gateway_test.exs"]
+    );
+
+    // Phase 3: the exact file, changed, selects the test that names it.
+    let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
+    change_gateway_config(&ws);
+    assert_eq!(
+        ws.plan("test").commands("//platform:test"),
+        ["mix test test/assets_test.exs test/direct_test.exs test/gateway_test.exs"]
+    );
+
+    // Phase 4: a deleted file still selects what names it.
+    let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
+    fs::remove_file(ws.root().join("gateway/configs/a.yaml")).unwrap();
+    assert_eq!(
+        ws.plan("test").commands("//platform:test"),
+        ["mix test test/assets_test.exs test/direct_test.exs test/gateway_test.exs"]
+    );
+}
+
+#[test]
+fn inferred_consumers_that_no_change_covers_leave_the_dependent_out() {
+    // Only configs/ is named, and the change is elsewhere in the dependency:
+    // no definition is selected, so the dependent does not run.
+    let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
+    for file in ["test/support/gateway.ex", "test/gateway_test.exs"] {
+        fs::remove_file(ws.root().join("platform").join(file)).unwrap();
+    }
+    ws.git(&["add", "-A"]);
+    ws.git(&["commit", "-q", "-m", "drop the root readers"]);
+    change_gateway(&ws);
+    let plan = ws.plan("test");
+    assert!(!plan.runs().contains(&"//platform:test"), "{plan:#?}");
+}
+
+#[test]
+fn declared_files_are_selected_by_any_change_in_the_dependency() {
+    let toml = "depends_on = [\"//gateway\"]\n\n[consumes.\"//gateway\"]\nfiles = [\"test/direct_test.exs\"]\n";
+    let ws = gateway(toml, "depends_on = [\"//platform\"]\n");
+    change_gateway(&ws);
+    assert_eq!(
+        ws.plan("test").commands("//platform:test"),
+        ["mix test test/direct_test.exs"]
     );
 }
 
@@ -2514,7 +2590,7 @@ fn declared_files_narrow_without_inference() {
 #[test]
 fn shard_projects_follow_the_narrowed_dependent() {
     let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
-    change_gateway(&ws);
+    change_gateway_config(&ws);
     let plan = ws.plan("test-ci");
     for shard in ["1", "2"] {
         let commands = plan.commands(&format!("//platform-shard-{shard}:test-ci"));
@@ -2534,7 +2610,7 @@ fn shard_projects_follow_the_narrowed_dependent() {
 #[test]
 fn narrowing_carries_on_to_the_dependents_of_the_dependent() {
     let ws = gateway(GATEWAY_INFER, PORTAL_INFER);
-    change_gateway(&ws);
+    change_gateway_config(&ws);
     // The platform's own code names the gateway, so what the platform
     // provides may differ and its dependent is affected in turn.
     let plan = ws.plan("test");
@@ -2552,7 +2628,7 @@ fn narrowing_carries_on_to_the_dependents_of_the_dependent() {
 
     // Without evidence the portal runs in full.
     let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
-    change_gateway(&ws);
+    change_gateway_config(&ws);
     let plan = ws.plan("test");
     assert!(plan.commands("//portal:test").is_empty(), "{plan:#?}");
     assert!(plan
