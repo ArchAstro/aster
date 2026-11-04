@@ -871,6 +871,11 @@ impl Walker<'_> {
         let Some(target) = target else {
             return false;
         };
+        // Under a computed path the route's own path is unknown. It stays
+        // file-level code, which is reached with the whole router.
+        if self.route_scopes.iter().any(|frame| frame.opaque) {
+            return false;
+        }
         let mut pattern = String::new();
         for frame in &self.route_scopes {
             pattern.push_str(frame.prefix.trim_end_matches('/'));
@@ -1363,8 +1368,9 @@ end
         assert!(pipes("/api/health").is_empty());
         assert_eq!(pipes("/api/orders/"), ["admin", "api"]);
         assert_eq!(pipes("/api/users"), ["api"]);
-        // A scope with a computed path could hold any pipeline's routes.
-        assert_eq!(pipes("/y"), ["*"]);
+        // A scope with a computed path holds no route the index can place.
+        assert!(!facts.defs.iter().any(|d| d.route.as_deref() == Some("/y")));
+        assert!(facts.top.atoms.contains("*"));
     }
 
     #[test]

@@ -3115,7 +3115,15 @@ impl<'a, 'b> Run<'a, 'b> {
             // Nothing names it, so something reaches it another way: a
             // framework callback, a macro expansion, reflection.
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id);
-            if def.callback || def.kind == DefKind::Macro || unnamed {
+            // An Elixir function nothing names is called through a module a
+            // caller holds (`mod.name(args)`), not by every user of its file.
+            let held = unnamed
+                && !def.callback
+                && def.kind == DefKind::Function
+                && source.facts.family == Family::Elixir;
+            if held {
+                self.dispatchers(id, &def.name);
+            } else if def.callback || def.kind == DefKind::Macro || unnamed {
                 match def.accepts.as_deref().filter(|_| def.callback) {
                     // A message clause is reached by what can send its message.
                     Some(tag) => self.senders(source.unit, id, tag),

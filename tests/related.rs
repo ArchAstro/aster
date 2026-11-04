@@ -626,7 +626,8 @@ fn a_source_file_read_by_path_selects_the_code_that_reads_it() {
         "export function add",
         "// Adds.\nexport function add",
     );
-    assert!(ws.plan("test").runs().is_empty());
+    let plan = ws.plan("test");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
 }
 
 #[test]
@@ -683,7 +684,8 @@ fn a_directory_named_by_path_selects_on_any_file_beneath_it() {
     // A document in the directory is read by the test that names the file.
     let ws = Workspace::new(&files);
     ws.write("money/data/prices/NOTES.md", "notes\n");
-    assert!(ws.plan("test").runs().is_empty());
+    let plan = ws.plan("test");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
     ws.write("money/data/prices/golden.txt", "1.00\n");
     assert_eq!(
         ws.plan("test").commands("//cart:test"),
@@ -3160,6 +3162,42 @@ fn a_behaviour_called_through_a_variable_reaches_the_tests_of_its_caller() {
     assert_eq!(
         ws.plan("test").commands("//app:test"),
         ["mix test test/app/dispatch_test.exs"]
+    );
+}
+
+#[test]
+fn a_new_elixir_function_nothing_calls_selects_no_test() {
+    let ws = Workspace::new(ELIXIR);
+    // Nothing names `free?`, so no test of the file's users runs.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "  def tax(amount)",
+        "  def free?(amount), do: amount == 0\n\n  def tax(amount)",
+    );
+    let plan = ws.plan("test");
+    assert!(plan.runs().is_empty(), "{plan:#?}");
+}
+
+#[test]
+fn an_elixir_function_called_through_a_module_variable_selects_its_callers() {
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "shop/lib/shop/checkout.ex",
+        "defmodule Shop.Checkout do\n  def free?(mod, amount), do: mod.free?(amount)\nend\n",
+    ));
+    files.push((
+        "shop/test/shop/checkout_test.exs",
+        "defmodule Shop.CheckoutTest do\n  use ExUnit.Case\n\n  test \"free\" do\n    assert Shop.Checkout.free?(Shop.Pricing, 0)\n  end\nend\n",
+    ));
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "  def tax(amount)",
+        "  def free?(amount), do: amount == 0\n\n  def tax(amount)",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/checkout_test.exs"]
     );
 }
 
