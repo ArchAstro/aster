@@ -1735,7 +1735,7 @@ impl<'a> Index<'a> {
         }
 
         let base_product: Vec<bool> = outcomes.iter().map(|o| o.product).collect();
-        self.spread(&mut run, &mut outcomes, &base_product);
+        self.spread(&mut run, &mut outcomes, &base_product, changes);
 
         Related {
             projects: self
@@ -1946,7 +1946,13 @@ impl<'a> Index<'a> {
     /// A dependent that declares which of its sources consume the
     /// dependency runs those and the tests that reach them instead of
     /// running in full; what they affect carries on to its own dependents.
-    fn spread(&self, run: &mut Run<'a, '_>, outcomes: &mut [Outcome], base_product: &[bool]) {
+    fn spread(
+        &self,
+        run: &mut Run<'a, '_>,
+        outcomes: &mut [Outcome],
+        base_product: &[bool],
+        changes: &[Change],
+    ) {
         let family = |i: usize| Family::of_plugin(&self.projects[i].plugin_name);
         // Projects the declared graph reaches from a changed project: what
         // `--dependents` would select. Opaque edges are followed inside this
@@ -2016,7 +2022,8 @@ impl<'a> Index<'a> {
             for (dependent, dependency, name, mut reason) in updates {
                 handled.insert((dependent, dependency));
                 if outcomes[dependent].full.is_none() {
-                    match self.consumer_seeds(dependent, dependency, &outcomes[dependency]) {
+                    match self.consumer_seeds(dependent, dependency, &outcomes[dependency], changes)
+                    {
                         Ok((seeds, note)) => {
                             for (id, why) in seeds {
                                 run.mark(id, Why::Changed(why));
@@ -2071,6 +2078,7 @@ impl<'a> Index<'a> {
         dependent: usize,
         dependency: usize,
         upstream: &Outcome,
+        changes: &[Change],
     ) -> Result<(Vec<(DefId, String)>, String), String> {
         let name = address(&self.projects[dependency]);
         let state = if upstream.changed {
@@ -2091,6 +2099,8 @@ impl<'a> Index<'a> {
         };
         let mut seeds: Vec<(DefId, String)> = Vec::new();
         let mut how = Vec::new();
+        // Definitions naming the dependency that no change reaches.
+        let mut uncovered = 0;
         if let Some(patterns) = &entry.files {
             let dir = &self.projects[dependent].relative_path;
             for pattern in patterns {
@@ -2131,6 +2141,31 @@ impl<'a> Index<'a> {
         }
         if entry.infer {
             let named = self.naming_defs(dependent, dependency);
+            // A definition names a path, so it consumes the dependency
+            // only when a change equals or lies beneath that path, as with
+            // `aster: reads`. When the dependency changed only through its
+            // own dependencies, no file of it says which paths matter.
+            let dependency_dir = &self.projects[dependency].relative_path;
+            let changed_here: Vec<&Path> = changes
+                .iter()
+                .map(|c| c.path.as_path())
+                .filter(|p| p.starts_with(dependency_dir))
+                .collect();
+            let precise = upstream.changed && !changed_here.is_empty();
+            let total = named.len();
+            let named: Vec<(DefId, PathBuf)> = named
+                .into_iter()
+                .filter_map(|(id, paths)| {
+                    if !precise {
+                        return paths.into_iter().next().map(|p| (id, p));
+                    }
+                    paths
+                        .into_iter()
+                        .find(|path| changed_here.iter().any(|c| c.starts_with(path)))
+                        .map(|p| (id, p))
+                })
+                .collect();
+            uncovered = total - named.len();
             how.push(format!(
                 "{} definition(s) naming a path in {name}",
                 named.len()
@@ -2143,6 +2178,15 @@ impl<'a> Index<'a> {
             }
         }
         if seeds.is_empty() {
+            if uncovered > 0 {
+                return Ok((
+                    seeds,
+                    format!(
+                        "no change in {name} is at a path the {uncovered} definition(s) naming \
+                         one in it read"
+                    ),
+                ));
+            }
             if entry.files.is_some() && !entry.infer {
                 return Ok((
                     seeds,
@@ -2169,8 +2213,8 @@ impl<'a> Index<'a> {
     }
 
     /// Definitions of `dependent` whose string literals name a path that
-    /// `dependency` owns, with the first such path.
-    fn naming_defs(&self, dependent: usize, dependency: usize) -> Vec<(DefId, PathBuf)> {
+    /// `dependency` owns, with every such path.
+    fn naming_defs(&self, dependent: usize, dependency: usize) -> Vec<(DefId, Vec<PathBuf>)> {
         let target = &self.projects[dependency].relative_path;
         if target.as_os_str().is_empty() {
             return Vec::new();
@@ -2190,19 +2234,23 @@ impl<'a> Index<'a> {
                 .map(|(d, def)| ((f as u32, d as u32), def))
                 .chain(std::iter::once(((f as u32, TOP), &source.facts.top)));
             for (id, def) in defs {
-                let named = def.strings.iter().find_map(|string| {
-                    consumers::named_paths(string, file_dir, project_dir)
-                        .into_iter()
-                        .find(|path| owner(self.projects, path) == Some(dependency))
-                });
-                let declared = || {
-                    def.reads
-                        .iter()
-                        .map(|pattern| annotations::literal_prefix(pattern))
-                        .find(|path| owner(self.projects, path) == Some(dependency))
-                };
-                if let Some(path) = named.or_else(declared) {
-                    found.push((id, path));
+                let mut paths: Vec<PathBuf> = Vec::new();
+                for string in &def.strings {
+                    for path in consumers::named_paths(string, file_dir, project_dir) {
+                        if owner(self.projects, &path) == Some(dependency) && !paths.contains(&path)
+                        {
+                            paths.push(path);
+                        }
+                    }
+                }
+                for pattern in &def.reads {
+                    let path = annotations::literal_prefix(pattern);
+                    if owner(self.projects, &path) == Some(dependency) && !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+                if !paths.is_empty() {
+                    found.push((id, paths));
                 }
             }
         }
