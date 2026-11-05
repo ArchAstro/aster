@@ -479,6 +479,103 @@ fn services_kill_ports_previews_then_clears_configured_listener() {
 }
 
 #[test]
+fn ports_report_drops_a_dead_supervisors_manifest_after_a_new_supervisor_takes_its_ports() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let lease_dir = root.join("leases");
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    // A one-port range forces the second supervisor onto the first one's port.
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    write_http_server_fixture(&root.join("app"));
+    fs::write(
+        root.join("aster.toml"),
+        format!(
+            r#"
+[dev.ports.http]
+allocation = "dynamic"
+range = [{port}, {port}]
+
+[dev.services.web]
+target = "//app:dev"
+port = "http"
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/aster.toml"),
+        r#"
+[targets.dev]
+command = "sh -c 'echo $$ > ../service.pid; exec python3 http_server.py {port}'"
+stream = true
+"#,
+    )
+    .unwrap();
+
+    // First supervisor crashes, then its service dies too. SIGKILL skips
+    // PortLease::drop, so the manifest outlives every process and lock it named.
+    let mut crashed = OwnedBundle::launch(root, &lease_dir);
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && allocation_manifest_count(&lease_dir) == 1
+    });
+    let crashed_pid = crashed.id();
+    let service_pid: i32 = fs::read_to_string(root.join("service.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    crashed.signal_group(libc::SIGKILL);
+    wait_until(Duration::from_secs(5), || {
+        crashed.try_wait().ok().flatten().is_some()
+    });
+    unsafe {
+        libc::kill(service_pid, libc::SIGKILL);
+    }
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect(("127.0.0.1", port)).is_err()
+    });
+    // The group is reaped, so its IDs may be reused: never signal it again.
+    crashed.released = true;
+    assert_eq!(allocation_manifest_count(&lease_dir), 1);
+
+    // A second supervisor in the same worktree leases the freed port.
+    let live = OwnedBundle::launch(root, &lease_dir);
+    wait_until(Duration::from_secs(20), || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && allocation_manifest_count(&lease_dir) == 2
+    });
+
+    // The port lock is held, but by the live supervisor. The crashed
+    // supervisor's manifest is stale: it must not be reported, and the report
+    // removes it.
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["--json", "services", "ports"])
+        .current_dir(root)
+        .env("ASTER_PORT_LEASE_DIR", &lease_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let instances = report["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1, "report: {report}");
+    assert_eq!(instances[0]["supervisor_pid"], live.id());
+    assert_eq!(instances[0]["status"], "active");
+    assert_eq!(allocation_manifest_count(&lease_dir), 1);
+    drop(live);
+    remove_fixture_manifests(&lease_dir, crashed_pid);
+}
+
+#[test]
 fn dynamic_port_bundles_are_distinct_propagated_and_released() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
