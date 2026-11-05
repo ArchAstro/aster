@@ -13,6 +13,10 @@
 // Rules that pull requests change are small switches in `Rules`, so each one can
 // be compared with the rule on main:
 //   callbackClauses  ArchAstro/aster#347 (merged: on in `mainRules`)
+//   deadSilent       ArchAstro/aster#353 (merged: on)
+//   processStarters  ArchAstro/aster#353 (merged: on)
+//   fullFallback     the "reaches no test, run in full" check that
+//                    ArchAstro/aster#354 removed (merged: off)
 //   schemaTop        ArchAstro/aster#348 (open)
 //   routeNothing     ArchAstro/aster#349 (open)
 module related {
@@ -59,14 +63,20 @@ module related {
     requests: Set[Request], reflects: Set[int],
     preloads: Set[Pair], builtPaths: Set[Pair], computed: Set[Pair],
   }
-  type Rules = { callbackClauses: bool, schemaTop: bool, routeNothing: bool }
+  type Rules = {
+    callbackClauses: bool, deadSilent: bool, processStarters: bool, fullFallback: bool,
+    schemaTop: bool, routeNothing: bool,
+  }
   // `comments`: units whose standalone comment line is edited. `trailing`:
   // definitions whose trailing comment (`0 # note`) is edited and nothing else.
   type Changes = { edits: Set[int], comments: Set[int], trailing: Set[int] }
   type Selection = { full: bool, tests: Set[int] }
   type State = { repo: Repo, rules: Rules, changes: Changes, selection: Selection }
 
-  pure val mainRules: Rules = { callbackClauses: true, schemaTop: false, routeNothing: false }
+  pure val mainRules: Rules = {
+    callbackClauses: true, deadSilent: true, processStarters: true, fullFallback: false,
+    schemaTop: false, routeNothing: false,
+  }
   pure val noChanges: Changes = { edits: Set(), comments: Set(), trailing: Set() }
   pure val noSelection: Selection = { full: false, tests: Set() }
   pure val emptyRepo: Repo = {
@@ -138,34 +148,80 @@ module related {
   // Each rule is a guard on a definition that yields Links labelled with the
   // rule that fired. `usersOf` is the unit-wide fan-out.
 
-  // Definitions that use unit `u`, as seen from `d` (so a rule can look at what `d` is).
+  // Functions that start a process, or hand a module to one that will.
+  pure val startFunctions: Set[str] = Set(
+    "start", "start_link", "start_child", "start_supervised", "start_supervised!",
+    "start_link_supervised!", "child_spec", "init")
+  // Callbacks of a process's life, and the ones that take a message.
+  pure val lifecycle: Set[str] = Set("init", "terminate", "code_change", "start_link", "start", "child_spec")
+  pure val messageCallbacks: Set[str] = Set("handle_call", "handle_cast", "handle_info", "handle_continue")
+
+  // Qualified calls `e` makes into unit `u`.
+  pure def intoCalls(r: Repo, e: int, u: int): Set[Pair] =
+    r.calls.filter(c => c.from == e and unit(r, c.to) == u)
+
+  // `e` names unit `u` other than as the receiver of a call to one of its functions: a
+  // struct, an import, or no call into it at all.
+  pure def namesOtherwise(r: Repo, e: int, u: int): bool =
+    shapesOf(r, e, u) or importsUnit(r, e, u) or intoCalls(r, e, u).size() == 0
+
+  // `e` may start a process of unit `u`, which runs its `init` and `terminate`.
+  pure def mayStart(r: Repo, e: int, u: int): bool =
+    unit(r, e) != u and
+    (intoCalls(r, e, u).exists(c => startFunctions.contains(r.nameOf.get(c.to)) or kind(r, c.to) == "macro")
+     or namesOtherwise(r, e, u))
+
+  // `e` may send a message tagged `tag` (any message when `tag` is 0) to a process of unit `u`.
+  pure def maySend(r: Repo, e: int, u: int, tag: int): bool = {
+    val sent = r.sends.filter(s => s.id == e)
+    r.sendsAny.contains(e) or
+    (if (tag == 0) sent.size() > 0 else sent.exists(s => s.tag == tag)) or
+    ((tag == 0 or sent.size() == 0) and unit(r, e) != u and
+     (intoCalls(r, e, u).exists(c => kind(r, c.to) == "macro") or namesOtherwise(r, e, u)))
+  }
+
+  // Definitions that use unit `u`, as seen from `d`, and so are reached when `d` fans out.
   pure def usersOf(r: Repo, rules: Rules, u: int, d: int): Set[int] = {
     val called = nodes(r).filter(e => callsInto(r, e, u))
     val shaped = nodes(r).filter(e => shapesOf(r, e, u) and not(callsInto(r, e, u)))
     // #348: a shape-only use depends on the target's top-level code, not its functions.
     val shapeReached = if (rules.schemaTop and kind(r, d) != "top") Set() else shaped
-    val reached = called.union(shapeReached)
-    // #347: a callback clause with a literal message tag is reached by senders of that tag.
-    val tag = if (r.accepts.keys().contains(d)) r.accepts.get(d) else 0
-    if (rules.callbackClauses and kind(r, d) == "callback" and tag > 0)
-      reached.filter(e => r.sendsAny.contains(e) or r.sends.contains({ id: e, tag: tag })
-                      or (r.sends.filter(s => s.id == e).size() == 0 and (shapesOf(r, e, u) or importsUnit(r, e, u))))
-    else reached
+    called.union(shapeReached)
   }
 
-  // The rule that sends `d` to every user of its unit, or "".
-  pure def fanRule(r: Repo, d: int): str =
+  // Where a callback fans out to. #347: a clause with a literal message tag goes to
+  // senders of it. #353: a lifecycle callback goes to what may start the process, and a
+  // clause that matches any message to what may send one or start the process.
+  pure def callbackUsers(r: Repo, rules: Rules, u: int, d: int): Set[int] = {
+    val tag = if (r.accepts.keys().contains(d)) r.accepts.get(d) else 0
+    val name = r.nameOf.get(d)
+    val candidates = usersOf(r, rules, u, d).union(defsOf(r, u)).exclude(Set(d))
+    if (rules.callbackClauses and tag > 0) candidates.filter(e => maySend(r, e, u, tag))
+    else if (rules.processStarters and lifecycle.contains(name)) candidates.filter(e => mayStart(r, e, u))
+    else if (rules.processStarters and messageCallbacks.contains(name))
+      candidates.filter(e => maySend(r, e, u, 0) or mayStart(r, e, u))
+    else usersOf(r, rules, u, d)
+  }
+
+  // A file that registers no callbacks (`use`, `@behaviour`, ...) cannot have a function
+  // called by a name nothing writes.
+  pure def registers(r: Repo, u: int): bool = r.imports.exists(i => i.from == u)
+
+  // The rule that sends `d` to every user of its unit, or "". `edited`: definitions the
+  // change itself touches, which keep the unnamed rule.
+  pure def fanRule(r: Repo, rules: Rules, edited: Set[int], d: int): str =
     if (inTestFile(r, d)) ""
     else if (kind(r, d) == "callback") "callback"
     else if (kind(r, d) == "macro") "macro"
-    else if (kind(r, d) == "fn" and namers(r, d).size() == 0) "unnamed"
+    else if (kind(r, d) == "fn" and namers(r, d).size() == 0 and
+             not(rules.deadSilent and not(registers(r, unit(r, d))) and not(edited.contains(d)))) "unnamed"
     else ""
 
   pure def mk(from: int, tos: Set[int], rule: str): Set[Link] =
     tos.map(t => { from: from, to: t, rule: rule })
 
   // Everything a reached definition `d` reaches next.
-  pure def linksFrom(r: Repo, rules: Rules, d: int): Set[Link] = {
+  pure def linksFrom(r: Repo, rules: Rules, edited: Set[int], d: int): Set[Link] = {
     val u = unit(r, d)
     val k = kind(r, d)
     if (k == "test") Set()
@@ -179,21 +235,23 @@ module related {
       else if (rules.routeNothing) Set()
       else mk(d, usersOf(r, rules, u, d), "route-fallback")
     } else {
-      val fan = fanRule(r, d)
+      val fan = fanRule(r, rules, edited, d)
       mk(d, namers(r, d), "named")
-        .union(if (fan == "") Set() else mk(d, usersOf(r, rules, u, d), fan))
+        .union(if (fan == "") Set()
+               else if (kind(r, d) == "callback") mk(d, callbackUsers(r, rules, u, d), fan)
+               else mk(d, usersOf(r, rules, u, d), fan))
     }
   }
 
-  pure def stepLinks(r: Repo, rules: Rules, from: Set[int]): Set[Link] =
-    from.fold(Set(), (acc, d) => acc.union(linksFrom(r, rules, d)))
+  pure def stepLinks(r: Repo, rules: Rules, edited: Set[int], from: Set[int]): Set[Link] =
+    from.fold(Set(), (acc, d) => acc.union(linksFrom(r, rules, edited, d)))
 
   type Reach = { nodes: Set[int], links: Set[Link] }
 
   // The least fixpoint of `linksFrom` from `seeds`.
   pure def reach(r: Repo, rules: Rules, seeds: Set[int]): Reach =
     nodes(r).fold({ nodes: seeds, links: Set() }, (acc, _) => {
-      val ls = stepLinks(r, rules, acc.nodes)
+      val ls = stepLinks(r, rules, seeds, acc.nodes)
       { nodes: acc.nodes.union(ls.map(l => l.to)), links: acc.links.union(ls) }
     })
 
@@ -219,7 +277,7 @@ module related {
       reachedTests(r, reach(r, rules, touched(ch).filter(d => unit(r, d) == u)).nodes).size() == 0)
 
   pure def selectTests(r: Repo, rules: Rules, ch: Changes): Selection = {
-    val full = unreached(r, rules, ch)
+    val full = rules.fullFallback and unreached(r, rules, ch)
     val got = reachedTests(r, reach(r, rules, seeds(r, ch)).nodes)
     { full: full, tests: if (full) r.testUnits else got }
   }

@@ -1,7 +1,7 @@
-//! Each test pins one place where the engine departs from a stated rule or
-//! invariant, on the smallest repo that shows it. They assert what the engine
-//! does today: when one fails, the engine changed, and the divergence list in
-//! the pull request that added this file needs updating.
+//! Each test pins one rule or invariant on the smallest repo that shows it. Some
+//! are divergences the model found that main has since fixed (D1, D5), written
+//! now as the behaviour that holds; the rest assert what the engine still does.
+//! When one fails, the engine changed and the model's rule switch needs updating.
 //!
 //! The same cases are written against the model in `witnesses.qnt`.
 
@@ -17,14 +17,14 @@ fn narrow(plan: &Plan) -> Vec<&str> {
     plan.files.iter().map(String::as_str).collect()
 }
 
-/// D1. Adding an edit can select fewer tests.
+/// D1 (fixed by #354). Adding an edit never selects fewer tests.
 ///
 /// `helper` is called by `Dead.run`, which nothing uses, so editing it alone
-/// "reaches no test" and the whole project runs. Editing `used` as well, in
-/// the same file, reaches the test that calls it, and the project then runs
-/// only that test.
+/// reaches no test and selects nothing. Editing `used` as well reaches the test
+/// that calls it. Before #354 the first change ran the whole project, which was
+/// more than the second.
 #[test]
-fn a_larger_change_selects_fewer_tests_than_a_smaller_one() {
+fn a_larger_change_selects_at_least_what_a_smaller_one_does() {
     // Setup: one file with two functions; the first is reachable only from
     // dead code, the second from a test. A second test touches neither.
     let files = [
@@ -55,10 +55,9 @@ fn a_larger_change_selects_fewer_tests_than_a_smaller_one() {
         "helper(x), do: x + 0",
     )
     .unwrap();
+    // Outcome: nothing reaches a test, so nothing runs.
     let small = ws.plan().unwrap();
-    // Outcome: nothing reached a test, so every test runs.
-    assert!(small.full, "{small:?}");
-    assert!(small.notes.contains("reaches no test"), "{}", small.notes);
+    assert_eq!(small, Plan::default(), "{small:?}");
 
     // Action: edit `used` too.
     ws.edit(
@@ -67,8 +66,8 @@ fn a_larger_change_selects_fewer_tests_than_a_smaller_one() {
         "used(x), do: x + 0",
     )
     .unwrap();
+    // Outcome: the larger change selects the test that calls `used`.
     let big = ws.plan().unwrap();
-    // Outcome: the larger change runs one test; the smaller one ran two.
     assert_eq!(narrow(&big), ["test/pipeline_test.exs"]);
 }
 
@@ -156,13 +155,13 @@ fn a_route_nothing_requests_selects_users_of_the_router_module() {
     assert_eq!(narrow(&ws.plan().unwrap()), ["test/router_test.exs"]);
 }
 
-/// D5. Reflection counts for the selection but not for the fallback.
+/// D5 (fixed by #354). A reflecting test counts as reaching a change.
 ///
 /// The test that lists the application's modules is reached by any change to
-/// non-test code, yet `unused` still "reaches no test", so the project runs in
-/// full instead of running that one test.
+/// non-test code; before #354 `unused` still "reached no test" and the project
+/// ran in full instead of that one test.
 #[test]
-fn a_change_only_a_reflecting_test_reaches_still_runs_in_full() {
+fn a_change_only_a_reflecting_test_reaches_selects_that_test() {
     let files = [
         MIX,
         (
@@ -180,9 +179,7 @@ fn a_change_only_a_reflecting_test_reaches_still_runs_in_full() {
     ];
     let ws = Workspace::from_files(&files).unwrap();
     ws.edit("shop/lib/a.ex", "do: x", "do: x + 0").unwrap();
-    let plan = ws.plan().unwrap();
-    assert!(plan.full, "{plan:?}");
-    assert!(plan.notes.contains("reaches no test"), "{}", plan.notes);
+    assert_eq!(narrow(&ws.plan().unwrap()), ["test/modules_test.exs"]);
 }
 
 /// D6. A computed module name is found only when the same definition also
@@ -210,4 +207,31 @@ fn a_function_called_by_computed_module_name_is_found_only_beside_a_mention_of_i
     ws.edit("shop/lib/a.ex", "def f(x), do: x", "def f(x), do: x + 0")
         .unwrap();
     assert_eq!(narrow(&ws.plan().unwrap()), ["test/seen_test.exs"]);
+}
+
+/// D7 (fixed by #354). A message clause nobody sends selects nothing.
+///
+/// `handle_cast({:ping}, ..)` is reached by what may send `:ping`. The test only
+/// starts the worker, so nothing reaches it; before #354 that ran the project.
+#[test]
+fn a_message_clause_nobody_sends_selects_nothing() {
+    let files = [
+        MIX,
+        (
+            "shop/lib/worker.ex",
+            "defmodule Shop.Worker do\n  def start_link(arg), do: arg\n\n  def handle_cast({:ping}, state), do: state\nend\n",
+        ),
+        (
+            "shop/test/worker_test.exs",
+            "defmodule Shop.WorkerTest do\n  use ExUnit.Case\n\n  test \"starts\" do\n    assert Shop.Worker.start_link(1) == 1\n  end\nend\n",
+        ),
+    ];
+    let ws = Workspace::from_files(&files).unwrap();
+    ws.edit(
+        "shop/lib/worker.ex",
+        "state), do: state",
+        "state), do: {state, 1}",
+    )
+    .unwrap();
+    assert_eq!(ws.plan().unwrap(), Plan::default());
 }

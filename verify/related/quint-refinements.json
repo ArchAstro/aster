@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "modelDigest": "sha256:c518b574f711f89cd38ecd4b0c27d8eb676430783ad9b3f49766b7b692de13d4",
+  "modelDigest": "sha256:7e87d71c4acde4ce1f5ee2644e9a4cfb7790d19cd28b8b0c698fb0e74f66ad74",
   "vocabulary": {
     "actions": [
       "build",
@@ -24,6 +24,7 @@
       "and",
       "applyDelta",
       "callEdges",
+      "callbackUsers",
       "callsInto",
       "choosePairs",
       "contained",
@@ -55,6 +56,7 @@
       "imul",
       "inTestFile",
       "indices",
+      "intoCalls",
       "ite",
       "keys",
       "kind",
@@ -62,10 +64,13 @@
       "linksFrom",
       "map",
       "mapBy",
+      "maySend",
+      "mayStart",
       "mentions",
       "mix",
       "mk",
       "namers",
+      "namesOtherwise",
       "neq",
       "nodes",
       "not",
@@ -77,6 +82,7 @@
       "reach",
       "reachedTests",
       "reflectRoots",
+      "registers",
       "requesters",
       "runs",
       "seeds",
@@ -207,7 +213,6 @@
       "edit91",
       "editable",
       "emptyRepo",
-      "everything",
       "expect_shopQuiet_commentOnly",
       "expect_shopQuiet_edit10",
       "expect_shopQuiet_edit1010",
@@ -228,7 +233,9 @@
       "expect_shop_edit21",
       "expect_workers_edit31",
       "fanoutRules",
+      "lifecycle",
       "mainRules",
+      "messageCallbacks",
       "noChanges",
       "noSelection",
       "reflectors",
@@ -236,6 +243,7 @@
       "shop",
       "shopDefs",
       "shopQuiet",
+      "startFunctions",
       "state",
       "statedFanout",
       "trailingOnly",
@@ -330,7 +338,6 @@
       "with"
     ],
     "runtimeObservationDependencies": [
-      "name:everything",
       "name:noSelection",
       "name:state",
       "name:x1",
@@ -382,7 +389,7 @@
       "path:state.selection",
       "path:state.selection.tests"
     ],
-    "runtimeObservationDependencyDigest": "sha256:ef2c823e694c52ab5260ea7add84f74aff201fc5fa5b2facb96eac9febf24dfd"
+    "runtimeObservationDependencyDigest": "sha256:fd58036f91afe7ea60d15f43b46bbc32af31a7c5070ba532f863bb365bf5bf4b"
   },
   "fixtures": {
     "scenarios": {
@@ -7015,23 +7022,6 @@
           "#set": []
         }
       },
-      "everything": {
-        "full": true,
-        "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
-        }
-      },
       "expect_shopQuiet_commentOnly": {
         "full": false,
         "tests": {
@@ -7099,8 +7089,6 @@
         "full": false,
         "tests": {
           "#set": [
-            101,
-            106,
             108
           ]
         }
@@ -7108,11 +7096,7 @@
       "expect_shopQuiet_edit62": {
         "full": false,
         "tests": {
-          "#set": [
-            101,
-            106,
-            108
-          ]
+          "#set": []
         }
       },
       "expect_shopQuiet_edit80": {
@@ -7132,36 +7116,16 @@
         }
       },
       "expect_shopQuiet_edit90": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "expect_shopQuiet_edit90_10": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
+            101
           ]
         }
       },
@@ -7209,6 +7173,9 @@
       },
       "mainRules": {
         "callbackClauses": true,
+        "deadSilent": true,
+        "fullFallback": false,
+        "processStarters": true,
         "routeNothing": false,
         "schemaTop": false
       },
@@ -8619,19 +8586,12 @@
         }
       },
       "x1": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
             102,
-            103,
-            104,
-            105,
             106,
-            107,
-            108,
-            109,
-            110
+            109
           ]
         }
       },
@@ -8651,9 +8611,7 @@
         "full": false,
         "tests": {
           "#set": [
-            106,
-            109,
-            110
+            109
           ]
         }
       },
@@ -8661,8 +8619,7 @@
         "full": false,
         "tests": {
           "#set": [
-            106,
-            108
+            106
           ]
         }
       },
@@ -8687,19 +8644,14 @@
         }
       },
       "x15": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
             103,
-            104,
             105,
             106,
             107,
-            108,
-            109,
-            110
+            108
           ]
         }
       },
@@ -8713,20 +8665,9 @@
         }
       },
       "x17": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "x18": {
@@ -8751,19 +8692,11 @@
         }
       },
       "x2": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
             106,
-            107,
-            108,
-            109,
-            110
+            107
           ]
         }
       },
@@ -8779,37 +8712,17 @@
         }
       },
       "x21": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
+            106
           ]
         }
       },
       "x22": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "x23": {
@@ -8864,54 +8777,24 @@
         }
       },
       "x29": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
             106,
-            107,
-            108,
-            109,
-            110
+            107
           ]
         }
       },
       "x3": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "x30": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "x31": {
@@ -8923,17 +8806,10 @@
         }
       },
       "x32": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
             106,
-            107,
-            108,
             109,
             110
           ]
@@ -8952,25 +8828,15 @@
         "tests": {
           "#set": [
             101,
-            102,
             106,
             108
           ]
         }
       },
       "x35": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
             110
           ]
         }
@@ -8997,27 +8863,13 @@
       "x38": {
         "full": false,
         "tests": {
-          "#set": [
-            106,
-            110
-          ]
+          "#set": []
         }
       },
       "x39": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       },
       "x4": {
@@ -9030,19 +8882,11 @@
         }
       },
       "x40": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
             102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
+            106
           ]
         }
       },
@@ -9071,431 +8915,27 @@
           "#set": [
             102,
             106,
-            108,
             109
           ]
         }
       },
       "x8": {
-        "full": true,
+        "full": false,
         "tests": {
           "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
+            105
           ]
         }
       },
       "x9": {
-        "full": true,
+        "full": false,
         "tests": {
-          "#set": [
-            101,
-            102,
-            103,
-            104,
-            105,
-            106,
-            107,
-            108,
-            109,
-            110
-          ]
+          "#set": []
         }
       }
     }
   },
   "assertionLists": [
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "Rec",
-              "arguments": [
-                {
-                  "kind": "str",
-                  "value": "repo"
-                },
-                {
-                  "kind": "call",
-                  "operator": "with",
-                  "arguments": [
-                    {
-                      "kind": "call",
-                      "operator": "with",
-                      "arguments": [
-                        {
-                          "kind": "call",
-                          "operator": "with",
-                          "arguments": [
-                            {
-                              "kind": "call",
-                              "operator": "with",
-                              "arguments": [
-                                {
-                                  "kind": "call",
-                                  "operator": "with",
-                                  "arguments": [
-                                    {
-                                      "kind": "call",
-                                      "operator": "with",
-                                      "arguments": [
-                                        {
-                                          "kind": "call",
-                                          "operator": "with",
-                                          "arguments": [
-                                            {
-                                              "kind": "call",
-                                              "operator": "with",
-                                              "arguments": [
-                                                {
-                                                  "kind": "call",
-                                                  "operator": "with",
-                                                  "arguments": [
-                                                    {
-                                                      "kind": "name",
-                                                      "value": "shop"
-                                                    },
-                                                    {
-                                                      "kind": "str",
-                                                      "value": "calls"
-                                                    },
-                                                    {
-                                                      "kind": "call",
-                                                      "operator": "field",
-                                                      "arguments": [
-                                                        {
-                                                          "kind": "name",
-                                                          "value": "d6"
-                                                        },
-                                                        {
-                                                          "kind": "str",
-                                                          "value": "calls"
-                                                        }
-                                                      ]
-                                                    }
-                                                  ]
-                                                },
-                                                {
-                                                  "kind": "str",
-                                                  "value": "bare"
-                                                },
-                                                {
-                                                  "kind": "call",
-                                                  "operator": "field",
-                                                  "arguments": [
-                                                    {
-                                                      "kind": "name",
-                                                      "value": "d6"
-                                                    },
-                                                    {
-                                                      "kind": "str",
-                                                      "value": "bare"
-                                                    }
-                                                  ]
-                                                }
-                                              ]
-                                            },
-                                            {
-                                              "kind": "str",
-                                              "value": "imports"
-                                            },
-                                            {
-                                              "kind": "call",
-                                              "operator": "field",
-                                              "arguments": [
-                                                {
-                                                  "kind": "name",
-                                                  "value": "d6"
-                                                },
-                                                {
-                                                  "kind": "str",
-                                                  "value": "imports"
-                                                }
-                                              ]
-                                            }
-                                          ]
-                                        },
-                                        {
-                                          "kind": "str",
-                                          "value": "shapes"
-                                        },
-                                        {
-                                          "kind": "call",
-                                          "operator": "field",
-                                          "arguments": [
-                                            {
-                                              "kind": "name",
-                                              "value": "d6"
-                                            },
-                                            {
-                                              "kind": "str",
-                                              "value": "shapes"
-                                            }
-                                          ]
-                                        }
-                                      ]
-                                    },
-                                    {
-                                      "kind": "str",
-                                      "value": "requests"
-                                    },
-                                    {
-                                      "kind": "call",
-                                      "operator": "field",
-                                      "arguments": [
-                                        {
-                                          "kind": "name",
-                                          "value": "d6"
-                                        },
-                                        {
-                                          "kind": "str",
-                                          "value": "requests"
-                                        }
-                                      ]
-                                    }
-                                  ]
-                                },
-                                {
-                                  "kind": "str",
-                                  "value": "reflects"
-                                },
-                                {
-                                  "kind": "call",
-                                  "operator": "field",
-                                  "arguments": [
-                                    {
-                                      "kind": "name",
-                                      "value": "d6"
-                                    },
-                                    {
-                                      "kind": "str",
-                                      "value": "reflects"
-                                    }
-                                  ]
-                                }
-                              ]
-                            },
-                            {
-                              "kind": "str",
-                              "value": "preloads"
-                            },
-                            {
-                              "kind": "call",
-                              "operator": "field",
-                              "arguments": [
-                                {
-                                  "kind": "name",
-                                  "value": "d6"
-                                },
-                                {
-                                  "kind": "str",
-                                  "value": "preloads"
-                                }
-                              ]
-                            }
-                          ]
-                        },
-                        {
-                          "kind": "str",
-                          "value": "builtPaths"
-                        },
-                        {
-                          "kind": "call",
-                          "operator": "field",
-                          "arguments": [
-                            {
-                              "kind": "name",
-                              "value": "d6"
-                            },
-                            {
-                              "kind": "str",
-                              "value": "builtPaths"
-                            }
-                          ]
-                        }
-                      ]
-                    },
-                    {
-                      "kind": "str",
-                      "value": "computed"
-                    },
-                    {
-                      "kind": "call",
-                      "operator": "field",
-                      "arguments": [
-                        {
-                          "kind": "name",
-                          "value": "d6"
-                        },
-                        {
-                          "kind": "str",
-                          "value": "computed"
-                        }
-                      ]
-                    }
-                  ]
-                },
-                {
-                  "kind": "str",
-                  "value": "rules"
-                },
-                {
-                  "kind": "name",
-                  "value": "mainRules"
-                },
-                {
-                  "kind": "str",
-                  "value": "changes"
-                },
-                {
-                  "kind": "name",
-                  "value": "noChanges"
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "noSelection"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:d6",
-          "name:mainRules",
-          "name:noChanges",
-          "name:noSelection",
-          "name:shop",
-          "name:state",
-          "operator:Rec",
-          "operator:assign",
-          "operator:field",
-          "operator:with",
-          "path:d6.bare",
-          "path:d6.builtPaths",
-          "path:d6.calls",
-          "path:d6.computed",
-          "path:d6.imports",
-          "path:d6.preloads",
-          "path:d6.reflects",
-          "path:d6.requests",
-          "path:d6.shapes"
-        ]
-      }
-    ],
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "with",
-              "arguments": [
-                {
-                  "kind": "call",
-                  "operator": "with",
-                  "arguments": [
-                    {
-                      "kind": "name",
-                      "value": "state"
-                    },
-                    {
-                      "kind": "str",
-                      "value": "changes"
-                    },
-                    {
-                      "kind": "name",
-                      "value": "c6"
-                    }
-                  ]
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "noSelection"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:c6",
-          "name:noSelection",
-          "name:state",
-          "operator:assign",
-          "operator:with"
-        ]
-      }
-    ],
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "with",
-              "arguments": [
-                {
-                  "kind": "name",
-                  "value": "state"
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "x6"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:state",
-          "name:x6",
-          "operator:assign",
-          "operator:with"
-        ]
-      }
-    ],
     [
       {
         "scope": "runtime",
@@ -22155,6 +21595,161 @@
                   "value": "repo"
                 },
                 {
+                  "kind": "name",
+                  "value": "shopQuiet"
+                },
+                {
+                  "kind": "str",
+                  "value": "rules"
+                },
+                {
+                  "kind": "name",
+                  "value": "mainRules"
+                },
+                {
+                  "kind": "str",
+                  "value": "changes"
+                },
+                {
+                  "kind": "name",
+                  "value": "noChanges"
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "noSelection"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:mainRules",
+          "name:noChanges",
+          "name:noSelection",
+          "name:shopQuiet",
+          "name:state",
+          "operator:Rec",
+          "operator:assign"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
+              "operator": "with",
+              "arguments": [
+                {
+                  "kind": "call",
+                  "operator": "with",
+                  "arguments": [
+                    {
+                      "kind": "name",
+                      "value": "state"
+                    },
+                    {
+                      "kind": "str",
+                      "value": "changes"
+                    },
+                    {
+                      "kind": "name",
+                      "value": "commentOnly"
+                    }
+                  ]
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "noSelection"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:commentOnly",
+          "name:noSelection",
+          "name:state",
+          "operator:assign",
+          "operator:with"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
+              "operator": "with",
+              "arguments": [
+                {
+                  "kind": "name",
+                  "value": "state"
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "expect_shopQuiet_commentOnly"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:expect_shopQuiet_commentOnly",
+          "name:state",
+          "operator:assign",
+          "operator:with"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
+              "operator": "Rec",
+              "arguments": [
+                {
+                  "kind": "str",
+                  "value": "repo"
+                },
+                {
                   "kind": "call",
                   "operator": "with",
                   "arguments": [
@@ -22513,161 +22108,6 @@
         "dependencies": [
           "name:state",
           "name:x40",
-          "operator:assign",
-          "operator:with"
-        ]
-      }
-    ],
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "Rec",
-              "arguments": [
-                {
-                  "kind": "str",
-                  "value": "repo"
-                },
-                {
-                  "kind": "name",
-                  "value": "shopQuiet"
-                },
-                {
-                  "kind": "str",
-                  "value": "rules"
-                },
-                {
-                  "kind": "name",
-                  "value": "mainRules"
-                },
-                {
-                  "kind": "str",
-                  "value": "changes"
-                },
-                {
-                  "kind": "name",
-                  "value": "noChanges"
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "noSelection"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:mainRules",
-          "name:noChanges",
-          "name:noSelection",
-          "name:shopQuiet",
-          "name:state",
-          "operator:Rec",
-          "operator:assign"
-        ]
-      }
-    ],
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "with",
-              "arguments": [
-                {
-                  "kind": "call",
-                  "operator": "with",
-                  "arguments": [
-                    {
-                      "kind": "name",
-                      "value": "state"
-                    },
-                    {
-                      "kind": "str",
-                      "value": "changes"
-                    },
-                    {
-                      "kind": "name",
-                      "value": "commentOnly"
-                    }
-                  ]
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "noSelection"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:commentOnly",
-          "name:noSelection",
-          "name:state",
-          "operator:assign",
-          "operator:with"
-        ]
-      }
-    ],
-    [
-      {
-        "scope": "runtime",
-        "expression": {
-          "kind": "call",
-          "operator": "assign",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "state"
-            },
-            {
-              "kind": "call",
-              "operator": "with",
-              "arguments": [
-                {
-                  "kind": "name",
-                  "value": "state"
-                },
-                {
-                  "kind": "str",
-                  "value": "selection"
-                },
-                {
-                  "kind": "name",
-                  "value": "expect_shopQuiet_commentOnly"
-                }
-              ]
-            }
-          ]
-        },
-        "dependencies": [
-          "name:expect_shopQuiet_commentOnly",
-          "name:state",
           "operator:assign",
           "operator:with"
         ]
@@ -24694,6 +24134,389 @@
             },
             {
               "kind": "call",
+              "operator": "Rec",
+              "arguments": [
+                {
+                  "kind": "str",
+                  "value": "repo"
+                },
+                {
+                  "kind": "call",
+                  "operator": "with",
+                  "arguments": [
+                    {
+                      "kind": "call",
+                      "operator": "with",
+                      "arguments": [
+                        {
+                          "kind": "call",
+                          "operator": "with",
+                          "arguments": [
+                            {
+                              "kind": "call",
+                              "operator": "with",
+                              "arguments": [
+                                {
+                                  "kind": "call",
+                                  "operator": "with",
+                                  "arguments": [
+                                    {
+                                      "kind": "call",
+                                      "operator": "with",
+                                      "arguments": [
+                                        {
+                                          "kind": "call",
+                                          "operator": "with",
+                                          "arguments": [
+                                            {
+                                              "kind": "call",
+                                              "operator": "with",
+                                              "arguments": [
+                                                {
+                                                  "kind": "call",
+                                                  "operator": "with",
+                                                  "arguments": [
+                                                    {
+                                                      "kind": "name",
+                                                      "value": "shop"
+                                                    },
+                                                    {
+                                                      "kind": "str",
+                                                      "value": "calls"
+                                                    },
+                                                    {
+                                                      "kind": "call",
+                                                      "operator": "field",
+                                                      "arguments": [
+                                                        {
+                                                          "kind": "name",
+                                                          "value": "d6"
+                                                        },
+                                                        {
+                                                          "kind": "str",
+                                                          "value": "calls"
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "kind": "str",
+                                                  "value": "bare"
+                                                },
+                                                {
+                                                  "kind": "call",
+                                                  "operator": "field",
+                                                  "arguments": [
+                                                    {
+                                                      "kind": "name",
+                                                      "value": "d6"
+                                                    },
+                                                    {
+                                                      "kind": "str",
+                                                      "value": "bare"
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            },
+                                            {
+                                              "kind": "str",
+                                              "value": "imports"
+                                            },
+                                            {
+                                              "kind": "call",
+                                              "operator": "field",
+                                              "arguments": [
+                                                {
+                                                  "kind": "name",
+                                                  "value": "d6"
+                                                },
+                                                {
+                                                  "kind": "str",
+                                                  "value": "imports"
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "kind": "str",
+                                          "value": "shapes"
+                                        },
+                                        {
+                                          "kind": "call",
+                                          "operator": "field",
+                                          "arguments": [
+                                            {
+                                              "kind": "name",
+                                              "value": "d6"
+                                            },
+                                            {
+                                              "kind": "str",
+                                              "value": "shapes"
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "kind": "str",
+                                      "value": "requests"
+                                    },
+                                    {
+                                      "kind": "call",
+                                      "operator": "field",
+                                      "arguments": [
+                                        {
+                                          "kind": "name",
+                                          "value": "d6"
+                                        },
+                                        {
+                                          "kind": "str",
+                                          "value": "requests"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                },
+                                {
+                                  "kind": "str",
+                                  "value": "reflects"
+                                },
+                                {
+                                  "kind": "call",
+                                  "operator": "field",
+                                  "arguments": [
+                                    {
+                                      "kind": "name",
+                                      "value": "d6"
+                                    },
+                                    {
+                                      "kind": "str",
+                                      "value": "reflects"
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "kind": "str",
+                              "value": "preloads"
+                            },
+                            {
+                              "kind": "call",
+                              "operator": "field",
+                              "arguments": [
+                                {
+                                  "kind": "name",
+                                  "value": "d6"
+                                },
+                                {
+                                  "kind": "str",
+                                  "value": "preloads"
+                                }
+                              ]
+                            }
+                          ]
+                        },
+                        {
+                          "kind": "str",
+                          "value": "builtPaths"
+                        },
+                        {
+                          "kind": "call",
+                          "operator": "field",
+                          "arguments": [
+                            {
+                              "kind": "name",
+                              "value": "d6"
+                            },
+                            {
+                              "kind": "str",
+                              "value": "builtPaths"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "kind": "str",
+                      "value": "computed"
+                    },
+                    {
+                      "kind": "call",
+                      "operator": "field",
+                      "arguments": [
+                        {
+                          "kind": "name",
+                          "value": "d6"
+                        },
+                        {
+                          "kind": "str",
+                          "value": "computed"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "kind": "str",
+                  "value": "rules"
+                },
+                {
+                  "kind": "name",
+                  "value": "mainRules"
+                },
+                {
+                  "kind": "str",
+                  "value": "changes"
+                },
+                {
+                  "kind": "name",
+                  "value": "noChanges"
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "noSelection"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:d6",
+          "name:mainRules",
+          "name:noChanges",
+          "name:noSelection",
+          "name:shop",
+          "name:state",
+          "operator:Rec",
+          "operator:assign",
+          "operator:field",
+          "operator:with",
+          "path:d6.bare",
+          "path:d6.builtPaths",
+          "path:d6.calls",
+          "path:d6.computed",
+          "path:d6.imports",
+          "path:d6.preloads",
+          "path:d6.reflects",
+          "path:d6.requests",
+          "path:d6.shapes"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
+              "operator": "with",
+              "arguments": [
+                {
+                  "kind": "call",
+                  "operator": "with",
+                  "arguments": [
+                    {
+                      "kind": "name",
+                      "value": "state"
+                    },
+                    {
+                      "kind": "str",
+                      "value": "changes"
+                    },
+                    {
+                      "kind": "name",
+                      "value": "c6"
+                    }
+                  ]
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "noSelection"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:c6",
+          "name:noSelection",
+          "name:state",
+          "operator:assign",
+          "operator:with"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
+              "operator": "with",
+              "arguments": [
+                {
+                  "kind": "name",
+                  "value": "state"
+                },
+                {
+                  "kind": "str",
+                  "value": "selection"
+                },
+                {
+                  "kind": "name",
+                  "value": "x6"
+                }
+              ]
+            }
+          ]
+        },
+        "dependencies": [
+          "name:state",
+          "name:x6",
+          "operator:assign",
+          "operator:with"
+        ]
+      }
+    ],
+    [
+      {
+        "scope": "runtime",
+        "expression": {
+          "kind": "call",
+          "operator": "assign",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "state"
+            },
+            {
+              "kind": "call",
               "operator": "with",
               "arguments": [
                 {
@@ -26392,189 +26215,6 @@
       "source": "scenarios.qnt",
       "module": "scenarios",
       "fixtureNamespace": "scenarios",
-      "name": "generated6Run",
-      "requiredCapabilities": [
-        "scenarios.buildWith",
-        "scenarios.change",
-        "scenarios.selectNow"
-      ],
-      "steps": [
-        {
-          "index": 0,
-          "kind": "init",
-          "action": "init",
-          "arguments": []
-        },
-        {
-          "index": 1,
-          "kind": "action",
-          "action": "buildWith",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "shop"
-            },
-            {
-              "kind": "name",
-              "value": "d6"
-            },
-            {
-              "kind": "name",
-              "value": "mainRules"
-            }
-          ],
-          "nextList": 0
-        },
-        {
-          "index": 2,
-          "kind": "action",
-          "action": "change",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "c6"
-            }
-          ],
-          "nextList": 1
-        },
-        {
-          "index": 3,
-          "kind": "action",
-          "action": "selectNow",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "x6"
-            }
-          ],
-          "nextList": 2
-        },
-        {
-          "index": 4,
-          "kind": "observe",
-          "assertions": [
-            {
-              "scope": "runtime",
-              "expression": {
-                "kind": "call",
-                "operator": "eq",
-                "arguments": [
-                  {
-                    "kind": "call",
-                    "operator": "field",
-                    "arguments": [
-                      {
-                        "kind": "name",
-                        "value": "state"
-                      },
-                      {
-                        "kind": "str",
-                        "value": "selection"
-                      }
-                    ]
-                  },
-                  {
-                    "kind": "name",
-                    "value": "x6"
-                  }
-                ]
-              },
-              "dependencies": [
-                "name:state",
-                "name:x6",
-                "operator:eq",
-                "operator:field",
-                "path:state.selection"
-              ]
-            }
-          ]
-        }
-      ],
-      "initialState": {
-        "changes": {
-          "comments": {
-            "#set": []
-          },
-          "edits": {
-            "#set": []
-          },
-          "trailing": {
-            "#set": []
-          }
-        },
-        "repo": {
-          "accepts": {
-            "#map": []
-          },
-          "bare": {
-            "#set": []
-          },
-          "builtPaths": {
-            "#set": []
-          },
-          "calls": {
-            "#set": []
-          },
-          "computed": {
-            "#set": []
-          },
-          "imports": {
-            "#set": []
-          },
-          "kindOf": {
-            "#map": []
-          },
-          "nameOf": {
-            "#map": []
-          },
-          "preloads": {
-            "#set": []
-          },
-          "reflects": {
-            "#set": []
-          },
-          "requests": {
-            "#set": []
-          },
-          "routes": {
-            "#map": []
-          },
-          "sends": {
-            "#set": []
-          },
-          "sendsAny": {
-            "#set": []
-          },
-          "serves": {
-            "#map": []
-          },
-          "shapes": {
-            "#set": []
-          },
-          "testUnits": {
-            "#set": []
-          },
-          "unitOf": {
-            "#map": []
-          }
-        },
-        "rules": {
-          "callbackClauses": true,
-          "routeNothing": false,
-          "schemaTop": false
-        },
-        "selection": {
-          "full": false,
-          "tests": {
-            "#set": []
-          }
-        }
-      }
-    },
-    {
-      "source": "scenarios.qnt",
-      "module": "scenarios",
-      "fixtureNamespace": "scenarios",
       "name": "generated7Run",
       "requiredCapabilities": [
         "scenarios.buildWith",
@@ -26606,7 +26246,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 3
+          "nextList": 0
         },
         {
           "index": 2,
@@ -26618,7 +26258,7 @@
               "value": "c7"
             }
           ],
-          "nextList": 4
+          "nextList": 1
         },
         {
           "index": 3,
@@ -26630,7 +26270,7 @@
               "value": "x7"
             }
           ],
-          "nextList": 5
+          "nextList": 2
         },
         {
           "index": 4,
@@ -26743,6 +26383,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -26789,7 +26432,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 6
+          "nextList": 3
         },
         {
           "index": 2,
@@ -26801,7 +26444,7 @@
               "value": "c8"
             }
           ],
-          "nextList": 7
+          "nextList": 4
         },
         {
           "index": 3,
@@ -26813,7 +26456,7 @@
               "value": "x8"
             }
           ],
-          "nextList": 8
+          "nextList": 5
         },
         {
           "index": 4,
@@ -26926,6 +26569,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -26972,7 +26618,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 9
+          "nextList": 6
         },
         {
           "index": 2,
@@ -26984,7 +26630,7 @@
               "value": "c9"
             }
           ],
-          "nextList": 10
+          "nextList": 7
         },
         {
           "index": 3,
@@ -26996,7 +26642,7 @@
               "value": "x9"
             }
           ],
-          "nextList": 11
+          "nextList": 8
         },
         {
           "index": 4,
@@ -27109,6 +26755,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -27155,7 +26804,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 12
+          "nextList": 9
         },
         {
           "index": 2,
@@ -27167,7 +26816,7 @@
               "value": "c10"
             }
           ],
-          "nextList": 13
+          "nextList": 10
         },
         {
           "index": 3,
@@ -27179,7 +26828,7 @@
               "value": "x10"
             }
           ],
-          "nextList": 14
+          "nextList": 11
         },
         {
           "index": 4,
@@ -27292,6 +26941,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -27338,7 +26990,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 15
+          "nextList": 12
         },
         {
           "index": 2,
@@ -27350,7 +27002,7 @@
               "value": "c11"
             }
           ],
-          "nextList": 16
+          "nextList": 13
         },
         {
           "index": 3,
@@ -27362,7 +27014,7 @@
               "value": "x11"
             }
           ],
-          "nextList": 17
+          "nextList": 14
         },
         {
           "index": 4,
@@ -27475,6 +27127,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -27521,7 +27176,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 18
+          "nextList": 15
         },
         {
           "index": 2,
@@ -27533,7 +27188,7 @@
               "value": "c12"
             }
           ],
-          "nextList": 19
+          "nextList": 16
         },
         {
           "index": 3,
@@ -27545,7 +27200,7 @@
               "value": "x12"
             }
           ],
-          "nextList": 20
+          "nextList": 17
         },
         {
           "index": 4,
@@ -27658,6 +27313,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -27704,7 +27362,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 21
+          "nextList": 18
         },
         {
           "index": 2,
@@ -27716,7 +27374,7 @@
               "value": "c13"
             }
           ],
-          "nextList": 22
+          "nextList": 19
         },
         {
           "index": 3,
@@ -27728,7 +27386,7 @@
               "value": "x13"
             }
           ],
-          "nextList": 23
+          "nextList": 20
         },
         {
           "index": 4,
@@ -27841,6 +27499,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -27887,7 +27548,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 24
+          "nextList": 21
         },
         {
           "index": 2,
@@ -27899,7 +27560,7 @@
               "value": "c14"
             }
           ],
-          "nextList": 25
+          "nextList": 22
         },
         {
           "index": 3,
@@ -27911,7 +27572,7 @@
               "value": "x14"
             }
           ],
-          "nextList": 26
+          "nextList": 23
         },
         {
           "index": 4,
@@ -28024,6 +27685,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28070,7 +27734,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 27
+          "nextList": 24
         },
         {
           "index": 2,
@@ -28082,7 +27746,7 @@
               "value": "c15"
             }
           ],
-          "nextList": 28
+          "nextList": 25
         },
         {
           "index": 3,
@@ -28094,7 +27758,7 @@
               "value": "x15"
             }
           ],
-          "nextList": 29
+          "nextList": 26
         },
         {
           "index": 4,
@@ -28207,6 +27871,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28253,7 +27920,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 30
+          "nextList": 27
         },
         {
           "index": 2,
@@ -28265,7 +27932,7 @@
               "value": "c16"
             }
           ],
-          "nextList": 31
+          "nextList": 28
         },
         {
           "index": 3,
@@ -28277,7 +27944,7 @@
               "value": "x16"
             }
           ],
-          "nextList": 32
+          "nextList": 29
         },
         {
           "index": 4,
@@ -28390,6 +28057,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28436,7 +28106,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 33
+          "nextList": 30
         },
         {
           "index": 2,
@@ -28448,7 +28118,7 @@
               "value": "c17"
             }
           ],
-          "nextList": 34
+          "nextList": 31
         },
         {
           "index": 3,
@@ -28460,7 +28130,7 @@
               "value": "x17"
             }
           ],
-          "nextList": 35
+          "nextList": 32
         },
         {
           "index": 4,
@@ -28573,6 +28243,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28619,7 +28292,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 36
+          "nextList": 33
         },
         {
           "index": 2,
@@ -28631,7 +28304,7 @@
               "value": "c18"
             }
           ],
-          "nextList": 37
+          "nextList": 34
         },
         {
           "index": 3,
@@ -28643,7 +28316,7 @@
               "value": "x18"
             }
           ],
-          "nextList": 38
+          "nextList": 35
         },
         {
           "index": 4,
@@ -28756,6 +28429,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28802,7 +28478,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 39
+          "nextList": 36
         },
         {
           "index": 2,
@@ -28814,7 +28490,7 @@
               "value": "c19"
             }
           ],
-          "nextList": 40
+          "nextList": 37
         },
         {
           "index": 3,
@@ -28826,7 +28502,7 @@
               "value": "x19"
             }
           ],
-          "nextList": 41
+          "nextList": 38
         },
         {
           "index": 4,
@@ -28939,6 +28615,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -28985,7 +28664,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 42
+          "nextList": 39
         },
         {
           "index": 2,
@@ -28997,7 +28676,7 @@
               "value": "c20"
             }
           ],
-          "nextList": 43
+          "nextList": 40
         },
         {
           "index": 3,
@@ -29009,7 +28688,7 @@
               "value": "x20"
             }
           ],
-          "nextList": 44
+          "nextList": 41
         },
         {
           "index": 4,
@@ -29122,6 +28801,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -29168,7 +28850,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 45
+          "nextList": 42
         },
         {
           "index": 2,
@@ -29180,7 +28862,7 @@
               "value": "c21"
             }
           ],
-          "nextList": 46
+          "nextList": 43
         },
         {
           "index": 3,
@@ -29192,7 +28874,7 @@
               "value": "x21"
             }
           ],
-          "nextList": 47
+          "nextList": 44
         },
         {
           "index": 4,
@@ -29305,6 +28987,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -29351,7 +29036,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 48
+          "nextList": 45
         },
         {
           "index": 2,
@@ -29363,7 +29048,7 @@
               "value": "c22"
             }
           ],
-          "nextList": 49
+          "nextList": 46
         },
         {
           "index": 3,
@@ -29375,7 +29060,7 @@
               "value": "x22"
             }
           ],
-          "nextList": 50
+          "nextList": 47
         },
         {
           "index": 4,
@@ -29488,6 +29173,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -29534,7 +29222,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 51
+          "nextList": 48
         },
         {
           "index": 2,
@@ -29546,7 +29234,7 @@
               "value": "c23"
             }
           ],
-          "nextList": 52
+          "nextList": 49
         },
         {
           "index": 3,
@@ -29558,7 +29246,7 @@
               "value": "x23"
             }
           ],
-          "nextList": 53
+          "nextList": 50
         },
         {
           "index": 4,
@@ -29671,6 +29359,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -29717,7 +29408,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 54
+          "nextList": 51
         },
         {
           "index": 2,
@@ -29729,7 +29420,7 @@
               "value": "c24"
             }
           ],
-          "nextList": 55
+          "nextList": 52
         },
         {
           "index": 3,
@@ -29741,7 +29432,7 @@
               "value": "x24"
             }
           ],
-          "nextList": 56
+          "nextList": 53
         },
         {
           "index": 4,
@@ -29854,6 +29545,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -29900,7 +29594,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 57
+          "nextList": 54
         },
         {
           "index": 2,
@@ -29912,7 +29606,7 @@
               "value": "c25"
             }
           ],
-          "nextList": 58
+          "nextList": 55
         },
         {
           "index": 3,
@@ -29924,7 +29618,7 @@
               "value": "x25"
             }
           ],
-          "nextList": 59
+          "nextList": 56
         },
         {
           "index": 4,
@@ -30037,6 +29731,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30083,7 +29780,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 60
+          "nextList": 57
         },
         {
           "index": 2,
@@ -30095,7 +29792,7 @@
               "value": "c26"
             }
           ],
-          "nextList": 61
+          "nextList": 58
         },
         {
           "index": 3,
@@ -30107,7 +29804,7 @@
               "value": "x26"
             }
           ],
-          "nextList": 62
+          "nextList": 59
         },
         {
           "index": 4,
@@ -30220,6 +29917,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30266,7 +29966,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 63
+          "nextList": 60
         },
         {
           "index": 2,
@@ -30278,7 +29978,7 @@
               "value": "c27"
             }
           ],
-          "nextList": 64
+          "nextList": 61
         },
         {
           "index": 3,
@@ -30290,7 +29990,7 @@
               "value": "x27"
             }
           ],
-          "nextList": 65
+          "nextList": 62
         },
         {
           "index": 4,
@@ -30403,6 +30103,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30449,7 +30152,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 66
+          "nextList": 63
         },
         {
           "index": 2,
@@ -30461,7 +30164,7 @@
               "value": "c28"
             }
           ],
-          "nextList": 67
+          "nextList": 64
         },
         {
           "index": 3,
@@ -30473,7 +30176,7 @@
               "value": "x28"
             }
           ],
-          "nextList": 68
+          "nextList": 65
         },
         {
           "index": 4,
@@ -30586,6 +30289,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30632,7 +30338,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 69
+          "nextList": 66
         },
         {
           "index": 2,
@@ -30644,7 +30350,7 @@
               "value": "c29"
             }
           ],
-          "nextList": 70
+          "nextList": 67
         },
         {
           "index": 3,
@@ -30656,7 +30362,7 @@
               "value": "x29"
             }
           ],
-          "nextList": 71
+          "nextList": 68
         },
         {
           "index": 4,
@@ -30769,6 +30475,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30815,7 +30524,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 72
+          "nextList": 69
         },
         {
           "index": 2,
@@ -30827,7 +30536,7 @@
               "value": "c30"
             }
           ],
-          "nextList": 73
+          "nextList": 70
         },
         {
           "index": 3,
@@ -30839,7 +30548,7 @@
               "value": "x30"
             }
           ],
-          "nextList": 74
+          "nextList": 71
         },
         {
           "index": 4,
@@ -30952,6 +30661,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -30998,7 +30710,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 75
+          "nextList": 72
         },
         {
           "index": 2,
@@ -31010,7 +30722,7 @@
               "value": "c31"
             }
           ],
-          "nextList": 76
+          "nextList": 73
         },
         {
           "index": 3,
@@ -31022,7 +30734,7 @@
               "value": "x31"
             }
           ],
-          "nextList": 77
+          "nextList": 74
         },
         {
           "index": 4,
@@ -31135,6 +30847,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -31181,7 +30896,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 78
+          "nextList": 75
         },
         {
           "index": 2,
@@ -31193,7 +30908,7 @@
               "value": "c32"
             }
           ],
-          "nextList": 79
+          "nextList": 76
         },
         {
           "index": 3,
@@ -31205,7 +30920,7 @@
               "value": "x32"
             }
           ],
-          "nextList": 80
+          "nextList": 77
         },
         {
           "index": 4,
@@ -31318,6 +31033,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -31364,7 +31082,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 81
+          "nextList": 78
         },
         {
           "index": 2,
@@ -31376,7 +31094,7 @@
               "value": "c33"
             }
           ],
-          "nextList": 82
+          "nextList": 79
         },
         {
           "index": 3,
@@ -31388,7 +31106,7 @@
               "value": "x33"
             }
           ],
-          "nextList": 83
+          "nextList": 80
         },
         {
           "index": 4,
@@ -31501,6 +31219,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -31547,7 +31268,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 84
+          "nextList": 81
         },
         {
           "index": 2,
@@ -31559,7 +31280,7 @@
               "value": "c34"
             }
           ],
-          "nextList": 85
+          "nextList": 82
         },
         {
           "index": 3,
@@ -31571,7 +31292,7 @@
               "value": "x34"
             }
           ],
-          "nextList": 86
+          "nextList": 83
         },
         {
           "index": 4,
@@ -31684,6 +31405,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -31730,7 +31454,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 87
+          "nextList": 84
         },
         {
           "index": 2,
@@ -31742,7 +31466,7 @@
               "value": "c35"
             }
           ],
-          "nextList": 88
+          "nextList": 85
         },
         {
           "index": 3,
@@ -31754,7 +31478,7 @@
               "value": "x35"
             }
           ],
-          "nextList": 89
+          "nextList": 86
         },
         {
           "index": 4,
@@ -31867,6 +31591,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -31913,7 +31640,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 90
+          "nextList": 87
         },
         {
           "index": 2,
@@ -31925,7 +31652,7 @@
               "value": "c36"
             }
           ],
-          "nextList": 91
+          "nextList": 88
         },
         {
           "index": 3,
@@ -31937,7 +31664,7 @@
               "value": "x36"
             }
           ],
-          "nextList": 92
+          "nextList": 89
         },
         {
           "index": 4,
@@ -32050,6 +31777,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -32096,7 +31826,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 93
+          "nextList": 90
         },
         {
           "index": 2,
@@ -32108,7 +31838,7 @@
               "value": "c37"
             }
           ],
-          "nextList": 94
+          "nextList": 91
         },
         {
           "index": 3,
@@ -32120,7 +31850,7 @@
               "value": "x37"
             }
           ],
-          "nextList": 95
+          "nextList": 92
         },
         {
           "index": 4,
@@ -32233,6 +31963,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -32279,7 +32012,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 96
+          "nextList": 93
         },
         {
           "index": 2,
@@ -32291,7 +32024,7 @@
               "value": "c38"
             }
           ],
-          "nextList": 97
+          "nextList": 94
         },
         {
           "index": 3,
@@ -32303,7 +32036,7 @@
               "value": "x38"
             }
           ],
-          "nextList": 98
+          "nextList": 95
         },
         {
           "index": 4,
@@ -32416,6 +32149,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -32462,7 +32198,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 99
+          "nextList": 96
         },
         {
           "index": 2,
@@ -32474,7 +32210,7 @@
               "value": "c39"
             }
           ],
-          "nextList": 100
+          "nextList": 97
         },
         {
           "index": 3,
@@ -32486,7 +32222,7 @@
               "value": "x39"
             }
           ],
-          "nextList": 101
+          "nextList": 98
         },
         {
           "index": 4,
@@ -32599,6 +32335,191 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
+          "routeNothing": false,
+          "schemaTop": false
+        },
+        "selection": {
+          "full": false,
+          "tests": {
+            "#set": []
+          }
+        }
+      }
+    },
+    {
+      "source": "scenarios.qnt",
+      "module": "scenarios",
+      "fixtureNamespace": "scenarios",
+      "name": "commentOnlyRun",
+      "requiredCapabilities": [
+        "scenarios.build",
+        "scenarios.change",
+        "scenarios.selectNow"
+      ],
+      "steps": [
+        {
+          "index": 0,
+          "kind": "init",
+          "action": "init",
+          "arguments": []
+        },
+        {
+          "index": 1,
+          "kind": "action",
+          "action": "build",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "shopQuiet"
+            },
+            {
+              "kind": "name",
+              "value": "mainRules"
+            }
+          ],
+          "nextList": 99
+        },
+        {
+          "index": 2,
+          "kind": "action",
+          "action": "change",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "commentOnly"
+            }
+          ],
+          "nextList": 100
+        },
+        {
+          "index": 3,
+          "kind": "action",
+          "action": "selectNow",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "expect_shopQuiet_commentOnly"
+            }
+          ],
+          "nextList": 101
+        },
+        {
+          "index": 4,
+          "kind": "observe",
+          "assertions": [
+            {
+              "scope": "runtime",
+              "expression": {
+                "kind": "call",
+                "operator": "eq",
+                "arguments": [
+                  {
+                    "kind": "call",
+                    "operator": "field",
+                    "arguments": [
+                      {
+                        "kind": "name",
+                        "value": "state"
+                      },
+                      {
+                        "kind": "str",
+                        "value": "selection"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "name",
+                    "value": "noSelection"
+                  }
+                ]
+              },
+              "dependencies": [
+                "name:noSelection",
+                "name:state",
+                "operator:eq",
+                "operator:field",
+                "path:state.selection"
+              ]
+            }
+          ]
+        }
+      ],
+      "initialState": {
+        "changes": {
+          "comments": {
+            "#set": []
+          },
+          "edits": {
+            "#set": []
+          },
+          "trailing": {
+            "#set": []
+          }
+        },
+        "repo": {
+          "accepts": {
+            "#map": []
+          },
+          "bare": {
+            "#set": []
+          },
+          "builtPaths": {
+            "#set": []
+          },
+          "calls": {
+            "#set": []
+          },
+          "computed": {
+            "#set": []
+          },
+          "imports": {
+            "#set": []
+          },
+          "kindOf": {
+            "#map": []
+          },
+          "nameOf": {
+            "#map": []
+          },
+          "preloads": {
+            "#set": []
+          },
+          "reflects": {
+            "#set": []
+          },
+          "requests": {
+            "#set": []
+          },
+          "routes": {
+            "#map": []
+          },
+          "sends": {
+            "#set": []
+          },
+          "sendsAny": {
+            "#set": []
+          },
+          "serves": {
+            "#map": []
+          },
+          "shapes": {
+            "#set": []
+          },
+          "testUnits": {
+            "#set": []
+          },
+          "unitOf": {
+            "#map": []
+          }
+        },
+        "rules": {
+          "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -32782,185 +32703,9 @@
         },
         "rules": {
           "callbackClauses": true,
-          "routeNothing": false,
-          "schemaTop": false
-        },
-        "selection": {
-          "full": false,
-          "tests": {
-            "#set": []
-          }
-        }
-      }
-    },
-    {
-      "source": "scenarios.qnt",
-      "module": "scenarios",
-      "fixtureNamespace": "scenarios",
-      "name": "commentOnlyRun",
-      "requiredCapabilities": [
-        "scenarios.build",
-        "scenarios.change",
-        "scenarios.selectNow"
-      ],
-      "steps": [
-        {
-          "index": 0,
-          "kind": "init",
-          "action": "init",
-          "arguments": []
-        },
-        {
-          "index": 1,
-          "kind": "action",
-          "action": "build",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "shopQuiet"
-            },
-            {
-              "kind": "name",
-              "value": "mainRules"
-            }
-          ],
-          "nextList": 105
-        },
-        {
-          "index": 2,
-          "kind": "action",
-          "action": "change",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "commentOnly"
-            }
-          ],
-          "nextList": 106
-        },
-        {
-          "index": 3,
-          "kind": "action",
-          "action": "selectNow",
-          "arguments": [
-            {
-              "kind": "name",
-              "value": "expect_shopQuiet_commentOnly"
-            }
-          ],
-          "nextList": 107
-        },
-        {
-          "index": 4,
-          "kind": "observe",
-          "assertions": [
-            {
-              "scope": "runtime",
-              "expression": {
-                "kind": "call",
-                "operator": "eq",
-                "arguments": [
-                  {
-                    "kind": "call",
-                    "operator": "field",
-                    "arguments": [
-                      {
-                        "kind": "name",
-                        "value": "state"
-                      },
-                      {
-                        "kind": "str",
-                        "value": "selection"
-                      }
-                    ]
-                  },
-                  {
-                    "kind": "name",
-                    "value": "noSelection"
-                  }
-                ]
-              },
-              "dependencies": [
-                "name:noSelection",
-                "name:state",
-                "operator:eq",
-                "operator:field",
-                "path:state.selection"
-              ]
-            }
-          ]
-        }
-      ],
-      "initialState": {
-        "changes": {
-          "comments": {
-            "#set": []
-          },
-          "edits": {
-            "#set": []
-          },
-          "trailing": {
-            "#set": []
-          }
-        },
-        "repo": {
-          "accepts": {
-            "#map": []
-          },
-          "bare": {
-            "#set": []
-          },
-          "builtPaths": {
-            "#set": []
-          },
-          "calls": {
-            "#set": []
-          },
-          "computed": {
-            "#set": []
-          },
-          "imports": {
-            "#set": []
-          },
-          "kindOf": {
-            "#map": []
-          },
-          "nameOf": {
-            "#map": []
-          },
-          "preloads": {
-            "#set": []
-          },
-          "reflects": {
-            "#set": []
-          },
-          "requests": {
-            "#set": []
-          },
-          "routes": {
-            "#map": []
-          },
-          "sends": {
-            "#set": []
-          },
-          "sendsAny": {
-            "#set": []
-          },
-          "serves": {
-            "#map": []
-          },
-          "shapes": {
-            "#set": []
-          },
-          "testUnits": {
-            "#set": []
-          },
-          "unitOf": {
-            "#map": []
-          }
-        },
-        "rules": {
-          "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33003,7 +32748,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -33015,7 +32760,7 @@
               "value": "trailingOnly"
             }
           ],
-          "nextList": 108
+          "nextList": 105
         },
         {
           "index": 3,
@@ -33027,7 +32772,7 @@
               "value": "expect_shopQuiet_trailingOnly"
             }
           ],
-          "nextList": 109
+          "nextList": 106
         },
         {
           "index": 4,
@@ -33165,6 +32910,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33211,7 +32959,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 110
+          "nextList": 107
         },
         {
           "index": 2,
@@ -33223,7 +32971,7 @@
               "value": "c1"
             }
           ],
-          "nextList": 111
+          "nextList": 108
         },
         {
           "index": 3,
@@ -33235,7 +32983,7 @@
               "value": "x1"
             }
           ],
-          "nextList": 112
+          "nextList": 109
         },
         {
           "index": 4,
@@ -33348,6 +33096,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33394,7 +33145,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 113
+          "nextList": 110
         },
         {
           "index": 2,
@@ -33406,7 +33157,7 @@
               "value": "c2"
             }
           ],
-          "nextList": 114
+          "nextList": 111
         },
         {
           "index": 3,
@@ -33418,7 +33169,7 @@
               "value": "x2"
             }
           ],
-          "nextList": 115
+          "nextList": 112
         },
         {
           "index": 4,
@@ -33531,6 +33282,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33577,7 +33331,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 116
+          "nextList": 113
         },
         {
           "index": 2,
@@ -33589,7 +33343,7 @@
               "value": "c3"
             }
           ],
-          "nextList": 117
+          "nextList": 114
         },
         {
           "index": 3,
@@ -33601,7 +33355,7 @@
               "value": "x3"
             }
           ],
-          "nextList": 118
+          "nextList": 115
         },
         {
           "index": 4,
@@ -33714,6 +33468,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33760,7 +33517,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 119
+          "nextList": 116
         },
         {
           "index": 2,
@@ -33772,7 +33529,7 @@
               "value": "c4"
             }
           ],
-          "nextList": 120
+          "nextList": 117
         },
         {
           "index": 3,
@@ -33784,7 +33541,7 @@
               "value": "x4"
             }
           ],
-          "nextList": 121
+          "nextList": 118
         },
         {
           "index": 4,
@@ -33897,6 +33654,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -33943,7 +33703,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 122
+          "nextList": 119
         },
         {
           "index": 2,
@@ -33955,7 +33715,7 @@
               "value": "c5"
             }
           ],
-          "nextList": 123
+          "nextList": 120
         },
         {
           "index": 3,
@@ -33967,7 +33727,7 @@
               "value": "x5"
             }
           ],
-          "nextList": 124
+          "nextList": 121
         },
         {
           "index": 4,
@@ -34080,6 +33840,195 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
+          "routeNothing": false,
+          "schemaTop": false
+        },
+        "selection": {
+          "full": false,
+          "tests": {
+            "#set": []
+          }
+        }
+      }
+    },
+    {
+      "source": "scenarios.qnt",
+      "module": "scenarios",
+      "fixtureNamespace": "scenarios",
+      "name": "generated6Run",
+      "requiredCapabilities": [
+        "scenarios.buildWith",
+        "scenarios.change",
+        "scenarios.selectNow"
+      ],
+      "steps": [
+        {
+          "index": 0,
+          "kind": "init",
+          "action": "init",
+          "arguments": []
+        },
+        {
+          "index": 1,
+          "kind": "action",
+          "action": "buildWith",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "shop"
+            },
+            {
+              "kind": "name",
+              "value": "d6"
+            },
+            {
+              "kind": "name",
+              "value": "mainRules"
+            }
+          ],
+          "nextList": 122
+        },
+        {
+          "index": 2,
+          "kind": "action",
+          "action": "change",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "c6"
+            }
+          ],
+          "nextList": 123
+        },
+        {
+          "index": 3,
+          "kind": "action",
+          "action": "selectNow",
+          "arguments": [
+            {
+              "kind": "name",
+              "value": "x6"
+            }
+          ],
+          "nextList": 124
+        },
+        {
+          "index": 4,
+          "kind": "observe",
+          "assertions": [
+            {
+              "scope": "runtime",
+              "expression": {
+                "kind": "call",
+                "operator": "eq",
+                "arguments": [
+                  {
+                    "kind": "call",
+                    "operator": "field",
+                    "arguments": [
+                      {
+                        "kind": "name",
+                        "value": "state"
+                      },
+                      {
+                        "kind": "str",
+                        "value": "selection"
+                      }
+                    ]
+                  },
+                  {
+                    "kind": "name",
+                    "value": "x6"
+                  }
+                ]
+              },
+              "dependencies": [
+                "name:state",
+                "name:x6",
+                "operator:eq",
+                "operator:field",
+                "path:state.selection"
+              ]
+            }
+          ]
+        }
+      ],
+      "initialState": {
+        "changes": {
+          "comments": {
+            "#set": []
+          },
+          "edits": {
+            "#set": []
+          },
+          "trailing": {
+            "#set": []
+          }
+        },
+        "repo": {
+          "accepts": {
+            "#map": []
+          },
+          "bare": {
+            "#set": []
+          },
+          "builtPaths": {
+            "#set": []
+          },
+          "calls": {
+            "#set": []
+          },
+          "computed": {
+            "#set": []
+          },
+          "imports": {
+            "#set": []
+          },
+          "kindOf": {
+            "#map": []
+          },
+          "nameOf": {
+            "#map": []
+          },
+          "preloads": {
+            "#set": []
+          },
+          "reflects": {
+            "#set": []
+          },
+          "requests": {
+            "#set": []
+          },
+          "routes": {
+            "#map": []
+          },
+          "sends": {
+            "#set": []
+          },
+          "sendsAny": {
+            "#set": []
+          },
+          "serves": {
+            "#map": []
+          },
+          "shapes": {
+            "#set": []
+          },
+          "testUnits": {
+            "#set": []
+          },
+          "unitOf": {
+            "#map": []
+          }
+        },
+        "rules": {
+          "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -34122,7 +34071,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -34284,6 +34233,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -34326,7 +34278,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -34488,6 +34440,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -34530,7 +34485,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -34692,6 +34647,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -34734,7 +34692,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -34896,6 +34854,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -34938,7 +34899,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -35100,6 +35061,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -35142,7 +35106,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -35212,14 +35176,6 @@
                         "kind": "call",
                         "operator": "Set",
                         "arguments": [
-                          {
-                            "kind": "int",
-                            "value": 101
-                          },
-                          {
-                            "kind": "int",
-                            "value": 106
-                          },
                           {
                             "kind": "int",
                             "value": 108
@@ -35312,6 +35268,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -35354,7 +35313,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -35516,6 +35475,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -35558,7 +35520,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -35720,6 +35682,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -35928,6 +35893,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -35970,7 +35938,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -36132,6 +36100,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -36174,7 +36145,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -36340,6 +36311,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -36355,7 +36329,7 @@
       "source": "scenarios.qnt",
       "module": "scenarios",
       "fixtureNamespace": "scenarios",
-      "name": "unreachedRun",
+      "name": "deadChangeRun",
       "requiredCapabilities": [
         "scenarios.build",
         "scenarios.change",
@@ -36382,7 +36356,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -36434,12 +36408,12 @@
                   },
                   {
                     "kind": "name",
-                    "value": "everything"
+                    "value": "noSelection"
                   }
                 ]
               },
               "dependencies": [
-                "name:everything",
+                "name:noSelection",
                 "name:state",
                 "operator:eq",
                 "operator:field",
@@ -36519,6 +36493,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -36534,7 +36511,7 @@
       "source": "scenarios.qnt",
       "module": "scenarios",
       "fixtureNamespace": "scenarios",
-      "name": "nonMonotoneRun",
+      "name": "monotoneRun",
       "requiredCapabilities": [
         "scenarios.build",
         "scenarios.change",
@@ -36561,7 +36538,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -36613,12 +36590,12 @@
                   },
                   {
                     "kind": "name",
-                    "value": "everything"
+                    "value": "noSelection"
                   }
                 ]
               },
               "dependencies": [
-                "name:everything",
+                "name:noSelection",
                 "name:state",
                 "operator:eq",
                 "operator:field",
@@ -36787,6 +36764,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -36829,7 +36809,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -37161,6 +37141,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -37203,7 +37186,7 @@
               "value": "mainRules"
             }
           ],
-          "nextList": 105
+          "nextList": 99
         },
         {
           "index": 2,
@@ -37254,14 +37237,39 @@
                     ]
                   },
                   {
-                    "kind": "name",
-                    "value": "everything"
+                    "kind": "call",
+                    "operator": "Rec",
+                    "arguments": [
+                      {
+                        "kind": "str",
+                        "value": "full"
+                      },
+                      {
+                        "kind": "bool",
+                        "value": false
+                      },
+                      {
+                        "kind": "str",
+                        "value": "tests"
+                      },
+                      {
+                        "kind": "call",
+                        "operator": "Set",
+                        "arguments": [
+                          {
+                            "kind": "int",
+                            "value": 101
+                          }
+                        ]
+                      }
+                    ]
                   }
                 ]
               },
               "dependencies": [
-                "name:everything",
                 "name:state",
+                "operator:Rec",
+                "operator:Set",
                 "operator:eq",
                 "operator:field",
                 "path:state.selection"
@@ -37340,6 +37348,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
@@ -37548,6 +37559,9 @@
         },
         "rules": {
           "callbackClauses": true,
+          "deadSilent": true,
+          "fullFallback": false,
+          "processStarters": true,
           "routeNothing": false,
           "schemaTop": false
         },
