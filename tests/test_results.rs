@@ -2057,3 +2057,195 @@ fn a_threshold_line_from_a_narrowed_retry_does_not_fail_the_target() {
     assert!(stderr.contains(threshold), "{stderr}");
     assert!(stderr.contains("not a test failure"), "{stderr}");
 }
+
+// Broken on main, end to end with a real `node --test` and a stand-in
+// aster-srv.
+
+/// A stand-in aster-srv that answers `GET /v1/test-results/quarantine` with
+/// `list` and refuses everything else (the run's upload included, which only
+/// warns). It serves until the process ends.
+fn fake_quarantine_server(list: serde_json::Value) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let list = list.clone();
+            std::thread::spawn(move || {
+                let mut request = vec![0u8; 8192];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]);
+                let (status, body) = if head.starts_with("GET /v1/test-results/quarantine") {
+                    ("200 OK", list.to_string())
+                } else {
+                    ("404 Not Found", r#"{"error":"not here"}"#.to_string())
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    url
+}
+
+/// An `app` whose `test` target runs `node --test` over one passing test and
+/// one that always throws, `main broken b`. The repository opts in to
+/// excusing tests broken on main.
+fn broken_on_main_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join(".git")).unwrap();
+    write(
+        tmp.path(),
+        "app/package.json",
+        r#"{"name":"app","scripts":{"test-ci":"node --test b.test.js"}}"#,
+    );
+    write(
+        tmp.path(),
+        "app/b.test.js",
+        "const test = require('node:test');\n\
+         test('main broken b', () => { throw new Error('database is down'); });\n\
+         test('stable b', () => {});\n",
+    );
+    write(
+        tmp.path(),
+        "app/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"npm run test-ci\"\n",
+    );
+    write(
+        tmp.path(),
+        "aster-quarantine.toml",
+        "broken_on_main = true\n",
+    );
+    tmp
+}
+
+/// One `aster test //app` as CI would run it on `branch`: a pull request's
+/// `GITHUB_HEAD_REF`, or a push's `GITHUB_REF_NAME`. Returns the output and
+/// the results file.
+fn run_broken_on_main(
+    tmp: &TempDir,
+    server: Option<&str>,
+    pull_request: Option<&str>,
+    branch: &str,
+) -> (Output, std::path::PathBuf) {
+    let results = tmp
+        .path()
+        .join(format!("out/{}.ndjson", branch.replace('/', "_")));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+    command
+        .current_dir(tmp.path())
+        .env_remove("ASTER_TEST_RESULTS")
+        .env_remove("ASTER_RETRY_FAILED")
+        .env_remove("ASTER_QUARANTINE")
+        .env_remove("GITHUB_RUN_ID")
+        .env_remove("GITHUB_HEAD_REF")
+        .env_remove("GITHUB_REF_TYPE")
+        .env_remove("ASTER_SRV_URL")
+        .env("GITHUB_REF_NAME", branch)
+        .env("ASTER_SRV_TOKEN", "test-token")
+        .env("RUNNER_TEMP", tmp.path().join("runner-temp"))
+        .args([
+            "--json",
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "test",
+            "//app",
+        ]);
+    if let Some(head) = pull_request {
+        command.env("GITHUB_HEAD_REF", head);
+    }
+    if let Some(url) = server {
+        command.env("ASTER_SRV_URL", url);
+    }
+    (command.output().unwrap(), results)
+}
+
+#[test]
+fn a_target_broken_on_main_passes_on_a_pull_request_and_still_fails_on_main() {
+    let available = |program: &str| Command::new(program).arg("--version").output().is_ok();
+    if !available("node") || !available("npm") {
+        eprintln!("skipping: node or npm is not installed");
+        return;
+    }
+    let tmp = broken_on_main_workspace();
+
+    // Setup: learn the failure hash Aster records for the throw, the way
+    // main's own runs would have uploaded it, with no server in the way.
+    let (first, first_results) = run_broken_on_main(&tmp, None, None, "learn");
+    assert!(!first.status.success(), "the throw fails the target");
+    let hash = read_records(&first_results)
+        .iter()
+        .find_map(|record| match record {
+            Record::Test(t) if t.name == "main broken b" => t.failure_hash.clone(),
+            _ => None,
+        })
+        .expect("the failing test has a failure hash");
+
+    // The server says main has been failing this test with that hash.
+    let test_id = read_records(&first_results)
+        .iter()
+        .find_map(|record| match record {
+            Record::Test(t) if t.name == "main broken b" => Some(t.test_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let server = fake_quarantine_server(serde_json::json!({
+        "repo": "o/r", "version": 41, "generated_at": "2026-11-05T00:00:00Z",
+        "truncated": false, "default_branch": "main", "tests": [],
+        "main_broken": [{
+            "test_id": test_id, "failure_hash": hash,
+            "since_sha": "0123456789abcdef", "since": "2026-11-05T00:00:00Z",
+        }],
+    }));
+
+    // Action 1: a pull request run. The only failure is the one main has, so
+    // the target passes and says why.
+    let (pr, pr_results) = run_broken_on_main(&tmp, Some(&server), Some("feature/x"), "123/merge");
+    let stderr = String::from_utf8_lossy(&pr.stderr);
+    assert!(pr.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("1 broken on main from aster-srv"),
+        "start line: {stderr}"
+    );
+    // The JSON summary names why the test was let through.
+    let stdout = String::from_utf8_lossy(&pr.stdout);
+    assert!(stdout.contains("broken on main since 0123456"), "{stdout}");
+    let records = read_records(&pr_results);
+    assert_eq!(target_status(&records, "//app:test"), TargetStatus::Passed);
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, Record::Test(t) if t.name == "main broken b" && t.quarantined)));
+
+    // Action 2: the same list on main itself. Main is never excused.
+    let (main, main_results) = run_broken_on_main(&tmp, Some(&server), None, "main");
+    assert!(!main.status.success());
+    let stderr = String::from_utf8_lossy(&main.stderr);
+    assert!(!stderr.contains("broken on main since"), "{stderr}");
+    assert_eq!(
+        target_status(&read_records(&main_results), "//app:test"),
+        TargetStatus::Failed
+    );
+
+    // Action 3: a merge queue branch is a pull request's, not main's.
+    let (queue, _) = run_broken_on_main(
+        &tmp,
+        Some(&server),
+        Some("gh-readonly-queue/main/pr-123-0123abc"),
+        "ignored",
+    );
+    assert!(
+        queue.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queue.stderr)
+    );
+
+    // Action 4: the repository has not opted in, so nothing changes.
+    fs::remove_file(tmp.path().join("aster-quarantine.toml")).unwrap();
+    let (off, _) = run_broken_on_main(&tmp, Some(&server), Some("feature/x"), "123/merge");
+    assert!(!off.status.success());
+}

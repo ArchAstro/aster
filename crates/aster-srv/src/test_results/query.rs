@@ -320,6 +320,32 @@ async fn quarantine_list(app: &App, identity: &Identity, query: Option<&str>) ->
         )
         .await?;
     let truncated = rows.len() as i64 > MAX_QUARANTINED;
+    // Tests failing the same way on the default branch: a pull request or
+    // merge queue run may let them fail while that lasts.
+    let main_broken: Vec<Value> = client
+        .query(
+            "SELECT test_id, target, file, suite, name, main_broken_failure_hash, \
+                    main_broken_since_sha, main_broken_at \
+             FROM test_results.tests \
+             WHERE repo = $1 AND main_broken_failure_hash IS NOT NULL \
+             ORDER BY test_id LIMIT $2",
+            &[&params.repo, &MAX_QUARANTINED],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            json!({
+                "test_id": row.get::<_, String>("test_id"),
+                "target": row.get::<_, Option<String>>("target"),
+                "file": row.get::<_, Option<String>>("file"),
+                "suite": row.get::<_, Option<String>>("suite"),
+                "name": row.get::<_, Option<String>>("name"),
+                "failure_hash": row.get::<_, String>("main_broken_failure_hash"),
+                "since_sha": row.get::<_, Option<String>>("main_broken_since_sha"),
+                "since": row.get::<_, Option<DateTime<Utc>>>("main_broken_at").map(time),
+            })
+        })
+        .collect();
     let tests: Vec<Value> = rows
         .iter()
         .take(MAX_QUARANTINED as usize)
@@ -344,6 +370,8 @@ async fn quarantine_list(app: &App, identity: &Identity, query: Option<&str>) ->
             "generated_at": time(Utc::now()),
             "tests": tests,
             "truncated": truncated,
+            "default_branch": app.config.default_branch,
+            "main_broken": main_broken,
         }),
     ))
 }

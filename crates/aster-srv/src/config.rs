@@ -69,6 +69,11 @@ pub struct Config {
     /// fail with the same failure hash before a test is broken. At least 3;
     /// default 3.
     pub broken_runs: u32,
+    /// `ASTER_SRV_MAIN_BROKEN_RUNS`: how many consecutive default-branch runs
+    /// must fail with the same failure hash before a pull request or merge
+    /// queue run may let that test fail (`main_broken` in the quarantine
+    /// list). At least 1; default 2.
+    pub main_broken_runs: u32,
     /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
@@ -294,6 +299,14 @@ impl Config {
                 .filter(|runs| *runs >= 3)
                 .context("ASTER_SRV_BROKEN_RUNS must be a number of runs, at least 3")?,
             None => 3,
+        };
+        let main_broken_runs = match var("ASTER_SRV_MAIN_BROKEN_RUNS") {
+            Some(runs) => runs
+                .parse()
+                .ok()
+                .filter(|runs| *runs >= 1)
+                .context("ASTER_SRV_MAIN_BROKEN_RUNS must be a number of runs, at least 1")?,
+            None => 2,
         };
         let max_body_bytes = match var("ASTER_SRV_MAX_BODY_BYTES") {
             Some(bytes) => bytes
@@ -563,6 +576,7 @@ impl Config {
             retention_days,
             default_branch,
             broken_runs,
+            main_broken_runs,
             max_body_bytes,
             max_large_bodies,
             iap_audience,
@@ -966,6 +980,7 @@ mod tests {
         assert_eq!(config.retention_days, 30);
         assert_eq!(config.default_branch, "main");
         assert_eq!(config.broken_runs, 3);
+        assert_eq!(config.main_broken_runs, 2);
         assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
         assert!(config.static_tokens.is_empty());
         assert!(config.raw_bucket.is_none());
@@ -1550,9 +1565,16 @@ mod tests {
         let mut pairs = REQUIRED.to_vec();
         pairs.push(("ASTER_SRV_DEFAULT_BRANCH", "trunk"));
         pairs.push(("ASTER_SRV_BROKEN_RUNS", "5"));
+        pairs.push(("ASTER_SRV_MAIN_BROKEN_RUNS", "1"));
         let config = Config::from_env(env_of(&pairs)).unwrap();
         assert_eq!(config.default_branch, "trunk");
         assert_eq!(config.broken_runs, 5);
+        assert_eq!(config.main_broken_runs, 1);
+        for bad in ["0", "many"] {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push(("ASTER_SRV_MAIN_BROKEN_RUNS", bad));
+            assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
         for bad in ["2", "0", "many"] {
             let mut pairs = REQUIRED.to_vec();
             pairs.push(("ASTER_SRV_BROKEN_RUNS", bad));

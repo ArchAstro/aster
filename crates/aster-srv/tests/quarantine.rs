@@ -203,7 +203,11 @@ async fn broken_tests_are_never_quarantined_and_leave_when_they_break() {
     assert!(quarantined(&feed(&server).await).is_empty());
     assert_eq!(
         log(&server).await,
-        vec![entry("later", "quarantined"), entry("later", "broken")]
+        vec![
+            entry("later", "quarantined"),
+            entry("later", "main_broken"),
+            entry("later", "broken")
+        ]
     );
     server.stop().await;
 }
@@ -731,5 +735,181 @@ async fn a_forged_pass_cannot_make_a_real_main_failure_quarantinable() {
     seed(&server, &main("t2", ago(now, 10), "pass")).await;
     classify(&server, now).await;
     assert!(score_and_quarantine(&server, "real").await.1);
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------
+// Broken on main: the list's `main_broken` array.
+
+/// `(test_id, failure_hash, since_sha)` of the feed's `main_broken` array.
+fn main_broken(feed: &Value) -> Vec<(String, String, Option<String>)> {
+    feed["main_broken"]
+        .as_array()
+        .expect("a main_broken array")
+        .iter()
+        .map(|t| {
+            (
+                t["test_id"].as_str().unwrap().to_string(),
+                t["failure_hash"].as_str().unwrap().to_string(),
+                t["since_sha"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn failing<'a>(
+    run: &'a str,
+    branch: &'a str,
+    at: DateTime<Utc>,
+    test: &'a str,
+    hash: &'a str,
+) -> Run<'a> {
+    Run::new(run, branch, at).result(test, "fail", Some(hash))
+}
+
+#[tokio::test]
+async fn a_test_failing_the_same_way_on_main_enters_main_broken() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // One failing run is not enough (default: 2).
+    seed(&server, &failing("m1", "main", ago(now, 30), "t", "same")).await;
+    classify(&server, ago(now, 25)).await;
+    let empty = feed(&server).await;
+    assert!(main_broken(&empty).is_empty());
+    assert_eq!(empty["default_branch"], "main");
+    assert_eq!(empty["version"], 0);
+
+    // The second failure with the same hash is.
+    seed(&server, &failing("m2", "main", ago(now, 20), "t", "same")).await;
+    classify(&server, ago(now, 10)).await;
+    let list = feed(&server).await;
+    assert_eq!(
+        main_broken(&list),
+        vec![("t".to_string(), "same".to_string(), Some("m1".to_string()))]
+    );
+    let entry = &list["main_broken"][0];
+    assert_eq!(entry["target"], "//a:test");
+    assert_eq!(entry["file"], "test/t_test.exs");
+    assert!(entry["since"].as_str().is_some());
+    // The flaky list is unchanged: it is not quarantined, and it is not yet
+    // broken (that needs 3 runs).
+    assert!(quarantined(&list).is_empty());
+    // The version moved, because the list did.
+    assert!(list["version"].as_i64().unwrap() > 0);
+    assert_eq!(log(&server).await, vec![entry_of("t", "main_broken")]);
+
+    // Another pass with nothing new keeps list and version.
+    classify(&server, ago(now, 5)).await;
+    assert_eq!(feed(&server).await["version"], list["version"]);
+    assert_eq!(main_broken(&feed(&server).await).len(), 1);
+    server.stop().await;
+}
+
+fn entry_of(test: &str, action: &str) -> (String, String) {
+    entry(test, action)
+}
+
+#[tokio::test]
+async fn failures_with_different_hashes_are_not_main_broken() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&server, &failing("m1", "main", ago(now, 30), "t", "one")).await;
+    seed(&server, &failing("m2", "main", ago(now, 20), "t", "two")).await;
+    seed(&server, &failing("m3", "main", ago(now, 10), "t", "three")).await;
+    classify(&server, now).await;
+    assert!(main_broken(&feed(&server).await).is_empty());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn one_default_branch_pass_ends_main_broken_and_moves_the_version() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&server, &failing("m1", "main", ago(now, 40), "t", "same")).await;
+    seed(&server, &failing("m2", "main", ago(now, 30), "t", "same")).await;
+    classify(&server, ago(now, 20)).await;
+    let broken = feed(&server).await;
+    assert_eq!(main_broken(&broken).len(), 1);
+
+    // Main passes: the very next pass removes it.
+    seed(
+        &server,
+        &Run::new("m3", "main", ago(now, 10)).result("t", "pass", None),
+    )
+    .await;
+    classify(&server, now).await;
+    let fixed = feed(&server).await;
+    assert!(main_broken(&fixed).is_empty());
+    assert!(fixed["version"].as_i64().unwrap() > broken["version"].as_i64().unwrap());
+    assert_eq!(
+        log(&server).await,
+        vec![entry_of("t", "main_broken"), entry_of("t", "main_fixed")]
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn pull_request_and_partial_runs_do_not_make_a_test_main_broken() {
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    // Failures on pull request branches, however many.
+    for (i, run) in ["p1", "p2", "p3"].into_iter().enumerate() {
+        seed(
+            &server,
+            &failing(run, "feature", ago(now, 30 - i as i64), "pr", "same"),
+        )
+        .await;
+    }
+    // A pull request run through an OIDC token is not main either, even if
+    // its record says `main`.
+    for (i, run) in ["o1", "o2"].into_iter().enumerate() {
+        seed(
+            &server,
+            &failing(run, "main", ago(now, 25 - i as i64), "oidc", "same")
+                .oidc("refs/pull/7/merge", "pull_request"),
+        )
+        .await;
+    }
+    // Partial results on main judge nothing.
+    for (i, run) in ["q1", "q2"].into_iter().enumerate() {
+        let mut partial = failing(run, "main", ago(now, 20 - i as i64), "partial", "same");
+        partial.confidence = Some("partial");
+        seed(&server, &partial).await;
+    }
+    classify(&server, now).await;
+    assert!(main_broken(&feed(&server).await).is_empty());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_main_broken_threshold_and_broken_state_are_independent() {
+    let Some(server) = start(&[("ASTER_SRV_MAIN_BROKEN_RUNS", "1")]).await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&server, &failing("m1", "main", ago(now, 10), "t", "same")).await;
+    classify(&server, now).await;
+    assert_eq!(main_broken(&feed(&server).await).len(), 1);
+    // A pass on main in the same pass window is judged by its final result.
+    server.stop().await;
+
+    // Three failures: broken (state) and main-broken at once; the quarantine
+    // rules are untouched, so it is not in `tests`.
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    break_on_main(&server, "both", now, 30).await;
+    classify(&server, now).await;
+    let list = feed(&server).await;
+    assert_eq!(main_broken(&list).len(), 1);
+    assert!(quarantined(&list).is_empty());
     server.stop().await;
 }

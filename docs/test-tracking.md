@@ -315,7 +315,9 @@ and then passed on a retry in one run, or when two runs with the same target
 many of a target run's tests fail together (a crashed shard or a dead
 database), the server records one **incident** for the target run instead of
 a flake per test. A test is **broken** when its last 3 default-branch runs
-failed the same way; broken tests are never quarantined.
+failed the same way; broken tests are never quarantined. A test failing the same way in the last 2
+default-branch runs is **broken on main**, which a repository may opt in to
+letting pull requests fail (see [section 5](#broken-on-main)).
 The details are in the [server README](../crates/aster-srv/README.md#flaky-and-broken-tests).
 
 ## 5. Quarantine
@@ -415,6 +417,46 @@ expires = 2026-11-15
 ```
 
 A malformed file stops the run with an error naming the entry.
+
+### Broken on main
+
+When a test fails on every default-branch run, every pull request fails it
+too, and none of them can fix it. A repository can opt in to letting such a
+test fail on pull request and merge queue runs, until main passes it again,
+with one top-level key in `aster-quarantine.toml`:
+
+```text
+broken_on_main = true
+```
+
+Without it nothing changes. With it, the server's list (`main_broken`) names
+the tests whose last `ASTER_SRV_MAIN_BROKEN_RUNS` (default 2) default-branch
+runs all failed with one failure hash, and a failing test counts as
+quarantined only when all of these hold, on top of the rules above:
+
+1. The run's branch is known (`GITHUB_HEAD_REF`, else `GITHUB_REF_NAME`; a
+   tag, or a local run with neither, has none) and is not the server's
+   `default_branch`. A merge queue branch
+   (`gh-readonly-queue/main/pr-12-abc`) is not the default branch.
+2. The test's last failure has the same failure hash as main's, so a change
+   that breaks the test in a new way still fails.
+3. The list is at most 1 hour old. When the server is unreachable, a cached
+   list stands in for the flaky list for up to 24 hours, but its
+   `main_broken` part is ignored after 1 hour.
+
+The first default-branch pass of the test removes it from the list at the
+server's next classifier pass (every 5 minutes), and a run that fetches the
+list after that no longer excuses it. A run already in flight keeps the list
+it fetched at start. Default-branch runs are never excused. The start line
+counts these separately and the test's source reads `broken on main since
+<short sha>`:
+
+```text
+[aster] Quarantine: 4 from aster-srv (version 312), 1 broken on main from aster-srv
+```
+
+The step summary labels such a test `quarantined`, like any other; the source
+is in the `--json` output (`tests.quarantined`) and the target's log.
 
 ## 6. Balanced partitions
 

@@ -77,6 +77,16 @@ default-branch runs all failed with the same non-null `failure_hash`.
 pass that finds a pass (or a different failure) clears it. A broken test is
 never flaky, even with a positive score.
 
+**Broken on main**: the same streak with a shorter length,
+`ASTER_SRV_MAIN_BROKEN_RUNS` (at least 1, default 2): the test's last
+default-branch runs (final attempts, not `partial`, not cached, from runs
+whose credentials say default branch) all failed with one non-null
+`failure_hash`. The classifier keeps `main_broken_since_sha`,
+`main_broken_failure_hash` and `main_broken_at` on `tests`; a default-branch
+pass, or a different failure, clears them in that pass. It is a separate
+signal from `state`: a test can be broken on main without being `broken`, and
+it does not affect flake scores or quarantine. Pull request runs never count.
+
 **Score**: `flake_score` is 3 per definite event plus 1 per likely event in
 the last 7 days. `state` is `broken`, else `flaky` when the score is positive,
 else `healthy`. `last_flake_at` is the latest event kept.
@@ -122,7 +132,10 @@ the classifier updates `test_results.quarantine`, in this order:
 
 Every change is a row in `test_results.quarantine_log` (`quarantined`,
 `released`, `expired` or `broken`, with details), kept for the retention
-period. A repository's newest log id is its list's `version`.
+period. A test entering or leaving broken-on-main (above) is logged too, as
+`main_broken` or `main_fixed`, which are not quarantine changes and do not
+count as a test leaving quarantine. A repository's newest log id is its
+list's `version`, so it moves when `main_broken` does.
 
 `GET /v1/test-results/quarantine` (the upload token; `repo=` must match it)
 returns:
@@ -133,8 +146,19 @@ returns:
  "tests": [{"test_id": "c81e…", "target": "//services/platform:test-ci",
             "file": "test/platform/agents_test.exs", "suite": "Platform.AgentsTest",
             "name": "test creates an agent", "since": "…", "expires_at": "…",
-            "runs": 2}]}
+            "runs": 2}],
+ "default_branch": "main",
+ "main_broken": [{"test_id": "9f2b…", "target": "//services/platform:test-ci",
+                  "file": "test/platform/db_test.exs", "suite": "Platform.DbTest",
+                  "name": "test connects", "failure_hash": "ab12…",
+                  "since_sha": "0123abc…", "since": "…"}]}
 ```
+
+`main_broken` lists tests failing on the default branch (see **Broken on
+main**), at most 10,000. A client that opted in lets a test in it fail on a
+run whose branch is not `default_branch` and whose failure has the same
+`failure_hash`; clients that do not know the field ignore it, and `tests`
+and `version` keep their meaning.
 
 It lists at most 10,000 tests (`truncated` says when there were more), which
 only lets more tests fail. `GET /v1/test-results/tests?state=quarantined`
@@ -428,6 +452,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_RETENTION_DAYS` | `30` | |
 | `ASTER_SRV_DEFAULT_BRANCH` | `main` | The branch whose runs decide broken and likely-flaky tests. |
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
+| `ASTER_SRV_MAIN_BROKEN_RUNS` | `2` | Consecutive default-branch runs failing the same way that put a test in the quarantine list's `main_broken`; at least 1. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
 | `ASTER_SRV_MAX_LARGE_BODIES` | `8` | Large request bodies (a cache commit's manifest, a test-results upload) one replica reads at once, 1 to 1024. Past it a request gets `503` with `Retry-After: 1`. |
 | `ASTER_SRV_RAW_BUCKET` | unset | A GCS bucket that keeps each upload as sent, using the pod's Workload Identity. Give the bucket a lifecycle rule that deletes objects after the retention period. |

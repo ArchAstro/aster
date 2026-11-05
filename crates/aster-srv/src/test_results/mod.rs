@@ -284,6 +284,26 @@ ALTER TABLE test_results.test_flake_events
     ADD COLUMN trusted boolean NOT NULL DEFAULT false;
 "#,
     },
+    Migration {
+        feature: "test_results",
+        version: 8,
+        // "Broken on main": the failure streak a test is on at the default
+        // branch (`ASTER_SRV_MAIN_BROKEN_RUNS`, shorter than the broken
+        // state's), kept on `tests` so the quarantine list reads it without
+        // touching results. Nullable columns on a small table; the next
+        // pass fills them. Changes are logged in `quarantine_log`, so two
+        // actions are added to its check; the table is small.
+        sql: r#"
+ALTER TABLE test_results.tests
+    ADD COLUMN main_broken_since_sha text,
+    ADD COLUMN main_broken_failure_hash text,
+    ADD COLUMN main_broken_at timestamptz;
+ALTER TABLE test_results.quarantine_log DROP CONSTRAINT quarantine_log_action_check;
+ALTER TABLE test_results.quarantine_log ADD CONSTRAINT quarantine_log_action_check
+    CHECK (action IN ('quarantined', 'released', 'expired', 'broken',
+                      'main_broken', 'main_fixed'));
+"#,
+    },
 ];
 
 /// The day-partitioned tables.
