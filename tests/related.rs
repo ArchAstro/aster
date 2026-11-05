@@ -3398,6 +3398,36 @@ fn a_call_that_only_shares_a_behaviours_function_name_selects_nothing() {
 }
 
 #[test]
+fn a_caller_beside_another_behaviours_callback_of_the_same_name_is_not_reached() {
+    let mut files = DISPATCHED.to_vec();
+    // A second behaviour declares its own `deliver`; its driver sits beside
+    // that declaration and calls `deliver` on a value it was given. The
+    // implementation edited below belongs to `App.Notifier`, not to this one.
+    files.push((
+        "app/lib/mailer/mailer.ex",
+        "defmodule Mailer.Behaviour do\n  @callback deliver(term) :: :ok\nend\n",
+    ));
+    files.push((
+        "app/lib/mailer/driver.ex",
+        "defmodule Mailer.Driver do\n  def run(mod, x), do: mod.deliver(x)\nend\n",
+    ));
+    files.push((
+        "app/test/mailer/driver_test.exs",
+        "defmodule Mailer.DriverTest do\n  use ExUnit.Case\n\n  test \"run\" do\n    assert Mailer.Driver.run(%{}, 1)\n  end\nend\n",
+    ));
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "app/lib/app/notifier/email.ex",
+        "{:email, message}",
+        "{:mail, message}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//app:test"),
+        ["mix test test/app/dispatch_test.exs"]
+    );
+}
+
+#[test]
 fn a_wrapper_in_a_project_with_its_own_code_does_not_follow_other_projects() {
     let mut files = sharded();
     // A JavaScript project whose test-ci groups its own tests with a test

@@ -270,7 +270,7 @@ struct Index<'a> {
     /// Behaviour callbacks the workspace declares, by name.
     declared: HashSet<String>,
     /// The directories that hold a file declaring each behaviour callback.
-    declared_in: HashMap<String, Vec<PathBuf>>,
+    declared_in: HashMap<String, Vec<(PathBuf, Vec<String>)>>,
     /// For each Elixir module a config file names, the atoms of that file:
     /// the keys that may hold it.
     config_keys: HashMap<String, BTreeSet<String>>,
@@ -1287,11 +1287,14 @@ impl<'a> Index<'a> {
             .iter()
             .flat_map(|source| source.facts.declared.iter().cloned())
             .collect();
-        let mut declared_in: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut declared_in: HashMap<String, Vec<(PathBuf, Vec<String>)>> = HashMap::new();
         for source in &sources {
             for name in &source.facts.declared {
                 let dir = source.path.parent().unwrap_or(Path::new("")).to_path_buf();
-                declared_in.entry(name.clone()).or_default().push(dir);
+                declared_in
+                    .entry(name.clone())
+                    .or_default()
+                    .push((dir, source.facts.modules.clone()));
             }
         }
         let mut config_keys: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -3362,10 +3365,18 @@ impl<'a, 'b> Run<'a, 'b> {
                 .dispatched
                 .get(name)
                 .is_some_and(|v| v.len() <= MAX_BESIDE)
-                && ix
-                    .declared_in
-                    .get(name)
-                    .is_some_and(|dirs| dirs.iter().any(|dir| other.path.starts_with(dir)));
+                && ix.declared_in.get(name).is_some_and(|dirs| {
+                    dirs.iter().any(|(dir, modules)| {
+                        // The callback must belong to a behaviour this
+                        // implementation declares; another behaviour's
+                        // callback of the same name is not it. (An
+                        // implementation that records none keeps the
+                        // name alone.)
+                        other.path.starts_with(dir)
+                            && (behaviours.is_empty()
+                                || modules.iter().any(|m| behaviours.contains(m)))
+                    })
+                });
             if beside || names(ix.def(candidate)) || names(&other.facts.top) {
                 self.mark(candidate, Why::Via(from));
             }
