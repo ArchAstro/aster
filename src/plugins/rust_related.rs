@@ -39,10 +39,13 @@
 //! source names, declared targets whose root file is missing, and a change
 //! that reaches no test. With files changed, the target is never skipped.
 
+use super::rust_manifest::{
+    expand_member_pattern, find_workspace_root, normalize, path_dependencies, target_roots,
+};
 use super::{FilesListPlan, FilesListSelection};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use toml::Value;
 
 /// Above this many module filters the command line stops being useful.
@@ -75,16 +78,7 @@ pub(crate) fn select(package_dir: &Path, command: &str, files: &[PathBuf]) -> Fi
     .select(files)
 }
 
-/// What kind of crate target a file is compiled into.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum LayoutKind {
-    Lib,
-    Bin(String),
-    Test(String),
-    Bench(String),
-    Example(String),
-    Build,
-}
+pub(crate) use super::rust_manifest::LayoutKind;
 
 /// One crate target: its source files (relative to the package directory)
 /// and the module path of each.
@@ -947,24 +941,22 @@ impl Package {
             missing_roots: Vec::new(),
         };
 
-        let lib_root = pkg
-            .manifest
-            .get("lib")
-            .and_then(|lib| lib.get("path"))
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| {
-                dir.join("src/lib.rs")
-                    .is_file()
-                    .then(|| PathBuf::from("src/lib.rs"))
-            });
-        if let Some(root) = lib_root {
-            pkg.lib = Some(pkg.walk_target(Owner::Lib(Vec::new()), &root));
-        }
-
-        for (owner, root) in pkg.target_roots() {
+        for (kind, root) in target_roots(&pkg.manifest, dir) {
+            let is_lib = matches!(kind, LayoutKind::Lib);
+            let owner = match kind {
+                LayoutKind::Lib => Owner::Lib(Vec::new()),
+                LayoutKind::Bin(name) => Owner::Bin(name),
+                LayoutKind::Test(name) => Owner::Aux(AuxKind::Test, name),
+                LayoutKind::Bench(name) => Owner::Aux(AuxKind::Bench, name),
+                LayoutKind::Example(name) => Owner::Aux(AuxKind::Example, name),
+                LayoutKind::Build => Owner::Build,
+            };
             let target = pkg.walk_target(owner, &root);
-            pkg.others.push(target);
+            if is_lib {
+                pkg.lib = Some(target);
+            } else {
+                pkg.others.push(target);
+            }
         }
         for target in pkg.lib.iter().chain(&pkg.others) {
             if target.files.is_empty() {
@@ -972,116 +964,6 @@ impl Package {
             }
         }
         Ok(pkg)
-    }
-
-    fn auto(&self, key: &str) -> bool {
-        self.manifest
-            .get("package")
-            .and_then(|p| p.get(key))
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-    }
-
-    /// Roots of every non-library target: bins, tests, benches, examples and
-    /// the build script.
-    fn target_roots(&self) -> Vec<(Owner, PathBuf)> {
-        let mut roots: Vec<(Owner, PathBuf)> = Vec::new();
-        let mut declared: HashSet<PathBuf> = HashSet::new();
-
-        let tables = [
-            ("bin", None),
-            ("test", Some(AuxKind::Test)),
-            ("bench", Some(AuxKind::Bench)),
-            ("example", Some(AuxKind::Example)),
-        ];
-        for (table, kind) in tables {
-            let Some(entries) = self.manifest.get(table).and_then(Value::as_array) else {
-                continue;
-            };
-            for entry in entries {
-                let Some(name) = entry.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                // Cargo's inference for a target without `path`.
-                let dir = match kind {
-                    None => "src/bin",
-                    Some(AuxKind::Test) => "tests",
-                    Some(AuxKind::Bench) => "benches",
-                    Some(AuxKind::Example) => "examples",
-                };
-                let mut candidates = Vec::new();
-                if kind.is_none() && name == self.name {
-                    candidates.push(PathBuf::from("src/main.rs"));
-                }
-                candidates.push(PathBuf::from(format!("{dir}/{name}.rs")));
-                candidates.push(PathBuf::from(format!("{dir}/{name}/main.rs")));
-                let path = entry
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        candidates
-                            .iter()
-                            .find(|c| self.dir.join(c).is_file())
-                            .cloned()
-                            .unwrap_or_else(|| candidates[0].clone())
-                    });
-                let owner = match kind {
-                    None => Owner::Bin(name.to_string()),
-                    Some(kind) => Owner::Aux(kind, name.to_string()),
-                };
-                declared.insert(normalize(&path));
-                roots.push((owner, path));
-            }
-        }
-
-        let declared_names: HashSet<Owner> = roots.iter().map(|(o, _)| o.clone()).collect();
-        let add_auto = |owner: Owner, path: PathBuf, roots: &mut Vec<(Owner, PathBuf)>| {
-            if !declared.contains(&normalize(&path)) && !declared_names.contains(&owner) {
-                roots.push((owner, path));
-            }
-        };
-
-        if self.auto("autobins") {
-            if self.dir.join("src/main.rs").is_file() {
-                add_auto(
-                    Owner::Bin(self.name.clone()),
-                    PathBuf::from("src/main.rs"),
-                    &mut roots,
-                );
-            }
-            for (name, path) in discover_targets(&self.dir, "src/bin") {
-                add_auto(Owner::Bin(name), path, &mut roots);
-            }
-        }
-        for (key, dir, kind) in [
-            ("autotests", "tests", AuxKind::Test),
-            ("autobenches", "benches", AuxKind::Bench),
-            ("autoexamples", "examples", AuxKind::Example),
-        ] {
-            if self.auto(key) {
-                for (name, path) in discover_targets(&self.dir, dir) {
-                    add_auto(Owner::Aux(kind, name), path, &mut roots);
-                }
-            }
-        }
-
-        let build = self
-            .manifest
-            .get("package")
-            .and_then(|p| p.get("build"))
-            .and_then(|b| b.as_str().map(PathBuf::from))
-            .or_else(|| {
-                self.dir
-                    .join("build.rs")
-                    .is_file()
-                    .then(|| PathBuf::from("build.rs"))
-            });
-        if let Some(build) = build {
-            roots.push((Owner::Build, build));
-        }
-        roots.sort();
-        roots
     }
 
     /// Walk a crate target from its root through `mod` declarations.
@@ -1157,47 +1039,6 @@ impl Package {
         .map(|p| normalize(&p))
         .find(|p| self.dir.join(p).is_file())
     }
-}
-
-/// Cargo's target auto-discovery in `dir`: `dir/*.rs` and `dir/*/main.rs`.
-fn discover_targets(package_dir: &Path, dir: &str) -> Vec<(String, PathBuf)> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(package_dir.join(dir)) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-        if path.is_file() {
-            if let Some(stem) = file_name.strip_suffix(".rs") {
-                found.push((stem.to_string(), PathBuf::from(dir).join(&file_name)));
-            }
-        } else if path.join("main.rs").is_file() {
-            found.push((
-                file_name.clone(),
-                PathBuf::from(dir).join(&file_name).join("main.rs"),
-            ));
-        }
-    }
-    found.sort();
-    found
-}
-
-/// Lexically normalise a relative path (`a/./b/../c` → `a/c`).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out: Vec<std::ffi::OsString> = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if out.pop().is_none() {
-                    out.push("..".into());
-                }
-            }
-            other => out.push(other.as_os_str().to_os_string()),
-        }
-    }
-    out.iter().collect()
 }
 
 // ============================================================================
@@ -1513,7 +1354,7 @@ impl Workspace {
 
         let mut members = Vec::new();
         let mut dir_names: HashMap<PathBuf, String> = HashMap::new();
-        let mut raw_deps: Vec<Vec<PathBuf>> = Vec::new();
+        let mut raw_deps = Vec::new();
         for dir in dirs {
             let Some(manifest) = std::fs::read_to_string(dir.join("Cargo.toml"))
                 .ok()
@@ -1539,7 +1380,7 @@ impl Workspace {
         for (member, deps) in members.iter_mut().zip(raw_deps) {
             member.deps = deps
                 .iter()
-                .filter_map(|d| dir_names.get(d).cloned())
+                .filter_map(|d| dir_names.get(&d.path).cloned())
                 .collect();
         }
         Workspace {
@@ -1551,103 +1392,6 @@ impl Workspace {
     fn member(&self, name: &str) -> Option<&Member> {
         self.members.iter().find(|m| m.name == name)
     }
-}
-
-fn find_workspace_root(package_dir: &Path) -> Option<(PathBuf, Value)> {
-    let mut dir = Some(package_dir);
-    while let Some(current) = dir {
-        if let Some(manifest) = std::fs::read_to_string(current.join("Cargo.toml"))
-            .ok()
-            .and_then(|s| toml::from_str::<Value>(&s).ok())
-        {
-            if manifest.get("workspace").is_some() {
-                return Some((current.to_path_buf(), manifest));
-            }
-        }
-        if current.join(".git").exists() {
-            break;
-        }
-        dir = current.parent();
-    }
-    None
-}
-
-/// Expand a `members` entry such as `crates/*` into directories.
-fn expand_member_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
-    let mut dirs = vec![root.to_path_buf()];
-    for segment in Path::new(pattern).components() {
-        let segment = segment.as_os_str().to_string_lossy().into_owned();
-        let matcher = if segment.contains(['*', '?', '[']) {
-            globset::Glob::new(&segment)
-                .ok()
-                .map(|g| g.compile_matcher())
-        } else {
-            None
-        };
-        let mut next = Vec::new();
-        for dir in dirs {
-            match &matcher {
-                None => next.push(dir.join(&segment)),
-                Some(matcher) => {
-                    let Ok(entries) = std::fs::read_dir(&dir) else {
-                        continue;
-                    };
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir() && matcher.is_match(entry.file_name()) {
-                            next.push(entry.path());
-                        }
-                    }
-                }
-            }
-        }
-        dirs = next;
-    }
-    dirs.into_iter().map(|d| normalize(&d)).collect()
-}
-
-/// Absolute directories of a manifest's path dependencies.
-fn path_dependencies(
-    manifest: &Value,
-    dir: &Path,
-    workspace_root: &Path,
-    shared: Option<&Value>,
-) -> Vec<PathBuf> {
-    let mut tables: Vec<&Value> = Vec::new();
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(table) = manifest.get(key) {
-            tables.push(table);
-        }
-    }
-    if let Some(targets) = manifest.get("target").and_then(Value::as_table) {
-        for target in targets.values() {
-            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                if let Some(table) = target.get(key) {
-                    tables.push(table);
-                }
-            }
-        }
-    }
-    let mut deps = Vec::new();
-    for table in tables {
-        let Some(table) = table.as_table() else {
-            continue;
-        };
-        for (name, spec) in table {
-            if let Some(path) = spec.get("path").and_then(Value::as_str) {
-                deps.push(normalize(&dir.join(path)));
-            } else if spec.get("workspace").and_then(Value::as_bool) == Some(true) {
-                let shared_name = spec.get("package").and_then(Value::as_str).unwrap_or(name);
-                if let Some(path) = shared
-                    .and_then(|s| s.get(shared_name).or_else(|| s.get(name)))
-                    .and_then(|s| s.get("path"))
-                    .and_then(Value::as_str)
-                {
-                    deps.push(normalize(&workspace_root.join(path)));
-                }
-            }
-        }
-    }
-    deps
 }
 
 // ============================================================================

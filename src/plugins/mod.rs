@@ -471,6 +471,7 @@ pub mod registry;
 pub(crate) mod related_tests;
 pub mod ruby;
 pub mod rust;
+pub(crate) mod rust_manifest;
 pub(crate) mod rust_related;
 pub(crate) mod test_reports;
 pub(crate) mod test_retry;
