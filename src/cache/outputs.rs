@@ -307,15 +307,40 @@ fn write_dir(path: &Path, mode: u32) -> Result<()> {
     set_mode(path, mode)
 }
 
+/// Create `path` as a directory, accepting one another restore created first.
+///
+/// Only a real directory counts: a symlink to a directory that appeared in the
+/// race is unlinked rather than followed, so later writes beneath `path` cannot
+/// be redirected outside the project.
 fn create_dir_tolerating_race(path: &Path) -> Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        // Another restore created it first.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)?;
-            Ok(())
+    const ATTEMPTS: usize = 4;
+    let mut last_error = None;
+    for _ in 0..ATTEMPTS {
+        match fs::create_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_real_dir(path)? {
+                    // Another restore created it first.
+                    return Ok(());
+                }
+                remove_path(path)?;
+                last_error = Some(error);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(path)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
         }
+    }
+    Err(last_error.expect("at least one attempt").into())
+}
+
+/// True when `path` is a directory itself, not a symlink to one.
+fn is_real_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -829,6 +854,21 @@ mod tests {
         }
         let mut file = File::create(path).unwrap();
         file.write_all(bytes).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_race_replaces_symlink_to_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = project.path().join("dist");
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+
+        create_dir_tolerating_race(&path).unwrap();
+
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert!(outside.path().exists());
     }
 
     #[test]
