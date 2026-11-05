@@ -350,6 +350,12 @@ pub struct FileFacts {
     /// definition each one fills.
     pub embeds: Vec<(String, Owner)>,
     pub parse_error: bool,
+    /// A definition nothing in the workspace names is never called: nothing
+    /// in this file registers a module as a callback module or expands
+    /// into calls (Elixir, with no `use`, `@behaviour`, `@impl`, `@derive`,
+    /// `defimpl` or `defprotocol`).
+    #[serde(default)]
+    pub unnamed_is_dead: bool,
 }
 
 impl FileFacts {
@@ -382,6 +388,7 @@ impl FileFacts {
             dynamic: None,
             embeds: Vec::new(),
             parse_error: false,
+            unnamed_is_dead: false,
         }
     }
 

@@ -916,6 +916,14 @@ How a change is followed:
 - A definition nothing names is assumed to be called another way: a
   callback (`handle_call`, `mount`, anything marked `@impl`), a macro, a
   route. It affects every definition that uses its file.
+  - Exception, Elixir: a function that is not the edit itself, that nothing
+    names, in a file with no `use`, `@behaviour`, `@impl`, `@derive`,
+    `defimpl` or `defprotocol`, affects nothing. The file registers no
+    callback and expands no macro, so no test can run the function; a
+    call through a name built at run time (`apply(m, :"set_#{x}", [])`) is
+    not followed. `use ExVerify`, `Ecto.Schema`, `Protobuf` and `Bitwise`
+    do not count as such a registration. An edit to the function itself
+    still affects every definition that uses its file.
 - An Elixir message clause (`handle_call`, `handle_cast`, `handle_info`,
   `handle_continue`, a channel's `handle_in`, a state machine's
   `handle_event/4`) whose message pattern starts with a literal
@@ -950,8 +958,27 @@ How a change is followed:
   definitions call) sit beside the file that declares the callback: the module they hold comes from
   configuration or an argument, so no code names the implementation. A call
   that only shares the name does not count.
-- An Elixir function nothing names reaches nothing: a caller that held its
-  module would still name the function.
+- An Elixir `init`, `terminate`, `code_change`, `start_link`, `start` or
+  `child_spec`, and a `handle_call`, `handle_cast`, `handle_info` or
+  `handle_continue` clause that matches any message, run once a process of
+  the module is started. They are reached by the definitions that may start
+  one: a definition of the module that calls a `start`, `start_link`,
+  `start_child`, `start_supervised` or `child_spec` of `GenServer`,
+  `Supervisor`, `DynamicSupervisor`, `Task.Supervisor`, `Agent` or
+  `:gen_server`; and a user that names the module other than as the
+  receiver of a call (a child specification, `{Module, arg}`, a registered
+  name), imports it, calls one of those start functions or a function it
+  does not define, or does not call it at all. A catch-all message clause is
+  also reached by whatever sends any message. A user whose only calls are to
+  functions the module defines is reached through those functions, as for a
+  message clause above. Other callbacks (`mount`, `render`, `call`,
+  `handle_in`, `handle_event/4`) still affect every definition that uses
+  their file.
+- A module name that more than one project defines (two `Shop.Fixtures`)
+  resolves, for a file, to the copy in its own project; failing that, to the
+  copy in a project it depends on. The copy in a project it does not depend
+  on is not in its program. If no copy is reachable as declared, every copy
+  is kept, since dependencies may be undeclared.
 - Elixir code that lists modules at run time
   (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
   `:code.all_loaded()`) can call into any of them, so it is affected by
@@ -987,9 +1014,10 @@ Where the source graph cannot see, Aster runs more:
   `test/test_helper.exs`, `go.mod`, `pyproject.toml`, `aster.toml`, …) run
   their project in full, and every project downstream of it. A
   workspace-level lockfile does the same for every project beneath it.
-- A project runs in full when a non-source file nothing names changed, when
-  a changed source file reaches no test at all, or when the project imports
-  Python modules by computed name.
+- A project runs in full when a non-source file nothing names changed, or
+  when the project imports Python modules by computed name. A changed source
+  file that reaches no test selects nothing for its project: the walk
+  followed every reference, so no test can observe it.
 - Inside the set `--dependents` would select, a project runs in full when
   it depends on an affected project in another language, on one Aster does
   not analyse (Ruby, JVM), or on one it never imports from: such a
