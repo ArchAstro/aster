@@ -59,6 +59,14 @@
 //! is the sha of the first run of that whole streak. The next pass that
 //! leaves it healthy clears it. Broken wins over flaky.
 //!
+//! Broken on main: the same streak at the shorter
+//! `ASTER_SRV_MAIN_BROKEN_RUNS` (at least 1, default 2) is kept as
+//! `main_broken_since_sha`, `main_broken_failure_hash` and `main_broken_at`
+//! on `tests`, independent of `state`. A pass or a different failure on the
+//! default branch clears it in the same pass. Entering and leaving are logged
+//! to `quarantine_log` (`main_broken`, `main_fixed`) so the quarantine list's
+//! version moves with its `main_broken` array.
+//!
 //! `flake_score` is 3 per definite event plus 1 per likely event observed in
 //! the last 7 days; `state` is `broken`, else `flaky` when the score is
 //! positive, else `healthy`.
@@ -224,6 +232,7 @@ pub(super) struct Window {
     /// The branch names that mean the default branch.
     on_default: String,
     broken_runs: u32,
+    main_broken_runs: u32,
     quarantine: QuarantineRules,
     webhooks: Vec<webhooks::Endpoint>,
 }
@@ -336,6 +345,7 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
         history_from: now.date_naive() - chrono::Days::new(u64::from(app.config.retention_days)),
         on_default: app.config.default_branch.clone(),
         broken_runs: app.config.broken_runs,
+        main_broken_runs: app.config.main_broken_runs,
         quarantine: app.config.quarantine,
         webhooks: app.config.webhooks.clone(),
     };
@@ -645,7 +655,8 @@ async fn classify(
                            SELECT repo, test_id FROM cls_win \
                            UNION \
                            SELECT repo, test_id FROM test_results.tests \
-                           WHERE state <> 'healthy' OR flake_score > 0) \
+                           WHERE state <> 'healthy' OR flake_score > 0 \
+                              OR main_broken_failure_hash IS NOT NULL) \
                      UNION ALL \
                      SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
                             failure_hash, false, 0, NULL::text \
@@ -710,7 +721,8 @@ async fn classify(
                      SELECT repo, test_id FROM cls_win \
                      UNION \
                      SELECT repo, test_id FROM test_results.tests \
-                     WHERE state <> 'healthy' OR flake_score > 0), \
+                     WHERE state <> 'healthy' OR flake_score > 0 \
+                        OR main_broken_failure_hash IS NOT NULL), \
                  scores AS ( \
                      SELECT a.repo, a.test_id, \
                             COALESCE(sum(CASE e.kind WHEN 'definite' THEN 3 ELSE 1 END) \
@@ -727,6 +739,7 @@ async fn classify(
                  derived AS ( \
                      SELECT s.repo, s.test_id, s.score, s.last_flake_at, \
                             COALESCE(k.length, 0) >= {k} AS broken, \
+                            COALESCE(k.length, 0) >= {mk} AS main_broken, \
                             k.since_sha, k.failure_hash \
                      FROM scores s LEFT JOIN streaks k USING (repo, test_id)), \
                  next AS ( \
@@ -735,17 +748,32 @@ async fn classify(
                                  WHEN score > 0 THEN 'flaky' ELSE 'healthy' END AS state, \
                             score AS flake_score, last_flake_at, \
                             CASE WHEN broken THEN since_sha END AS broken_since_sha, \
-                            CASE WHEN broken THEN failure_hash END AS broken_failure_hash \
+                            CASE WHEN broken THEN failure_hash END AS broken_failure_hash, \
+                            CASE WHEN main_broken THEN since_sha END AS main_broken_since_sha, \
+                            CASE WHEN main_broken THEN failure_hash END AS main_broken_failure_hash \
                      FROM derived) \
-                 SELECT n.*, o.state AS old_state \
+                 SELECT n.repo, n.test_id, n.state, n.flake_score, n.last_flake_at, \
+                        n.broken_since_sha, n.broken_failure_hash, \
+                        n.main_broken_since_sha, n.main_broken_failure_hash, \
+                        CASE WHEN n.main_broken_failure_hash IS NULL THEN NULL \
+                             WHEN (o.main_broken_since_sha, o.main_broken_failure_hash) \
+                                  IS NOT DISTINCT FROM \
+                                  (n.main_broken_since_sha, n.main_broken_failure_hash) \
+                             THEN o.main_broken_at \
+                             ELSE {to} END AS main_broken_at, \
+                        o.state AS old_state, \
+                        o.main_broken_failure_hash AS old_main_broken_failure_hash \
                  FROM next n JOIN test_results.tests o USING (repo, test_id) \
                  WHERE (o.state, o.flake_score, o.last_flake_at, \
-                        o.broken_since_sha, o.broken_failure_hash) \
+                        o.broken_since_sha, o.broken_failure_hash, \
+                        o.main_broken_since_sha, o.main_broken_failure_hash) \
                        IS DISTINCT FROM \
                        (n.state, n.flake_score, n.last_flake_at, \
-                        n.broken_since_sha, n.broken_failure_hash)",
+                        n.broken_since_sha, n.broken_failure_hash, \
+                        n.main_broken_since_sha, n.main_broken_failure_hash)",
                 to = at(window.to),
                 k = window.broken_runs,
+                mk = window.main_broken_runs,
             ),
             &[],
         )
@@ -767,11 +795,37 @@ async fn classify(
             "UPDATE test_results.tests t SET \
                  state = s.state, flake_score = s.flake_score, last_flake_at = s.last_flake_at, \
                  broken_since_sha = s.broken_since_sha, \
-                 broken_failure_hash = s.broken_failure_hash \
+                 broken_failure_hash = s.broken_failure_hash, \
+                 main_broken_since_sha = s.main_broken_since_sha, \
+                 main_broken_failure_hash = s.main_broken_failure_hash, \
+                 main_broken_at = s.main_broken_at \
              FROM cls_state s \
              WHERE t.repo = s.repo AND t.test_id = s.test_id \
              RETURNING t.repo, t.test_id, t.target, t.file, t.suite, t.name, t.state, \
                        s.old_state, t.broken_since_sha, t.broken_failure_hash",
+            &[],
+        )
+        .await?;
+    // A test entering, leaving or changing its main failure changes the
+    // quarantine list, so it is a log row: the newest row is the list's
+    // version.
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO test_results.quarantine_log (repo, test_id, action, at, detail) \
+                 SELECT repo, test_id, \
+                        CASE WHEN main_broken_failure_hash IS NULL \
+                             THEN 'main_fixed' ELSE 'main_broken' END, \
+                        {to}, \
+                        jsonb_build_object('since_sha', main_broken_since_sha, \
+                                           'failure_hash', COALESCE(main_broken_failure_hash, \
+                                                                    old_main_broken_failure_hash)) \
+                 FROM cls_state \
+                 WHERE main_broken_failure_hash IS DISTINCT FROM old_main_broken_failure_hash \
+                    OR (main_broken_failure_hash IS NOT NULL AND main_broken_at = {to}) \
+                 ORDER BY repo, test_id",
+                to = at(window.to),
+            ),
             &[],
         )
         .await?;

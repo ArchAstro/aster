@@ -591,6 +591,11 @@ reason = "DBConnection.OwnershipError under load; tracked in #4812"
 expires = 2026-11-30
 ```
 
+Adding `broken_on_main = true` at the top of the file also lets pull request
+and merge queue runs fail a test that the default branch fails the same way,
+until main passes it (see
+[docs/test-tracking.md](docs/test-tracking.md#broken-on-main)).
+
 `ASTER_QUARANTINE=off` turns it off. [Test tracking](docs/test-tracking.md)
 covers capture per runner, uploading to aster-srv, the labels in the step
 summary, and the quarantine rules in full.

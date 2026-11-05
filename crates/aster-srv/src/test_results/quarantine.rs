@@ -25,7 +25,11 @@
 //!    run crosses it later.
 //!
 //! Every change is a row in `quarantine_log`, kept for the retention period.
-//! The newest log id of a repository is its quarantine list's version.
+//! The newest log id of a repository is its quarantine list's version. The
+//! classifier also logs `main_broken` and `main_fixed` there when a test
+//! enters or leaves the list's `main_broken` array (see
+//! [`super::classifier`]), so the version moves with that array too; they
+//! are not quarantine entries and do not count as a test leaving quarantine.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -225,7 +229,7 @@ pub(super) async fn update(
                 &format!(
                     "WITH left_at AS ( \
                          SELECT repo, test_id, max(at) AS at FROM test_results.quarantine_log \
-                         WHERE action <> 'quarantined' GROUP BY repo, test_id), \
+                         WHERE action IN ('released', 'expired', 'broken') GROUP BY repo, test_id), \
                      recent AS ( \
                          SELECT e.repo, e.test_id, e.run_id, e.observed_at \
                          FROM test_results.test_flake_events e \

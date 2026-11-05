@@ -26,8 +26,32 @@
 //! 5. `ASTER_QUARANTINE` is not `off`.
 //!
 //! Quarantined tests still run and their results are still uploaded.
+//!
+//! # Broken on main
+//!
+//! A repository may also opt in, with `broken_on_main = true` at the top of
+//! `aster-quarantine.toml`, to letting a test fail on a pull request or merge
+//! queue run while the default branch itself fails it the same way. A pull
+//! request cannot fix a test that main has broken, and every other PR fails
+//! it too. The server lists such tests as `main_broken`, with the failure
+//! hash of the streak. A failing test is excused through it only when all of
+//! these hold, on top of the rules above:
+//!
+//! 1. the opt-in is on;
+//! 2. the run's branch is known (`GITHUB_HEAD_REF`, else `GITHUB_REF_NAME`;
+//!    not a tag) and is not the server's `default_branch`, so a merge queue
+//!    branch counts as a pull request and a local run or the default branch
+//!    never excuses;
+//! 3. the test's last failure hashes to the entry's `failure_hash`, so a PR
+//!    that breaks the test differently still fails;
+//! 4. the list is at most [`MAIN_BROKEN_CACHE_MINUTES`] old. A cached list
+//!    older than that stands in for the flaky list (24 hours) but its
+//!    `main_broken` part is dropped, because main may have been fixed since.
+//!
+//! The server removes a test from `main_broken` on the first default-branch
+//! pass; the run that fetched the list before then may still excuse it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,6 +63,7 @@ use super::client::Server;
 use super::upload::{proxy_token_from_env, Credentials};
 use super::{same_test, TestCase, TestReport};
 use crate::test_results::Confidence;
+use aster_results_model::failure_hash;
 
 /// The repository's own list, at the workspace root.
 pub const REPO_FILE: &str = "aster-quarantine.toml";
@@ -63,6 +88,11 @@ const NON_TEST_FAILURE_MARKERS: &[&str] = &[
 
 /// How long a cached server list may stand in for the server.
 const CACHE_HOURS: i64 = 24;
+
+/// How long a cached list's `main_broken` part may stand in for the server.
+/// It is short because the excuse ends the moment main passes the test, and a
+/// stale cache cannot know that.
+pub const MAIN_BROKEN_CACHE_MINUTES: i64 = 60;
 
 /// How long the start of a run waits for the server's list.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -109,8 +139,20 @@ fn toml_date<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<NaiveD
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoFile {
+    /// Opt in to excusing tests that are broken on the default branch (see
+    /// the module documentation).
+    #[serde(default)]
+    broken_on_main: bool,
     #[serde(default)]
     test: Vec<RepoEntry>,
+}
+
+/// What [`REPO_FILE`] holds that is still in force.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoConfig {
+    pub entries: Vec<RepoEntry>,
+    pub broken_on_main: bool,
+    pub warnings: Vec<String>,
 }
 
 impl RepoEntry {
@@ -145,20 +187,27 @@ impl RepoEntry {
 /// Read [`REPO_FILE`] from `root`: its entries still in force on `today`,
 /// and a warning for each that has expired. No file is no entries.
 pub fn read_repo_file(root: &Path, today: NaiveDate) -> Result<(Vec<RepoEntry>, Vec<String>)> {
+    let config = read_repo_config(root, today)?;
+    Ok((config.entries, config.warnings))
+}
+
+/// [`read_repo_file`] with the file's other settings.
+pub fn read_repo_config(root: &Path, today: NaiveDate) -> Result<RepoConfig> {
     let path = root.join(REPO_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), Vec::new()))
+            return Ok(RepoConfig::default())
         }
         Err(error) => return Err(error).with_context(|| format!("cannot read {REPO_FILE}")),
     };
     let file: RepoFile = toml::from_str(&text).with_context(|| {
         format!(
             "{REPO_FILE} must hold [[test]] entries with a reason, an expires date, \
-             and an id or a name"
+             and an id or a name, and may set broken_on_main = true"
         )
     })?;
+    let broken_on_main = file.broken_on_main;
     let mut live = Vec::new();
     let mut warnings = Vec::new();
     for (index, entry) in file.test.into_iter().enumerate() {
@@ -184,7 +233,11 @@ pub fn read_repo_file(root: &Path, today: NaiveDate) -> Result<(Vec<RepoEntry>, 
         }
         live.push(entry);
     }
-    Ok((live, warnings))
+    Ok(RepoConfig {
+        entries: live,
+        broken_on_main,
+        warnings,
+    })
 }
 
 /// The server's list as cached in `.aster/quarantine.json`.
@@ -197,6 +250,33 @@ pub struct ServerList {
     #[serde(with = "rfc3339")]
     pub fetched_at: DateTime<Utc>,
     pub test_ids: Vec<String>,
+    /// The server's default branch; `None` from a server without
+    /// `main_broken`.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    /// Tests failing on the default branch (see the module documentation).
+    #[serde(default)]
+    pub main_broken: Vec<MainBroken>,
+}
+
+/// One `main_broken` entry of the server's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainBroken {
+    pub test_id: String,
+    /// The failure hash the default branch's runs share.
+    pub failure_hash: String,
+    /// The commit the failing streak began at.
+    #[serde(default)]
+    pub since_sha: Option<String>,
+}
+
+impl MainBroken {
+    fn label(&self) -> String {
+        match &self.since_sha {
+            Some(sha) => format!("broken on main since {}", sha.get(..7).unwrap_or(sha)),
+            None => "broken on main".to_string(),
+        }
+    }
 }
 
 mod rfc3339 {
@@ -232,6 +312,22 @@ impl ServerList {
                 .iter()
                 .filter_map(|test| test["test_id"].as_str().map(str::to_string))
                 .collect(),
+            default_branch: reply["default_branch"].as_str().map(str::to_string),
+            main_broken: reply["main_broken"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            Some(MainBroken {
+                                test_id: entry["test_id"].as_str()?.to_string(),
+                                failure_hash: entry["failure_hash"].as_str()?.to_string(),
+                                since_sha: entry["since_sha"].as_str().map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -255,6 +351,10 @@ pub struct Quarantine {
     pub server: Option<(ServerList, ServerSource)>,
     server_ids: HashSet<String>,
     pub entries: Vec<RepoEntry>,
+    /// The server's `main_broken` entries this run may use, by test id:
+    /// empty unless [`Quarantine::with_broken_on_main`] found the run
+    /// eligible.
+    main_broken: HashMap<String, MainBroken>,
 }
 
 /// What [`Quarantine::judge`] decided for a failed target.
@@ -292,11 +392,28 @@ impl Quarantine {
             server,
             server_ids,
             entries,
+            main_broken: HashMap::new(),
         }
     }
 
+    /// Let this run use the server's `main_broken` entries, when the
+    /// repository opted in and `branch` (the run's branch, `None` when
+    /// unknown) is known and is not the server's default branch.
+    pub fn with_broken_on_main(mut self, opted_in: bool, branch: Option<&str>) -> Self {
+        if let (true, Some(branch), Some((list, _))) = (opted_in, branch, &self.server) {
+            if list.default_branch.as_deref().is_some_and(|d| d != branch) {
+                self.main_broken = list
+                    .main_broken
+                    .iter()
+                    .map(|entry| (entry.test_id.clone(), entry.clone()))
+                    .collect();
+            }
+        }
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.server_ids.is_empty() && self.entries.is_empty()
+        self.server_ids.is_empty() && self.entries.is_empty() && self.main_broken.is_empty()
     }
 
     /// Why `case` (of the target at `address`, recorded under `project`
@@ -315,6 +432,12 @@ impl Quarantine {
             .iter()
             .find(|entry| entry.matches(address, &test_id, case))
             .map(|entry| format!("{REPO_FILE}: {}", entry.reason))
+            .or_else(|| {
+                // Broken on main: only the failure main has too.
+                let entry = self.main_broken.get(&test_id)?;
+                let message = case.message.as_deref()?;
+                (failure_hash(message) == entry.failure_hash).then(|| entry.label())
+            })
     }
 
     /// Whether a failed target may pass. `plugin` names the target's
@@ -399,6 +522,12 @@ impl Quarantine {
                 list.fetched_at.format("%Y-%m-%d %H:%M UTC"),
             )),
             None => {}
+        }
+        if !self.main_broken.is_empty() {
+            parts.push(format!(
+                "{} broken on main from aster-srv",
+                self.main_broken.len()
+            ));
         }
         if !self.entries.is_empty() {
             parts.push(format!("{} from {REPO_FILE}", self.entries.len()));
@@ -511,7 +640,11 @@ pub fn load(
         return Ok(None);
     }
     let now = Utc::now();
-    let (entries, warnings) = read_repo_file(workspace_root, now.date_naive())?;
+    let RepoConfig {
+        entries,
+        broken_on_main,
+        warnings,
+    } = read_repo_config(workspace_root, now.date_naive())?;
     for warning in warnings {
         eprintln!("[aster] Warning: {warning}");
     }
@@ -521,7 +654,10 @@ pub fn load(
             let fetched = fetch(&url, env, now);
             server_list(workspace_root, &url, fetched, now)
         });
-    let quarantine = Quarantine::new(server, entries);
+    let quarantine = Quarantine::new(server, entries).with_broken_on_main(
+        broken_on_main,
+        super::context::pull_request_branch(env).as_deref(),
+    );
     if quarantine.is_empty() && quarantine.server.is_none() {
         return Ok(None);
     }
@@ -573,7 +709,15 @@ fn server_list(
                 .filter(|list| list.url == url)
                 .filter(|list| now - list.fetched_at < chrono::Duration::hours(CACHE_HOURS));
             match cached {
-                Some(list) => Some((list, ServerSource::Cached(why))),
+                Some(mut list) => {
+                    // The flaky list may be a day old; "broken on main" ends
+                    // the moment main passes, so it may not.
+                    if now - list.fetched_at >= chrono::Duration::minutes(MAIN_BROKEN_CACHE_MINUTES)
+                    {
+                        list.main_broken.clear();
+                    }
+                    Some((list, ServerSource::Cached(why)))
+                }
                 None => {
                     eprintln!(
                         "[aster] Quarantine: aster-srv's list is unavailable ({why}) and no \
@@ -829,6 +973,8 @@ mod tests {
             version: 7,
             fetched_at: Utc::now(),
             test_ids: vec![id],
+            default_branch: None,
+            main_broken: Vec::new(),
         };
         let q = Quarantine::new(Some((list, ServerSource::Fetched)), Vec::new());
         assert_eq!(
@@ -933,6 +1079,8 @@ expires = 2026-10-14
             version: 3,
             fetched_at: now,
             test_ids: vec!["t".into()],
+            default_branch: None,
+            main_broken: Vec::new(),
         };
         let fetched = server_list(dir.path(), "https://srv", Ok(list.clone()), now);
         assert_eq!(fetched, Some((list.clone(), ServerSource::Fetched)));
@@ -1071,5 +1219,222 @@ expires = 2026-10-14
         );
         std::fs::remove_file(dir.path().join(REPO_FILE)).unwrap();
         assert_eq!(load(dir.path(), &nothing).unwrap(), None);
+    }
+
+    // --- Broken on main ---
+
+    const BOOM: &str = "expected 1, got 2 at line 40";
+
+    fn failing_with(name: &str, message: &str) -> TestCase {
+        let mut failed = case(name, TestOutcome::Fail, 1);
+        failed.message = Some(message.into());
+        failed
+    }
+
+    fn main_list(
+        test: &TestCase,
+        hash: &str,
+        fetched_at: DateTime<Utc>,
+    ) -> (ServerList, ServerSource) {
+        (
+            ServerList {
+                url: "https://srv".into(),
+                repo: "o/r".into(),
+                version: 9,
+                fetched_at,
+                test_ids: Vec::new(),
+                default_branch: Some("main".into()),
+                main_broken: vec![MainBroken {
+                    test_id: crate::test_results::stream::test_id(ADDRESS, None, test),
+                    failure_hash: hash.into(),
+                    since_sha: Some("0123456789abcdef".into()),
+                }],
+            },
+            ServerSource::Fetched,
+        )
+    }
+
+    /// The verdict for one failing test on `branch` with the repository's
+    /// opt-in `opted_in`, against a list saying `hash` is main's failure.
+    fn broken_on_main_verdict(
+        opted_in: bool,
+        branch: Option<&str>,
+        hash: &str,
+        confidence: Confidence,
+    ) -> Verdict {
+        let failed = failing_with("broken", BOOM);
+        let q = Quarantine::new(Some(main_list(&failed, hash, Utc::now())), Vec::new())
+            .with_broken_on_main(opted_in, branch);
+        let mut run = report(vec![failed, case("fine", TestOutcome::Pass, 1)]);
+        run.confidence = confidence;
+        q.judge(ADDRESS, "elixir", MIX, Some(2), &run, "")
+    }
+
+    #[test]
+    fn a_pull_request_run_may_fail_what_main_fails_the_same_way() {
+        let hash = failure_hash(BOOM);
+        for branch in ["feature/x", "gh-readonly-queue/main/pr-12-abc123"] {
+            let Verdict::Pass(tests) =
+                broken_on_main_verdict(true, Some(branch), &hash, Confidence::Complete)
+            else {
+                panic!("expected a pass on {branch}");
+            };
+            assert_eq!(tests[0].source, "broken on main since 0123456");
+        }
+        // Line numbers and the like do not change the hash.
+        let q = Quarantine::new(
+            Some(main_list(&failing_with("broken", BOOM), &hash, Utc::now())),
+            Vec::new(),
+        )
+        .with_broken_on_main(true, Some("feature"));
+        let moved = report(vec![failing_with("broken", "expected 1, got 2 at line 55")]);
+        assert!(matches!(
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &moved, ""),
+            Verdict::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn broken_on_main_is_never_excused_without_every_condition() {
+        let hash = failure_hash(BOOM);
+        let complete = Confidence::Complete;
+        // The default branch, and a branch that is not known.
+        assert_eq!(
+            broken_on_main_verdict(true, Some("main"), &hash, complete),
+            Verdict::Untouched
+        );
+        assert_eq!(
+            broken_on_main_verdict(true, None, &hash, complete),
+            Verdict::Untouched
+        );
+        // A different failure than main's.
+        assert_eq!(
+            broken_on_main_verdict(true, Some("feature"), &failure_hash("other"), complete),
+            Verdict::Untouched
+        );
+        // No opt-in.
+        assert_eq!(
+            broken_on_main_verdict(false, Some("feature"), &hash, complete),
+            Verdict::Untouched
+        );
+        // Partial results still refuse.
+        assert!(matches!(
+            broken_on_main_verdict(true, Some("feature"), &hash, Confidence::Partial),
+            Verdict::Fail(why) if why.contains("partial")
+        ));
+        // A test without a message has no hash to compare.
+        let q = Quarantine::new(
+            Some(main_list(&failing_with("broken", BOOM), &hash, Utc::now())),
+            Vec::new(),
+        )
+        .with_broken_on_main(true, Some("feature"));
+        let silent = report(vec![case("broken", TestOutcome::Fail, 1)]);
+        assert_eq!(
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &silent, ""),
+            Verdict::Untouched
+        );
+        // A server that does not name its default branch cannot say which
+        // branch this is.
+        let mut list = main_list(&failing_with("broken", BOOM), &hash, Utc::now());
+        list.0.default_branch = None;
+        let q = Quarantine::new(Some(list), Vec::new()).with_broken_on_main(true, Some("feature"));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn the_start_line_counts_broken_on_main_separately() {
+        let failed = failing_with("broken", BOOM);
+        let q = Quarantine::new(
+            Some(main_list(&failed, &failure_hash(BOOM), Utc::now())),
+            vec![entry("flaky")],
+        )
+        .with_broken_on_main(true, Some("feature"));
+        assert_eq!(
+            q.describe(),
+            "0 from aster-srv (version 9), 1 broken on main from aster-srv, \
+             1 from aster-quarantine.toml"
+        );
+        // Off the default branch only: the default branch lists none.
+        let q = Quarantine::new(Some(main_list(&failed, "h", Utc::now())), Vec::new())
+            .with_broken_on_main(true, Some("main"));
+        assert!(!q.describe().contains("broken on main"));
+    }
+
+    #[test]
+    fn a_cached_list_drops_broken_on_main_after_an_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let failed = failing_with("broken", BOOM);
+        let (list, _) = main_list(&failed, &failure_hash(BOOM), now);
+        server_list(dir.path(), "https://srv", Ok(list.clone()), now).unwrap();
+        let down = || Err(anyhow::anyhow!("connection refused"));
+
+        let soon = now + chrono::Duration::minutes(MAIN_BROKEN_CACHE_MINUTES - 1);
+        let (fresh, _) = server_list(dir.path(), "https://srv", down(), soon).unwrap();
+        assert_eq!(fresh.main_broken, list.main_broken);
+
+        let later = now + chrono::Duration::minutes(MAIN_BROKEN_CACHE_MINUTES + 1);
+        let (stale, source) = server_list(dir.path(), "https://srv", down(), later).unwrap();
+        assert!(matches!(source, ServerSource::Cached(_)));
+        // Still the flaky list, but nothing is excused through main.
+        assert_eq!(stale.version, list.version);
+        assert!(stale.main_broken.is_empty());
+        let q = Quarantine::new(Some((stale, source)), Vec::new())
+            .with_broken_on_main(true, Some("feature"));
+        let run = report(vec![failed]);
+        assert_eq!(
+            q.judge(ADDRESS, "elixir", MIX, Some(2), &run, ""),
+            Verdict::Untouched
+        );
+    }
+
+    #[test]
+    fn reads_main_broken_and_the_opt_in() {
+        let reply = serde_json::json!({
+            "repo": "o/r", "version": 12, "default_branch": "main", "tests": [],
+            "main_broken": [
+                {"test_id": "a", "failure_hash": "h", "since_sha": "abc", "since": "x"},
+                {"test_id": "no hash"}
+            ],
+        });
+        let list = ServerList::from_reply("https://srv", &reply, Utc::now()).unwrap();
+        assert_eq!(list.default_branch.as_deref(), Some("main"));
+        assert_eq!(list.main_broken.len(), 1);
+        // An older server sends neither.
+        let old = serde_json::json!({"repo": "o/r", "version": 1, "tests": []});
+        let list = ServerList::from_reply("https://srv", &old, Utc::now()).unwrap();
+        assert!(list.default_branch.is_none() && list.main_broken.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = |text: &str| {
+            std::fs::write(dir.path().join(REPO_FILE), text).unwrap();
+            read_repo_config(dir.path(), today())
+        };
+        assert!(!config("").unwrap().broken_on_main);
+        assert!(config("broken_on_main = true\n").unwrap().broken_on_main);
+        assert!(config("broken_on_main = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn the_branch_comes_from_ci_and_never_from_a_tag_or_a_checkout() {
+        use super::super::context::pull_request_branch;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let pr = env(&[
+            ("GITHUB_HEAD_REF", "feature"),
+            ("GITHUB_REF_NAME", "12/merge"),
+        ]);
+        assert_eq!(pull_request_branch(&pr).as_deref(), Some("feature"));
+        let push = env(&[("GITHUB_HEAD_REF", ""), ("GITHUB_REF_NAME", "main")]);
+        assert_eq!(pull_request_branch(&push).as_deref(), Some("main"));
+        let tag = env(&[("GITHUB_REF_NAME", "v1"), ("GITHUB_REF_TYPE", "tag")]);
+        assert_eq!(pull_request_branch(&tag), None);
+        assert_eq!(pull_request_branch(&env(&[])), None);
     }
 }

@@ -86,6 +86,20 @@ fn pull_request(reference: &str) -> Option<u64> {
     entry.strip_prefix("pr-")?.split('-').next()?.parse().ok()
 }
 
+/// The branch a CI run is for, as the environment names it, or `None` when
+/// it is not known: a local run, or a tag. Unlike the run record's branch it
+/// never falls back to the checkout's HEAD, because a decision to excuse
+/// failures must rest on what CI says.
+pub fn pull_request_branch(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let var = |name: &str| env(name).filter(|value| !value.is_empty());
+    var("GITHUB_HEAD_REF").or_else(|| {
+        if var("GITHUB_REF_TYPE").as_deref() == Some("tag") {
+            return None;
+        }
+        var("GITHUB_REF_NAME")
+    })
+}
+
 /// `owner/name` from the `origin` remote, for GitHub-style URLs.
 fn origin_repo(repository: &git2::Repository) -> Option<String> {
     let remote = repository.find_remote("origin").ok()?;
