@@ -596,9 +596,7 @@ cp "$ASTER_TEST_DYNAMIC_KEY" "$key"
         .stderr(stderr.reopen().unwrap())
         .spawn()
         .unwrap();
-    wait_until(Duration::from_secs(8), || {
-        TcpStream::connect(("127.0.0.1", tls_port)).is_ok()
-    });
+    wait_for_tls_edge_ready(stdout.path(), tls_port);
 
     // Observable behavior: exact and suffix hosts cross real TLS and HTTP
     // sockets, preserve logical Host, and select different upstream services.
@@ -683,9 +681,7 @@ cp "$ASTER_TEST_DYNAMIC_KEY" "$key"
         .stderr(second_stderr.reopen().unwrap())
         .spawn()
         .unwrap();
-    wait_until(Duration::from_secs(8), || {
-        TcpStream::connect(("127.0.0.1", tls_port)).is_ok()
-    });
+    wait_for_tls_edge_ready(second_stdout.path(), tls_port);
     let persisted_site_response = https_get_with_roots(
         tls_port,
         "docs.acme.example.test",
@@ -869,6 +865,16 @@ fn https_get_with_roots(
     let mut response = String::new();
     tls.read_to_string(&mut response).unwrap();
     response
+}
+
+/// Wait for this supervisor's edge to report that it bound `port`. A bare TCP
+/// connect is not proof: once the test drops its reservation, a concurrently
+/// running test can briefly bind the same ephemeral port.
+fn wait_for_tls_edge_ready(stdout: &std::path::Path, port: u16) {
+    let ready = format!("TLS edge 'edge' ready https://127.0.0.1:{port}");
+    wait_until(Duration::from_secs(8), || {
+        fs::read_to_string(stdout).is_ok_and(|output| output.contains(&ready))
+    });
 }
 
 fn wait_for_control_token(port: u16, process_id: u32) -> (std::path::PathBuf, String) {
