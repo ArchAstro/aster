@@ -4268,3 +4268,145 @@ fn js_dynamic_import_edge_survives_a_static_importer() {
         ["npm test -- test/shout.test.js --coverage.enabled=false"]
     );
 }
+
+/// A pnpm workspace with two packages and an Elixir service that depends on
+/// the first. The lockfile is the one pnpm v9 writes: one importer per
+/// package, `packages:` and `snapshots:` for the resolved graph.
+const PNPM_WORKSPACE: &[(&str, &str)] = &[
+    ("pnpm-workspace.yaml", "packages:\n  - 'pkg-*'\n"),
+    (
+        "package.json",
+        r#"{"name":"root","private":true,"packageManager":"pnpm@9.0.0"}"#,
+    ),
+    (
+        "pkg-a/package.json",
+        r#"{"name":"pkg-a","scripts":{"test":"vitest run","build":"tsc"}}"#,
+    ),
+    (
+        "pkg-b/package.json",
+        r#"{"name":"pkg-b","scripts":{"test":"vitest run","build":"tsc"}}"#,
+    ),
+    (
+        "api/mix.exs",
+        "defmodule Api.MixProject do\n  use Mix.Project\n  def project, do: [app: :api, version: \"0.1.0\"]\nend\n",
+    ),
+    ("api/aster.toml", "depends_on = [\"//pkg-a\"]\n"),
+    (
+        "api/test/api_test.exs",
+        "defmodule ApiTest do\n  use ExUnit.Case\n  test \"ok\" do\n    assert true\n  end\nend\n",
+    ),
+    (
+        "pnpm-lock.yaml",
+        "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+
+importers:
+
+  .: {}
+
+  pkg-a:
+    dependencies:
+      left-pad:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+  pkg-b:
+    dependencies:
+      wrapper:
+        specifier: ^1.0.0
+        version: 1.0.0
+      right-pad:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  left-pad@1.0.0:
+    resolution: {integrity: sha512-aaa}
+
+  right-pad@1.0.0:
+    resolution: {integrity: sha512-bbb}
+
+  wrapper@1.0.0:
+    resolution: {integrity: sha512-ccc}
+
+snapshots:
+
+  left-pad@1.0.0: {}
+
+  right-pad@1.0.0: {}
+
+  wrapper@1.0.0:
+    dependencies:
+      left-pad: 1.0.0
+",
+    ),
+];
+
+/// Bumping a package that one workspace project resolves must run that
+/// project and what depends on it, not the whole workspace.
+#[test]
+fn a_pnpm_lockfile_edit_runs_only_the_projects_whose_importers_it_changes() {
+    // Setup: two Node projects in one pnpm workspace and an Elixir service
+    // whose `depends_on` points at pkg-a only.
+    let ws = Workspace::new(PNPM_WORKSPACE);
+
+    // Action 1: the lockfile changes only pkg-a's importer entry (a new
+    // pinned version of its own direct dependency).
+    ws.edit(
+        "pnpm-lock.yaml",
+        "specifier: ^1.0.0\n        version: 1.0.0\n\n  pkg-b",
+        "specifier: ^1.0.0\n        version: 1.0.1\n\n  pkg-b",
+    );
+    let plan = ws.plan("test");
+    // Outcome: pkg-a runs in full for that reason, its Elixir dependent
+    // follows, and pkg-b is not touched by the lockfile.
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//api:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+    assert!(plan
+        .notes("//pkg-a:test")
+        .contains("pnpm-lock.yaml changed: importer pkg-a changed"));
+
+    // Action 2: restore, then change a transitive package's resolution.
+    // left-pad is direct for pkg-a and reached through `wrapper` by pkg-b.
+    ws.git(&["checkout", "-q", "pnpm-lock.yaml"]);
+    ws.edit("pnpm-lock.yaml", "sha512-aaa", "sha512-zzz");
+    let plan = ws.plan("test");
+    // Outcome: both importers reach it.
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+
+    // Action 3: a package only pkg-b resolves.
+    ws.git(&["checkout", "-q", "pnpm-lock.yaml"]);
+    ws.edit("pnpm-lock.yaml", "sha512-bbb", "sha512-yyy");
+    let plan = ws.plan("test");
+    // Outcome: pkg-b alone; the Elixir service depends on pkg-a, not pkg-b.
+    assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//api:test"), "{plan:#?}");
+
+    // Fail closed: a workspace-wide setting can change every resolution,
+    // so every project runs in full.
+    ws.git(&["checkout", "-q", "pnpm-lock.yaml"]);
+    ws.edit(
+        "pnpm-lock.yaml",
+        "autoInstallPeers: true",
+        "autoInstallPeers: false",
+    );
+    let plan = ws.plan("test");
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+    assert!(plan
+        .notes("//pkg-b:test")
+        .contains("pnpm-lock.yaml changed; running in full"));
+
+    // Fail closed: a lockfile this parser cannot read.
+    ws.git(&["checkout", "-q", "pnpm-lock.yaml"]);
+    ws.write("pnpm-lock.yaml", "importers:\n\tbroken\n");
+    let plan = ws.plan("test");
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+}

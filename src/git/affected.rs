@@ -270,6 +270,22 @@ impl AffectedDetector {
                 }
                 continue;
             }
+            if change
+                .path
+                .file_name()
+                .is_some_and(|n| n == "pnpm-lock.yaml")
+            {
+                // The related engine diffs both lockfiles to find the
+                // importers and packages that changed.
+                if !change.deleted {
+                    change.old_source = blob(&base_tree, &change.path);
+                    change.new_source = match &head_tree {
+                        Some(head_tree) => blob(head_tree, &change.path),
+                        None => self.workdir_text(&change.path),
+                    };
+                }
+                continue;
+            }
             if crate::related::Family::of(&change.path).is_none() {
                 continue;
             }
