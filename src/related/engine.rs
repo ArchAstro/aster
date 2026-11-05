@@ -5,6 +5,7 @@ use super::annotations;
 use super::cache::FactsCache;
 use super::consumers::{self, Consume};
 use super::facts::{DefKind, Family, FileFacts, LineClass};
+use super::pnpm_lock;
 use super::resolve::{Resolvers, Workspace};
 use super::{elixir, go, js, python, rust};
 use crate::discovery::DiscoveredProject;
@@ -1866,13 +1867,46 @@ impl<'a> Index<'a> {
                 .unwrap_or("");
             if let Some(plugin) = lockfile_plugin(name) {
                 let dir = change.path.parent().unwrap_or(Path::new(""));
+                // A pnpm lockfile edit reaches only the importers it changed,
+                // directly or through the packages they resolve. Anything
+                // the diff cannot attribute reaches every project.
+                let pnpm = (name == "pnpm-lock.yaml")
+                    .then(|| {
+                        let (old, new) =
+                            (change.old_source.as_deref()?, change.new_source.as_deref()?);
+                        Some(pnpm_lock::lock_impact(old, new))
+                    })
+                    .flatten();
                 for (i, candidate) in self.projects.iter().enumerate() {
                     if candidate.plugin_name == plugin && candidate.relative_path.starts_with(dir) {
+                        let mut reason = format!("{} changed", change.path.display());
+                        if let Some(pnpm_lock::LockImpact::Importers(hit)) = &pnpm {
+                            let importer = candidate
+                                .relative_path
+                                .strip_prefix(dir)
+                                .unwrap_or(Path::new(""));
+                            let importer = if importer.as_os_str().is_empty() {
+                                ".".to_string()
+                            } else {
+                                importer.to_string_lossy().replace('\\', "/")
+                            };
+                            match hit.get(&importer) {
+                                Some(why) => {
+                                    reason = format!("{} changed: {why}", change.path.display())
+                                }
+                                // Not an importer, or an importer the edit left
+                                // alone: the lockfile resolved nothing new for it.
+                                None => continue,
+                            }
+                        }
                         outcomes[i].changed = true;
                         outcomes[i].product = true;
-                        let reason = format!("{} changed", change.path.display());
                         set_full(&mut outcomes, i, true, reason);
                     }
+                }
+                // The lockfile's own project was judged above as an importer.
+                if matches!(pnpm, Some(pnpm_lock::LockImpact::Importers(_))) {
+                    continue;
                 }
             }
             if let Some(p) = project {

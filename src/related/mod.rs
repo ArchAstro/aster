@@ -41,6 +41,7 @@ mod facts;
 mod go;
 mod js;
 mod lint;
+mod pnpm_lock;
 mod python;
 mod resolve;
 mod rust;
