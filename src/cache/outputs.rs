@@ -6,9 +6,10 @@
 //! without following symlinks. A missing declaration or a symlink that leaves
 //! the project is a warning and is not stored.
 //!
-//! [`restore`] materializes a packed entry list. It validates every path
-//! before deleting anything, replaces each declared output root, and removes
-//! those roots again if a blob is missing or corrupt.
+//! [`restore`] materializes a packed entry list in place. It validates every
+//! path and blob before changing anything, rewrites only outputs that differ,
+//! prunes what a declared directory no longer holds, and removes the declared
+//! paths if a blob turns out corrupt.
 
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -90,21 +91,41 @@ pub fn pack(
     Ok(Some(entries))
 }
 
-/// Replace declared outputs under `project_root` with the packed tree.
+/// Make declared outputs under `project_root` match the packed tree.
 ///
-/// Every entry is checked before the first delete. A path that is absolute,
-/// contains `..`, or otherwise leaves `project_root` is refused and nothing
-/// is removed. Each declared path is removed (a directory root takes its
-/// children with it), then files, directories, and symlinks are written.
-/// File bytes come from `store` and land via a same-directory temp rename.
+/// Every entry is checked before anything on disk changes. A path that is
+/// absolute, contains `..`, or otherwise leaves `project_root` is refused and
+/// nothing is touched. A file blob missing from `store` is refused the same
+/// way.
 ///
-/// A missing or corrupt blob, or any write error after a delete, removes the
-/// declared paths again and returns `Err`. The caller treats that as a miss.
+/// Restore updates outputs in place, so other processes can read them while it
+/// runs. Several restores of the same entry can also run at once. An output
+/// that already matches its entry is left alone. A changed file is written to a
+/// sibling temp file and renamed over the old one. A path whose type changed
+/// (a file that is now a directory) is removed first. Then anything under a
+/// declared directory that the entry list does not name is removed, so stale
+/// files do not survive a hit. Another restore's in-flight temp files are
+/// skipped.
+///
+/// A corrupt blob or a write error removes the declared paths and returns
+/// `Err`. The caller treats that as a miss and runs the target.
 pub fn restore(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
     let entries = validate_restore_entries(project_root, entries)?;
-    let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
-    remove_outputs(project_root, &paths)?;
-    if let Err(error) = write_outputs(project_root, &entries, store) {
+    if let Some(entry) = entries.iter().find(|entry| {
+        entry
+            .digest
+            .as_ref()
+            .is_some_and(|digest| !store.has_blob(digest))
+    }) {
+        bail!(
+            "cache restore file `{}` has no blob in the store",
+            entry.path
+        );
+    }
+    let result = write_outputs(project_root, &entries, store)
+        .and_then(|()| prune_undeclared(project_root, &entries));
+    if let Err(error) = result {
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
         let _ = remove_outputs(project_root, &paths);
         return Err(error);
     }
@@ -234,6 +255,8 @@ fn remove_outputs(project_root: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Parents come before children (see [`validate_restore_entries`]), so a
+/// declared directory exists, and is a real directory, before its entries.
 fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
     for entry in entries {
         let path = project_root.join(&entry.path);
@@ -242,12 +265,20 @@ fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStor
                 .with_context(|| format!("Failed to restore directory {}", entry.path))?,
             OutputKind::File => {
                 let digest = entry.digest.as_ref().expect("validated");
+                if file_matches(&path, digest, entry.mode)? {
+                    continue;
+                }
+                remove_if_real_dir(&path)?;
                 write_file_atomic(&path, digest, entry.mode, store)
                     .with_context(|| format!("Failed to restore file {} from blob", entry.path))?;
             }
             OutputKind::Symlink => {
                 let target = entry.target.as_deref().expect("validated");
-                write_symlink(&path, target)
+                if fs::read_link(&path).is_ok_and(|current| current == Path::new(target)) {
+                    continue;
+                }
+                remove_if_real_dir(&path)?;
+                write_symlink_atomic(&path, target)
                     .with_context(|| format!("Failed to restore symlink {}", entry.path))?;
             }
         }
@@ -255,9 +286,150 @@ fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStor
     Ok(())
 }
 
+/// Create `path` as a real directory with `mode`. A file or symlink in the
+/// way is unlinked, never followed.
 fn write_dir(path: &Path, mode: u32) -> Result<()> {
-    fs::create_dir_all(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            if mode_matches(&metadata, mode) {
+                return Ok(());
+            }
+        }
+        Ok(_) => {
+            remove_path(path)?;
+            create_dir_tolerating_race(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_dir_tolerating_race(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     set_mode(path, mode)
+}
+
+fn create_dir_tolerating_race(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        // Another restore created it first.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// True when `path` is a regular file (not a symlink) with `digest` and `mode`.
+fn file_matches(path: &Path, digest: &Digest, mode: u32) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || !mode_matches(&metadata, mode) {
+        return Ok(false);
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        // Replaced or removed since the stat: rewrite it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Digest::of_reader(file)? == *digest)
+}
+
+/// A rename cannot replace a directory, so a real directory where a file or
+/// symlink belongs is removed first. Symlinks are left for the rename, which
+/// replaces the link itself.
+fn remove_if_real_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            remove_path(path)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Remove whatever is at `path` without following a symlink.
+///
+/// Another restore may change the same path between the stat and the remove
+/// (a directory it just replaced with a file, say). The type is read again and
+/// the remove retried, and a path that is already gone counts as removed, so
+/// that race does not fail this restore and trigger its cleanup.
+fn remove_path(path: &Path) -> Result<()> {
+    const ATTEMPTS: usize = 4;
+    let mut last_error = None;
+    for _ in 0..ATTEMPTS {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("at least one attempt").into())
+}
+
+/// Remove what a declared directory holds that the entry list does not name.
+///
+/// Only children of `Dir` entries are inspected. A glob of files declares no
+/// directory, so nothing beside those files is touched. An undeclared child
+/// directory goes with its contents. Symlinks are unlinked, not followed.
+fn prune_undeclared(project_root: &Path, entries: &[OutputEntry]) -> Result<()> {
+    let declared: BTreeSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    for entry in entries.iter().filter(|entry| entry.kind == OutputKind::Dir) {
+        let dir = project_root.join(&entry.path);
+        let children = match fs::read_dir(&dir) {
+            Ok(children) => children,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read cache output {}", entry.path));
+            }
+        };
+        for child in children {
+            let child = child.with_context(|| format!("Failed to read {}", entry.path))?;
+            let name = child.file_name();
+            // Manifest paths are UTF-8, so a non-UTF-8 name is never declared.
+            let rel = name.to_str().map(|name| format!("{}/{name}", entry.path));
+            let keep = rel.as_deref().is_some_and(|rel| {
+                declared.contains(rel) || is_live_restore_temp(&rel[entry.path.len() + 1..], &child)
+            });
+            if keep {
+                continue;
+            }
+            let rel = rel.unwrap_or_else(|| child.path().display().to_string());
+            remove_path(&child.path())
+                .with_context(|| format!("Failed to remove stale cache output {rel}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// How long a restore temp file is assumed to belong to a running restore.
+/// Older ones are leftovers of a killed process and are pruned.
+const RESTORE_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn is_live_restore_temp(name: &str, entry: &fs::DirEntry) -> bool {
+    if !(name.starts_with('.') && name.contains(RESTORE_TEMP_MARKER)) {
+        return false;
+    }
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_none_or(|age| age < RESTORE_TEMP_GRACE)
 }
 
 /// Write blob bytes to a sibling temp file, then rename over `path`.
@@ -280,24 +452,37 @@ fn write_file_atomic(path: &Path, digest: &Digest, mode: u32, store: &LocalStore
     write_result
 }
 
-fn write_symlink(path: &Path, target: &str) -> Result<()> {
+/// Create the link under a sibling temp name, then rename it over `path`.
+fn write_symlink_atomic(path: &Path, target: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, path)?;
+    let tmp = restore_temp_path(path);
+    let write_result = (|| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, &tmp)?;
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, &tmp)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = target;
+            bail!("symlinks are not supported on this platform");
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_file(target, path)?;
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        bail!("symlinks are not supported on this platform");
-    }
-    Ok(())
+    write_result
 }
+
+/// Every restore temp name contains this; see [`restore_temp_path`].
+const RESTORE_TEMP_MARKER: &str = ".aster-restore.";
 
 fn restore_temp_path(final_path: &Path) -> PathBuf {
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -307,7 +492,7 @@ fn restore_temp_path(final_path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("output");
     final_path.with_file_name(format!(
-        ".{name}.aster-restore.{}.{seq}",
+        ".{name}{RESTORE_TEMP_MARKER}{}.{seq}",
         std::process::id()
     ))
 }
@@ -593,6 +778,12 @@ fn is_safe_declaration(path: &Path) -> bool {
 
 fn exists_no_follow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+/// Unix permission bits match. Other platforms do not store them, so a
+/// unix-packed 0o755 would otherwise never match and be rewritten every hit.
+fn mode_matches(metadata: &fs::Metadata, mode: u32) -> bool {
+    !cfg!(unix) || mode_of(metadata) == mode & 0o777
 }
 
 fn mode_of(metadata: &fs::Metadata) -> u32 {
@@ -895,6 +1086,107 @@ mod tests {
             "partial restore left dist behind"
         );
         assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_leaves_matching_outputs_in_place_and_prunes_stale_ones() {
+        use std::os::unix::fs::MetadataExt;
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/same.js"), b"same");
+        write_file(&project.path().join("dist/changed.js"), b"new");
+        write_file(&project.path().join("dist/nested/kept.js"), b"kept");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        let packed = snapshot(project.path(), "dist");
+
+        // The checkout drifted: one file changed, stale files and a stale
+        // directory appeared. `same.js` is untouched.
+        let inode = |rel: &str| fs::metadata(project.path().join(rel)).unwrap().ino();
+        let same_before = inode("dist/same.js");
+        fs::write(project.path().join("dist/changed.js"), b"old").unwrap();
+        write_file(&project.path().join("dist/stale.js"), b"stale");
+        write_file(&project.path().join("dist/gone/deep.js"), b"stale");
+
+        restore(project.path(), &entries, &store).unwrap();
+
+        assert_eq!(snapshot(project.path(), "dist"), packed);
+        assert_eq!(
+            inode("dist/same.js"),
+            same_before,
+            "matching file was rewritten"
+        );
+    }
+
+    #[test]
+    fn restore_replaces_outputs_whose_type_changed() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/was_dir"), b"file now");
+        write_file(&project.path().join("dist/was_file/inner.js"), b"dir now");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        let packed = snapshot(project.path(), "dist");
+
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        write_file(&project.path().join("dist/was_dir/child.js"), b"x");
+        write_file(&project.path().join("dist/was_file"), b"x");
+
+        restore(project.path(), &entries, &store).unwrap();
+        assert_eq!(snapshot(project.path(), "dist"), packed);
+    }
+
+    #[test]
+    fn restore_skips_a_running_restores_temp_file_and_prunes_an_old_one() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/app.js"), b"app");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+
+        let live = project.path().join("dist/.app.js.aster-restore.1.0");
+        let old = project.path().join("dist/.app.js.aster-restore.2.0");
+        write_file(&live, b"in flight");
+        write_file(&old, b"left by a killed restore");
+        let long_ago = std::time::SystemTime::now() - RESTORE_TEMP_GRACE * 2;
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        restore(project.path(), &entries, &store).unwrap();
+        assert!(live.exists(), "another restore's temp file was removed");
+        assert!(!old.exists(), "a stale temp file survived");
+    }
+
+    #[test]
+    fn restore_refuses_a_missing_blob_before_touching_outputs() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.txt"), b"aaa");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let entries = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        let digest = entries[1].digest.as_ref().unwrap();
+        fs::remove_file(store.blob_path(digest).unwrap()).unwrap();
+        fs::write(project.path().join("dist/a.txt"), b"local").unwrap();
+
+        let error = restore(project.path(), &entries, &store).unwrap_err();
+        assert!(error.to_string().contains("no blob"), "{error}");
+        assert_eq!(
+            fs::read(project.path().join("dist/a.txt")).unwrap(),
+            b"local"
+        );
     }
 
     #[test]

@@ -487,3 +487,182 @@ fn copy_sources(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
     walk(from, to, std::path::Path::new(""));
 }
+
+/// A cache hit must not take away outputs another process is reading.
+///
+/// The firstlanding coverage incident: one `aster` invocation restored the
+/// SDK's cached `dist/` while tests in another process imported it, and a
+/// third invocation restoring the same target failed with "Directory not
+/// empty". Restore used to delete every declared output root and write it
+/// back, so a hit on unchanged outputs still left a window where files were
+/// missing. This drives real `aster run` processes against one checkout.
+#[test]
+fn concurrent_cache_hits_keep_unchanged_outputs_readable() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Setup: a build that writes a nested `dist/` tree, declared as a
+    // directory output, the shape a JS SDK build has.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_sdk_fixture(root);
+    let counter = root.join("runs.txt");
+    let aster = |root: &std::path::Path| run_sdk_build(root, &counter);
+    let first = aster(root);
+    assert!(first.status.success(), "{first:?}");
+    let files: Vec<_> = walkdir_files(&root.join("sdk/dist"));
+    assert_eq!(files.len(), 401);
+
+    // Boundary: a separate reader keeps opening every module, standing in
+    // for a test process importing the SDK while builds run elsewhere.
+    let stop = Arc::new(AtomicBool::new(false));
+    let missing = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let (stop, missing, files) = (stop.clone(), missing.clone(), files.clone());
+        std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                for file in &files {
+                    if fs::read(file).is_err() {
+                        missing.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reads += 1;
+                }
+            }
+            reads
+        })
+    };
+
+    // Action: several concurrent `aster run` processes all hit the cache
+    // and restore the same unchanged outputs.
+    let runs: Vec<_> = std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| (0..3).map(|_| aster(root)).collect::<Vec<_>>()))
+            .collect();
+        callers
+            .into_iter()
+            .flat_map(|caller| caller.join().unwrap())
+            .collect()
+    });
+    stop.store(true, Ordering::Relaxed);
+    let reads = reader.join().unwrap();
+
+    // Outcome: every invocation succeeded from the cache without warning,
+    // the build never re-ran, and the reader never saw a module disappear.
+    for output in &runs {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "aster failed: {stderr}");
+        assert!(
+            !stderr.contains("cache restore failed"),
+            "restore raced another restore: {stderr}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&counter).unwrap().lines().count(),
+        1,
+        "every later invocation must be a cache hit"
+    );
+    assert!(reads > 0);
+    assert_eq!(
+        missing.load(Ordering::Relaxed),
+        0,
+        "reader saw outputs vanish during {reads} reads"
+    );
+    assert_eq!(walkdir_files(&root.join("sdk/dist")), files);
+}
+
+/// Concurrent hits on a checkout whose outputs changed type since the
+/// manifest was stored (a file became a directory and the reverse) all
+/// succeed. One restore replacing a path must not fail another restore that
+/// stat'd the old type, because a failed restore deletes its outputs.
+#[test]
+fn concurrent_cache_hits_converge_a_checkout_whose_output_types_changed() {
+    // Setup: build once, then flip two outputs to the other type.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_sdk_fixture(root);
+    let counter = root.join("runs.txt");
+    assert!(run_sdk_build(root, &counter).status.success());
+    let expected = walkdir_files(&root.join("sdk/dist"));
+    let expected_index = fs::read(root.join("sdk/dist/index.js")).unwrap();
+
+    for round in 0..5 {
+        fs::remove_file(root.join("sdk/dist/index.js")).unwrap();
+        fs::create_dir_all(root.join("sdk/dist/index.js/stale")).unwrap();
+        fs::remove_dir_all(root.join("sdk/dist/resources/a")).unwrap();
+        fs::write(root.join("sdk/dist/resources/a"), b"was a directory").unwrap();
+
+        // Action: four `aster run` processes restore the same hit at once.
+        let outputs: Vec<_> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| run_sdk_build(root, &counter)))
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().unwrap())
+                .collect()
+        });
+
+        // Outcome: no restore failed, the build never re-ran, and the
+        // checkout matches the manifest again.
+        for output in &outputs {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "round {round}: {stderr}");
+            assert!(
+                !stderr.contains("cache restore failed"),
+                "round {round}: a restore failed: {stderr}"
+            );
+        }
+        assert_eq!(
+            walkdir_files(&root.join("sdk/dist")),
+            expected,
+            "round {round}"
+        );
+        assert_eq!(
+            fs::read(root.join("sdk/dist/index.js")).unwrap(),
+            expected_index
+        );
+    }
+    assert_eq!(fs::read_to_string(&counter).unwrap().lines().count(), 1);
+}
+
+fn write_sdk_fixture(root: &std::path::Path) {
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("sdk")).unwrap();
+    fs::write(root.join("sdk/package.json"), r#"{"name":"sdk"}"#).unwrap();
+    fs::write(
+        root.join("sdk/aster.toml"),
+        r#"
+[targets.build]
+command = "bash -c 'for d in a b c d; do mkdir -p dist/resources/$d; for i in $(seq 1 100); do echo $d$i > dist/resources/$d/m$i.js; done; done; echo index > dist/index.js; echo run >> \"$COUNTER_FILE\"'"
+cache = { enabled = true, outputs = ["dist"] }
+"#,
+    )
+    .unwrap();
+}
+
+fn run_sdk_build(root: &std::path::Path, counter: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aster"))
+        .current_dir(root)
+        .env("COUNTER_FILE", counter)
+        .args(["run", "//sdk:build", "--no-deps"])
+        .output()
+        .unwrap()
+}
+
+fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
