@@ -1,16 +1,17 @@
-//! Cargo resolves membership; Aster gives each declared action one graph owner.
+//! Aster gives configured workspace actions one owner using its local project graph.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 
 use super::{DiscoveredProject, PartialProject};
 use crate::config::project::CargoWorkspaceInputs;
 use crate::config::TargetConfig;
-use crate::plugins::{LocalDependency, Target};
+use crate::plugins::rust_manifest::{
+    expand_member_pattern, find_workspace_root, normalize, path_dependencies, target_roots,
+};
+use crate::plugins::Target;
 
 pub(super) struct Owner {
     root: PathBuf,
@@ -20,41 +21,13 @@ pub(super) struct Owner {
     source_files: Vec<PathBuf>,
 }
 
-#[derive(Deserialize)]
-struct Metadata {
-    workspace_root: PathBuf,
-    workspace_members: Vec<String>,
-    target_directory: PathBuf,
-    packages: Vec<Package>,
-}
-
-#[derive(Deserialize)]
-struct Package {
-    id: String,
-    manifest_path: PathBuf,
-    targets: Vec<CargoTarget>,
-    dependencies: Vec<CargoDependency>,
-}
-
-#[derive(Deserialize)]
-struct CargoDependency {
-    name: String,
-    rename: Option<String>,
-    path: Option<PathBuf>,
-}
-
-#[derive(Deserialize)]
-struct CargoTarget {
-    src_path: PathBuf,
-}
-
 pub(super) fn prepare(
     projects: &mut [PartialProject],
     workspace_root: &Path,
 ) -> Result<Vec<Owner>> {
     let canonical_workspace = workspace_root.canonicalize()?;
     let mut owners = Vec::new();
-    let mut cargo_dependencies = HashMap::new();
+    let mut local_dependencies = HashMap::new();
     for project in projects.iter() {
         let Some(config) = &project.cargo.workspace else {
             continue;
@@ -82,34 +55,7 @@ pub(super) fn prepare(
             }
         }
 
-        // No dependency resolution, downloads, or lockfile updates during discovery.
-        // Cargo includes globbed, implicit path, and package.workspace members.
-        let output = Command::new("cargo")
-            .args([
-                "metadata",
-                "--no-deps",
-                "--offline",
-                "--locked",
-                "--format-version",
-                "1",
-            ])
-            .current_dir(&project.root)
-            .output()
-            .with_context(|| format!("Discover Cargo workspace ownership for {address}"))?;
-        if !output.status.success() {
-            bail!(
-                "Cargo workspace metadata failed for {address}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let metadata: Metadata = serde_json::from_slice(&output.stdout)
-            .with_context(|| format!("Read Cargo workspace metadata for {address}"))?;
-        if metadata.workspace_root.canonicalize()? != project.root.canonicalize()? {
-            bail!(
-                "{address}: [cargo.workspace] must be declared at the Cargo workspace root {}",
-                metadata.workspace_root.display()
-            );
-        }
+        let cargo_root = project.root.canonicalize()?;
         let relative = |path: &Path| -> Result<PathBuf> {
             let canonical = path.canonicalize()?;
             canonical
@@ -122,50 +68,64 @@ pub(super) fn prepare(
                     )
                 })
         };
-        let ids: HashSet<_> = metadata.workspace_members.iter().collect();
+        let workspace = &manifest["workspace"];
+        let paths = |key: &str| -> BTreeSet<PathBuf> {
+            workspace
+                .get(key)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .flat_map(|pattern| expand_member_pattern(&cargo_root, pattern))
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect()
+        };
+        // Exclusions are directory prefixes, not member glob expressions.
+        let excluded: Vec<_> = workspace
+            .get("exclude")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(|path| normalize(&cargo_root.join(path)))
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .collect();
+        let is_excluded = |path: &Path| excluded.iter().any(|root| path.starts_with(root));
+        let mut pending = paths("members");
+        pending.retain(|path| !is_excluded(path));
+        if manifest.get("package").is_some() {
+            pending.insert(cargo_root.clone());
+        }
+        let mut visited = HashSet::new();
         let mut members = Vec::new();
         let mut source_files = Vec::new();
-        for package in &metadata.packages {
-            if !ids.contains(&package.id) {
+        while let Some(package_root) = pending.pop_first() {
+            if !visited.insert(package_root.clone()) {
                 continue;
             }
-            let member = relative(
-                package
-                    .manifest_path
-                    .parent()
-                    .context("Cargo manifest has no parent")?,
-            )?;
+            let member = relative(&package_root)?;
             let Some(discovered) = projects
                 .iter()
                 .find(|p| p.relative_path == member && p.plugin_name == "rust")
             else {
                 bail!("{address}: Cargo member //{} was not discovered; include every owned member in the Aster checkout and discovery configuration", member.display());
             };
-            let package_root = discovered.root.canonicalize()?;
-            cargo_dependencies.insert(
-                member.clone(),
-                package
-                    .dependencies
-                    .iter()
-                    .filter_map(|dependency| {
-                        let path = dependency.path.as_ref()?;
-                        // Cargo permits a renamed self dev-dependency (often
-                        // to enable test-only features). It is not an edge to
-                        // another Aster project and must not form a self cycle.
-                        if path.canonicalize().is_ok_and(|path| path == package_root) {
-                            return None;
-                        }
-                        Some(LocalDependency {
-                            name: dependency
-                                .rename
-                                .as_ref()
-                                .unwrap_or(&dependency.name)
-                                .clone(),
-                            path: path.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let package: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&discovered.config_path)?)?;
+            if package.get("package").is_none() {
+                bail!(
+                    "{address}: Cargo member //{} has no [package]",
+                    member.display()
+                );
+            }
+            let member_workspace =
+                find_workspace_root(&package_root).and_then(|(root, _)| root.canonicalize().ok());
+            if member_workspace.as_ref() != Some(&cargo_root) {
+                bail!(
+                    "{address}: Cargo member //{} belongs to a different workspace",
+                    member.display()
+                );
+            }
             if discovered.root != project.root {
                 for name in &config.targets {
                     if discovered.custom_targets.contains_key(name) {
@@ -173,27 +133,60 @@ pub(super) fn prepare(
                     }
                 }
             }
-            for target in &package.targets {
-                source_files.push(relative(&target.src_path)?);
+            // Reuse the related-test manifest reader for the richer local graph
+            // of configured owners, without changing unconfigured projects.
+            let mut dependencies = path_dependencies(
+                &package,
+                &discovered.root,
+                &project.root,
+                workspace.get("dependencies"),
+            );
+            dependencies.retain(|dependency| {
+                !dependency
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|path| path == package_root)
+            });
+            // Excluded/independent packages keep their graph edges, but do not
+            // acquire forwarding targets from this owner.
+            for dependency in &dependencies {
+                if dependency.path.to_string_lossy().starts_with("//") {
+                    continue;
+                }
+                let path = discovered.root.join(&dependency.path);
+                let path = path.canonicalize().with_context(|| {
+                    format!(
+                        "Read local dependency {} of //{}",
+                        path.display(),
+                        member.display()
+                    )
+                })?;
+                if is_excluded(&path) {
+                    continue;
+                }
+                if find_workspace_root(&path)
+                    .and_then(|(root, _)| root.canonicalize().ok())
+                    .as_ref()
+                    == Some(&cargo_root)
+                {
+                    pending.insert(path);
+                }
             }
+            for (_, source) in target_roots(&package, &package_root) {
+                source_files.push(relative(&package_root.join(source))?);
+            }
+            local_dependencies.insert(member.clone(), dependencies);
             members.push(member);
         }
         members.sort();
         members.dedup();
         source_files.sort();
         source_files.dedup();
-        // The output directory may not exist yet. Metadata returns an absolute path.
-        let target_directory = metadata
-            .target_directory
-            .strip_prefix(&metadata.workspace_root)
-            .map(|path| project.relative_path.join(path))
-            .or_else(|_| {
-                metadata
-                    .target_directory
-                    .strip_prefix(&canonical_workspace)
-                    .map(Path::to_path_buf)
-            })
-            .unwrap_or(metadata.target_directory);
+        let output = target_directory(&cargo_root)?;
+        let target_directory = output
+            .strip_prefix(&canonical_workspace)
+            .map(Path::to_path_buf)
+            .unwrap_or(output);
         owners.push(Owner {
             root: project.relative_path.clone(),
             members,
@@ -203,17 +196,57 @@ pub(super) fn prepare(
         });
     }
     for project in projects.iter_mut() {
-        if let Some(native) = cargo_dependencies.remove(&project.relative_path) {
-            // Metadata also resolves workspace-inherited and target-specific
-            // path dependencies. Preserve that source graph for affected/cache
-            // selection even though Cargo owns the compilation ordering.
+        if let Some(dependencies) = local_dependencies.remove(&project.relative_path) {
             project
                 .dependencies
                 .retain(|dependency| dependency.path.to_string_lossy().starts_with("//"));
-            project.dependencies.extend(native);
+            project.dependencies.extend(dependencies);
         }
     }
     Ok(owners)
+}
+
+/// Read only the output location needed to exclude build artifacts from inputs.
+/// Cargo still interprets the build configuration when an operation executes.
+fn target_directory(root: &Path) -> Result<PathBuf> {
+    if let Some(path) =
+        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+    {
+        return Ok(normalize(&root.join(path)));
+    }
+    let mut configs: Vec<_> = root
+        .ancestors()
+        .map(|dir| (dir.join(".cargo"), dir.to_path_buf()))
+        .collect();
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        .map(|home| normalize(&root.join(home)))
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
+    {
+        // Cargo resolves config-relative paths from the parent of .cargo.
+        let base = home.parent().unwrap_or(&home).to_path_buf();
+        configs.push((home, base));
+    }
+    for (dir, base) in configs {
+        let legacy = dir.join("config");
+        let config = if legacy.is_file() {
+            legacy
+        } else {
+            dir.join("config.toml")
+        };
+        if !config.is_file() {
+            continue;
+        }
+        let value: toml::Value = toml::from_str(&std::fs::read_to_string(&config)?)
+            .with_context(|| format!("Read Cargo output directory from {}", config.display()))?;
+        if let Some(path) = value
+            .get("build")
+            .and_then(|build| build.get("target-dir"))
+            .and_then(toml::Value::as_str)
+        {
+            return Ok(normalize(&base.join(path)));
+        }
+    }
+    Ok(root.join("target"))
 }
 
 pub(super) fn remove_inferred_builds(

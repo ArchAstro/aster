@@ -388,18 +388,25 @@ for a distinct build variant. Unlisted targets, including package tests, retain
 their commands. Existing `alias` targets still copy commands rather than share
 execution ownership.
 
-Membership comes from `cargo metadata --no-deps --offline --locked`, once per
-configured root during discovery. It includes Cargo's globbed and implicit path
-members. Cargo must be available, and all owned members must be present and
-discoverable. Discovery does not fetch packages or update lockfiles. Aster removes
-inferred build prerequisites between members of an owned workspace because
-Cargo compiles those dependencies itself; explicitly configured prerequisites
-remain in place.
+Discovery reads local manifests through Aster's existing Rust dependency tracking;
+`list`, `graph`, `check`, affected planning, and independent non-Rust targets do
+not require Cargo. Workspace member globs, exclusions, local path dependencies
+(including inherited, renamed, and target-specific paths), and explicit
+`package.workspace` locations determine ownership. All owned members must be
+present and discoverable. Aster does not resolve registry packages, evaluate
+features or target conditions, fetch dependencies, or update lockfiles during
+discovery. Cargo handles package resolution and compilation when a Rust command
+runs; a non-Rust target with a Rust prerequisite still requires that command.
+Aster removes inferred build prerequisites between members of an owned workspace
+because Cargo compiles those dependencies itself; explicit prerequisites remain.
 
 The owner's cache and affected-file scope includes member manifests and authored
 files, including embedded assets and custom Cargo target sources. Member walks
 respect ignore files and exclude nested projects and Cargo's output directory;
-the `deps` target only adds member manifests. Existing explicit cache inputs,
+the `deps` target only adds member manifests. Output exclusion recognizes the
+default `target/`, `CARGO_TARGET_DIR` / `CARGO_BUILD_TARGET_DIR`, and the applicable
+Cargo config's `build.target-dir`. Command-specific output overrides must also be
+excluded with ignore rules or the target's `cache.exclude`. Existing explicit cache inputs,
 environment/runtime settings and outputs remain supported. Build scripts that
 read files outside member directories must declare those files with `cache.include`
 or `cache.workspace_include`. Commands are used as written: ownership does not

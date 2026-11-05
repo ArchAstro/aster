@@ -4,11 +4,13 @@
 //! affected-file selection, cold/warm cache, changed unselected member inputs,
 //! newly discovered members, aliases, and a compiler failure. Virtual and
 //! package roots, nested workspaces, excluded crates, external source paths,
-//! and personal ignore rules exercise input ownership. Package tests and build
+//! custom output directories, and personal ignore rules exercise input ownership.
+//! General discovery/planning and independent non-Rust work run with Cargo absent
+//! or guarded; mixed-language prerequisites succeed/fail at real Rust execution. Package tests and build
 //! variants remain separate. Dependency-only targets also exercise prerequisite
 //! failure, sparse missing prerequisites, and incompatible execution flags.
-//! Fidelity: production Aster discovery/scheduler/cache, Cargo metadata and
-//! compiler, and Git. Shell wrappers only record which real Cargo gates ran.
+//! Fidelity: production Aster discovery/scheduler/cache, Cargo compiler, and Git.
+//! Cargo-free discovery uses an absent tool and an invocation-recording guard. Shell wrappers only record which real Cargo gates ran.
 //! Automatic coverage: CI pull requests/main pushes run the existing integration
 //! test binary on Linux and macOS. These Unix fixtures do not cover Windows.
 #![cfg(unix)]
@@ -40,6 +42,7 @@ fn aster(repo: &TempDir, runtime: &TempDir, args: &[&str]) -> Output {
         .env_remove("ASTER_REMOTE_CACHE")
         .env("ASTER_CACHE_MODE", "off")
         .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
         .args(args)
         .output()
         .unwrap()
@@ -68,6 +71,7 @@ fn cargo_lockfile(repo: &TempDir) {
         Command::new("cargo")
             .current_dir(repo.path())
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
             .args(["generate-lockfile", "--offline"])
             .output()
             .unwrap(),
@@ -86,11 +90,248 @@ fn git(repo: &TempDir, args: &[&str]) {
 }
 
 #[test]
+fn configured_cargo_workspace_discovery_works_without_cargo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    // The configured Rust owner is present even when the selected work is web-only.
+    // An inherited, target-specific dependency also contributes an implicit member.
+    write_file(&repo, "Cargo.toml", "[workspace]\nmembers = [\"crates/a*\"]\n[workspace.dependencies]\nshared = { package = \"basis\", path = \"crates/basis\" }\n");
+    write_file(&repo, "aster.toml", "[cargo.workspace]\ntargets = [\"build\"]\n[targets.build]\ncommand = \"cargo build --workspace --offline\"\n");
+    write_file(&repo, "crates/app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[target.'cfg(unix)'.dependencies]\nshared.workspace = true\n");
+    write_file(
+        &repo,
+        "crates/basis/Cargo.toml",
+        "[package]\nname = \"basis\"\nversion = \"0.1.0\"\n",
+    );
+    for member in ["app", "basis"] {
+        write_file(
+            &repo,
+            &format!("crates/{member}/src/lib.rs"),
+            "pub fn value() {}\n",
+        );
+    }
+    write_package_json(&repo, "web/package.json", r#"{"name":"web"}"#);
+    write_file(&repo, "web/aster.toml", "[targets.verify]\ncommand = \"/bin/echo web-ok\"\ncache = { runtime = [] }\n[targets.bundle]\ncommand = \"/bin/echo bundle-ok\"\ndepends_on = [\"//crates/app:build\"]\ncache = { runtime = [] }\n");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "mixed workspace",
+        ],
+    );
+    // A nested Git checkout is still a member of its declared Cargo workspace.
+    fs::create_dir(repo.path().join("crates/app/.git")).unwrap();
+    let manifests: Vec<_> = [
+        "Cargo.toml",
+        "crates/app/Cargo.toml",
+        "crates/basis/Cargo.toml",
+    ]
+    .into_iter()
+    .map(|path| (path, fs::read(repo.path().join(path)).unwrap()))
+    .collect();
+    let bin = runtime.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    // Keep Git available for affected planning, but omit Cargo and rustup.
+    let git_binary = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(git_binary, bin.join("git")).unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(repo.path())
+            .env("PATH", &bin)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("ASTER_EXECUTION_DIR", runtime.path().join("host"))
+            .env("ASTER_CACHE_DIR", runtime.path().join("cache"))
+            .env_remove("ASTER_EXECUTION_CONTEXT")
+            .env_remove("ASTER_REMOTE_CACHE")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // Cross the public CLI/process boundary with no Cargo (or rustup shim) on PATH.
+    let listing = successful(invoke(&["--json", "list"]));
+    let projects: Value = serde_json::from_slice(&listing.stdout).unwrap();
+    for address in ["//", "//crates/app", "//crates/basis", "//web"] {
+        assert!(
+            projects
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["address"] == address),
+            "missing {address}: {projects}"
+        );
+    }
+    let graph_output = successful(invoke(&["--json", "graph"]));
+    let graph: Value = serde_json::from_slice(&graph_output.stdout).unwrap();
+    let available = successful(aster(&repo, &runtime, &["--json", "graph"]));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&available.stdout).unwrap(),
+        graph
+    );
+    for member in ["app", "basis"] {
+        assert_eq!(
+            graph["edges"][format!("//crates/{member}:build")],
+            serde_json::json!(["//:build"])
+        );
+    }
+    assert!(graph["edges"]["//web:bundle"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("//crates/app:build")));
+    successful(invoke(&["check"]));
+    let web = successful(invoke(&["run", "//web:verify", "--json"]));
+    let web: Value = serde_json::from_slice(&web.stdout).unwrap();
+    assert_eq!(web["results"][0]["address"], "//web:verify");
+    assert_eq!(web["results"][0]["output"], "web-ok\n");
+
+    // Planning still selects the workspace owner after an implicit member changes.
+    write_file(&repo, "crates/basis/src/lib.rs", "pub fn changed() {}\n");
+    let plan = successful(invoke(&[
+        "affected",
+        "build",
+        "--base=HEAD",
+        "--dry-run",
+        "--json",
+    ]));
+    assert!(String::from_utf8_lossy(&plan.stdout).contains("//:build"));
+
+    // An installed but unusable Cargo must not be probed or have its failure swallowed.
+    let guard = bin.join("cargo");
+    fs::write(
+        &guard,
+        format!(
+            "#!/bin/sh\nprintf invoked >> '{}'\nexit 97\n",
+            runtime.path().join("cargo-calls").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755)).unwrap();
+    let guarded_graph = successful(invoke(&["--json", "graph"]));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&guarded_graph.stdout).unwrap(),
+        graph
+    );
+    successful(invoke(&["check"]));
+    successful(invoke(&["list"]));
+    successful(invoke(&[
+        "affected",
+        "build",
+        "--base=HEAD",
+        "--dry-run",
+        "--json",
+    ]));
+    successful(invoke(&["run", "//web:verify", "--json"]));
+    assert!(!runtime.path().join("cargo-calls").exists());
+    for (path, original) in manifests {
+        assert_eq!(
+            fs::read(repo.path().join(path)).unwrap(),
+            original,
+            "discovery changed {path}"
+        );
+    }
+    assert!(!repo.path().join("Cargo.lock").exists());
+
+    // Real Rust prerequisites retain their execution boundary and report a missing tool.
+    fs::remove_file(guard).unwrap();
+    for target in ["//:build", "//web:bundle"] {
+        let output = invoke(&["run", target]);
+        assert!(!output.status.success(), "Rust work unexpectedly succeeded");
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostic.contains("cargo"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("Discover Cargo workspace ownership"),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn cargo_workspace_membership_respects_excluded_directories_and_nested_checkouts() {
+    // Cargo's member globs and exclusion directory prefixes are different rules.
+    // Confirm the fixture with real Cargo, then inspect production Aster forwarding.
+    for (exclude, owns_basis) in [
+        ("vendor", false),
+        ("vendor/basis", false),
+        ("vendor/*", true),
+    ] {
+        let repo = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        setup_workspace(&repo);
+        write_file(
+            &repo,
+            "Cargo.toml",
+            &format!("[workspace]\nmembers = [\"app\"]\nexclude = [\"{exclude}\"]\n"),
+        );
+        write_file(&repo, "aster.toml", "[cargo.workspace]\ntargets = [\"build\"]\n[targets.build]\ncommand = \"cargo build --workspace --offline\"\n");
+        write_file(&repo, "app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nbasis = { path = \"../vendor/basis\" }\n");
+        write_file(&repo, "app/src/lib.rs", "pub fn app() {}\n");
+        write_file(
+            &repo,
+            "vendor/basis/Cargo.toml",
+            "[package]\nname = \"basis\"\nversion = \"0.1.0\"\n",
+        );
+        write_file(&repo, "vendor/basis/src/lib.rs", "pub fn basis() {}\n");
+        fs::create_dir(repo.path().join("app/.git")).unwrap();
+        let metadata = successful(
+            Command::new("cargo")
+                .current_dir(repo.path())
+                .args([
+                    "metadata",
+                    "--no-deps",
+                    "--offline",
+                    "--format-version",
+                    "1",
+                ])
+                .output()
+                .unwrap(),
+        );
+        let metadata: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        assert_eq!(
+            metadata["workspace_members"].as_array().unwrap().len(),
+            if owns_basis { 2 } else { 1 }
+        );
+        let graph = successful(aster(&repo, &runtime, &["graph", "--json"]));
+        let graph: Value = serde_json::from_slice(&graph.stdout).unwrap();
+        assert_eq!(
+            graph["edges"]["//app:build"],
+            serde_json::json!(["//:build"])
+        );
+        let basis = &graph["edges"]["//vendor/basis:build"];
+        assert_eq!(
+            basis
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("//:build")),
+            owns_basis,
+            "wrong ownership with exclude={exclude}: {graph}"
+        );
+    }
+}
+
+#[test]
 fn cargo_workspace_members_share_gates_and_invalidate_unselected_inputs() {
     let repo = TempDir::new().unwrap();
     let runtime = TempDir::new().unwrap();
 
-    // Cargo owns membership: app matches the glob, basis joins implicitly as
+    // Local manifests define membership: app matches the glob, basis joins as
     // its path dependency. The virtual root has no package to build itself.
     write_file(
         &repo,
@@ -155,6 +396,19 @@ command = "sh -c 'echo release >> \"$WORKSPACE_GATE_LOG\"; cargo build -p app --
 alias = "build"
 "#,
     );
+    // Put real Cargo artifacts inside a member: exclusion must keep them out
+    // of the owner's input hash even without an ignore rule for this directory.
+    write_file(
+        &repo,
+        ".cargo/config.toml",
+        "[build]\ntarget-dir = \"crates/app/output\"\n",
+    );
+    write_package_json(&repo, "web/package.json", r#"{"name":"web"}"#);
+    write_file(
+        &repo,
+        "web/aster.toml",
+        "[targets.bundle]\ncommand = \"/bin/echo bundled\"\ndepends_on = [\"//crates/app:build\"]\n",
+    );
     cargo_lockfile(&repo);
     git(&repo, &["init", "-q"]);
     git(&repo, &["add", "."]);
@@ -171,6 +425,19 @@ alias = "build"
         ],
     );
 
+    // A non-Rust entry point must wait for its real Rust prerequisite.
+    let bundle = successful(aster(&repo, &runtime, &["run", "//web:bundle", "--json"]));
+    let bundle: Value = serde_json::from_slice(&bundle.stdout).unwrap();
+    assert!(bundle["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| result["address"] == "//web:bundle" && result["output"] == "bundled\n"));
+    assert!(repo
+        .path()
+        .join("crates/app/output/debug/libapp.rlib")
+        .is_file());
+
     // Root and both member addresses cross the real scheduler/Cargo boundary.
     // Each workspace gate must run exactly once despite the overlapping entry points.
     for target in ["build", "lint"] {
@@ -183,7 +450,10 @@ alias = "build"
     for gate in ["deps", "build", "lint"] {
         assert_eq!(gate_count(&runtime, gate), 1, "duplicate {gate} gate");
     }
-    assert!(repo.path().join("target/debug/libapp.rlib").is_file());
+    assert!(repo
+        .path()
+        .join("crates/app/output/debug/libapp.rlib")
+        .is_file());
 
     // A second invocation must reuse the owner's result; member entry points
     // must not invent separately cached successes or launch another Cargo command.
@@ -256,7 +526,7 @@ alias = "build"
     assert_eq!(gate_count(&runtime, "build"), 4);
     assert!(repo
         .path()
-        .join("target/debug/libadditional.rlib")
+        .join("crates/app/output/debug/libadditional.rlib")
         .is_file());
     assert!(!repo.path().join("crates/additional/aster.toml").exists());
 
@@ -337,7 +607,17 @@ fn nested_cargo_workspace_hashes_external_modules_without_claiming_excluded_crat
     write_file(&repo, ".gitignore", "target/\n.aster/\n");
     // This nested workspace has a root package. Its member's lib and sibling
     // module/assets live outside both the package and Cargo workspace directories.
-    write_file(&repo, "rust/Cargo.toml", "[package]\nname = \"root_package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\nmembers = [\"members/app\"]\nexclude = [\"excluded\"]\nresolver = \"2\"\n");
+    write_file(&repo, "rust/Cargo.toml", "[package]\nname = \"root_package\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\nmembers = [\"members/app\", \"../external\"]\nexclude = [\"excluded\"]\nresolver = \"2\"\n");
+    write_file(
+        &repo,
+        "external/Cargo.toml",
+        "[package]\nname = \"external_member\"\nversion = \"0.1.0\"\nworkspace = \"../rust\"\n",
+    );
+    write_file(
+        &repo,
+        "external/src/lib.rs",
+        "pub fn external_member() {}\n",
+    );
     write_file(&repo, "rust/src/lib.rs", "pub fn root_package() {}\n");
     write_file(&repo, "rust/members/app/Cargo.toml", "[package]\nname = \"external_source\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"../../../shared/lib.rs\"\n");
     write_file(
@@ -386,7 +666,7 @@ command = "sh -c 'echo excluded >> \"$WORKSPACE_GATE_LOG\"; cargo build --offlin
     successful(aster(
         &repo,
         &runtime,
-        &["build", "//rust", "//rust/members/app"],
+        &["build", "//rust", "//rust/members/app", "//external"],
     ));
     assert_eq!(gate_count(&runtime, "nested"), 1);
     assert!(repo
@@ -425,7 +705,7 @@ command = "sh -c 'echo excluded >> \"$WORKSPACE_GATE_LOG\"; cargo build --offlin
         ],
     );
 
-    // Cargo metadata names lib.rs; changing its sibling mod alone must select
+    // The manifest names lib.rs; changing its sibling mod alone must select
     // and invalidate the owner through the affected entry point.
     write_file(
         &repo,
