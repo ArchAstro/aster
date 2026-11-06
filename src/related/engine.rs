@@ -201,6 +201,9 @@ struct Source {
     uses: Vec<Vec<u32>>,
     /// Units whose users reach each definition (see `Def::via`).
     via: Vec<Vec<u32>>,
+    /// Units of the protocol a definition implements, when it is in the
+    /// workspace: its callers name it rather than the type.
+    protocol: Vec<Vec<u32>>,
     /// Qualified calls of each definition, resolved to units; the last
     /// entry is the top-level code.
     calls: Vec<Vec<(u32, String)>>,
@@ -299,7 +302,7 @@ struct Run<'a, 'b> {
     ix: &'b Index<'a>,
     affected: HashMap<DefId, Why>,
     queue: VecDeque<DefId>,
-    symbols_seen: HashSet<(DefId, u32, String, Option<String>)>,
+    symbols_seen: HashSet<(u32, DefId, u32, String, Option<String>)>,
     users_seen: HashSet<(u32, bool)>,
     stop_at_test: bool,
     hit_test: bool,
@@ -973,6 +976,17 @@ impl<'a> Index<'a> {
                         .collect()
                 })
                 .collect();
+            let protocol: Vec<Vec<u32>> = file
+                .defs
+                .iter()
+                .map(|def| {
+                    def.protocol
+                        .iter()
+                        .flat_map(|spec| resolve(path, family, spec))
+                        .filter(|unit| *unit != file_unit[i])
+                        .collect()
+                })
+                .collect();
             // A Go qualifier is one of the file's packages; any other
             // operand is a value, and the name a member of it.
             let package = |module: &str| -> Option<Option<u32>> {
@@ -1174,7 +1188,7 @@ impl<'a> Index<'a> {
                 .flat_map(|spec| resolve(path, family, spec))
                 .collect();
             let linked = (calls, loose, opaque, preloaded, late, implicit, brought);
-            sources.push((uses, via, linked, imports, file_unit[i]));
+            sources.push((uses, (via, protocol), linked, imports, file_unit[i]));
         }
 
         let mut facts = facts;
@@ -1186,7 +1200,7 @@ impl<'a> Index<'a> {
                     path,
                     (
                         uses,
-                        via,
+                        (via, protocol),
                         (calls, loose, opaque, preloaded, late, implicit, brought),
                         imports,
                         unit,
@@ -1210,6 +1224,7 @@ impl<'a> Index<'a> {
                         unit,
                         uses,
                         via,
+                        protocol,
                         calls,
                         imports,
                         loose,
@@ -3261,7 +3276,17 @@ impl<'a, 'b> Run<'a, 'b> {
             let edited = matches!(self.affected.get(&id), Some(Why::Changed(_)));
             let dead = source.facts.unnamed_is_dead && !edited;
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id) && !dead;
-            if def.callback || def.kind == DefKind::Macro || unnamed {
+            // A function of an implementation is reached by calls to the
+            // protocol's function of that name, not by every user of the
+            // type it is for. Where nothing calls the protocol that way, or
+            // the protocol is not in the workspace, it keeps the wider rule.
+            let mut dispatched = false;
+            if def.callback {
+                for unit in &source.protocol[id.1 as usize] {
+                    dispatched |= self.symbol(*unit, &def.name, None, id, id.0);
+                }
+            }
+            if !dispatched && (def.callback || def.kind == DefKind::Macro || unnamed) {
                 match def.accepts.as_deref().filter(|_| def.callback) {
                     // A message clause is reached by what can send its message.
                     Some(tag) => self.senders(source.unit, id, Some(tag)),
@@ -3287,7 +3312,7 @@ impl<'a, 'b> Run<'a, 'b> {
             // Users of a type or trait reach its implementation without
             // naming it. With static types that takes a call nothing
             // names; a named call is matched as one.
-            if !source.facts.static_types || def.callback {
+            if !dispatched && (!source.facts.static_types || def.callback) {
                 for unit in &source.via[id.1 as usize] {
                     self.users(*unit, id);
                 }
@@ -3432,6 +3457,7 @@ impl<'a, 'b> Run<'a, 'b> {
     ) -> bool {
         let owner = member.flatten();
         let key = (
+            unit,
             from,
             file,
             format!("{name}{}", if member.is_some() { "()" } else { "" }),

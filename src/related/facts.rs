@@ -90,6 +90,10 @@ pub struct Def {
     /// Specifiers of files whose users reach this definition without naming
     /// its own file: the protocol and type of an Elixir `defimpl`.
     pub via: Vec<String>,
+    /// The protocol an Elixir `defimpl` implements, for a public function of
+    /// it. Calls to the protocol's function of the same name reach it; the
+    /// type's users do not, unless the protocol is not in the workspace.
+    pub protocol: Option<String>,
     /// The URL path pattern this definition serves, when it is a route
     /// declaration (`/orgs/:org/members`). Requests reach it by path, not
     /// by name.
@@ -186,6 +190,7 @@ impl Def {
             loaded: BTreeSet::new(),
             callback: false,
             via: Vec::new(),
+            protocol: None,
             route: None,
             paths: Vec::new(),
             reflects: None,

@@ -254,6 +254,104 @@ fn framework_callback_change_selects_users_of_the_module() {
     );
 }
 
+/// A protocol with an implementation beside the struct it is for, a module
+/// that only builds the struct, one that prices it through the protocol, one
+/// that calls the implementation by its module name, and an implementation of
+/// a protocol from outside the workspace.
+const PROTOCOL: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/price.ex",
+        "defprotocol Shop.Price do\n  def cost(item)\nend\n",
+    ),
+    (
+        "shop/lib/shop/item.ex",
+        "defmodule Shop.Item do\n  defstruct [:name]\nend\n\ndefimpl Shop.Price, for: Shop.Item do\n  def cost(item), do: base(item) + 1\n\n  defp base(item), do: String.length(item.name)\nend\n",
+    ),
+    (
+        "shop/lib/shop/item_text.ex",
+        "defimpl String.Chars, for: Shop.Item do\n  def to_string(item), do: item.name\nend\n",
+    ),
+    (
+        "shop/lib/shop/catalog.ex",
+        "defmodule Shop.Catalog do\n  alias Shop.Item\n\n  def make(name), do: %Item{name: name}\nend\n",
+    ),
+    (
+        "shop/lib/shop/checkout.ex",
+        "defmodule Shop.Checkout do\n  alias Shop.Price\n\n  def total(item), do: Price.cost(item)\nend\n",
+    ),
+    (
+        "shop/lib/shop/direct.ex",
+        "defmodule Shop.Direct do\n  alias Shop.Price.Shop.Item, as: ItemPrice\n\n  def total(item), do: ItemPrice.cost(item)\nend\n",
+    ),
+    (
+        "shop/test/shop/catalog_test.exs",
+        "defmodule Shop.CatalogTest do\n  use ExUnit.Case\n\n  test \"make\" do\n    assert Shop.Catalog.make(\"a\").name == \"a\"\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/checkout_test.exs",
+        "defmodule Shop.CheckoutTest do\n  use ExUnit.Case\n\n  test \"total\" do\n    assert Shop.Checkout.total(%Shop.Item{name: \"a\"}) == 2\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/direct_test.exs",
+        "defmodule Shop.DirectTest do\n  use ExUnit.Case\n\n  test \"total\" do\n    assert Shop.Direct.total(%Shop.Item{name: \"a\"}) == 2\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_protocol_implementation_runs_for_what_calls_the_protocol_not_for_what_mentions_the_type() {
+    // Phase 1: the public function. Callers of `Price.cost` and of the
+    // implementation module run. The test that only builds an `%Item{}`
+    // does not: it never prices one.
+    let ws = Workspace::new(PROTOCOL);
+    ws.edit("shop/lib/shop/item.ex", "base(item) + 1", "base(item) + 2");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/checkout_test.exs test/shop/direct_test.exs"]
+    );
+
+    // Phase 2: a private helper of the implementation is reached through the
+    // function that calls it, and is no callback of its own.
+    let ws = Workspace::new(PROTOCOL);
+    ws.edit("shop/lib/shop/item.ex", "String.length(item.name)", "1");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/checkout_test.exs test/shop/direct_test.exs"]
+    );
+
+    // Phase 3: a protocol from outside the workspace has no caller to name,
+    // so every user of the type may reach its implementation.
+    let ws = Workspace::new(PROTOCOL);
+    ws.edit(
+        "shop/lib/shop/item_text.ex",
+        "item.name",
+        "item.name <> \"!\"",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/catalog_test.exs test/shop/checkout_test.exs test/shop/direct_test.exs"]
+    );
+
+    // Phase 4: a protocol function nothing calls keeps the wider rule.
+    let mut files = PROTOCOL.to_vec();
+    files[4].1 = "defmodule Shop.Catalog do\n  alias Shop.Item\n\n  def make(name), do: %Item{name: name}\nend\n";
+    files[5].1 = "defmodule Shop.Checkout do\n  def total(item), do: item\nend\n";
+    files[6].1 = "defmodule Shop.Direct do\n  def total(item), do: item\nend\n";
+    let ws = Workspace::new(&files);
+    ws.edit("shop/lib/shop/item.ex", "base(item) + 1", "base(item) + 2");
+    let plan = ws.plan("test");
+    assert!(
+        plan.commands("//shop:test")[0].contains("test/shop/catalog_test.exs"),
+        "{plan:#?}"
+    );
+}
+
 /// A GenServer with one clause per message. Each message has a wrapper
 /// that sends it and a test that calls the wrapper; a third test sends a
 /// message it builds at run time.
