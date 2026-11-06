@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! The read API (`GET /v1/test-results/...`) against a real Postgres.
 
 mod common;

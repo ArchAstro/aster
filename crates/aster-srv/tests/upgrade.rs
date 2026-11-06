@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! Upgrading a database that already holds data from an earlier release.
 
 use chrono::{DateTime, Utc};

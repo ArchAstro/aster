@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! N5: a lookup's GCS and IAM work is bounded.
 //!
 //! Real Postgres and the real routes, an in-memory GCS with injected HEAD

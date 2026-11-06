@@ -121,6 +121,7 @@ fn emit(severity: &str, message: &str, fields: Value) {
     let line = line.to_string();
     match CAPTURE.lock().unwrap().as_mut() {
         Some(lines) => lines.push(line),
+        #[allow(clippy::disallowed_macros)] // server log lines are its stdout protocol
         None => println!("{line}"),
     }
 }

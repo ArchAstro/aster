@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! Shared by the classifier and query tests: a server on a fresh database,
 //! tokens, and a way to put runs into the database at chosen times.
 //!
