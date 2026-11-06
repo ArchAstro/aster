@@ -36,7 +36,7 @@ labelled with the name the model gives it:
 | `route-fallback` | every user of the router unit, when no literal does |
 | reflection | definitions that list modules at run time reach every non-test change |
 
-`Rules` holds pull requests as switches. `callbackClauses` (#347), `deadSilent`
+`Rules` holds pull requests as switches. `sendSites` (on in `mainRules`) says that naming a unit in a struct, like naming it in a child specification, does not make a definition a sender of its messages. `callbackClauses` (#347), `deadSilent`
 and `processStarters` (#353) are on in `mainRules`, and `fullFallback`, the
 "reaches no test, run in full" check #354 removed, is off. `schemaTop` (#348)
 and `routeNothing` (#349) are open and off. Each switch is a small guard in
@@ -87,7 +87,7 @@ package is at 0.1.0 and the crate is not on crates.io yet.
 
 ## Not modelled
 
-Go, JavaScript, Python and Rust paths; several projects and the declared
+Go, JavaScript, Python and Rust paths; handing a module to a function (the engine's `hands_over`); several projects and the declared
 project graph; `defimpl` and its `via` rule; deleted and renamed definitions;
 import-line edits; `alias`; data files and file-path literals; runner
 configuration; the facts cache; `describe` and test names.

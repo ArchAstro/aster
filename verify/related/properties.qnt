@@ -30,6 +30,7 @@ module properties {
     mainRules.with("routeNothing", true),
     mainRules.with("schemaTop", true).with("routeNothing", true),
     mainRules.with("fullFallback", true),
+    mainRules.with("sendSites", false),
     mainRules.with("callbackClauses", false).with("deadSilent", false).with("processStarters", false))
 
   var repo: Repo

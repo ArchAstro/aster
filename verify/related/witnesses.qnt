@@ -18,6 +18,7 @@ module witnesses {
   pure val before347: Rules = mainRules.with("callbackClauses", false)
   pure val before353: Rules = mainRules.with("deadSilent", false).with("processStarters", false)
   pure val before354: Rules = mainRules.with("fullFallback", true)
+  pure val beforeSendSites: Rules = mainRules.with("sendSites", false)
 
   // D1 (fixed by #354). A superset of edits selects a superset of tests. With the
   // "reaches no test, run in full" check, the larger change selected fewer.
@@ -92,9 +93,12 @@ module witnesses {
   run messageClauseWitness = init.then(all {
     val quietWorkers = workers.with("sendsAny", Set())
     all {
-      assert(selectTests(workers, before347, editing(Set(31))).tests == Set(102, 111, 112)),
+      assert(selectTests(workers, before347, editing(Set(31))).tests == Set(102, 111, 112, 113)),
       assert(selectTests(workers, mainRules, editing(Set(31))).tests == Set(102, 112)),
       assert(selectTests(workers, mainRules, editing(Set(33))).tests == Set(112)),
+      // Sending sites: a test that only names the module (unit 113) was a possible sender.
+      assert(selectTests(workers, beforeSendSites, editing(Set(31))).tests == Set(102, 112, 113)),
+      assert(selectTests(workers, beforeSendSites, editing(Set(33))).tests == Set(112, 113)),
       assert(selectTests(quietWorkers, mainRules, editing(Set(33))) == nothing),
       assert(selectTests(quietWorkers, before354, editing(Set(33))).full),
       state' = state,

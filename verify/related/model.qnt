@@ -19,6 +19,8 @@
 //                    ArchAstro/aster#354 removed (merged: off)
 //   schemaTop        ArchAstro/aster#348 (open)
 //   routeNothing     ArchAstro/aster#349 (open)
+//   sendSites        naming a unit's module (a struct, a child specification) does not make a
+//                    definition a sender of its messages; handing it to a call does (on)
 module related {
   type Pair = { from: int, to: int }
   type Request = { id: int, path: List[int] }
@@ -65,7 +67,7 @@ module related {
   }
   type Rules = {
     callbackClauses: bool, deadSilent: bool, processStarters: bool, fullFallback: bool,
-    schemaTop: bool, routeNothing: bool,
+    schemaTop: bool, routeNothing: bool, sendSites: bool,
   }
   // `comments`: units whose standalone comment line is edited. `trailing`:
   // definitions whose trailing comment (`0 # note`) is edited and nothing else.
@@ -75,7 +77,7 @@ module related {
 
   pure val mainRules: Rules = {
     callbackClauses: true, deadSilent: true, processStarters: true, fullFallback: false,
-    schemaTop: false, routeNothing: false,
+    schemaTop: false, routeNothing: false, sendSites: true,
   }
   pure val noChanges: Changes = { edits: Set(), comments: Set(), trailing: Set() }
   pure val noSelection: Selection = { full: false, tests: Set() }
@@ -172,12 +174,16 @@ module related {
      or namesOtherwise(r, e, u))
 
   // `e` may send a message tagged `tag` (any message when `tag` is 0) to a process of unit `u`.
-  pure def maySend(r: Repo, e: int, u: int, tag: int): bool = {
+  // With `sendSites`, only a macro call or an import counts as naming the unit in a way that
+  // may send: a struct (like a child specification) names it without sending. Handing the
+  // module to a call, which the engine also counts, is not modelled.
+  pure def maySend(r: Repo, rules: Rules, e: int, u: int, tag: int): bool = {
     val sent = r.sends.filter(s => s.id == e)
     r.sendsAny.contains(e) or
     (if (tag == 0) sent.size() > 0 else sent.exists(s => s.tag == tag)) or
     ((tag == 0 or sent.size() == 0) and unit(r, e) != u and
-     (intoCalls(r, e, u).exists(c => kind(r, c.to) == "macro") or namesOtherwise(r, e, u)))
+     (intoCalls(r, e, u).exists(c => kind(r, c.to) == "macro") or
+      (if (rules.sendSites) importsUnit(r, e, u) else namesOtherwise(r, e, u))))
   }
 
   // Definitions that use unit `u`, as seen from `d`, and so are reached when `d` fans out.
@@ -196,10 +202,10 @@ module related {
     val tag = if (r.accepts.keys().contains(d)) r.accepts.get(d) else 0
     val name = r.nameOf.get(d)
     val candidates = usersOf(r, rules, u, d).union(defsOf(r, u)).exclude(Set(d))
-    if (rules.callbackClauses and tag > 0) candidates.filter(e => maySend(r, e, u, tag))
+    if (rules.callbackClauses and tag > 0) candidates.filter(e => maySend(r, rules, e, u, tag))
     else if (rules.processStarters and lifecycle.contains(name)) candidates.filter(e => mayStart(r, e, u))
     else if (rules.processStarters and messageCallbacks.contains(name))
-      candidates.filter(e => maySend(r, e, u, 0) or mayStart(r, e, u))
+      candidates.filter(e => maySend(r, rules, e, u, 0) or mayStart(r, e, u))
     else usersOf(r, rules, u, d)
   }
 

@@ -96,13 +96,15 @@ module repos {
     { id: 33, unit: 3, kind: "callback", name: "handle_cast" },
     { id: 1020, unit: 102, kind: "test", name: "t1020" },
     { id: 1110, unit: 111, kind: "test", name: "t1110" },
-    { id: 1120, unit: 112, kind: "test", name: "t1120" }
+    { id: 1120, unit: 112, kind: "test", name: "t1120" },
+    { id: 1130, unit: 113, kind: "test", name: "t1130" }
   )
 
   pure val workers: Repo =
     withDefs(emptyRepo, workerDefs)
-      .with("testUnits", Set(102, 111, 112))
+      .with("testUnits", Set(102, 111, 112, 113))
       .with("calls", Set({ from: 1020, to: 32 }, { from: 1110, to: 32 }, { from: 1120, to: 32 }))
+      .with("shapes", Set({ from: 1130, to: 3 }))
       .with("accepts", Map(31 -> 5, 33 -> 6))
       .with("sends", Set({ id: 1020, tag: 5 }))
       .with("sendsAny", Set(1120))

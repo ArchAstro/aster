@@ -36,6 +36,49 @@ const INERT_ATTRIBUTES: &[&str] = &[
 /// Modules whose `use` brings in no call to a function of the using module:
 /// a verification DSL, a schema DSL, generated protobuf code.
 const INERT_USES: &[&str] = &["ExVerify", "Ecto.Schema", "Protobuf", "Bitwise"];
+/// Calls that take a module without sending to it: they name modules, start
+/// processes or build child specifications.
+const HANDS_NOTHING: &[&str] = &[
+    "alias",
+    "require",
+    "import",
+    "use",
+    "defmodule",
+    "defimpl",
+    "defprotocol",
+    "start",
+    "start_link",
+    "start_child",
+    "start_supervised",
+    "start_supervised!",
+    "start_link_supervised!",
+    "child_spec",
+    "init",
+];
+/// Functions whose call delivers a message, by name.
+fn sends_a_message(function: &str) -> bool {
+    matches!(
+        function,
+        "call"
+            | "cast"
+            | "send"
+            | "send_request"
+            | "reply"
+            | "multi_call"
+            | "abcast"
+            | "send_after"
+            | "send_interval"
+            | "start_timer"
+            | "broadcast"
+            | "broadcast!"
+            | "broadcast_from"
+            | "broadcast_from!"
+            | "local_broadcast"
+            | "direct_broadcast"
+            | "dispatch"
+            | "push"
+    )
+}
 /// Callbacks the runtime invokes; nothing calls them by name.
 const CALLBACKS: &[&str] = &[
     "init",
@@ -426,6 +469,7 @@ impl Walker<'_> {
                     let receiver = text(left, self.source);
                     let receiver_module = self.expand(receiver);
                     self.send_site(scope.owner, Some(&receiver_module), &function, node);
+                    self.hand_over(scope.owner, &function, node);
                     if lists_modules(receiver, &function, node, self.source) {
                         self.facts.owner(scope.owner).reflects = Some("lists modules at run time");
                     }
@@ -621,6 +665,7 @@ impl Walker<'_> {
             _ => {}
         }
         self.send_site(scope.owner, None, name, node);
+        self.hand_over(scope.owner, name, node);
         self.facts.owner(scope.owner).refs.insert(name.to_string());
         if name == "use" && scope.module_level {
             let used = arguments(node)
@@ -662,6 +707,26 @@ impl Walker<'_> {
             (Some("Phoenix.PubSub"), "broadcast_from" | "broadcast_from!") => 3,
             // Phoenix.ChannelTest's `push(socket, "event", payload)`.
             (None, "push") => 1,
+            // A reply goes to the process that called; which message is not seen.
+            (
+                Some("GenServer" | ":gen_server" | ":gen_statem" | "GenStateMachine"),
+                "reply" | "multi_call",
+            ) => {
+                self.facts.owner(owner).sends_any = true;
+                return;
+            }
+            // `apply(mod, :fun, args)` with a function that is not a send is a
+            // plain call, named by its atom. Any other `apply` may be a send.
+            (Some("Kernel"), "apply") | (None, "apply") => {
+                let literal_function = args
+                    .get(1usize.wrapping_sub(skipped))
+                    .filter(|a| a.kind() == "atom")
+                    .map(|a| text(*a, self.source).trim_start_matches(':'));
+                if args.len() + skipped != 3 || literal_function.is_none_or(sends_a_message) {
+                    self.facts.owner(owner).sends_any = true;
+                }
+                return;
+            }
             // Delivery to every subscriber, or to nodes: anything may go.
             (_, "broadcast" | "broadcast!" | "broadcast_from" | "broadcast_from!")
             | (_, "local_broadcast" | "direct_broadcast" | "abcast" | "multi_call")
@@ -678,6 +743,37 @@ impl Walker<'_> {
                 def.sends.insert(tag);
             }
             None => def.sends_any = true,
+        }
+    }
+
+    /// Record the modules handed to a call as plain arguments. The callee may
+    /// send them a message, in a way its caller does not show. Starting a
+    /// process, building a child specification, and the directives that name
+    /// modules (`alias`, `use`) hand over nothing; neither does an attribute
+    /// definition (`@session Mod`), which its readers' own calls show.
+    fn hand_over(&mut self, owner: Owner, function: &str, call: Node) {
+        if HANDS_NOTHING.contains(&function)
+            || call.parent().is_some_and(|p| {
+                p.kind() == "unary_operator" && text(p, self.source).starts_with('@')
+            })
+        {
+            return;
+        }
+        let mut handed: Vec<Node> = arguments(call)
+            .into_iter()
+            .filter(|a| a.kind() == "alias")
+            .collect();
+        // `Mod |> wrapper(msg)`.
+        if let Some(parent) = call.parent().filter(|_| piped(call, self.source)) {
+            handed.extend(
+                parent
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "alias"),
+            );
+        }
+        for module in handed {
+            let full = self.expand(text(module, self.source));
+            self.facts.owner(owner).hands_over.insert(full);
         }
     }
 
@@ -1128,6 +1224,49 @@ end
     }
 
     #[test]
+    fn a_module_handed_to_a_function_may_be_sent_to_but_one_that_is_started_or_listed_is_not() {
+        let source = r#"defmodule Shop.Lobby do
+  @room Shop.Room
+  alias Shop.Room
+
+  def start(id), do: DynamicSupervisor.start_child(Shop.Sup, %{start: {Room, :start_link, [id]}})
+  def listed, do: [Room, {Room, 1}]
+  def spec, do: Supervisor.child_spec(Room, id: 1)
+  def handed, do: Shop.Mailbox.deliver(Room, :join)
+  def piped, do: Room |> Shop.Mailbox.deliver(:join)
+  def stopped, do: GenServer.stop(Room)
+  def applied_plain, do: apply(Room, :name, [])
+  def applied_dynamic(fun), do: apply(Room, fun, [])
+  def applied_send, do: apply(GenServer, :call, [Room, :join])
+  def reply(from), do: GenServer.reply(from, :ok)
+end
+"#;
+        let facts = extract(Path::new("lib/shop/lobby.ex"), source);
+        let handed = |name: &str| -> Vec<String> {
+            def_named(&facts, name, 0)
+                .hands_over
+                .iter()
+                .cloned()
+                .collect()
+        };
+        let room = vec!["Shop.Room".to_string()];
+        assert!(handed("start").is_empty());
+        assert!(handed("listed").is_empty());
+        assert!(handed("spec").is_empty());
+        assert!(facts.top.hands_over.is_empty());
+        assert_eq!(handed("handed"), room);
+        assert_eq!(handed("piped"), room);
+        assert_eq!(handed("stopped"), room);
+        assert_eq!(handed("applied_plain"), room);
+        let sends_any = |name: &str| def_named(&facts, name, 0).sends_any;
+        assert!(!sends_any("applied_plain"));
+        assert!(sends_any("applied_dynamic"));
+        assert!(sends_any("applied_send"));
+        assert!(sends_any("reply"));
+        assert!(!sends_any("handed"));
+    }
+
+    #[test]
     fn message_clauses_record_the_tag_they_accept() {
         let source = r#"defmodule Shop.Room do
   use GenServer
@@ -1214,7 +1353,8 @@ end
         assert_eq!(sent("push_event"), (vec!["s:new_msg"], false));
         assert_eq!(sent("interpolated"), (vec![], true));
         assert_eq!(sent("next"), (vec!["a:load"], false));
-        assert_eq!(sent("reply"), (vec![], false));
+        // A reply is a message to the caller, whose handler is not seen.
+        assert_eq!(sent("reply"), (vec![], true));
         assert_eq!(sent("unrelated"), (vec![], false));
     }
 
