@@ -102,6 +102,7 @@ impl Drop for Workspace {
         if std::env::var_os(KEEP).is_some() {
             let kept =
                 std::mem::replace(&mut self.dir, TempDir::new().expect("a scratch dir")).keep();
+            #[allow(clippy::disallowed_macros)] // test-only diagnostic
             eprintln!("kept scratch repo {}", kept.display());
         }
     }
