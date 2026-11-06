@@ -446,6 +446,7 @@ fn blocked_dependents_are_reported_blocked_and_total_time_is_wall_clock() {
     project("after", "touch should-not-run", "//bad:build");
     project("left", "sleep 1", "");
     project("right", "sleep 1", "");
+    let host = TempDir::new().unwrap();
 
     let run = |json: bool| {
         let mut args = vec!["--jobs", "4", "--no-cache"];
@@ -453,9 +454,14 @@ fn blocked_dependents_are_reported_blocked_and_total_time_is_wall_clock() {
             args.push("--json");
         }
         args.extend(["build", "--all"]);
+        // `--jobs 4` sets the host execution capacity. Admission state is
+        // shared across every aster on the host, so give this run its own:
+        // otherwise a concurrent test's invocation holding a different
+        // capacity rejects it before any target runs.
         Command::new(env!("CARGO_BIN_EXE_aster"))
             .current_dir(tmp.path())
             .env("CI", "1")
+            .env("ASTER_EXECUTION_DIR", host.path())
             .args(&args)
             .output()
             .unwrap()
@@ -498,9 +504,13 @@ fn blocked_dependents_are_reported_blocked_and_total_time_is_wall_clock() {
         .find_map(|line| line.strip_prefix("Total time: ")?.strip_suffix("ms"))
         .and_then(|ms| ms.trim().parse::<u128>().ok())
         .unwrap_or_else(|| panic!("missing Total time: {stdout}"));
+    // `left` and `right` each sleep 1s and run in parallel. Wall-clock time
+    // is at least one sleep and under their 2s sum, which is what a summed
+    // per-target total would report. Process startup (discovery, admission)
+    // is outside the summary, so it is bounded by elapsed time, not equal to it.
     assert!(
-        total_time + 1000 >= elapsed_ms && elapsed_ms + 1000 >= total_time,
-        "Total time {total_time}ms should be within ~1s of elapsed {elapsed_ms}ms"
+        (1000..2000).contains(&total_time) && total_time <= elapsed_ms,
+        "Total time {total_time}ms should be wall clock (1s..2s, at most elapsed {elapsed_ms}ms)"
     );
 
     let json_run = run(true);
