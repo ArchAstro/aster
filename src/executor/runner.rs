@@ -213,7 +213,12 @@ pub struct Executor<'a> {
     /// When set, a cache hit still reports `cached` but does not print the
     /// stored log. Status and JSON fields are unchanged.
     no_replay: bool,
+    /// Called with the final results before failure output is printed.
+    results_hook: Option<ResultsHook>,
 }
+
+/// See [`Executor::with_results_hook`].
+pub type ResultsHook = Arc<dyn Fn(&[ExecutionResult]) + Send + Sync>;
 
 /// Default cap on one command's combined log: 16 MiB.
 pub const DEFAULT_LOG_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -234,6 +239,7 @@ impl<'a> Executor<'a> {
             quarantine: None,
             wrappers: Wrappers::default(),
             no_replay: false,
+            results_hook: None,
         }
     }
 
@@ -252,6 +258,7 @@ impl<'a> Executor<'a> {
             quarantine: None,
             wrappers: Wrappers::default(),
             no_replay: false,
+            results_hook: None,
         }
     }
 
@@ -274,6 +281,7 @@ impl<'a> Executor<'a> {
             quarantine: None,
             wrappers: Wrappers::default(),
             no_replay: false,
+            results_hook: None,
         }
     }
 
@@ -297,6 +305,7 @@ impl<'a> Executor<'a> {
             quarantine: None,
             wrappers: Wrappers::default(),
             no_replay: false,
+            results_hook: None,
         }
     }
 
@@ -315,6 +324,14 @@ impl<'a> Executor<'a> {
     }
 
     /// Suppress printing a cache hit's stored log. The hit is still reported.
+    /// Run `hook` with the final results before any failure output is
+    /// printed, so durable records (the test results file) exist even if the
+    /// console cannot be written.
+    pub fn with_results_hook(mut self, hook: Option<ResultsHook>) -> Self {
+        self.results_hook = hook;
+        self
+    }
+
     pub fn with_no_replay(mut self, no_replay: bool) -> Self {
         self.no_replay = no_replay;
         self
@@ -886,6 +903,10 @@ impl<'a> Executor<'a> {
 
         if self.output_mode != OutputMode::Json {
             self.store_logs(target_label_for_logs, &all_results);
+        }
+
+        if let Some(hook) = &self.results_hook {
+            hook(&all_results);
         }
 
         if show_output {

@@ -2,6 +2,11 @@
 //!
 //! Build orchestration for polyglot monorepos.
 
+// Same module as the library's: console writes that cannot panic.
+#[macro_use]
+#[path = "safe_io.rs"]
+mod safe_io;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use console::style;
@@ -1508,6 +1513,7 @@ fn run() -> Result<()> {
                 let run_record = test_results.as_ref().map(|_| {
                     detect_run(&workspace_root, &target, lane, &|name| env::var(name).ok())
                 });
+                let recorder = results_recorder(test_results.clone(), run_record);
                 let executor = Executor::with_all_options(
                     &workspace_root,
                     output_mode,
@@ -1515,6 +1521,7 @@ fn run() -> Result<()> {
                     !cli.no_cache,
                 )
                 .with_test_capture(test_results.is_some())
+                .with_results_hook(recorder.clone())
                 .with_retry_failed(cli.retry_failed())
                 .with_wrappers(&workspace_config.affected.related.wrappers)
                 .with_no_replay(cli.no_replay)
@@ -1554,7 +1561,7 @@ fn run() -> Result<()> {
                 } else {
                     executor.execute(&target, &all_project_refs, &graph, Some(&primary_addrs))
                 };
-                write_test_results(test_results, run_record, &results);
+                record_results(recorder.as_ref(), &results);
 
                 // Output results based on mode
                 if output_mode == OutputMode::Json {
@@ -1655,9 +1662,11 @@ fn run() -> Result<()> {
             let run_record = test_results
                 .as_ref()
                 .map(|_| detect_run(&workspace_root, "run", None, &|name| env::var(name).ok()));
+            let recorder = results_recorder(test_results.clone(), run_record);
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
+                    .with_results_hook(recorder.clone())
                     .with_retry_failed(cli.retry_failed())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
@@ -1671,7 +1680,7 @@ fn run() -> Result<()> {
                         test_results.is_some() || cli.retry_failed() > 0,
                     )?);
             let results = executor.execute_targets(&primary_targets, &all_project_refs, no_deps);
-            write_test_results(test_results, run_record, &results);
+            record_results(recorder.as_ref(), &results);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
@@ -2016,9 +2025,11 @@ fn run() -> Result<()> {
                     env::var(name).ok()
                 })
             });
+            let recorder = results_recorder(test_results.clone(), run_record);
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
+                    .with_results_hook(recorder.clone())
                     .with_retry_failed(cli.retry_failed())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
@@ -2127,7 +2138,7 @@ fn run() -> Result<()> {
                     Some(&primary_projects),
                 )
             };
-            write_test_results(test_results, run_record, &results);
+            record_results(recorder.as_ref(), &results);
 
             // Output results based on mode
             if output_mode == OutputMode::Json {
@@ -2169,6 +2180,29 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Writes the run's test results once, whichever of the executor (before it
+/// prints failure output) or the caller (after it returns) reaches it first.
+type Recorder = std::sync::Arc<dyn Fn(&[aster::executor::ExecutionResult]) + Send + Sync>;
+
+fn results_recorder(
+    destination: Option<Option<PathBuf>>,
+    run: Option<aster_results_model::RunRecord>,
+) -> Option<Recorder> {
+    let pending = std::sync::Mutex::new(Some((destination?, run?)));
+    Some(std::sync::Arc::new(move |results| {
+        let taken = pending.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((destination, run)) = taken {
+            write_test_results(Some(destination), Some(run), results);
+        }
+    }))
+}
+
+fn record_results(recorder: Option<&Recorder>, results: &[aster::executor::ExecutionResult]) {
+    if let Some(recorder) = recorder {
+        recorder(results);
+    }
 }
 
 /// Write the run's test results when recording is on. A file that cannot be
