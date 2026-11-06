@@ -817,6 +817,24 @@ the tests that reach them, across project boundaries.
   selection; `vitest --shard=1/2` works the same way. A `mix test` shard
   whose partition gets none of the selected files is skipped: partition 3
   of two files is empty, and Mix fails on paths that match nothing.
+  **A small selection is packed into one shard.** Every shard that starts
+  pays a cold boot (checkout, dependencies, compile, database) before its
+  first test, which a handful of files does not repay. When a `mix test
+  --partitions N` selection has at most `pack_shards_up_to` files (default
+  200, `0` turns packing off), shard 1 runs all of them with `--partitions`
+  removed (so Mix does not deal any away; `MIX_TEST_PARTITION=1` stays for
+  per-partition database names) and shards 2 to N are skipped. The limit
+  counts files, not time: 200 is below what one shard carries in a full run
+  of a suite big enough to need sharding (about 1,300 files over 4 shards),
+  so a packed lane is never the slowest lane of a full run. Larger
+  selections, `--all` and projects that run in full are unchanged.
+  `vitest --shard` is not packed.
+
+  ```toml
+  [affected.related]
+  pack_shards_up_to = 200
+  ```
+
   Everything before the
   final command is kept, which must be a plain command after an optional
   `cd <dir> &&`. Test targets the requested target depends on in other

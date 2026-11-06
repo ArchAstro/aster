@@ -67,6 +67,9 @@ pub struct AffectedRequest<'a> {
     pub declared_inputs: &'a HashSet<String>,
     /// `[affected.related] wrappers`: programs in front of a test command.
     pub related_wrappers: &'a [RelatedWrapperConfig],
+    /// `[affected.related] pack_shards_up_to`: a selection this small runs
+    /// in the first shard of a sharded suite.
+    pub pack_shards_up_to: usize,
 }
 
 /// How a project's targets are narrowed.
@@ -98,6 +101,7 @@ pub fn plan_affected_commands(
             related,
             registry,
             pinned: HashSet::new(),
+            pack_shards_up_to: request.pack_shards_up_to,
         };
         let mut pinned = HashSet::new();
         for project in request.projects {
@@ -470,6 +474,8 @@ enum Narrowed<'a> {
     Commands(Vec<String>, &'a Outcome),
     /// None of the tests it runs reaches the change.
     Nothing,
+    /// The selection is small enough that shard 1 runs all of it.
+    Packed(usize),
 }
 
 /// Shared inputs of a related plan.
@@ -480,6 +486,8 @@ struct RelatedPlanner<'a> {
     /// Targets a project running in full depends on; they run as written
     /// whatever another project's selection says.
     pinned: HashSet<String>,
+    /// `[affected.related] pack_shards_up_to`.
+    pack_shards_up_to: usize,
 }
 
 impl<'a> RelatedPlanner<'a> {
@@ -535,15 +543,18 @@ impl<'a> RelatedPlanner<'a> {
             .delegated
             .as_ref()
             .is_some_and(Delegated::hides_environment);
-        let attempt = |tests: &[RelatedTest]| {
+        let attempt_packing = |tests: &[RelatedTest], pack: usize| {
             plugin.and_then(|p| {
                 if hidden_environment {
+                    // Packing reads the partition from the command, which a
+                    // hidden environment may change.
                     p.related_tests_in_hidden_environment(&project.root, &command, tests)
                 } else {
-                    p.related_tests(&project.root, &command, tests)
+                    p.related_tests_packing(&project.root, &command, tests, pack)
                 }
             })
         };
+        let attempt = |tests: &[RelatedTest]| attempt_packing(tests, self.pack_shards_up_to);
         if !placeholder && attempt(&[]).is_none() {
             return Ok(Narrowed::NotRunner);
         }
@@ -599,7 +610,18 @@ impl<'a> RelatedPlanner<'a> {
                 }
                 Narrowed::Commands(commands, outcome)
             }
-            FilesListPlan::Nothing => Narrowed::Nothing,
+            FilesListPlan::Nothing => {
+                // A shard that packing emptied, rather than one no test
+                // reaches: without packing the same command would run.
+                let packed = !placeholder
+                    && self.pack_shards_up_to > 0
+                    && matches!(attempt_packing(&tests, 0), Some(FilesListPlan::Commands(_)));
+                if packed {
+                    Narrowed::Packed(tests.len())
+                } else {
+                    Narrowed::Nothing
+                }
+            }
             FilesListPlan::Full | FilesListPlan::Declined => {
                 Narrowed::AsWritten("the command could not be narrowed".into())
             }
@@ -691,7 +713,12 @@ impl<'a> RelatedPlanner<'a> {
                 runs = true;
                 continue;
             }
-            match self.narrow(owner, &name, def)? {
+            let narrowed = self.narrow(owner, &name, def)?;
+            let packed = match narrowed {
+                Narrowed::Packed(count) => Some(count),
+                _ => None,
+            };
+            match narrowed {
                 Narrowed::NotRunner => {
                     if is_requested {
                         requested_is_runner = false;
@@ -740,20 +767,28 @@ impl<'a> RelatedPlanner<'a> {
                         plan.overrides.insert(addr, CommandOverride::Run(commands));
                     }
                 }
-                Narrowed::Nothing => {
+                Narrowed::Nothing | Narrowed::Packed(_) => {
                     skips += 1;
+                    let (note, skip) = match packed {
+                        Some(count) => (
+                            format!(
+                                "skipped: its {count} selected tests are small enough to \
+                                 run together in partition 1 (pack_shards_up_to)"
+                            ),
+                            "the selection runs together in partition 1 (--related)".to_string(),
+                        ),
+                        None => (
+                            "skipped: no test it runs reaches the change".to_string(),
+                            "no test it runs reaches the change (--related)".to_string(),
+                        ),
+                    };
                     if !plan.notes.contains_key(&addr) {
-                        plan.note(&addr, "skipped: no test it runs reaches the change");
+                        plan.note(&addr, note);
                     }
                     if is_requested {
                         return Ok(Some(addr));
                     }
-                    plan.overrides.insert(
-                        addr,
-                        CommandOverride::Skip(
-                            "no test it runs reaches the change (--related)".into(),
-                        ),
-                    );
+                    plan.overrides.insert(addr, CommandOverride::Skip(skip));
                 }
             }
         }
@@ -805,6 +840,7 @@ pub fn related_proxies(
         related,
         registry,
         pinned: HashSet::new(),
+        pack_shards_up_to: 0,
     };
     let needs_run = |addr: &String| {
         related

@@ -549,7 +549,7 @@ pub struct AffectedWorkspaceConfig {
 }
 
 /// `[affected.related]`: how `--related` reads test commands.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AffectedRelatedConfig {
     /// Programs that run another command given as their arguments
@@ -558,6 +558,31 @@ pub struct AffectedRelatedConfig {
     /// front of it unchanged.
     #[serde(default)]
     pub wrappers: Vec<RelatedWrapperConfig>,
+    /// A sharded suite (`MIX_TEST_PARTITION=K mix test --partitions N`)
+    /// whose selection has at most this many test files runs them all in
+    /// shard 1, and the other shards are skipped. Each shard that starts
+    /// pays a cold boot (checkout, dependencies, compile, database), which
+    /// a handful of files does not repay. 0 turns packing off. The default
+    /// stays under the share a shard carries in a full run of a suite big
+    /// enough to be sharded, so a packed lane is never the slowest one.
+    #[serde(default = "default_pack_shards_up_to")]
+    pub pack_shards_up_to: usize,
+}
+
+/// Default for [`AffectedRelatedConfig::pack_shards_up_to`].
+pub const DEFAULT_PACK_SHARDS_UP_TO: usize = 200;
+
+fn default_pack_shards_up_to() -> usize {
+    DEFAULT_PACK_SHARDS_UP_TO
+}
+
+impl Default for AffectedRelatedConfig {
+    fn default() -> Self {
+        Self {
+            wrappers: Vec::new(),
+            pack_shards_up_to: DEFAULT_PACK_SHARDS_UP_TO,
+        }
+    }
 }
 
 /// A wrapper program for `[affected.related] wrappers`: a bare string names a
@@ -728,6 +753,29 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn shard_packing_defaults_on_and_zero_turns_it_off() {
+        let parse = |toml: &str| toml::from_str::<WorkspaceConfig>(toml).unwrap();
+        assert_eq!(
+            parse("").affected.related.pack_shards_up_to,
+            DEFAULT_PACK_SHARDS_UP_TO
+        );
+        assert_eq!(
+            parse("[affected.related]\nwrappers = [\"mise\"]\n")
+                .affected
+                .related
+                .pack_shards_up_to,
+            DEFAULT_PACK_SHARDS_UP_TO
+        );
+        assert_eq!(
+            parse("[affected.related]\npack_shards_up_to = 0\n")
+                .affected
+                .related
+                .pack_shards_up_to,
+            0
+        );
+    }
 
     #[test]
     fn parses_dev_services_ports_and_environment() {
