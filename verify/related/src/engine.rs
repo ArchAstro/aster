@@ -98,11 +98,11 @@ pub struct Workspace {
 const KEEP: &str = "RELATED_MODEL_KEEP";
 
 impl Drop for Workspace {
+    #[allow(clippy::disallowed_macros)] // test-only diagnostic
     fn drop(&mut self) {
         if std::env::var_os(KEEP).is_some() {
             let kept =
                 std::mem::replace(&mut self.dir, TempDir::new().expect("a scratch dir")).keep();
-            #[allow(clippy::disallowed_macros)] // test-only diagnostic
             eprintln!("kept scratch repo {}", kept.display());
         }
     }
