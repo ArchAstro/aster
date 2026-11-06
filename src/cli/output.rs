@@ -3,6 +3,7 @@
 //! Provides OutputMode enum for controlling output format and helpers
 //! for JSON serialization in CLI commands.
 
+use crate::{errln, outln};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -273,22 +274,22 @@ pub fn print_summary(
         if blocked > 0 {
             parts.push(format!("{blocked} blocked"));
         }
-        eprintln!("{}", parts.join(", "));
+        errln!("{}", parts.join(", "));
         return;
     }
 
     // Normal or Verbose mode - detailed summary
-    println!("\n=== Summary ===");
+    outln!("\n=== Summary ===");
     if skipped > 0 {
-        println!(
+        outln!(
             "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed{blocked_summary}, {skipped} skipped (no target)"
         );
     } else {
-        println!(
+        outln!(
             "Ran '{target}' on {total} {context}: {passed} passed{cached_summary}, {failed} failed{blocked_summary}"
         );
     }
-    println!("Total time: {total_duration}ms");
+    outln!("Total time: {total_duration}ms");
 
     let quarantined: Vec<_> = results
         .iter()
@@ -298,26 +299,26 @@ pub fn print_summary(
         })
         .collect();
     if !quarantined.is_empty() {
-        println!("\nPassed with quarantined failures:");
+        outln!("\nPassed with quarantined failures:");
         for (result, tests) in quarantined {
-            println!("  - {} (quarantined: {})", result.address, tests.len());
+            outln!("  - {} (quarantined: {})", result.address, tests.len());
             for test in tests {
-                println!("      {} ({})", test.name, test.source);
+                outln!("      {} ({})", test.name, test.source);
             }
         }
     }
 
     if failed > 0 {
-        println!("\nFailed projects:");
+        outln!("\nFailed projects:");
         for result in results.iter().filter(|r| !r.success && !r.blocked) {
-            println!("  - {}", result.address);
+            outln!("  - {}", result.address);
         }
     }
 
     if blocked > 0 {
-        println!("\nBlocked projects:");
+        outln!("\nBlocked projects:");
         for result in results.iter().filter(|r| r.blocked) {
-            println!("  - {}", result.address);
+            outln!("  - {}", result.address);
         }
     }
 }

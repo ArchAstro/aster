@@ -22,6 +22,7 @@
 //! without a request, and one line names the 429 count and the entries
 //! created before the stop.
 
+use crate::errln;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -336,7 +337,7 @@ impl GhaBackend {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                eprintln!(
+                errln!(
                     "[aster] Warning: GitHub Actions cache rate limited ({count} repeated 429s, {} entries created); remote writes stopped for this run",
                     self.created.load(Ordering::Relaxed)
                 );

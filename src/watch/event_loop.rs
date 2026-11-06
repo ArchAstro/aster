@@ -1,6 +1,7 @@
 //! Watch event loop: debounces fs events, maps them to targets via the
 //! [`WatchPlan`], and drives the executor + stream supervisor.
 
+use crate::errln;
 use anyhow::{Context, Result};
 use console::style;
 use crossbeam_channel::{select, tick, unbounded};
@@ -87,7 +88,7 @@ pub fn run_watch(
     // Initial run.
     if opts.run_initial {
         let successful = if !requested_non_stream.is_empty() {
-            eprintln!("{} initial build…", style("[watch]").cyan().bold());
+            errln!("{} initial build…", style("[watch]").cyan().bold());
             executor
                 .execute_targets(&requested_non_stream, &project_refs, false)
                 .iter()
@@ -100,14 +101,14 @@ pub fn run_watch(
         for t in &requested_stream {
             if stream_prerequisites_succeeded(&t.address, &graph, &plan, &successful) {
                 if let Err(e) = start_stream_target(&mut supervisor, t, &projects) {
-                    eprintln!(
+                    errln!(
                         "{} failed to start {}: {e:#}",
                         style("[watch]").red().bold(),
                         t.address
                     );
                 }
             } else {
-                eprintln!(
+                errln!(
                     "{} {} was not started because its prerequisite failed",
                     style("[watch]").red().bold(),
                     t.address
@@ -149,21 +150,21 @@ pub fn run_watch(
 
         for t in stream_addrs {
             if stream_prerequisites_succeeded(&t.address, &graph, &plan, &successful) {
-                eprintln!(
+                errln!(
                     "{} restart {}",
                     style("[watch]").cyan().bold(),
                     style(&t.address).yellow()
                 );
                 let mut sup = supervisor_cell.borrow_mut();
                 if let Err(e) = restart_stream_target(&mut sup, t, &projects) {
-                    eprintln!(
+                    errln!(
                         "{} failed to restart {}: {e:#}",
                         style("[watch]").red().bold(),
                         t.address
                     );
                 }
             } else {
-                eprintln!(
+                errln!(
                     "{} {} was not restarted because its prerequisite failed",
                     style("[watch]").red().bold(),
                     t.address
@@ -175,7 +176,7 @@ pub fn run_watch(
     let idle_tick = || {
         let mut sup = supervisor_cell.borrow_mut();
         for (addr, code) in sup.reap() {
-            eprintln!(
+            errln!(
                 "{} stream target {addr} exited (code {code})",
                 style("[watch]").yellow().bold()
             );
@@ -235,7 +236,7 @@ where
             recv(event_rx) -> msg => match msg {
                 Ok(Ok(ev)) => Some(ev),
                 Ok(Err(e)) => {
-                    eprintln!("{} watcher error: {e}", style("[watch]").red().bold());
+                    errln!("{} watcher error: {e}", style("[watch]").red().bold());
                     continue;
                 }
                 Err(_) => break,
@@ -278,7 +279,7 @@ where
                     &mut pending,
                     &mut trigger_paths,
                 ),
-                Ok(Err(e)) => eprintln!("{} watcher error: {e}", style("[watch]").red().bold()),
+                Ok(Err(e)) => errln!("{} watcher error: {e}", style("[watch]").red().bold()),
                 Err(_) => break,
             }
         }
@@ -299,7 +300,7 @@ where
             .filter(|s| seen_samples.insert(s.clone()))
             .take(3)
             .collect();
-        eprintln!(
+        errln!(
             "{} change: {}",
             style("[watch]").cyan().bold(),
             samples.join(", "),
@@ -505,7 +506,7 @@ fn start_stream_target(
         .targets
         .get(&t.target_name)
         .context("target def not found")?;
-    eprintln!(
+    errln!(
         "{} start {}",
         style("[watch]").cyan().bold(),
         style(&t.address).yellow()
@@ -537,7 +538,7 @@ fn emit_startup_banner(plan: &WatchPlan) {
         .map(|t| t.address.as_str())
         .collect();
 
-    eprintln!(
+    errln!(
         "{} watching {} target(s) across {} project(s)",
         style("[watch]").cyan().bold(),
         plan.watched.len(),
@@ -545,7 +546,7 @@ fn emit_startup_banner(plan: &WatchPlan) {
     );
 
     for addr in &fallbacks {
-        eprintln!(
+        errln!(
             "{} {} has no cache_inputs; watching whole project dir (set [targets.X.cache] to refine)",
             style("[watch]").yellow().bold(),
             addr,

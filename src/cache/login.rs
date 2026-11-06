@@ -50,6 +50,7 @@
 //! logout` deletes the file and has the server refuse every token the
 //! person was issued before.
 
+use crate::errln;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -138,7 +139,7 @@ fn load_token(config_dir: &Path, server_url: &str, now: SystemTime) -> Option<St
     let origin = server_origin(server_url).filter(|origin| is_secure_origin(origin))?;
     let path = token_path(config_dir, &origin)?;
     if readable_by_others(&path) {
-        eprintln!(
+        errln!(
             "[aster] ignoring {}: other users can read it; run aster srv login again",
             path.display()
         );

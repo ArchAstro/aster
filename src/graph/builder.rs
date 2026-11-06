@@ -3,6 +3,7 @@
 //! Builds a petgraph DiGraph where nodes are projects and edges represent
 //! dependencies between them.
 
+use crate::errln;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -67,7 +68,7 @@ pub fn build_graph(projects: &[DiscoveredProject]) -> anyhow::Result<ProjectGrap
             } else {
                 // Dependency not found - warn but continue
                 // This can happen with cross-language dependencies
-                eprintln!(
+                errln!(
                     "warning: dependency {dep_address} from {from_address} not found in workspace"
                 );
             }

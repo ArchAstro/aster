@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! End-to-end remote cache: real aster-srv, real Postgres, fake GCS.
 //!
 //! Checkout A runs a target and stores through aster-srv. The signed blob

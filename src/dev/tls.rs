@@ -1,3 +1,4 @@
+use crate::{errln, outln};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -81,7 +82,7 @@ pub fn setup_tls(workspace_root: &Path, config: &DevWorkspaceConfig, edge: &str)
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
     }
-    println!(
+    outln!(
         "TLS edge '{edge}' certificate ready in {}",
         cert_dir.display()
     );
@@ -170,7 +171,7 @@ async fn serve(
     let listener = TcpListener::bind(("127.0.0.1", listen_port))
         .await
         .with_context(|| format!("TLS edge '{edge}' could not bind 127.0.0.1:{listen_port}"))?;
-    println!("TLS edge '{edge}' ready https://127.0.0.1:{listen_port}");
+    outln!("TLS edge '{edge}' ready https://127.0.0.1:{listen_port}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -180,7 +181,7 @@ async fn serve(
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    eprintln!("TLS handshake from {peer} failed: {error}");
+                    errln!("TLS handshake from {peer} failed: {error}");
                     return;
                 }
             };
@@ -190,7 +191,7 @@ async fn serve(
                 .with_upgrades()
                 .await;
             if let Err(error) = result {
-                eprintln!("TLS connection from {peer} failed: {error}");
+                errln!("TLS connection from {peer} failed: {error}");
             }
         });
     }
@@ -268,7 +269,7 @@ async fn proxy_request(
                             match tokio::try_join!(downstream_upgrade, upstream_upgrade) {
                                 Ok(upgrades) => upgrades,
                                 Err(error) => {
-                                    eprintln!("TLS upgrade failed: {error}");
+                                    errln!("TLS upgrade failed: {error}");
                                     return;
                                 }
                             };
@@ -276,7 +277,7 @@ async fn proxy_request(
                         let mut upstream = TokioIo::new(upstream);
                         if let Err(error) = copy_bidirectional(&mut downstream, &mut upstream).await
                         {
-                            eprintln!("TLS upgraded connection failed: {error}");
+                            errln!("TLS upgraded connection failed: {error}");
                         }
                     });
                 }
@@ -431,7 +432,7 @@ impl ResolvesServerCert for DynamicCertificateResolver {
                 Some(certified)
             }
             Err(error) => {
-                eprintln!("TLS certificate issuance failed: {error:#}");
+                errln!("TLS certificate issuance failed: {error:#}");
                 None
             }
         }

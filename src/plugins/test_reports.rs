@@ -1184,6 +1184,7 @@ pub(super) fn maven(ctx: &ReportContext) -> Option<ReportPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errln;
     use crate::test_results::TestOutcome;
     use std::path::PathBuf;
 
@@ -1302,7 +1303,7 @@ mod tests {
             .output()
             .is_err()
         {
-            eprintln!("skipping: node is not installed");
+            errln!("skipping: node is not installed");
             return;
         }
         let (_tmp, f) = node_project(r#"{"scripts": {"test": "node --test"}}"#);

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! Real CLI/process proofs of host admission. Each test has its own host state;
 //! no test acquires a developer's execution slots or signals unrelated jobs.
 //!

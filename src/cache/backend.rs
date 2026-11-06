@@ -10,6 +10,7 @@
 //! when that variable is unset, `GITHUB_ACTIONS=true`, and the Actions
 //! runtime env is present.
 
+use crate::errln;
 use anyhow::{Context, Result};
 use std::any::Any;
 use std::collections::HashMap;
@@ -221,7 +222,7 @@ impl RemoteHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            eprintln!("{text}");
+            errln!("{text}");
         }
     }
 
@@ -425,7 +426,7 @@ impl TieredCache {
                 // The aster-srv client already printed the one-line sign-in
                 // warning. Do not add a second line for it.
                 if !super::aster_srv::is_signed_out(error) {
-                    eprintln!(
+                    errln!(
                         "[aster] Warning: remote cache disabled for the rest of this run, continuing locally: {reason}"
                     );
                 }
@@ -596,7 +597,7 @@ pub fn select_remote(
             None => match GhaBackend::from_env() {
                 Some(backend) => Ok(Some(install_gha_backend(backend))),
                 None => {
-                    eprintln!(
+                    errln!(
                         "[aster] Warning: {REMOTE_CACHE_ENV}=gha but ACTIONS_RESULTS_URL or ACTIONS_RUNTIME_TOKEN is unset; using the local cache only"
                     );
                     Ok(None)
@@ -608,7 +609,7 @@ pub fn select_remote(
         return match super::http::HttpCache::from_vars(http_url, http_token)? {
             Some(cache) => Ok(Some(Arc::new(cache))),
             None => {
-                eprintln!(
+                errln!(
                     "[aster] Warning: {REMOTE_CACHE_ENV}=http but {} is unset; using the local cache only",
                     super::http::REMOTE_CACHE_URL_ENV
                 );
@@ -637,7 +638,7 @@ pub fn select_remote(
             Ok(Some(Arc::new(backend)))
         }
         None => {
-            eprintln!(
+            errln!(
                 "[aster] Warning: {ASTER_SRV_URL_ENV} is set but the repository cannot be determined; using the local cache only"
             );
             Ok(None)

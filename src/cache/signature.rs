@@ -13,6 +13,7 @@
 //! sign that path: a signature the server drops would make every lookup a
 //! miss.
 
+use crate::errln;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -120,7 +121,7 @@ fn warn_once() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        eprintln!(
+        errln!(
             "[aster] Warning: remote cache manifest signature is missing or invalid; treating it as a cache miss"
         );
     }

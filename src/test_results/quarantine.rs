@@ -51,6 +51,7 @@
 //! The server removes a test from `main_broken` on the first default-branch
 //! pass; the run that fetched the list before then may still excuse it.
 
+use crate::errln;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -636,7 +637,7 @@ pub fn load(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<Quarantine>> {
     if env("ASTER_QUARANTINE").is_some_and(|value| value.eq_ignore_ascii_case("off")) {
-        eprintln!("[aster] Quarantine: off (ASTER_QUARANTINE=off)");
+        errln!("[aster] Quarantine: off (ASTER_QUARANTINE=off)");
         return Ok(None);
     }
     let now = Utc::now();
@@ -646,7 +647,7 @@ pub fn load(
         warnings,
     } = read_repo_config(workspace_root, now.date_naive())?;
     for warning in warnings {
-        eprintln!("[aster] Warning: {warning}");
+        errln!("[aster] Warning: {warning}");
     }
     let server = env("ASTER_SRV_URL")
         .filter(|url| !url.is_empty())
@@ -661,7 +662,7 @@ pub fn load(
     if quarantine.is_empty() && quarantine.server.is_none() {
         return Ok(None);
     }
-    eprintln!("[aster] Quarantine: {}", quarantine.describe());
+    errln!("[aster] Quarantine: {}", quarantine.describe());
     Ok(Some(quarantine))
 }
 
@@ -697,7 +698,7 @@ fn server_list(
                 .and_then(|()| Ok(serde_json::to_vec(&list)?))
                 .and_then(|json| Ok(std::fs::write(&path, json)?));
             if let Err(error) = written {
-                eprintln!("[aster] Warning: cannot cache the quarantine list: {error:#}");
+                errln!("[aster] Warning: cannot cache the quarantine list: {error:#}");
             }
             Some((list, ServerSource::Fetched))
         }
@@ -719,7 +720,7 @@ fn server_list(
                     Some((list, ServerSource::Cached(why)))
                 }
                 None => {
-                    eprintln!(
+                    errln!(
                         "[aster] Quarantine: aster-srv's list is unavailable ({why}) and no \
                          list cached in the last {CACHE_HOURS} hours; only {REPO_FILE} applies"
                     );

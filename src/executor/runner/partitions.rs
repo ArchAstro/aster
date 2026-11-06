@@ -7,6 +7,7 @@
 //! `aster results durations`) times the suite, the shard runs a share picked
 //! by time instead of the one Mix deals out by count.
 
+use crate::errln;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -99,7 +100,7 @@ pub(super) fn balance(
         found.partition, found.total
     );
     let keep = |why: &str| {
-        eprintln!("{label} split by Mix ({why})");
+        errln!("{label} split by Mix ({why})");
         None
     };
     if env(OFF_SWITCH).is_some_and(|value| value.eq_ignore_ascii_case("off")) {
@@ -131,7 +132,7 @@ pub(super) fn balance(
         .map(|bin| balance::expected_ms(bin, &files, &durations))
         .max()
         .unwrap_or(0);
-    eprintln!(
+    errln!(
         "{label} balanced by duration: {} of {} files, ~{}s of a slowest ~{}s \
          ({known} files timed in {})",
         mine.len(),

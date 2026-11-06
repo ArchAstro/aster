@@ -11,6 +11,7 @@
 //! prunes what a declared directory no longer holds, and removes the declared
 //! paths if a blob turns out corrupt.
 
+use crate::errln;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::BTreeSet;
@@ -828,7 +829,7 @@ fn mode_of(metadata: &fs::Metadata) -> u32 {
 }
 
 fn warn_skip(message: &str) {
-    eprintln!("Warning: {message}; result not stored");
+    errln!("Warning: {message}; result not stored");
 }
 
 /// Rewind a file after hashing it, without pulling `Seek` into the signature.

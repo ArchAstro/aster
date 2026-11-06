@@ -2,6 +2,7 @@
 //!
 //! Defines the main CLI structure and available subcommands.
 
+use crate::outln;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use super::output::OutputMode;
@@ -256,8 +257,7 @@ pub fn print_target_command_usage(target: Option<&str>) {
         Some(target) => format!("Usage: aster {target} [selectors...] [flags]"),
         None => "Usage: aster <target> [selectors...] [flags]".to_string(),
     };
-    println!("{header}\n\n{TARGET_COMMAND_USAGE}");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    outln!("{header}\n\n{TARGET_COMMAND_USAGE}");
 }
 
 /// Whether external-target args are a help request (`--help` or `-h`).

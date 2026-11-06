@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! End-to-end tests for `--test-results`: per-test capture from a native
 //! runner's report, the NDJSON results file, and the `--json` summary.
 //!

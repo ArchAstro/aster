@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! End-to-end tests for test commands that hide their runners behind a
 //! package script or a script file: `aster affected --related` narrows what
 //! it can read, and `aster check` reports what it cannot.

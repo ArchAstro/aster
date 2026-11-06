@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! End-to-end laptop sign-in: real aster-srv, real Postgres, real `aster`
 //! binary on both ends, a scripted browser in the middle.
 //!

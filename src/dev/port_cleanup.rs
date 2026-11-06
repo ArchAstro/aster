@@ -1,3 +1,4 @@
+use crate::{errln, outln};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
@@ -108,12 +109,12 @@ pub fn kill_workspace_ports(
 pub fn kill_ports(ports: &[u16], options: KillPortsOptions) -> Result<()> {
     let owners = find_owners(ports)?;
     if owners.is_empty() {
-        println!("No listeners found on {}.", format_ports(ports));
+        outln!("No listeners found on {}.", format_ports(ports));
         return Ok(());
     }
 
     for owner in owners.values() {
-        println!(
+        outln!(
             "{}: process {} ({}) listening on {}",
             if options.dry_run {
                 "Would terminate"
@@ -137,7 +138,7 @@ pub fn kill_ports(ports: &[u16], options: KillPortsOptions) -> Result<()> {
         remaining = find_owners(ports)?;
     }
     if !remaining.is_empty() {
-        eprintln!("Force-killing {} remaining listener(s)...", remaining.len());
+        errln!("Force-killing {} remaining listener(s)...", remaining.len());
         terminate_owners(remaining.values(), true)?;
     }
 
@@ -145,7 +146,7 @@ pub fn kill_ports(ports: &[u16], options: KillPortsOptions) -> Result<()> {
     loop {
         let remaining = find_owners(ports)?;
         if remaining.is_empty() {
-            println!("Cleared {}.", format_ports(ports));
+            outln!("Cleared {}.", format_ports(ports));
             return Ok(());
         }
         if Instant::now() >= deadline {
