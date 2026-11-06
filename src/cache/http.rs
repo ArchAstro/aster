@@ -19,6 +19,7 @@
 //! The bearer token is sent as `Authorization` and is never included in an
 //! error, a log line, or [`Debug`].
 
+use crate::errln;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -210,7 +211,7 @@ impl HttpCache {
         }
         if status == 401 || status == 403 {
             self.read_only.store(true, Ordering::Release);
-            eprintln!(
+            errln!(
                 "[aster] Warning: remote cache rejected an upload ({status}); continuing read-only"
             );
             // Err, not Ok: the object was not stored. TieredCache::upload must

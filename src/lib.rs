@@ -1,6 +1,3 @@
-#[macro_use]
-mod safe_io;
-
 pub mod address;
 pub mod cache;
 pub mod check;
@@ -12,6 +9,7 @@ pub mod executor;
 pub mod git;
 pub mod graph;
 pub mod plugins;
+pub mod safe_io;
 pub(crate) mod srv_url;
 pub mod targets;
 pub mod test_results;

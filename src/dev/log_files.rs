@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -106,7 +106,7 @@ pub fn show_service_logs(
         }
     };
 
-    if !io::stdout().is_terminal() {
+    if !crate::safe_io::stdout_is_terminal() {
         return copy_to_stdout(&file);
     }
 
@@ -180,7 +180,7 @@ fn run_pager(file: &File, command: &[&str]) -> Result<()> {
 }
 
 fn copy_to_stdout(file: &File) -> Result<()> {
-    let mut stdout = io::stdout().lock();
+    let mut stdout = crate::safe_io::ConsoleOut;
     let mut input = file;
     io::copy(&mut input, &mut stdout).context("failed to write service logs to stdout")?;
     Ok(())

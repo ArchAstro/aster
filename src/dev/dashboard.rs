@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // the TUI owns the terminal
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};

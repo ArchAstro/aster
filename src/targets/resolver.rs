@@ -3,6 +3,7 @@
 //! Plugins detect available targets from native config files.
 //! Custom targets from aster.toml override detected targets at the key level.
 
+use crate::errln;
 use std::collections::{HashMap, HashSet};
 
 use crate::config::TargetConfig;
@@ -272,7 +273,7 @@ impl TargetResolver {
         }
 
         for (name, alias_config) in pending_aliases {
-            eprintln!(
+            errln!(
                 "Warning: alias target '{name}' references unresolved target '{}', skipping",
                 alias_config.alias
             );

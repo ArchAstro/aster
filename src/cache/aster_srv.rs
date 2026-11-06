@@ -14,6 +14,7 @@
 //! process. Network errors are returned so [`TieredCache`] can disable the
 //! remote after repeated failures. Tokens are never logged.
 
+use crate::errln;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,7 +137,7 @@ impl AsterSrvBackend {
         };
         if let Some(notice) = signature_exclusion_notice(super::signature::signing_key().is_some())
         {
-            eprintln!("{notice}");
+            errln!("{notice}");
         }
         Ok(Some(backend))
     }
@@ -169,7 +170,7 @@ impl AsterSrvBackend {
                 self.blob_agent = build_agent(&origin, BLOB_TIMEOUT);
                 self.gcs_base = Some(base);
             }
-            Err(error) => eprintln!("[aster] Warning: ignoring ASTER_SRV_GCS_BASE: {error:#}"),
+            Err(error) => errln!("[aster] Warning: ignoring ASTER_SRV_GCS_BASE: {error:#}"),
         }
         self
     }
@@ -353,9 +354,7 @@ impl AsterSrvBackend {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            eprintln!(
-                "[aster] Warning: remote cache is read-only for this run; uploads are skipped"
-            );
+            errln!("[aster] Warning: remote cache is read-only for this run; uploads are skipped");
         }
     }
 
@@ -608,7 +607,7 @@ fn decode_hit(entry: &Value) -> Result<Option<Hit>> {
 /// a backend per target, and stop asking.
 fn signed_out() -> anyhow::Error {
     static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| eprintln!("{}", login::SIGNED_OUT_MESSAGE));
+    SAID.call_once(|| errln!("{}", login::SIGNED_OUT_MESSAGE));
     DisablingFailure(anyhow::anyhow!(SIGNED_OUT_REASON)).into()
 }
 

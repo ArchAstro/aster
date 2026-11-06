@@ -9,6 +9,7 @@
 //!   0..N-1) are a display concept: dry-run plans, result ordering and the
 //!   tie-break between targets that become ready together
 
+use crate::{errln, out, outln};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -61,7 +62,7 @@ fn auto_prune_cache(workspace_root: &Path, output_mode: OutputMode) {
     let loaded = match crate::config::WorkspaceConfig::load(workspace_root) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("[aster] Warning: cache prune skipped, workspace config: {error:#}");
+            errln!("[aster] Warning: cache prune skipped, workspace config: {error:#}");
             return;
         }
     };
@@ -71,20 +72,22 @@ fn auto_prune_cache(workspace_root: &Path, output_mode: OutputMode) {
     ) {
         Ok(limits) => limits,
         Err(error) => {
-            eprintln!("[aster] Warning: cache prune skipped, invalid [cache]: {error:#}");
+            errln!("[aster] Warning: cache prune skipped, invalid [cache]: {error:#}");
             return;
         }
     };
     match prune_if_over_cap(workspace_root, limits) {
         Ok(Some(stats)) if output_mode != OutputMode::Quiet => {
-            eprintln!(
+            errln!(
                 "[aster] Pruned {} manifests and {} blobs ({} bytes remaining)",
-                stats.manifests_removed, stats.blobs_removed, stats.bytes_remaining
+                stats.manifests_removed,
+                stats.blobs_removed,
+                stats.bytes_remaining
             );
         }
         Ok(_) => {}
         Err(error) => {
-            eprintln!("[aster] Warning: cache prune failed: {error:#}");
+            errln!("[aster] Warning: cache prune failed: {error:#}");
         }
     }
 }
@@ -448,8 +451,8 @@ impl<'a> Executor<'a> {
         let working_dir = target_def.working_dir.as_ref().unwrap_or(&project.root);
 
         if self.output_mode == OutputMode::Verbose {
-            eprintln!("[aster] Running: {command}");
-            eprintln!("[aster] Working directory: {}", working_dir.display());
+            errln!("[aster] Running: {command}");
+            errln!("[aster] Working directory: {}", working_dir.display());
         }
 
         let parsed = parse_command(command).map_err(|error| error.to_string())?;
@@ -656,7 +659,7 @@ impl<'a> Executor<'a> {
         if !missing.is_empty() {
             if self.output_mode != OutputMode::Json {
                 for result in &missing {
-                    eprintln!("[aster] {}: {}", result.address, result.output);
+                    errln!("[aster] {}: {}", result.address, result.output);
                 }
             }
             return missing;
@@ -665,7 +668,7 @@ impl<'a> Executor<'a> {
         if self.output_mode != OutputMode::Json {
             let log_store = LogStore::new(self.workspace_root);
             if let Err(error) = log_store.clear_latest() {
-                eprintln!("[aster] Warning: Failed to clear previous logs: {error}");
+                errln!("[aster] Warning: Failed to clear previous logs: {error}");
             }
         }
 
@@ -676,7 +679,7 @@ impl<'a> Executor<'a> {
                 // quiet modes would otherwise report only the summary.
                 let message = format!("Execution admission: {error:#}");
                 if self.output_mode != OutputMode::Json {
-                    eprintln!("[aster] {message}");
+                    errln!("[aster] {message}");
                 }
                 return targets_to_run
                     .iter()
@@ -920,12 +923,12 @@ impl<'a> Executor<'a> {
                 // no stored manifest names missing blobs; those targets are
                 // remote misses next run, not a failed build.
                 if let Err(error) = backend.finish() {
-                    eprintln!("[aster] Warning: remote cache upload failed; targets bundled into the pack were not published: {error:#}");
+                    errln!("[aster] Warning: remote cache upload failed; targets bundled into the pack were not published: {error:#}");
                 }
                 let summary = backend.summary();
-                eprintln!("{summary}");
+                errln!("{summary}");
             } else if let Some(summary) = crate::cache::RemoteStats::global().take() {
-                eprintln!("{summary}");
+                errln!("{summary}");
             }
         }
 
@@ -1165,7 +1168,7 @@ impl<'a> Executor<'a> {
             } else if let Err(e) = store.remove(target_addr) {
                 // A disabled or currently unhashable target must not leave
                 // an older entry available for a future false hit.
-                eprintln!(
+                errln!(
                     "[aster] Warning: Failed to remove unavailable cache for {target_addr}: {e}"
                 );
             }
@@ -1456,7 +1459,7 @@ impl<'a> Executor<'a> {
                         for line in
                             retry::flaky_annotations(report, &working_dir, &workspace_root_path)
                         {
-                            eprintln!("{line}");
+                            errln!("{line}");
                         }
                     }
                 }
@@ -1493,7 +1496,7 @@ impl<'a> Executor<'a> {
                                     &working_dir,
                                     &workspace_root_path,
                                 ) {
-                                    eprintln!("{line}");
+                                    errln!("{line}");
                                 }
                             }
                             if let Some(report) = result.tests.as_mut() {
@@ -1535,7 +1538,7 @@ impl<'a> Executor<'a> {
                     if let Some(cache_dir) = cache_store_path.as_ref() {
                         let store = ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                         if let Err(e) = store.remove(&addr) {
-                            eprintln!(
+                            errln!(
                             "[aster] Warning: Failed to remove cache after failure for {addr}: {e}"
                         );
                         }
@@ -1586,7 +1589,7 @@ impl<'a> Executor<'a> {
                                     target_cache_config.as_ref(),
                                     &result,
                                 ) {
-                                    eprintln!(
+                                    errln!(
                                         "[aster] Warning: Failed to update cache for {addr}: {e}"
                                     );
                                 }
@@ -1598,7 +1601,7 @@ impl<'a> Executor<'a> {
                                 let store =
                                     ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                                 if let Err(e) = store.remove(&addr) {
-                                    eprintln!(
+                                    errln!(
                                         "[aster] Warning: Failed to remove stale cache for {addr}: {e}"
                                     );
                                 }
@@ -1613,7 +1616,7 @@ impl<'a> Executor<'a> {
                         let store = ArtifactCache::new(cache_dir.clone(), &workspace_root_path);
                         let project_addr = project_of(&addr).unwrap_or(&addr);
                         if let Err(e) = store.invalidate_project(project_addr) {
-                            eprintln!(
+                            errln!(
                             "[aster] Warning: Failed to invalidate cache for {project_addr}: {e}"
                         );
                         }
@@ -1678,7 +1681,7 @@ impl<'a> Executor<'a> {
         };
 
         if let Err(e) = log_store.store(&run_log) {
-            eprintln!("[aster] Warning: Failed to store logs: {e}");
+            errln!("[aster] Warning: Failed to store logs: {e}");
         }
     }
 
@@ -1699,7 +1702,7 @@ impl<'a> Executor<'a> {
             if progress.is_enabled() {
                 progress.println("");
             } else {
-                eprintln!();
+                errln!();
             }
 
             // Blocked dependents never ran; do not announce them as failures.
@@ -1708,7 +1711,7 @@ impl<'a> Executor<'a> {
             if progress.is_enabled() {
                 progress.println(&header);
             } else {
-                eprintln!("{header}");
+                errln!("{header}");
             }
 
             // Print output (full or truncated based on full_logs flag)
@@ -1717,7 +1720,7 @@ impl<'a> Executor<'a> {
                 if progress.is_enabled() {
                     progress.println(&indented);
                 } else {
-                    eprintln!("{indented}");
+                    errln!("{indented}");
                 }
             }
 
@@ -1734,7 +1737,7 @@ impl<'a> Executor<'a> {
                 if progress.is_enabled() {
                     progress.println(&hint);
                 } else {
-                    eprintln!("{hint}");
+                    errln!("{hint}");
                 }
             }
         }
@@ -1889,18 +1892,13 @@ fn interrupted_report(full_logs: bool) -> Vec<String> {
 /// [`INTERRUPT_FLUSH_TIMEOUT`] or a second signal. A full pipe blocks the
 /// writer, not shutdown; the thread is abandoned and dies with the process.
 fn write_stderr_bounded(lines: Vec<String>) {
-    use std::io::Write;
-
     let (done_tx, done_rx) = mpsc::channel();
     thread::spawn(move || {
-        let stderr = std::io::stderr();
-        let mut stderr = stderr.lock();
+        // Through the shared stderr stream: a lagging reader gets the report
+        // as it drains, within INTERRUPT_FLUSH_TIMEOUT.
         for line in lines {
-            if writeln!(stderr, "{line}").is_err() {
-                break;
-            }
+            errln!("{line}");
         }
-        let _ = stderr.flush();
         let _ = done_tx.send(());
     });
     let deadline = Instant::now() + INTERRUPT_FLUSH_TIMEOUT;
@@ -2398,7 +2396,7 @@ fn check_cache(
     ) {
         Ok(hash) => hash,
         Err(error) => {
-            eprintln!("[aster] Warning: Target {target_addr} is not cacheable: {error:#}");
+            errln!("[aster] Warning: Target {target_addr} is not cacheable: {error:#}");
             return None;
         }
     };
@@ -2413,13 +2411,13 @@ fn check_cache(
             // as a restore failure: the target runs instead of replaying nothing.
             match load_log(store, &manifest) {
                 Err(error) => {
-                    eprintln!(
+                    errln!(
                         "[aster] Warning: cache log missing for {target_addr}, running instead: {error:#}"
                     );
                 }
                 Ok(log) => {
                     if let Err(error) = restore(&project.root, &manifest.outputs, store) {
-                        eprintln!(
+                        errln!(
                             "[aster] Warning: cache restore failed for {target_addr}, running instead: {error:#}"
                         );
                     } else {
@@ -2435,7 +2433,7 @@ fn check_cache(
         }
         Ok(_) => {}
         Err(error) => {
-            eprintln!(
+            errln!(
                 "[aster] Warning: cache lookup failed for {target_addr}, running instead: {error:#}"
             );
         }
@@ -2449,9 +2447,9 @@ fn print_replayed_log(output: &str) {
     if output.is_empty() {
         return;
     }
-    print!("{output}");
+    out!("{output}");
     if !output.ends_with('\n') {
-        println!();
+        outln!();
     }
 }
 
@@ -2859,7 +2857,7 @@ pub(crate) fn plan_captures(
             let report_dir = match test_results::new_report_dir() {
                 Ok(dir) => dir,
                 Err(error) => {
-                    eprintln!("[aster] Warning: test results will not be captured: {error:#}");
+                    errln!("[aster] Warning: test results will not be captured: {error:#}");
                     return None;
                 }
             };
@@ -2921,7 +2919,7 @@ fn read_test_report(
                 }
             }
             Err(error) => {
-                eprintln!("[aster] Warning: test results for {address} are incomplete: {error:#}");
+                errln!("[aster] Warning: test results for {address} are incomplete: {error:#}");
                 complete = false;
                 failed_to_read = true;
             }
@@ -2933,7 +2931,7 @@ fn read_test_report(
     // A planned capture that found nothing is a lost report, not a run
     // without tests: quarantine and flake tracking see only what is captured.
     if cases.is_empty() && !failed_to_read {
-        eprintln!(
+        errln!(
             "[aster] Warning: no test results were captured for {address}; the runner's report \
              was empty or missing, so quarantine and flake tracking cannot apply to this run"
         );

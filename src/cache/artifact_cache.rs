@@ -5,6 +5,7 @@
 //! invalidation do not scan the action cache. `.aster/cache/cache.json` is
 //! obsolete and is neither read nor written.
 
+use crate::errln;
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,7 @@ impl ArtifactCache {
     /// not-yet-implemented remote is local-only and does not fail construction.
     pub fn new(cache_dir: PathBuf, workspace_root: &Path) -> Self {
         let tier = super::backend::tier_from_env(&cache_dir, workspace_root).unwrap_or_else(|error| {
-            eprintln!(
+            errln!(
                 "[aster] Warning: remote cache config ignored, using the local cache only: {error:#}"
             );
             TieredCache::local_only(LocalStore::new(cache_dir.clone()))
@@ -384,7 +385,7 @@ fn read_index_file(path: &Path) -> Result<ProjectIndex> {
     match serde_json::from_slice(&bytes) {
         Ok(index) => Ok(index),
         Err(error) => {
-            eprintln!(
+            errln!(
                 "[aster] Warning: failed to parse {}, treating project index as empty: {error}",
                 path.display()
             );

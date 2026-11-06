@@ -5,6 +5,7 @@
 //! descended into, even when they are not gitignored. Finds projects by their
 //! marker files (e.g., package.json) and merges aster.toml overrides.
 
+use crate::errln;
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -161,7 +162,7 @@ pub fn discover_projects(
         let mut metadata = match plugin.parse_project(workspace_root, &config_path) {
             Ok(metadata) => metadata,
             Err(error) if crate::plugins::python::is_not_a_project(&error) => {
-                eprintln!(
+                errln!(
                     "[aster] Warning: skipping {}: no [project].name or [tool.poetry].name",
                     config_path.display()
                 );

@@ -2,17 +2,13 @@
 //!
 //! Build orchestration for polyglot monorepos.
 
-// Same module as the library's: console writes that cannot panic.
-#[macro_use]
-#[path = "safe_io.rs"]
-mod safe_io;
-
 use anyhow::{Context, Result};
+use aster::{errln, out, outln};
 use clap::Parser;
 use console::style;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::process::ExitCode;
 
 use aster::cli::affected_files::{
@@ -54,7 +50,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(error) => {
-                eprintln!("execution supervisor: {error:#}");
+                errln!("execution supervisor: {error:#}");
                 ExitCode::FAILURE
             }
         };
@@ -62,7 +58,7 @@ fn main() -> ExitCode {
     match env::current_exe() {
         Ok(executable) => aster::executor::admission::enable(executable),
         Err(error) => {
-            eprintln!("cannot locate Aster's execution supervisor: {error}");
+            errln!("cannot locate Aster's execution supervisor: {error}");
             return ExitCode::FAILURE;
         }
     }
@@ -70,7 +66,7 @@ fn main() -> ExitCode {
         return match aster::dev::serve_from_environment() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("daemon error: {error}");
+                errln!("daemon error: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -94,7 +90,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            errln!("error: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -147,7 +143,7 @@ fn run() -> Result<()> {
                     Some(run_args)
                 }
                 Err(message) => {
-                    eprintln!("error: {message}");
+                    errln!("error: {message}");
                     std::process::exit(2);
                 }
             }
@@ -199,11 +195,11 @@ fn run() -> Result<()> {
                 no_browser,
                 loopback,
             } => {
-                eprintln!("[aster] `aster cache login` is now `aster srv login`");
+                errln!("[aster] `aster cache login` is now `aster srv login`");
                 return srv_login(*no_browser, *loopback, output_mode);
             }
             CacheCommands::Logout => {
-                eprintln!("[aster] `aster cache logout` is now `aster srv logout`");
+                errln!("[aster] `aster cache logout` is now `aster srv logout`");
                 return srv_logout();
             }
             CacheCommands::Stats { target } => {
@@ -227,7 +223,7 @@ fn run() -> Result<()> {
                 if output_mode == OutputMode::Json {
                     output_json(&serde_json::json!({"stopped": stopped.len()}))?;
                 } else if output_mode != OutputMode::Quiet {
-                    println!(
+                    outln!(
                         "Stopped {} daemon-managed service bundle{}.",
                         stopped.len(),
                         if stopped.len() == 1 { "" } else { "s" }
@@ -298,7 +294,7 @@ fn run() -> Result<()> {
                 if output_mode == OutputMode::Json {
                     output_json(&report)?;
                 } else if output_mode != OutputMode::Quiet {
-                    print!(
+                    out!(
                         "{}",
                         aster::dev::format_service_bundles(&report, &workspace_config.dev)
                     );
@@ -311,7 +307,7 @@ fn run() -> Result<()> {
                 if output_mode == OutputMode::Json {
                     output_json(&serde_json::json!({"stopped": stopped.len()}))?;
                 } else if output_mode != OutputMode::Quiet {
-                    println!(
+                    outln!(
                         "Stopped {} daemon-managed service bundle{} in this worktree.",
                         stopped.len(),
                         if stopped.len() == 1 { "" } else { "s" }
@@ -378,7 +374,7 @@ fn run() -> Result<()> {
                             aster::dev::LaunchStatus::AlreadyRunning => "Already running",
                         };
                         let group = result.bundle.display_group.as_deref().unwrap_or("default");
-                        println!(
+                        outln!(
                             "{action} service bundle '{group}' (supervisor {}).",
                             result.bundle.supervisor_pid
                         );
@@ -410,7 +406,7 @@ fn run() -> Result<()> {
         if output_mode == OutputMode::Json {
             output_json(&report)?;
         } else if output_mode != OutputMode::Quiet {
-            print!("{}", aster::dev::format_workspace_ports(&report));
+            out!("{}", aster::dev::format_workspace_ports(&report));
         }
         return Ok(());
     }
@@ -443,7 +439,7 @@ fn run() -> Result<()> {
     }
 
     if output_mode == OutputMode::Verbose {
-        eprintln!("[aster] Workspace root: {}", workspace_root.display());
+        errln!("[aster] Workspace root: {}", workspace_root.display());
     }
 
     // `aster check` reports a configuration it cannot load with its own
@@ -464,7 +460,7 @@ fn run() -> Result<()> {
         ) {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("error: {error:#}");
+                errln!("error: {error:#}");
                 2
             }
         };
@@ -479,7 +475,7 @@ fn run() -> Result<()> {
         discover_projects(&workspace_root, &registry).context("Failed to discover projects")?;
 
     if output_mode == OutputMode::Verbose {
-        eprintln!("[aster] Discovered {} projects", projects.len());
+        errln!("[aster] Discovered {} projects", projects.len());
     }
 
     let explicit_target = matches!(&command, Commands::RunTarget { .. });
@@ -549,7 +545,7 @@ fn run() -> Result<()> {
             } else if output_mode != OutputMode::Quiet {
                 // Normal or Verbose: text output with colors
                 for project in &filtered_projects {
-                    println!(
+                    outln!(
                         "{}",
                         style(format!("//{}", project.relative_path.display()))
                             .cyan()
@@ -565,9 +561,9 @@ fn run() -> Result<()> {
                         for name in target_names {
                             let target = &project.targets[name];
                             if target.depends_on.is_empty() {
-                                println!("  {}: {}", style(name).yellow(), target.command);
+                                outln!("  {}: {}", style(name).yellow(), target.command);
                             } else {
-                                println!(
+                                outln!(
                                     "  {}: {} {} {}",
                                     style(name).yellow(),
                                     target.command,
@@ -608,9 +604,9 @@ fn run() -> Result<()> {
             let range = source_graph::describe_range(commit.as_deref());
             if output_mode == OutputMode::Json {
                 let value = source_graph::render_json(&analysis, &range);
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                outln!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                print!("{}", source_graph::render_text(&analysis, &range));
+                out!("{}", source_graph::render_text(&analysis, &range));
             }
         }
         Commands::Graph { target, .. } => {
@@ -619,7 +615,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = graph.find_cycle() {
-                eprintln!("error: {cycle}");
+                errln!("error: {cycle}");
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
@@ -685,19 +681,19 @@ fn run() -> Result<()> {
                 if let Some(addr) = target {
                     // Show deps for specific target
                     if let Some(node) = graph.get(&addr) {
-                        println!("{}", style(&node.address).cyan().bold());
+                        outln!("{}", style(&node.address).cyan().bold());
                         for dep in graph.dependencies(&addr) {
-                            println!("  {} {}", style("→").dim(), style(&dep.address).dim());
+                            outln!("  {} {}", style("→").dim(), style(&dep.address).dim());
                         }
                         let inputs =
                             aster::graph::workspace_inputs(&projects, std::slice::from_ref(&addr));
                         for glob in inputs.get(&addr).into_iter().flatten() {
-                            println!("  {} {}", style("reads").dim(), style(glob).dim());
+                            outln!("  {} {}", style("reads").dim(), style(glob).dim());
                         }
                         let selectors =
                             aster::graph::selected_by(&projects, std::slice::from_ref(&addr));
                         for selector in selectors.get(&addr).into_iter().flatten() {
-                            println!("  {} {}", style("selected by").dim(), style(selector).dim());
+                            outln!("  {} {}", style("selected by").dim(), style(selector).dim());
                         }
                     } else {
                         return Err(anyhow::anyhow!("Target not found: {addr}"));
@@ -711,18 +707,18 @@ fn run() -> Result<()> {
                     for node in targets {
                         if node.project_address != current_project {
                             if !current_project.is_empty() {
-                                println!();
+                                outln!();
                             }
                             current_project = node.project_address.clone();
-                            println!("{}", style(&current_project).cyan().bold());
+                            outln!("{}", style(&current_project).cyan().bold());
                         }
                         let deps = graph.dependencies(&node.address);
                         if deps.is_empty() {
-                            println!("  {}", style(format!(":{}", node.target_name)).yellow());
+                            outln!("  {}", style(format!(":{}", node.target_name)).yellow());
                         } else {
                             let dep_strs: Vec<&str> =
                                 deps.iter().map(|d| d.address.as_str()).collect();
-                            println!(
+                            outln!(
                                 "  {} {} {}",
                                 style(format!(":{}", node.target_name)).yellow(),
                                 style("→").dim(),
@@ -759,10 +755,10 @@ fn run() -> Result<()> {
                 // Normal/Verbose: text output
                 match path {
                     Some(p) => {
-                        println!("{}", format_path(&p));
+                        outln!("{}", format_path(&p));
                     }
                     None => {
-                        println!("No dependency path found between {from} and {to}");
+                        outln!("No dependency path found between {from} and {to}");
                     }
                 }
             }
@@ -793,14 +789,14 @@ fn run() -> Result<()> {
                         if output_mode == OutputMode::Json {
                             output_json(&target_log)?;
                         } else {
-                            println!("--- {} ---", target_log.address);
+                            outln!("--- {} ---", target_log.address);
                             if !target_log.output.is_empty() {
-                                print!("{}", target_log.output);
+                                out!("{}", target_log.output);
                                 if !target_log.output.ends_with('\n') {
-                                    println!();
+                                    outln!();
                                 }
                             }
-                            println!(
+                            outln!(
                                 "[{}] {} ({}ms)",
                                 target_log.status.to_uppercase(),
                                 target_log.address,
@@ -812,7 +808,7 @@ fn run() -> Result<()> {
                         // Exit silently for missing target (per CONTEXT.md - not an error)
                         if output_mode == OutputMode::Json {
                             // Output empty object for consistency
-                            println!("{{}}");
+                            outln!("{{}}");
                         }
                     }
                 }
@@ -825,26 +821,26 @@ fn run() -> Result<()> {
                         } else {
                             use aster::ui::colors::{status_fail, status_pass, status_skip};
 
-                            println!("Last run: {} ({})", run.target, run.timestamp);
-                            println!();
+                            outln!("Last run: {} ({})", run.target, run.timestamp);
+                            outln!();
                             for result in &run.results {
                                 let status_icon = match result.status.as_str() {
                                     "passed" => status_pass(),
                                     "failed" => status_fail(),
                                     _ => status_skip(),
                                 };
-                                println!("  {} {}", status_icon, result.address);
+                                outln!("  {} {}", status_icon, result.address);
                             }
-                            println!();
-                            println!("Use `aster logs <target>` to view full output");
+                            outln!();
+                            outln!("Use `aster logs <target>` to view full output");
                         }
                     }
                     None => {
                         if output_mode == OutputMode::Json {
                             // Output empty object for no previous run
-                            println!("{{}}");
+                            outln!("{{}}");
                         } else {
-                            println!("No previous run found");
+                            outln!("No previous run found");
                         }
                     }
                 }
@@ -907,14 +903,14 @@ fn run() -> Result<()> {
             let changed_files = ignore.filter(changed_files);
 
             if output_mode == OutputMode::Verbose {
-                eprintln!("[aster] Found {} changed files", changed_files.len());
+                errln!("[aster] Found {} changed files", changed_files.len());
                 if configured_ignored > 0 {
-                    eprintln!(
+                    errln!(
                         "[aster] Ignored {configured_ignored} changed files via affected.ignore"
                     );
                 }
                 for file in &changed_files {
-                    eprintln!("  - {}", file.display());
+                    errln!("  - {}", file.display());
                 }
             }
 
@@ -929,7 +925,7 @@ fn run() -> Result<()> {
             };
 
             if output_mode == OutputMode::Verbose {
-                eprintln!("[aster] Directly affected: {directly_affected:?}");
+                errln!("[aster] Directly affected: {directly_affected:?}");
             }
 
             // Build the graph
@@ -937,7 +933,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = find_cycle(&graph) {
-                eprintln!("error: {cycle}");
+                errln!("error: {cycle}");
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
@@ -972,9 +968,11 @@ fn run() -> Result<()> {
                     facts_cache.as_deref(),
                 );
                 if output_mode == OutputMode::Verbose {
-                    eprintln!(
+                    errln!(
                         "[aster] Analysed {} source files, {} from cache ({})",
-                        analysis.files_analysed, analysis.facts_reused, analysis.timings
+                        analysis.files_analysed,
+                        analysis.facts_reused,
+                        analysis.timings
                     );
                 }
                 Some(analysis)
@@ -1109,7 +1107,7 @@ fn run() -> Result<()> {
                         &projects,
                     )?;
                     if output_mode == OutputMode::Verbose {
-                        eprintln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
+                        errln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
                     }
                 }
                 // Every mode runs the target only where it is defined. Dependents,
@@ -1160,8 +1158,8 @@ fn run() -> Result<()> {
                             lane_plans
                                 .insert(lane_label.to_string(), serde_json::to_value(&empty)?);
                         } else if output_mode != OutputMode::Quiet {
-                            println!("Lane {lane_label}: no projects affected");
-                            println!();
+                            outln!("Lane {lane_label}: no projects affected");
+                            outln!();
                         }
                         continue;
                     }
@@ -1183,11 +1181,11 @@ fn run() -> Result<()> {
                         }
                     } else if output_mode != OutputMode::Quiet {
                         if missing_among_affected {
-                            println!(
+                            outln!(
                                 "No projects define target '{target}' among the affected projects"
                             );
                         } else {
-                            println!("No projects affected");
+                            outln!("No projects affected");
                         }
                     }
                     return Ok(());
@@ -1200,10 +1198,10 @@ fn run() -> Result<()> {
                     && output_mode != OutputMode::Quiet
                     && output_mode != OutputMode::Json
                 {
-                    println!("Lane {lane_label}:");
+                    outln!("Lane {lane_label}:");
                 }
                 if output_mode == OutputMode::Verbose {
-                    eprintln!(
+                    errln!(
                         "[aster] Running '{}' on {} affected projects",
                         target,
                         ordered.len()
@@ -1212,7 +1210,7 @@ fn run() -> Result<()> {
 
                 // Machine-readable output must contain JSON only, including dry runs.
                 if output_mode != OutputMode::Quiet && output_mode != OutputMode::Json {
-                    println!(
+                    outln!(
                         "Affected projects ({}):",
                         if lane.is_some() {
                             "selected by lane"
@@ -1225,7 +1223,7 @@ fn run() -> Result<()> {
                         }
                     );
                     for p in &ordered {
-                        println!("  //{}", p.relative_path.display());
+                        outln!("  //{}", p.relative_path.display());
                     }
                 }
 
@@ -1442,61 +1440,61 @@ fn run() -> Result<()> {
 
                         if let Some(plan) = &command_plan {
                             if !plan.skipped.is_empty() {
-                                println!();
+                                outln!();
                                 if related {
-                                    println!("Skipped by --related (no test reaches the change):");
+                                    outln!("Skipped by --related (no test reaches the change):");
                                 } else {
-                                    println!(
+                                    outln!(
                                     "Skipped by --only-affected-files (no relevant changed files):"
                                 );
                                 }
                                 for addr in &plan.skipped {
-                                    println!("  {addr}");
+                                    outln!("  {addr}");
                                     for line in target_notes.get(addr).into_iter().flatten() {
-                                        println!("    > {line}");
+                                        outln!("    > {line}");
                                     }
                                 }
                             }
                         }
 
-                        println!();
+                        outln!();
                         if dep_count > 0 {
-                            println!(
+                            outln!(
                                 "Would run '{}' on {} projects (+{} dependency targets):",
                                 target,
                                 primary_addrs.len(),
                                 dep_count
                             );
                         } else {
-                            println!(
+                            outln!(
                                 "Would run '{}' on {} projects:",
                                 target,
                                 primary_addrs.len()
                             );
                         }
-                        println!();
+                        outln!();
                         for level in &levels {
                             for target_addr in level {
                                 let reason = rationale_for(target_addr);
-                                println!("  {target_addr}  ({reason})");
+                                outln!("  {target_addr}  ({reason})");
                                 if reason == "affected" {
                                     if let Some((project_addr, _)) =
                                         parse_target_address(target_addr)
                                     {
                                         if let Some(files) = files_per_project.get(&project_addr) {
                                             for file in files {
-                                                println!("    - {file}");
+                                                outln!("    - {file}");
                                             }
                                         }
                                     }
                                 }
                                 for line in target_notes.get(target_addr).into_iter().flatten() {
-                                    println!("    > {line}");
+                                    outln!("    > {line}");
                                 }
                             }
                         }
                         if several_lanes {
-                            println!();
+                            outln!();
                         }
                     }
                     if several_lanes {
@@ -1513,7 +1511,7 @@ fn run() -> Result<()> {
                 let run_record = test_results.as_ref().map(|_| {
                     detect_run(&workspace_root, &target, lane, &|name| env::var(name).ok())
                 });
-                let recorder = results_recorder(test_results.clone(), run_record);
+                let recorder = ResultsRecorder::new(test_results.clone(), run_record);
                 let executor = Executor::with_all_options(
                     &workspace_root,
                     output_mode,
@@ -1521,7 +1519,7 @@ fn run() -> Result<()> {
                     !cli.no_cache,
                 )
                 .with_test_capture(test_results.is_some())
-                .with_results_hook(recorder.clone())
+                .with_results_hook(recorder_hook(&recorder))
                 .with_retry_failed(cli.retry_failed())
                 .with_wrappers(&workspace_config.affected.related.wrappers)
                 .with_no_replay(cli.no_replay)
@@ -1537,16 +1535,16 @@ fn run() -> Result<()> {
                         addresses.sort();
                         for addr in addresses {
                             for line in &plan.notes[addr] {
-                                eprintln!("[aster] {addr}: {line}");
+                                errln!("[aster] {addr}: {line}");
                             }
                         }
                         for addr in &plan.skipped {
-                            eprintln!(
+                            errln!(
                             "[aster] Skipping {addr}: no matching files for --only-affected-files"
                         );
                         }
                         if !plan.overrides.is_empty() {
-                            eprintln!(
+                            errln!(
                                 "[aster] Using modified commands for {} targets",
                                 plan.overrides.len()
                             );
@@ -1603,7 +1601,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = target_graph.find_cycle() {
-                eprintln!("error: {cycle}");
+                errln!("error: {cycle}");
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
@@ -1650,7 +1648,7 @@ fn run() -> Result<()> {
 
             if filtered_targets.is_empty() {
                 if output_mode != OutputMode::Quiet {
-                    println!("No targets match the specified language filter");
+                    outln!("No targets match the specified language filter");
                 }
                 return Ok(());
             }
@@ -1662,11 +1660,11 @@ fn run() -> Result<()> {
             let run_record = test_results
                 .as_ref()
                 .map(|_| detect_run(&workspace_root, "run", None, &|name| env::var(name).ok()));
-            let recorder = results_recorder(test_results.clone(), run_record);
+            let recorder = ResultsRecorder::new(test_results.clone(), run_record);
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
-                    .with_results_hook(recorder.clone())
+                    .with_results_hook(recorder_hook(&recorder))
                     .with_retry_failed(cli.retry_failed())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
@@ -1766,7 +1764,7 @@ fn run() -> Result<()> {
                         (artifact_cache.clear()?, String::new())
                     };
                     if output_mode != OutputMode::Quiet {
-                        println!(
+                        outln!(
                             "Cleared {removed} cache entries{scope}. Blobs are kept until `aster cache prune`."
                         );
                     }
@@ -1809,9 +1807,11 @@ fn run() -> Result<()> {
                     if output_mode == OutputMode::Json {
                         output_json(&stats)?;
                     } else if output_mode != OutputMode::Quiet {
-                        println!(
+                        outln!(
                             "Pruned {} manifests and {} blobs ({} bytes remaining)",
-                            stats.manifests_removed, stats.blobs_removed, stats.bytes_remaining
+                            stats.manifests_removed,
+                            stats.blobs_removed,
+                            stats.bytes_remaining
                         );
                     }
                 }
@@ -1910,7 +1910,7 @@ fn run() -> Result<()> {
             let run_args = match parsed_external {
                 Some(run_args) => run_args,
                 None => parse_run_args(args.clone()).unwrap_or_else(|message| {
-                    eprintln!("error: {message}");
+                    errln!("error: {message}");
                     std::process::exit(2);
                 }),
             };
@@ -1974,7 +1974,7 @@ fn run() -> Result<()> {
 
             // Check for cycles
             if let Some(cycle) = find_cycle(&graph) {
-                eprintln!("error: {cycle}");
+                errln!("error: {cycle}");
                 return Err(anyhow::anyhow!("Dependency cycle detected"));
             }
 
@@ -1997,7 +1997,7 @@ fn run() -> Result<()> {
             let ordered = graph.topological_order_subset(&selected);
 
             if output_mode == OutputMode::Verbose {
-                eprintln!(
+                errln!(
                     "[aster] Running '{}' on {} projects",
                     run_args.target,
                     primary_projects.len()
@@ -2025,11 +2025,11 @@ fn run() -> Result<()> {
                     env::var(name).ok()
                 })
             });
-            let recorder = results_recorder(test_results.clone(), run_record);
+            let recorder = ResultsRecorder::new(test_results.clone(), run_record);
             let executor =
                 Executor::with_all_options(&workspace_root, output_mode, full_logs, !cli.no_cache)
                     .with_test_capture(test_results.is_some())
-                    .with_results_hook(recorder.clone())
+                    .with_results_hook(recorder_hook(&recorder))
                     .with_retry_failed(cli.retry_failed())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
@@ -2100,7 +2100,7 @@ fn run() -> Result<()> {
                 }
 
                 if output_mode == OutputMode::Verbose && !command_overrides.is_empty() {
-                    eprintln!(
+                    errln!(
                         "[aster] Using warnings-as-errors for {} targets",
                         command_overrides.len()
                     );
@@ -2182,39 +2182,78 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Writes the run's test results once, whichever of the executor (before it
-/// prints failure output) or the caller (after it returns) reaches it first.
-type Recorder = std::sync::Arc<dyn Fn(&[aster::executor::ExecutionResult]) + Send + Sync>;
+/// Records a run's test results in two phases so a slow or hung step cannot
+/// delay the failure output or lose the file:
+///
+/// 1. [`write`](Self::write): the local results file. The executor calls it
+///    before printing failure output.
+/// 2. [`publish`](Self::publish): the aster-srv upload and the GitHub summary.
+///    `main` calls it after the executor returns.
+///
+/// Each phase runs once, whichever call reaches it first.
+struct ResultsRecorder {
+    pending: std::sync::Mutex<Option<(Option<PathBuf>, aster_results_model::RunRecord)>>,
+    written: std::sync::Mutex<Option<PathBuf>>,
+}
 
-fn results_recorder(
-    destination: Option<Option<PathBuf>>,
-    run: Option<aster_results_model::RunRecord>,
-) -> Option<Recorder> {
-    let pending = std::sync::Mutex::new(Some((destination?, run?)));
-    Some(std::sync::Arc::new(move |results| {
-        let taken = pending.lock().ok().and_then(|mut slot| slot.take());
+impl ResultsRecorder {
+    fn new(
+        destination: Option<Option<PathBuf>>,
+        run: Option<aster_results_model::RunRecord>,
+    ) -> Option<std::sync::Arc<Self>> {
+        Some(std::sync::Arc::new(Self {
+            pending: std::sync::Mutex::new(Some((destination?, run?))),
+            written: std::sync::Mutex::new(None),
+        }))
+    }
+
+    fn write(&self, results: &[aster::executor::ExecutionResult]) {
+        let taken = self.pending.lock().ok().and_then(|mut slot| slot.take());
         if let Some((destination, run)) = taken {
-            write_test_results(Some(destination), Some(run), results);
+            let written = write_test_results_file(destination, run, results);
+            if let Ok(mut slot) = self.written.lock() {
+                *slot = written;
+            }
         }
-    }))
+    }
+
+    fn publish(&self) {
+        let path = self.written.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(path) = path {
+            if let Some(url) = srv_url(None) {
+                upload_test_results(&url, &path, OutputMode::Normal);
+            }
+            github_test_summary(&path);
+        }
+    }
+}
+
+type Recorder = std::sync::Arc<ResultsRecorder>;
+
+/// The executor hook that runs [`ResultsRecorder::write`].
+fn recorder_hook(recorder: &Option<Recorder>) -> Option<aster::executor::ResultsHook> {
+    recorder.as_ref().map(|recorder| {
+        let recorder = recorder.clone();
+        std::sync::Arc::new(move |results: &[aster::executor::ExecutionResult]| {
+            recorder.write(results)
+        }) as aster::executor::ResultsHook
+    })
 }
 
 fn record_results(recorder: Option<&Recorder>, results: &[aster::executor::ExecutionResult]) {
     if let Some(recorder) = recorder {
-        recorder(results);
+        recorder.write(results);
+        recorder.publish();
     }
 }
 
 /// Write the run's test results when recording is on. A file that cannot be
 /// written is a warning: recording never fails the build.
-fn write_test_results(
-    destination: Option<Option<PathBuf>>,
-    run: Option<aster_results_model::RunRecord>,
+fn write_test_results_file(
+    destination: Option<PathBuf>,
+    run: aster_results_model::RunRecord,
     results: &[aster::executor::ExecutionResult],
-) {
-    let (Some(destination), Some(run)) = (destination, run) else {
-        return;
-    };
+) -> Option<PathBuf> {
     let path = destination.unwrap_or_else(|| aster::test_results::default_path(&run.run_id));
     let records = aster::test_results::records(run, results);
     let tests = records
@@ -2222,20 +2261,17 @@ fn write_test_results(
         .filter(|record| matches!(record, aster_results_model::Record::Test(_)))
         .count();
     match aster::test_results::write(&path, &records) {
-        Ok(()) => eprintln!(
+        Ok(()) => errln!(
             "[aster] Test results ({tests} test{}) written to {}",
             if tests == 1 { "" } else { "s" },
             path.display()
         ),
         Err(error) => {
-            eprintln!("[aster] Warning: {error:#}");
-            return;
+            errln!("[aster] Warning: {error:#}");
+            return None;
         }
     }
-    if let Some(url) = srv_url(None) {
-        upload_test_results(&url, &path, OutputMode::Normal);
-    }
-    github_test_summary(&path);
+    Some(path)
 }
 
 /// `aster results ...`.
@@ -2260,13 +2296,15 @@ fn handle_check(
     };
     let report = aster::check::run(workspace_root, &projects, &registry, &config, &options)?;
     if output_mode == OutputMode::Json {
-        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+        outln!("{}", serde_json::to_string_pretty(&report.to_json())?);
     } else {
-        print!("{}", report.render_text());
+        out!("{}", report.render_text());
         if output_mode == OutputMode::Verbose {
-            eprintln!(
+            errln!(
                 "[aster] Checked {} source files, {} from cache, in {} ms",
-                report.stats.source_files, report.stats.facts_reused, report.stats.elapsed_ms
+                report.stats.source_files,
+                report.stats.facts_reused,
+                report.stats.elapsed_ms
             );
         }
     }
@@ -2292,7 +2330,7 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
                 flaky_warnings: true,
             },
             &|name| env::var(name).ok(),
-            &mut io::stdout().lock(),
+            &mut aster::safe_io::ConsoleOut,
         ),
         ResultsCommands::Failures {
             github_run,
@@ -2315,7 +2353,7 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
                 .ok_or_else(|| {
                     anyhow::anyhow!("aster-srv has no results for GitHub run {github_run}")
                 })?;
-            println!("{report}");
+            outln!("{report}");
             Ok(())
         }
         ResultsCommands::Flaky { target } => {
@@ -2358,13 +2396,13 @@ fn handle_results(command: &ResultsCommands, output_mode: OutputMode) -> Result<
             balance::write(&workspace_root, &file)?;
             if output_mode != OutputMode::Quiet {
                 for (dir, suite) in &file.suites {
-                    eprintln!(
+                    errln!(
                         "[aster] {dir}: {} files timed from {} partitions",
                         suite.files.len(),
                         suite.targets.len()
                     );
                 }
-                eprintln!(
+                errln!(
                     "[aster] Wrote {}",
                     workspace_root.join(balance::FILE).display()
                 );
@@ -2411,34 +2449,33 @@ fn srv_login(no_browser: bool, loopback: bool, output_mode: OutputMode) -> Resul
             }
             match announcement.flow {
                 Flow::OpenedBrowser => {
-                    println!("Opening your browser to sign in. If it does not open, visit:")
+                    outln!("Opening your browser to sign in. If it does not open, visit:")
                 }
-                Flow::LoopbackUrl => println!("Open this URL in a browser to sign in:"),
+                Flow::LoopbackUrl => outln!("Open this URL in a browser to sign in:"),
                 Flow::Code(reason) => {
                     match reason {
                         CodeReason::Requested => {}
-                        CodeReason::RemoteSession => println!(
+                        CodeReason::RemoteSession => outln!(
                             "This looks like a remote shell, so Aster will ask for a code instead of a redirect."
                         ),
-                        CodeReason::BrowserFailed => println!(
+                        CodeReason::BrowserFailed => outln!(
                             "Could not open a browser, so Aster will ask for a code instead of a redirect."
                         ),
                     }
-                    println!("Open this URL in a browser on any computer and sign in:");
+                    outln!("Open this URL in a browser on any computer and sign in:");
                 }
             }
-            println!("{}", announcement.url);
-            println!(
+            outln!("{}", announcement.url);
+            outln!(
                 "Confirm only if the page shows this code: {}",
                 announcement.user_code
             );
             if copy {
-                println!("Request id: {}", announcement.request_id);
-                println!("{}", aster::cache::PASTE_WARNING);
-                print!("Paste the code the page shows, then press Enter: ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
+                outln!("Request id: {}", announcement.request_id);
+                outln!("{}", aster::cache::PASTE_WARNING);
+                out!("Paste the code the page shows, then press Enter: ");
             } else {
-                println!("Waiting for the browser (Ctrl-C to cancel)...");
+                outln!("Waiting for the browser (Ctrl-C to cancel)...");
             }
         },
         &mut std::io::stdin().lock(),
@@ -2452,7 +2489,7 @@ fn srv_login(no_browser: bool, loopback: bool, output_mode: OutputMode) -> Resul
         let until = chrono::DateTime::from_timestamp(signed_in.expires_at as i64, 0)
             .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
             .unwrap_or_else(|| "it expires".to_string());
-        println!(
+        outln!(
             "Signed in{who}. Token stored at {} until {until}.",
             signed_in.path.display()
         );
@@ -2465,15 +2502,15 @@ fn srv_logout() -> Result<()> {
     let server = srv_login_url(None, "logout")?;
     let signed_out = aster::cache::logout(&server)?;
     if let Some(path) = &signed_out.deleted {
-        println!("Deleted {}.", path.display());
+        outln!("Deleted {}.", path.display());
     }
     match signed_out.revoked {
         Ok(()) => {
-            println!("Signed out: the server refuses every token issued to you before now.");
+            outln!("Signed out: the server refuses every token issued to you before now.");
             Ok(())
         }
         Err(reason) if signed_out.deleted.is_none() => {
-            println!("Nothing to do: {reason}.");
+            outln!("Nothing to do: {reason}.");
             Ok(())
         }
         Err(reason) => anyhow::bail!(
@@ -2492,7 +2529,7 @@ fn srv_whoami(url: Option<&str>) -> Result<()> {
         .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "it expires".to_string());
     let who = stored.email.as_deref().unwrap_or("an unknown account");
-    println!("Signed in to {} as {who} until {until}.", stored.server);
+    outln!("Signed in to {} as {who} until {until}.", stored.server);
     Ok(())
 }
 
@@ -2532,7 +2569,7 @@ fn handle_srv(command: &SrvCommands, output_mode: OutputMode) -> Result<()> {
         ),
     };
     if let Some(renamed) = renamed {
-        eprintln!("[aster] this command is now `aster {renamed}`");
+        errln!("[aster] this command is now `aster {renamed}`");
     }
     print_srv_dataset(&path, target)
 }
@@ -2552,7 +2589,7 @@ fn print_srv_dataset(path: &str, target: &SrvTarget) -> Result<()> {
         &env_var,
         std::time::SystemTime::now(),
     )?;
-    println!("{}", serde_json::to_string_pretty(&body)?);
+    outln!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
 
@@ -2605,10 +2642,10 @@ fn github_test_summary(path: &Path) {
             flaky_warnings: false,
         },
         &|name| env::var(name).ok(),
-        &mut io::stderr().lock(),
+        &mut aster::safe_io::ConsoleErr,
     );
     if let Err(error) = result {
-        eprintln!("[aster] Warning: test results summary not written: {error:#}");
+        errln!("[aster] Warning: test results summary not written: {error:#}");
     }
 }
 
@@ -2617,7 +2654,7 @@ fn github_test_summary(path: &Path) {
 fn upload_test_results(url: &str, path: &Path, output_mode: OutputMode) -> bool {
     use aster::test_results::upload::{upload, Credentials};
     let Some(credentials) = Credentials::from_env(&|name| env::var(name).ok()) else {
-        eprintln!(
+        errln!(
             "[aster] Warning: test results not uploaded: no credentials. In GitHub Actions \
              grant `id-token: write`; elsewhere set ASTER_SRV_TOKEN."
         );
@@ -2629,7 +2666,7 @@ fn upload_test_results(url: &str, path: &Path, output_mode: OutputMode) -> bool 
     match upload(url, path, &credentials, proxy_token.as_deref()) {
         Ok(receipt) => {
             if output_mode != OutputMode::Quiet {
-                eprintln!(
+                errln!(
                     "[aster] Test results uploaded: run {}{}",
                     receipt.run_id,
                     if receipt.duplicate {
@@ -2642,14 +2679,14 @@ fn upload_test_results(url: &str, path: &Path, output_mode: OutputMode) -> bool 
             true
         }
         Err(error) => {
-            eprintln!("[aster] Warning: test results not uploaded: {error:#}");
+            errln!("[aster] Warning: test results not uploaded: {error:#}");
             false
         }
     }
 }
 
 fn print_skills() -> Result<()> {
-    match io::stdout().lock().write_all(SKILLS_MARKDOWN.as_bytes()) {
+    match aster::safe_io::write_stdout_checked(SKILLS_MARKDOWN.as_bytes()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(error).context("Failed to write the Aster skills guide"),
@@ -2686,12 +2723,12 @@ fn print_heterogeneous_summary(
     };
 
     if output_mode == OutputMode::Quiet {
-        println!("{passed} passed{cached_summary}, {failed} failed{blocked_summary}");
+        outln!("{passed} passed{cached_summary}, {failed} failed{blocked_summary}");
         return;
     }
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{} {} passed{}, {} failed{}{}",
         if failed > 0 || blocked > 0 {
             style("✗").red()
@@ -2787,7 +2824,7 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     }
 
     if verbose {
-        eprintln!("Workspace root: {}", workspace_root.display());
+        errln!("Workspace root: {}", workspace_root.display());
     }
 
     // Write minimal aster.toml
@@ -2798,10 +2835,10 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
     fs::write(&aster_toml_path, content)
         .with_context(|| format!("Failed to write {}", aster_toml_path.display()))?;
 
-    println!("Created {}", aster_toml_path.display());
+    outln!("Created {}", aster_toml_path.display());
 
     if ensure_aster_gitignored(&workspace_root)? {
-        println!("Updated .gitignore");
+        outln!("Updated .gitignore");
     }
 
     // Set up plugin registry
@@ -2813,14 +2850,14 @@ fn handle_init(cwd: &std::path::Path, verbose: bool) -> Result<()> {
 
     // Print discovery summary
     if projects.is_empty() {
-        println!("No projects discovered yet.");
+        outln!("No projects discovered yet.");
     } else {
-        print!("Found {} projects: ", projects.len());
+        out!("Found {} projects: ", projects.len());
         let addrs: Vec<String> = projects
             .iter()
             .map(|p| format!("//{}", p.relative_path.display()))
             .collect();
-        println!("{}", addrs.join(", "));
+        outln!("{}", addrs.join(", "));
     }
 
     Ok(())
@@ -2992,11 +3029,11 @@ fn handle_project_init(
         .with_context(|| format!("Failed to write {}", aster_toml_path.display()))?;
 
     if output_mode != OutputMode::Quiet {
-        println!("Created {}", aster_toml_path.display());
+        outln!("Created {}", aster_toml_path.display());
         if let Some(plugin) = detected_plugin {
-            println!("Detected language: {plugin}");
+            outln!("Detected language: {plugin}");
         } else {
-            println!("No language detected - using generic template");
+            outln!("No language detected - using generic template");
         }
     }
 
@@ -3244,7 +3281,7 @@ fn print_cache_status(
 ) -> Result<()> {
     if output_mode == OutputMode::Json {
         if target.is_some_and(|addr| addr.contains(':')) && status.targets.is_empty() {
-            println!("null");
+            outln!("null");
             return Ok(());
         }
         output_json(status)?;
@@ -3253,20 +3290,24 @@ fn print_cache_status(
 
     if let Some(addr) = target.filter(|addr| addr.contains(':')) {
         if status.targets.is_empty() {
-            println!("{addr}: not cached");
+            outln!("{addr}: not cached");
             return Ok(());
         }
     }
 
-    println!("Cache dir: {}", status.cache_dir);
+    outln!("Cache dir: {}", status.cache_dir);
     if status.targets.is_empty() {
-        println!("No cached targets");
+        outln!("No cached targets");
         return Ok(());
     }
-    println!("Cached targets ({}):", status.targets.len());
-    println!(
+    outln!("Cached targets ({}):", status.targets.len());
+    outln!(
         "  {:<24} {:<12} {:>8} {:>12} {:>6}  CREATED",
-        "ADDRESS", "KEY", "OUTPUTS", "BYTES", "EXIT"
+        "ADDRESS",
+        "KEY",
+        "OUTPUTS",
+        "BYTES",
+        "EXIT"
     );
     for row in &status.targets {
         let key = &row.key[..CACHE_HASH_DISPLAY_LENGTH.min(row.key.len())];
@@ -3274,9 +3315,14 @@ fn print_cache_status(
             .exit_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "-".to_string());
-        println!(
+        outln!(
             "  {:<24} {:<12} {:>8} {:>12} {:>6}  {}",
-            row.address, key, row.outputs, row.output_bytes, exit, row.created_at
+            row.address,
+            key,
+            row.outputs,
+            row.output_bytes,
+            exit,
+            row.created_at
         );
     }
     Ok(())
@@ -3369,55 +3415,55 @@ fn print_cache_inputs(
         );
         output_json(&ordered)?;
     } else {
-        println!("salt: {}", material.salt.replace('\n', " "));
-        println!("platform: {}", material.platform);
+        outln!("salt: {}", material.salt.replace('\n', " "));
+        outln!("platform: {}", material.platform);
         if material.files.is_empty() {
-            println!("files: (none)");
+            outln!("files: (none)");
         } else {
-            println!("files:");
+            outln!("files:");
             for file in &material.files {
-                println!("  {} {}", file.digest, file.path);
+                outln!("  {} {}", file.digest, file.path);
             }
         }
-        println!("command: {}", material.command);
+        outln!("command: {}", material.command);
         if material.deps.is_empty() {
-            println!("deps: (none)");
+            outln!("deps: (none)");
         } else {
-            println!("deps:");
+            outln!("deps:");
             for dep in &material.deps {
                 match &dep.hash {
-                    Some(hash) => println!("  {} {hash}", dep.address),
-                    None => println!("  {} (no key)", dep.address),
+                    Some(hash) => outln!("  {} {hash}", dep.address),
+                    None => outln!("  {} (no key)", dep.address),
                 }
             }
         }
         if material.env.is_empty() {
-            println!("env: (none)");
+            outln!("env: (none)");
         } else {
-            println!("env:");
+            outln!("env:");
             for var in &material.env {
                 match &var.value_hash {
-                    Some(hash) => println!("  {} set {hash}", var.name),
-                    None => println!("  {} unset", var.name),
+                    Some(hash) => outln!("  {} set {hash}", var.name),
+                    None => outln!("  {} unset", var.name),
                 }
             }
         }
         if !material.path_env.is_empty() {
-            println!("path-env:");
+            outln!("path-env:");
             for var in &material.path_env {
                 if let Some(hash) = &var.value_hash {
-                    println!("  {} set {hash}", var.name);
+                    outln!("  {} set {hash}", var.name);
                 }
             }
         }
         if material.runtime.is_empty() {
-            println!("runtime: (none)");
+            outln!("runtime: (none)");
         } else {
-            println!("runtime:");
+            outln!("runtime:");
             for input in &material.runtime {
                 match &input.output_hash {
-                    Some(hash) => println!("  {} {hash}", input.cmd),
-                    None => println!(
+                    Some(hash) => outln!("  {} {hash}", input.cmd),
+                    None => outln!(
                         "  {} failed: {}",
                         input.cmd,
                         input.error.as_deref().unwrap_or("unknown error")
@@ -3427,16 +3473,16 @@ fn print_cache_inputs(
         }
         let outputs = effective_outputs(target);
         if outputs.is_empty() {
-            println!("outputs: (none)");
+            outln!("outputs: (none)");
         } else {
-            println!("outputs:");
+            outln!("outputs:");
             for output in outputs {
-                println!("  {output}");
+                outln!("  {output}");
             }
         }
         match &key {
-            Ok(key) => println!("key: {key}"),
-            Err(_) => println!("key: (unavailable)"),
+            Ok(key) => outln!("key: {key}"),
+            Err(_) => outln!("key: (unavailable)"),
         }
     }
 

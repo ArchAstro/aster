@@ -1,0 +1,13 @@
+# Console output goes through `aster::safe_io` (see its module docs): the std
+# print macros and raw stdout/stderr handles panic or fail on a full
+# non-blocking pipe. `safe_io` and the TUI allow these locally.
+disallowed-macros = [
+    { path = "std::println", reason = "use `outln!` (aster::safe_io)" },
+    { path = "std::print", reason = "use `out!` (aster::safe_io)" },
+    { path = "std::eprintln", reason = "use `errln!` (aster::safe_io)" },
+    { path = "std::eprint", reason = "use `err!` (aster::safe_io)" },
+]
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "use `ConsoleOut`, `outln!` or `write_stdout_checked` (aster::safe_io)" },
+    { path = "std::io::stderr", reason = "use `ConsoleErr`, `errln!` (aster::safe_io)" },
+]

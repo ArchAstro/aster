@@ -1,6 +1,7 @@
 //! Host execution admission for the CLI. File locks, not PID files or clocks,
 //! own capacity. An exec'd command supervisor retains them if its scheduler dies.
 
+use crate::errln;
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -283,7 +284,7 @@ impl Host {
             }
             drop(files);
             if !reported_wait {
-                eprintln!(
+                errln!(
                     "[aster] Waiting for execution admission: {address} (host capacity {})",
                     self.capacity
                 );
@@ -419,7 +420,7 @@ fn supervise() -> Result<i32> {
             Ok(request) => request,
             Err(error) => {
                 if !control_error {
-                    eprintln!("cannot read ancestor cancellation: {error}");
+                    errln!("cannot read ancestor cancellation: {error}");
                 }
                 control_error = true;
                 (true, false)
@@ -428,7 +429,7 @@ fn supervise() -> Result<i32> {
         if super::shutdown_requested() || inherited_cancel || inherited_force || control_error {
             let since = terminating.get_or_insert_with(|| {
                 if let Err(error) = fs::write(spec.family.directory.join("cancel"), []) {
-                    eprintln!("cannot propagate execution cancellation: {error}");
+                    errln!("cannot propagate execution cancellation: {error}");
                     control_error = true;
                 }
                 unsafe {
@@ -443,7 +444,7 @@ fn supervise() -> Result<i32> {
             {
                 forced = true;
                 if let Err(error) = fs::write(spec.family.directory.join("force"), []) {
-                    eprintln!("cannot propagate forced execution cancellation: {error}");
+                    errln!("cannot propagate forced execution cancellation: {error}");
                     control_error = true;
                 }
                 unsafe {
@@ -459,7 +460,7 @@ fn supervise() -> Result<i32> {
                 Ok(result) => status = result,
                 Err(error) => {
                     if !wait_failed {
-                        eprintln!("cannot observe admitted target: {error}");
+                        errln!("cannot observe admitted target: {error}");
                     }
                     wait_failed = true;
                     control_error = true;
@@ -474,7 +475,7 @@ fn supervise() -> Result<i32> {
                 Ok(false) => {}
                 Err(error) => {
                     if !control_error {
-                        eprintln!("cannot observe nested borrowers: {error}");
+                        errln!("cannot observe nested borrowers: {error}");
                     }
                     control_error = true;
                 }

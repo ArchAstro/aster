@@ -1,3 +1,4 @@
+use crate::{errln, outln};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -325,7 +326,7 @@ pub fn run_dev(
                             watch_deadline.get_or_insert_with(|| Instant::now() + watch_debounce);
                         }
                         Ok(_) => {}
-                        Err(error) => eprintln!("[services] watcher error: {error}"),
+                        Err(error) => errln!("[services] watcher error: {error}"),
                     }
                 }
                 if watch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -546,7 +547,7 @@ pub fn run_dev(
     })();
 
     drop(terminal);
-    eprintln!("[services] shutting down services...");
+    errln!("[services] shutting down services...");
     executor::request_shutdown();
     pending_starts.clear();
     if let Some(active) = active_start.take() {
@@ -1149,7 +1150,7 @@ fn drain_logs(
         let _ = durable_log_tx.send(event.clone());
         if !ui {
             let stream = if event.stderr { "!" } else { "|" };
-            println!("[{}] {stream} {}", event.service, event.line);
+            outln!("[{}] {stream} {}", event.service, event.line);
         }
         #[cfg(unix)]
         if let Some(session) = session {
@@ -1310,7 +1311,7 @@ fn write_published_service_state(
     })();
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary);
-        eprintln!(
+        errln!(
             "[services] failed to publish service state {}: {error}",
             path.display()
         );
@@ -1318,13 +1319,13 @@ fn write_published_service_state(
 }
 
 fn print_plan(plan: &DevPlan) {
-    eprintln!("[services] {} service(s)", plan.services.len());
+    errln!("[services] {} service(s)", plan.services.len());
     for service in &plan.services {
         let port = service
             .port
             .map(|port| format!(" :{port}"))
             .unwrap_or_default();
-        eprintln!(
+        errln!(
             "[services]   {}{port} -> {}{}",
             service.name,
             service.target_address,
@@ -1336,7 +1337,7 @@ fn print_plan(plan: &DevPlan) {
         );
     }
     if let Some(port) = plan.control_port {
-        eprintln!("[services]   control :{port}");
+        errln!("[services]   control :{port}");
     }
 }
 
@@ -1370,7 +1371,7 @@ impl ControlServer {
         })?;
         listener.set_nonblocking(true)?;
         let (token, token_path) = create_control_token(port)?;
-        eprintln!("[services]   control token {}", token_path.display());
+        errln!("[services]   control token {}", token_path.display());
         let stop = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();

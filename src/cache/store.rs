@@ -1,5 +1,6 @@
 //! Cache storage and retrieval
 
+use crate::errln;
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
@@ -86,7 +87,7 @@ impl CacheStore {
         match serde_json::from_str(&content) {
             Ok(state) => Ok(state),
             Err(error) => {
-                eprintln!(
+                errln!(
                     "Warning: failed to parse {}, treating cache as empty: {error}",
                     self.cache_path.display()
                 );

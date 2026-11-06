@@ -1,3 +1,4 @@
+use crate::outln;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -549,7 +550,7 @@ fn forward_log_line(
     let _ = senders.durable.send(event.clone());
     if !senders.ui {
         let stream = if stderr { "!" } else { "|" };
-        println!("[{service}] {stream} {}", event.line);
+        outln!("[{service}] {stream} {}", event.line);
         return;
     }
     match senders.dashboard.try_send(event) {

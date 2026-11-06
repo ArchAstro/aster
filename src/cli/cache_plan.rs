@@ -5,6 +5,7 @@
 //! loop over a dynamic list of steps, so the plan also emits one combined
 //! entry covering every path.
 
+use crate::outln;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -316,18 +317,18 @@ fn combined_entry(entries: &[CachePlanEntry], platform: &str) -> CombinedCacheEn
 }
 
 fn print_table(plan: &CachePlan) {
-    println!("{:<28} {:<16} KEY", "ID", "PROJECTS");
+    outln!("{:<28} {:<16} KEY", "ID", "PROJECTS");
     for entry in &plan.entries {
-        println!(
+        outln!(
             "{:<28} {:<16} {}",
             entry.id,
             entry.projects.len(),
             entry.key
         );
     }
-    println!();
-    println!("combined  {}", plan.combined.key);
-    println!("paths     {}", plan.combined.paths.len());
+    outln!();
+    outln!("combined  {}", plan.combined.key);
+    outln!("paths     {}", plan.combined.paths.len());
 }
 
 /// Append the combined entry using the actions/cache output contract.

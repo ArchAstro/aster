@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! End-to-end tests for `aster affected --related`: source-level selection
 //! of the tests a change reaches.
 

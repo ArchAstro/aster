@@ -7,8 +7,8 @@
 //!
 //! Writes to stderr so JSON output on stdout remains clean.
 
+use crate::errln;
 use std::collections::HashMap;
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,11 +67,11 @@ impl ProgressDisplay {
     /// - CI mode (auto-detected): Simple line-by-line output with timestamps
     pub fn with_verbose(enabled: bool, verbose: bool) -> Self {
         // Auto-detect CI mode: when stderr is not a terminal, use simple line output
-        let ci_mode = enabled && !std::io::stderr().is_terminal();
+        let ci_mode = enabled && !crate::safe_io::stderr_is_terminal();
 
         // In CI mode, don't use MultiProgress (no spinners needed)
         let multi = if enabled && !ci_mode {
-            MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
+            MultiProgress::with_draw_target(crate::safe_io::ProgressTerm::draw_target())
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
@@ -195,7 +195,7 @@ impl ProgressDisplay {
 
         // CI mode: print START message and return (no spinner)
         if self.ci_mode {
-            eprintln!(
+            errln!(
                 "{} {} {}",
                 style(format_timestamp()).dim(),
                 style("START").cyan(),
@@ -233,7 +233,7 @@ impl ProgressDisplay {
 
         // CI mode: print SKIP with timestamp
         if self.enabled && self.ci_mode {
-            eprintln!(
+            errln!(
                 "{} {} {}",
                 style(format_timestamp()).dim(),
                 style("SKIP").yellow(),
@@ -272,7 +272,7 @@ impl ProgressDisplay {
         let duration = format_duration(duration_ms);
         let suffix = format!("({})", style("cached").dim());
         if self.ci_mode {
-            eprintln!(
+            errln!(
                 "{} {} {} ({}) {suffix}",
                 style(format_timestamp()).dim(),
                 style("PASS").green(),
@@ -357,7 +357,7 @@ impl ProgressDisplay {
         if self.ci_mode {
             let duration_str = format_duration(duration_ms);
             if success {
-                eprintln!(
+                errln!(
                     "{} {} {} ({}){flaky_note}",
                     style(format_timestamp()).dim(),
                     style("PASS").green(),
@@ -365,7 +365,7 @@ impl ProgressDisplay {
                     style(duration_str).dim()
                 );
             } else {
-                eprintln!(
+                errln!(
                     "{} {} {} ({})",
                     style(format_timestamp()).dim(),
                     style("FAIL").red(),
@@ -418,11 +418,11 @@ impl ProgressDisplay {
     /// Print a message above the progress bars
     ///
     /// Uses multi.println() to avoid interfering with spinner output.
-    /// In CI mode, uses eprintln! directly since there are no spinners.
+    /// In CI mode, uses errln! directly since there are no spinners.
     pub fn println(&self, msg: &str) {
         if self.enabled {
             if self.ci_mode {
-                eprintln!("{msg}");
+                errln!("{msg}");
             } else {
                 let _ = self.multi.println(msg);
             }

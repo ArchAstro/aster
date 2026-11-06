@@ -1,5 +1,6 @@
 //! Go language plugin for go.mod parsing
 
+use crate::errln;
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -459,7 +460,7 @@ pub fn exec_go_test(selection: Option<&str>, args: &[String]) -> Result<i32> {
     };
     for command in commands {
         let argv = shell_words::split(&command)?;
-        eprintln!("[aster] external Go after setup: {command}");
+        errln!("[aster] external Go after setup: {command}");
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .status()
@@ -863,7 +864,7 @@ mod tests {
             .filter(|output| output.status.success())
             .is_none()
         {
-            eprintln!("skipping: go is not installed");
+            errln!("skipping: go is not installed");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
