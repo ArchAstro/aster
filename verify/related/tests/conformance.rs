@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! Canonical end-to-end proof: the model's scenarios drive the real
 //! `aster affected --related` engine, and its answers are held to the model's.
 
