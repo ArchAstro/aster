@@ -6,7 +6,6 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::{self, Write};
 
 use crate::executor::ExecutionResult;
 
@@ -28,16 +27,13 @@ pub enum OutputMode {
 /// Uses pretty printing if stdout is a terminal, compact otherwise.
 /// Always ensures trailing newline.
 pub fn output_json<T: Serialize>(value: &T) -> Result<()> {
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-
-    if console::Term::stdout().is_term() {
-        serde_json::to_writer_pretty(&mut handle, value)?;
+    let mut bytes = if console::Term::stdout().is_term() {
+        serde_json::to_vec_pretty(value)?
     } else {
-        serde_json::to_writer(&mut handle, value)?;
-    }
-
-    writeln!(handle)?;
+        serde_json::to_vec(value)?
+    };
+    bytes.push(b'\n');
+    crate::safe_io::write_stdout_checked(&bytes)?;
     Ok(())
 }
 
