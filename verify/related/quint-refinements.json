@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "modelDigest": "sha256:81528aa652460b24a58a73560ac733fdc4f1aa46048727c9d42c0a8c63b8a82d",
+  "modelDigest": "sha256:f606fb637403c380ec84392a65d81e8d1dc3db7898fef6659283258a442cacd8",
   "vocabulary": {
     "actions": [
       "build",
