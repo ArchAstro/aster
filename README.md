@@ -870,6 +870,15 @@ How a change is followed:
   so does a shorter base such as `"/api/orders"` that code may extend. If no
   code names a route's path, everything that goes through the router is
   affected instead.
+- A public function of an Elixir `defimpl` for a protocol the workspace
+  declares is reached by calls to the protocol's function of the same name
+  (`Protocol.fun(x)`, `&Protocol.fun/1`, `apply(Protocol, :fun, args)`) and
+  by calls to the implementation module (`Protocol.Type.fun(x)`). Code that
+  only names the type (`%Type{}`, `Type.t()`) does not reach it. A private
+  function of the implementation is reached through the functions that call
+  it. An implementation of a protocol from outside the workspace
+  (`String.Chars`, `Jason.Encoder`), or one that nothing calls through its
+  protocol, is reached by every user of the type, as before.
 - Methods, and functions of an Elixir `defimpl`, are reached through a
   value, so their callers need not import their file. They are matched by
   name, against member accesses (`value.name`) in the changed project and

@@ -140,6 +140,14 @@ fn lists_modules(receiver: &str, function: &str, call: Node, source: &str) -> bo
     }
 }
 
+/// A `defimpl` with no `for:` implements its protocol for the module it
+/// is written in.
+fn types_of_enclosing(module: Option<&str>, protocol: &str, modules: &mut Vec<String>) {
+    if let Some(outer) = module {
+        modules.push(format!("{protocol}.{outer}"));
+    }
+}
+
 fn call_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
     if node.kind() != "call" {
         return None;
@@ -482,6 +490,16 @@ impl Walker<'_> {
                     self.node(*arg, scope, module);
                     self.impl_modules(*arg);
                 }
+                // The implementation is a module of its own, `Protocol.Type`,
+                // which callers can name.
+                if let Some((protocol, types)) = self.impl_of.split_first() {
+                    if types.is_empty() {
+                        types_of_enclosing(module, protocol, &mut self.facts.modules);
+                    }
+                    for implemented in types {
+                        self.facts.modules.push(format!("{protocol}.{implemented}"));
+                    }
+                }
             } else if !full.is_empty() {
                 self.facts.modules.push(full.clone());
             }
@@ -516,7 +534,10 @@ impl Walker<'_> {
                 DefKind::Function
             };
             let mut def = Def::new(defined.clone(), kind, span(node));
-            def.callback = scope.in_impl || CALLBACKS.contains(&defined.as_str());
+            // The runtime calls public functions: a private one is reached
+            // only by the functions of its module that name it.
+            let private = name.ends_with('p');
+            def.callback = !private && (scope.in_impl || CALLBACKS.contains(&defined.as_str()));
             if name == "def" {
                 if let Some(head) = arguments(node).first() {
                     def.accepts = self.accepted_tag(&defined, *head);
@@ -527,7 +548,10 @@ impl Walker<'_> {
                 // (an atom, picked up by the walk) says otherwise.
                 def.atoms.insert(defined.clone());
             }
-            def.via = self.impl_of.clone();
+            if !private {
+                def.via = self.impl_of.clone();
+                def.protocol = self.impl_of.first().cloned();
+            }
             let owner = self.facts.push(def);
             let inner = Scope {
                 owner,
@@ -1043,6 +1067,64 @@ end
             .filter(|d| d.name == name)
             .nth(nth)
             .unwrap()
+    }
+
+    #[test]
+    fn an_implementation_is_a_module_and_only_its_public_functions_dispatch() {
+        let source = r#"defimpl Shop.Price, for: Shop.Item do
+  def cost(item), do: base(item) + 1
+  defp base(item), do: item.cents
+end
+
+defmodule Shop.Gadget do
+  defimpl Shop.Price do
+    def cost(_), do: 2
+  end
+
+  def init(arg), do: arg
+  defp update(arg), do: arg
+end
+"#;
+        let facts = extract(Path::new("lib/shop/item.ex"), source);
+        assert_eq!(
+            facts.modules,
+            [
+                "Shop.Price.Shop.Item",
+                "Shop.Gadget",
+                "Shop.Price.Shop.Gadget"
+            ]
+        );
+        let cost = def_named(&facts, "cost", 0);
+        assert!(cost.callback);
+        assert_eq!(cost.protocol.as_deref(), Some("Shop.Price"));
+        assert_eq!(cost.via, ["Shop.Price", "Shop.Item"]);
+        // A private function is no callback, however it is named or where.
+        let base = def_named(&facts, "base", 0);
+        assert!(!base.callback);
+        assert!(base.protocol.is_none() && base.via.is_empty());
+        assert!(!def_named(&facts, "update", 0).callback);
+        assert!(def_named(&facts, "init", 0).callback);
+        let nested = def_named(&facts, "cost", 1);
+        assert_eq!(nested.protocol.as_deref(), Some("Shop.Price"));
+    }
+
+    #[test]
+    fn a_protocol_function_is_called_by_capture_and_by_apply() {
+        let source = r#"defmodule Shop.Report do
+  alias Shop.Price
+
+  def all(items), do: Enum.map(items, &Price.cost/1)
+  def piped(item), do: item |> Price.cost()
+  def later(item), do: apply(Price, :cost, [item])
+  def impl(item), do: Price.impl_for(item).cost(item)
+end
+"#;
+        let facts = extract(Path::new("lib/shop/report.ex"), source);
+        let cost = ("Shop.Price".to_string(), "cost".to_string());
+        assert!(def_named(&facts, "all", 0).calls.contains(&cost));
+        assert!(def_named(&facts, "piped", 0).calls.contains(&cost));
+        assert!(def_named(&facts, "later", 0).atoms.contains("cost"));
+        assert!(def_named(&facts, "impl", 0).atoms.contains("cost"));
     }
 
     #[test]
