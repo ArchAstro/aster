@@ -707,10 +707,10 @@ impl Walker<'_> {
             (Some("Phoenix.PubSub"), "broadcast_from" | "broadcast_from!") => 3,
             // Phoenix.ChannelTest's `push(socket, "event", payload)`.
             (None, "push") => 1,
-            // A reply goes to the process that called; which message is not seen.
+            // Calls to several nodes: which message is not seen.
             (
                 Some("GenServer" | ":gen_server" | ":gen_statem" | "GenStateMachine"),
-                "reply" | "multi_call",
+                "multi_call",
             ) => {
                 self.facts.owner(owner).sends_any = true;
                 return;
@@ -1262,7 +1262,8 @@ end
         assert!(!sends_any("applied_plain"));
         assert!(sends_any("applied_dynamic"));
         assert!(sends_any("applied_send"));
-        assert!(sends_any("reply"));
+        // A reply answers a call; it is no message for a clause.
+        assert!(!sends_any("reply"));
         assert!(!sends_any("handed"));
     }
 
@@ -1353,8 +1354,7 @@ end
         assert_eq!(sent("push_event"), (vec!["s:new_msg"], false));
         assert_eq!(sent("interpolated"), (vec![], true));
         assert_eq!(sent("next"), (vec!["a:load"], false));
-        // A reply is a message to the caller, whose handler is not seen.
-        assert_eq!(sent("reply"), (vec![], true));
+        assert_eq!(sent("reply"), (vec![], false));
         assert_eq!(sent("unrelated"), (vec![], false));
     }
 

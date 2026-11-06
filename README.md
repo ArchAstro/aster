@@ -972,7 +972,7 @@ How a change is followed:
   channel test's `push/3`, and `{:continue, tag}` or `{:next_event, ...}`
   return values. A sender whose message is not a literal, or that
   broadcasts, may send any tag, and so may a call to `apply` with a computed
-  function, `GenServer.reply` or `GenServer.multi_call`. A user of the module
+  function or `GenServer.multi_call`. A user of the module
   with no send of its own is reached through the functions it calls, unless
   it hands the module to a function (`Wrapper.deliver(Module, msg)`,
   `GenServer.stop(Module)`, `Module |> wrapper(msg)`), imports it, or calls a
