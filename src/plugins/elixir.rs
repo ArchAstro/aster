@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use crate::config::CacheConfig;
+
 use super::{
     LanguagePlugin, LocalDependency, NativeCache, ProjectMetadata, Target, TargetCapability,
     TargetContext,
@@ -136,7 +138,12 @@ impl LanguagePlugin for ElixirPlugin {
                     capabilities: HashSet::new(),
                     files_glob: None,
                     stream: false,
-                    cache: None,
+                    // deps/ belongs to the native cache, not this target's
+                    // outputs. Mix must repair it when that cache misses.
+                    cache: Some(CacheConfig {
+                        enabled: Some(false),
+                        ..Default::default()
+                    }),
                     invalidates_cache: false,
                     working_dir: None,
                     exclusive_resources: vec!["hex_registry".into()],
@@ -542,7 +549,12 @@ fn detect_standalone_targets(
             capabilities: HashSet::new(),
             files_glob: None,
             stream: false,
-            cache: None,
+            // An outputless cached success cannot restore missing dependencies.
+            // Always let Mix validate the native dependency tree.
+            cache: Some(CacheConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
             invalidates_cache: false,
             working_dir: None,
             exclusive_resources: vec!["hex_registry".into()],
