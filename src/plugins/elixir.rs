@@ -169,6 +169,16 @@ impl LanguagePlugin for ElixirPlugin {
         super::related_tests::mix(project_dir, command, tests)
     }
 
+    fn related_tests_packing(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[super::RelatedTest],
+        pack_shards_up_to: usize,
+    ) -> Option<super::FilesListPlan> {
+        super::related_tests::mix_packing(project_dir, command, tests, pack_shards_up_to)
+    }
+
     fn with_files_list(
         &self,
         target_name: &str,

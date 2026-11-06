@@ -201,17 +201,10 @@ impl PartitionedMix {
     /// `--partitions`, otherwise as written.
     pub(crate) fn render(&self, files: &[String]) -> String {
         let mut drop = self.listed();
-        let parts = &self.argv.parts;
-        let mut i = self.test + 1;
-        while i < parts.len() {
-            if parts[i] == "--partitions" {
-                drop.extend([i, i + 1]);
-                i += 1;
-            } else if parts[i].starts_with("--partitions=") {
-                drop.push(i);
-            }
-            i += 1;
-        }
+        drop.extend(super::related_tests::partition_flags(
+            &self.argv,
+            self.test + 1,
+        ));
         let inner = self.argv.render(&drop, files);
         match &self.delegated {
             Some(delegated) => delegated.render(&inner),

@@ -348,6 +348,20 @@ pub trait LanguagePlugin: Send + Sync {
         None
     }
 
+    /// [`Self::related_tests`] for a plugin that can pack a small selection
+    /// into one shard of a sharded suite: a selection of at most
+    /// `pack_shards_up_to` files runs whole in shard 1 and the other shards
+    /// get [`FilesListPlan::Nothing`]. 0 never packs.
+    fn related_tests_packing(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        tests: &[RelatedTest],
+        _pack_shards_up_to: usize,
+    ) -> Option<FilesListPlan> {
+        self.related_tests(project_dir, command, tests)
+    }
+
     /// [`Self::related_tests`] for a command run by a shell one-liner that
     /// may change its environment where Aster cannot read it (`export`,
     /// `source env.sh`). A plugin whose narrowing reads the environment

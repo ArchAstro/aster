@@ -32,13 +32,18 @@ struct Workspace {
 impl Workspace {
     /// A committed git workspace holding `files`.
     fn new(files: &[(&str, &str)]) -> Self {
+        Self::with_config("", files)
+    }
+
+    /// [`Self::new`] with this root `aster.toml`.
+    fn with_config(config: &str, files: &[(&str, &str)]) -> Self {
         let workspace = Self {
             tmp: TempDir::new().unwrap(),
         };
         workspace.git(&["init", "-q", "-b", "main"]);
         workspace.git(&["config", "user.email", "test@test.com"]);
         workspace.git(&["config", "user.name", "Test"]);
-        workspace.write("aster.toml", "");
+        workspace.write("aster.toml", config);
         for (path, content) in files {
             workspace.write(path, content);
         }
@@ -2326,7 +2331,8 @@ fn sharded() -> Vec<(&'static str, &'static str)> {
 
 #[test]
 fn shard_projects_run_their_slice_of_the_selected_tests() {
-    let ws = Workspace::new(&sharded());
+    // Packing off: each shard deals out the selection as Mix does.
+    let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 0\n", &sharded());
     ws.edit(
         "shop/lib/shop/pricing.ex",
         "Enum.sum(items)",
@@ -2360,7 +2366,8 @@ fn shard_projects_run_their_slice_of_the_selected_tests() {
 
 #[test]
 fn a_shard_whose_partition_gets_no_selected_file_is_skipped() {
-    let ws = Workspace::new(&sharded());
+    // Packing off, so only the partition rule decides.
+    let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 0\n", &sharded());
     ws.edit(
         "shop/lib/shop/pricing.ex",
         "Enum.sum(items)",
@@ -2377,6 +2384,126 @@ fn a_shard_whose_partition_gets_no_selected_file_is_skipped() {
         !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
         "{plan:#?}"
     );
+}
+
+#[test]
+fn a_small_selection_runs_whole_in_the_first_shard_and_the_other_shards_start_no_lane() {
+    let ws = Workspace::new(&sharded());
+    // Setup: both pricing functions changed, so two test files are
+    // selected. With the default threshold that is far too little work to
+    // repay a cold boot on a second lane.
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+
+    // Plan: shard 1 lists every selected file and no `--partitions`, so
+    // Mix cannot deal any of them away; it keeps MIX_TEST_PARTITION=1, which
+    // names the shard's databases.
+    let plan = ws.plan("test-ci");
+    let commands = plan.commands("//shop-shard-1:test-ci");
+    assert_eq!(commands.len(), 1, "{plan:#?}");
+    assert_eq!(
+        shell_words::split(&commands[0]).unwrap(),
+        [
+            "bash".to_string(),
+            "-c".to_string(),
+            "cd ../shop && MIX_TEST_PARTITION=1 exec mix test --warnings-as-errors \
+             test/shop/cart_test.exs test/shop/tax_test.exs"
+                .to_string(),
+        ]
+    );
+
+    // Outcome: shard 2 is not in the matrix, and the plan says why.
+    assert!(
+        !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
+        "{plan:#?}"
+    );
+    assert!(plan.skipped.contains(&"//shop-shard-2:test-ci".to_string()));
+}
+
+#[test]
+fn a_selection_over_the_threshold_still_fans_out_to_every_shard() {
+    // Setup: the threshold is one file, and two are selected.
+    let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 1\n", &sharded());
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+
+    // Plan: both shards run, each with its `--partitions 2` slice.
+    let plan = ws.plan("test-ci");
+    for shard in ["1", "2"] {
+        let commands = plan.commands(&format!("//shop-shard-{shard}:test-ci"));
+        assert_eq!(commands.len(), 1, "{plan:#?}");
+        assert!(
+            commands[0].contains(&format!("MIX_TEST_PARTITION={shard}"))
+                && commands[0].contains("--partitions 2"),
+            "{commands:?}"
+        );
+    }
+
+    // A selection exactly at the threshold packs.
+    let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 2\n", &sharded());
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    let plan = ws.plan("test-ci");
+    assert!(
+        !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
+        "{plan:#?}"
+    );
+}
+
+#[test]
+fn an_all_run_keeps_every_shard_on_its_own_partition() {
+    let ws = Workspace::new(&sharded());
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+
+    // `--all` selects every project and does not narrow, so the packing
+    // threshold has nothing to act on: both shards run their command as
+    // written (no replacement command).
+    let output = ws.aster(&["--json", "affected", "test-ci", "--all", "--dry-run"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let targets: Vec<&Value> = json["targets"].as_array().unwrap().iter().collect();
+    for shard in ["1", "2"] {
+        let address = format!("//shop-shard-{shard}:test-ci");
+        let entry = targets
+            .iter()
+            .find(|t| t["address"] == address.as_str())
+            .unwrap_or_else(|| panic!("{address} missing: {json:#}"));
+        assert!(
+            entry["commands"].as_array().is_none_or(|c| c.is_empty()),
+            "{entry:#}"
+        );
+    }
+}
+
+#[test]
+fn a_manifest_change_runs_every_shard_in_full_whatever_the_threshold() {
+    // A change that runs the whole project is not a small selection.
+    let ws = Workspace::new(&sharded());
+    ws.edit("shop/mix.exs", "0.1.0", "0.2.0");
+    let plan = ws.plan("test-ci");
+    for shard in ["1", "2"] {
+        assert!(
+            plan.notes(&format!("//shop-shard-{shard}:test-ci"))
+                .contains("running as written"),
+            "{plan:#?}"
+        );
+    }
 }
 
 #[test]
@@ -2867,19 +2994,20 @@ fn shard_projects_follow_the_narrowed_dependent() {
     let ws = gateway(GATEWAY_INFER, "depends_on = [\"//platform\"]\n");
     change_gateway_config(&ws);
     let plan = ws.plan("test-ci");
-    for shard in ["1", "2"] {
-        let commands = plan.commands(&format!("//platform-shard-{shard}:test-ci"));
-        assert_eq!(commands.len(), 1, "{plan:#?}");
-        let words = shell_words::split(&commands[0]).unwrap();
-        assert_eq!(
-            words[2],
-            format!(
-                "cd ../platform && MIX_TEST_PARTITION={shard} exec mix test --partitions 2 \
-                 test/assets_test.exs test/direct_test.exs test/gateway_test.exs"
-            ),
-            "{plan:#?}"
-        );
-    }
+    // Three files are selected: shard 1 runs them all, shard 2 is packed away.
+    let commands = plan.commands("//platform-shard-1:test-ci");
+    assert_eq!(commands.len(), 1, "{plan:#?}");
+    let words = shell_words::split(&commands[0]).unwrap();
+    assert_eq!(
+        words[2],
+        "cd ../platform && MIX_TEST_PARTITION=1 exec mix test \
+         test/assets_test.exs test/direct_test.exs test/gateway_test.exs",
+        "{plan:#?}"
+    );
+    assert!(
+        !plan.runs().iter().any(|addr| addr.contains("shard-2")),
+        "{plan:#?}"
+    );
 }
 
 #[test]

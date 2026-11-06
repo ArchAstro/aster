@@ -1249,6 +1249,7 @@ fn run() -> Result<()> {
                             all_projects: &projects,
                             declared_inputs: &declared_addrs,
                             related_wrappers: &workspace_config.affected.related.wrappers,
+                            pack_shards_up_to: workspace_config.affected.related.pack_shards_up_to,
                         },
                         &registry,
                     )?)
