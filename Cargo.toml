@@ -1,6 +1,6 @@
 [package]
 name = "aster"
-version = "0.31.2"
+version = "0.31.3"
 edition = "2021"
 rust-version = "1.88"
 description = "Build orchestration for polyglot monorepos"
