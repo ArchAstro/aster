@@ -358,6 +358,107 @@ fn a_protocol_implementation_runs_for_what_calls_the_protocol_not_for_what_menti
     );
 }
 
+/// A room process with two message clauses, and the modules around it: a
+/// supervisor that starts it from a child specification, a report that only
+/// names it in a list, a lobby that hands it to a mailbox wrapper, and tests
+/// for each.
+const ROOMS: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/room.ex",
+        "defmodule Shop.Room do\n  use GenServer\n\n  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)\n\n  @impl true\n  def init(arg), do: {:ok, arg}\n\n  @impl true\n  def handle_call(:join, _from, state), do: {:reply, :joined, state}\n  def handle_call(:leave, _from, state), do: {:reply, :left, state}\nend\n",
+    ),
+    (
+        "shop/lib/shop/room_supervisor.ex",
+        "defmodule Shop.RoomSupervisor do\n  def start_room(id) do\n    DynamicSupervisor.start_child(Shop.Sup, %{id: {Shop.Room, id}, start: {Shop.Room, :start_link, [id]}})\n  end\nend\n",
+    ),
+    (
+        "shop/lib/shop/report.ex",
+        "defmodule Shop.Report do\n  def processes, do: [Shop.Room]\nend\n",
+    ),
+    (
+        "shop/lib/shop/mailbox.ex",
+        "defmodule Shop.Mailbox do\n  def deliver(target, msg), do: GenServer.call(target, msg)\nend\n",
+    ),
+    (
+        "shop/lib/shop/lobby.ex",
+        "defmodule Shop.Lobby do\n  def poke, do: Shop.Mailbox.deliver(Shop.Room, :join)\nend\n",
+    ),
+    (
+        "shop/test/shop/join_test.exs",
+        "defmodule Shop.JoinTest do\n  use ExUnit.Case\n\n  test \"join\" do\n    {:ok, pid} = Shop.Room.start_link([])\n    assert GenServer.call(pid, :join) == :joined\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/leave_test.exs",
+        "defmodule Shop.LeaveTest do\n  use ExUnit.Case\n\n  test \"leave\" do\n    {:ok, pid} = Shop.Room.start_link([])\n    assert GenServer.call(pid, :leave) == :left\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/supervisor_test.exs",
+        "defmodule Shop.SupervisorTest do\n  use ExUnit.Case\n\n  test \"start\" do\n    assert match?({:ok, _}, Shop.RoomSupervisor.start_room(1))\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/report_test.exs",
+        "defmodule Shop.ReportTest do\n  use ExUnit.Case\n\n  test \"processes\" do\n    assert hd(Shop.Report.processes()) == Shop.Room\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/lobby_test.exs",
+        "defmodule Shop.LobbyTest do\n  use ExUnit.Case\n\n  test \"poke\" do\n    assert Shop.Lobby.poke() == :joined\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_room_clause_runs_for_what_sends_its_message_not_for_what_only_starts_or_names_the_room() {
+    // Setup: a room with `:join` and `:leave` clauses. The supervisor starts it
+    // from a child specification, the report lists it, the lobby hands it to a
+    // wrapper that sends, and two tests send each tag themselves.
+    //
+    // Phase 1: edit the `:join` clause. The test that sends `:join` runs, and
+    // so does the lobby test: the lobby gives the room to a function that may
+    // send. The supervisor and report tests do not: starting a process or
+    // naming it in a list sends nothing. The `:leave` test sends another tag.
+    let ws = Workspace::new(ROOMS);
+    ws.edit("shop/lib/shop/room.ex", ":joined, state", ":entered, state");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/join_test.exs test/shop/lobby_test.exs"]
+    );
+
+    // Phase 2: a dynamic send is not narrowed. A function that applies a
+    // computed function to the room may be sending.
+    let mut files = ROOMS.to_vec();
+    files[3].1 = "defmodule Shop.Report do\n  def processes(fun \\\\ :module_info), do: [Shop.Room, apply(Shop.Room, fun, [])]\nend\n";
+    let ws = Workspace::new(&files);
+    ws.edit("shop/lib/shop/room.ex", ":joined, state", ":entered, state");
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/join_test.exs test/shop/lobby_test.exs test/shop/report_test.exs"]
+    );
+
+    // Phase 3: the clause's own direct tests still run when it is edited, and
+    // a clause that matches any message is still reached by what starts the
+    // room.
+    let mut files = ROOMS.to_vec();
+    files[1].1 = "defmodule Shop.Room do\n  use GenServer\n\n  def start_link(arg), do: GenServer.start_link(__MODULE__, arg)\n\n  @impl true\n  def init(arg), do: {:ok, arg}\n\n  @impl true\n  def handle_call(msg, _from, state), do: {:reply, msg, state}\nend\n";
+    let ws = Workspace::new(&files);
+    ws.edit(
+        "shop/lib/shop/room.ex",
+        "{:reply, msg, state}",
+        "{:reply, {:ok, msg}, state}",
+    );
+    let plan = ws.plan("test");
+    let command = &plan.commands("//shop:test")[0];
+    assert!(
+        command.contains("test/shop/supervisor_test.exs"),
+        "{command}"
+    );
+    assert!(command.contains("test/shop/join_test.exs"), "{command}");
+}
+
 /// A GenServer with one clause per message. Each message has a wrapper
 /// that sends it and a test that calls the wrapper; a third test sends a
 /// message it builds at run time.

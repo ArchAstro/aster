@@ -161,6 +161,11 @@ pub struct Def {
     /// Sends a message whose head is not a literal, or hands one to a
     /// broadcast: it may send any message.
     pub sends_any: bool,
+    /// Modules handed to a function as a plain argument (`Wrapper.deliver(Mod,
+    /// msg)`, `GenServer.stop(Mod)`), other than to one that starts a process
+    /// or builds a child specification. The callee may send to `Mod`. Only
+    /// Elixir fills this.
+    pub hands_over: BTreeSet<String>,
     /// Modules named other than as the receiver of a call (`%Mod{}`, an
     /// argument, a child spec). Only Elixir fills this.
     pub bare: BTreeSet<String>,
@@ -209,6 +214,7 @@ impl Def {
             accepts: None,
             sends: BTreeSet::new(),
             sends_any: false,
+            hands_over: BTreeSet::new(),
             bare: BTreeSet::new(),
         }
     }
