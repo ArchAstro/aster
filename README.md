@@ -436,6 +436,14 @@ names are `deps`, `build`, `test`,
 `lint`, `format`, `typecheck`, and `check`. Other targets must opt in with
 `cache.enabled = true`. Set `enabled = false` to opt out.
 
+Inferred Elixir `deps` targets opt out: standalone projects and umbrella roots
+always run `mix deps.get`. Their dependency files live in the native cache;
+replaying a successful result would not restore them when that cache is empty.
+Mix checks the existing files on warm runs and fetches missing dependencies.
+Targets depending on this uncached prerequisite also execute instead of reusing
+Aster results, since their cache keys require prerequisite hashes. Mix still
+reuses its native dependency and compiler caches.
+
 GitHub Actions can warm native tool caches (Cargo registry, npm, and the
 rest) with `aster ci cache-plan`, and share the artifact cache through
 `ArchAstro/aster/action`. See
@@ -443,7 +451,7 @@ rest) with `aster ci cache-plan`, and share the artifact cache through
 
 Every cache key includes `platform:<os>-<arch>` (for example `platform:linux-x86_64`), so an artifact built on one OS and CPU architecture is never restored on another.
 
-Go, Node.js, Elixir, Rust, and Python targets other than `deps` hash every non-ignored file in the project. A change to testdata, a `//go:embed` file, a `.mjs` / `.css` / `.vue` module, Elixir `priv` or `test/support`, or a tool config (`vite.config.js`, `rustfmt.toml`, `clippy.toml`) misses the cache. `exclude` removes paths from that set and wins over the default. `deps` stays limited to lockfiles and toolchain files, so a source edit does not reinstall dependencies. The hasher skips tool caches (`node_modules`, `.venv`, `__pycache__`, `.pytest_cache`) at any depth, and `target`, `_build`, `deps`, `dist`, and `build` only at the project root, so `src/build` stays an input. Declared `[targets.*.cache] outputs` are not inputs either. `include` can name a file inside one of those directories. A build does not invalidate itself.
+Go, Node.js, Elixir, Rust, and Python targets other than `deps` hash every non-ignored file in the project. A change to testdata, a `//go:embed` file, a `.mjs` / `.css` / `.vue` module, Elixir `priv` or `test/support`, or a tool config (`vite.config.js`, `rustfmt.toml`, `clippy.toml`) misses the cache. `exclude` removes paths from that set and wins over the default. Cacheable `deps` targets stay limited to lockfiles and toolchain files, so a source edit does not reinstall dependencies. The hasher skips tool caches (`node_modules`, `.venv`, `__pycache__`, `.pytest_cache`) at any depth, and `target`, `_build`, `deps`, `dist`, and `build` only at the project root, so `src/build` stays an input. Declared `[targets.*.cache] outputs` are not inputs either. `include` can name a file inside one of those directories. A build does not invalidate itself.
 
 `include`, `exclude`, and `env` extend a target's detected cache inputs.
 An `env` name ending in `*` matches every variable that starts with the name

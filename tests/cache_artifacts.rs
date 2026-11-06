@@ -5,6 +5,136 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// Integration matrix: standalone and umbrella-child builds, warm and missing
+/// dependency files, with an existing outputless success from the old policy.
+/// The real CLI discovers targets, stores/reuses the seed entry, and starts child
+/// processes. Only Mix/Elixir are shell fixtures: no Hex network or BEAM compiler
+/// is exercised here. Their scripts do not implement Aster's cache decisions.
+#[test]
+#[cfg(unix)]
+fn elixir_build_fetches_missing_dependencies_despite_old_cached_success() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for umbrella in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let project = tmp.path().join("app");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("mix.lock"), "%{}\n").unwrap();
+        fs::write(
+            project.join("mix.exs"),
+            if umbrella {
+                "[apps_path: \"apps\"]\n"
+            } else {
+                "[app: :proof]\n"
+            },
+        )
+        .unwrap();
+        let (build_dir, address, command) = if umbrella {
+            let child = project.join("apps/proof");
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("mix.exs"), "[app: :proof]\n").unwrap();
+            (
+                child,
+                "//app/apps/proof:build",
+                "mix do --app proof compile",
+            )
+        } else {
+            (project.clone(), "//app:build", "mix compile")
+        };
+        // As in Platform, compile must run while deps uses its inferred policy.
+        let build_config =
+            format!("[targets.build]\ncommand = \"{command}\"\ncache = {{ enabled = false }}\n");
+        fs::write(build_dir.join("aster.toml"), &build_config).unwrap();
+
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for (name, script) in [
+            ("elixir", "#!/bin/sh\necho 'Elixir fixture'\n"),
+            (
+                "mix",
+                r#"#!/bin/sh
+set -eu
+case "$*" in
+  deps.get)
+    mkdir -p deps
+    echo dependency > deps/package
+    echo fetch >> "$COUNTER_FILE"
+    ;;
+  compile|'do --app proof compile')
+    test -f deps/package || { echo 'dependency is not available' >&2; exit 1; }
+    ;;
+  *) echo "unexpected mix arguments: $*" >&2; exit 1 ;;
+esac
+"#,
+            ),
+        ] {
+            let path = bin.join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let counter = tmp.path().join("fetches");
+        let run = |target: &str| {
+            let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+                .current_dir(tmp.path())
+                .env("PATH", &path)
+                .env("COUNTER_FILE", &counter)
+                .env("ASTER_CACHE_DIR", tmp.path().join("cache"))
+                .env_remove("ASTER_SRV_URL")
+                .env_remove("ASTER_REMOTE_CACHE")
+                .args(["run", target, "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umbrella={umbrella}, {target}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+
+        // Produce a legacy outputless entry through the real cache writer. An
+        // explicit user policy can still enable caching; the inferred default
+        // below must ignore this success after the native dependency tree goes.
+        let root_build = if umbrella { "" } else { &build_config };
+        fs::write(
+            project.join("aster.toml"),
+            format!(
+                "{root_build}\n[targets.deps]\ncommand = \"mix deps.get\"\ncache = {{ enabled = true, outputs = [] }}\n"
+            ),
+        )
+        .unwrap();
+        run(address);
+        let seeded = run("//app:deps");
+        assert_eq!(seeded["summary"]["cached"], 1, "{seeded}");
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "fetch\n");
+
+        // Restore the inferred policy and simulate a cold native cache. Build
+        // crosses the actual deps edge and cannot succeed without a new fetch.
+        fs::write(project.join("aster.toml"), root_build).unwrap();
+        fs::remove_dir_all(project.join("deps")).unwrap();
+        let cold = run(address);
+        assert_eq!(cold["summary"]["cached"], 0, "{cold}");
+        assert_eq!(
+            fs::read_to_string(project.join("deps/package")).unwrap(),
+            "dependency\n"
+        );
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "fetch\nfetch\n");
+
+        // Warm files still go through Mix, which owns dependency validation.
+        run(address);
+        assert_eq!(
+            fs::read_to_string(&counter).unwrap(),
+            "fetch\nfetch\nfetch\n"
+        );
+    }
+}
+
 fn setup(tmp: &TempDir) {
     fs::create_dir(tmp.path().join(".git")).unwrap();
     fs::create_dir(tmp.path().join("app")).unwrap();
