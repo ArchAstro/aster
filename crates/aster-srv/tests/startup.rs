@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! Starting while a rolling deploy holds table locks.
 //!
 //! Set ASTER_SRV_TEST_DATABASE_URL as in `server.rs`; without it the test skips.

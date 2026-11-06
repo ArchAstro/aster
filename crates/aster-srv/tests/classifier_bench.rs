@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // test diagnostics may use std print macros
 //! How long a classifier pass takes over a long history. Ignored by
 //! default; run with
 //! `cargo test -p aster-srv --test classifier_bench -- --ignored --nocapture`
