@@ -208,6 +208,86 @@ sys.exit(7 if sys.argv[3] == 'fail' else 0)
     }
 }
 
+/// A foreground service must report contention through its log channel while
+/// still waiting, rather than write raw stderr across the dashboard.
+#[test]
+fn service_admission_wait_is_routed_to_service_logs() {
+    let f = Fixture::new();
+    let owner_root = f.workspace("owner", "", "normal");
+    let service_root = f.workspace("service", "", "normal");
+    let config = service_root.join("aster.toml");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(
+        "\n[targets.dev]\ncommand = 'echo SERVICE_STARTED'\nstream = true\ndepends_on = ['//:work']\n[dev.services.web]\ntarget = '//:dev'\n",
+    );
+    fs::write(config, contents).unwrap();
+    fs::create_dir(service_root.join(".git")).unwrap();
+
+    let mut owner = f.start(&owner_root, 1, "//:work");
+    let held = f.started();
+    let output_path = f.root.path().join("service-output");
+    let mut command = f.command(&service_root, 1);
+    command
+        .args(["services", "up", "--no-ui", "--no-watch"])
+        .env("ASTER_PORT_LEASE_DIR", f.root.path().join("leases"))
+        .stdout(fs::File::create(&output_path).unwrap());
+    let mut service = Run::spawn(command);
+    let expected = "[web] | [aster] Waiting for execution admission: //:work (host capacity 1)";
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let output = fs::read_to_string(&output_path).unwrap();
+        if output.contains(expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing routed wait notice: {output}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    f.remains_blocked();
+    held.release();
+    assert!(owner.finish());
+    f.started().release();
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        if fs::read_to_string(&output_path)
+            .unwrap()
+            .contains("SERVICE_STARTED")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "service did not start after admission"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    service.signal(libc::SIGTERM);
+    service.finish();
+    let output = fs::read_to_string(output_path).unwrap();
+    assert_eq!(output.matches(expected).count(), 1, "{output}");
+    let stderr = service.1.iter().collect::<Vec<_>>().join("\n");
+    assert!(
+        !stderr.contains("Waiting for execution admission"),
+        "{stderr}"
+    );
+
+    let logs = f
+        .command(&service_root, 1)
+        .args(["services", "logs", "web"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(logs.status.success(), "{logs:?}");
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs.contains("Waiting for execution admission: //:work"),
+        "{logs}"
+    );
+}
+
 #[test]
 fn concurrent_workspaces_share_capacity_and_release_after_child_exit() {
     let f = Fixture::new();

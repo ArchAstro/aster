@@ -26,6 +26,7 @@ impl Host {
         _resources: &[String],
         _workspace: &Path,
         _address: &str,
+        _on_wait: impl FnOnce(String),
     ) -> Result<Permit> {
         unreachable!("host admission is not enabled on this platform")
     }

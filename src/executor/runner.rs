@@ -218,6 +218,16 @@ pub struct Executor<'a> {
     no_replay: bool,
     /// Called with the final results before failure output is printed.
     results_hook: Option<ResultsHook>,
+    /// Receives admission notices instead of writing them to the terminal.
+    admission_wait_hook: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+
+fn report_admission_wait(hook: &Option<Arc<dyn Fn(String) + Send + Sync>>, line: String) {
+    if let Some(hook) = hook {
+        hook(line);
+    } else {
+        errln!("{line}");
+    }
 }
 
 /// See [`Executor::with_results_hook`].
@@ -243,6 +253,7 @@ impl<'a> Executor<'a> {
             wrappers: Wrappers::default(),
             no_replay: false,
             results_hook: None,
+            admission_wait_hook: None,
         }
     }
 
@@ -262,6 +273,7 @@ impl<'a> Executor<'a> {
             wrappers: Wrappers::default(),
             no_replay: false,
             results_hook: None,
+            admission_wait_hook: None,
         }
     }
 
@@ -285,6 +297,7 @@ impl<'a> Executor<'a> {
             wrappers: Wrappers::default(),
             no_replay: false,
             results_hook: None,
+            admission_wait_hook: None,
         }
     }
 
@@ -309,6 +322,7 @@ impl<'a> Executor<'a> {
             wrappers: Wrappers::default(),
             no_replay: false,
             results_hook: None,
+            admission_wait_hook: None,
         }
     }
 
@@ -332,6 +346,12 @@ impl<'a> Executor<'a> {
     /// console cannot be written.
     pub fn with_results_hook(mut self, hook: Option<ResultsHook>) -> Self {
         self.results_hook = hook;
+        self
+    }
+
+    /// Route admission wait notices to an embedding UI's log channel.
+    pub fn with_admission_wait_hook(mut self, hook: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        self.admission_wait_hook = Some(hook);
         self
     }
 
@@ -467,6 +487,7 @@ impl<'a> Executor<'a> {
                     &target_def.exclusive_resources,
                     self.workspace_root,
                     &target_addr,
+                    |line| report_admission_wait(&self.admission_wait_hook, line),
                 )
             })
             .transpose()
@@ -1329,6 +1350,7 @@ impl<'a> Executor<'a> {
         };
 
         let host = host.clone();
+        let admission_wait_hook = self.admission_wait_hook.clone();
         let resource_names = project
             .targets
             .get(&target_name)
@@ -1369,7 +1391,11 @@ impl<'a> Executor<'a> {
                 }
                 let permit = match host
                     .as_ref()
-                    .map(|host| host.acquire(&resource_names, &workspace_root_path, &addr))
+                    .map(|host| {
+                        host.acquire(&resource_names, &workspace_root_path, &addr, |line| {
+                            report_admission_wait(&admission_wait_hook, line);
+                        })
+                    })
                     .transpose()
                 {
                     Ok(permit) => permit,

@@ -167,6 +167,7 @@ impl Host {
         resources: &[String],
         workspace: &Path,
         address: &str,
+        on_wait: impl FnOnce(String),
     ) -> Result<Permit> {
         let workspace = fs::canonicalize(workspace)?;
         let mut keys = resources
@@ -202,7 +203,7 @@ impl Host {
             }
             keys.retain(|k| !inherited_resources.contains(k));
         }
-        let mut reported_wait = false;
+        let mut on_wait = Some(on_wait);
         loop {
             if super::shutdown_requested() {
                 bail!("Cancelled: shutdown requested while waiting for execution admission");
@@ -283,12 +284,11 @@ impl Host {
                 });
             }
             drop(files);
-            if !reported_wait {
-                errln!(
+            if let Some(on_wait) = on_wait.take() {
+                on_wait(format!(
                     "[aster] Waiting for execution admission: {address} (host capacity {})",
                     self.capacity
-                );
-                reported_wait = true;
+                ));
             }
             wait()?;
         }

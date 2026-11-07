@@ -757,8 +757,15 @@ fn begin_start_service(
     let system_tx = system_tx.clone();
     let durable_log_tx = durable_log_tx.clone();
     std::thread::spawn(move || {
-        let prerequisite_run =
-            run_prerequisites(&prerequisites, &workspace_root, &projects, use_cache);
+        let wait_tx = system_tx.clone();
+        let wait_service = service_name.clone();
+        let prerequisite_run = run_prerequisites(
+            &prerequisites,
+            &workspace_root,
+            &projects,
+            use_cache,
+            Arc::new(move |line| emit_system(&wait_tx, &wait_service, line, false)),
+        );
         for (stderr, line) in prerequisite_run.lines {
             let _ = system_tx.send(LogEvent {
                 service: service_name.clone(),
@@ -857,6 +864,7 @@ fn run_prerequisites(
     workspace_root: &Path,
     projects: &[DiscoveredProject],
     use_cache: bool,
+    on_admission_wait: Arc<dyn Fn(String) + Send + Sync>,
 ) -> PrerequisiteRun {
     if prerequisites.is_empty() {
         return PrerequisiteRun {
@@ -867,6 +875,7 @@ fn run_prerequisites(
 
     let refs = projects.iter().collect::<Vec<_>>();
     let results = Executor::with_all_options(workspace_root, OutputMode::Quiet, true, use_cache)
+        .with_admission_wait_hook(on_admission_wait)
         .with_null_stdin()
         .execute_targets(prerequisites, &refs, true);
     let mut lines = Vec::new();

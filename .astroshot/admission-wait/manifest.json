@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "feature": "admission-wait",
+  "run_id": "admission-wait-20261107T002124Z-15962",
+  "status": "pass",
+  "shots": [
+    {
+      "id": "0001",
+      "file": "0001-waiting.png",
+      "slug": "waiting",
+      "title": "Admission wait stays inside service logs",
+      "description": "One external build holds the execution slot; the foreground service dashboard displays the wait notice inside its log pane.",
+      "captured_at": "2026-11-07T00:21:24Z"
+    }
+  ]
+}
