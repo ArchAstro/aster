@@ -66,6 +66,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// and the tier falls back to local. Three consecutive failures disable the
 /// remote, so the worst stall is a few of these.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upload and commit work grows with the number of output files: the server
+/// checks and signs every digest. A build with hundreds of files outlasts
+/// [`REQUEST_TIMEOUT`], and a timeout disables the remote for the target, so
+/// its outputs were never stored. Lookup keeps the short budget.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Signed blob transfers can be large, but still bounded.
 const BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -101,6 +106,8 @@ pub struct AsterSrvBackend {
     /// instead. Tests only; production is `None`.
     gcs_base: Option<String>,
     agent: ureq::Agent,
+    /// For `/v1/cache/upload` and `/v1/cache/commit`.
+    write_agent: ureq::Agent,
     blob_agent: ureq::Agent,
     state: Mutex<State>,
     logged_read_only: AtomicBool,
@@ -184,6 +191,14 @@ impl AsterSrvBackend {
         self
     }
 
+    /// Replace the timeout of upload and commit calls. Tests only.
+    #[cfg(test)]
+    fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        let origin = checked_origin(&self.base_url).expect("checked in new");
+        self.write_agent = build_agent(&origin, timeout);
+        self
+    }
+
     fn new(
         base_url: String,
         repo: String,
@@ -202,6 +217,7 @@ impl AsterSrvBackend {
             person_token,
             gcs_base: None,
             agent: build_agent(&origin, REQUEST_TIMEOUT),
+            write_agent: build_agent(&origin, WRITE_TIMEOUT),
             // Signed blob URLs come from the server's reply, so they get the
             // server's policy: https only, unless the server is this machine.
             blob_agent: build_agent(&origin, BLOB_TIMEOUT),
@@ -278,8 +294,13 @@ impl AsterSrvBackend {
             (None, Some(token)) => token.clone(),
             (None, None) => return Err(signed_out()),
         };
-        let response =
-            self.send_post(&url, &payload, Some(&bearer), self.proxy_token.as_deref())?;
+        let response = self.send_post(
+            &url,
+            &payload,
+            Some(&bearer),
+            self.proxy_token.as_deref(),
+            write,
+        )?;
         // A stored sign-in the server no longer accepts (expired early, key
         // rotated, access removed) is the same as none.
         if response.status().as_u16() == 401 && self.credentials.is_none() {
@@ -294,14 +315,19 @@ impl AsterSrvBackend {
         payload: &[u8],
         bearer: Option<&str>,
         proxy: Option<&str>,
+        write: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
+        let agent = if write {
+            &self.write_agent
+        } else {
+            &self.agent
+        };
         // A signal during the blocking call is this process, not the remote.
         // ureq returns that as `io: Interrupted` and does not restart it.
         // Retrying keeps one EINTR from failing a lookup; a timeout still
         // disables, because it is not an interrupt.
         retrying_interrupt(|| {
-            let mut request = self
-                .agent
+            let mut request = agent
                 .post(url)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", USER_AGENT);
@@ -779,6 +805,8 @@ mod tests {
         /// server signs and checks every blob of every hit one at a time, so
         /// its lookup time grows with the batch.
         lookup_ms_per_key: Arc<std::sync::atomic::AtomicU64>,
+        /// Milliseconds every upload and commit call waits before it answers.
+        write_ms: Arc<std::sync::atomic::AtomicU64>,
         proxy_seen: Arc<Mutex<Vec<String>>>,
         /// The `Authorization` header of each cache call (lowercased).
         auth_seen: Arc<Mutex<Vec<String>>>,
@@ -798,6 +826,7 @@ mod tests {
             let commit_status = Arc::new(Mutex::new(201_u16));
             let refuse = Arc::new(AtomicBool::new(false));
             let lookup_ms_per_key = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let write_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let proxy_seen = Arc::new(Mutex::new(Vec::new()));
             let auth_seen = Arc::new(Mutex::new(Vec::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -810,6 +839,7 @@ mod tests {
             let status_c = Arc::clone(&commit_status);
             let refuse_c = Arc::clone(&refuse);
             let delay_c = Arc::clone(&lookup_ms_per_key);
+            let write_ms_c = Arc::clone(&write_ms);
             let proxy_seen_c = Arc::clone(&proxy_seen);
             let auth_seen_c = Arc::clone(&auth_seen);
             let shutdown_c = Arc::clone(&shutdown);
@@ -832,6 +862,7 @@ mod tests {
                     let status_c = Arc::clone(&status_c);
                     let refuse_c = Arc::clone(&refuse_c);
                     let delay_c = Arc::clone(&delay_c);
+                    let write_ms_c = Arc::clone(&write_ms_c);
                     let proxy_seen_c = Arc::clone(&proxy_seen_c);
                     let auth_seen_c = Arc::clone(&auth_seen_c);
                     thread::spawn(move || {
@@ -923,6 +954,11 @@ mod tests {
                                 asked * delay_c.load(Ordering::Relaxed),
                             ));
                         }
+                        if path == "/v1/cache/upload" || path == "/v1/cache/commit" {
+                            thread::sleep(Duration::from_millis(
+                                write_ms_c.load(Ordering::Relaxed),
+                            ));
+                        }
                         let (status, payload, extra_headers) = route(
                             path,
                             &body,
@@ -953,6 +989,7 @@ mod tests {
                 commit_status,
                 refuse,
                 lookup_ms_per_key,
+                write_ms,
                 proxy_seen,
                 auth_seen,
                 shutdown,
@@ -1393,6 +1430,33 @@ mod tests {
         );
         drop(stream);
         slow.join().unwrap();
+    }
+
+    /// Upload and commit scale with the number of output files, so they get a
+    /// longer budget than lookup. A call slower than the lookup timeout but
+    /// inside the write timeout succeeds, and a lookup that slow still times
+    /// out. (Production: 5s and 60s; shrunk here to keep the test short.)
+    #[test]
+    fn upload_and_commit_outlast_the_lookup_timeout_but_lookup_does_not() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 1);
+        fake.write_ms.store(900, Ordering::Relaxed);
+        fake.lookup_ms_per_key.store(900, Ordering::Relaxed);
+        let client = backend(&fake)
+            .with_request_timeout(Duration::from_millis(400))
+            .with_write_timeout(Duration::from_millis(5_000));
+
+        let bytes = b"slow-write".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        let missing = client.find_missing(std::slice::from_ref(&digest)).unwrap();
+        assert_eq!(missing, vec![digest.clone()]);
+        client.put_blob(&digest, &mut Cursor::new(bytes)).unwrap();
+        client
+            .put_manifest(&manifest(&"ab".repeat(32), &digest))
+            .unwrap();
+
+        let error = client.get_manifest(&keys[0]).unwrap_err();
+        assert!(disables(&error), "lookup must still time out: {error:#}");
     }
 
     /// A lookup of one target that times out still stops the run's remote
