@@ -142,15 +142,17 @@ fn reserve_consecutive_dynamic_bundles() -> (u16, u16) {
     panic!("could not find two consecutive free dynamic port bundles");
 }
 
-/// A window below the ephemeral range. Parallel tests bind with port 0 in
-/// that range, and `dynamic_port_bundles_are_distinct_propagated_and_released`
-/// can claim the first free pair after this probe releases it. A two-port
-/// range then has no collision-free bundle, and the supervisor exits before
-/// readiness.
+/// A window in 20000..30000, which no other test scans. Parallel tests bind
+/// with port 0 in the ephemeral range, and `reserve_consecutive_dynamic_bundles`
+/// scans upward from 30000 with its own lease directory, so a window there can
+/// be claimed by `dynamic_port_bundles_are_distinct_propagated_and_released`
+/// after this probe releases it. The supervisor then advertises ports that the
+/// sibling's servers hold, and they never both accept a connection.
 fn reserve_dynamic_port_window(width: u16) -> u16 {
-    let ephemeral_start = 32_768u16;
-    let last = ephemeral_start.saturating_sub(width);
-    for start in 30_000..last {
+    let window_floor = 20_000u16;
+    let window_ceiling = 30_000u16;
+    let last = window_ceiling - width;
+    for start in window_floor..=last {
         let end = start + width - 1;
         let listeners = (start..=end)
             .map(|port| TcpListener::bind(("127.0.0.1", port)))
@@ -160,7 +162,9 @@ fn reserve_dynamic_port_window(width: u16) -> u16 {
             return start;
         }
     }
-    panic!("could not reserve {width} consecutive dynamic ports below {ephemeral_start}");
+    panic!(
+        "could not reserve {width} consecutive dynamic ports in {window_floor}..{window_ceiling}"
+    );
 }
 
 fn runtime_log_text(xdg: &Path) -> String {
