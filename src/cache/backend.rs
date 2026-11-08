@@ -265,6 +265,12 @@ pub struct TieredCache {
     mode: CacheMode,
     remote: Option<RemoteHandle>,
     stats: Arc<RemoteStats>,
+    /// Skip the remote once any tier of this run disabled it. The executor
+    /// builds a fresh tier per lookup and per store, so a handle's own
+    /// `disabled` flag alone would let the store wait on a hung gateway
+    /// again. Set for tiers built from the environment; tests that build a
+    /// tier directly keep their remote to themselves.
+    follow_run: bool,
 }
 
 impl TieredCache {
@@ -275,6 +281,7 @@ impl TieredCache {
             mode: CacheMode::ReadWrite,
             remote: None,
             stats: RemoteStats::global(),
+            follow_run: false,
         }
     }
 
@@ -294,7 +301,17 @@ impl TieredCache {
             mode,
             remote,
             stats,
+            follow_run: false,
         }
+    }
+
+    /// The remote, unless this tier's handle or (for tiers built from the
+    /// environment) an earlier tier of this run disabled it.
+    fn active_remote(&self) -> Option<&dyn CacheBackend> {
+        if self.follow_run && self.stats.is_disabled() {
+            return None;
+        }
+        self.remote.as_ref().and_then(|remote| remote.active())
     }
 
     /// Record this tier's remote activity in `stats` instead of the
@@ -314,9 +331,7 @@ impl TieredCache {
 
     /// Whether a remote is configured and has not been disabled.
     pub fn remote_enabled(&self) -> bool {
-        self.remote
-            .as_ref()
-            .is_some_and(|remote| remote.active().is_some())
+        self.active_remote().is_some()
     }
 
     /// Ask the remote for every `keys` entry before the executor runs them.
@@ -331,7 +346,7 @@ impl TieredCache {
         if !self.mode.reads() {
             return;
         }
-        let Some(remote) = self.remote.as_ref().and_then(|remote| remote.active()) else {
+        let Some(remote) = self.active_remote() else {
             return;
         };
         let Some(backend) = remote
@@ -372,7 +387,7 @@ impl TieredCache {
         if !self.mode.reads() {
             return Ok(None);
         }
-        let Some(remote) = self.remote.as_ref().and_then(|remote| remote.active()) else {
+        let Some(remote) = self.active_remote() else {
             return Ok(None);
         };
         match self.download(remote, key) {
@@ -400,7 +415,7 @@ impl TieredCache {
         if !self.mode.writes() {
             return Ok(());
         }
-        let Some(remote) = self.remote.as_ref().and_then(|remote| remote.active()) else {
+        let Some(remote) = self.active_remote() else {
             return Ok(());
         };
         match self.upload(remote, manifest) {
@@ -666,12 +681,17 @@ pub fn tier_from_env(cache_dir: impl AsRef<Path>, workspace_root: &Path) -> Resu
         http_url.as_deref(),
         http_token,
     )? {
-        Some(remote) => Ok(TieredCache::with_remote(local, mode, remote)),
+        Some(remote) => {
+            let mut tier = TieredCache::with_remote(local, mode, remote);
+            tier.follow_run = true;
+            Ok(tier)
+        }
         None => Ok(TieredCache {
             local,
             mode,
             remote: None,
             stats: RemoteStats::global(),
+            follow_run: false,
         }),
     }
 }
@@ -1148,6 +1168,31 @@ mod tests {
             stats.snapshot().unwrap().to_string(),
             "remote: 0 hits / 0 misses / 0 uploads / 1 failures; disabled: timeout: global"
         );
+    }
+
+    /// The executor builds a new tier for each lookup and each store. Once
+    /// one tier of the run disabled the remote, a later tier from the
+    /// environment must not call it again (a hung gateway is one wait).
+    #[test]
+    fn a_disabled_run_skips_the_remote_in_later_tiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stats = Arc::new(RemoteStats::new());
+        stats.configured();
+        stats.disabled("timeout: global");
+        let remote = InMemoryBackend::new();
+        let mut later = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote.clone()),
+        )
+        .with_stats(Arc::clone(&stats));
+        later.follow_run = true;
+        let key = "d2".repeat(32);
+        assert!(!later.remote_enabled());
+        assert!(later.lookup(&key).unwrap().is_none());
+        later.store(&manifest(&key, None)).unwrap();
+        assert_eq!(remote.get_calls(), 0);
+        assert_eq!(remote.put_calls(), 0);
     }
 
     #[test]

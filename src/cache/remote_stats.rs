@@ -66,6 +66,14 @@ impl RemoteStats {
         }
     }
 
+    /// Whether a tier already stopped using the remote this run.
+    pub(super) fn is_disabled(&self) -> bool {
+        self.disabled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
     /// The summary so far, or `None` when no tier used a remote.
     pub fn snapshot(&self) -> Option<RemoteSummary> {
         if !self.configured.load(Ordering::Acquire) {
