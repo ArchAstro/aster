@@ -414,25 +414,96 @@ async fn upload(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     if !app.cache_store.enabled() {
         return Reply::error(503, "no cache bucket is configured");
     }
+    if let Some(digest) = request.digests.iter().find(|digest| !is_sha256(digest)) {
+        return Reply::error(400, format!("digest {digest} is not a sha256"));
+    }
+    let placements = match place_blobs(app, &request.digests).await {
+        Ok(placements) => placements,
+        Err(error) => return db_error(error),
+    };
     let mut missing = serde_json::Map::new();
-    for digest in &request.digests {
-        if !is_sha256(digest) {
-            return Reply::error(400, format!("digest {digest} is not a sha256"));
+    for (digest, placement) in request.digests.iter().zip(placements) {
+        if let Placement::Put(url) = placement {
+            missing.insert(digest.clone(), Value::String(url));
         }
-        let present = match blob_present(app, digest).await {
-            Ok(present) => present,
-            Err(error) => return db_error(error),
-        };
-        if present {
-            continue;
-        }
-        let url = match app.cache_store.signed_url(digest, Method::Put).await {
-            Ok(url) => url,
-            Err(error) => return db_error(error),
-        };
-        missing.insert(digest.clone(), Value::String(url));
     }
     Reply::json(200, json!({"missing": missing}))
+}
+
+/// What upload does for one digest.
+#[derive(Debug, PartialEq, Eq)]
+enum Placement {
+    /// A commit verified the blob and it is still in GCS.
+    Present,
+    /// The client PUTs the blob here.
+    Put(String),
+}
+
+/// Decide, in request order, whether each digest needs uploading.
+///
+/// One query reads which digests have a `cache.blobs` row. The GCS HEAD and
+/// the signature for each digest then run [`LOOKUP_CONCURRENCY`] at a time:
+/// a build with hundreds of outputs would otherwise outlast the client's
+/// request timeout. A row whose object is gone is dropped so a later upload
+/// can replace it.
+async fn place_blobs(app: &App, digests: &[String]) -> anyhow::Result<Vec<Placement>> {
+    let recorded = recorded_blobs(app, digests).await?;
+    let (placements, gone) = place_recorded(&app.cache_store, digests, &recorded).await?;
+    if !gone.is_empty() {
+        let client = app.pool.get().await?;
+        client
+            .execute("DELETE FROM cache.blobs WHERE sha256 = ANY($1)", &[&gone])
+            .await?;
+    }
+    Ok(placements)
+}
+
+async fn recorded_blobs(
+    app: &App,
+    digests: &[String],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let client = app.pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT sha256 FROM cache.blobs WHERE sha256 = ANY($1)",
+            &[&digests],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// The store half of [`place_blobs`]. Returns one placement per digest, in
+/// order, and the recorded digests whose object is gone.
+async fn place_recorded(
+    store: &super::store::BlobStore,
+    digests: &[String],
+    recorded: &std::collections::HashSet<String>,
+) -> anyhow::Result<(Vec<Placement>, Vec<String>)> {
+    use futures_util::stream::{self, StreamExt};
+    // `buffered` keeps request order, so the first error is the same one a
+    // serial loop would have returned.
+    let outcomes: Vec<anyhow::Result<(Placement, bool)>> = stream::iter(digests.iter().cloned())
+        .map(|digest| async move {
+            let is_recorded = recorded.contains(&digest);
+            if is_recorded && store.exists(&digest).await? {
+                return Ok((Placement::Present, false));
+            }
+            let url = store.signed_url(&digest, Method::Put).await?;
+            Ok((Placement::Put(url), is_recorded))
+        })
+        .buffered(LOOKUP_CONCURRENCY)
+        .collect()
+        .await;
+    let mut placements = Vec::with_capacity(outcomes.len());
+    let mut gone = Vec::new();
+    for (digest, outcome) in digests.iter().zip(outcomes) {
+        let (placement, was_gone) = outcome?;
+        if was_gone {
+            gone.push(digest.clone());
+        }
+        placements.push(placement);
+    }
+    Ok((placements, gone))
 }
 
 async fn commit(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
@@ -482,6 +553,45 @@ async fn commit(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         ),
         Err(error) => db_error(error),
     }
+}
+
+/// What the store says about one blob a manifest names.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Recorded by an earlier commit and still in GCS.
+    Present,
+    /// Not recorded; its bytes hash to its name, and it has this size.
+    Hashed(u64),
+    /// Its bytes do not hash to its name.
+    Mismatch,
+    Absent,
+}
+
+/// Check every blob of a manifest against GCS, [`LOOKUP_CONCURRENCY`] at a
+/// time and in request order. The calls that read GCS (HEAD, and a full read
+/// to hash an unrecorded blob) are the slow part of a commit; the database
+/// writes that follow stay on the transaction's one connection.
+async fn verify_blobs(
+    store: &super::store::BlobStore,
+    digests: &[String],
+    recorded: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<Verdict>> {
+    use futures_util::stream::{self, StreamExt};
+    let outcomes: Vec<anyhow::Result<Verdict>> = stream::iter(digests.iter().cloned())
+        .map(|digest| async move {
+            if recorded.contains(&digest) && store.exists(&digest).await? {
+                return Ok(Verdict::Present);
+            }
+            Ok(match store.hash(&digest).await? {
+                Some((actual, size)) if actual == digest => Verdict::Hashed(size),
+                Some(_) => Verdict::Mismatch,
+                None => Verdict::Absent,
+            })
+        })
+        .buffered(LOOKUP_CONCURRENCY)
+        .collect()
+        .await;
+    outcomes.into_iter().collect()
 }
 
 enum Committed {
@@ -544,23 +654,20 @@ async fn commit_manifest(
         transaction.rollback().await?;
         return Ok(Committed::Exists);
     }
+    let recorded = recorded_blobs(app, digests).await?;
+    let verdicts = verify_blobs(&app.cache_store, digests, &recorded).await?;
     let mut missing = Vec::new();
-    for digest in digests {
-        let recorded = transaction
-            .query_opt("SELECT 1 FROM cache.blobs WHERE sha256 = $1", &[&digest])
-            .await?
-            .is_some();
-        if recorded && app.cache_store.exists(digest).await? {
-            transaction
-                .execute(
-                    "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
-                    &[&digest],
-                )
-                .await?;
-            continue;
-        }
-        match app.cache_store.hash(digest).await? {
-            Some((actual, size)) if actual == *digest => {
+    for (digest, verdict) in digests.iter().zip(verdicts) {
+        match verdict {
+            Verdict::Present => {
+                transaction
+                    .execute(
+                        "UPDATE cache.blobs SET last_used_at = now() WHERE sha256 = $1",
+                        &[&digest],
+                    )
+                    .await?;
+            }
+            Verdict::Hashed(size) => {
                 transaction
                     .execute(
                         "INSERT INTO cache.blobs (sha256, size_bytes) VALUES ($1, $2) \
@@ -570,7 +677,7 @@ async fn commit_manifest(
                     )
                     .await?;
             }
-            Some(_) => {
+            Verdict::Mismatch => {
                 crate::log::error(
                     "cache blob does not match its digest",
                     json!({"sha256": digest, "repo": repo}),
@@ -578,7 +685,7 @@ async fn commit_manifest(
                 app.cache_store.delete(digest).await?;
                 missing.push(digest.clone());
             }
-            None => missing.push(digest.clone()),
+            Verdict::Absent => missing.push(digest.clone()),
         }
     }
     if !missing.is_empty() {
@@ -596,27 +703,6 @@ async fn commit_manifest(
     }
     transaction.commit().await?;
     Ok(Committed::Stored)
-}
-
-/// A blob is present when a commit has verified it (its row exists) and
-/// the object is still in GCS. An unverified object gets a fresh PUT URL.
-/// A row whose object is gone is dropped, so a later upload can replace it.
-async fn blob_present(app: &App, digest: &str) -> anyhow::Result<bool> {
-    let client = app.pool.get().await?;
-    let recorded = client
-        .query_opt("SELECT 1 FROM cache.blobs WHERE sha256 = $1", &[&digest])
-        .await?
-        .is_some();
-    if !recorded {
-        return Ok(false);
-    }
-    if app.cache_store.exists(digest).await? {
-        return Ok(true);
-    }
-    client
-        .execute("DELETE FROM cache.blobs WHERE sha256 = $1", &[&digest])
-        .await?;
-    Ok(false)
 }
 
 /// Digests a manifest names: each output `digest` and `log`.
@@ -701,4 +787,143 @@ pub(super) fn db_error(error: anyhow::Error) -> Reply {
         json!({"error": format!("{error:#}")}),
     );
     Reply::error(500, "the cache is unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::store::{BlobStore, FanoutConfig};
+    use crate::cache::FixedSigner;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const BLOBS: usize = 500;
+    const HEAD: Duration = Duration::from_millis(20);
+
+    fn store(head_latency: Duration) -> BlobStore {
+        let signer = Arc::new(FixedSigner {
+            email: "t@example.iam.gserviceaccount.com".into(),
+            signature: b"sig".to_vec(),
+            signed: Default::default(),
+        });
+        BlobStore::memory_with("bucket", signer, FanoutConfig::default(), head_latency)
+    }
+
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A build with hundreds of outputs asks upload about all of them in one
+    /// request. Serial HEADs would take BLOBS x HEAD (10s here), past the
+    /// client's request timeout; they now overlap, and the answer keeps the
+    /// order of the request.
+    #[tokio::test]
+    async fn upload_checks_hundreds_of_recorded_blobs_concurrently_and_in_order() {
+        let store = store(HEAD);
+        let digests: Vec<String> = (0..BLOBS)
+            .map(|index| digest_of(format!("blob-{index}").as_bytes()))
+            .collect();
+        // Even blobs are recorded and in the bucket. Odd blobs are recorded
+        // but gone from the bucket, so they get a fresh PUT URL and a stale
+        // row to drop.
+        let mut recorded = HashSet::new();
+        for (index, digest) in digests.iter().enumerate() {
+            recorded.insert(digest.clone());
+            if index % 2 == 0 {
+                store
+                    .put_unrecorded(digest, Bytes::from(format!("blob-{index}")))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let started = Instant::now();
+        let (placements, gone) = place_recorded(&store, &digests, &recorded).await.unwrap();
+        let elapsed = started.elapsed();
+
+        let serial = HEAD * BLOBS as u32;
+        assert!(
+            elapsed < serial / 4,
+            "took {elapsed:?}, serial would take {serial:?}"
+        );
+        assert_eq!(placements.len(), BLOBS);
+        for (index, placement) in placements.iter().enumerate() {
+            match (index % 2, placement) {
+                (0, Placement::Present) => {}
+                (1, Placement::Put(url)) => assert!(url.contains(&digests[index]), "{url}"),
+                other => panic!("blob {index}: {other:?}"),
+            }
+        }
+        let odd: Vec<String> = digests.iter().skip(1).step_by(2).cloned().collect();
+        assert_eq!(gone, odd);
+    }
+
+    /// An unrecorded blob has never been vouched for, so it gets a PUT URL
+    /// and no stale row to drop.
+    #[tokio::test]
+    async fn upload_hands_out_a_url_for_a_blob_with_no_row() {
+        let store = store(Duration::ZERO);
+        let digest = digest_of(b"new");
+        let (placements, gone) = place_recorded(&store, &[digest], &HashSet::new())
+            .await
+            .unwrap();
+        assert!(matches!(placements.as_slice(), [Placement::Put(_)]));
+        assert!(gone.is_empty());
+    }
+
+    /// Commit verifies every blob its manifest names. The GCS HEADs overlap,
+    /// and the verdicts come back in manifest order, including blobs that
+    /// are absent or whose bytes do not match their name.
+    #[tokio::test]
+    async fn commit_verifies_hundreds_of_blobs_concurrently_and_in_order() {
+        let store = store(HEAD);
+        let mut digests = Vec::new();
+        let mut recorded = HashSet::new();
+        for index in 0..BLOBS {
+            let bytes = format!("blob-{index}");
+            let digest = digest_of(bytes.as_bytes());
+            store
+                .put_unrecorded(&digest, Bytes::from(bytes))
+                .await
+                .unwrap();
+            recorded.insert(digest.clone());
+            digests.push(digest);
+        }
+        // Not recorded, bytes match: hashed.
+        let fresh = digest_of(b"fresh");
+        store
+            .put_unrecorded(&fresh, Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+        // Not recorded, bytes differ from the name: mismatch.
+        let liar = digest_of(b"claimed");
+        store
+            .put_unrecorded(&liar, Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+        let absent = digest_of(b"never uploaded");
+        digests.extend([fresh, liar, absent]);
+
+        let started = Instant::now();
+        let verdicts = verify_blobs(&store, &digests, &recorded).await.unwrap();
+        let elapsed = started.elapsed();
+
+        let serial = HEAD * BLOBS as u32;
+        assert!(
+            elapsed < serial / 4,
+            "took {elapsed:?}, serial would take {serial:?}"
+        );
+        assert_eq!(verdicts.len(), BLOBS + 3);
+        assert!(verdicts[..BLOBS]
+            .iter()
+            .all(|verdict| *verdict == Verdict::Present));
+        assert_eq!(verdicts[BLOBS], Verdict::Hashed(5));
+        assert_eq!(verdicts[BLOBS + 1], Verdict::Mismatch);
+        assert_eq!(verdicts[BLOBS + 2], Verdict::Absent);
+    }
 }
