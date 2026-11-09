@@ -11,8 +11,9 @@ mod skills;
 pub mod source_graph;
 
 pub use commands::{
-    CacheCommands, CiCommands, Cli, Commands, ProjectCommands, ResultsCommands, ServicesCommands,
-    ServicesDaemonCommands, SrvCommands, SrvTarget, TlsCommands,
+    CacheCommands, CiCommands, Cli, Commands, DirCacheRestoreArgs, DirCacheSaveArgs,
+    ProjectCommands, ResultsCommands, ServicesCommands, ServicesDaemonCommands, SrvCommands,
+    SrvTarget, TlsCommands,
 };
 pub use output::{
     build_execution_output, build_execution_output_with_cache, output_json, print_summary,

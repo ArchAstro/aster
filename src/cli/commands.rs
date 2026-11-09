@@ -770,6 +770,42 @@ pub enum CiCommands {
     },
 }
 
+/// Arguments of `aster cache save`
+#[derive(clap::Args)]
+pub struct DirCacheSaveArgs {
+    /// The key to store under. An existing key is never replaced.
+    #[arg(long)]
+    pub key: String,
+
+    /// A file or directory to store. `~/` means the home directory; other
+    /// relative paths start at the current directory. Part of the entry's
+    /// identity, so restore must name the same paths. A glob (`*` stops at
+    /// `/`) stores what it matches under its literal leading directories.
+    #[arg(long = "path", required = true)]
+    pub paths: Vec<String>,
+
+    /// A glob, relative to each path, to leave out (e.g. `**/incremental`).
+    #[arg(long = "exclude")]
+    pub excludes: Vec<String>,
+}
+
+/// Arguments of `aster cache restore`
+#[derive(clap::Args)]
+pub struct DirCacheRestoreArgs {
+    /// The key to restore.
+    #[arg(long)]
+    pub key: String,
+
+    /// A key prefix to fall back to, newest entry first. Repeat in priority
+    /// order.
+    #[arg(long = "restore-key")]
+    pub restore_keys: Vec<String>,
+
+    /// The same paths the entry was saved with.
+    #[arg(long = "path", required = true)]
+    pub paths: Vec<String>,
+}
+
 /// Cache subcommands
 #[derive(Subcommand)]
 pub enum CacheCommands {
@@ -805,6 +841,22 @@ pub enum CacheCommands {
         #[arg(long)]
         inputs: bool,
     },
+
+    /// Store directories in aster-srv under a key
+    ///
+    /// For tool caches, dependency stores and incremental build trees, the
+    /// things a target's outputs do not cover. Does nothing when the key is
+    /// already stored, when `ASTER_CACHE_MODE` does not write, or when this
+    /// identity may not write. A remote failure is a warning, not an error.
+    Save(DirCacheSaveArgs),
+
+    /// Restore directories from aster-srv
+    ///
+    /// Tries `--key` exactly, then the newest entry under each
+    /// `--restore-key` prefix in order. A miss or a remote failure is not an
+    /// error. On GitHub Actions, writes `cache-hit` (true only for an exact
+    /// match), `cache-primary-key` and `cache-matched-key` to `$GITHUB_OUTPUT`.
+    Restore(DirCacheRestoreArgs),
 
     /// The shared cache's size, lookups and last writer, from aster-srv
     ///
@@ -1117,7 +1169,10 @@ mod tests {
                 .collect()
         };
         assert_eq!(visible("srv"), ["login", "logout", "whoami", "get"]);
-        assert_eq!(visible("cache"), ["clear", "status", "stats", "prune"]);
+        assert_eq!(
+            visible("cache"),
+            ["clear", "status", "save", "restore", "stats", "prune"]
+        );
         assert!(visible("results").contains(&"flaky".to_string()));
     }
 

@@ -58,6 +58,8 @@ fn platform_string(artifact: &str) -> &'static str {
         "linux-x64"
     } else if artifact.contains("darwin") || artifact.contains("macos") {
         "macos"
+    } else if artifact.contains("windows-x64") {
+        "windows-x64"
     } else {
         panic!("release artifact {artifact} has no documented platform string");
     }

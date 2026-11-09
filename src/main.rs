@@ -257,6 +257,28 @@ fn run() -> Result<()> {
                     target,
                 );
             }
+            CacheCommands::Save(args) => {
+                return aster::cache::dir_cache::run_save(
+                    &aster::cache::dir_cache::Spec {
+                        key: args.key.clone(),
+                        restore_keys: Vec::new(),
+                        paths: args.paths.clone(),
+                        excludes: args.excludes.clone(),
+                    },
+                    &std::env::current_dir()?,
+                );
+            }
+            CacheCommands::Restore(args) => {
+                return aster::cache::dir_cache::run_restore(
+                    &aster::cache::dir_cache::Spec {
+                        key: args.key.clone(),
+                        restore_keys: args.restore_keys.clone(),
+                        paths: args.paths.clone(),
+                        excludes: Vec::new(),
+                    },
+                    &std::env::current_dir()?,
+                );
+            }
             CacheCommands::Clear { .. }
             | CacheCommands::Status { .. }
             | CacheCommands::Prune { .. } => {}
@@ -1835,6 +1857,8 @@ fn run() -> Result<()> {
                 }
                 CacheCommands::Login { .. }
                 | CacheCommands::Logout
+                | CacheCommands::Save(_)
+                | CacheCommands::Restore(_)
                 | CacheCommands::Stats { .. } => {
                     unreachable!("handled before workspace discovery")
                 }

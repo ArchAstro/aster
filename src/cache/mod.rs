@@ -11,6 +11,7 @@ mod artifact;
 mod artifact_cache;
 mod aster_srv;
 mod backend;
+pub mod dir_cache;
 mod gha;
 mod hasher;
 mod http;

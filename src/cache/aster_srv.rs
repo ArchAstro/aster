@@ -149,7 +149,7 @@ impl AsterSrvBackend {
         Ok(Some(backend))
     }
 
-    fn from_parts(
+    pub(super) fn from_parts(
         url: Option<&str>,
         repo: Option<&str>,
         credentials: Option<Credentials>,
@@ -191,9 +191,9 @@ impl AsterSrvBackend {
         self
     }
 
-    /// Replace the timeout of upload and commit calls. Tests only.
-    #[cfg(test)]
-    fn with_write_timeout(mut self, timeout: Duration) -> Self {
+    /// Replace the timeout of upload and commit calls. A directory-cache
+    /// commit makes the server hash far more bytes than a target's does.
+    pub(super) fn with_write_timeout(mut self, timeout: Duration) -> Self {
         let origin = checked_origin(&self.base_url).expect("checked in new");
         self.write_agent = build_agent(&origin, timeout);
         self
@@ -285,7 +285,46 @@ impl AsterSrvBackend {
         Ok(state.hits.get(key).cloned().flatten())
     }
 
+    /// Find a directory-cache entry: `key`, else the newest entry under the
+    /// first of `prefixes` that has one. Returns the stored key; its manifest
+    /// and blob URLs are then available through [`CacheBackend`].
+    pub(super) fn lookup_dir(&self, key: &str, prefixes: &[String]) -> Result<Option<String>> {
+        let body = json!({ "repo": self.repo, "key": key, "prefixes": prefixes });
+        // Resolving every chunk of a cold entry is allowed longer than a
+        // target lookup, so this does not use the lookup timeout.
+        let value = self.post_via(&self.write_agent, "/v1/cache/dir-lookup", &body, false)?;
+        let Some(entry) = value.get("hit").filter(|hit| !hit.is_null()) else {
+            return Ok(None);
+        };
+        let stored = entry
+            .get("key")
+            .and_then(Value::as_str)
+            .context("dir-lookup hit has no key")?
+            .to_string();
+        let Some(hit) = decode_hit(entry)? else {
+            return Ok(None);
+        };
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.hits.insert(stored.clone(), Some(hit));
+        Ok(Some(stored))
+    }
+
     fn post(&self, path: &str, body: &Value, write: bool) -> Result<Value> {
+        let agent = if write {
+            &self.write_agent
+        } else {
+            &self.agent
+        };
+        self.post_via(agent, path, body, write)
+    }
+
+    fn post_via(
+        &self,
+        agent: &ureq::Agent,
+        path: &str,
+        body: &Value,
+        write: bool,
+    ) -> Result<Value> {
         let payload = serde_json::to_vec(body).context("encode cache request")?;
         let url = format!("{}{path}", self.base_url);
         let bearer = match (&self.credentials, &self.person_token) {
@@ -294,12 +333,12 @@ impl AsterSrvBackend {
             (None, Some(token)) => token.clone(),
             (None, None) => return Err(signed_out()),
         };
-        let response = self.send_post(
+        let response = Self::send_post(
+            agent,
             &url,
             &payload,
             Some(&bearer),
             self.proxy_token.as_deref(),
-            write,
         )?;
         // A stored sign-in the server no longer accepts (expired early, key
         // rotated, access removed) is the same as none.
@@ -310,18 +349,12 @@ impl AsterSrvBackend {
     }
 
     fn send_post(
-        &self,
+        agent: &ureq::Agent,
         url: &str,
         payload: &[u8],
         bearer: Option<&str>,
         proxy: Option<&str>,
-        write: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        let agent = if write {
-            &self.write_agent
-        } else {
-            &self.agent
-        };
         // A signal during the blocking call is this process, not the remote.
         // ureq returns that as `io: Interrupted` and does not restart it.
         // Retrying keeps one EINTR from failing a lookup; a timeout still

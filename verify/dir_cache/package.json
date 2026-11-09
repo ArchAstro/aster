@@ -1,0 +1,16 @@
+{
+  "name": "aster-dir-cache-model",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "compile": "quint-refinements compile scenarios.qnt --artifact quint-refinements.json --rust src/generated_refinement.rs",
+    "check": "quint-refinements compile scenarios.qnt --artifact quint-refinements.json --rust src/generated_refinement.rs --check",
+    "typecheck": "quint typecheck model.qnt && quint typecheck scenarios.qnt && quint typecheck witnesses.qnt && quint typecheck properties.qnt",
+    "quint:test": "quint test --main witnesses --match 'Witness$' --max-samples=1 witnesses.qnt",
+    "quint:properties": "quint run properties.qnt --main properties --init start --step step --max-samples 2000 --max-steps 14 --invariant allHold && quint run properties.qnt --main properties --init start --step stepWithLoss --max-samples 2000 --max-steps 14 --invariant holdDespiteLoss"
+  },
+  "devDependencies": {
+    "quint-refinements": "https://github.com/ArchAstro/quint-refinements/archive/6229384ee53f07ac192f8f4365dcca89efe0a242.tar.gz",
+    "@informalsystems/quint": "0.33.0"
+  }
+}

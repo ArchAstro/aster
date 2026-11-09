@@ -62,15 +62,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             artifact: aster-linux-x64
+            binary: aster
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
             artifact: aster-linux-arm64
+            binary: aster
           - target: x86_64-apple-darwin
             os: macos-15-intel
             artifact: aster-darwin-x64
+            binary: aster
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: aster-darwin-arm64
+            binary: aster
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            artifact: aster-windows-x64
+            binary: aster.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
@@ -79,14 +87,14 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Smoke test
-        run: target/${{ matrix.target }}/release/aster --version
+        shell: bash
+        run: target/${{ matrix.target }}/release/${{ matrix.binary }} --version
       - name: Package
         shell: bash
         run: |
-          mkdir dist
-          tar -czf "dist/${{ matrix.artifact }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" aster \
-            -C "${GITHUB_WORKSPACE}" LICENSE
+          mkdir dist stage
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" LICENSE stage/
+          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C stage "${{ matrix.binary }}" LICENSE
       - name: Install nFPM
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |

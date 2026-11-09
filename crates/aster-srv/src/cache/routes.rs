@@ -19,11 +19,26 @@ use crate::Reply;
 const MAX_KEYS: usize = 256;
 const MAX_DIGESTS: usize = 1024;
 const SHA256_LEN: usize = 64;
+/// Every directory-cache key starts here, so a prefix can never enumerate
+/// target-cache entries.
+const DIR_KEY_NAMESPACE: &str = "dir/v1/";
+const MAX_DIR_PREFIXES: usize = 16;
+const MAX_KEY_LEN: usize = 256;
+/// Entries with a lost chunk one lookup will remove before it answers a miss.
+const MAX_BROKEN_DIR_ENTRIES: usize = 3;
 
 #[derive(Debug, Deserialize)]
 struct LookupRequest {
     repo: String,
     keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirLookupRequest {
+    repo: String,
+    key: String,
+    #[serde(default)]
+    prefixes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +96,7 @@ pub async fn handle(
     };
     match path {
         "/v1/cache/lookup" => lookup(app, headers, request).await,
+        "/v1/cache/dir-lookup" => dir_lookup(app, headers, request).await,
         "/v1/cache/upload" => upload(app, headers, request).await,
         "/v1/cache/commit" => commit(app, headers, request).await,
         _ => Reply::error(404, "not found"),
@@ -154,7 +170,8 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     let counts = reader.caller == Caller::Ci && reader.may_write;
     // Aggregate lookup stats stay a hit-rate view over every CI lookup.
     let records_stats = reader.caller == Caller::Ci;
-    match lookup_hits(app, &reader.repository, &request.keys, counts).await {
+    let budget = app.cache_store.lookup_budget();
+    match lookup_hits(app, &reader.repository, &request.keys, counts, budget).await {
         Ok(hits) => {
             let requested = request
                 .keys
@@ -168,6 +185,152 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         }
         Err(error) => db_error(error),
     }
+}
+
+/// Whether `value` is a usable directory-cache key or prefix.
+fn in_dir_namespace(value: &str) -> bool {
+    value.len() > DIR_KEY_NAMESPACE.len()
+        && value.len() <= MAX_KEY_LEN
+        && value.starts_with(DIR_KEY_NAMESPACE)
+}
+
+/// Answer `aster cache restore`: the exact key, else the newest entry under
+/// the first prefix that has one. Blobs and hit counting are [`lookup_hits`]'s,
+/// so a read keeps an entry alive under the same rule as a target-cache hit.
+async fn dir_lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
+    let request: DirLookupRequest = match serde_json::from_value(body) {
+        Ok(request) => request,
+        Err(_) => return Reply::error(400, "dir-lookup needs repo and key"),
+    };
+    let reader = match reader_for(app, headers, &request.repo, false).await {
+        Ok(reader) => reader,
+        Err(reply) => return reply,
+    };
+    if let Err(reply) = same_repo(&reader, &request.repo) {
+        return reply;
+    }
+    if request.prefixes.len() > MAX_DIR_PREFIXES {
+        return Reply::error(
+            400,
+            format!("dir-lookup accepts at most {MAX_DIR_PREFIXES} prefixes"),
+        );
+    }
+    if !in_dir_namespace(&request.key) || !request.prefixes.iter().all(|p| in_dir_namespace(p)) {
+        return Reply::error(400, format!("keys must start with {DIR_KEY_NAMESPACE}"));
+    }
+    let records_stats = reader.caller == Caller::Ci;
+    let counts = reader.caller == Caller::Ci && reader.may_write;
+    // `None` without a bucket: every blob then looks absent, which says
+    // nothing about the entry.
+    let deadline = app
+        .cache_store
+        .dir_lookup_budget()
+        .map(|budget| std::time::Instant::now() + budget);
+    for _ in 0..=MAX_BROKEN_DIR_ENTRIES {
+        // One budget for the whole request, however many entries it tries.
+        let budget = deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
+        if budget.is_some_and(|budget| budget.is_zero()) {
+            break;
+        }
+        let repo = &reader.repository;
+        let key = match resolve_dir_key(app, repo, &request.key, &request.prefixes).await {
+            Ok(Some(key)) => key,
+            Ok(None) => break,
+            Err(error) => return db_error(error),
+        };
+        let wanted = std::slice::from_ref(&key);
+        let hit = match lookup_hits(app, repo, wanted, counts, budget).await {
+            Ok(mut hits) => hits.remove(&key),
+            Err(error) => return db_error(error),
+        };
+        match hit {
+            Some(Value::Object(mut entry)) if names_only_present_blobs(&entry) => {
+                if records_stats {
+                    record_lookup(app, repo, 1, 1);
+                }
+                entry.insert("key".to_string(), Value::String(key));
+                return Reply::json(200, json!({"hit": entry}));
+            }
+            // A chunk is gone from the bucket, so the entry can never be
+            // restored. Drop it: the next-newest entry serves this job, and
+            // the next save can store the key again.
+            Some(Value::Object(entry)) if deadline.is_some() => {
+                if let Err(error) = drop_manifest(app, repo, &key, &manifest_of(&entry)).await {
+                    return db_error(error);
+                }
+            }
+            Some(_) => break,
+            // Not resolved within the budget: unknown, so left alone.
+            None => break,
+        }
+    }
+    if records_stats {
+        record_lookup(app, &reader.repository, 0, 1);
+    }
+    Reply::json(200, json!({"hit": null}))
+}
+
+fn manifest_of(entry: &serde_json::Map<String, Value>) -> Vec<u8> {
+    entry
+        .get("manifest")
+        .and_then(Value::as_str)
+        .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
+        .unwrap_or_default()
+}
+
+fn names_only_present_blobs(entry: &serde_json::Map<String, Value>) -> bool {
+    let present = entry.get("blobs").and_then(Value::as_object);
+    blob_refs(&manifest_of(entry))
+        .iter()
+        .all(|digest| present.is_some_and(|blobs| blobs.contains_key(digest)))
+}
+
+/// Only these bytes: a writer may have stored the key again meanwhile.
+async fn drop_manifest(app: &App, repo: &str, key: &str, manifest: &[u8]) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    client
+        .execute(
+            "DELETE FROM cache.manifests WHERE repo = $1 AND key = $2 AND manifest = $3",
+            &[&repo, &key, &manifest],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The stored key `dir_lookup` should serve, if any.
+async fn resolve_dir_key(
+    app: &App,
+    repo: &str,
+    key: &str,
+    prefixes: &[String],
+) -> anyhow::Result<Option<String>> {
+    let client = app.pool.get().await?;
+    let exact = client
+        .query_opt(
+            "SELECT key FROM cache.manifests WHERE repo = $1 AND key = $2",
+            &[&repo, &key],
+        )
+        .await?;
+    if let Some(row) = exact {
+        return Ok(Some(row.get(0)));
+    }
+    for prefix in prefixes {
+        // U+10FFFF sorts after every valid key under the "C" collation.
+        let upper = format!("{prefix}\u{10FFFF}");
+        let newest = client
+            .query_opt(
+                "SELECT key FROM cache.manifests \
+                 WHERE repo = $1 AND key LIKE 'dir/v1/%' \
+                   AND key COLLATE \"C\" >= $2 AND key COLLATE \"C\" < $3 \
+                 ORDER BY created_at DESC, key DESC LIMIT 1",
+                &[&repo, prefix, &upper],
+            )
+            .await?;
+        if let Some(row) = newest {
+            return Ok(Some(row.get(0)));
+        }
+    }
+    Ok(None)
 }
 
 /// How long the stats write may wait, lock waits included, before it gives up.
@@ -250,10 +413,15 @@ async fn lookup_hits(
     repo: &str,
     keys: &[String],
     counts: bool,
+    budget: Option<std::time::Duration>,
 ) -> anyhow::Result<serde_json::Map<String, Value>> {
     use futures_util::stream::{self, StreamExt};
-    let client = app.pool.get().await?;
-    let rows = client
+    // Not held while blobs resolve: that can take the whole budget, and every
+    // other cache route needs the same pool.
+    let rows = app
+        .pool
+        .get()
+        .await?
         .query(
             "SELECT key, manifest FROM cache.manifests WHERE repo = $1 AND key = ANY($2)",
             &[&repo, &keys],
@@ -294,10 +462,7 @@ async fn lookup_hits(
     // miss, so the reply beats the client's request timeout. Without a
     // bucket every blob resolves at once as absent and there is no budget:
     // a zero one would race the stream and drop entries at random.
-    let budget = app
-        .cache_store
-        .lookup_budget()
-        .unwrap_or(std::time::Duration::MAX);
+    let budget = budget.unwrap_or(std::time::Duration::MAX);
     let wanted = digests.len();
     let mut pending = stream::iter(digests)
         .map(|digest| async move {
@@ -376,6 +541,7 @@ async fn lookup_hits(
     }
     if counts && !served_keys.is_empty() {
         // Only what the response serves counts and is kept alive.
+        let client = app.pool.get().await?;
         client
             .execute(
                 "UPDATE cache.manifests \
@@ -606,8 +772,8 @@ enum Committed {
 /// The transaction holds the retention lock shared, so a retention pass
 /// cannot delete a blob between this check and the insert that names it.
 /// A blob with no `cache.blobs` row has only been PUT through a signed URL;
-/// its bytes are hashed here before a row vouches for them, and an object
-/// that does not match its name is deleted so the client can upload again.
+/// [`vouch_for_new_blobs`] hashes it first, outside the transaction, so a
+/// large entry does not hold a connection and the lock while it reads GCS.
 async fn commit_manifest(
     app: &App,
     repo: &str,
@@ -617,6 +783,15 @@ async fn commit_manifest(
     writer: &Writer,
 ) -> anyhow::Result<Committed> {
     let summary = browse::ManifestColumns::of(manifest);
+    if manifest_exists(app, repo, key).await? {
+        return Ok(Committed::Exists);
+    }
+    let recorded = recorded_blobs(app, digests).await?;
+    let missing = vouch_for_new_blobs(app, repo, digests, &recorded).await?;
+    if !missing.is_empty() {
+        forget_blobs(app, &missing).await?;
+        return Ok(Committed::Missing(missing));
+    }
     let mut client = app.pool.get().await?;
     let transaction = client.transaction().await?;
     transaction
@@ -654,7 +829,17 @@ async fn commit_manifest(
         transaction.rollback().await?;
         return Ok(Committed::Exists);
     }
-    let recorded = recorded_blobs(app, digests).await?;
+    // Read again under the lock: a blob retention removed since it was hashed
+    // has no row, and is either hashed again here or reported missing.
+    let recorded: std::collections::HashSet<String> = transaction
+        .query(
+            "SELECT sha256 FROM cache.blobs WHERE sha256 = ANY($1)",
+            &[&digests],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
     let verdicts = verify_blobs(&app.cache_store, digests, &recorded).await?;
     let mut missing = Vec::new();
     for (digest, verdict) in digests.iter().zip(verdicts) {
@@ -690,19 +875,84 @@ async fn commit_manifest(
     }
     if !missing.is_empty() {
         transaction.rollback().await?;
-        // Forget rows for blobs that are gone or were deleted as corrupt, so
-        // upload hands out a fresh PUT URL.
-        let client = app.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM cache.blobs WHERE sha256 = ANY($1)",
-                &[&missing],
-            )
-            .await?;
+        // Back to the pool first: 16 failing commits must not each hold one
+        // connection while waiting for another.
+        drop(client);
+        forget_blobs(app, &missing).await?;
         return Ok(Committed::Missing(missing));
     }
     transaction.commit().await?;
     Ok(Committed::Stored)
+}
+
+async fn manifest_exists(app: &App, repo: &str, key: &str) -> anyhow::Result<bool> {
+    let client = app.pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM cache.manifests WHERE repo = $1 AND key = $2",
+            &[&repo, &key],
+        )
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Hash the blobs with no row, recording each batch as it finishes. A commit
+/// cut off by a timeout keeps those rows, so its retry hashes only the rest.
+/// Returns the blobs that are absent or do not match their name.
+async fn vouch_for_new_blobs(
+    app: &App,
+    repo: &str,
+    digests: &[String],
+    recorded: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let new: Vec<String> = digests
+        .iter()
+        .filter(|digest| !recorded.contains(*digest))
+        .cloned()
+        .collect();
+    let unvouched = std::collections::HashSet::new();
+    let mut missing = Vec::new();
+    for batch in new.chunks(LOOKUP_CONCURRENCY) {
+        let verdicts = verify_blobs(&app.cache_store, batch, &unvouched).await?;
+        let client = app.pool.get().await?;
+        for (digest, verdict) in batch.iter().zip(verdicts) {
+            match verdict {
+                Verdict::Hashed(size) => {
+                    client
+                        .execute(
+                            "INSERT INTO cache.blobs (sha256, size_bytes) VALUES ($1, $2) \
+                             ON CONFLICT (sha256) DO UPDATE \
+                             SET size_bytes = EXCLUDED.size_bytes, last_used_at = now()",
+                            &[digest, &(size as i64)],
+                        )
+                        .await?;
+                }
+                Verdict::Mismatch => {
+                    crate::log::error(
+                        "cache blob does not match its digest",
+                        json!({"sha256": digest, "repo": repo}),
+                    );
+                    app.cache_store.delete(digest).await?;
+                    missing.push(digest.clone());
+                }
+                Verdict::Absent | Verdict::Present => missing.push(digest.clone()),
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// Forget rows for blobs that are gone or were deleted as corrupt, so upload
+/// hands out a fresh PUT URL.
+async fn forget_blobs(app: &App, digests: &[String]) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    client
+        .execute(
+            "DELETE FROM cache.blobs WHERE sha256 = ANY($1)",
+            &[&digests],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Digests a manifest names: each output `digest` and `log`.
