@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aster_srv::cache::{expires_at, BlobStore, FixedSigner, Signer, URL_TTL};
+use aster_srv::cache::{expires_at, BlobStore, FanoutConfig, FixedSigner, Signer, URL_TTL};
 use base64::Engine;
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
@@ -51,6 +51,13 @@ fn manifest(key: &str, digests: &[&str]) -> String {
 async fn server() -> Option<(common::Server, Arc<FixedSigner>)> {
     let signing = signer();
     let store = BlobStore::memory("aster-cache-test", signing.clone() as Arc<dyn Signer>);
+    server_with(store, signing).await
+}
+
+async fn server_with(
+    store: BlobStore,
+    signing: Arc<FixedSigner>,
+) -> Option<(common::Server, Arc<FixedSigner>)> {
     let started = common::start_with(
         &[
             ("ASTER_SRV_CACHE_BUCKET", "aster-cache-test"),
@@ -281,6 +288,446 @@ async fn commit_verifies_uploaded_bytes_against_their_digest() {
         .await;
     assert_eq!(status, 200, "{upload}");
     assert_eq!(upload["missing"], json!({}));
+    server.stop().await;
+}
+
+/// A commit that cannot finish keeps the chunks it already hashed. The second
+/// commit passes although the first blob's bytes have since changed, which
+/// only happens if it was not hashed again.
+#[tokio::test]
+async fn a_retried_commit_does_not_hash_what_the_first_attempt_verified() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let store = &server.app.cache_store;
+    let body = b"first chunk";
+    let verified = sha256_hex(body);
+    let late_body = b"second chunk";
+    let late = sha256_hex(late_body);
+    store
+        .put_unrecorded(&verified, bytes::Bytes::from_static(body))
+        .await
+        .unwrap();
+    let commit = json!({
+        "repo": REPO,
+        "key": "large-entry",
+        "manifest": manifest("large-entry", &[&verified, &late]),
+    });
+    let (status, reply) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 422, "{reply}");
+    assert_eq!(reply["missing"], json!([late]));
+    let client = server.client().await;
+    let rows = client
+        .query("SELECT sha256 FROM cache.blobs", &[])
+        .await
+        .unwrap();
+    let recorded: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(recorded, vec![verified.clone()]);
+
+    // A retention pass between the attempts leaves that progress in place.
+    aster_srv::cache::run_retention(&server.app, Utc::now())
+        .await
+        .unwrap()
+        .expect("this replica holds the lock");
+    assert!(store.get(&verified).await.unwrap().is_some());
+
+    store
+        .put_unrecorded(&verified, bytes::Bytes::from_static(b"changed"))
+        .await
+        .unwrap();
+    store
+        .put_unrecorded(&late, bytes::Bytes::from_static(late_body))
+        .await
+        .unwrap();
+    let (status, reply) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 201, "{reply}");
+    // A key that is already stored answers without looking at its blobs.
+    let (status, _) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 409);
+    server.stop().await;
+}
+
+/// A directory entry resolves hundreds of chunks at once. The same entry as a
+/// target lookup exceeds that route's budget and is a miss; the directory
+/// lookup has its own budget and finds it.
+#[tokio::test]
+async fn a_large_directory_entry_outlasts_the_target_lookup_budget() {
+    let signing = signer();
+    let config = FanoutConfig {
+        lookup_budget: std::time::Duration::from_millis(100),
+        ..FanoutConfig::default()
+    };
+    let store = BlobStore::memory_with(
+        "aster-cache-test",
+        signing.clone() as Arc<dyn Signer>,
+        config,
+        std::time::Duration::from_millis(20),
+    );
+    let Some((server, _)) = server_with(store, signing).await else {
+        return;
+    };
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let digests: Vec<String> = (0..200)
+        .map(|index| sha256_hex(format!("chunk-{index}").as_bytes()))
+        .collect();
+    for (index, digest) in digests.iter().enumerate() {
+        server
+            .app
+            .cache_store
+            .put_unrecorded(digest, bytes::Bytes::from(format!("chunk-{index}")))
+            .await
+            .unwrap();
+    }
+    let key = "dir/v1/0123456789abcdef/large";
+    let refs: Vec<&str> = digests.iter().map(String::as_str).collect();
+    let commit = json!({"repo": REPO, "key": key, "manifest": manifest(key, &refs)});
+    let (status, reply) = server
+        .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+        .await;
+    assert_eq!(status, 201, "{reply}");
+
+    let (status, reply) = server
+        .post_json(
+            "/v1/cache/lookup",
+            &json!({"repo": REPO, "keys": [key]}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply["hits"].get(key).is_none(), "{reply}");
+
+    let (status, reply) = server
+        .post_json(
+            "/v1/cache/dir-lookup",
+            &json!({"repo": REPO, "key": key}),
+            Some(&writer),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["hit"]["key"], key, "{reply}");
+    assert_eq!(reply["hit"]["blobs"].as_object().unwrap().len(), 200);
+    server.stop().await;
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A chunk lost from the bucket would otherwise leave a key that always
+/// misses, can never be stored again, and is kept alive by each lookup.
+#[tokio::test]
+async fn an_entry_that_lost_a_chunk_is_dropped_and_the_next_newest_serves() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let store = &server.app.cache_store;
+    let (old_body, new_body) = (b"older chunk".to_vec(), b"newer chunk".to_vec());
+    let (old, new) = (sha256_hex(&old_body), sha256_hex(&new_body));
+    store
+        .put_unrecorded(&old, bytes::Bytes::from(old_body))
+        .await
+        .unwrap();
+    store
+        .put_unrecorded(&new, bytes::Bytes::from(new_body.clone()))
+        .await
+        .unwrap();
+    let older = "dir/v1/0123456789abcdef/deps-1";
+    let newer = "dir/v1/0123456789abcdef/deps-2";
+    let commit_body = |key: &str, digest: &str| json!({"repo": REPO, "key": key, "manifest": manifest(key, &[digest])});
+    for (key, digest) in [(older, &old), (newer, &new)] {
+        let body = commit_body(key, digest);
+        let (status, reply) = server
+            .post_json("/v1/cache/commit", &body, Some(&writer), None)
+            .await;
+        assert_eq!(status, 201, "{reply}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    store.delete(&new).await.unwrap();
+    let ask = json!({
+        "repo": REPO,
+        "key": newer,
+        "prefixes": ["dir/v1/0123456789abcdef/deps-"],
+    });
+    let (status, reply) = server
+        .post_json("/v1/cache/dir-lookup", &ask, Some(&writer), None)
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["hit"]["key"], older, "{reply}");
+
+    // The key can be stored again.
+    store
+        .put_unrecorded(&new, bytes::Bytes::from(new_body))
+        .await
+        .unwrap();
+    let body = commit_body(newer, &new);
+    let (status, reply) = server
+        .post_json("/v1/cache/commit", &body, Some(&writer), None)
+        .await;
+    assert_eq!(status, 201, "{reply}");
+    server.stop().await;
+}
+
+async fn broken_server(head_ms: u64, budget_ms: u64) -> Option<common::Server> {
+    let signing = signer();
+    let config = FanoutConfig {
+        dir_lookup_budget: std::time::Duration::from_millis(budget_ms),
+        ..FanoutConfig::default()
+    };
+    let store = BlobStore::memory_with(
+        "aster-cache-test",
+        signing.clone() as Arc<dyn Signer>,
+        config,
+        std::time::Duration::from_millis(head_ms),
+    );
+    server_with(store, signing).await.map(|(server, _)| server)
+}
+
+async fn insert_manifest(client: &deadpool_postgres::Client, key: &str, digest: &str) -> Vec<u8> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(manifest(key, &[digest]))
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO cache.manifests (repo, key, manifest, size_bytes) \
+             VALUES ($1, $2, $3, $4)",
+            &[&REPO, &key, &bytes, &(bytes.len() as i64)],
+        )
+        .await
+        .unwrap();
+    bytes
+}
+
+/// One lookup gets one budget, however many broken entries it walks past.
+#[tokio::test]
+async fn a_lookup_past_broken_entries_stops_at_one_budget() {
+    let Some(server) = broken_server(150, 200).await else {
+        return;
+    };
+    let client = server.client().await;
+    let prefix = "dir/v1/0123456789abcdef/deps-";
+    for index in 0..4 {
+        let digest = sha256_hex(format!("lost-{index}").as_bytes());
+        insert_manifest(&client, &format!("{prefix}{index}"), &digest).await;
+    }
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let ask = json!({"repo": REPO, "key": format!("{prefix}none"), "prefixes": [prefix]});
+    let (status, reply) = server
+        .post_json("/v1/cache/dir-lookup", &ask, Some(&writer), None)
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply["hit"].is_null(), "{reply}");
+    let left: i64 = client
+        .query_one("SELECT count(*) FROM cache.manifests", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(left > 0, "the budget should stop the walk; {left} left");
+    server.stop().await;
+}
+
+/// A writer may store the key again while a reader decides an older entry is
+/// broken. The reader removes the bytes it examined and nothing newer.
+#[tokio::test]
+async fn dropping_a_broken_entry_leaves_a_newer_commit_of_its_key() {
+    let Some(server) = broken_server(400, 30_000).await else {
+        return;
+    };
+    let client = server.client().await;
+    let key = "dir/v1/0123456789abcdef/deps";
+    let lost = sha256_hex(b"lost");
+    insert_manifest(&client, key, &lost).await;
+    // The newer commit's chunk is really there.
+    server
+        .app
+        .cache_store
+        .put_unrecorded(DIGEST, bytes::Bytes::new())
+        .await
+        .unwrap();
+    let reader = {
+        let (url, writer) = (
+            format!("{}/v1/cache/dir-lookup", server.url),
+            bearer(REPO, Some("refs/heads/main")),
+        );
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", writer)
+                .json(&json!({"repo": REPO, "key": key}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let newer = base64::engine::general_purpose::STANDARD
+        .decode(manifest(key, &[DIGEST]))
+        .unwrap();
+    client
+        .execute(
+            "UPDATE cache.manifests SET manifest = $1 WHERE key = $2",
+            &[&newer, &key],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.await.unwrap(), 200);
+    let kept: Vec<u8> = client
+        .query_one("SELECT manifest FROM cache.manifests", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(kept, newer);
+    server.stop().await;
+}
+
+/// A deployment missing its bucket setting sees every blob as absent. That
+/// says nothing about the bucket, so no entry may be dropped.
+#[tokio::test]
+async fn a_server_without_a_bucket_does_not_drop_directory_entries() {
+    let Some(server) = common::start_with(
+        &[
+            ("ASTER_SRV_CACHE_DAYS", "14"),
+            (
+                "ASTER_SRV_STATIC_TOKENS",
+                "ArchAstro/firstlanding=dev-token-0123456789",
+            ),
+        ],
+        Some(BlobStore::Disabled),
+    )
+    .await
+    else {
+        return;
+    };
+    let key = "dir/v1/0123456789abcdef/deps";
+    let body = manifest(key, &[DIGEST]);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap();
+    let client = server.client().await;
+    client
+        .execute(
+            "INSERT INTO cache.manifests (repo, key, manifest, size_bytes) \
+             VALUES ($1, $2, $3, $4)",
+            &[&REPO, &key, &bytes, &(bytes.len() as i64)],
+        )
+        .await
+        .unwrap();
+    let (status, reply) = server
+        .post_json(
+            "/v1/cache/dir-lookup",
+            &json!({"repo": REPO, "key": key}),
+            Some("Bearer dev-token-0123456789"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply["hit"].is_null(), "{reply}");
+    let rows = client
+        .query("SELECT key FROM cache.manifests", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    server.stop().await;
+}
+
+/// Directory entries are bounded by size as well as age: the least recently
+/// used goes, its chunks go unless a kept entry shares them, and target-cache
+/// entries are not touched.
+#[tokio::test]
+async fn retention_evicts_the_least_recently_used_directory_entries_over_the_cap() {
+    let signing = signer();
+    let store = BlobStore::memory("aster-cache-test", signing.clone() as Arc<dyn Signer>);
+    let Some((server, _)) = common::start_with(
+        &[
+            ("ASTER_SRV_CACHE_BUCKET", "aster-cache-test"),
+            (
+                "ASTER_SRV_CACHE_SIGNER",
+                "cache-test@example.iam.gserviceaccount.com",
+            ),
+            ("ASTER_SRV_CACHE_DAYS", "14"),
+            ("ASTER_SRV_DIR_CACHE_MAX_BYTES", "25"),
+        ],
+        Some(store),
+    )
+    .await
+    .map(|started| (started, ())) else {
+        return;
+    };
+    let writer = bearer(REPO, Some("refs/heads/main"));
+    let store = &server.app.cache_store;
+    let shared_body = vec![1_u8; 10];
+    let old_body = vec![2_u8; 10];
+    let new_body = vec![3_u8; 10];
+    let (shared, old, new) = (
+        sha256_hex(&shared_body),
+        sha256_hex(&old_body),
+        sha256_hex(&new_body),
+    );
+    for (digest, body) in [
+        (&shared, &shared_body),
+        (&old, &old_body),
+        (&new, &new_body),
+    ] {
+        store
+            .put_unrecorded(digest, bytes::Bytes::from(body.clone()))
+            .await
+            .unwrap();
+    }
+    let entries = [
+        ("dir/v1/0123456789abcdef/old", vec![&shared, &old]),
+        ("dir/v1/0123456789abcdef/new", vec![&shared, &new]),
+        ("target-entry", vec![&old]),
+    ];
+    for (key, digests) in &entries {
+        let refs: Vec<&str> = digests.iter().map(|digest| digest.as_str()).collect();
+        let commit = json!({"repo": REPO, "key": key, "manifest": manifest(key, &refs)});
+        let (status, reply) = server
+            .post_json("/v1/cache/commit", &commit, Some(&writer), None)
+            .await;
+        assert_eq!(status, 201, "{reply}");
+    }
+    let client = server.client().await;
+    let earlier = Utc::now() - Duration::hours(1);
+    client
+        .execute(
+            "UPDATE cache.manifests SET last_used_at = $1 WHERE key LIKE '%/old'",
+            &[&earlier],
+        )
+        .await
+        .unwrap();
+
+    let report = aster_srv::cache::run_retention(&server.app, Utc::now())
+        .await
+        .unwrap()
+        .expect("this replica holds the lock");
+    assert_eq!(report.manifests, 1);
+    let rows = client
+        .query("SELECT key FROM cache.manifests ORDER BY key", &[])
+        .await
+        .unwrap();
+    let kept: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(kept, vec!["dir/v1/0123456789abcdef/new", "target-entry"]);
+    assert!(store.get(&shared).await.unwrap().is_some());
+    assert!(store.get(&new).await.unwrap().is_some());
+    assert!(
+        store.get(&old).await.unwrap().is_some(),
+        "the target entry still names this chunk"
+    );
     server.stop().await;
 }
 
@@ -651,6 +1098,104 @@ async fn commit_as(server: &common::Server, writer: &str, key: &str, target: &st
         .await;
     assert_eq!(status, 201, "{body}");
     size
+}
+
+/// `aster cache restore` reads through this route. Exact wins, then the
+/// newest entry under the first prefix with any; a prefix is literal text, and
+/// it can only ever reach directory-cache keys.
+#[tokio::test]
+async fn dir_lookup_prefers_exact_then_newest_and_stays_in_its_namespace() {
+    let Some((server, _)) = server().await else {
+        return;
+    };
+    put_blob(&server, DIGEST).await;
+    let writer = ci_writer("1", "abc");
+    commit_as(&server, &writer, "plain-target-key", "//apps/web:build").await;
+    for key in ["dir/v1/p/deps-1", "dir/v1/p/deps-2", "dir/v1/p/depsXold"] {
+        commit_as(&server, &writer, key, "//:dir-cache").await;
+    }
+    let client = server.client().await;
+    // Oldest to newest: deps-2, then deps-1. Names sort the other way, so a
+    // result ordered by key instead of age would fail.
+    for (key, age) in [
+        ("dir/v1/p/depsXold", 3),
+        ("dir/v1/p/deps-2", 2),
+        ("dir/v1/p/deps-1", 1),
+    ] {
+        client
+            .execute(
+                "UPDATE cache.manifests SET created_at = now() - make_interval(hours => $1) \
+                 WHERE key = $2",
+                &[&age, &key],
+            )
+            .await
+            .unwrap();
+    }
+
+    let reader = bearer(REPO, Some("refs/pull/1/merge"));
+    let ask = |key: &'static str, prefixes: Vec<&'static str>| {
+        let reader = reader.clone();
+        let server = &server;
+        async move {
+            let body = json!({"repo": REPO, "key": key, "prefixes": prefixes});
+            server
+                .post_json("/v1/cache/dir-lookup", &body, Some(&reader), None)
+                .await
+        }
+    };
+
+    let (status, body) = ask("dir/v1/p/deps-2", vec!["dir/v1/p/deps-"]).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hit"]["key"], "dir/v1/p/deps-2", "exact beats newest");
+    assert!(body["hit"]["blobs"][DIGEST].is_string(), "{body}");
+
+    let (_, body) = ask("dir/v1/p/deps-9", vec!["dir/v1/p/none", "dir/v1/p/deps-"]).await;
+    assert_eq!(
+        body["hit"]["key"], "dir/v1/p/deps-1",
+        "newest under the first match"
+    );
+
+    let (_, body) = ask("dir/v1/p/deps-9", vec!["dir/v1/p/deps_"]).await;
+    assert_eq!(body["hit"], Value::Null, "_ is not a wildcard");
+    let (_, body) = ask("dir/v1/p/deps-9", vec!["dir/v1/p/deps%"]).await;
+    assert_eq!(body["hit"], Value::Null, "% is not a wildcard");
+
+    // A prefix cannot reach a target-cache key, or the whole key space.
+    // A restore key may be a whole stored key.
+    let (status, body) = ask("dir/v1/p/none", vec!["dir/v1/p/deps-2"]).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hit"]["key"], "dir/v1/p/deps-2", "{body}");
+
+    let (status, _) = ask("dir/v1/p/deps-9", vec!["plain"]).await;
+    assert_eq!(status, 400);
+    let (status, _) = ask("plain-target-key", vec![]).await;
+    assert_eq!(status, 400);
+    let (status, _) = ask("dir/v1/p/deps-9", vec!["dir/v1/"]).await;
+    assert_eq!(status, 400);
+
+    // A pull request's read must not keep an entry alive; a main push's must.
+    let hits = |key: &'static str| {
+        let server = &server;
+        async move {
+            server
+                .client()
+                .await
+                .query_one("SELECT hits FROM cache.manifests WHERE key = $1", &[&key])
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        }
+    };
+    let before = hits("dir/v1/p/deps-1").await;
+    let (_, body) = ask("dir/v1/p/deps-1", vec![]).await;
+    assert_eq!(body["hit"]["key"], "dir/v1/p/deps-1");
+    assert_eq!(hits("dir/v1/p/deps-1").await, before);
+    let body = json!({"repo": REPO, "key": "dir/v1/p/deps-1"});
+    server
+        .post_json("/v1/cache/dir-lookup", &body, Some(&writer), None)
+        .await;
+    assert_eq!(hits("dir/v1/p/deps-1").await, before + 1);
+    server.stop().await;
 }
 
 /// An operator checks that the shared cache works: two CI runs on main write

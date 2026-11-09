@@ -57,9 +57,13 @@ async fn start() -> Option<Running> {
         eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
         return None;
     };
+    // The tests in this file start in parallel, so a clock reading alone can
+    // name the same database twice.
+    static NEXT_DATABASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let database = format!(
-        "aster_e2e_{}_{}",
+        "aster_e2e_{}_{}_{}",
         std::process::id(),
+        NEXT_DATABASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -282,6 +286,296 @@ async fn remote_restore_across_checkouts_through_aster_srv() {
         !stderr.contains(TOKEN),
         "the token must not be logged: {stderr}"
     );
+
+    server.stop().await;
+}
+
+/// One `aster cache save|restore` in `dir`, with `$GITHUB_OUTPUT` captured.
+fn dir_cache(dir: &Path, server: &str, args: &[&str], mode: Option<&str>) -> (String, String) {
+    fs::create_dir_all(dir).unwrap();
+    let outputs = dir.join("github-output");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aster"));
+    command
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("ASTER_SRV_URL", server)
+        .env("ASTER_SRV_TOKEN", TOKEN)
+        .env("ASTER_SRV_GCS_BASE", server)
+        .env("GITHUB_REPOSITORY", REPO)
+        .env("GITHUB_OUTPUT", &outputs)
+        .env_remove("ASTER_REMOTE_CACHE")
+        .env_remove("ASTER_CACHE_MODE")
+        .args(["cache"])
+        .args(args);
+    if let Some(mode) = mode {
+        command.env("ASTER_CACHE_MODE", mode);
+    }
+    let output = command.output().expect("spawn aster");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "aster cache failed: {stderr}");
+    let written = fs::read_to_string(&outputs).unwrap_or_default();
+    let _ = fs::remove_file(&outputs);
+    (written, stderr)
+}
+
+/// Bytes zstd cannot shrink, so an entry is forced across several chunks.
+fn incompressible(length: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut bytes = Vec::with_capacity(length + 8);
+    while bytes.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(length);
+    bytes
+}
+
+/// A real Cargo-cache-sized entry, 5 GiB after compression. Run by hand with
+/// `--ignored --release`: it needs about 15 GiB of memory and disk.
+///
+/// Real: the release aster binary, aster-srv's routes, Postgres. Faked: GCS,
+/// by the server's in-memory bucket, which hashes one chunk at a time and is
+/// therefore slower at commit than the real bucket's concurrent reads.
+#[tokio::test]
+#[ignore = "needs about 15 GiB; run by hand"]
+async fn a_five_gigabyte_directory_cache_round_trips() {
+    let Some(mut server) = start().await else {
+        return;
+    };
+    let url = server.url.clone();
+    let root = tempfile::tempdir().unwrap();
+    let writer = root.path().join("writer");
+
+    // Five files of bytes zstd cannot shrink, each linked a second time the
+    // way Cargo links an artifact: the entry must hold one copy of each.
+    fs::create_dir_all(writer.join("target/deps")).unwrap();
+    let mut expected = Vec::new();
+    for index in 0..5_u8 {
+        let mut body = incompressible(1024 * 1024 * 1024);
+        body[0] = index;
+        let name = format!("target/deps/artifact-{index}");
+        fs::write(writer.join(&name), &body).unwrap();
+        fs::hard_link(
+            writer.join(&name),
+            writer.join(format!("target/artifact-{index}")),
+        )
+        .unwrap();
+        expected.push((name, sha256(&body)));
+    }
+
+    let started = std::time::Instant::now();
+    let saving = {
+        let (url, writer) = (url.clone(), writer.clone());
+        tokio::task::spawn_blocking(move || {
+            dir_cache(
+                &writer,
+                &url,
+                &["save", "--key", "cargo-1", "--path", "target"],
+                None,
+            )
+        })
+    };
+    let (_, stderr) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = saving => done.unwrap(),
+    };
+    let saved_in = started.elapsed();
+    assert!(stderr.contains("stored cargo-1"), "{stderr}");
+    let chunks = server.app.cache_store.objects().await.len();
+    assert!(
+        (160..=172).contains(&chunks),
+        "5 GiB is about 161 chunks, one copy of each file; got {chunks}"
+    );
+
+    let started = std::time::Instant::now();
+    let machine = root.path().join("other-machine");
+    let restoring = {
+        let (url, machine) = (url.clone(), machine.clone());
+        tokio::task::spawn_blocking(move || {
+            dir_cache(
+                &machine,
+                &url,
+                &["restore", "--key", "cargo-1", "--path", "target"],
+                None,
+            )
+        })
+    };
+    let (outputs, stderr) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = restoring => done.unwrap(),
+    };
+    let restored_in = started.elapsed();
+    assert!(outputs.contains("cache-hit=true\n"), "{outputs}{stderr}");
+    for (name, digest) in &expected {
+        assert_eq!(&sha256(&fs::read(machine.join(name)).unwrap()), digest);
+    }
+    eprintln!("5 GiB: {chunks} chunks, saved in {saved_in:?}, restored in {restored_in:?}");
+    server.stop().await;
+}
+
+fn sha256(bytes: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).to_vec()
+}
+
+/// The `actions/cache` contract, end to end: a main-branch job stores a
+/// dependency tree, and jobs on other machines restore it by exact key or as
+/// the newest entry under a prefix.
+///
+/// Real: the aster binary, aster-srv's routes, migrations and Postgres.
+/// Faked: GCS, by the server's in-memory bucket behind the signed-URL path.
+#[tokio::test]
+async fn a_directory_cache_restores_by_exact_key_and_by_newest_prefix() {
+    let Some(mut server) = start().await else {
+        return;
+    };
+    let url = server.url.clone();
+    let root = tempfile::tempdir().unwrap();
+    let writer = root.path().join("writer");
+
+    // A writer stores two generations of a tree. The first is 70 MiB of
+    // incompressible data, so it has to travel as several 32 MiB chunks.
+    let large = incompressible(70 * 1024 * 1024);
+    fs::create_dir_all(writer.join("deps/pkg/incremental")).unwrap();
+    fs::write(writer.join("deps/pkg/large.bin"), &large).unwrap();
+    fs::write(writer.join("deps/pkg/incremental/skip"), b"not stored").unwrap();
+    fs::create_dir_all(writer.join(".tool")).unwrap();
+    fs::write(writer.join(".tool/bin"), b"tool in home").unwrap();
+    fs::create_dir_all(writer.join("tools")).unwrap();
+    fs::write(writer.join("tools/esbuild-0.25"), b"matched").unwrap();
+    fs::write(writer.join("tools/unrelated"), b"not stored").unwrap();
+    let paths = [
+        "--path",
+        "deps",
+        "--path",
+        "~/.tool",
+        "--path",
+        "tools/esbuild-*",
+    ];
+    let save = |key: &'static str| {
+        let (url, writer) = (url.clone(), writer.clone());
+        let mut args = vec!["save", "--key", key, "--exclude", "**/incremental"];
+        args.extend(paths);
+        tokio::task::spawn_blocking(move || dir_cache(&writer, &url, &args, None))
+    };
+    let first = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = save("deps-linux-1") => done.unwrap(),
+    };
+    assert!(first.1.contains("stored deps-linux-1"), "{}", first.1);
+    let chunks = server.app.cache_store.objects().await.len();
+    assert!(chunks >= 3, "70 MiB must be several chunks, got {chunks}");
+
+    // Postgres orders generations by created_at, so they must not tie.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    fs::write(writer.join("deps/pkg/version"), b"generation two").unwrap();
+    let second = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = save("deps-linux-2") => done.unwrap(),
+    };
+    assert!(second.1.contains("stored deps-linux-2"), "{}", second.1);
+
+    // Saving a key that exists is a quiet no-op, as actions/cache is.
+    let again = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = save("deps-linux-1") => done.unwrap(),
+    };
+    assert!(again.1.contains("already stored"), "{}", again.1);
+
+    let restore = |dir: std::path::PathBuf, extra: Vec<&'static str>| {
+        let url = url.clone();
+        let mut args = vec!["restore"];
+        args.extend(extra);
+        args.extend(paths);
+        tokio::task::spawn_blocking(move || dir_cache(&dir, &url, &args, None))
+    };
+
+    // Exact key: this generation, reported as a hit.
+    let exact = root.path().join("exact-machine");
+    let (outputs, stderr) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = restore(exact.clone(), vec!["--key", "deps-linux-1"]) => done.unwrap(),
+    };
+    assert!(outputs.contains("cache-hit=true\n"), "{outputs}{stderr}");
+    assert!(
+        outputs.contains("cache-matched-key=deps-linux-1\n"),
+        "{outputs}"
+    );
+    assert_eq!(fs::read(exact.join("deps/pkg/large.bin")).unwrap(), large);
+    assert_eq!(fs::read(exact.join(".tool/bin")).unwrap(), b"tool in home");
+    assert_eq!(
+        fs::read(exact.join("tools/esbuild-0.25")).unwrap(),
+        b"matched"
+    );
+    assert!(!exact.join("tools/unrelated").exists(), "glob ignored");
+    assert!(
+        !exact.join("deps/pkg/incremental").exists(),
+        "the exclude was ignored"
+    );
+    assert!(!exact.join("deps/pkg/version").exists(), "wrong generation");
+
+    // A changed lockfile: no exact entry, so the newest under the prefix.
+    let fallback = root.path().join("fallback-machine");
+    let args = vec![
+        // A blank restore-keys line is ignored, as in actions/cache.
+        "--restore-key",
+        "",
+        "--key",
+        "deps-linux-9",
+        "--restore-key",
+        "nope-",
+        "--restore-key",
+        "deps-linux-",
+    ];
+    let (outputs, stderr) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = restore(fallback.clone(), args) => done.unwrap(),
+    };
+    assert!(outputs.contains("cache-hit=false\n"), "{outputs}{stderr}");
+    assert!(
+        outputs.contains("cache-matched-key=deps-linux-2\n"),
+        "{outputs}{stderr}"
+    );
+    assert_eq!(
+        fs::read(fallback.join("deps/pkg/version")).unwrap(),
+        b"generation two"
+    );
+
+    // Nothing matches: not an error, and nothing is written.
+    let cold = root.path().join("cold-machine");
+    let (outputs, _) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = restore(cold.clone(), vec!["--key", "other", "--restore-key", "zzz"]) => done.unwrap(),
+    };
+    assert!(outputs.contains("cache-hit=false\n"), "{outputs}");
+    assert!(outputs.contains("cache-matched-key=\n"), "{outputs}");
+    assert!(!cold.join("deps").exists());
+
+    // The path list is part of an entry's identity.
+    let other_paths = root.path().join("other-paths");
+    let (outputs, _) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = tokio::task::spawn_blocking({
+            let (url, dir) = (url.clone(), other_paths.clone());
+            move || dir_cache(&dir, &url, &["restore", "--key", "deps-linux-1", "--path", "deps"], None)
+        }) => done.unwrap(),
+    };
+    assert!(outputs.contains("cache-matched-key=\n"), "{outputs}");
+
+    // A pull-request job runs with ASTER_CACHE_MODE=read: it stores nothing.
+    let before = server.app.cache_store.objects().await.len();
+    let (_, stderr) = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = tokio::task::spawn_blocking({
+            let (url, dir) = (url.clone(), writer.clone());
+            move || dir_cache(&dir, &url, &["save", "--key", "pr-key", "--path", "deps"], Some("read"))
+        }) => done.unwrap(),
+    };
+    assert!(stderr.contains("does not write"), "{stderr}");
+    assert_eq!(server.app.cache_store.objects().await.len(), before);
+    assert!(!stderr.contains(TOKEN), "the token must not be logged");
 
     server.stop().await;
 }

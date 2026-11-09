@@ -39,6 +39,9 @@ impl<'a> IapAudience<'a> {
     }
 }
 
+/// One TiB of compressed entries per repository.
+const DEFAULT_DIR_CACHE_MAX_BYTES: u64 = 1 << 40;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `ASTER_SRV_LISTEN`, default `0.0.0.0:8080`.
@@ -110,6 +113,9 @@ pub struct Config {
     /// `ASTER_SRV_CACHE_DAYS`: drop manifests unused this long, and blobs
     /// no remaining manifest names. Default 14.
     pub cache_days: u32,
+    /// Per repository. Directory-cache entries over this are evicted, least
+    /// recently used first, by the retention pass.
+    pub dir_cache_max_bytes: u64,
     /// `ASTER_SRV_CACHE_WRITERS`: `repo=ref` patterns that may upload and
     /// commit. Default `*=refs/heads/<default branch>`.
     pub cache_writers: CacheWriters,
@@ -359,6 +365,12 @@ impl Config {
             None => Vec::new(),
         };
         let default_branch = var("ASTER_SRV_DEFAULT_BRANCH").unwrap_or_else(|| "main".to_string());
+        let dir_cache_max_bytes = match var("ASTER_SRV_DIR_CACHE_MAX_BYTES") {
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("ASTER_SRV_DIR_CACHE_MAX_BYTES must be a number of bytes")
+            })?,
+            None => DEFAULT_DIR_CACHE_MAX_BYTES,
+        };
         let cache_days = match var("ASTER_SRV_CACHE_DAYS") {
             Some(days) => days
                 .parse()
@@ -587,6 +599,7 @@ impl Config {
             cache_bucket,
             cache_signer,
             cache_days,
+            dir_cache_max_bytes,
             cache_writers,
             writer_workflows,
             owner_ids,

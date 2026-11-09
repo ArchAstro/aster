@@ -322,7 +322,7 @@ async fn the_code_exchange_is_the_only_v1_route_without_a_token_and_never_says_2
 
 /// The reads a person's token may make: the whole allowlist, spelled out so
 /// a new route classed `CiOrPerson` is a decision made here too.
-const PERSON_READS: [(&str, &str); 10] = [
+const PERSON_READS: [(&str, &str); 11] = [
     ("GET", "/v1/test-results/durations"),
     ("GET", "/v1/test-results/tests"),
     ("GET", "/v1/test-results/tests/:test_id"),
@@ -333,6 +333,7 @@ const PERSON_READS: [(&str, &str); 10] = [
     ("GET", "/v1/cache/summary"),
     ("GET", "/v1/cache/entries"),
     ("POST", "/v1/cache/lookup"),
+    ("POST", "/v1/cache/dir-lookup"),
 ];
 
 #[tokio::test]
@@ -356,7 +357,8 @@ async fn a_person_reaches_only_the_read_allowlist_and_every_other_route_is_403()
             continue;
         }
         let path = path_of(route);
-        let post_body = |repo: &str| json!({"repo": repo, "keys": ["k"]}).to_string();
+        let post_body =
+            |repo: &str| json!({"repo": repo, "keys": ["k"], "key": "dir/v1/p/k"}).to_string();
         for repo in [REPO, "evil/x"] {
             let url = format!("{}{path}?repo={}", server.url, repo.replace('/', "%2F"));
             let client = aster_srv::http_client().build().unwrap();

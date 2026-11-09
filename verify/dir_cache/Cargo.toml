@@ -1,0 +1,29 @@
+[package]
+name = "aster-dir-cache-model"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "Checks aster-srv's directory cache against its Quint model"
+
+# Not a member of the aster workspace: it has its own lockfile and CI job
+# (see .github/workflows/ci.yml, "Directory cache model").
+[workspace]
+
+[dependencies]
+aster-srv = { path = "../../crates/aster-srv" }
+# crates.io has no quint-refinements release yet; the npm compiler in
+# package.json is pinned to the same commit.
+quint-refinements = { git = "https://github.com/ArchAstro/quint-refinements", rev = "6229384ee53f07ac192f8f4365dcca89efe0a242" }
+# The rest is what crates/aster-srv/tests/common needs.
+aws-lc-rs = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+deadpool-postgres = "0.14"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }

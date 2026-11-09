@@ -159,6 +159,12 @@ pub const ROUTES: &[Route] = &[
     ),
     route(
         "POST",
+        "/v1/cache/dir-lookup",
+        Auth::CiOrPerson,
+        Handler::CacheLookup,
+    ),
+    route(
+        "POST",
         "/v1/cache/upload",
         Auth::CiWriter,
         Handler::CacheWrite,

@@ -126,6 +126,7 @@ Windows is not currently built or tested. Each tagged release includes:
 - `aster-linux-arm64.tar.gz` (Linux arm64)
 - `aster-darwin-x64.tar.gz` (macOS x86-64)
 - `aster-darwin-arm64.tar.gz` (macOS Apple Silicon)
+- `aster-windows-x64.tar.gz` (Windows x86-64)
 
 Linux arm64 users should use the `aster-linux-arm64` tarball rather than apt
 or dnf. Those native packages, and the Homebrew tap, are x86-64 only on Linux.
@@ -494,6 +495,22 @@ dashboard shows: `aster results flaky`, `aster results clusters`, `aster srv get
 print JSON; `aster srv whoami` shows who you are signed in as ([details](docs/test-tracking.md#reading-the-dashboards-data)).
 
 A hit restores declared `outputs` from the artifact cache and skips execution.
+`aster cache save` and `aster cache restore` store and fetch directories
+through aster-srv: tool installs, package stores and incremental build trees,
+which a target's outputs do not cover. They work like `actions/cache`. `restore`
+tries `--key`, then the newest entry under each `--restore-key` prefix, and on
+GitHub Actions writes `cache-hit`, `cache-primary-key` and `cache-matched-key`
+to `$GITHUB_OUTPUT`. The set of `--path` values is part of an entry's identity.
+A `--path` may be a glob (`src/*/_build/dev/dialyxir_*`); `*` stops at `/`.
+aster-srv evicts the least recently used entries past
+`ASTER_SRV_DIR_CACHE_MAX_BYTES` per repository (default 1 TiB).
+A miss or a remote failure does not fail the step.
+
+```bash
+aster cache restore --key "pnpm-$HASH" --restore-key pnpm- --path ~/.pnpm-store
+aster cache save --key "pnpm-$HASH" --path ~/.pnpm-store
+```
+
 `aster cache status` reads that store's per-project index. `--json` prints
 `{"cache_dir","targets":[{"address","key","created_at","outputs","output_bytes","exit_code"}]}`;
 human output prints the same fields as a table. `aster cache clear //proj`

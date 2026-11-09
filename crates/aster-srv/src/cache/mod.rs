@@ -7,6 +7,7 @@
 //! | Route | |
 //! |---|---|
 //! | `POST /v1/cache/lookup` | Hits for the named keys, each with a signed GET per blob that exists. An unknown key is a miss, not an error. |
+//! | `POST /v1/cache/dir-lookup` | One directory-cache entry: the exact key, else the newest entry under the first prefix that has one. |
 //! | `POST /v1/cache/upload` | Signed PUT URLs for blobs not yet in the bucket. Writers only. |
 //! | `POST /v1/cache/commit` | Store a manifest once every blob it names exists, and record who wrote it. `409` if the key is already stored; `422` if a blob is missing. Writers only. |
 //! | `GET /v1/cache/summary` | Counts, sizes, last writer and 14 days of lookups for one repository. Read-only. |
@@ -130,6 +131,18 @@ WHERE parsed.repo = m.repo AND parsed.key = m.key
 DROP FUNCTION cache.manifest_json(bytea);
 
 CREATE INDEX manifests_browse ON cache.manifests (repo, created_at DESC, key);
+"#,
+    },
+    // `aster cache restore` asks for the newest entry under a key prefix. The
+    // "C" collation makes that a byte-range scan whatever the database's
+    // locale. Partial, so target-cache rows pay nothing.
+    Migration {
+        feature: "cache",
+        version: 4,
+        sql: r#"
+CREATE INDEX IF NOT EXISTS manifests_dir_cache_prefix
+    ON cache.manifests (repo, key COLLATE "C")
+    WHERE key LIKE 'dir/v1/%';
 "#,
     },
 ];

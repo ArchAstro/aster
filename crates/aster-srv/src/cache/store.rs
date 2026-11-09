@@ -6,6 +6,7 @@
 //! matches its name, so neither a signed PUT that never completed nor one
 //! that sent other bytes can be committed or served.
 
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -46,6 +47,10 @@ pub struct FanoutConfig {
     /// still replies inside the client's request timeout (5s since 0.22)
     /// instead of timing out and losing every hit in the batch.
     pub lookup_budget: Duration,
+    /// Longest one directory-cache lookup spends. An entry is hundreds of
+    /// chunks asked for once per job, not a batch inside the target loop.
+    /// Stays well under the load balancer's backend timeout.
+    pub dir_lookup_budget: Duration,
     pub sign: SignLimits,
 }
 
@@ -57,6 +62,7 @@ impl Default for FanoutConfig {
             head_concurrency: 64,
             max_slots: 20_000,
             lookup_budget: Duration::from_secs(3),
+            dir_lookup_budget: Duration::from_secs(30),
             sign: SignLimits::default(),
         }
     }
@@ -192,6 +198,11 @@ impl BlobStore {
     /// [`FanoutConfig::lookup_budget`]. `None` without a bucket.
     pub fn lookup_budget(&self) -> Option<Duration> {
         self.fanout().map(|fanout| fanout.config.lookup_budget)
+    }
+
+    /// [`FanoutConfig::dir_lookup_budget`]. `None` without a bucket.
+    pub fn dir_lookup_budget(&self) -> Option<Duration> {
+        self.fanout().map(|fanout| fanout.config.dir_lookup_budget)
     }
 
     /// HEAD requests issued so far (cache hits excluded). For tests.
@@ -588,7 +599,7 @@ fn object_url(bucket: &str, sha256: &str) -> String {
 /// Drop manifests unused for `cache_days`, then blobs no remaining manifest
 /// names, and delete those objects. Objects with no row, from signed PUTs
 /// never committed, go too once they are older than the same cutoff, so an
-/// upload awaiting its commit is left alone. Safe to run again; replicas take turns
+/// upload awaiting its commit is left alone, as is a blob a commit verified. Safe to run again; replicas take turns
 /// through an advisory lock.
 pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Option<Report>> {
     let mut client = app.pool.get().await?;
@@ -607,12 +618,22 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     transaction
         .execute("SELECT pg_advisory_xact_lock($1)", &[&BLOB_LOCK])
         .await?;
-    let manifests = transaction
-        .execute(
-            "DELETE FROM cache.manifests WHERE last_used_at < $1",
+    let expired = transaction
+        .query(
+            "DELETE FROM cache.manifests WHERE last_used_at < $1 RETURNING manifest",
             &[&cutoff],
         )
         .await?;
+    let mut manifests = expired.len() as u64;
+    // Blobs this pass stops naming go now. Others with no manifest may belong
+    // to a commit in progress.
+    let mut released = HashSet::new();
+    for row in expired {
+        let bytes: Vec<u8> = row.get(0);
+        released.extend(super::routes::blob_refs(&bytes));
+    }
+    manifests +=
+        evict_dir_entries(&transaction, app.config.dir_cache_max_bytes, &mut released).await?;
     // Lookup counts only feed a 14-day view; keep a month, or the cache's own
     // retention if that is longer, so the table does not grow without bound.
     let stats_days = i64::from(app.config.cache_days.max(30));
@@ -632,19 +653,28 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
         keep.extend(super::routes::blob_refs(&bytes));
     }
     let blobs = transaction
-        .query("SELECT sha256 FROM cache.blobs", &[])
+        .query("SELECT sha256, last_used_at FROM cache.blobs", &[])
         .await?;
     let mut orphans = Vec::new();
+    // A commit records each blob as it verifies it, before its manifest
+    // exists. A retry resumes from those rows, so they wait out the cutoff.
+    let mut awaiting_commit = HashSet::new();
     for row in blobs {
         let sha256: String = row.get(0);
-        if !keep.contains(&sha256) {
+        let last_used: DateTime<Utc> = row.get(1);
+        if keep.contains(&sha256) {
+            continue;
+        }
+        if last_used < cutoff || released.contains(&sha256) {
             orphans.push(sha256);
+        } else {
+            awaiting_commit.insert(sha256);
         }
     }
     let rows = orphans.len() as u64;
     let mut targets: HashSet<String> = orphans.iter().cloned().collect();
     for (sha256, created) in listed {
-        if created < cutoff && !keep.contains(&sha256) {
+        if created < cutoff && !keep.contains(&sha256) && !awaiting_commit.contains(&sha256) {
             targets.insert(sha256);
         }
     }
@@ -659,11 +689,15 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
     // Delete the objects before the rows commit. A failed delete rolls the
     // rows back, so the next pass tries them again instead of leaving an
     // object nothing names.
-    let mut objects = Vec::new();
-    for sha256 in &targets {
-        app.cache_store.delete(sha256).await?;
-        objects.push(object_name(sha256));
-    }
+    // Concurrent, because commits wait on the lock this pass holds.
+    let mut objects = futures_util::stream::iter(targets)
+        .map(|sha256: String| async move {
+            app.cache_store.delete(&sha256).await?;
+            Ok::<_, anyhow::Error>(object_name(&sha256))
+        })
+        .buffer_unordered(RETENTION_DELETE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
     transaction.commit().await?;
     objects.sort();
     Ok(Some(Report {
@@ -671,6 +705,59 @@ pub async fn run_retention(app: &crate::App, now: DateTime<Utc>) -> Result<Optio
         blobs: rows,
         objects,
     }))
+}
+
+const RETENTION_DELETE_CONCURRENCY: usize = 32;
+
+/// Keep each repository's directory-cache entries within `max_bytes`, dropping
+/// the least recently used. A key per commit can be several GiB, so age alone
+/// does not bound them. Returns the entries removed and adds their blobs to
+/// `released`. The most recently used entry always stays.
+async fn evict_dir_entries(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    max_bytes: u64,
+    released: &mut HashSet<String>,
+) -> Result<u64> {
+    let rows = transaction
+        .query(
+            "SELECT repo, key, manifest FROM cache.manifests WHERE key LIKE 'dir/v1/%' \
+             ORDER BY last_used_at DESC, created_at DESC",
+            &[],
+        )
+        .await?;
+    let sizes: HashMap<String, u64> = transaction
+        .query("SELECT sha256, size_bytes FROM cache.blobs", &[])
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get::<_, i64>(1) as u64))
+        .collect();
+    let mut used: HashMap<String, (u64, HashSet<String>)> = HashMap::new();
+    let mut evicted = 0;
+    for row in rows {
+        let repo: String = row.get(0);
+        let key: String = row.get(1);
+        let refs = super::routes::blob_refs(&row.get::<_, Vec<u8>>(2));
+        let (total, seen) = used.entry(repo.clone()).or_default();
+        let added: u64 = refs
+            .iter()
+            .filter(|digest| !seen.contains(*digest))
+            .map(|digest| sizes.get(digest).copied().unwrap_or(0))
+            .sum();
+        if !seen.is_empty() && total.saturating_add(added) > max_bytes {
+            transaction
+                .execute(
+                    "DELETE FROM cache.manifests WHERE repo = $1 AND key = $2",
+                    &[&repo, &key],
+                )
+                .await?;
+            released.extend(refs);
+            evicted += 1;
+        } else {
+            *total += added;
+            seen.extend(refs);
+        }
+    }
+    Ok(evicted)
 }
 
 /// Run a pass now and every six hours after. The pass also drops sign-in

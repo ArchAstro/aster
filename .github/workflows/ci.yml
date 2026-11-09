@@ -54,6 +54,22 @@ jobs:
         run: cargo test --locked --workspace --all-targets --all-features
       - run: scripts/test-dynamic-service-ports
 
+  windows:
+    name: Windows directory cache
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - run: cargo test --locked --lib cache::dir_cache::portable
+      # No server here: a signed-out restore must be a clean miss.
+      - name: The binary answers a restore with a miss
+        shell: bash
+        run: |
+          cargo build --locked --bin aster
+          outputs="${RUNNER_TEMP}/outputs"
+          GITHUB_OUTPUT="${outputs}" target/debug/aster.exe cache restore --key k --path some/dir
+          grep -q '^cache-hit=false' "${outputs}"
+
   aster-srv:
     name: aster-srv
     runs-on: ubuntu-latest
@@ -149,6 +165,48 @@ jobs:
       - name: Build the aster binary under test
         run: cargo build --locked --bin aster --manifest-path ../../Cargo.toml
       - name: The engine selects what the model says
+        run: cargo test --locked
+
+  dir-cache-model:
+    name: Directory cache model
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verify/dir_cache
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ASTER_SRV_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: clippy, rustfmt
+      - run: npm ci
+      - name: Generated files match the model
+        run: npm run check
+      - name: Model typechecks; divergence witnesses hold
+        run: |
+          npm run typecheck
+          npm run quint:test
+      - name: Properties hold while commits and retention interleave
+        run: npm run quint:properties
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: The server follows the model
         run: cargo test --locked
 
   msrv:
