@@ -897,7 +897,7 @@ fn workspace_patterns_at(dir: &Path) -> Vec<String> {
 ///
 /// This is a deliberately minimal parser (the project has no YAML dependency); it
 /// reads just the one field aster needs and ignores everything else.
-fn parse_pnpm_workspace_packages(content: &str) -> Vec<String> {
+pub(crate) fn parse_pnpm_workspace_packages(content: &str) -> Vec<String> {
     let mut packages = Vec::new();
     let mut in_block = false;
 

@@ -10,6 +10,7 @@
 //!   tie-break between targets that become ready together
 
 use crate::{errln, out, outln};
+use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,7 @@ mod chain;
 mod retry;
 
 use super::admission::{Host, Permit};
+use super::admission_order::Gate;
 use super::command::parse_command;
 use super::{force_shutdown_requested, shutdown_requested};
 #[cfg(any(unix, windows))]
@@ -743,6 +745,7 @@ impl<'a> Executor<'a> {
         // One lock per exclusive resource for the whole run: targets that
         // share a resource serialize even when they sit at different levels.
         let resource_mutexes = exclusive_resource_locks(targets_to_run, project_map);
+        let gate = Gate::new();
         let (tx, rx) = mpsc::channel();
         let ctx = LaunchContext {
             project_map,
@@ -755,6 +758,7 @@ impl<'a> Executor<'a> {
             runtime_inputs: &runtime_inputs,
             resource_mutexes: &resource_mutexes,
             host: &host,
+            gate: &gate,
             tx: &tx,
         };
 
@@ -871,6 +875,7 @@ impl<'a> Executor<'a> {
                         &mut progress,
                         show_progress,
                         &mut handles,
+                        queue.chain(&target_addr),
                     ) {
                         running += 1;
                     } else {
@@ -964,6 +969,7 @@ impl<'a> Executor<'a> {
         progress: &mut ProgressDisplay,
         show_progress: bool,
         handles: &mut Vec<thread::JoinHandle<()>>,
+        gated_chain: usize,
     ) -> bool {
         let LaunchContext {
             project_map,
@@ -976,6 +982,7 @@ impl<'a> Executor<'a> {
             runtime_inputs,
             resource_mutexes,
             host,
+            gate,
             tx: _,
         } = *ctx;
         let target_addr = &target_addr.to_string();
@@ -1346,6 +1353,9 @@ impl<'a> Executor<'a> {
         };
 
         let host = host.clone();
+        // Join the line for a slot now, on the launching thread, so requests
+        // keep launch order whatever order the threads start in.
+        let ticket = host.as_ref().map(|_| gate.enter(gated_chain));
         let admission_wait_hook = self.admission_wait_hook.clone();
         let resource_names = project
             .targets
@@ -1360,11 +1370,26 @@ impl<'a> Executor<'a> {
                 if test_hooks::should_panic(&addr) {
                     panic!("injected panic for {addr}");
                 }
-                // Acquire exclusive resource locks (sorted to prevent deadlocks)
+                // Acquire exclusive resource locks (sorted to prevent deadlocks).
+                // A target that has to wait for one steps out of the line for
+                // a slot, so it cannot hold up targets behind it, or wait on
+                // a resource whose holder waits behind it.
                 let _resource_guards: Vec<_> = target_resource_locks
                     .iter()
-                    .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+                    .map(|m| match m.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            if let Some(ticket) = &ticket {
+                                ticket.park();
+                            }
+                            m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                        }
+                    })
                     .collect();
+                if let Some(ticket) = &ticket {
+                    ticket.unpark();
+                }
 
                 if shutdown_requested() {
                     let result = ExecutionResult {
@@ -1387,10 +1412,17 @@ impl<'a> Executor<'a> {
                 }
                 let permit = match host
                     .as_ref()
-                    .map(|host| {
-                        host.acquire(&resource_names, &workspace_root_path, &addr, |line| {
-                            report_admission_wait(&admission_wait_hook, line);
-                        })
+                    .zip(ticket)
+                    .map(|(host, ticket)| {
+                        host.acquire_ordered(
+                            &resource_names,
+                            &workspace_root_path,
+                            &addr,
+                            ticket,
+                            |line| {
+                                report_admission_wait(&admission_wait_hook, line);
+                            },
+                        )
                     })
                     .transpose()
                 {
@@ -2060,6 +2092,8 @@ struct LaunchContext<'a> {
     runtime_inputs: &'a Arc<RuntimeInputCache>,
     resource_mutexes: &'a HashMap<String, Arc<Mutex<()>>>,
     host: &'a Option<Arc<Host>>,
+    /// Orders the targets waiting for an execution slot.
+    gate: &'a Arc<Gate>,
     tx: &'a mpsc::Sender<ExecutionResult>,
 }
 
@@ -2089,13 +2123,18 @@ fn exclusive_resource_locks(
 ///
 /// A target becomes ready when every dependency inside the run has
 /// completed (passed, failed or been blocked). Ready targets come out ordered
-/// by display level, then address, so launch order is deterministic.
+/// by the longest chain of dependents they gate (longest first), then display
+/// level, then address, so launch order is deterministic and a target that
+/// gates a long chain asks for an execution slot before one that gates nothing.
 struct ReadyQueue<'a> {
     /// Dependencies of each target that have not completed yet.
     unmet: HashMap<String, HashSet<String>>,
     dependents: HashMap<String, Vec<String>>,
-    ready: BTreeSet<(usize, String)>,
+    ready: BTreeSet<(Reverse<usize>, usize, String)>,
     level_of: &'a HashMap<String, usize>,
+    /// Targets on the longest chain of dependents that starts at each target,
+    /// itself included.
+    chain: HashMap<String, usize>,
 }
 
 impl<'a> ReadyQueue<'a> {
@@ -2109,6 +2148,7 @@ impl<'a> ReadyQueue<'a> {
             dependents: HashMap::new(),
             ready: BTreeSet::new(),
             level_of,
+            chain: HashMap::new(),
         };
         for addr in targets {
             let deps: HashSet<String> = target_dependencies(addr, project_map)
@@ -2122,24 +2162,42 @@ impl<'a> ReadyQueue<'a> {
                     .or_default()
                     .push(addr.clone());
             }
-            if deps.is_empty() {
-                queue.ready.insert((queue.level(addr), addr.clone()));
-            } else {
+            if !deps.is_empty() {
                 queue.unmet.insert(addr.clone(), deps);
             }
         }
+        queue.chain = chain_lengths(targets, &queue.dependents);
+        for addr in targets {
+            if !queue.unmet.contains_key(addr) {
+                queue.ready.insert(queue.ready_key(addr));
+            }
+        }
         queue
+    }
+
+    fn ready_key(&self, addr: &str) -> (Reverse<usize>, usize, String) {
+        (
+            Reverse(self.chain(addr)),
+            self.level(addr),
+            addr.to_string(),
+        )
+    }
+
+    /// Targets on the longest chain of dependents starting at `addr`.
+    fn chain(&self, addr: &str) -> usize {
+        self.chain.get(addr).copied().unwrap_or(1)
     }
 
     fn level(&self, addr: &str) -> usize {
         self.level_of.get(addr).copied().unwrap_or(0)
     }
 
-    /// Take every ready target, lowest level and address first.
+    /// Take every ready target: longest dependent chain first, then lowest
+    /// level and address.
     fn take_ready(&mut self) -> Vec<String> {
         std::mem::take(&mut self.ready)
             .into_iter()
-            .map(|(_, addr)| addr)
+            .map(|(_, _, addr)| addr)
             .collect()
     }
 
@@ -2166,10 +2224,49 @@ impl<'a> ReadyQueue<'a> {
             unmet.remove(addr);
             if unmet.is_empty() {
                 self.unmet.remove(&dependent);
-                self.ready.insert((self.level(&dependent), dependent));
+                self.ready.insert(self.ready_key(&dependent));
             }
         }
     }
+}
+
+/// For each target, the number of targets on the longest chain of
+/// dependents that starts at it, itself included: the work that cannot begin
+/// until it finishes. A dependency cycle contributes nothing past its entry
+/// point.
+fn chain_lengths(
+    targets: &HashSet<String>,
+    dependents: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    fn visit(
+        addr: &str,
+        dependents: &HashMap<String, Vec<String>>,
+        lengths: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(length) = lengths.get(addr) {
+            return *length;
+        }
+        if !visiting.insert(addr.to_string()) {
+            return 0;
+        }
+        let longest = dependents
+            .get(addr)
+            .into_iter()
+            .flatten()
+            .map(|dependent| visit(dependent, dependents, lengths, visiting))
+            .max()
+            .unwrap_or(0);
+        visiting.remove(addr);
+        lengths.insert(addr.to_string(), longest + 1);
+        longest + 1
+    }
+    let mut lengths = HashMap::new();
+    let mut visiting = HashSet::new();
+    for addr in targets {
+        visit(addr, dependents, &mut lengths, &mut visiting);
+    }
+    lengths
 }
 
 /// Compute DAG levels for target execution
@@ -4645,7 +4742,8 @@ mod tests {
             .collect();
 
         let mut queue = ReadyQueue::new(&set, &project_map, &level_of);
-        assert_eq!(queue.take_ready(), vec!["//p:a", "//p:b"]);
+        // b gates c and d (three targets deep); a gates only d.
+        assert_eq!(queue.take_ready(), vec!["//p:b", "//p:a"]);
         assert!(queue.take_ready().is_empty());
         queue.complete("//p:b");
         assert_eq!(queue.take_ready(), vec!["//p:c"]);
@@ -4654,6 +4752,134 @@ mod tests {
         queue.complete("//p:c");
         assert_eq!(queue.take_ready(), vec!["//p:d"]);
         assert!(queue.take_stuck().is_empty());
+    }
+
+    /// Level and address of every target of `set`, as the runner computes them.
+    fn levels_of(
+        set: &HashSet<String>,
+        project_map: &HashMap<String, &DiscoveredProject>,
+    ) -> HashMap<String, usize> {
+        compute_target_levels(set, project_map)
+            .iter()
+            .enumerate()
+            .flat_map(|(level, addrs)| addrs.iter().map(move |addr| (addr.clone(), level)))
+            .collect()
+    }
+
+    #[test]
+    fn ready_targets_come_out_longest_dependent_chain_first() {
+        // z-gate gates chain1 and chain2; the independents gate nothing.
+        let mut targets = HashMap::new();
+        targets.insert("z-gate".to_string(), target("true", vec![]));
+        targets.insert("chain1".to_string(), target("true", vec!["//p:z-gate"]));
+        targets.insert("chain2".to_string(), target("true", vec!["//p:chain1"]));
+        targets.insert("a-solo".to_string(), target("true", vec![]));
+        targets.insert("b-solo".to_string(), target("true", vec![]));
+        targets.insert("diamond".to_string(), target("true", vec!["//p:a-solo"]));
+        let project = make_project_with_targets("p", targets);
+        let project_map = HashMap::from([("//p".to_string(), &project)]);
+        let set: HashSet<String> = ["z-gate", "chain1", "chain2", "a-solo", "b-solo", "diamond"]
+            .iter()
+            .map(|t| format!("//p:{t}"))
+            .collect();
+        let level_of = levels_of(&set, &project_map);
+
+        let mut queue = ReadyQueue::new(&set, &project_map, &level_of);
+        assert_eq!(queue.chain("//p:z-gate"), 3);
+        assert_eq!(queue.chain("//p:a-solo"), 2);
+        assert_eq!(queue.chain("//p:b-solo"), 1);
+        // Longest chain first; equal chains by level, then address.
+        assert_eq!(
+            queue.take_ready(),
+            vec!["//p:z-gate", "//p:a-solo", "//p:b-solo"]
+        );
+        // A target released later takes the chain it gates, not its release order.
+        queue.complete("//p:z-gate");
+        assert_eq!(queue.take_ready(), vec!["//p:chain1"]);
+    }
+
+    #[test]
+    fn chain_length_survives_a_dependency_cycle() {
+        let mut targets = HashMap::new();
+        targets.insert("a".to_string(), target("true", vec!["//p:b"]));
+        targets.insert("b".to_string(), target("true", vec!["//p:a"]));
+        let project = make_project_with_targets("p", targets);
+        let project_map = HashMap::from([("//p".to_string(), &project)]);
+        let set: HashSet<String> = ["a", "b"].iter().map(|t| format!("//p:{t}")).collect();
+        let level_of = levels_of(&set, &project_map);
+        let queue = ReadyQueue::new(&set, &project_map, &level_of);
+        assert!(queue.chain("//p:a") >= 1 && queue.chain("//p:b") >= 1);
+    }
+
+    /// Entry 334 in miniature: one short target (`z-gate`, last by address)
+    /// gates a chain of longer targets, while twelve independent targets
+    /// compete for four slots. Runs the real ready queue against a simulated
+    /// clock and returns when the last target finishes.
+    fn makespan(prioritise_chains: bool) -> u32 {
+        let mut targets = HashMap::new();
+        let mut seconds: HashMap<String, u32> = HashMap::new();
+        let mut add = |name: &str, deps: Vec<&str>, duration: u32| {
+            targets.insert(name.to_string(), target("true", deps));
+            seconds.insert(format!("//p:{name}"), duration);
+        };
+        add("z-gate", vec![], 1);
+        add("chain1", vec!["//p:z-gate"], 10);
+        add("chain2", vec!["//p:chain1"], 10);
+        for n in 0..12 {
+            add(&format!("crate-{n:02}"), vec![], 5);
+        }
+        let project = make_project_with_targets("p", targets);
+        let project_map = HashMap::from([("//p".to_string(), &project)]);
+        let set: HashSet<String> = seconds.keys().cloned().collect();
+        let level_of = levels_of(&set, &project_map);
+
+        let capacity = 4;
+        let mut queue = ReadyQueue::new(&set, &project_map, &level_of);
+        // Waiting for a slot, with the request order they arrived in.
+        let mut waiting: Vec<(usize, String)> = Vec::new();
+        let mut running: Vec<(u32, String)> = Vec::new();
+        let (mut now, mut requests) = (0, 0);
+        loop {
+            for addr in queue.take_ready() {
+                waiting.push((requests, addr));
+                requests += 1;
+            }
+            while running.len() < capacity && !waiting.is_empty() {
+                let next = (0..waiting.len())
+                    .min_by_key(|&i| {
+                        let (request, addr) = &waiting[i];
+                        if prioritise_chains {
+                            (Reverse(queue.chain(addr)), *request, String::new())
+                        } else {
+                            // Without priorities: level, then address.
+                            (Reverse(0), queue.level(addr), addr.clone())
+                        }
+                    })
+                    .unwrap();
+                let (_, addr) = waiting.remove(next);
+                running.push((now + seconds[&addr], addr));
+            }
+            let Some(end) = running.iter().map(|(end, _)| *end).min() else {
+                return now;
+            };
+            now = end;
+            for (_, addr) in running.iter().filter(|(e, _)| *e == end) {
+                queue.complete(addr);
+            }
+            running.retain(|(e, _)| *e != end);
+        }
+    }
+
+    #[test]
+    fn starting_the_gating_chain_first_shortens_the_run() {
+        let by_address = makespan(false);
+        let by_chain = makespan(true);
+        // Address order starts z-gate after three rounds of the independents
+        // (15 s), then needs 1 + 10 + 10 s for the chain. Starting it first
+        // runs the chain beside the independents. The chain's last target
+        // gates nothing, so it still queues in request order behind them.
+        assert_eq!(by_address, 36);
+        assert_eq!(by_chain, 25);
     }
 
     #[test]
