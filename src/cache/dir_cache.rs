@@ -16,9 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +27,7 @@ use walkdir::WalkDir;
 use super::artifact::{Digest, Manifest, OutputEntry, OutputKind, MANIFEST_SCHEMA_VERSION};
 use super::aster_srv::{repo_from_env, AsterSrvBackend};
 use super::backend::{CacheBackend, CacheMode, ASTER_SRV_URL_ENV};
+use super::chunks::{run_parallel, with_retries, write_chunked};
 use super::hasher::encode_hex;
 use crate::errln;
 
@@ -36,11 +35,6 @@ const NAMESPACE: &str = "dir/v1/";
 /// The target recorded on an entry. The dashboard shows it; restore checks it.
 const ENTRY_TARGET: &str = "//:dir-cache";
 const MAX_KEY_LEN: usize = 256;
-/// Small enough that one chunk fits the blob timeout on a slow link and a few
-/// fit in memory while they wait for an upload slot.
-const CHUNK_BYTES: usize = 32 * 1024 * 1024;
-const TRANSFER_WORKERS: usize = 8;
-const TRANSFER_ATTEMPTS: u32 = 3;
 const ZSTD_LEVEL: i32 = 3;
 /// The server hashes every new chunk before it stores the manifest. This stays
 /// under the load balancer's 120 second backend timeout.
@@ -390,6 +384,7 @@ fn entry_manifest(key: &str, digests: Vec<Digest>, elapsed: Duration) -> Manifes
         log: None,
         aster_version: env!("CARGO_PKG_VERSION").to_string(),
         packs: Vec::new(),
+        archive: None,
     }
 }
 
@@ -400,67 +395,10 @@ fn upload_archive(
     excludes: &GlobSet,
     remote: &AsterSrvBackend,
 ) -> Result<Vec<Digest>> {
-    let (sender, receiver) = sync_channel::<(usize, Vec<u8>)>(TRANSFER_WORKERS);
-    let receiver = Mutex::new(receiver);
-    let failed = AtomicBool::new(false);
-    let digests = Mutex::new(Vec::<(usize, Digest)>::new());
-    let first_error = Mutex::new(None::<anyhow::Error>);
-    let written = std::thread::scope(|scope| {
-        for _ in 0..TRANSFER_WORKERS {
-            scope.spawn(|| {
-                upload_worker(&receiver, remote, &failed, &digests, &first_error);
-            });
-        }
-        let sink = ChunkSink {
-            buffer: Vec::with_capacity(CHUNK_BYTES),
-            next: 0,
-            sender,
-            failed: &failed,
-        };
-        write_archive(roots, excludes, sink)
-    });
-    if let Some(error) = lock(&first_error).take() {
-        return Err(error);
-    }
-    written?;
-    let mut digests = digests
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    digests.sort_by_key(|(index, _)| *index);
-    Ok(digests.into_iter().map(|(_, digest)| digest).collect())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn upload_worker(
-    receiver: &Mutex<Receiver<(usize, Vec<u8>)>>,
-    remote: &AsterSrvBackend,
-    failed: &AtomicBool,
-    digests: &Mutex<Vec<(usize, Digest)>>,
-    first_error: &Mutex<Option<anyhow::Error>>,
-) {
-    loop {
-        // The lock is released before the upload: only the wait is exclusive.
-        let next = lock(receiver).recv();
-        let Ok((index, bytes)) = next else {
-            return;
-        };
-        if failed.load(Ordering::Acquire) {
-            continue;
-        }
-        let digest = Digest::of_bytes(&bytes);
-        match with_retries(|| upload_chunk(remote, &digest, &bytes)) {
-            Ok(()) => lock(digests).push((index, digest)),
-            Err(error) => {
-                failed.store(true, Ordering::Release);
-                lock(first_error).get_or_insert(error);
-            }
-        }
-    }
+    write_chunked(
+        |digest, bytes| upload_chunk(remote, digest, bytes),
+        |sink| pack(roots, excludes, sink).map(drop),
+    )
 }
 
 fn upload_chunk(remote: &AsterSrvBackend, digest: &Digest, bytes: &[u8]) -> Result<()> {
@@ -469,71 +407,6 @@ fn upload_chunk(remote: &AsterSrvBackend, digest: &Digest, bytes: &[u8]) -> Resu
         remote.put_blob(digest, &mut Cursor::new(bytes))?;
     }
     Ok(())
-}
-
-fn with_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut tried = 1;
-    loop {
-        match attempt() {
-            Ok(value) => return Ok(value),
-            Err(error) if tried >= TRANSFER_ATTEMPTS => return Err(error),
-            Err(_) => {
-                std::thread::sleep(Duration::from_secs(u64::from(tried)));
-                tried += 1;
-            }
-        }
-    }
-}
-
-/// Cuts the compressed stream into chunks and hands them to the uploaders.
-struct ChunkSink<'a> {
-    buffer: Vec<u8>,
-    next: usize,
-    sender: SyncSender<(usize, Vec<u8>)>,
-    failed: &'a AtomicBool,
-}
-
-impl ChunkSink<'_> {
-    fn send(&mut self) -> io::Result<()> {
-        if self.failed.load(Ordering::Acquire) {
-            return Err(io::Error::other("a chunk upload failed"));
-        }
-        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK_BYTES));
-        self.sender
-            .send((self.next, chunk))
-            .map_err(|_| io::Error::other("the chunk uploaders stopped"))?;
-        self.next += 1;
-        Ok(())
-    }
-
-    fn finish(mut self) -> io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        self.send()
-    }
-}
-
-impl Write for ChunkSink<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let room = CHUNK_BYTES - self.buffer.len();
-        let taken = room.min(bytes.len());
-        self.buffer.extend_from_slice(&bytes[..taken]);
-        if self.buffer.len() == CHUNK_BYTES {
-            self.send()?;
-        }
-        Ok(taken)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Write the tar stream for `roots`, compressed, into `sink`.
-fn write_archive(roots: &[Root], excludes: &GlobSet, sink: ChunkSink<'_>) -> Result<()> {
-    let sink = pack(roots, excludes, sink)?;
-    sink.finish().context("flush the last chunk")
 }
 
 fn pack<W: Write>(roots: &[Root], excludes: &GlobSet, sink: W) -> Result<W> {
@@ -815,31 +688,15 @@ fn download_pending(
     paths: &[PathBuf],
     done: &[AtomicBool],
 ) -> Result<()> {
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let first_error = Mutex::new(None::<anyhow::Error>);
-    std::thread::scope(|scope| {
-        for _ in 0..TRANSFER_WORKERS.min(digests.len()) {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= digests.len() || failed.load(Ordering::Acquire) {
-                    return;
-                }
-                if done[index].load(Ordering::Acquire) {
-                    continue;
-                }
-                match with_retries(|| download_chunk(remote, &digests[index], &paths[index])) {
-                    Ok(()) => done[index].store(true, Ordering::Release),
-                    Err(error) => {
-                        failed.store(true, Ordering::Release);
-                        lock(&first_error).get_or_insert(error);
-                    }
-                }
-            });
-        }
-    });
-    let error = lock(&first_error).take();
-    error.map_or(Ok(()), Err)
+    run_parallel(
+        digests.len(),
+        |index| done[index].load(Ordering::Acquire),
+        |index| {
+            with_retries(|| download_chunk(remote, &digests[index], &paths[index]))?;
+            done[index].store(true, Ordering::Release);
+            Ok(())
+        },
+    )
 }
 
 fn download_chunk(remote: &AsterSrvBackend, digest: &Digest, path: &Path) -> Result<()> {
@@ -1207,6 +1064,7 @@ mod portable {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::chunks::lock;
     use super::*;
     use crate::test_results::upload::Credentials;
     use base64::Engine as _;
@@ -1214,7 +1072,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -1646,25 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn the_sink_cuts_the_stream_at_the_chunk_size() {
-        let (sender, receiver) = sync_channel(4);
-        let failed = AtomicBool::new(false);
-        let mut sink = ChunkSink {
-            buffer: Vec::with_capacity(CHUNK_BYTES),
-            next: 0,
-            sender,
-            failed: &failed,
-        };
-        let body = vec![7_u8; CHUNK_BYTES + 5];
-        sink.write_all(&body).unwrap();
-        sink.finish().unwrap();
-        let chunks: Vec<(usize, Vec<u8>)> = receiver.iter().collect();
-        assert_eq!(chunks.len(), 2);
-        assert_eq!((chunks[0].0, chunks[0].1.len()), (0, CHUNK_BYTES));
-        assert_eq!((chunks[1].0, chunks[1].1.len()), (1, 5));
-    }
-
-    #[test]
     fn hard_links_are_stored_once_and_restored_as_one_inode() {
         let source = tempfile::tempdir().unwrap();
         let tree = source.path().join("target/debug");
@@ -2010,18 +1849,5 @@ mod tests {
         let roots = identity(&["tree"], target.path()).roots;
         assert!(extract(&bytes[..bytes.len() / 2], &roots).is_err());
         assert!(extract(&b"not zstd"[..], &roots).is_err());
-    }
-
-    #[test]
-    fn the_sink_stops_once_an_upload_has_failed() {
-        let (sender, _receiver) = sync_channel(4);
-        let failed = AtomicBool::new(true);
-        let mut sink = ChunkSink {
-            buffer: Vec::with_capacity(CHUNK_BYTES),
-            next: 0,
-            sender,
-            failed: &failed,
-        };
-        assert!(sink.write_all(&vec![0_u8; CHUNK_BYTES]).is_err());
     }
 }

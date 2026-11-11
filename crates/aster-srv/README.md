@@ -647,7 +647,7 @@ signs them with IAM Credentials `signBlob` as its own service account
 
 | Route | |
 |---|---|
-| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A key whose blobs the server could not resolve (over the blob cap, past the time budget, or GCS or IAM failed or was busy) is also absent, so the client treats it as a miss and rebuilds. See [Lookup bounds](#lookup-bounds). A writer CI token's lookup updates `last_used_at`; see below. |
+| `POST /v1/cache/lookup` | `{repo, keys[]}` → `{hits: {key: {manifest, blobs}}, unresolved?: {key: blob_count}}`. `manifest` is base64. `blobs` maps each sha256 the manifest names to a signed GET URL, and only when that object exists. An unknown key is absent from `hits`, not an error. A key whose blobs the server could not resolve (over the blob cap, past the time budget, or GCS or IAM failed or was busy) is also absent from `hits`, and is listed in `unresolved` with the number of blobs its manifest names. `unresolved` is omitted when empty. A client that ignores it treats those keys as misses and rebuilds; a newer one asks for them again in smaller requests. See [Lookup bounds](#lookup-bounds). A writer CI token's lookup updates `last_used_at`; see below. |
 | `POST /v1/cache/upload` | `{repo, digests[]}` → `{missing: {sha256: signed PUT URL}}` for blobs not yet in the bucket. Writers only. |
 | `POST /v1/cache/dir-lookup` | `{repo, key, prefixes[]}` → `{hit: {key, manifest, blobs} \| null}`. The exact key, else the newest entry under the first prefix that has one. Used by `aster cache restore`. Keys must start with `dir/v1/`. |
 | `POST /v1/cache/commit` | `{repo, key, manifest}` stores the manifest once every blob it names exists, and records the writer's `ref`, `run_id`, `sha` and `workflow_ref` claims (null for a static token). A blob uploaded through a signed URL is hashed on its first commit; bytes that do not match their sha256 are deleted and reported missing. `201` stored, `409` the key is already stored, `422` a named blob is missing or corrupt. Writers only. |
@@ -674,9 +674,12 @@ and losing them all:
 - **Blob cap.** One response names at most 4096 distinct blobs
   (`MAX_LOOKUP_BLOBS`). Entries are admitted in the order the request lists
   them; an entry whose blobs would push the total over the cap is absent
-  from `hits` (a miss) and is not counted.
+  from `hits` and is not counted. It is listed in `unresolved`, unless it
+  alone names more than the cap: no request could serve it, so it is a plain
+  miss.
 - **Time budget.** Blobs are resolved 16 at a time per request, for at most
-  3 seconds. An entry with a blob still unresolved then is a miss.
+  3 seconds. An entry with a blob still unresolved then is absent from `hits`
+  and listed in `unresolved`.
 - **Remembered answers.** A positive HEAD is remembered for an hour (blobs
   are content-addressed and a blob a stored manifest names is not deleted by
   retention); a miss is never remembered. A signed GET URL is reused while
@@ -685,7 +688,18 @@ and losing them all:
 - **IAM `signBlob` limit.** Per replica, at most 16 signatures in flight and
   a token bucket of 200 per second with a burst of 512. A signature that
   would wait more than 2 seconds fails with "signing is busy" and its entry
-  is a miss. HEADs are capped at 64 in flight per replica.
+  is left out of `hits` and listed in `unresolved`. HEADs are capped at 64 in
+  flight per replica.
+- **Asking again.** A repeat finds the HEADs and signatures the first request
+  resolved remembered, so it gets further. The client asks for `unresolved`
+  keys again, in requests of at most 800 blobs by the counts the server
+  gave, at most twice and for at most 20 seconds a run; keys still
+  unresolved then run as misses, counted apart from keys the cache lacks in
+  the `remote-io:` line.
+
+A target's output files are one blob per 32 MB chunk of a compressed archive,
+not one blob per file, so a target names a handful of blobs and a lookup of
+dozens of targets stays far under these bounds.
 
 Every route needs a bearer token; an IAP assertion alone is never accepted
 here, so a request with neither answers `401`. Reads accept any authenticated

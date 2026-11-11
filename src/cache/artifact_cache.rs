@@ -252,7 +252,7 @@ impl ArtifactCache {
                 let manifest = self.tier.local_store().get_manifest(&row.key)?;
                 let (outputs, output_bytes, exit_code) = match &manifest {
                     Some(manifest) => (
-                        manifest.outputs.len() as u64,
+                        manifest.tree().len() as u64,
                         self.output_bytes(manifest)?,
                         Some(manifest.exit_code),
                     ),
@@ -486,6 +486,7 @@ mod tests {
             log: None,
             aster_version: "0.21.0".to_string(),
             packs: Vec::new(),
+            archive: None,
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
             log: None,
             aster_version: "0.21.0".to_string(),
             packs: Vec::new(),
+            archive: None,
         };
         let remote = crate::cache::InMemoryBackend::new();
         let tier = crate::cache::TieredCache::with_remote(

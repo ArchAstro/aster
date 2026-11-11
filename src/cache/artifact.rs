@@ -3,6 +3,13 @@
 //! An action cache entry is a small JSON manifest keyed by a task hash.
 //! File contents live in the content-addressed store as blobs keyed by
 //! [`Digest`] (sha256 of the uncompressed bytes).
+//!
+//! A target's output files are stored as one archive: a zstd-compressed tar
+//! stream cut into chunks, each chunk a blob. The manifest then names only the
+//! chunks in `outputs` (kind `archive_chunk`), so the server resolves a handful
+//! of blobs per target instead of one per file, and keeps the real file list
+//! in `archive`. A client that predates archives fails to parse the unknown
+//! kind and treats the entry as a miss.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -57,6 +64,10 @@ pub enum OutputKind {
     File,
     Dir,
     Symlink,
+    /// One chunk of the manifest's [`OutputArchive`]. Only appears in
+    /// [`Manifest::outputs`] of an archived manifest. Older clients do not
+    /// know this kind, so they cannot decode such a manifest.
+    ArchiveChunk,
 }
 
 /// One restored output. `path` is project-relative and `/`-separated.
@@ -69,6 +80,17 @@ pub struct OutputEntry {
     pub mode: u32,
     /// Symlink target. Set for [`OutputKind::Symlink`].
     pub target: Option<String>,
+}
+
+/// The output tree of a manifest whose file contents are one chunked archive.
+///
+/// `entries` is what `outputs` holds in an unarchived manifest. Every
+/// [`OutputKind::File`] entry has its bytes in the archive, as the tar member
+/// named by the entry's index in `entries`; directories and symlinks live only
+/// here. The chunks are the manifest's `outputs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputArchive {
+    pub entries: Vec<OutputEntry>,
 }
 
 /// A small blob stored inside a per-run pack entry rather than its own key.
@@ -100,6 +122,10 @@ pub struct Manifest {
     /// manifests written before packs existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<PackRef>,
+    /// Set when the output files are stored as one chunked archive. Then
+    /// `outputs` lists only the archive's chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<OutputArchive>,
 }
 
 impl Manifest {
@@ -120,24 +146,59 @@ impl Manifest {
     }
 
     /// Reject absolute paths, `..` components, file entries without a digest,
-    /// and symlink entries whose target is missing or escapes the project.
+    /// symlink entries whose target is missing or escapes the project, and an
+    /// archive whose chunk list is not the manifest's `outputs`.
     pub fn validate(&self) -> anyhow::Result<()> {
-        for output in &self.outputs {
-            if !is_safe_relative_path(&output.path) {
-                anyhow::bail!("unsafe output path: {}", output.path);
-            }
-            match output.kind {
-                OutputKind::File if output.digest.is_none() => {
-                    anyhow::bail!("file output missing digest: {}", output.path);
+        match &self.archive {
+            None => {
+                for output in &self.outputs {
+                    validate_entry(output)?;
                 }
-                OutputKind::Symlink => match &output.target {
-                    Some(target) if symlink_target_stays_in_project(&output.path, target) => {}
-                    _ => anyhow::bail!("unsafe symlink target for {}", output.path),
-                },
-                _ => {}
+            }
+            Some(archive) => {
+                for (index, chunk) in self.outputs.iter().enumerate() {
+                    if chunk.kind != OutputKind::ArchiveChunk
+                        || chunk.digest.is_none()
+                        || chunk.path != chunk_path(index)
+                    {
+                        anyhow::bail!("archive chunk {index} is malformed");
+                    }
+                }
+                if self.outputs.is_empty() {
+                    anyhow::bail!("archive has no chunks");
+                }
+                for entry in &archive.entries {
+                    validate_entry(entry)?;
+                }
+                if !archive
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == OutputKind::File)
+                {
+                    anyhow::bail!("archive holds no files");
+                }
             }
         }
         Ok(())
+    }
+
+    /// The tree a restore materializes: the archive's entries, else `outputs`.
+    pub fn tree(&self) -> &[OutputEntry] {
+        match &self.archive {
+            Some(archive) => &archive.entries,
+            None => &self.outputs,
+        }
+    }
+
+    /// Chunk digests of the archive, in stream order. Empty without one.
+    pub fn archive_chunks(&self) -> Vec<Digest> {
+        if self.archive.is_none() {
+            return Vec::new();
+        }
+        self.outputs
+            .iter()
+            .filter_map(|chunk| chunk.digest.clone())
+            .collect()
     }
 
     /// Every blob this manifest references: output digests, then the log.
@@ -152,6 +213,31 @@ impl Manifest {
         }
         refs
     }
+}
+
+/// The `outputs` path of archive chunk `index`.
+pub fn chunk_path(index: usize) -> String {
+    format!("chunk/{index:06}")
+}
+
+fn validate_entry(output: &OutputEntry) -> anyhow::Result<()> {
+    if !is_safe_relative_path(&output.path) {
+        anyhow::bail!("unsafe output path: {}", output.path);
+    }
+    match output.kind {
+        OutputKind::File if output.digest.is_none() => {
+            anyhow::bail!("file output missing digest: {}", output.path);
+        }
+        OutputKind::Symlink => match &output.target {
+            Some(target) if symlink_target_stays_in_project(&output.path, target) => {}
+            _ => anyhow::bail!("unsafe symlink target for {}", output.path),
+        },
+        OutputKind::ArchiveChunk => {
+            anyhow::bail!("archive chunk outside an archive: {}", output.path)
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Project-relative, `/`-separated path: only normal components, so prefixes, roots, and `..` are rejected.
@@ -240,6 +326,7 @@ mod tests {
             log: Some(Digest::of_bytes(b"log")),
             aster_version: "0.17.2".into(),
             packs: Vec::new(),
+            archive: None,
         }
     }
 
@@ -337,5 +424,109 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], manifest.outputs[0].digest.clone().unwrap());
         assert_eq!(refs[1], manifest.log.clone().unwrap());
+    }
+
+    fn archived() -> Manifest {
+        let mut manifest = sample();
+        let tree = std::mem::take(&mut manifest.outputs);
+        manifest.outputs = vec![OutputEntry {
+            path: chunk_path(0),
+            kind: OutputKind::ArchiveChunk,
+            digest: Some(Digest::of_bytes(b"chunk")),
+            mode: 0o644,
+            target: None,
+        }];
+        manifest.archive = Some(OutputArchive { entries: tree });
+        manifest
+    }
+
+    #[test]
+    fn an_archived_manifest_round_trips_and_names_only_its_chunks() {
+        let manifest = archived();
+        let decoded = Manifest::decode(&manifest.encode()).expect("round trip");
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.tree().len(), 2, "the tree is the archive's entries");
+        assert_eq!(decoded.archive_chunks(), vec![Digest::of_bytes(b"chunk")]);
+        let refs = decoded.blob_refs();
+        assert_eq!(
+            refs.len(),
+            2,
+            "one chunk and the log, not one blob per file"
+        );
+        assert_eq!(refs[0], Digest::of_bytes(b"chunk"));
+    }
+
+    #[test]
+    fn a_client_that_predates_archives_reads_one_as_a_miss() {
+        // The previous release's manifest shape: a closed set of output kinds.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreviousKind {
+            File,
+            Dir,
+            Symlink,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreviousOutput {
+            path: String,
+            kind: PreviousKind,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreviousManifest {
+            schema: u32,
+            outputs: Vec<PreviousOutput>,
+        }
+        // Its own manifests decode, so the failure below is the new kind.
+        assert!(serde_json::from_slice::<PreviousManifest>(&sample().encode()).is_ok());
+        assert!(
+            serde_json::from_slice::<PreviousManifest>(&archived().encode()).is_err(),
+            "an older client would decode an archive's chunks as files"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_malformed_archives() {
+        let mut bad_path = archived();
+        bad_path.outputs[0].path = "chunk/7".into();
+        assert!(Manifest::decode(&bad_path.encode()).is_none());
+
+        let mut no_digest = archived();
+        no_digest.outputs[0].digest = None;
+        assert!(Manifest::decode(&no_digest.encode()).is_none());
+
+        let mut no_chunks = archived();
+        no_chunks.outputs.clear();
+        assert!(Manifest::decode(&no_chunks.encode()).is_none());
+
+        let mut a_file_chunk = archived();
+        a_file_chunk.outputs[0].kind = OutputKind::File;
+        assert!(Manifest::decode(&a_file_chunk.encode()).is_none());
+
+        let mut no_files = archived();
+        no_files.archive.as_mut().unwrap().entries.remove(0);
+        assert!(Manifest::decode(&no_files.encode()).is_none());
+
+        let mut nested = archived();
+        nested
+            .archive
+            .as_mut()
+            .unwrap()
+            .entries
+            .push(archived().outputs.remove(0));
+        assert!(Manifest::decode(&nested.encode()).is_none());
+
+        let mut unsafe_path = archived();
+        unsafe_path.archive.as_mut().unwrap().entries[0].path = "../x".into();
+        assert!(Manifest::decode(&unsafe_path.encode()).is_none());
+    }
+
+    #[test]
+    fn a_chunk_outside_an_archive_is_rejected() {
+        let mut manifest = sample();
+        manifest.outputs.push(archived().outputs.remove(0));
+        assert!(Manifest::decode(&manifest.encode()).is_none());
     }
 }

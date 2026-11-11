@@ -2,29 +2,75 @@
 //! them onto disk from that store.
 //!
 //! Declarations are project-relative paths or globs from
-//! `[targets.<t>.cache] outputs`. Files become blobs. Directories are walked
-//! without following symlinks. A missing declaration or a symlink that leaves
-//! the project is a warning and is not stored.
+//! `[targets.<t>.cache] outputs`. Directories are walked without following
+//! symlinks. A missing declaration or a symlink that leaves the project is a
+//! warning and is not stored.
 //!
-//! [`restore`] materializes a packed entry list in place. It validates every
-//! path and blob before changing anything, rewrites only outputs that differ,
-//! prunes what a declared directory no longer holds, and removes the declared
-//! paths if a blob turns out corrupt.
+//! The regular files of one target become one archive: a tar stream, zstd
+//! compressed and cut into chunks that are stored as blobs (see
+//! [`super::chunks`]). A member is named by the index of its entry in the
+//! output tree, so a restore decides where each file goes and an archive
+//! cannot name a path. Directories and symlinks exist only in the tree.
+//!
+//! [`restore`] materializes a packed tree in place. It validates every path
+//! and checks every chunk is stored before changing anything, rewrites only
+//! outputs that differ, prunes what a declared directory no longer holds, and
+//! removes the declared paths if the archive turns out corrupt.
 
 use crate::errln;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::collections::BTreeSet;
+use sha2::{Digest as ShaDigest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
-use super::artifact::{Digest, OutputEntry, OutputKind};
-use super::hasher::normalize_rel;
+use super::artifact::{chunk_path, Digest, OutputArchive, OutputEntry, OutputKind};
+use super::chunks::write_chunked;
+use super::hasher::{encode_hex, normalize_rel};
 use super::local::LocalStore;
 
-/// Expand `output_globs` and write file blobs into `store`.
+/// The output tree of one target and the chunks that hold its file bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packed {
+    /// Every declared file, directory and symlink, sorted by path. Each file
+    /// carries the digest of its bytes.
+    pub tree: Vec<OutputEntry>,
+    /// Archive chunk digests in stream order. Empty when the tree holds no
+    /// regular file, so there is nothing to archive.
+    pub chunks: Vec<Digest>,
+}
+
+impl Packed {
+    /// The manifest's `outputs` and `archive`.
+    ///
+    /// An archived tree names only its chunks in `outputs`; a tree of
+    /// directories and symlinks has no bytes to store and stays in `outputs`.
+    pub fn into_manifest_parts(self) -> (Vec<OutputEntry>, Option<OutputArchive>) {
+        if self.chunks.is_empty() {
+            return (self.tree, None);
+        }
+        let outputs = self
+            .chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, digest)| OutputEntry {
+                path: chunk_path(index),
+                kind: OutputKind::ArchiveChunk,
+                digest: Some(digest),
+                mode: 0o644,
+                target: None,
+            })
+            .collect();
+        (outputs, Some(OutputArchive { entries: self.tree }))
+    }
+}
+
+/// Expand `output_globs`, archive the files they select and write the
+/// archive's chunks into `store`.
 ///
 /// `Ok(None)` means the result must not be stored: a declared output is
 /// missing, or a symlink points outside the project. Both print a warning.
@@ -33,9 +79,12 @@ pub fn pack(
     project_root: &Path,
     output_globs: &[String],
     store: &LocalStore,
-) -> Result<Option<Vec<OutputEntry>>> {
+) -> Result<Option<Packed>> {
     if output_globs.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(Packed {
+            tree: Vec::new(),
+            chunks: Vec::new(),
+        }));
     }
 
     let mut literals = Vec::new();
@@ -84,20 +133,136 @@ pub fn pack(
     let mut entries = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for path in paths {
-        if !pack_tree(project_root, &path, store, &mut entries, &mut seen)? {
+        if !pack_tree(project_root, &path, &mut entries, &mut seen)? {
             return Ok(None);
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(Some(entries))
+    let chunks = archive_files(project_root, &mut entries, store)?;
+    Ok(Some(Packed {
+        tree: entries,
+        chunks,
+    }))
+}
+
+/// Stream every file entry into one tar, zstd and chunk it, and fill in each
+/// entry's digest from the bytes that went into the archive. Returns the
+/// chunk digests, none when there is no file.
+///
+/// The archive is deterministic (no times, owners or names beyond the member
+/// index), so unchanged outputs produce the same chunk blobs.
+fn archive_files(
+    project_root: &Path,
+    entries: &mut [OutputEntry],
+    store: &LocalStore,
+) -> Result<Vec<Digest>> {
+    if !entries.iter().any(|entry| entry.kind == OutputKind::File) {
+        return Ok(Vec::new());
+    }
+    write_chunked(
+        |digest, bytes| {
+            store
+                .put_blob(digest, bytes)
+                .with_context(|| format!("Failed to store archive chunk {}", digest.as_str()))
+        },
+        |sink| {
+            let encoder = zstd::stream::write::Encoder::new(sink, ARCHIVE_ZSTD_LEVEL)
+                .context("Failed to start the output archive")?;
+            let mut tar = tar::Builder::new(encoder);
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if entry.kind == OutputKind::File {
+                    append_file(&mut tar, project_root, index, entry)?;
+                }
+            }
+            let encoder = tar
+                .into_inner()
+                .context("Failed to finish the output archive")?;
+            encoder
+                .finish()
+                .context("Failed to finish the output archive")?;
+            Ok(())
+        },
+    )
+}
+
+/// Same trade as the directory cache: fast enough that packing never shows
+/// next to the build, and build outputs compress well at this level.
+const ARCHIVE_ZSTD_LEVEL: i32 = 3;
+
+/// Add `entry`'s file as member `index` and record the digest of the bytes
+/// that were archived.
+fn append_file<W: Write>(
+    tar: &mut tar::Builder<W>,
+    project_root: &Path,
+    index: usize,
+    entry: &mut OutputEntry,
+) -> Result<()> {
+    let path = project_root.join(&entry.path);
+    let file =
+        File::open(&path).with_context(|| format!("Failed to open cache output {}", entry.path))?;
+    let length = file
+        .metadata()
+        .with_context(|| format!("Failed to stat cache output {}", entry.path))?
+        .len();
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(length);
+    header.set_mode(entry.mode & 0o777);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    // Exactly `length` bytes, hashed as they go: a file that changes while it
+    // is read cannot desynchronize the stream, and the digest is of what was
+    // stored.
+    let mut reader = HashingReader::new(file.take(length), length);
+    tar.append_data(&mut header, index.to_string(), &mut reader)
+        .with_context(|| format!("Failed to archive cache output {}", entry.path))?;
+    entry.digest = Some(reader.finish());
+    Ok(())
+}
+
+/// Hashes what passes through, and fails if the source ends before `remaining`.
+struct HashingReader<R> {
+    inner: R,
+    remaining: u64,
+    hasher: Sha256,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self {
+            inner,
+            remaining,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> Digest {
+        Digest::from_hex(encode_hex(ShaDigest::finalize(self.hasher).as_ref()))
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let read = self.inner.read(buffer)?;
+        if read == 0 {
+            return Err(io::Error::other("a file shrank while it was being stored"));
+        }
+        self.remaining -= read as u64;
+        ShaDigest::update(&mut self.hasher, &buffer[..read]);
+        Ok(read)
+    }
 }
 
 /// Make declared outputs under `project_root` match the packed tree.
 ///
 /// Every entry is checked before anything on disk changes. A path that is
 /// absolute, contains `..`, or otherwise leaves `project_root` is refused and
-/// nothing is touched. A file blob missing from `store` is refused the same
-/// way.
+/// nothing is touched. An archive chunk missing from `store` is refused the
+/// same way.
 ///
 /// Restore updates outputs in place, so other processes can read them while it
 /// runs. Several restores of the same entry can also run at once. An output
@@ -108,42 +273,63 @@ pub fn pack(
 /// files do not survive a hit. Another restore's in-flight temp files are
 /// skipped.
 ///
-/// A corrupt blob or a write error removes the declared paths and returns
-/// `Err`. The caller treats that as a miss and runs the target.
-pub fn restore(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
-    let entries = validate_restore_entries(project_root, entries)?;
-    if let Some(entry) = entries.iter().find(|entry| {
-        entry
-            .digest
-            .as_ref()
-            .is_some_and(|digest| !store.has_blob(digest))
-    }) {
+/// The files that need writing come out of one pass over the archive. The
+/// pass reads every chunk through the end of the last file it needs, even
+/// when most files already match, because the stream cannot be entered in the
+/// middle. When every file already matches, the archive is not read at all.
+/// Each file is hashed as it is written and must equal its entry's digest.
+/// Files are not fsynced: a crash can leave a truncated file, and the next
+/// restore of this entry finds the digest wrong and rewrites it.
+///
+/// A corrupt chunk, a file that fails its digest or a write error removes the
+/// declared paths and returns `Err`. The caller treats that as a miss and runs
+/// the target.
+pub fn restore(
+    project_root: &Path,
+    tree: &[OutputEntry],
+    chunks: &[Digest],
+    store: &LocalStore,
+) -> Result<()> {
+    let entries = validate_restore_entries(project_root, tree)?;
+    if let Some(chunk) = chunks.iter().find(|chunk| !store.has_blob(chunk)) {
         bail!(
-            "cache restore file `{}` has no blob in the store",
-            entry.path
+            "cache restore archive chunk {} has no blob in the store",
+            chunk.as_str()
         );
     }
-    let result = write_outputs(project_root, &entries, store)
+    if chunks.is_empty()
+        && entries
+            .iter()
+            .any(|(_, entry)| entry.kind == OutputKind::File)
+    {
+        bail!("cache restore has files but no archive");
+    }
+    let result = write_outputs(project_root, &entries, chunks, store)
         .and_then(|()| prune_undeclared(project_root, &entries));
     if let Err(error) = result {
-        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|(_, entry)| entry.path.clone())
+            .collect();
         let _ = remove_outputs(project_root, &paths);
         return Err(error);
     }
     Ok(())
 }
 
-/// Checked entries, parents before children, so a directory exists before its files.
+/// Checked entries with their index in the packed tree, parents before
+/// children, so a directory exists before its files. The index names the
+/// entry's archive member.
 fn validate_restore_entries(
     project_root: &Path,
     entries: &[OutputEntry],
-) -> Result<Vec<OutputEntry>> {
+) -> Result<Vec<(usize, OutputEntry)>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
     let mut checked = Vec::with_capacity(entries.len());
     let mut seen = BTreeSet::new();
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if !is_restore_path(&entry.path) {
             bail!(
                 "cache restore path `{}` escapes the project root",
@@ -169,14 +355,17 @@ fn validate_restore_entries(
             },
             _ => {}
         }
+        if entry.kind == OutputKind::ArchiveChunk {
+            bail!("cache restore path `{}` is an archive chunk", entry.path);
+        }
         if !seen.insert(entry.path.clone()) {
             bail!("cache restore path `{}` is declared twice", entry.path);
         }
-        checked.push(entry.clone());
+        checked.push((index, entry.clone()));
     }
-    for entry in &checked {
+    for (_, entry) in &checked {
         refuse_symlinked_ancestor(project_root, &entry.path, &seen)?;
-        if let Some(link) = checked.iter().find(|other| {
+        if let Some((_, link)) = checked.iter().find(|(_, other)| {
             other.kind == OutputKind::Symlink && entry.path.starts_with(&format!("{}/", other.path))
         }) {
             bail!(
@@ -186,7 +375,7 @@ fn validate_restore_entries(
             );
         }
     }
-    checked.sort_by(|left, right| {
+    checked.sort_by(|(_, left), (_, right)| {
         left.path
             .matches('/')
             .count()
@@ -256,10 +445,18 @@ fn remove_outputs(project_root: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Parents come before children (see [`validate_restore_entries`]), so a
-/// declared directory exists, and is a real directory, before its entries.
-fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStore) -> Result<()> {
-    for entry in entries {
+/// Directories and symlinks first, parents before children (see
+/// [`validate_restore_entries`]), noting which files differ from the tree.
+/// Then one pass over the archive writes those files.
+fn write_outputs(
+    project_root: &Path,
+    entries: &[(usize, OutputEntry)],
+    chunks: &[Digest],
+    store: &LocalStore,
+) -> Result<()> {
+    // Archive member index -> the entry whose bytes it holds.
+    let mut stale: BTreeMap<usize, &OutputEntry> = BTreeMap::new();
+    for (index, entry) in entries {
         let path = project_root.join(&entry.path);
         match entry.kind {
             OutputKind::Dir => write_dir(&path, entry.mode)
@@ -270,8 +467,7 @@ fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStor
                     continue;
                 }
                 remove_if_real_dir(&path)?;
-                write_file_atomic(&path, digest, entry.mode, store)
-                    .with_context(|| format!("Failed to restore file {} from blob", entry.path))?;
+                stale.insert(*index, entry);
             }
             OutputKind::Symlink => {
                 let target = entry.target.as_deref().expect("validated");
@@ -282,9 +478,121 @@ fn write_outputs(project_root: &Path, entries: &[OutputEntry], store: &LocalStor
                 write_symlink_atomic(&path, target)
                     .with_context(|| format!("Failed to restore symlink {}", entry.path))?;
             }
+            OutputKind::ArchiveChunk => unreachable!("validated"),
         }
     }
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let files = entries
+        .iter()
+        .filter(|(_, entry)| entry.kind == OutputKind::File)
+        .count();
+    unpack_archive(project_root, &stale, files, chunks, store)
+}
+
+/// Read the archive once and write the members named in `stale`. `files` is
+/// how many file members the tree has: all of them must be present.
+fn unpack_archive(
+    project_root: &Path,
+    stale: &BTreeMap<usize, &OutputEntry>,
+    files: usize,
+    chunks: &[Digest],
+    store: &LocalStore,
+) -> Result<()> {
+    let decoder = zstd::stream::read::Decoder::new(ChunkReader::new(store, chunks))
+        .context("Failed to open the output archive")?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut seen = 0_usize;
+    let mut written = 0_usize;
+    let mut previous: Option<usize> = None;
+    for member in archive
+        .entries()
+        .context("Failed to read the output archive")?
+    {
+        let mut member = member.context("cache output archive is unreadable or corrupt")?;
+        let index = member_index(&member)?;
+        if previous.is_some_and(|previous| index <= previous) {
+            bail!("output archive members are out of order at {index}");
+        }
+        previous = Some(index);
+        seen += 1;
+        let Some(entry) = stale.get(&index) else {
+            // Already on disk, or not a file: the next iteration skips its bytes.
+            continue;
+        };
+        let digest = entry.digest.as_ref().expect("validated");
+        write_member_atomic(
+            &project_root.join(&entry.path),
+            &mut member,
+            digest,
+            entry.mode,
+        )
+        .with_context(|| format!("Failed to restore file {} from the archive", entry.path))?;
+        written += 1;
+    }
+    if written != stale.len() || seen != files {
+        bail!(
+            "output archive holds {seen} of {files} files and {written} of {} needed",
+            stale.len()
+        );
+    }
     Ok(())
+}
+
+/// The tree index a member is named by: canonical decimal, nothing else.
+fn member_index<R: Read>(member: &tar::Entry<'_, R>) -> Result<usize> {
+    if member.header().entry_type() != tar::EntryType::Regular {
+        bail!("output archive holds a member that is not a regular file");
+    }
+    let path = member.path().context("Failed to read a member name")?;
+    let name = path.to_str().unwrap_or_default();
+    let index: usize = name
+        .parse()
+        .with_context(|| format!("output archive member `{name}` is not an index"))?;
+    if index.to_string() != name {
+        bail!("output archive member `{name}` is not an index");
+    }
+    Ok(index)
+}
+
+/// The archive's chunks as one byte stream. Each chunk is read from the store
+/// whole when the stream reaches it, which checks its digest, and is dropped
+/// when the next one is loaded.
+struct ChunkReader<'a> {
+    store: &'a LocalStore,
+    pending: std::slice::Iter<'a, Digest>,
+    current: io::Cursor<Vec<u8>>,
+}
+
+impl<'a> ChunkReader<'a> {
+    fn new(store: &'a LocalStore, chunks: &'a [Digest]) -> Self {
+        Self {
+            store,
+            pending: chunks.iter(),
+            current: io::Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for ChunkReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let read = self.current.read(buffer)?;
+            if read > 0 || buffer.is_empty() {
+                return Ok(read);
+            }
+            let Some(digest) = self.pending.next() else {
+                return Ok(0);
+            };
+            let mut bytes = std::mem::take(self.current.get_mut());
+            bytes.clear();
+            self.store
+                .get_blob(digest, &mut bytes)
+                .map_err(io::Error::other)?;
+            self.current = io::Cursor::new(bytes);
+        }
+    }
 }
 
 /// Create `path` as a real directory with `mode`. A file or symlink in the
@@ -411,9 +719,15 @@ fn remove_path(path: &Path) -> Result<()> {
 /// Only children of `Dir` entries are inspected. A glob of files declares no
 /// directory, so nothing beside those files is touched. An undeclared child
 /// directory goes with its contents. Symlinks are unlinked, not followed.
-fn prune_undeclared(project_root: &Path, entries: &[OutputEntry]) -> Result<()> {
-    let declared: BTreeSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-    for entry in entries.iter().filter(|entry| entry.kind == OutputKind::Dir) {
+fn prune_undeclared(project_root: &Path, entries: &[(usize, OutputEntry)]) -> Result<()> {
+    let declared: BTreeSet<&str> = entries
+        .iter()
+        .map(|(_, entry)| entry.path.as_str())
+        .collect();
+    for (_, entry) in entries
+        .iter()
+        .filter(|(_, entry)| entry.kind == OutputKind::Dir)
+    {
         let dir = project_root.join(&entry.path);
         let children = match fs::read_dir(&dir) {
             Ok(children) => children,
@@ -458,16 +772,33 @@ fn is_live_restore_temp(name: &str, entry: &fs::DirEntry) -> bool {
         .is_none_or(|age| age < RESTORE_TEMP_GRACE)
 }
 
-/// Write blob bytes to a sibling temp file, then rename over `path`.
-fn write_file_atomic(path: &Path, digest: &Digest, mode: u32, store: &LocalStore) -> Result<()> {
+/// Copy `source` to a sibling temp file, check its digest, then rename it
+/// over `path`. No fsync: see [`restore`].
+fn write_member_atomic(
+    path: &Path,
+    source: &mut impl Read,
+    digest: &Digest,
+    mode: u32,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = restore_temp_path(path);
     let write_result = (|| {
-        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-        store.get_blob(digest, &mut file)?;
-        file.sync_all()?;
+        let file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let mut writer = HashingWriter {
+            inner: BufWriter::with_capacity(128 * 1024, file),
+            hasher: Sha256::new(),
+        };
+        io::copy(source, &mut writer)?;
+        writer.inner.flush()?;
+        let hashed = encode_hex(ShaDigest::finalize(writer.hasher).as_ref());
+        if hashed != digest.as_str() {
+            bail!(
+                "restored bytes do not match digest {} (got {hashed})",
+                digest.as_str()
+            );
+        }
         set_mode(&tmp, mode)?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -476,6 +807,23 @@ fn write_file_atomic(path: &Path, digest: &Digest, mode: u32, store: &LocalStore
         let _ = fs::remove_file(&tmp);
     }
     write_result
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        ShaDigest::update(&mut self.hasher, &bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Create the link under a sibling temp name, then rename it over `path`.
@@ -594,7 +942,6 @@ fn symlink_target_stays_inside(link_rel: &str, target: &str) -> bool {
 fn pack_tree(
     project_root: &Path,
     path: &Path,
-    store: &LocalStore,
     entries: &mut Vec<OutputEntry>,
     seen: &mut std::collections::BTreeSet<String>,
 ) -> Result<bool> {
@@ -624,39 +971,27 @@ fn pack_tree(
             .with_context(|| format!("Failed to read {}", path.display()))?;
         children.sort();
         for child in children {
-            if !pack_tree(project_root, &child, store, entries, seen)? {
+            if !pack_tree(project_root, &child, entries, seen)? {
                 return Ok(false);
             }
         }
         return Ok(true);
     }
     if file_type.is_file() {
-        entries.push(pack_file(path, &rel, mode_of(&metadata), store)?);
+        entries.push(OutputEntry {
+            path: rel,
+            kind: OutputKind::File,
+            // Filled in as the file goes into the archive.
+            digest: None,
+            mode: mode_of(&metadata),
+            target: None,
+        });
         return Ok(true);
     }
     warn_skip(&format!(
         "cache output `{rel}` is not a file, directory, or symlink"
     ));
     Ok(false)
-}
-
-fn pack_file(path: &Path, rel: &str, mode: u32, store: &LocalStore) -> Result<OutputEntry> {
-    let mut file =
-        File::open(path).with_context(|| format!("Failed to open cache output {rel}"))?;
-    let digest = Digest::of_reader(&mut file)
-        .with_context(|| format!("Failed to hash cache output {rel}"))?;
-    file.seek_read_from_start()
-        .with_context(|| format!("Failed to rewind cache output {rel}"))?;
-    store
-        .put_blob(&digest, file)
-        .with_context(|| format!("Failed to store cache output {rel}"))?;
-    Ok(OutputEntry {
-        path: rel.to_string(),
-        kind: OutputKind::File,
-        digest: Some(digest),
-        mode,
-        target: None,
-    })
 }
 
 /// Store a symlink without following it. An external target rejects the pack.
@@ -832,18 +1167,6 @@ fn warn_skip(message: &str) {
     errln!("Warning: {message}; result not stored");
 }
 
-/// Rewind a file after hashing it, without pulling `Seek` into the signature.
-trait Rewind {
-    fn seek_read_from_start(&mut self) -> std::io::Result<()>;
-}
-
-impl Rewind for File {
-    fn seek_read_from_start(&mut self) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        self.seek(SeekFrom::Start(0)).map(|_| ())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,9 +1211,10 @@ mod tests {
         }
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
 
         let paths: Vec<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(
@@ -905,12 +1229,10 @@ mod tests {
             .unwrap();
         assert_eq!(app.kind, OutputKind::File);
         assert_eq!(app.digest, Some(Digest::of_bytes(b"app")));
-        assert!(store.has_blob(app.digest.as_ref().unwrap()));
-        let mut restored = Vec::new();
-        store
-            .get_blob(app.digest.as_ref().unwrap(), &mut restored)
-            .unwrap();
-        assert_eq!(restored, b"app");
+        // Two files, one archive: a single chunk, and no blob of its own per file.
+        assert_eq!(packed.chunks.len(), 1);
+        assert!(store.has_blob(&packed.chunks[0]));
+        assert!(!store.has_blob(app.digest.as_ref().unwrap()));
 
         let run = entries
             .iter()
@@ -933,9 +1255,10 @@ mod tests {
         std::os::windows::fs::symlink_file("app.js", project.path().join("dist/current")).unwrap();
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         let link = entries
             .iter()
             .find(|entry| entry.path == "dist/current")
@@ -943,7 +1266,8 @@ mod tests {
         assert_eq!(link.kind, OutputKind::Symlink);
         assert_eq!(link.target.as_deref(), Some("app.js"));
         assert!(link.digest.is_none());
-        assert!(store.has_blob(&Digest::of_bytes(b"app")));
+        assert_eq!(packed.chunks.len(), 1);
+        assert!(store.has_blob(&packed.chunks[0]));
     }
 
     #[test]
@@ -954,13 +1278,20 @@ mod tests {
         write_file(&project.path().join("dist/nested/app.css"), b"css");
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist/**/*.js".to_string()], &store)
+        let packed = pack(project.path(), &["dist/**/*.js".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "dist/nested/app.js");
         assert_eq!(entries[0].digest, Some(Digest::of_bytes(b"app")));
-        assert!(!store.has_blob(&Digest::of_bytes(b"css")));
+        let mut archived = Vec::new();
+        store.get_blob(&packed.chunks[0], &mut archived).unwrap();
+        let archived = zstd::decode_all(&archived[..]).unwrap();
+        assert!(
+            !archived.windows(3).any(|window| window == b"css"),
+            "the file the glob did not select was archived"
+        );
     }
 
     #[test]
@@ -976,9 +1307,10 @@ mod tests {
             .unwrap();
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         let link = entries
             .iter()
             .find(|entry| entry.path == "dist/links/current")
@@ -1069,18 +1401,19 @@ mod tests {
             .unwrap();
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
-        let packed = snapshot(project.path(), "dist");
+        let entries = packed.tree.clone();
+        let before = snapshot(project.path(), "dist");
 
         fs::remove_dir_all(project.path().join("dist")).unwrap();
         write_file(&project.path().join("dist/stale.txt"), b"stale");
         write_file(&project.path().join("keep.txt"), b"keep");
 
-        restore(project.path(), &entries, &store).unwrap();
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
 
-        assert_eq!(snapshot(project.path(), "dist"), packed);
+        assert_eq!(snapshot(project.path(), "dist"), before);
         assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
         assert!(!project.path().join("dist/stale.txt").exists());
         #[cfg(unix)]
@@ -1107,21 +1440,22 @@ mod tests {
         write_file(&project.path().join("keep.txt"), b"keep");
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         fs::remove_dir_all(project.path().join("dist")).unwrap();
 
         let b = entries
             .iter()
             .find(|entry| entry.path == "dist/b.txt")
             .unwrap();
-        let digest = b.digest.as_ref().unwrap();
-        let blob = store.blob_path(digest).unwrap();
+        assert!(b.digest.is_some());
+        let blob = store.blob_path(&packed.chunks[0]).unwrap();
         fs::write(&blob, b"not-a-zstd-frame").unwrap();
 
-        let error = restore(project.path(), &entries, &store).unwrap_err();
-        assert!(error.to_string().contains("dist"), "{error}");
+        let error = restore(project.path(), &entries, &packed.chunks, &store).unwrap_err();
+        assert!(error.to_string().contains("archive"), "{error}");
         assert!(
             !project.path().join("dist").exists(),
             "partial restore left dist behind"
@@ -1139,10 +1473,11 @@ mod tests {
         write_file(&project.path().join("dist/changed.js"), b"new");
         write_file(&project.path().join("dist/nested/kept.js"), b"kept");
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
-        let packed = snapshot(project.path(), "dist");
+        let entries = packed.tree.clone();
+        let before = snapshot(project.path(), "dist");
 
         // The checkout drifted: one file changed, stale files and a stale
         // directory appeared. `same.js` is untouched.
@@ -1152,9 +1487,9 @@ mod tests {
         write_file(&project.path().join("dist/stale.js"), b"stale");
         write_file(&project.path().join("dist/gone/deep.js"), b"stale");
 
-        restore(project.path(), &entries, &store).unwrap();
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
 
-        assert_eq!(snapshot(project.path(), "dist"), packed);
+        assert_eq!(snapshot(project.path(), "dist"), before);
         assert_eq!(
             inode("dist/same.js"),
             same_before,
@@ -1169,17 +1504,18 @@ mod tests {
         write_file(&project.path().join("dist/was_dir"), b"file now");
         write_file(&project.path().join("dist/was_file/inner.js"), b"dir now");
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
-        let packed = snapshot(project.path(), "dist");
+        let entries = packed.tree.clone();
+        let before = snapshot(project.path(), "dist");
 
         fs::remove_dir_all(project.path().join("dist")).unwrap();
         write_file(&project.path().join("dist/was_dir/child.js"), b"x");
         write_file(&project.path().join("dist/was_file"), b"x");
 
-        restore(project.path(), &entries, &store).unwrap();
-        assert_eq!(snapshot(project.path(), "dist"), packed);
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
+        assert_eq!(snapshot(project.path(), "dist"), before);
     }
 
     #[test]
@@ -1188,9 +1524,10 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         write_file(&project.path().join("dist/app.js"), b"app");
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
 
         let live = project.path().join("dist/.app.js.aster-restore.1.0");
         let old = project.path().join("dist/.app.js.aster-restore.2.0");
@@ -1204,7 +1541,7 @@ mod tests {
             .set_modified(long_ago)
             .unwrap();
 
-        restore(project.path(), &entries, &store).unwrap();
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
         assert!(live.exists(), "another restore's temp file was removed");
         assert!(!old.exists(), "a stale temp file survived");
     }
@@ -1215,14 +1552,14 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         write_file(&project.path().join("dist/a.txt"), b"aaa");
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
-        let digest = entries[1].digest.as_ref().unwrap();
-        fs::remove_file(store.blob_path(digest).unwrap()).unwrap();
+        let entries = packed.tree.clone();
+        fs::remove_file(store.blob_path(&packed.chunks[0]).unwrap()).unwrap();
         fs::write(project.path().join("dist/a.txt"), b"local").unwrap();
 
-        let error = restore(project.path(), &entries, &store).unwrap_err();
+        let error = restore(project.path(), &entries, &packed.chunks, &store).unwrap_err();
         assert!(error.to_string().contains("no blob"), "{error}");
         assert_eq!(
             fs::read(project.path().join("dist/a.txt")).unwrap(),
@@ -1245,7 +1582,7 @@ mod tests {
                 mode: 0o644,
                 target: None,
             }];
-            let error = restore(project.path(), &entries, &store).unwrap_err();
+            let error = restore(project.path(), &entries, &[], &store).unwrap_err();
             assert!(
                 error.to_string().contains("escapes"),
                 "path {path:?} produced {error}"
@@ -1260,7 +1597,7 @@ mod tests {
             mode: 0o777,
             target: Some("../../outside".into()),
         }];
-        assert!(restore(project.path(), &link, &store).is_err());
+        assert!(restore(project.path(), &link, &[], &store).is_err());
         assert!(!project.path().join("dist").exists());
     }
 
@@ -1275,11 +1612,12 @@ mod tests {
         std::os::windows::fs::symlink_file("app.js", project.path().join("dist/current")).unwrap();
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist".to_string()], &store)
+        let packed = pack(project.path(), &["dist".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         fs::remove_dir_all(project.path().join("dist")).unwrap();
-        restore(project.path(), &entries, &store).unwrap();
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
 
         let link = fs::read_link(project.path().join("dist/current")).unwrap();
         assert_eq!(link, Path::new("app.js"));
@@ -1296,9 +1634,10 @@ mod tests {
         write_file(&project.path().join("dist/app.js"), b"app");
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist/app.js".to_string()], &store)
+        let packed = pack(project.path(), &["dist/app.js".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         fs::remove_file(project.path().join("dist/app.js")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), project.path().join("dist/app.js")).unwrap();
@@ -1306,7 +1645,7 @@ mod tests {
         std::os::windows::fs::symlink_dir(outside.path(), project.path().join("dist/app.js"))
             .unwrap();
 
-        restore(project.path(), &entries, &store).unwrap();
+        restore(project.path(), &entries, &packed.chunks, &store).unwrap();
         assert_eq!(
             fs::read(project.path().join("dist/app.js")).unwrap(),
             b"app"
@@ -1323,19 +1662,225 @@ mod tests {
         write_file(&project.path().join("dist/app.js"), b"app");
 
         let store = LocalStore::new(cache.path().to_path_buf());
-        let entries = pack(project.path(), &["dist/app.js".to_string()], &store)
+        let packed = pack(project.path(), &["dist/app.js".to_string()], &store)
             .unwrap()
             .expect("stored");
+        let entries = packed.tree.clone();
         fs::remove_dir_all(project.path().join("dist")).unwrap();
         write_file(&outside.path().join("app.js"), b"outside");
         std::os::unix::fs::symlink(outside.path(), project.path().join("dist")).unwrap();
 
-        let error = restore(project.path(), &entries, &store).unwrap_err();
+        let error = restore(project.path(), &entries, &packed.chunks, &store).unwrap_err();
         assert!(error.to_string().contains("symlinked directory"), "{error}");
         assert_eq!(fs::read(outside.path().join("app.js")).unwrap(), b"outside");
         assert!(fs::symlink_metadata(project.path().join("dist"))
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    /// Bytes zstd cannot shrink, so an archive is forced across chunks.
+    fn incompressible(length: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut bytes = Vec::with_capacity(length + 8);
+        while bytes.len() < length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(length);
+        bytes
+    }
+
+    #[test]
+    fn many_small_files_are_one_chunk_and_round_trip() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        for index in 0..700 {
+            write_file(
+                &project
+                    .path()
+                    .join(format!("dist/assets/{}/f{index}.js", index % 20)),
+                format!("export const n = {index};\n").repeat(5).as_bytes(),
+            );
+        }
+        fs::create_dir_all(project.path().join("dist/empty")).unwrap();
+        write_file(&project.path().join("dist/zero.bin"), b"");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        assert_eq!(
+            packed.chunks.len(),
+            1,
+            "700 small files are one blob, not 700"
+        );
+        let before = snapshot(project.path(), "dist");
+
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        restore(project.path(), &packed.tree, &packed.chunks, &store).unwrap();
+        assert_eq!(snapshot(project.path(), "dist"), before);
+        assert!(project.path().join("dist/empty").is_dir());
+        assert_eq!(fs::read(project.path().join("dist/zero.bin")).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_file_larger_than_a_chunk_spans_chunks_and_round_trips() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let big = incompressible(super::super::chunks::CHUNK_BYTES + 5_000_000, 7);
+        write_file(&project.path().join("out/before.txt"), b"first");
+        write_file(&project.path().join("out/big.bin"), &big);
+        write_file(&project.path().join("out/after.txt"), b"last");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["out".to_string()], &store)
+            .unwrap()
+            .expect("stored");
+        assert_eq!(packed.chunks.len(), 2, "a file past 32 MB spans two chunks");
+
+        fs::remove_dir_all(project.path().join("out")).unwrap();
+        restore(project.path(), &packed.tree, &packed.chunks, &store).unwrap();
+        assert_eq!(fs::read(project.path().join("out/big.bin")).unwrap(), big);
+        assert_eq!(
+            fs::read(project.path().join("out/after.txt")).unwrap(),
+            b"last"
+        );
+    }
+
+    #[test]
+    fn the_same_outputs_pack_to_the_same_chunks() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.js"), b"a");
+        write_file(&project.path().join("dist/b.js"), b"b");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let first = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        // A later mtime must not change the archive.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_file(&project.path().join("dist/a.js"), b"a");
+        let second = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.chunks, second.chunks);
+    }
+
+    #[test]
+    fn a_tree_of_directories_and_links_has_no_archive() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("dist/empty")).unwrap();
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        assert!(packed.chunks.is_empty());
+        let (outputs, archive) = packed.clone().into_manifest_parts();
+        assert!(archive.is_none());
+        assert_eq!(outputs, packed.tree);
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        restore(project.path(), &packed.tree, &packed.chunks, &store).unwrap();
+        assert!(project.path().join("dist/empty").is_dir());
+    }
+
+    #[test]
+    fn a_tree_that_already_matches_never_opens_the_archive() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.js"), b"a");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        // If restore read the archive, this would fail it.
+        fs::write(store.blob_path(&packed.chunks[0]).unwrap(), b"garbage").unwrap();
+        restore(project.path(), &packed.tree, &packed.chunks, &store).unwrap();
+        assert_eq!(fs::read(project.path().join("dist/a.js")).unwrap(), b"a");
+    }
+
+    #[test]
+    fn bytes_that_do_not_match_the_entry_digest_are_a_miss_not_a_partial_tree() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.js"), b"aaa");
+        write_file(&project.path().join("dist/b.js"), b"bbb");
+        write_file(&project.path().join("keep.txt"), b"keep");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        // The manifest says b.js holds other bytes than the archive does.
+        let mut tree = packed.tree.clone();
+        tree.iter_mut()
+            .find(|entry| entry.path == "dist/b.js")
+            .unwrap()
+            .digest = Some(Digest::of_bytes(b"something else"));
+
+        let error = restore(project.path(), &tree, &packed.chunks, &store).unwrap_err();
+        assert!(format!("{error:#}").contains("digest"), "{error:#}");
+        assert!(
+            !project.path().join("dist").exists(),
+            "a.js was left behind"
+        );
+        assert_eq!(fs::read(project.path().join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn an_archive_missing_a_file_is_a_miss() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_file(&project.path().join("dist/a.js"), b"aaa");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        let packed = pack(project.path(), &["dist".to_string()], &store)
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        let mut tree = packed.tree.clone();
+        tree.push(OutputEntry {
+            path: "dist/b.js".into(),
+            kind: OutputKind::File,
+            digest: Some(Digest::of_bytes(b"bbb")),
+            mode: 0o644,
+            target: None,
+        });
+        let error = restore(project.path(), &tree, &packed.chunks, &store).unwrap_err();
+        assert!(error.to_string().contains("holds 1 of 2 files"), "{error}");
+        assert!(!project.path().join("dist").exists());
+    }
+
+    #[test]
+    fn a_member_that_names_a_path_is_refused_and_writes_nothing() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let outside = project.path().join("outside.txt");
+        let store = LocalStore::new(cache.path().to_path_buf());
+        // A hostile archive: the member is named like a path, not an index.
+        let mut builder = tar::Builder::new(Vec::new());
+        // `append` writes the header as given, so the raw name survives.
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..14].copy_from_slice(b"../outside.txt");
+        header.set_size(3);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append(&header, &b"bad"[..]).unwrap();
+        let archive = zstd::encode_all(&builder.into_inner().unwrap()[..], 1).unwrap();
+        let chunk = Digest::of_bytes(&archive);
+        store.put_blob(&chunk, &archive[..]).unwrap();
+        let entry = OutputEntry {
+            path: "dist/a.js".into(),
+            kind: OutputKind::File,
+            digest: Some(Digest::of_bytes(b"bad")),
+            mode: 0o644,
+            target: None,
+        };
+
+        let error = restore(project.path(), &[entry], &[chunk], &store).unwrap_err();
+        assert!(format!("{error:#}").contains("not an index"), "{error:#}");
+        assert!(!outside.exists());
+        assert!(!project.path().join("dist").exists());
     }
 }

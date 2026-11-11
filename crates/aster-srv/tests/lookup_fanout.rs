@@ -157,6 +157,10 @@ async fn a_wide_lookup_finishes_in_bounded_time_and_a_repeat_is_free() {
     let (status, body, cold) = lookup(&server, &keys).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"].as_object().unwrap().len(), 64);
+    assert!(
+        body.get("unresolved").is_none(),
+        "a lookup that resolved everything lists nothing as unresolved: {body}"
+    );
     assert!(body["hits"]["k63"]["blobs"][digest(511)]
         .as_str()
         .unwrap()
@@ -221,6 +225,9 @@ async fn entries_over_the_blob_cap_are_misses_and_are_not_counted() {
     let hits = body["hits"].as_object().unwrap();
     assert_eq!(hits.len(), 4, "{:?}", hits.keys().collect::<Vec<_>>());
     assert!(hits.get("big4").is_none());
+    // The key that did not fit exists, so the client is told to ask again
+    // with fewer keys, and how many blobs it names.
+    assert_eq!(body["unresolved"], json!({"big4": per_entry}), "{body}");
     let counted: Vec<(String, i64)> = server
         .client()
         .await
@@ -260,6 +267,7 @@ async fn a_saturated_signer_turns_entries_into_misses_not_errors() {
     let (status, body, _) = lookup(&server, &keys).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"].as_object().unwrap().len(), 3, "{body}");
+    assert_eq!(body["unresolved"].as_object().unwrap().len(), 3, "{body}");
     assert_eq!(signer.calls.load(Ordering::SeqCst), 3);
     // Only the three served entries were counted.
     let counted: i64 = server
@@ -330,6 +338,14 @@ async fn a_slow_lookup_answers_within_its_budget_and_the_rest_are_misses() {
     for hit in body["hits"].as_object().unwrap().values() {
         assert_eq!(hit["blobs"].as_object().unwrap().len(), 1, "{hit}");
     }
+    // Every key the budget cut off is named, with its blob count, instead of
+    // being indistinguishable from a key the cache does not hold.
+    let unresolved = body["unresolved"].as_object().unwrap();
+    assert_eq!(first + unresolved.len(), keys.len(), "{body}");
+    assert!(unresolved.values().all(|blobs| blobs == 1), "{body}");
+    for key in unresolved.keys() {
+        assert!(body["hits"].get(key).is_none(), "{key} is both");
+    }
     // Only the entries served were counted.
     let counted: i64 = server
         .client()
@@ -344,5 +360,23 @@ async fn a_slow_lookup_answers_within_its_budget_and_the_rest_are_misses() {
     let (status, again, _) = lookup(&server, &keys).await;
     assert_eq!(status, 200);
     assert!(again["hits"].as_object().unwrap().len() > first, "{again}");
+    server.stop().await;
+}
+
+/// An entry that alone names more blobs than one response may hold can never
+/// be served, so asking again would never help: it is a plain miss, not listed
+/// as unresolved.
+#[tokio::test]
+async fn an_entry_that_can_never_fit_is_a_miss_not_an_unresolved_key() {
+    let Some((server, _)) = server(FanoutConfig::default(), Duration::ZERO, Duration::ZERO).await
+    else {
+        return;
+    };
+    let blobs: Vec<String> = (0..MAX_LOOKUP_BLOBS + 1).map(digest).collect();
+    seed(&server, "huge", &blobs).await;
+    let (status, body, _) = lookup(&server, &["huge".to_string()]).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["hits"].as_object().unwrap().is_empty(), "{body}");
+    assert!(body.get("unresolved").is_none(), "{body}");
     server.stop().await;
 }

@@ -10,12 +10,12 @@
 //! databases. Without it the test skips, the same way the aster-srv suite does.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use aster_srv::auth::Verifier;
-use aster_srv::cache::{BlobStore, FixedSigner};
+use aster_srv::cache::{BlobStore, FanoutConfig, FixedSigner};
 use aster_srv::raw_store::RawStore;
 use aster_srv::{App, Config};
 
@@ -53,6 +53,11 @@ impl Running {
 }
 
 async fn start() -> Option<Running> {
+    start_with(None).await
+}
+
+/// [`start`], over a chosen blob store instead of the default in-memory one.
+async fn start_with(store: Option<BlobStore>) -> Option<Running> {
     let Ok(admin_url) = std::env::var("ASTER_SRV_TEST_DATABASE_URL") else {
         eprintln!("skipping: ASTER_SRV_TEST_DATABASE_URL is not set");
         return None;
@@ -100,7 +105,7 @@ async fn start() -> Option<Running> {
         signature: b"e2e-signature".to_vec(),
         signed: Default::default(),
     });
-    let store = BlobStore::memory("aster-cache-e2e", signer);
+    let store = store.unwrap_or_else(|| BlobStore::memory("aster-cache-e2e", signer));
     let app = App::start_with_cache(
         config,
         verifier,
@@ -166,6 +171,11 @@ cache = { enabled = true, outputs = ["out/**"], exclude = ["runs.txt"] }
 }
 
 fn run_blocking(dir: &Path, server: &str) -> std::process::Output {
+    run_target(dir, server, "//app:build", &["--no-deps"])
+}
+
+/// `aster run <target> <extra>` in `dir` against `server`, which must pass.
+fn run_target(dir: &Path, server: &str, target: &str, extra: &[&str]) -> std::process::Output {
     let output = Command::new(env!("CARGO_BIN_EXE_aster"))
         .current_dir(dir)
         .env("ASTER_SRV_URL", server)
@@ -175,7 +185,8 @@ fn run_blocking(dir: &Path, server: &str) -> std::process::Output {
         .env_remove("ASTER_REMOTE_CACHE")
         .env_remove("ASTER_CACHE_MODE")
         .env_remove("ASTER_CACHE_DIR")
-        .args(["run", "//app:build", "--no-deps"])
+        .args(["run", target])
+        .args(extra)
         .output()
         .expect("spawn aster");
     assert!(
@@ -186,6 +197,15 @@ fn run_blocking(dir: &Path, server: &str) -> std::process::Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+/// The `remote-io: ...` line a run prints on stderr, if it did remote I/O.
+fn io_line(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("remote-io: "))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The `remote: ...` line a run prints on stderr. Exactly one per run.
@@ -605,4 +625,487 @@ fn unreachable_remote_is_counted_in_the_summary_and_the_build_still_passes() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+const FILES: usize = 700;
+
+/// A checkout whose `build` writes the shape of a front-end bundle: hundreds
+/// of small files in nested directories, a few MB of binary, an executable, a
+/// symlink and an empty directory.
+fn many_file_checkout(dir: &Path) {
+    fs::create_dir_all(dir.join("app")).unwrap();
+    fs::write(dir.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(
+        dir.join("app/build.sh"),
+        format!(
+            "set -e\n\
+             mkdir -p out/assets out/empty\n\
+             for i in $(seq 1 {FILES}); do echo \"export const n = $i;\" > out/assets/f$i.js; done\n\
+             head -c 3000000 /dev/urandom > out/bundle.bin\n\
+             printf '#!/bin/sh\\n' > out/run.sh\n\
+             chmod 755 out/run.sh\n\
+             ln -s assets/f1.js out/current\n\
+             echo ran >> runs.txt\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("app/aster.toml"),
+        r#"
+[targets.build]
+command = "bash build.sh"
+cache = { enabled = true, outputs = ["out/**"], exclude = ["runs.txt"] }
+"#,
+    )
+    .unwrap();
+    git_init(dir);
+}
+
+fn git_init(dir: &Path) {
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "e2e")
+            .env("GIT_AUTHOR_EMAIL", "e2e@example.com")
+            .env("GIT_COMMITTER_NAME", "e2e")
+            .env("GIT_COMMITTER_EMAIL", "e2e@example.com")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "fixture"]);
+}
+
+/// Every path under `root` with what restore must reproduce: file bytes,
+/// symlink target or directory marker, and the permission bits.
+fn listing(root: &Path) -> Vec<(String, String, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut rows = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.unwrap();
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let metadata = fs::symlink_metadata(entry.path()).unwrap();
+        let what = if metadata.file_type().is_symlink() {
+            format!("link:{}", fs::read_link(entry.path()).unwrap().display())
+        } else if metadata.is_dir() {
+            "dir".to_string()
+        } else {
+            let digest = sha256(&fs::read(entry.path()).unwrap());
+            format!(
+                "file:{}",
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        };
+        rows.push((relative, what, metadata.permissions().mode() & 0o777));
+    }
+    rows
+}
+
+/// A bundle of 700 files is one blob on the server, one lookup entry and one
+/// download, and restores byte for byte on another machine.
+///
+/// Before archives, this target was 701 blobs: the server's lookup resolved
+/// each one (a GCS HEAD and a signature apiece) inside a 3 second budget, and
+/// a client restored them one file at a time.
+///
+/// Real: the aster binary (two checkouts, two empty local caches), aster-srv's
+/// routes and Postgres. Faked: GCS, by the server's in-memory bucket behind
+/// the signed-URL path. Integration matrix: lookup, restore and upload each
+/// cross the real HTTP boundary here; the budget-exceeded and corrupt-chunk
+/// cells are the two tests that follow, and old-client behaviour is the
+/// manifest decode test in `src/cache/artifact.rs`.
+#[tokio::test]
+async fn a_seven_hundred_file_target_is_one_archive_through_aster_srv() {
+    let Some(mut server) = start().await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("workspace-a");
+    let b = root.path().join("other-machine").join("workspace-b");
+    many_file_checkout(&a);
+    many_file_checkout(&b);
+
+    // Phase 1, upload: checkout A runs the build, which writes the files.
+    // The archive goes to the bucket and the manifest is committed.
+    let first = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, a) = (server.url.clone(), a.clone());
+            move || run_blocking(&a, &url)
+        }) => output.expect("aster thread"),
+    };
+    let stderr_a = String::from_utf8_lossy(&first.stderr).to_string();
+    assert_eq!(runs(&a), 1, "A must run the target: {stderr_a}");
+    assert_eq!(
+        summary_line(&first),
+        "remote: 0 hits / 1 misses / 1 uploads",
+        "{stderr_a}"
+    );
+    let objects = server.app.cache_store.objects().await;
+    assert_eq!(
+        objects.len(),
+        1,
+        "{FILES} files and a binary are one chunk in the bucket, not {FILES} blobs: {objects:?}"
+    );
+    assert!(
+        io_line(&first).contains("upload 1 blobs"),
+        "{}",
+        io_line(&first)
+    );
+    let built = listing(&a.join("app/out"));
+    assert!(
+        built.len() > FILES,
+        "the fixture built its tree: {}",
+        built.len()
+    );
+
+    // Phase 2, lookup and download: checkout B has an empty local cache and
+    // asks the server. The reply names one blob; B downloads it once.
+    let restored = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, b) = (server.url.clone(), b.clone());
+            move || run_target(&b, &url, "//app:build", &["--no-deps", "--json"])
+        }) => output.expect("aster thread"),
+    };
+    let stderr_b = String::from_utf8_lossy(&restored.stderr).to_string();
+    assert_eq!(runs(&b), 0, "B must not run the target: {stderr_b}");
+    assert_eq!(
+        summary_line(&restored),
+        "remote: 1 hits / 0 misses / 0 uploads",
+        "{stderr_b}"
+    );
+    let io = io_line(&restored);
+    assert!(io.contains("lookup 1 requests / 1 keys / 1 blobs"), "{io}");
+    assert!(io.contains("download 1 blobs"), "{io}");
+    assert!(io.contains("unpack 1 targets"), "{io}");
+    // The same counters are in the machine-readable run summary.
+    let json: serde_json::Value = serde_json::from_slice(&restored.stdout).expect("run json");
+    let remote = &json["summary"]["remote_cache"];
+    assert_eq!(remote["hits"], 1, "{json}");
+    assert_eq!(remote["io"]["lookup_blobs"], 1, "{json}");
+    assert_eq!(remote["io"]["download_blobs"], 1, "{json}");
+    assert_eq!(remote["io"]["lookup_budget_misses"], 0, "{json}");
+
+    // Phase 3, observable result: the tree on B is A's tree, file for file,
+    // with modes, the symlink and the empty directory.
+    assert_eq!(
+        listing(&b.join("app/out")),
+        built,
+        "B must restore an identical tree: {stderr_b}"
+    );
+
+    // Phase 4: B's next run is a local hit and downloads nothing.
+    let local = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, b) = (server.url.clone(), b.clone());
+            move || run_blocking(&b, &url)
+        }) => output.expect("aster thread"),
+    };
+    assert_eq!(runs(&b), 0);
+    assert!(
+        !io_line(&local).contains("download"),
+        "a local hit downloaded again: {}",
+        io_line(&local)
+    );
+
+    server.stop().await;
+}
+
+/// A chunk whose bytes on the server are not the bytes its digest names is a
+/// miss. The target runs and its own output stands: no half-restored tree.
+#[tokio::test]
+async fn a_corrupt_chunk_on_the_server_is_a_miss_and_the_target_runs() {
+    let Some(mut server) = start().await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("workspace-a");
+    let c = root.path().join("other-machine").join("workspace-c");
+    many_file_checkout(&a);
+    many_file_checkout(&c);
+
+    let first = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, a) = (server.url.clone(), a.clone());
+            move || run_blocking(&a, &url)
+        }) => output.expect("aster thread"),
+    };
+    assert_eq!(runs(&a), 1, "{}", String::from_utf8_lossy(&first.stderr));
+
+    // The bucket now holds other bytes under the chunk's name.
+    let objects = server.app.cache_store.objects().await;
+    assert_eq!(objects.len(), 1);
+    server
+        .app
+        .cache_store
+        .put_unrecorded(&objects[0], bytes::Bytes::from_static(b"bit rot"))
+        .await
+        .unwrap();
+
+    let second = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, c) = (server.url.clone(), c.clone());
+            move || run_blocking(&c, &url)
+        }) => output.expect("aster thread"),
+    };
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(runs(&c), 1, "a corrupt chunk must not be a hit: {stderr}");
+    assert!(stderr.contains("digest mismatch"), "{stderr}");
+    assert_eq!(
+        listing(&c.join("app/out")).len(),
+        listing(&a.join("app/out")).len(),
+        "the target's own build is the tree: {stderr}"
+    );
+
+    server.stop().await;
+}
+
+/// 40 targets are looked up in one batch. The server resolves blobs 16 at a
+/// time inside a budget shorter than that takes, so it answers some keys as
+/// unresolved. Before, those keys were read as misses and the targets reran.
+/// Now the client asks again and every target is a hit.
+///
+/// Real: the aster binary, aster-srv, Postgres and its lookup budget logic.
+/// Faked: GCS, with 150 ms added to every HEAD so the budget is reachable.
+#[tokio::test]
+async fn a_batch_cut_short_by_the_server_budget_is_asked_again_and_every_target_hits() {
+    const TARGETS: usize = 40;
+    let signer = std::sync::Arc::new(FixedSigner {
+        email: "cache-e2e@example.iam.gserviceaccount.com".into(),
+        signature: b"e2e-signature".to_vec(),
+        signed: Default::default(),
+    });
+    let store = BlobStore::memory_with(
+        "aster-cache-e2e",
+        signer,
+        FanoutConfig {
+            lookup_budget: std::time::Duration::from_millis(300),
+            ..FanoutConfig::default()
+        },
+        std::time::Duration::from_millis(150),
+    );
+    let Some(mut server) = start_with(Some(store)).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let write_checkout = |dir: &Path| {
+        fs::create_dir_all(dir.join("app")).unwrap();
+        fs::write(dir.join("app/package.json"), r#"{"name":"app"}"#).unwrap();
+        let mut config = String::new();
+        let mut names = Vec::new();
+        for index in 0..TARGETS {
+            config.push_str(&format!(
+                "[targets.t{index}]\ncommand = \"bash -c 'mkdir -p out/t{index} && echo {index} > out/t{index}/f'\"\n\
+                 cache = {{ enabled = true, outputs = [\"out/t{index}/**\"], exclude = [\"out/**\"] }}\n\n"
+            ));
+            names.push(format!("\"//app:t{index}\""));
+        }
+        config.push_str(&format!(
+            "[targets.all]\ncommand = \"true\"\ndepends_on = [{}]\n",
+            names.join(", ")
+        ));
+        fs::write(dir.join("app/aster.toml"), config).unwrap();
+        git_init(dir);
+    };
+    let a = root.path().join("workspace-a");
+    let b = root.path().join("other-machine").join("workspace-b");
+    write_checkout(&a);
+    write_checkout(&b);
+
+    // A runs and stores all 40 targets; B restores them.
+    let first = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, a) = (server.url.clone(), a.clone());
+            move || run_target(&a, &url, "//app:all", &[])
+        }) => output.expect("aster thread"),
+    };
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("remote:"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let restored = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        output = tokio::task::spawn_blocking({
+            let (url, b) = (server.url.clone(), b.clone());
+            move || run_target(&b, &url, "//app:all", &[])
+        }) => output.expect("aster thread"),
+    };
+    let stderr = String::from_utf8_lossy(&restored.stderr);
+    for index in 0..TARGETS {
+        assert!(
+            b.join(format!("app/out/t{index}/f")).is_file(),
+            "t{index} was not restored: {stderr}"
+        );
+    }
+    let io = io_line(&restored);
+    assert!(
+        io.contains("unresolved by the server"),
+        "the budget never cut the lookup short, so this proves nothing: {io}\nA: {}\nB: {stderr}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    eprintln!("budget-bound restore of {TARGETS} targets: {io}");
+    assert!(!io.contains("missed on the server's time budget"), "{io}");
+    let summary = stderr
+        .lines()
+        .find(|line| line.starts_with("remote: "))
+        .unwrap_or_default();
+    assert!(
+        summary.starts_with(&format!("remote: {TARGETS} hits / 0 misses")),
+        "every target must hit: {summary}\n{io}"
+    );
+
+    server.stop().await;
+}
+
+/// What one client build costs on the seven-hundred-file target.
+#[derive(Debug)]
+#[allow(dead_code)] // read through Debug
+struct BenchRow {
+    lookup_blobs: usize,
+    lookup: std::time::Duration,
+    upload: std::time::Duration,
+    restore: std::time::Duration,
+}
+
+/// Run the many-file build with `binary` against a fresh server whose GCS
+/// answers each HEAD in 20 ms, as production's does, and time each leg.
+async fn bench_binary(binary: &Path) -> Option<BenchRow> {
+    let signer = std::sync::Arc::new(FixedSigner {
+        email: "cache-e2e@example.iam.gserviceaccount.com".into(),
+        signature: b"e2e-signature".to_vec(),
+        signed: Default::default(),
+    });
+    let store = BlobStore::memory_with(
+        "aster-cache-e2e",
+        signer,
+        FanoutConfig::default(),
+        std::time::Duration::from_millis(20),
+    );
+    let mut server = start_with(Some(store)).await?;
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("workspace-a");
+    let b = root.path().join("other-machine").join("workspace-b");
+    many_file_checkout(&a);
+    many_file_checkout(&b);
+    let run = |binary: PathBuf, dir: PathBuf, url: String, extra: Vec<&'static str>| {
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let output = Command::new(binary)
+                .current_dir(&dir)
+                .env("ASTER_SRV_URL", &url)
+                .env("ASTER_SRV_TOKEN", TOKEN)
+                .env("ASTER_SRV_GCS_BASE", &url)
+                .env("GITHUB_REPOSITORY", REPO)
+                .env_remove("ASTER_REMOTE_CACHE")
+                .env_remove("ASTER_CACHE_MODE")
+                .env_remove("ASTER_CACHE_DIR")
+                .args(["run", "//app:build", "--no-deps"])
+                .args(extra)
+                .output()
+                .expect("spawn aster");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            started.elapsed()
+        })
+    };
+    // The build with no cache at all is what a cache leg is measured against.
+    let plain = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        took = run(binary.to_path_buf(), a.clone(), server.url.clone(), vec!["--no-cache"]) => took.unwrap(),
+    };
+    fs::remove_dir_all(a.join("app/out")).unwrap();
+    let stored = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        took = run(binary.to_path_buf(), a.clone(), server.url.clone(), vec![]) => took.unwrap(),
+    };
+    // One lookup of the stored key, straight at the server.
+    let key: String = server
+        .app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT key FROM cache.manifests", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let (url, key_c) = (server.url.clone(), key.clone());
+    let lookup = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        done = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let reply: serde_json::Value = ureq::post(&format!("{url}/v1/cache/lookup"))
+                .header("Authorization", &format!("Bearer {TOKEN}"))
+                .send_json(serde_json::json!({"repo": REPO, "keys": [key_c]}))
+                .unwrap()
+                .into_body()
+                .read_json()
+                .unwrap();
+            let blobs = reply["hits"][&key_c]["blobs"].as_object().map_or(0, |b| b.len());
+            (blobs, started.elapsed())
+        }) => done.unwrap(),
+    };
+    let restored = tokio::select! {
+        _ = &mut server.accept => unreachable!("accept ended"),
+        took = run(binary.to_path_buf(), b.clone(), server.url.clone(), vec![]) => took.unwrap(),
+    };
+    assert_eq!(runs(&b), 0, "B must restore, not run");
+    server.stop().await;
+    Some(BenchRow {
+        lookup_blobs: lookup.0,
+        lookup: lookup.1,
+        upload: stored.saturating_sub(plain),
+        restore: restored,
+    })
+}
+
+/// Compare this build with another binary on the seven-hundred-file target:
+/// blobs a lookup names, lookup time, upload time on top of the build, and the
+/// time a fresh checkout takes to restore it.
+///
+/// Run by hand, in release, with `ASTER_BENCH_BEFORE` naming the binary to
+/// compare against:
+/// `ASTER_BENCH_BEFORE=/path/to/aster cargo test --release --test
+/// cache_remote_e2e bench_ -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "a benchmark; run by hand with ASTER_BENCH_BEFORE set"]
+async fn bench_many_file_target_against_another_binary() {
+    let Some(before) = std::env::var_os("ASTER_BENCH_BEFORE") else {
+        eprintln!("skipping: ASTER_BENCH_BEFORE is not set");
+        return;
+    };
+    for round in 1..=3 {
+        for (label, binary) in [
+            ("before", PathBuf::from(before.clone())),
+            ("after", PathBuf::from(env!("CARGO_BIN_EXE_aster"))),
+        ] {
+            let Some(row) = bench_binary(&binary).await else {
+                return;
+            };
+            eprintln!("bench round {round} {label}: {row:?}");
+        }
+    }
 }

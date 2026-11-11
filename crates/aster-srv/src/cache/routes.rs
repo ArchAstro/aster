@@ -172,7 +172,7 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
     let records_stats = reader.caller == Caller::Ci;
     let budget = app.cache_store.lookup_budget();
     match lookup_hits(app, &reader.repository, &request.keys, counts, budget).await {
-        Ok(hits) => {
+        Ok(Lookup { hits, unresolved }) => {
             let requested = request
                 .keys
                 .iter()
@@ -181,7 +181,13 @@ async fn lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
             if records_stats {
                 record_lookup(app, &reader.repository, hits.len(), requested);
             }
-            Reply::json(200, json!({"hits": hits}))
+            // Additive: a client that predates `unresolved` reads these keys
+            // as misses, same as before. A newer one asks for them again.
+            if unresolved.is_empty() {
+                Reply::json(200, json!({"hits": hits}))
+            } else {
+                Reply::json(200, json!({"hits": hits, "unresolved": unresolved}))
+            }
         }
         Err(error) => db_error(error),
     }
@@ -240,7 +246,7 @@ async fn dir_lookup(app: &App, headers: &Headers<'_>, body: Value) -> Reply {
         };
         let wanted = std::slice::from_ref(&key);
         let hit = match lookup_hits(app, repo, wanted, counts, budget).await {
-            Ok(mut hits) => hits.remove(&key),
+            Ok(mut lookup) => lookup.hits.remove(&key),
             Err(error) => return db_error(error),
         };
         match hit {
@@ -408,13 +414,25 @@ enum Resolved {
     Failed,
 }
 
+/// What [`lookup_hits`] found.
+struct Lookup {
+    /// Entries served, by key.
+    hits: serde_json::Map<String, Value>,
+    /// Keys that exist but were not answered: the blob cap or the time budget
+    /// ran out, or GCS or IAM failed or was busy. Each maps to the number of
+    /// blobs the entry names, so a client can size a retry. An entry that
+    /// names more blobs than one response may hold is a plain miss, never
+    /// listed: asking again cannot change that.
+    unresolved: serde_json::Map<String, Value>,
+}
+
 async fn lookup_hits(
     app: &App,
     repo: &str,
     keys: &[String],
     counts: bool,
     budget: Option<std::time::Duration>,
-) -> anyhow::Result<serde_json::Map<String, Value>> {
+) -> anyhow::Result<Lookup> {
     use futures_util::stream::{self, StreamExt};
     // Not held while blobs resolve: that can take the whole budget, and every
     // other cache route needs the same pool.
@@ -434,6 +452,7 @@ async fn lookup_hits(
 
     // Admit entries in request order until the blob budget is spent.
     let mut admitted: Vec<(String, Vec<u8>, Vec<String>)> = Vec::new();
+    let mut unresolved = serde_json::Map::new();
     let mut digests: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for key in keys {
@@ -447,6 +466,9 @@ async fn lookup_hits(
                 "cache lookup over the blob cap; answered as a miss",
                 json!({"repo": repo, "key": key, "blobs": refs.len(), "cap": MAX_LOOKUP_BLOBS}),
             );
+            if refs.len() <= MAX_LOOKUP_BLOBS {
+                unresolved.insert(key.clone(), json!(refs.len()));
+            }
             continue;
         }
         for digest in &refs {
@@ -521,6 +543,7 @@ async fn lookup_hits(
                 Some(Resolved::Url(_) | Resolved::Absent)
             )
         }) {
+            unresolved.insert(key, json!(refs.len()));
             continue;
         }
         let mut blobs = serde_json::Map::new();
@@ -559,7 +582,7 @@ async fn lookup_hits(
             )
             .await?;
     }
-    Ok(hits)
+    Ok(Lookup { hits, unresolved })
 }
 
 async fn upload(app: &App, headers: &Headers<'_>, body: Value) -> Reply {

@@ -17,9 +17,9 @@
 use crate::errln;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -31,6 +31,7 @@ use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use super::artifact::{Digest, Manifest};
 use super::backend::CacheBackend;
 use super::hasher::encode_hex;
+use super::remote_stats::RemoteStats;
 use crate::srv_url::{checked_origin, scheme_policy};
 use crate::test_results::upload::{proxy_token_from_env, Credentials};
 
@@ -60,6 +61,16 @@ const USER_AGENT: &str = concat!("aster/", env!("CARGO_PKG_VERSION"));
 const MAX_KEYS: usize = 256;
 /// Upload accepts at most this many digests.
 const MAX_DIGESTS: usize = 1024;
+/// Blobs one retry request asks the server to resolve. The server resolves
+/// 16 blobs at a time inside a 3 second budget, so a request this heavy fits
+/// when the server's HEAD and signature caches are warm, which the first
+/// attempt has just made them.
+const RETRY_BATCH_BLOBS: usize = 800;
+/// Times keys the server left unresolved are asked again.
+const LOOKUP_RETRIES: usize = 2;
+/// Wall time one backend spends on those retries before it stops asking and
+/// lets the keys run as misses. A slow server costs at most this much per run.
+const LOOKUP_RETRY_TIME: Duration = Duration::from_secs(20);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A hung gateway must not stall the build. Past this, the call is a failure
@@ -111,6 +122,14 @@ pub struct AsterSrvBackend {
     blob_agent: ureq::Agent,
     state: Mutex<State>,
     logged_read_only: AtomicBool,
+    /// Request counts and timings go here once a tier attaches its counters.
+    stats: Mutex<Option<Arc<RemoteStats>>>,
+    /// A lookup that timed out is asked once more, once per backend: a slow
+    /// reply is often a cold server that the first request has warmed. A
+    /// second timeout is a dead gateway and disables the remote as before.
+    timeout_retried: AtomicBool,
+    /// Microseconds spent on retry rounds, against [`LOOKUP_RETRY_TIME`].
+    retry_micros: AtomicU64,
 }
 
 impl AsterSrvBackend {
@@ -227,7 +246,17 @@ impl AsterSrvBackend {
                 read_only: person_only,
             }),
             logged_read_only: AtomicBool::new(false),
+            stats: Mutex::new(None),
+            timeout_retried: AtomicBool::new(false),
+            retry_micros: AtomicU64::new(0),
         })
+    }
+
+    fn stats(&self) -> Option<Arc<RemoteStats>> {
+        self.stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Ask lookup for every `keys` entry that is not already cached.
@@ -252,25 +281,130 @@ impl AsterSrvBackend {
         Ok(())
     }
 
+    /// Look up `keys`, asking again for the ones the server could not resolve.
+    ///
+    /// The server answers a key it cannot finish inside its time budget as
+    /// unresolved, not as a miss. Those keys are asked again, in requests
+    /// sized by the blob counts the server reported, up to
+    /// [`LOOKUP_RETRIES`] times and [`LOOKUP_RETRY_TIME`] in all. A key still
+    /// unresolved then is recorded as a miss and counted apart from keys the
+    /// cache does not hold.
     fn lookup_keys(&self, keys: &[String]) -> Result<()> {
-        let body = json!({ "repo": self.repo, "keys": keys });
-        let value = self.post("/v1/cache/lookup", &body, false)?;
+        let stats = self.stats();
+        let mut pending: Vec<(String, usize)> = keys.iter().map(|key| (key.clone(), 0)).collect();
+        for round in 0..=LOOKUP_RETRIES {
+            let started = Instant::now();
+            let mut unresolved = Vec::new();
+            for batch in weighted_batches(&pending) {
+                if round > 0 {
+                    let spent = Duration::from_micros(self.retry_micros.load(Ordering::Relaxed))
+                        + started.elapsed();
+                    if spent >= LOOKUP_RETRY_TIME {
+                        // Out of retry time: the rest stay unresolved.
+                        unresolved.extend(
+                            pending
+                                .iter()
+                                .filter(|(key, _)| batch.contains(key))
+                                .cloned(),
+                        );
+                        continue;
+                    }
+                    if let Some(stats) = &stats {
+                        stats.lookup_retried(batch.len());
+                    }
+                }
+                unresolved.extend(self.lookup_call(&batch)?);
+            }
+            if round > 0 {
+                let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.retry_micros.fetch_add(micros, Ordering::Relaxed);
+            }
+            if round == 0 && !unresolved.is_empty() {
+                if let Some(stats) = &stats {
+                    stats.lookup_unresolved(unresolved.len());
+                }
+            }
+            pending = unresolved;
+            let spent = Duration::from_micros(self.retry_micros.load(Ordering::Relaxed));
+            if pending.is_empty() || spent >= LOOKUP_RETRY_TIME {
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            if let Some(stats) = &stats {
+                stats.lookup_budget_misses(pending.len());
+            }
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            for (key, _) in pending {
+                state.hits.insert(key, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// One lookup request. Records each key's answer and returns the keys the
+    /// server left unresolved with the number of blobs each names.
+    fn lookup_call(&self, keys: &[String]) -> Result<Vec<(String, usize)>> {
+        let value = self.post_lookup(keys)?;
         let hits = value
             .get("hits")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let unresolved = value.get("unresolved").and_then(Value::as_object);
+        let blobs: usize = hits
+            .values()
+            .filter_map(|entry| entry.get("blobs").and_then(Value::as_object))
+            .map(|blobs| blobs.len())
+            .sum();
+        if let Some(stats) = self.stats() {
+            stats.lookup_blobs(blobs);
+        }
+        let mut waiting = Vec::new();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         for key in keys {
             let hit = match hits.get(key) {
                 Some(entry) => {
                     decode_hit(entry).with_context(|| format!("lookup hit for {key}"))?
                 }
-                None => None,
+                None => match unresolved.and_then(|unresolved| unresolved.get(key)) {
+                    Some(weight) => {
+                        let weight = weight.as_u64().unwrap_or(0);
+                        waiting.push((key.clone(), usize::try_from(weight).unwrap_or(usize::MAX)));
+                        continue;
+                    }
+                    None => None,
+                },
             };
             state.hits.insert(key.clone(), hit);
         }
-        Ok(())
+        Ok(waiting)
+    }
+
+    /// POST `/v1/cache/lookup`, timing the request. A timeout is asked once
+    /// more, once per backend; see [`Self::timeout_retried`].
+    fn post_lookup(&self, keys: &[String]) -> Result<Value> {
+        let body = json!({ "repo": self.repo, "keys": keys });
+        let stats = self.stats();
+        loop {
+            let started = Instant::now();
+            let reply = self.post("/v1/cache/lookup", &body, false);
+            if let Some(stats) = &stats {
+                stats.lookup_request(keys.len(), started.elapsed());
+            }
+            let Err(error) = &reply else {
+                return reply;
+            };
+            if !is_timeout(error) {
+                return reply;
+            }
+            if let Some(stats) = &stats {
+                stats.lookup_timeout();
+            }
+            if self.timeout_retried.swap(true, Ordering::AcqRel) {
+                return reply;
+            }
+        }
     }
 
     fn cached_hit(&self, key: &str) -> Result<Option<Hit>> {
@@ -616,6 +750,13 @@ impl CacheBackend for AsterSrvBackend {
         !self.read_only()
     }
 
+    fn attach_stats(&self, stats: Arc<RemoteStats>) {
+        *self
+            .stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stats);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -660,6 +801,35 @@ fn decode_hit(entry: &Value) -> Result<Option<Hit>> {
         }
     }
     Ok(Some(Hit { manifest, blobs }))
+}
+
+/// Keys per request: at most [`MAX_KEYS`], and no more than
+/// [`RETRY_BATCH_BLOBS`] blobs by the weights the server reported. A key whose
+/// weight is not known counts as zero; a heavier key than the limit goes
+/// alone.
+fn weighted_batches(pending: &[(String, usize)]) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut weight = 0;
+    for (key, blobs) in pending {
+        let full = batches
+            .last()
+            .is_none_or(|batch| batch.len() >= MAX_KEYS || weight + blobs > RETRY_BATCH_BLOBS);
+        if full {
+            batches.push(Vec::new());
+            weight = 0;
+        }
+        weight += blobs;
+        if let Some(batch) = batches.last_mut() {
+            batch.push(key.clone());
+        }
+    }
+    batches
+}
+
+/// Whether `error` is a request that hit the client's timeout, as opposed to
+/// being signed out, which also stops the remote but is not worth asking again.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<DisablingFailure>()) && !is_signed_out(error)
 }
 
 /// The remote is skipped: say so once per process, since the executor builds
@@ -820,6 +990,7 @@ mod tests {
             log: None,
             aster_version: "0.21.0".to_string(),
             packs: Vec::new(),
+            archive: None,
         }
     }
 
@@ -840,6 +1011,12 @@ mod tests {
         lookup_ms_per_key: Arc<std::sync::atomic::AtomicU64>,
         /// Milliseconds every upload and commit call waits before it answers.
         write_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// When non-zero, a lookup resolves only this many stored keys and
+        /// lists the rest as `unresolved`, as the real server does when its
+        /// time budget runs out.
+        resolve_limit: Arc<AtomicUsize>,
+        /// The next this-many lookups stall for 1.5s before they answer.
+        stall_next: Arc<AtomicUsize>,
         proxy_seen: Arc<Mutex<Vec<String>>>,
         /// The `Authorization` header of each cache call (lowercased).
         auth_seen: Arc<Mutex<Vec<String>>>,
@@ -860,6 +1037,8 @@ mod tests {
             let refuse = Arc::new(AtomicBool::new(false));
             let lookup_ms_per_key = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let write_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let resolve_limit = Arc::new(AtomicUsize::new(0));
+            let stall_next = Arc::new(AtomicUsize::new(0));
             let proxy_seen = Arc::new(Mutex::new(Vec::new()));
             let auth_seen = Arc::new(Mutex::new(Vec::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -873,6 +1052,8 @@ mod tests {
             let refuse_c = Arc::clone(&refuse);
             let delay_c = Arc::clone(&lookup_ms_per_key);
             let write_ms_c = Arc::clone(&write_ms);
+            let resolve_limit_c = Arc::clone(&resolve_limit);
+            let stall_next_c = Arc::clone(&stall_next);
             let proxy_seen_c = Arc::clone(&proxy_seen);
             let auth_seen_c = Arc::clone(&auth_seen);
             let shutdown_c = Arc::clone(&shutdown);
@@ -896,6 +1077,8 @@ mod tests {
                     let refuse_c = Arc::clone(&refuse_c);
                     let delay_c = Arc::clone(&delay_c);
                     let write_ms_c = Arc::clone(&write_ms_c);
+                    let resolve_limit_c = Arc::clone(&resolve_limit_c);
+                    let stall_next_c = Arc::clone(&stall_next_c);
                     let proxy_seen_c = Arc::clone(&proxy_seen_c);
                     let auth_seen_c = Arc::clone(&auth_seen_c);
                     thread::spawn(move || {
@@ -986,6 +1169,14 @@ mod tests {
                             thread::sleep(Duration::from_millis(
                                 asked * delay_c.load(Ordering::Relaxed),
                             ));
+                            let stalled = stall_next_c
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                    left.checked_sub(1)
+                                })
+                                .is_ok();
+                            if stalled {
+                                thread::sleep(Duration::from_millis(1500));
+                            }
                         }
                         if path == "/v1/cache/upload" || path == "/v1/cache/commit" {
                             thread::sleep(Duration::from_millis(
@@ -1002,6 +1193,7 @@ mod tests {
                             &objects_c,
                             &manifests_c,
                             &status_c,
+                            &resolve_limit_c,
                         );
                         let response = format!(
                         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1023,6 +1215,8 @@ mod tests {
                 refuse,
                 lookup_ms_per_key,
                 write_ms,
+                resolve_limit,
+                stall_next,
                 proxy_seen,
                 auth_seen,
                 shutdown,
@@ -1047,12 +1241,15 @@ mod tests {
         objects: &Mutex<HashMap<String, Vec<u8>>>,
         manifests: &Mutex<HashMap<String, Vec<u8>>>,
         commit_status: &Mutex<u16>,
+        resolve_limit: &AtomicUsize,
     ) -> (u16, Vec<u8>, String) {
         let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         match path {
             "/v1/cache/lookup" => {
                 lookups.fetch_add(1, Ordering::Relaxed);
                 let mut hits = serde_json::Map::new();
+                let mut unresolved = serde_json::Map::new();
+                let limit = resolve_limit.load(Ordering::Relaxed);
                 let stored = manifests.lock().unwrap();
                 let blobs = objects.lock().unwrap();
                 for key in request["keys"].as_array().into_iter().flatten() {
@@ -1060,6 +1257,11 @@ mod tests {
                     let Some(bytes) = stored.get(key) else {
                         continue;
                     };
+                    if limit > 0 && hits.len() >= limit {
+                        let weight = Manifest::decode(bytes).map_or(0, |m| m.blob_refs().len());
+                        unresolved.insert(key.to_string(), json!(weight));
+                        continue;
+                    }
                     let mut urls = serde_json::Map::new();
                     if let Some(manifest) = Manifest::decode(bytes) {
                         for digest in manifest.blob_refs() {
@@ -1079,11 +1281,11 @@ mod tests {
                         }),
                     );
                 }
-                (
-                    200,
-                    serde_json::to_vec(&json!({"hits": hits})).unwrap(),
-                    String::new(),
-                )
+                let mut reply = json!({"hits": hits});
+                if !unresolved.is_empty() {
+                    reply["unresolved"] = Value::Object(unresolved);
+                }
+                (200, serde_json::to_vec(&reply).unwrap(), String::new())
             }
             "/v1/cache/upload" => {
                 uploads.fetch_add(1, Ordering::Relaxed);
@@ -1510,6 +1712,129 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("timeout"), "{line}");
+    }
+
+    /// The server ran out of its time budget for some keys and listed them as
+    /// unresolved. Before, the client read them as misses and rebuilt those
+    /// targets. Now it asks again, and the keys hit.
+    #[test]
+    fn keys_the_server_left_unresolved_are_asked_again_and_hit() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 6);
+        fake.resolve_limit.store(4, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_secs(5), dir.path());
+
+        tier.prefetch(&keys);
+        assert_eq!(fake.lookups.load(Ordering::Relaxed), 2, "one retry round");
+        for key in &keys {
+            assert!(tier.lookup(key).unwrap().is_some(), "{key} must hit");
+        }
+        assert_eq!(
+            fake.lookups.load(Ordering::Relaxed),
+            2,
+            "answers are remembered; no lookup per target"
+        );
+        let summary = stats.snapshot().unwrap();
+        assert_eq!((summary.hits, summary.misses, summary.failures), (6, 0, 0));
+        let io = summary.io;
+        assert_eq!(io.lookup_requests, 2);
+        assert_eq!(io.lookup_keys, 8, "6 keys, then the 2 left over");
+        assert_eq!((io.lookup_unresolved, io.lookup_retried), (2, 2));
+        assert_eq!(io.lookup_budget_misses, 0);
+    }
+
+    /// A server that keeps running out of budget costs a bounded number of
+    /// rounds. The keys it never answered run as misses, counted apart from
+    /// keys the cache does not hold, and the remote stays on.
+    #[test]
+    fn keys_still_unresolved_after_the_retries_are_budget_misses_not_a_dead_remote() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 6);
+        fake.resolve_limit.store(1, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_secs(5), dir.path());
+
+        tier.prefetch(&keys);
+        assert_eq!(
+            fake.lookups.load(Ordering::Relaxed),
+            1 + LOOKUP_RETRIES,
+            "the first try and no more than the allowed retries"
+        );
+        assert!(tier.remote_enabled());
+        let hit = keys
+            .iter()
+            .filter(|key| tier.lookup(key).unwrap().is_some())
+            .count();
+        assert_eq!(hit, 3, "one key per round resolved");
+        assert_eq!(
+            fake.lookups.load(Ordering::Relaxed),
+            1 + LOOKUP_RETRIES,
+            "a key given up on is not asked about again target by target"
+        );
+        let summary = stats.snapshot().unwrap();
+        assert_eq!(summary.io.lookup_budget_misses, 3);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(summary.disabled, None);
+        let line = summary.io_line().unwrap();
+        assert!(
+            line.contains("3 missed on the server's time budget"),
+            "{line}"
+        );
+    }
+
+    /// One stalled lookup used to turn the remote off for the run. A cold
+    /// server often answers the second try, so the first timeout is asked
+    /// again; a second one still disables it.
+    #[test]
+    fn a_lookup_that_times_out_once_is_asked_again_and_a_second_timeout_disables() {
+        let fake = Fake::spawn();
+        let keys = publish(&fake, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let (tier, stats) = tier_over(&fake, Duration::from_millis(400), dir.path());
+
+        fake.stall_next.store(1, Ordering::SeqCst);
+        assert!(
+            tier.lookup(&keys[0]).unwrap().is_some(),
+            "the retry answers"
+        );
+        assert!(tier.remote_enabled());
+        assert_eq!(stats.snapshot().unwrap().io.lookup_timeouts, 1);
+
+        // The one retry per run is spent: the next timeout is final.
+        fake.stall_next.store(1, Ordering::SeqCst);
+        assert!(tier.lookup(&keys[1]).unwrap().is_none());
+        assert!(!tier.remote_enabled(), "a hung gateway stops the remote");
+        let summary = stats.snapshot().unwrap();
+        assert_eq!(summary.io.lookup_timeouts, 2);
+        assert!(summary.disabled.unwrap().contains("timeout"));
+    }
+
+    #[test]
+    fn retry_requests_are_sized_by_the_blobs_the_server_reported() {
+        let pending: Vec<(String, usize)> =
+            [("a", 500), ("b", 400), ("c", 10), ("d", 900), ("e", 1)]
+                .into_iter()
+                .map(|(key, blobs)| (key.to_string(), blobs))
+                .collect();
+        let batches = weighted_batches(&pending);
+        // 500 + 400 fits 800? No: a alone, then b and c, then the heavy d, then e.
+        assert_eq!(
+            batches,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string(), "c".to_string()],
+                vec!["d".to_string()],
+                vec!["e".to_string()],
+            ]
+        );
+        // Unknown weights only obey the key limit.
+        let unknown: Vec<(String, usize)> = (0..MAX_KEYS + 1)
+            .map(|index| (index.to_string(), 0))
+            .collect();
+        let sizes: Vec<usize> = weighted_batches(&unknown).iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![MAX_KEYS, 1]);
+        assert!(weighted_batches(&[]).is_empty());
     }
 
     #[test]

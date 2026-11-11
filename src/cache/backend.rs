@@ -11,15 +11,17 @@
 //! runtime env is present.
 
 use crate::errln;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use super::artifact::{Digest, Manifest};
+use super::chunks::{run_parallel, with_retries};
 use super::gha::GhaBackend;
 use super::local::LocalStore;
 use super::remote_stats::RemoteStats;
@@ -157,6 +159,10 @@ pub trait CacheBackend: Send + Sync + Any {
         true
     }
 
+    /// Where this backend reports request counts and timings. Backends that
+    /// have nothing to report ignore it.
+    fn attach_stats(&self, _stats: Arc<RemoteStats>) {}
+
     /// Downcast so a batch lookup can reach the aster-srv client.
     fn as_any(&self) -> &dyn Any;
 }
@@ -293,8 +299,9 @@ impl TieredCache {
             Some(RemoteHandle::new(remote))
         };
         let stats = RemoteStats::global();
-        if remote.is_some() {
+        if let Some(handle) = &remote {
             stats.configured();
+            handle.backend.attach_stats(Arc::clone(&stats));
         }
         Self {
             local,
@@ -317,8 +324,9 @@ impl TieredCache {
     /// Record this tier's remote activity in `stats` instead of the
     /// process-wide counters. Tests use it to read one tier's numbers.
     pub fn with_stats(mut self, stats: Arc<RemoteStats>) -> Self {
-        if self.remote.is_some() {
+        if let Some(handle) = &self.remote {
             stats.configured();
+            handle.backend.attach_stats(Arc::clone(&stats));
         }
         self.stats = stats;
         self
@@ -492,38 +500,14 @@ impl TieredCache {
                 missing.len()
             )));
         }
-        for digest in manifest.blob_refs() {
-            if self.local.has_blob(&digest) {
-                continue;
-            }
-            // Spool to disk: a blob can be larger than memory.
-            let mut spool = self.local.spool().map_err(Local)?;
-            if !remote.get_blob(&digest, &mut spool).map_err(Remote)? {
-                return Err(Remote(anyhow::anyhow!(
-                    "remote blob {} disappeared during download",
-                    digest.as_str()
-                )));
-            }
-            // Check the remote's bytes before storing, so a digest mismatch
-            // in `put_blob_file` can only be a local fault.
-            spool
-                .seek(SeekFrom::Start(0))
-                .context("Failed to rewind blob spool")
-                .map_err(Local)?;
-            let hashed = Digest::of_reader(&mut spool)
-                .context("Failed to hash blob spool")
-                .map_err(Local)?;
-            if hashed != digest {
-                return Err(Remote(anyhow::anyhow!(
-                    "remote blob digest mismatch: expected {}, got {}",
-                    digest.as_str(),
-                    hashed.as_str()
-                )));
-            }
-            self.local
-                .put_blob_file(&digest, &mut spool)
-                .map_err(Local)?;
-        }
+        // Few blobs per target now (an archive is a handful of chunks), but a
+        // wide archive is several 32 MB chunks: fetch them side by side.
+        let mut wanted = std::collections::HashSet::new();
+        let absent: Vec<Digest> = refs
+            .into_iter()
+            .filter(|digest| wanted.insert(digest.clone()) && !self.local.has_blob(digest))
+            .collect();
+        self.fetch_blobs(remote, &absent)?;
         self.local.put_manifest(&manifest).map_err(Local)?;
         if let Some(handle) = &self.remote {
             handle.succeed();
@@ -531,25 +515,143 @@ impl TieredCache {
         self.local.get_manifest(key).map_err(Local)
     }
 
+    /// Fetch `digests` into the local store, side by side.
+    fn fetch_blobs(
+        &self,
+        remote: &dyn CacheBackend,
+        digests: &[Digest],
+    ) -> Result<(), DownloadError> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let bytes = AtomicU64::new(0);
+        let fetched = run_parallel(
+            digests.len(),
+            |_| false,
+            |index| self.fetch_blob(remote, &digests[index], &bytes),
+        );
+        self.stats.downloaded(
+            digests.len(),
+            bytes.load(Ordering::Relaxed),
+            started.elapsed(),
+        );
+        fetched.map_err(|error| match error.downcast::<LocalFault>() {
+            Ok(fault) => DownloadError::Local(fault.0),
+            Err(error) => DownloadError::Remote(error),
+        })
+    }
+
+    /// One blob, remote to local store. A local fault comes back wrapped in
+    /// [`LocalFault`] so [`Self::fetch_blobs`] can tell which side failed.
+    fn fetch_blob(
+        &self,
+        remote: &dyn CacheBackend,
+        digest: &Digest,
+        bytes: &AtomicU64,
+    ) -> Result<()> {
+        let local = |error: anyhow::Error| anyhow::Error::new(LocalFault(error));
+        // Spool to disk: a blob can be larger than memory.
+        let mut spool = self.local.spool().map_err(local)?;
+        let mut counted = CountingWriter {
+            inner: &mut spool,
+            bytes,
+        };
+        if !remote.get_blob(digest, &mut counted)? {
+            bail!(
+                "remote blob {} disappeared during download",
+                digest.as_str()
+            );
+        }
+        // Check the remote's bytes before storing, so a digest mismatch in
+        // `put_blob_file` can only be a local fault.
+        spool
+            .seek(SeekFrom::Start(0))
+            .context("Failed to rewind blob spool")
+            .map_err(local)?;
+        let hashed = Digest::of_reader(&mut spool)
+            .context("Failed to hash blob spool")
+            .map_err(local)?;
+        if hashed != *digest {
+            bail!(
+                "remote blob digest mismatch: expected {}, got {}",
+                digest.as_str(),
+                hashed.as_str()
+            );
+        }
+        self.local.put_blob_file(digest, &mut spool).map_err(local)
+    }
+
     fn upload(&self, remote: &dyn CacheBackend, manifest: &Manifest) -> Result<()> {
         let refs = manifest.blob_refs();
         let missing = remote.find_missing(&refs)?;
-        for digest in missing {
-            // Decompress to a spool file rather than memory, then stream it.
-            let mut spool = self.local.spool()?;
-            self.local
-                .get_blob(&digest, &mut spool)
-                .with_context(|| format!("local blob {} missing before upload", digest.as_str()))?;
-            spool
-                .seek(SeekFrom::Start(0))
-                .context("Failed to rewind blob spool")?;
-            remote.put_blob(&digest, &mut spool)?;
+        if !missing.is_empty() {
+            let started = Instant::now();
+            let bytes = AtomicU64::new(0);
+            let sent = run_parallel(
+                missing.len(),
+                |_| false,
+                |index| {
+                    let digest = &missing[index];
+                    // Decompress to a spool file rather than memory, then stream it.
+                    let mut spool = self.local.spool()?;
+                    self.local.get_blob(digest, &mut spool).with_context(|| {
+                        format!("local blob {} missing before upload", digest.as_str())
+                    })?;
+                    let length = spool.metadata().map(|meta| meta.len()).unwrap_or(0);
+                    with_retries(|| {
+                        spool
+                            .seek(SeekFrom::Start(0))
+                            .context("Failed to rewind blob spool")?;
+                        remote.put_blob(digest, &mut spool)
+                    })?;
+                    bytes.fetch_add(length, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+            self.stats.uploaded(
+                missing.len(),
+                bytes.load(Ordering::Relaxed),
+                started.elapsed(),
+            );
+            sent?;
         }
         remote.put_manifest(manifest)?;
         if let Some(handle) = &self.remote {
             handle.succeed();
         }
         Ok(())
+    }
+}
+
+/// A fault in the local store, as opposed to the remote, inside a parallel
+/// blob fetch.
+#[derive(Debug)]
+struct LocalFault(anyhow::Error);
+
+impl std::fmt::Display for LocalFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for LocalFault {}
+
+/// Counts the bytes that pass through to `inner`.
+struct CountingWriter<'a, W> {
+    inner: W,
+    bytes: &'a AtomicU64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes.fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -834,6 +936,7 @@ mod tests {
             log: None,
             aster_version: "0.21.0".to_string(),
             packs: Vec::new(),
+            archive: None,
         }
     }
 
@@ -1446,5 +1549,164 @@ mod tests {
         .err()
         .expect("a cleartext url must be refused");
         assert!(format!("{error:#}").contains("must be https"), "{error:#}");
+    }
+
+    /// A project whose `dist` holds `files` small files and one random file
+    /// of `big` bytes, packed into `local`, as a manifest ready to store.
+    fn archived_manifest(
+        project: &Path,
+        local: &LocalStore,
+        key: &str,
+        files: usize,
+        big: usize,
+    ) -> (Manifest, crate::cache::outputs::Packed) {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut random = Vec::with_capacity(big + 8);
+        while random.len() < big {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            random.extend_from_slice(&state.to_le_bytes());
+        }
+        random.truncate(big);
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::write(project.join("dist/big.bin"), &random).unwrap();
+        for index in 0..files {
+            std::fs::write(
+                project.join(format!("dist/f{index}.js")),
+                format!("n={index}"),
+            )
+            .unwrap();
+        }
+        let packed = crate::cache::outputs::pack(project, &["dist".to_string()], local)
+            .unwrap()
+            .unwrap();
+        let (outputs, archive) = packed.clone().into_manifest_parts();
+        let mut stored = manifest(key, None);
+        stored.outputs = outputs;
+        stored.archive = archive;
+        (stored, packed)
+    }
+
+    #[test]
+    fn an_archived_target_moves_as_a_few_chunks_in_parallel_and_restores_intact() {
+        let project = tempfile::tempdir().unwrap();
+        let uploader_dir = tempfile::tempdir().unwrap();
+        let key = "a1".repeat(32);
+        let local = LocalStore::new(uploader_dir.path().to_path_buf());
+        // 300 files plus a random file past 32 MB: three chunks, not 301 blobs.
+        let (stored, packed) = archived_manifest(
+            project.path(),
+            &local,
+            &key,
+            300,
+            2 * crate::cache::chunks::CHUNK_BYTES + 1_000_000,
+        );
+        let chunks = stored.archive_chunks();
+        assert!(chunks.len() >= 3, "{} chunks", chunks.len());
+        assert_eq!(
+            stored.blob_refs().len(),
+            chunks.len(),
+            "the manifest names only chunks"
+        );
+
+        let remote = InMemoryBackend::new();
+        let up_stats = Arc::new(RemoteStats::new());
+        TieredCache::with_remote(local, CacheMode::ReadWrite, Arc::new(remote.clone()))
+            .with_stats(Arc::clone(&up_stats))
+            .store(&stored)
+            .unwrap();
+        let uploaded = up_stats.snapshot().unwrap().io;
+        assert_eq!(uploaded.upload_blobs, chunks.len() as u64);
+        assert!(uploaded.upload_bytes > 2 * crate::cache::chunks::CHUNK_BYTES as u64);
+
+        // A checkout with an empty local cache looks the key up.
+        let downloader_dir = tempfile::tempdir().unwrap();
+        let down_stats = Arc::new(RemoteStats::new());
+        let tier = TieredCache::with_remote(
+            LocalStore::new(downloader_dir.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote.clone()),
+        )
+        .with_stats(Arc::clone(&down_stats));
+        let hit = tier.lookup(&key).unwrap().expect("remote hit");
+        assert_eq!(hit, stored);
+        let downloaded = down_stats.snapshot().unwrap().io;
+        assert_eq!(downloaded.download_blobs, chunks.len() as u64);
+        assert!(downloaded.download_bytes > 2 * crate::cache::chunks::CHUNK_BYTES as u64);
+
+        let other = tempfile::tempdir().unwrap();
+        crate::cache::outputs::restore(
+            other.path(),
+            hit.tree(),
+            &hit.archive_chunks(),
+            tier.local_store(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(other.path().join("dist/big.bin")).unwrap(),
+            std::fs::read(project.path().join("dist/big.bin")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(other.path().join("dist/f299.js")).unwrap(),
+            b"n=299"
+        );
+        assert_eq!(hit.tree(), packed.tree.as_slice());
+    }
+
+    #[test]
+    fn a_corrupt_remote_chunk_is_a_miss_and_nothing_reaches_the_local_store() {
+        let project = tempfile::tempdir().unwrap();
+        let uploader_dir = tempfile::tempdir().unwrap();
+        let key = "b2".repeat(32);
+        let local = LocalStore::new(uploader_dir.path().to_path_buf());
+        let (stored, _) = archived_manifest(project.path(), &local, &key, 5, 1000);
+        let chunk = stored.archive_chunks()[0].clone();
+        let remote = InMemoryBackend::new();
+        // The remote serves other bytes under the chunk's digest.
+        remote.put_blob(&chunk, &mut &b"not the chunk"[..]).unwrap();
+        remote.put_manifest(&stored).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tier = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote),
+        );
+        assert!(tier.lookup(&key).unwrap().is_none());
+        assert!(!tier.local_store().has_blob(&chunk));
+        assert!(tier.local_store().get_manifest(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_archive_with_a_chunk_the_remote_lost_is_a_miss() {
+        let project = tempfile::tempdir().unwrap();
+        let uploader_dir = tempfile::tempdir().unwrap();
+        let key = "c3".repeat(32);
+        let local = LocalStore::new(uploader_dir.path().to_path_buf());
+        let (stored, _) = archived_manifest(
+            project.path(),
+            &local,
+            &key,
+            5,
+            crate::cache::chunks::CHUNK_BYTES + 100,
+        );
+        let chunks = stored.archive_chunks();
+        assert_eq!(chunks.len(), 2);
+        let remote = InMemoryBackend::new();
+        // Only the first chunk was ever uploaded.
+        let mut bytes = Vec::new();
+        local.get_blob(&chunks[0], &mut bytes).unwrap();
+        remote.put_blob(&chunks[0], &mut bytes.as_slice()).unwrap();
+        remote.put_manifest(&stored).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tier = TieredCache::with_remote(
+            LocalStore::new(tmp.path().to_path_buf()),
+            CacheMode::ReadWrite,
+            Arc::new(remote),
+        );
+        assert!(tier.lookup(&key).unwrap().is_none());
+        assert!(tier.local_store().get_manifest(&key).unwrap().is_none());
     }
 }

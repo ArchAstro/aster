@@ -425,8 +425,12 @@ fn decode_manifest(bytes: &[u8]) -> Decoded {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        // An archived manifest lists archive chunks in `outputs` and the
+        // files in `archive.entries`; the files are what a reader means.
         output_files: manifest
-            .get("outputs")
+            .get("archive")
+            .and_then(|archive| archive.get("entries"))
+            .or_else(|| manifest.get("outputs"))
             .and_then(Value::as_array)
             .map_or(0, |outputs| outputs.len() as u64),
         exit_code: manifest
@@ -486,5 +490,18 @@ mod tests {
         let odd = serde_json::to_vec(&json!({"target": "//a:b", "duration_ms": "slow"})).unwrap();
         assert_eq!(decode_manifest(&odd).target, "//a:b");
         assert_eq!(decode_manifest(&odd).duration_ms, 0);
+    }
+
+    /// An archived manifest lists its chunks in `outputs`; the dashboard counts
+    /// the files in `archive.entries`.
+    #[test]
+    fn an_archived_manifest_counts_its_files_not_its_chunks() {
+        let archived = serde_json::to_vec(&json!({
+            "schema": 1, "key": "k", "target": "//a:b",
+            "outputs": [{"path": "chunk/000000", "kind": "archive_chunk"}],
+            "archive": {"entries": [{"path": "a"}, {"path": "b"}, {"path": "c"}]},
+        }))
+        .unwrap();
+        assert_eq!(decode_manifest(&archived).output_files, 3);
     }
 }
