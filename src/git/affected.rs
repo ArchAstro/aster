@@ -296,10 +296,11 @@ impl AffectedDetector {
             if change
                 .path
                 .file_name()
-                .is_some_and(|n| n == "pnpm-lock.yaml")
+                .is_some_and(|n| n == "pnpm-lock.yaml" || n == "pnpm-workspace.yaml")
             {
                 // The related engine diffs both lockfiles to find the
-                // importers and packages that changed.
+                // importers and packages that changed, and reads both
+                // workspace files to find the packages they list.
                 if !change.deleted {
                     change.old_source = blob(&base_tree, &change.path);
                     change.new_source = match &head_tree {

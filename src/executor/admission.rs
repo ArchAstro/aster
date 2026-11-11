@@ -12,6 +12,8 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use super::admission_order::Ticket;
+
 const CONTEXT_ENV: &str = "ASTER_EXECUTION_CONTEXT";
 const SPEC_ENV: &str = "ASTER_EXECUTION_SPEC";
 const INTERNAL_COMMAND: &str = "__aster_execute";
@@ -56,12 +58,14 @@ fn try_lock(file: &File) -> Result<bool> {
     }
 }
 
+const POLL: Duration = Duration::from_millis(20);
+
 fn wait() -> Result<()> {
     if super::shutdown_requested() {
         bail!("Cancelled: shutdown requested while waiting for execution admission");
     }
     // Poll OS lock availability, never infer ownership from elapsed time.
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(POLL);
     Ok(())
 }
 
@@ -162,6 +166,8 @@ impl Host {
         })))
     }
 
+    /// Wait for admission, polling the OS locks. Waiters in this process race
+    /// each other; use [`Host::acquire_ordered`] to choose who goes first.
     pub(super) fn acquire(
         &self,
         resources: &[String],
@@ -169,6 +175,64 @@ impl Host {
         address: &str,
         on_wait: impl FnOnce(String),
     ) -> Result<Permit> {
+        let request = self.request(resources, workspace)?;
+        let mut on_wait = Some(on_wait);
+        loop {
+            if super::shutdown_requested() {
+                bail!("Cancelled: shutdown requested while waiting for execution admission");
+            }
+            if let Attempt::Granted(permit) = self.attempt(&request)? {
+                return Ok(permit);
+            }
+            self.report_wait(&mut on_wait, address);
+            wait()?;
+        }
+    }
+
+    /// Wait for admission in the order [`Gate`] gives: the waiter on the
+    /// longest remaining chain of dependents first, then the earliest request.
+    /// The ticket is released as soon as the permit is granted, so the next
+    /// waiter is not held behind a target that is already running.
+    pub(super) fn acquire_ordered(
+        &self,
+        resources: &[String],
+        workspace: &Path,
+        address: &str,
+        ticket: Ticket,
+        on_wait: impl FnOnce(String),
+    ) -> Result<Permit> {
+        let request = self.request(resources, workspace)?;
+        let mut on_wait = Some(on_wait);
+        loop {
+            if super::shutdown_requested() {
+                bail!("Cancelled: shutdown requested while waiting for execution admission");
+            }
+            if ticket.wait_turn(POLL) {
+                match self.attempt(&request)? {
+                    Attempt::Granted(permit) => return Ok(permit),
+                    // The slots are full: stay at the front of the line.
+                    Attempt::Busy(Blocker::Capacity) => ticket.unpark(),
+                    // A resource held elsewhere says nothing about the slots,
+                    // so waiters behind this one may try them.
+                    Attempt::Busy(Blocker::Resource) => ticket.park(),
+                }
+                self.report_wait(&mut on_wait, address);
+                wait()?;
+            }
+        }
+    }
+
+    fn report_wait(&self, on_wait: &mut Option<impl FnOnce(String)>, address: &str) {
+        if let Some(on_wait) = on_wait.take() {
+            on_wait(format!(
+                "[aster] Waiting for execution admission: {address} (host capacity {})",
+                self.capacity
+            ));
+        }
+    }
+
+    /// The resource keys this acquisition needs, minus those an ancestor owns.
+    fn request(&self, resources: &[String], workspace: &Path) -> Result<Request> {
         let workspace = fs::canonicalize(workspace)?;
         let mut keys = resources
             .iter()
@@ -203,96 +267,112 @@ impl Host {
             }
             keys.retain(|k| !inherited_resources.contains(k));
         }
-        let mut on_wait = Some(on_wait);
-        loop {
-            if super::shutdown_requested() {
-                bail!("Cancelled: shutdown requested while waiting for execution admission");
-            }
-            let mut files = vec![self.epoch.try_clone()?];
-            let mut ready = true;
-            // Acquire the whole set nonblocking. Never hold a resource while
-            // waiting for capacity, or a partial set while another caller runs.
-            for key in &keys {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(key.as_bytes())
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                let name = format!("resource-{digest}.lock");
-                let file = open_lock(&self.directory.join(name))?;
-                if !try_lock(&file)? {
-                    ready = false;
-                    break;
-                }
-                files.push(file);
-            }
-            if ready {
-                if let Some(family) = &self.inherited {
-                    let owner = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(family.directory.join("owner.lock"))
-                        .context("inherited execution owner is gone")?;
-                    if try_lock(&owner)? {
-                        bail!("inherited execution owner is gone");
-                    }
-                    let borrow = open_lock(&family.directory.join("borrow.lock"))?;
-                    if try_lock(&borrow)? {
-                        files.push(borrow);
-                    } else {
-                        ready = false;
-                    }
-                } else {
-                    ready = false;
-                    for n in 0..self.capacity {
-                        let file = open_lock(&self.directory.join(format!("slot-{n}.lock")))?;
-                        if try_lock(&file)? {
-                            files.push(file);
-                            ready = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if ready {
-                let family_dir = tempfile::Builder::new()
-                    .prefix("family-")
-                    .tempdir_in(&self.directory)?;
-                let owner = open_lock(&family_dir.path().join("owner.lock"))?;
-                owner.lock_exclusive()?;
-                files.push(owner);
-                open_lock(&family_dir.path().join("borrow.lock"))?;
-                inherited_resources.extend(keys);
-                let family = Family {
-                    directory: family_dir.path().to_path_buf(),
-                    resources: inherited_resources,
-                    ancestors: self
-                        .inherited
-                        .as_ref()
-                        .map(|parent| {
-                            let mut ancestors = parent.ancestors.clone();
-                            ancestors.push(parent.directory.clone());
-                            ancestors
-                        })
-                        .unwrap_or_default(),
-                };
-                return Ok(Permit {
-                    files,
-                    family,
-                    _directory: family_dir,
-                    executable: self.executable.clone(),
-                });
-            }
-            drop(files);
-            if let Some(on_wait) = on_wait.take() {
-                on_wait(format!(
-                    "[aster] Waiting for execution admission: {address} (host capacity {})",
-                    self.capacity
-                ));
-            }
-            wait()?;
-        }
+        Ok(Request {
+            keys,
+            inherited_resources,
+        })
     }
+
+    /// One nonblocking try at the whole set of locks.
+    fn attempt(&self, request: &Request) -> Result<Attempt> {
+        let keys = &request.keys;
+        let mut files = vec![self.epoch.try_clone()?];
+        let mut blocker = None;
+        // Acquire the whole set nonblocking. Never hold a resource while
+        // waiting for capacity, or a partial set while another caller runs.
+        for key in keys {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(key.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let name = format!("resource-{digest}.lock");
+            let file = open_lock(&self.directory.join(name))?;
+            if !try_lock(&file)? {
+                blocker = Some(Blocker::Resource);
+                break;
+            }
+            files.push(file);
+        }
+        if blocker.is_none() {
+            if let Some(family) = &self.inherited {
+                let owner = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(family.directory.join("owner.lock"))
+                    .context("inherited execution owner is gone")?;
+                if try_lock(&owner)? {
+                    bail!("inherited execution owner is gone");
+                }
+                let borrow = open_lock(&family.directory.join("borrow.lock"))?;
+                if try_lock(&borrow)? {
+                    files.push(borrow);
+                } else {
+                    blocker = Some(Blocker::Capacity);
+                }
+            } else {
+                blocker = Some(Blocker::Capacity);
+                for n in 0..self.capacity {
+                    let file = open_lock(&self.directory.join(format!("slot-{n}.lock")))?;
+                    if try_lock(&file)? {
+                        files.push(file);
+                        blocker = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(blocker) = blocker {
+            return Ok(Attempt::Busy(blocker));
+        }
+        let family_dir = tempfile::Builder::new()
+            .prefix("family-")
+            .tempdir_in(&self.directory)?;
+        let owner = open_lock(&family_dir.path().join("owner.lock"))?;
+        owner.lock_exclusive()?;
+        files.push(owner);
+        open_lock(&family_dir.path().join("borrow.lock"))?;
+        let mut inherited_resources = request.inherited_resources.clone();
+        inherited_resources.extend(keys.iter().cloned());
+        let family = Family {
+            directory: family_dir.path().to_path_buf(),
+            resources: inherited_resources,
+            ancestors: self
+                .inherited
+                .as_ref()
+                .map(|parent| {
+                    let mut ancestors = parent.ancestors.clone();
+                    ancestors.push(parent.directory.clone());
+                    ancestors
+                })
+                .unwrap_or_default(),
+        };
+        Ok(Attempt::Granted(Permit {
+            files,
+            family,
+            _directory: family_dir,
+            executable: self.executable.clone(),
+        }))
+    }
+}
+
+/// What one admission needs, worked out once per acquisition.
+struct Request {
+    keys: Vec<String>,
+    inherited_resources: Vec<String>,
+}
+
+enum Attempt {
+    Granted(Permit),
+    Busy(Blocker),
+}
+
+/// What one failed attempt was stopped by.
+enum Blocker {
+    /// A named resource is held by another target or invocation.
+    Resource,
+    /// Every execution slot is taken.
+    Capacity,
 }
 
 pub(super) struct Permit {

@@ -686,6 +686,128 @@ fn lockfile_plugin(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether a `pnpm-workspace.yaml` change can reach `candidate`, a Node
+/// project under the file's directory `dir`.
+///
+/// The root is always reached, and so is any project when a side of the file
+/// cannot be read. When only the `packages:` list changed, the packages
+/// whose membership changed are reached (their lockfile importers are judged
+/// separately) and nothing else installs differently. When any other
+/// setting changed (overrides, patches, catalogs, the linker, hoisting),
+/// every package either version lists is reached, and so is a project the
+/// list does not name unless it is installed on its own: a project with no
+/// `node_modules` or lockfile of its own resolves modules from the root's by
+/// directory walk-up.
+fn pnpm_workspace_reaches(change: &Change, candidate: &DiscoveredProject, dir: &Path) -> bool {
+    let member = candidate
+        .relative_path
+        .strip_prefix(dir)
+        .unwrap_or(Path::new(""));
+    if member.as_os_str().is_empty() {
+        return true;
+    }
+    let (Some(old), Some(new)) = (change.old_source.as_deref(), change.new_source.as_deref())
+    else {
+        return true;
+    };
+    let member = member.to_string_lossy().replace('\\', "/");
+    let (Some(was), Some(is)) = (
+        pnpm_workspace_has(old, &member),
+        pnpm_workspace_has(new, &member),
+    ) else {
+        return true;
+    };
+    if pnpm_workspace_settings(old) == pnpm_workspace_settings(new) {
+        was != is
+    } else {
+        was || is || !installed_on_its_own(candidate, dir)
+    }
+}
+
+/// Whether a project, or a directory between it and the workspace root
+/// `dir`, holds its own install: a pnpm workspace file, lockfile or
+/// `node_modules`.
+fn installed_on_its_own(candidate: &DiscoveredProject, dir: &Path) -> bool {
+    let depth = candidate
+        .relative_path
+        .strip_prefix(dir)
+        .map_or(0, |rest| rest.components().count());
+    candidate.root.ancestors().take(depth).any(|path| {
+        ["pnpm-workspace.yaml", "pnpm-lock.yaml", "node_modules"]
+            .iter()
+            .any(|name| path.join(name).exists())
+    })
+}
+
+/// Whether a `pnpm-workspace.yaml` lists the package at `member`; `None`
+/// when the file has no readable `packages:` list and could list anything.
+fn pnpm_workspace_has(text: &str, member: &str) -> Option<bool> {
+    use globset::GlobBuilder;
+    let patterns = crate::plugins::nodejs::parse_pnpm_workspace_packages(text);
+    if patterns.is_empty() {
+        return None;
+    }
+    let matches = |pattern: &str| {
+        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
+        GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            // A pattern that does not parse might list anything.
+            .map_or(true, |glob| glob.compile_matcher().is_match(member))
+    };
+    let (excluded, included): (Vec<&String>, Vec<&String>) =
+        patterns.iter().partition(|p| p.starts_with('!'));
+    Some(included.iter().any(|p| matches(p)) && !excluded.iter().any(|p| matches(&p[1..])))
+}
+
+/// The lines of a `pnpm-workspace.yaml` outside its `packages:` list,
+/// without comments and blank lines.
+fn pnpm_workspace_settings(text: &str) -> Vec<String> {
+    let mut settings = Vec::new();
+    let mut in_packages = false;
+    for raw in text.lines() {
+        let line = without_yaml_comment(raw).trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with("packages:") {
+            in_packages = true;
+            continue;
+        }
+        if in_packages
+            && line.starts_with(char::is_whitespace)
+            && line.trim_start().starts_with('-')
+        {
+            continue;
+        }
+        in_packages = false;
+        settings.push(line.to_string());
+    }
+    settings
+}
+
+/// A YAML line without its comment: `#` starts one only at the start of the
+/// line or after whitespace, and outside quotes.
+fn without_yaml_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut previous = ' ';
+    for (index, c) in line.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if (c == '\'' || c == '"')
+                && (previous.is_whitespace() || ":[,{".contains(previous)) =>
+            {
+                quote = Some(c)
+            }
+            None if c == '#' && previous.is_whitespace() => return &line[..index],
+            None => {}
+        }
+        previous = c;
+    }
+    line
+}
+
 fn spans(lines: &Option<Vec<(usize, usize)>>) -> String {
     match lines {
         Some(lines) if !lines.is_empty() => {
@@ -1878,6 +2000,14 @@ impl<'a> Index<'a> {
                     .flatten();
                 for (i, candidate) in self.projects.iter().enumerate() {
                     if candidate.plugin_name == plugin && candidate.relative_path.starts_with(dir) {
+                        // A workspace file governs the root and the packages
+                        // it lists. A project it does not list is installed
+                        // on its own and cannot see the edit.
+                        if name == "pnpm-workspace.yaml"
+                            && !pnpm_workspace_reaches(change, candidate, dir)
+                        {
+                            continue;
+                        }
                         let mut reason = format!("{} changed", change.path.display());
                         if let Some(pnpm_lock::LockImpact::Importers(hit)) = &pnpm {
                             let importer = candidate
@@ -3673,5 +3803,32 @@ mod config_change_tests {
         assert_eq!(config_change(None, Some(BASE)), ConfigChange::Other);
         assert_eq!(config_change(Some(BASE), None), ConfigChange::Other);
         assert_eq!(change("targets = 1\n"), ConfigChange::Other);
+    }
+}
+
+#[cfg(test)]
+mod pnpm_workspace_tests {
+    use super::{pnpm_workspace_settings, without_yaml_comment};
+
+    #[test]
+    fn yaml_comments_start_only_after_whitespace_outside_quotes() {
+        assert_eq!(without_yaml_comment("a: b # note"), "a: b ");
+        assert_eq!(without_yaml_comment("# whole line"), "");
+        assert_eq!(without_yaml_comment("a: b#c"), "a: b#c");
+        assert_eq!(without_yaml_comment("a: 'b # c'"), "a: 'b # c'");
+        assert_eq!(without_yaml_comment("a: \"b # c\" # d"), "a: \"b # c\" ");
+        assert_eq!(without_yaml_comment("a: don't # d"), "a: don't ");
+    }
+
+    #[test]
+    fn a_hash_inside_a_value_is_still_a_settings_change() {
+        let old = "packages:\n  - 'a'\nregistry: https://x/#one\n";
+        let new = "packages:\n  - 'a'\nregistry: https://x/#two\n";
+        assert_ne!(pnpm_workspace_settings(old), pnpm_workspace_settings(new));
+        let commented = "packages:\n  - 'a'\n# note\nregistry: https://x/#one # why\n";
+        assert_eq!(
+            pnpm_workspace_settings(old),
+            pnpm_workspace_settings(commented)
+        );
     }
 }

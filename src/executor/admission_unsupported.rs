@@ -30,4 +30,15 @@ impl Host {
     ) -> Result<Permit> {
         unreachable!("host admission is not enabled on this platform")
     }
+
+    pub(super) fn acquire_ordered(
+        &self,
+        _resources: &[String],
+        _workspace: &Path,
+        _address: &str,
+        _ticket: super::admission_order::Ticket,
+        _on_wait: impl FnOnce(String),
+    ) -> Result<Permit> {
+        unreachable!("host admission is not enabled on this platform")
+    }
 }

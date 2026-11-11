@@ -4447,6 +4447,82 @@ snapshots:
     ),
 ];
 
+/// An edit to `pnpm-workspace.yaml` reaches the root and the packages it
+/// lists. A project it does not list resolves modules from the root's
+/// `node_modules`, so a setting change reaches it too unless it is installed
+/// on its own (its own lockfile); a change to the package list alone does not.
+#[test]
+fn a_pnpm_workspace_edit_runs_only_the_packages_it_can_reach() {
+    // Setup: the workspace lists `pkg-*`; `wrapper` has a package.json so
+    // Aster discovers it, but no pattern lists it and it has no install of
+    // its own; `standalone` is unlisted with its own lockfile.
+    let ws = Workspace::new(PNPM_WORKSPACE);
+    ws.write(
+        "wrapper/package.json",
+        r#"{"name":"wrapper","scripts":{"test":"vitest run"}}"#,
+    );
+    ws.write(
+        "standalone/package.json",
+        r#"{"name":"standalone","scripts":{"test":"vitest run"}}"#,
+    );
+    ws.write("standalone/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    ws.git(&["add", "-A"]);
+    ws.git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "wrapper",
+    ]);
+
+    // Action 1: a setting changes (an override applies to every package).
+    ws.write(
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'pkg-*'\noverrides:\n  left-pad: 1.0.1\n",
+    );
+    let plan = ws.plan("test");
+    // Outcome: both listed packages run in full, and so does the unlisted
+    // wrapper that resolves from the root install; the standalone one does not.
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+    assert!(
+        plan.notes("//pkg-a:test")
+            .contains("pnpm-workspace.yaml changed; running in full"),
+        "{plan:#?}"
+    );
+    assert!(plan.targets.contains_key("//wrapper:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//standalone:test"), "{plan:#?}");
+
+    // Action 2: only the package list changes, by adding a package.
+    ws.git(&["checkout", "-q", "pnpm-workspace.yaml"]);
+    ws.write(
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'pkg-*'\n  - 'extra'\n",
+    );
+    ws.write(
+        "extra/package.json",
+        r#"{"name":"extra","scripts":{"test":"vitest run"}}"#,
+    );
+    let plan = ws.plan("test");
+    // Outcome: the new member runs; members whose membership did not change
+    // keep their selection (the lockfile decides whether they install anew).
+    assert!(plan.targets.contains_key("//extra:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//wrapper:test"), "{plan:#?}");
+    assert!(!plan.targets.contains_key("//standalone:test"), "{plan:#?}");
+
+    // Fail closed: a workspace file this parser finds no list in could list
+    // anything, so every project runs.
+    ws.write("pnpm-workspace.yaml", "# emptied\n");
+    let plan = ws.plan("test");
+    assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
+    assert!(plan.targets.contains_key("//wrapper:test"), "{plan:#?}");
+}
+
 /// Bumping a package that one workspace project resolves must run that
 /// project and what depends on it, not the whole workspace.
 #[test]

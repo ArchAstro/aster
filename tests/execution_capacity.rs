@@ -632,6 +632,67 @@ fn cached_work_bypasses_capacity_and_affected_dependencies_make_progress() {
     assert!(affected.finish());
 }
 
+/// Entry 334 of the firstlanding CI audit: a short target that gates a chain
+/// of dependents waited for a slot behind targets that gate nothing, because
+/// every ready target polled the host locks and the first poll after a slot
+/// freed won. The target with the longest chain of dependents must take a
+/// slot first, whatever its name sorts like or which thread polls first.
+#[test]
+fn the_target_gating_the_longest_chain_takes_a_slot_before_independent_targets() {
+    // Setup: four slots; `z-gate` sorts after eight independent targets and
+    // gates `chain1`. Every target holds its slot until the test releases it.
+    let f = Fixture::new();
+    let root = f.root.path().join("sched");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("package.json"), r#"{"name":"sched"}"#).unwrap();
+    let probe = |label: &str| {
+        format!(
+            "python3 {} {} {label} normal",
+            aster::executor::quote_command_argument(
+                &f.root.path().join("probe.py").display().to_string()
+            ),
+            f.listener.local_addr().unwrap().port()
+        )
+    };
+    let mut config = String::from("name = 'sched'\n");
+    let mut requested = vec!["//:chain1".to_string()];
+    for n in 0..8 {
+        config += &format!(
+            "[targets.i{n}]\ncommand = {:?}\ncache = {{ enabled = false }}\n",
+            probe(&format!("i{n}"))
+        );
+        requested.push(format!("//:i{n}"));
+    }
+    config += &format!(
+        "[targets.z-gate]\ncommand = {:?}\ncache = {{ enabled = false }}\n",
+        probe("z-gate")
+    );
+    config += &format!(
+        "[targets.chain1]\ncommand = {:?}\ndepends_on = ['//:z-gate']\ncache = {{ enabled = false }}\n",
+        probe("chain1")
+    );
+    fs::write(root.join("aster.toml"), config).unwrap();
+
+    // Action: run all ten targets at once on four slots.
+    let mut command = f.command(&root, 4);
+    command.arg("run").args(&requested).arg("--quiet");
+    let mut run = Run::spawn(command);
+
+    // Outcome: the first four admitted include the gate, which an unordered
+    // poll would admit last of the nine ready targets about half the time.
+    let first_four: Vec<Target> = (0..4).map(|_| f.started()).collect();
+    let mut labels: Vec<&str> = first_four.iter().map(|t| t.label.as_str()).collect();
+    labels.sort();
+    assert_eq!(labels, ["i0", "i1", "i2", "z-gate"]);
+
+    // Cleanup: release everything as it starts so the run completes.
+    first_four.into_iter().for_each(Target::release);
+    for _ in 0..6 {
+        f.started().release();
+    }
+    assert!(run.finish());
+}
+
 #[test]
 fn multiple_ready_targets_share_two_slots_across_invocations() {
     let f = Fixture::new();
