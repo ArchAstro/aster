@@ -536,6 +536,25 @@ pub enum Commands {
         /// running `aster affected <target> --lane <lane>`. Implies --dry-run.
         #[arg(long)]
         matrix: bool,
+
+        /// Write the plan of every lane planned to FILE (needs --dry-run or --matrix)
+        ///
+        /// The file holds each lane's dry-run plan, with the commands that
+        /// narrow its targets, and the key it is valid for: base and head
+        /// commits, mode, requested target, flags, changed files and Aster
+        /// version. Replay a lane from it with --plan-in.
+        #[arg(long, value_name = "FILE", conflicts_with = "plan_in")]
+        plan_out: Option<std::path::PathBuf>,
+
+        /// Run one lane from a plan written by --plan-out, skipping the analysis
+        ///
+        /// Runs exactly what the analysis would select, using the stored
+        /// targets and narrowed commands. When the file is missing, cannot be
+        /// read, lacks the lane, or its key differs from this invocation, one
+        /// line on stderr says why and the analysis runs as usual. With
+        /// --dry-run, replays only under --json.
+        #[arg(long, value_name = "FILE", conflicts_with = "matrix")]
+        plan_in: Option<std::path::PathBuf>,
     },
 
     /// View logs from the last run

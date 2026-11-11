@@ -17,6 +17,10 @@ use aster::cli::affected_files::{
 use aster::cli::commands::{
     conventional_target_help_name, explicit_target_help_name, print_target_command_usage,
 };
+use aster::cli::phases::Phases;
+use aster::cli::plan_replay::{
+    self, DryRunOutput, DryRunTarget, KeyInputs, PlanFile, PlanKey, PlanRecorder, StoredLane,
+};
 use aster::cli::source_graph;
 use aster::cli::{
     build_execution_output, build_execution_output_with_cache, check_reserved_target,
@@ -542,8 +546,10 @@ fn run() -> Result<()> {
     let registry = PluginRegistry::with_all_plugins();
 
     // Discover projects
+    let discovery_started = std::time::Instant::now();
     let projects =
         discover_projects(&workspace_root, &registry).context("Failed to discover projects")?;
+    let discovery_elapsed = discovery_started.elapsed();
 
     if output_mode == OutputMode::Verbose {
         errln!("[aster] Discovered {} projects", projects.len());
@@ -929,10 +935,17 @@ fn run() -> Result<()> {
             lang,
             all,
             matrix: matrix_rows,
+            plan_out,
+            plan_in,
         } => {
             validate_lang_filter(&lang)?;
             // --matrix plans every lane and prints JSON only.
             let dry_run = dry_run || matrix_rows;
+            if plan_out.is_some() && !dry_run {
+                return Err(anyhow::anyhow!(
+                    "--plan-out writes a plan without running it: add --dry-run or --matrix"
+                ));
+            }
             let output_mode = if matrix_rows {
                 OutputMode::Json
             } else {
@@ -944,6 +957,7 @@ fn run() -> Result<()> {
 
             // Create affected detector from workspace (requires git)
             let detector = AffectedDetector::new(&workspace_root)?;
+            let mut phases = Phases::new(discovery_elapsed);
 
             // Get changed files
             let changed_files = if all {
@@ -970,6 +984,89 @@ fn run() -> Result<()> {
                 .filter(|path| ignore.is_configured_ignore(path))
                 .count();
             let changed_files = ignore.filter(changed_files);
+            phases.mark("changes");
+
+            // What a stored plan must have been made for to stand in for the
+            // analysis below.
+            let plan_key = if plan_out.is_some() || plan_in.is_some() {
+                let (base_sha, head_sha) = if all {
+                    ("-".to_string(), "-".to_string())
+                } else {
+                    (
+                        detector.resolve_commit(&base, "base")?,
+                        detector.resolve_commit(head.as_deref().unwrap_or("HEAD"), "head")?,
+                    )
+                };
+                let dirty_files = ignore.filter(detector.uncommitted_changes()?);
+                Some(PlanKey::new(KeyInputs {
+                    base_sha,
+                    head_sha,
+                    head_pinned: head.is_some(),
+                    all,
+                    related,
+                    dependents,
+                    only_affected_files,
+                    warnings_as_errors,
+                    target: &target,
+                    lang: &lang,
+                    changed_files: &changed_files,
+                    dirty_files: &dirty_files,
+                    projects: &projects,
+                    root: &workspace_root,
+                }))
+            } else {
+                None
+            };
+            let replay: Option<PlanFile> = match (&plan_in, &plan_key) {
+                (Some(path), Some(key)) => {
+                    let outcome = if lane.len() != 1 {
+                        Err("a plan replays one lane; pass exactly one --lane".to_string())
+                    } else if dry_run
+                        && output_mode != OutputMode::Json
+                        && output_mode != OutputMode::Quiet
+                    {
+                        Err("a --dry-run replay prints JSON only; add --json".to_string())
+                    } else {
+                        find_lane(&lane[0], &workspace_config.affected)
+                            .map_err(|error| error.to_string())
+                            .and_then(|config| {
+                                let lane_target =
+                                    config.target.clone().unwrap_or_else(|| target.clone());
+                                plan_replay::load(
+                                    path,
+                                    key,
+                                    &[(lane[0].clone(), lane_target)],
+                                    &projects,
+                                )
+                            })
+                    };
+                    match outcome {
+                        Ok(file) => {
+                            if output_mode != OutputMode::Quiet {
+                                errln!(
+                                    "[aster] --plan-in {}: replaying lane '{}', skipping the analysis",
+                                    path.display(),
+                                    lane[0]
+                                );
+                            }
+                            Some(file)
+                        }
+                        Err(reason) => {
+                            errln!(
+                                "[aster] --plan-in {}: {reason}; analysing instead",
+                                path.display()
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            phases.mark("plan-in");
+            let mut recorder = match (&plan_out, &plan_key) {
+                (Some(path), Some(key)) => Some(PlanRecorder::new(path, key.clone())),
+                _ => None,
+            };
 
             if output_mode == OutputMode::Verbose {
                 errln!("[aster] Found {} changed files", changed_files.len());
@@ -1004,13 +1101,15 @@ fn run() -> Result<()> {
             if let Some(cycle) = find_cycle(&graph) {
                 return Err(anyhow::anyhow!("{cycle}"));
             }
+            phases.mark("graph");
 
             // Keep a copy of directly affected for rationale tracking in dry-run
             let directly_affected_addrs = directly_affected.clone();
 
             // Under --related the source graph decides which projects the
-            // change reaches and which of their tests observe it.
-            let related_analysis = if related {
+            // change reaches and which of their tests observe it. A replayed
+            // plan already holds that decision.
+            let related_analysis = if related && replay.is_none() {
                 let mut changes = detector
                     .changes(&base, head.as_deref())
                     .context("Failed to read the changed lines")?;
@@ -1048,8 +1147,12 @@ fn run() -> Result<()> {
                 None
             };
 
+            phases.mark("related");
+
             // Expand with dependents if requested
-            let affected_addrs = if let Some(analysis) = &related_analysis {
+            let affected_addrs = if replay.is_some() {
+                HashSet::new()
+            } else if let Some(analysis) = &related_analysis {
                 let reached: HashSet<String> = analysis
                     .projects
                     .iter()
@@ -1066,18 +1169,6 @@ fn run() -> Result<()> {
             };
 
             #[derive(serde::Serialize)]
-            struct DryRunTarget {
-                address: String,
-                reason: String,
-                files: Vec<String>,
-                /// Commands replacing the target's own command.
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                commands: Vec<String>,
-                /// How the target's command was chosen.
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                selection: Vec<String>,
-            }
-            #[derive(serde::Serialize)]
             struct LaneRow {
                 lane: String,
                 name: String,
@@ -1085,20 +1176,6 @@ fn run() -> Result<()> {
                 toolchains: Vec<String>,
                 #[serde(flatten)]
                 matrix: toml::Table,
-            }
-            #[derive(serde::Serialize)]
-            struct DryRunOutput {
-                target: String,
-                base: String,
-                head: Option<String>,
-                targets: Vec<DryRunTarget>,
-                count: usize,
-                /// Requested targets dropped by --only-affected-files.
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                skipped: Vec<String>,
-                /// Plugins of every project the plan runs a target in, plus
-                /// the lane's declared toolchains: what a runner must install.
-                toolchains: Vec<String>,
             }
             // Several lanes are planned from the one analysis above; running
             // them is one invocation per lane, each on its own runner.
@@ -1143,60 +1220,70 @@ fn run() -> Result<()> {
                 let lane_toolchains = lane_config
                     .map(|config| config.toolchains.clone())
                     .unwrap_or_default();
+                let stored = replay.as_ref().and_then(|file| file.lanes.get(lane_label));
                 let mut affected_addrs = reached.clone();
-
-                // A changed file the target declares as a workspace input
-                // selects its project, which then runs the target in full.
-                let declared_inputs =
-                    select_by_declared_inputs(&target, &changed_files, &projects)?;
-                let declared_addrs: HashSet<String> = declared_inputs.keys().cloned().collect();
-                affected_addrs.extend(declared_addrs.iter().cloned());
+                let mut declared_inputs = std::collections::BTreeMap::new();
+                let mut declared_addrs: HashSet<String> = HashSet::new();
                 let mut directly_affected_addrs = directly_affected_addrs.clone();
-                directly_affected_addrs.extend(declared_addrs.iter().cloned());
-                // Shard and wrapper projects follow the project whose tests
-                // they run.
-                if let Some(analysis) = &related_analysis {
-                    affected_addrs.extend(related_proxies(
-                        &projects,
-                        &target,
-                        analysis,
-                        &PluginRegistry::with_all_plugins(),
-                        &workspace_config.affected.related.wrappers,
-                    ));
-                }
-
-                // Lane selection applies only to primary projects, after optional
-                // dependent expansion and before target dependency closure.
-                if let Some(lane_name) = lane {
-                    affected_addrs = select_affected_lane(
-                        lane_name,
-                        &workspace_config.affected,
-                        affected_addrs,
-                        &projects,
-                    )?;
-                    if output_mode == OutputMode::Verbose {
-                        errln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
+                let missing_among_affected;
+                if let Some(stored) = stored {
+                    // The plan holds the selection the analysis made.
+                    affected_addrs = stored.affected_set();
+                    missing_among_affected = stored.missing_among_affected;
+                } else {
+                    // A changed file the target declares as a workspace input
+                    // selects its project, which then runs the target in full.
+                    declared_inputs =
+                        select_by_declared_inputs(&target, &changed_files, &projects)?;
+                    declared_addrs = declared_inputs.keys().cloned().collect();
+                    affected_addrs.extend(declared_addrs.iter().cloned());
+                    directly_affected_addrs.extend(declared_addrs.iter().cloned());
+                    // Shard and wrapper projects follow the project whose tests
+                    // they run.
+                    if let Some(analysis) = &related_analysis {
+                        affected_addrs.extend(related_proxies(
+                            &projects,
+                            &target,
+                            analysis,
+                            &PluginRegistry::with_all_plugins(),
+                            &workspace_config.affected.related.wrappers,
+                        ));
                     }
+
+                    // Lane selection applies only to primary projects, after optional
+                    // dependent expansion and before target dependency closure.
+                    if let Some(lane_name) = lane {
+                        affected_addrs = select_affected_lane(
+                            lane_name,
+                            &workspace_config.affected,
+                            affected_addrs,
+                            &projects,
+                        )?;
+                        if output_mode == OutputMode::Verbose {
+                            errln!("[aster] Affected lane '{lane_name}': {affected_addrs:?}");
+                        }
+                    }
+                    // Every mode runs the target only where it is defined. Dependents,
+                    // declared inputs, related proxies, and lane selection have already
+                    // chosen this primary set. Target-dependency closure runs later,
+                    // from the projects that remain, so a dependency target in another
+                    // project is not dropped here.
+                    let defines_target: HashSet<String> = projects
+                        .iter()
+                        .filter(|project| project.targets.contains_key(&target))
+                        .map(|project| format!("//{}", project.relative_path.display()))
+                        .collect();
+                    if defines_target.is_empty() {
+                        return Err(anyhow::anyhow!("no project defines target '{target}'"));
+                    }
+                    let had_affected = !affected_addrs.is_empty();
+                    affected_addrs.retain(|addr| defines_target.contains(addr));
+                    // Lanes and --all already omitted projects that lack the target
+                    // and keep their existing empty-selection message.
+                    missing_among_affected =
+                        had_affected && affected_addrs.is_empty() && lane.is_none() && !all;
                 }
-                // Every mode runs the target only where it is defined. Dependents,
-                // declared inputs, related proxies, and lane selection have already
-                // chosen this primary set. Target-dependency closure runs later,
-                // from the projects that remain, so a dependency target in another
-                // project is not dropped here.
-                let defines_target: HashSet<String> = projects
-                    .iter()
-                    .filter(|project| project.targets.contains_key(&target))
-                    .map(|project| format!("//{}", project.relative_path.display()))
-                    .collect();
-                if defines_target.is_empty() {
-                    return Err(anyhow::anyhow!("no project defines target '{target}'"));
-                }
-                let had_affected = !affected_addrs.is_empty();
-                affected_addrs.retain(|addr| defines_target.contains(addr));
-                // Lanes and --all already omitted projects that lack the target
-                // and keep their existing empty-selection message.
-                let missing_among_affected =
-                    had_affected && affected_addrs.is_empty() && lane.is_none() && !all;
+                phases.mark("select");
 
                 // Primary projects are the affected ones (only these run the requested target)
                 let primary_addrs: HashSet<String> = affected_addrs.iter().cloned().collect();
@@ -1212,6 +1299,27 @@ fn run() -> Result<()> {
                     .collect();
 
                 if affected_projects.is_empty() {
+                    if let Some(recorder) = recorder.as_mut() {
+                        let empty = DryRunOutput {
+                            target: target.clone(),
+                            base: base.clone(),
+                            head: head.clone(),
+                            targets: Vec::new(),
+                            count: 0,
+                            skipped: Vec::new(),
+                            toolchains: Vec::new(),
+                        };
+                        recorder.record(
+                            lane_label,
+                            StoredLane::new(
+                                &target,
+                                &affected_addrs,
+                                missing_among_affected,
+                                None,
+                                empty.clone(),
+                            ),
+                        );
+                    }
                     if several_lanes {
                         if output_mode == OutputMode::Json {
                             let empty = DryRunOutput {
@@ -1256,6 +1364,10 @@ fn run() -> Result<()> {
                             outln!("No projects affected");
                         }
                     }
+                    if let Some(recorder) = &recorder {
+                        recorder.write()?;
+                    }
+                    report_phases(&phases, replay.is_some(), output_mode);
                     return Ok(());
                 }
 
@@ -1298,7 +1410,9 @@ fn run() -> Result<()> {
                 // Narrow targets to changed files and apply warnings-as-errors.
                 // Under --dependents, a project whose dependency changed cannot be
                 // narrowed to its own files.
-                let command_plan = if only_affected_files || related || warnings_as_errors {
+                let command_plan = if let Some(stored) = stored {
+                    stored.commands()
+                } else if only_affected_files || related || warnings_as_errors {
                     let registry = PluginRegistry::with_all_plugins();
                     // Under --dependents a project answers for a changed
                     // project it depends on, which its own files do not
@@ -1340,6 +1454,7 @@ fn run() -> Result<()> {
                 } else {
                     None
                 };
+                phases.mark("narrow");
                 let primary_addrs = command_plan
                     .as_ref()
                     .map(|plan| plan.primary.clone())
@@ -1349,6 +1464,19 @@ fn run() -> Result<()> {
                     .as_ref()
                     .map(|plan| &plan.notes)
                     .unwrap_or(&no_notes);
+
+                // Dry run of a replayed lane: the plan is already stored.
+                if let (true, Some(stored)) = (dry_run, stored) {
+                    if output_mode == OutputMode::Json {
+                        let mut plan = stored.plan.clone();
+                        // Name the refs this invocation was given.
+                        plan.base = base.clone();
+                        plan.head = head.clone();
+                        output_json(&plan)?;
+                    }
+                    report_phases(&phases, true, output_mode);
+                    return Ok(());
+                }
 
                 // Dry run: show the full execution graph with rationale
                 if dry_run {
@@ -1433,7 +1561,7 @@ fn run() -> Result<()> {
                         "target dependency"
                     };
 
-                    if output_mode == OutputMode::Json {
+                    if output_mode == OutputMode::Json || recorder.is_some() {
                         let mut all_targets = Vec::new();
                         for level in &levels {
                             for target_addr in level {
@@ -1493,12 +1621,28 @@ fn run() -> Result<()> {
                                 matrix: config.matrix.clone(),
                             });
                         }
-                        if several_lanes {
+                        if let Some(recorder) = recorder.as_mut() {
+                            recorder.record(
+                                lane_label,
+                                StoredLane::new(
+                                    &target,
+                                    &affected_addrs,
+                                    missing_among_affected,
+                                    command_plan.as_ref(),
+                                    output.clone(),
+                                ),
+                            );
+                        }
+                        if output_mode != OutputMode::Json {
+                            // Recorded only; the text below is what prints.
+                        } else if several_lanes {
                             lane_plans
                                 .insert(lane_label.to_string(), serde_json::to_value(&output)?);
                         } else {
                             output_json(&output)?;
                         }
+                    }
+                    if output_mode == OutputMode::Json {
                     } else if output_mode != OutputMode::Quiet {
                         // Count targets by category
                         let dep_count = targets_to_run
@@ -1568,6 +1712,10 @@ fn run() -> Result<()> {
                     if several_lanes {
                         continue;
                     }
+                    if let Some(recorder) = &recorder {
+                        recorder.write()?;
+                    }
+                    report_phases(&phases, false, output_mode);
                     return Ok(());
                 }
 
@@ -1579,6 +1727,12 @@ fn run() -> Result<()> {
                 let run_record = test_results.as_ref().map(|_| {
                     detect_run(&workspace_root, &target, lane, &|name| env::var(name).ok())
                 });
+                let quarantine = quarantine_for(
+                    &workspace_root,
+                    test_results.is_some() || cli.retry_failed() > 0,
+                )?;
+                phases.mark("quarantine");
+                report_phases(&phases, replay.is_some(), output_mode);
                 let recorder = ResultsRecorder::new(test_results.clone(), run_record);
                 let executor = Executor::with_all_options(
                     &workspace_root,
@@ -1591,10 +1745,7 @@ fn run() -> Result<()> {
                 .with_retry_failed(cli.retry_failed())
                 .with_wrappers(&workspace_config.affected.related.wrappers)
                 .with_no_replay(cli.no_replay)
-                .with_quarantine(quarantine_for(
-                    &workspace_root,
-                    test_results.is_some() || cli.retry_failed() > 0,
-                )?);
+                .with_quarantine(quarantine);
                 let all_project_refs: Vec<_> = projects.iter().collect();
 
                 let results = if let Some(plan) = &command_plan {
@@ -1650,6 +1801,10 @@ fn run() -> Result<()> {
                     return Err(anyhow::anyhow!("{blocked} project(s) blocked"));
                 }
             }
+            if let Some(recorder) = &recorder {
+                recorder.write()?;
+            }
+            report_phases(&phases, false, output_mode);
             if matrix_rows {
                 output_json(&lane_rows)?;
             } else if several_lanes && output_mode == OutputMode::Json {
@@ -2659,6 +2814,13 @@ fn print_srv_dataset(path: &str, target: &SrvTarget) -> Result<()> {
 /// The quarantine for a run, loaded once per invocation (a run over
 /// several lanes executes several times). Only a run that captures test
 /// results can use one.
+/// The `affected` timing line, on stderr so JSON output stays clean.
+fn report_phases(phases: &Phases, replayed: bool, output_mode: OutputMode) {
+    if output_mode != OutputMode::Quiet {
+        errln!("{}", phases.line(replayed));
+    }
+}
+
 fn quarantine_for(
     workspace_root: &Path,
     capturing: bool,

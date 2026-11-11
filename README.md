@@ -1546,6 +1546,80 @@ aster affected test --base=main --related --lane "$LANE"
 [GitHub Actions](docs/ci/github-actions.md#fanning-lanes-out-as-a-job-matrix)
 has a worked workflow.
 
+### Replaying a plan instead of repeating the analysis
+
+Under `--related` every job of a matrix repeats the source-level analysis the
+plan job already did, which costs seconds to half a minute of a job's runner.
+`--plan-out FILE` stores the plan, and `--plan-in FILE` runs one lane from it:
+
+```console
+aster affected test --base=main --related --matrix --plan-out plan.json
+aster affected test --base=main --related --lane "$LANE" --plan-in plan.json
+```
+
+`--plan-out` works with `--matrix` and `--dry-run`. The file holds every lane
+planned: the `--dry-run --json` plan, with the narrowed command of each
+target, and what execution needs (selected projects, command overrides). It
+also holds the key it is valid for: the commits `--base` and `--head` (default
+`HEAD`) resolve to, the mode (`related`, `dependents`, `changed` or `all`), the
+requested target, `--dependents`, `--only-affected-files`,
+`--warnings-as-errors`, `--lang`, a digest of the changed files after
+`affected.ignore` (uncommitted and untracked files included, and without
+`--head` their content, so an edit after the plan was made is a different
+plan), a digest of the
+discovered projects and their targets, and the Aster version.
+
+`--plan-in` replays a lane only when all of this holds, and otherwise logs one
+line on stderr that says which check failed and runs the analysis as if the
+flag were absent:
+
+```text
+[aster] --plan-in plan.json: base differs (plan has "4f2c...", this run has "9a1e..."); analysing instead
+```
+
+- the file exists, parses and has the supported schema;
+- its key equals this invocation's key (any field above);
+- exactly one `--lane` is given, the plan has it, and the lane runs the same
+  target as now;
+- every project the lane names is still discovered;
+- under `--dry-run`, `--json` is set (the text plan is built from the
+  analysis).
+
+A replay prints the same `--json` plan a fresh analysis does, and runs the
+same targets with the same commands. It does not carry anything the key does
+not name: a plan is for one tree. Write it and replay it from checkouts of the
+same commit with the same uncommitted state. A job that adds or edits files
+before it runs `affected` changes the changed-file digest and falls back,
+which is safe but pays for the analysis. That includes the plan file: keep it
+outside the checkout (`$RUNNER_TEMP`) or under `.aster/`, which `affected`
+never counts as a change.
+
+`--plan-in` and `--matrix` cannot be combined, nor can `--plan-in` and
+`--plan-out`.
+
+### Where `affected` spends its time
+
+A run of `affected` that is not `--quiet` ends its planning with one stderr
+line naming the phases, so a long gap before the first target can be
+attributed:
+
+```text
+[aster] affected phases: discover 1.1s, changes 0.6s, plan-in 0.0s, graph 0.0s, related 22.3s, select 0.2s, narrow 0.1s, quarantine 0.3s, total 24.6s
+```
+
+- `discover`: finding projects and targets;
+- `changes`: reading the changed files from Git and applying `affected.ignore`;
+- `plan-in`: reading and checking a stored plan (zero without `--plan-in`);
+- `graph`: building and checking the project graph;
+- `related`: the `--related` source analysis (zero without it, and under a
+  replay);
+- `select`: lane selection and declared inputs, added up over the lanes;
+- `narrow`: choosing narrowed commands, added up over the lanes;
+- `quarantine`: loading the quarantine list, when results are recorded.
+
+A replay marks the line `(replayed plan)`. `--verbose` adds the breakdown of
+`related`.
+
 ### Running everything
 
 `--all` treats every project as changed: each lane selects every project it
