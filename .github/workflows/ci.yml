@@ -303,8 +303,7 @@ jobs:
           scripts/test-aur-package aur-package
       - name: Build signed APT and Yum repositories
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes apt-utils createrepo-c dpkg-dev
+          scripts/install-apt-packages apt-utils createrepo-c dpkg-dev
           export GNUPGHOME="${RUNNER_TEMP}/gnupg"
           fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"

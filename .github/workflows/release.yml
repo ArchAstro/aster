@@ -255,8 +255,7 @@ jobs:
           test -n "$(find released-packages -maxdepth 1 -name '*.rpm' -print -quit)"
       - name: Install repository tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes apt-utils createrepo-c dpkg-dev
+          scripts/install-apt-packages apt-utils createrepo-c dpkg-dev
       - name: Build and test repositories
         env:
           PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
