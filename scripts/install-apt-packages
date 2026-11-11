@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Install Ubuntu packages on a GitHub-hosted runner.
+#
+# The runner's apt mirror list (/etc/apt/apt-mirrors.txt) puts
+# azure.archive.ubuntu.com first. When that name stops resolving on the
+# runner, `apt-get update` and `install` fail even though archive.ubuntu.com
+# and security.ubuntu.com still work. This drops mirrors whose host does not
+# resolve, then retries the update and install a few times.
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <package>..." >&2
+  exit 2
+fi
+
+readonly mirrors=/etc/apt/apt-mirrors.txt
+readonly attempts=3
+
+host_resolves() {
+  getent hosts "$1" >/dev/null 2>&1
+}
+
+drop_unresolvable_mirrors() {
+  [[ -f "${mirrors}" ]] || return 0
+  local kept="" line url host
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    url="${line%%[[:space:]]*}"
+    host="${url#*://}"
+    host="${host%%/*}"
+    if [[ -z "${host}" ]] || host_resolves "${host}"; then
+      kept+="${line}"$'\n'
+    else
+      echo "install-apt-packages: dropping mirror ${url}: ${host} does not resolve" >&2
+    fi
+  done <"${mirrors}"
+  if [[ -z "${kept//[[:space:]]/}" ]]; then
+    echo "install-apt-packages: no mirror in ${mirrors} resolves; keeping the list" >&2
+    return 0
+  fi
+  printf '%s' "${kept}" | sudo tee "${mirrors}" >/dev/null
+}
+
+for attempt in $(seq 1 "${attempts}"); do
+  drop_unresolvable_mirrors
+  if sudo apt-get -o Acquire::Retries=5 update &&
+    sudo apt-get -o Acquire::Retries=5 install --yes "$@"; then
+    exit 0
+  fi
+  if [[ "${attempt}" -lt "${attempts}" ]]; then
+    echo "install-apt-packages: attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
+    sleep $((attempt * 15))
+  fi
+done
+
+echo "install-apt-packages: could not install $* after ${attempts} attempts" >&2
+exit 1
