@@ -224,6 +224,11 @@ pub struct ExecutionSummary {
     /// Remote cache counters, present when a GitHub Actions cache ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_summary: Option<crate::cache::CacheSummary>,
+    /// What the aster-srv remote cache did during this run: hits, misses,
+    /// uploads, and lookup, download, unpack and upload volume and time.
+    /// Present when a remote cache was configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_cache: Option<crate::cache::RemoteSummary>,
 }
 
 /// Print execution summary based on output mode
@@ -392,6 +397,7 @@ pub fn build_execution_output_with_cache(
             cached,
             duration_ms: total_duration,
             cache_summary,
+            remote_cache: crate::cache::RemoteStats::last_run(),
         },
     }
 }
@@ -493,6 +499,7 @@ mod tests {
             cached: 0,
             duration_ms: 5000,
             cache_summary: None,
+            remote_cache: None,
         };
 
         let json = serde_json::to_string(&summary).unwrap();

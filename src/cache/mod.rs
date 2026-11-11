@@ -11,6 +11,7 @@ mod artifact;
 mod artifact_cache;
 mod aster_srv;
 mod backend;
+mod chunks;
 pub mod dir_cache;
 mod gha;
 mod hasher;
@@ -25,7 +26,9 @@ mod runtime;
 mod signature;
 mod store;
 
-pub use artifact::{Digest, Manifest, OutputEntry, OutputKind, PackRef, MANIFEST_SCHEMA_VERSION};
+pub use artifact::{
+    Digest, Manifest, OutputArchive, OutputEntry, OutputKind, PackRef, MANIFEST_SCHEMA_VERSION,
+};
 pub use artifact_cache::{project_of, ArtifactCache, CacheStatus, CacheStatusTarget, IndexEntry};
 pub use backend::{
     current_gha, install_gha_backend, select_remote, tier_from_env, CacheBackend, CacheMode,
@@ -41,12 +44,12 @@ pub use login::{
     LoginOptions, SignedIn, SignedOut, LOGIN_TIMEOUT, PASTE_WARNING, SIGNED_OUT_MESSAGE,
 };
 pub use matcher::TargetInputMatcher;
-pub use outputs::{pack, restore};
+pub use outputs::{pack, restore, Packed};
 pub use prune::{
     format_prune_summary, prune_cache, prune_if_over_cap, PruneLimits, DEFAULT_MAX_AGE,
     DEFAULT_MAX_SIZE,
 };
-pub use remote_stats::{RemoteStats, RemoteSummary};
+pub use remote_stats::{RemoteIo, RemoteStats, RemoteSummary};
 pub use runtime::RuntimeInputCache;
 pub use signature::SIGNATURE_KEY_ENV;
 pub use store::CacheStore;
@@ -83,7 +86,11 @@ pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
 /// so old entries cannot be restored under an incompatible layout. A crate
 /// version change already salts keys; this constant covers layout changes
 /// that ship without a version bump.
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+///
+/// 3: a target's output files are one chunked archive (`Manifest::archive`)
+/// instead of one blob per file. The new keys keep a client that cannot read
+/// archives from ever finding one, and keep this client off per-file entries.
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Entry in the cache for a single target
 #[derive(Debug, Clone, Serialize, Deserialize)]

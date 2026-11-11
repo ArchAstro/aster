@@ -949,8 +949,15 @@ impl<'a> Executor<'a> {
                 }
                 let summary = backend.summary();
                 errln!("{summary}");
-            } else if let Some(summary) = crate::cache::RemoteStats::global().take() {
-                errln!("{summary}");
+            } else {
+                let summary = crate::cache::RemoteStats::global().take();
+                if let Some(summary) = &summary {
+                    errln!("{summary}");
+                    if let Some(io) = summary.io_line() {
+                        errln!("{io}");
+                    }
+                }
+                crate::cache::RemoteStats::set_last_run(summary);
             }
         }
 
@@ -2466,7 +2473,10 @@ pub fn fresh_cache_key(
 /// A cache lookup that can be stored, or a hit whose outputs were restored.
 enum CacheLookup {
     /// Manifest key matches, outputs were restored, and the log blob was read.
-    Hit { manifest: Manifest, log: Vec<u8> },
+    Hit {
+        manifest: Box<Manifest>,
+        log: Vec<u8>,
+    },
     /// Cacheable, but nothing reusable is stored. Carries the key to store.
     Miss(String),
 }
@@ -2535,7 +2545,15 @@ fn check_cache(
                     );
                 }
                 Ok(log) => {
-                    if let Err(error) = restore(&project.root, &manifest.outputs, store) {
+                    let unpack_started = std::time::Instant::now();
+                    let restored = restore(
+                        &project.root,
+                        manifest.tree(),
+                        &manifest.archive_chunks(),
+                        store,
+                    );
+                    crate::cache::RemoteStats::global().unpacked(unpack_started.elapsed());
+                    if let Err(error) = restored {
                         errln!(
                             "[aster] Warning: cache restore failed for {target_addr}, running instead: {error:#}"
                         );
@@ -2543,7 +2561,7 @@ fn check_cache(
                         let mut hashes = computed_hashes.lock().ok()?;
                         hashes.insert(target_addr.to_string(), current_hash);
                         return Some(CacheLookup::Hit {
-                            manifest,
+                            manifest: Box::new(manifest),
                             log: log.unwrap_or_default(),
                         });
                     }
@@ -2629,10 +2647,11 @@ fn store_success(
     let globs = cache_config
         .and_then(|config| config.outputs.as_deref())
         .unwrap_or(&[]);
-    let Some(outputs) = pack(project_root, globs, cache.local_store())? else {
+    let Some(packed) = pack(project_root, globs, cache.local_store())? else {
         cache.remove(address)?;
         return Ok(());
     };
+    let (outputs, archive) = packed.into_manifest_parts();
     let log = if result.log.is_empty() {
         None
     } else {
@@ -2653,6 +2672,7 @@ fn store_success(
         log,
         aster_version: env!("CARGO_PKG_VERSION").to_string(),
         packs: Vec::new(),
+        archive,
     };
     let project = project_of(address).unwrap_or(address);
     cache.store(project, address, &manifest)
@@ -4024,6 +4044,7 @@ mod tests {
                     log: None,
                     aster_version: "0.21.0".to_string(),
                     packs: Vec::new(),
+                    archive: None,
                 },
             )
             .unwrap();
@@ -4123,6 +4144,7 @@ mod tests {
             log: None,
             aster_version: "0.17.2".into(),
             packs: Vec::new(),
+            archive: None,
         };
         store.put_manifest(&manifest(old_key, &old)).unwrap();
         store.put_manifest(&manifest(new_key, &new)).unwrap();
@@ -4220,6 +4242,7 @@ mod tests {
                     log: None,
                     aster_version: "0.21.0".to_string(),
                     packs: Vec::new(),
+                    archive: None,
                 },
             )
             .unwrap();
@@ -4262,6 +4285,7 @@ mod tests {
                     log: None,
                     aster_version: "0.21.0".to_string(),
                     packs: Vec::new(),
+                    archive: None,
                 },
             )
             .unwrap();

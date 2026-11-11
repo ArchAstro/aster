@@ -495,6 +495,24 @@ dashboard shows: `aster results flaky`, `aster results clusters`, `aster srv get
 print JSON; `aster srv whoami` shows who you are signed in as ([details](docs/test-tracking.md#reading-the-dashboards-data)).
 
 A hit restores declared `outputs` from the artifact cache and skips execution.
+A target's output files are stored as one archive (a tar stream, zstd-compressed,
+cut into 32 MB chunks), so a target with hundreds of files is one or a few
+remote blobs, and a hit downloads the chunks in parallel and unpacks them in
+one pass. Restore checks every file against the digest in the manifest and
+does not fsync the files; a crash mid-restore is repaired by the next hit, which
+rewrites any file whose digest is wrong. A corrupt or missing chunk is a miss and the target runs.
+Entries written by an Aster that stored one blob per file are not read, and an
+older Aster does not read these (the cache key changed), so the first run after
+an upgrade rebuilds once.
+
+With a remote cache, a run ends with `remote: H hits / M misses / U uploads`
+and, when there was remote I/O, a `remote-io:` line: lookup requests, keys and
+signed blob URLs with their time; how many keys the server left unresolved
+and how many ran as misses because it never resolved them in its time budget
+(a different thing from a key the cache lacks); bytes and time downloaded and
+uploaded; and the time spent unpacking. `--json` carries the same counters
+under `summary.remote_cache`.
+
 `aster cache save` and `aster cache restore` store and fetch directories
 through aster-srv: tool installs, package stores and incremental build trees,
 which a target's outputs do not cover. They work like `actions/cache`. `restore`
