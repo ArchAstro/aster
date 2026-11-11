@@ -1169,11 +1169,24 @@ mod tests {
                             thread::sleep(Duration::from_millis(
                                 asked * delay_c.load(Ordering::Relaxed),
                             ));
-                            let stalled = stall_next_c
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                                    left.checked_sub(1)
-                                })
-                                .is_ok();
+                            // A compare-exchange loop, not `fetch_update`: newer
+                            // toolchains deprecate it for `try_update`, which
+                            // the MSRV lacks.
+                            let mut left = stall_next_c.load(Ordering::SeqCst);
+                            let stalled = loop {
+                                let Some(next) = left.checked_sub(1) else {
+                                    break false;
+                                };
+                                match stall_next_c.compare_exchange(
+                                    left,
+                                    next,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(actual) => left = actual,
+                                }
+                            };
                             if stalled {
                                 thread::sleep(Duration::from_millis(1500));
                             }
