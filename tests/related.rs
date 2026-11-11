@@ -4512,3 +4512,134 @@ fn a_pnpm_lockfile_edit_runs_only_the_projects_whose_importers_it_changes() {
     assert!(plan.targets.contains_key("//pkg-a:test"), "{plan:#?}");
     assert!(plan.targets.contains_key("//pkg-b:test"), "{plan:#?}");
 }
+
+/// A dry-run plan with the order a run does not promise (targets within a
+/// level, changed files) removed, so two plans compare equal when they
+/// select the same targets with the same commands.
+#[cfg(unix)]
+fn normalized(stdout: &[u8]) -> Value {
+    let mut plan: Value = serde_json::from_slice(stdout).unwrap();
+    if let Some(targets) = plan["targets"].as_array_mut() {
+        for target in targets.iter_mut() {
+            if let Some(files) = target["files"].as_array_mut() {
+                files.sort_by_key(|file| file.to_string());
+            }
+        }
+        targets.sort_by_key(|target| target["address"].to_string());
+    }
+    plan
+}
+
+/// The Elixir fixture with a lane over `//shop` and a `test` target that
+/// records the files it was given, with the source change `edit` makes.
+#[cfg(unix)]
+fn recording_shop() -> Workspace {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut files = ELIXIR.to_vec();
+    files.push((
+        "shop/aster.toml",
+        "[targets.deps]\ncommand = \"true\"\n\n[targets.test]\ncommand = \"./record.sh {files}\"\ncapabilities = [\"files_list\"]\n",
+    ));
+    files.push((
+        "shop/record.sh",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > ran.txt\n",
+    ));
+    let ws = Workspace::with_config("[affected.lanes.shop]\ninclude = [\"//shop\"]\n", &files);
+    let script = ws.root().join("shop/record.sh");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    ws.git(&["commit", "-qam", "executable"]);
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    ws
+}
+
+#[cfg(unix)]
+#[test]
+fn a_replayed_lane_plans_and_runs_what_the_analysis_does() {
+    let ws = recording_shop();
+    // Under .aster/, which is never a change; elsewhere in the tree the
+    // plan file would be an untracked file and a change itself.
+    let plan_file = ws.root().join(".aster/plan.json");
+    let plan_path = plan_file.to_str().unwrap();
+    let related = ["--base=HEAD", "--related", "--no-cache", "--lane=shop"];
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--json", "affected", "test"];
+        args.extend(related);
+        args.extend(extra);
+        let output = ws.aster(&args);
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // Plan once, writing the plan the analysis made.
+    let fresh = run(&["--dry-run", "--plan-out", plan_path]);
+    assert!(plan_file.exists());
+
+    // The replay prints the same plan, narrowed command included, and says
+    // so on stderr.
+    let replayed = run(&["--dry-run", "--plan-in", plan_path]);
+    assert_eq!(
+        normalized(&replayed.stdout),
+        normalized(&fresh.stdout),
+        "the replay prints the plan the analysis printed"
+    );
+    let stderr = String::from_utf8_lossy(&replayed.stderr);
+    assert!(stderr.contains("replaying lane 'shop'"), "{stderr}");
+    assert!(stderr.contains("(replayed plan)"), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&fresh.stdout).contains("test/shop/cart_test.exs"),
+        "the plan holds the narrowed command"
+    );
+
+    // Running from the plan executes the narrowed command, not the whole
+    // suite.
+    run(&["--plan-in", plan_path]);
+    let ran = fs::read_to_string(ws.root().join("shop/ran.txt")).unwrap();
+    assert_eq!(ran.trim(), "test/shop/cart_test.exs");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plan_made_for_another_change_is_not_replayed() {
+    let ws = recording_shop();
+    // Under .aster/, which is never a change; elsewhere in the tree the
+    // plan file would be an untracked file and a change itself.
+    let plan_file = ws.root().join(".aster/plan.json");
+    let plan_path = plan_file.to_str().unwrap();
+    let args = |extra: &[&str]| {
+        let mut args = vec![
+            "--json",
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--related",
+            "--no-cache",
+            "--lane=shop",
+        ];
+        args.extend(extra);
+        ws.aster(&args)
+    };
+    assert!(args(&["--dry-run", "--plan-out", plan_path])
+        .status
+        .success());
+
+    // A second source change after the plan: the stored selection no longer
+    // describes the tree, so the analysis runs and sees both changes.
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    let fresh = args(&["--dry-run"]);
+    let replay = args(&["--dry-run", "--plan-in", plan_path]);
+    assert_eq!(normalized(&fresh.stdout), normalized(&replay.stdout));
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(stderr.contains("changed files differs"), "{stderr}");
+    assert!(!stderr.contains("replaying lane"), "{stderr}");
+    assert!(String::from_utf8_lossy(&replay.stdout).contains("tax_test.exs"));
+}

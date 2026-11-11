@@ -417,5 +417,12 @@ jobs:
 ```
 
 The plan and test jobs pass the same flags, so a row exists exactly when its
-lane has something to run. A lane-specific setup step reads a `matrix` field
+lane has something to run.
+
+To skip the `--related` analysis in the test jobs, have the plan job write the
+plan (`--matrix --plan-out plan.json`), upload it as an artifact, and pass the
+downloaded file to each test job with `--plan-in plan.json`. A job whose
+checkout, flags or Aster version differ from the plan job's logs why and
+analyses as before. See
+[Replaying a plan](../../README.md#replaying-a-plan-instead-of-repeating-the-analysis). A lane-specific setup step reads a `matrix` field
 (`if: matrix.browser`) rather than comparing lane names.

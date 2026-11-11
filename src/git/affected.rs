@@ -66,6 +66,11 @@ impl AffectedDetector {
         .with_context(|| format!("Could not get commit for ref '{name}'"))
     }
 
+    /// The commit id `name` resolves to, as 40 hex characters.
+    pub fn resolve_commit(&self, name: &str, flag: &str) -> Result<String> {
+        Ok(self.commit_of(name, flag)?.id().to_string())
+    }
+
     fn merge_base_id(
         &self,
         base_commit: &git2::Commit<'_>,

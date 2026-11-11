@@ -137,6 +137,10 @@ has work: `lane`, `name`, `target`, `toolchains`, plus the lane's `matrix`
 fields. Run each row with `aster affected test --base=main --related --lane
 <lane>`. `--all` treats every project as changed, for scheduled full runs. A
 target's `cache.workspace_include` files also select it when they change.
+`--matrix --plan-out plan.json` stores every lane's plan and each job can run
+`--lane <lane> --plan-in plan.json` to skip the analysis; a plan whose key
+(commits, mode, flags, changed files, Aster version) differs, or a missing
+lane or file, logs one line and analyses instead.
 
 `--only-affected-files` narrows targets that declare the `files_list`
 capability to each project's changed files: the requested target and any
