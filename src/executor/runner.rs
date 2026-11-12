@@ -204,6 +204,9 @@ pub struct Executor<'a> {
     /// capture is planned for every target when this is above 0, whether or
     /// not results are recorded.
     retry_failed: u32,
+    /// Fail a test target that passed but recorded no tests, instead of only
+    /// warning (`ASTER_REQUIRE_TEST_RESULTS`).
+    require_test_results: bool,
     /// Maximum combined stdout+stderr bytes retained for one command.
     log_cap: usize,
     /// The tests whose failures may not fail their target.
@@ -246,6 +249,7 @@ impl<'a> Executor<'a> {
             null_stdin: true,
             capture_tests: false,
             retry_failed: 0,
+            require_test_results: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
             wrappers: Wrappers::default(),
@@ -266,6 +270,7 @@ impl<'a> Executor<'a> {
             null_stdin: true,
             capture_tests: false,
             retry_failed: 0,
+            require_test_results: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
             wrappers: Wrappers::default(),
@@ -290,6 +295,7 @@ impl<'a> Executor<'a> {
             null_stdin: true,
             capture_tests: false,
             retry_failed: 0,
+            require_test_results: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
             wrappers: Wrappers::default(),
@@ -315,6 +321,7 @@ impl<'a> Executor<'a> {
             null_stdin: true,
             capture_tests: false,
             retry_failed: 0,
+            require_test_results: false,
             log_cap: DEFAULT_LOG_CAP_BYTES,
             quarantine: None,
             wrappers: Wrappers::default(),
@@ -371,6 +378,13 @@ impl<'a> Executor<'a> {
     /// is cached.
     pub fn with_test_capture(mut self, capture_tests: bool) -> Self {
         self.capture_tests = capture_tests;
+        self
+    }
+
+    /// Fail a test target that passes while recording zero tests. Off, such a
+    /// target only warns, so the run's exit status is unchanged.
+    pub fn with_require_test_results(mut self, require: bool) -> Self {
+        self.require_test_results = require;
         self
     }
 
@@ -1327,6 +1341,7 @@ impl<'a> Executor<'a> {
         let retry_command = (self.retry_failed > 0 && commands.len() == 1 && chain.is_none())
             .then(|| commands[0].clone());
         let retry_failed = self.retry_failed;
+        let require_results = self.require_test_results;
         let wrappers = self.wrappers.clone();
         let declared_report = project
             .targets
@@ -1479,6 +1494,9 @@ impl<'a> Executor<'a> {
                 };
                 if !captures.is_empty() {
                     result.tests = read_test_report(&addr, &captures, &raw_outputs, started);
+                }
+                if capturing && !result.skipped && !result.cached {
+                    enforce_recorded_tests(&addr, &target_name_clone, &mut result, require_results);
                 }
                 let mut retried = false;
                 // A narrowed retry keeps coverage flags and echoes its command,
@@ -3086,6 +3104,70 @@ fn read_test_report(
         cases,
         quarantined: Vec::new(),
     })
+}
+
+/// Whether `name` names a test target (`test`, `test-ci`, `test_browser`,
+/// `unit-test`): the targets whose per-test results flake tracking, retries
+/// and quarantine depend on.
+fn is_test_target_name(name: &str) -> bool {
+    let name = name.rsplit(':').next().unwrap_or(name);
+    name == "test"
+        || name.starts_with("test-")
+        || name.starts_with("test_")
+        || name.ends_with("-test")
+        || name.ends_with("_test")
+}
+
+/// Say so when a test target that ran recorded no tests, and fail it when
+/// `require` is set and it would otherwise pass.
+///
+/// Two cases print nothing from [`read_test_report`]: a target whose command
+/// Aster planned no report for (`result.tests` is `None`), and a package
+/// script chain that stopped before any runner step wrote a report. A target
+/// whose planned report was empty already warned there; only a failed one gets
+/// the extra line here.
+fn enforce_recorded_tests(
+    address: &str,
+    target_name: &str,
+    result: &mut ExecutionResult,
+    require: bool,
+) {
+    if !is_test_target_name(target_name) {
+        return;
+    }
+    let (recorded, captured) = match &result.tests {
+        Some(report) => (report.cases.len(), !report.capture.is_empty()),
+        None => (0, false),
+    };
+    if recorded > 0 {
+        return;
+    }
+    let consequence = if result.success {
+        "it contributes nothing to flake tracking"
+    } else {
+        "this failure cannot be retried or quarantined"
+    };
+    if !captured {
+        errln!(
+            "[aster] Warning: no test results were captured for {address}: Aster planned no \
+             per-test report for its command, or the runner never started; {consequence} \
+             (`aster check` explains why a command is not captured)"
+        );
+    } else if !result.success {
+        errln!("[aster] Warning: {address} failed with no recorded tests; {consequence}");
+    }
+    if require && result.success {
+        let message = format!(
+            "{address} recorded no tests and ASTER_REQUIRE_TEST_RESULTS is set; failing it"
+        );
+        errln!("[aster] Error: {message}");
+        result.success = false;
+        if !result.output.is_empty() && !result.output.ends_with('\n') {
+            result.output.push('\n');
+        }
+        result.output.push_str(&message);
+        result.output.push('\n');
+    }
 }
 
 /// Run commands in order, stopping at the first failure. Returns the
@@ -5227,6 +5309,99 @@ mod tests {
         for (_, dir) in captures.iter().flatten() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    fn bare_result(success: bool, tests: Option<TestReport>) -> ExecutionResult {
+        ExecutionResult {
+            address: "//a:test".to_string(),
+            success,
+            skipped: false,
+            cached: false,
+            output: String::new(),
+            log: Vec::new(),
+            duration_ms: 0,
+            exit_code: None,
+            tests,
+            input_hash: None,
+            interrupted: false,
+            blocked: false,
+            run_wall_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_target_names() {
+        for name in [
+            "test",
+            "test-ci",
+            "test_browser",
+            "unit-test",
+            "//a:test-ci",
+        ] {
+            assert!(is_test_target_name(name), "{name}");
+        }
+        for name in ["build", "lint", "contest", "testdata"] {
+            assert!(!is_test_target_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn unplanned_passing_test_target_fails_only_when_required() {
+        let mut lenient = bare_result(true, None);
+        enforce_recorded_tests("//a:test", "test", &mut lenient, false);
+        assert!(lenient.success);
+
+        let mut strict = bare_result(true, None);
+        enforce_recorded_tests("//a:test", "test", &mut strict, true);
+        assert!(!strict.success);
+        assert!(strict.output.contains("recorded no tests"));
+    }
+
+    #[test]
+    fn other_targets_and_failed_targets_are_left_as_they_were() {
+        let mut build = bare_result(true, None);
+        enforce_recorded_tests("//a:build", "build", &mut build, true);
+        assert!(build.success && build.output.is_empty());
+
+        let mut failed = bare_result(false, None);
+        enforce_recorded_tests("//a:test", "test", &mut failed, true);
+        assert!(!failed.success && failed.output.is_empty());
+    }
+
+    #[test]
+    fn empty_planned_report_fails_when_required() {
+        let report = TestReport {
+            project: None,
+            capture: "junit".to_string(),
+            confidence: Confidence::Complete,
+            cases: Vec::new(),
+            quarantined: Vec::new(),
+        };
+        let mut result = bare_result(true, Some(report));
+        enforce_recorded_tests("//a:test", "test", &mut result, true);
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn recorded_tests_satisfy_the_requirement() {
+        let report = TestReport {
+            project: None,
+            capture: "junit".to_string(),
+            confidence: Confidence::Complete,
+            cases: vec![crate::test_results::TestCase {
+                file: None,
+                suite: None,
+                name: "t".to_string(),
+                outcome: crate::test_results::TestOutcome::Pass,
+                attempt: 1,
+                duration_ms: None,
+                message: None,
+            }],
+            quarantined: Vec::new(),
+        };
+        let mut result = bare_result(true, Some(report));
+        enforce_recorded_tests("//a:test", "test", &mut result, true);
+        assert!(result.success);
     }
 
     #[test]

@@ -110,6 +110,14 @@ prints `[aster] Warning: no test results were captured for <target>`: the
 report was empty or missing, so quarantine and flake tracking cannot apply
 to that run.
 
+A target that records no tests at all gets a warning too, with a note when it
+failed (a failure with no recorded tests cannot be retried or quarantined):
+that is a target whose command Aster planned no report for, or a package
+script chain that stopped before its runner wrote one. It applies to targets
+named like tests (`test`, `test-ci`, `unit-test`). Set
+`ASTER_REQUIRE_TEST_RESULTS=1` to make such a target fail when it would
+otherwise pass; the default only warns.
+
 ### Declared reports
 
 Aster recognises a runner in the target's command, directly or as the last
