@@ -87,9 +87,13 @@ fn branch(out: &mut String, nodes: &[GraphNode], children: &[Vec<usize>], at: us
         let last = position + 1 == below.len();
         let node = &nodes[child];
         let mark = if node.test { "  [test]" } else { "" };
+        let edge = node
+            .edge
+            .as_deref()
+            .map_or(String::new(), |edge| format!("  <- {edge}"));
         let _ = writeln!(
             out,
-            "{indent}{} {}{mark}",
+            "{indent}{} {}{edge}{mark}",
             if last { "└─" } else { "├─" },
             label(node)
         );
@@ -121,6 +125,7 @@ pub fn render_json(analysis: &Related, range: &str) -> Value {
                 "project": node.project,
                 "test": node.test,
                 "changed": node.changed,
+                "edge": node.edge,
             })
         })
         .collect();
@@ -143,7 +148,25 @@ mod tests {
             test: file.contains("test"),
             changed: via.is_none().then(|| "lib/a.ex:3 changed".to_string()),
             via,
+            edge: None,
         }
+    }
+
+    #[test]
+    fn an_edge_label_follows_the_definition_it_reaches() {
+        let mut reached = node("lib/b.ex", "total", 4, Some(0));
+        reached.edge = Some("refers to `sum`".to_string());
+        let analysis = Related {
+            graph: vec![node("lib/a.ex", "sum", 3, None), reached],
+            ..Related::default()
+        };
+        let text = render_text(&analysis, "main..HEAD");
+        assert!(
+            text.contains("└─ total (lib/b.ex:4)  <- refers to `sum`\n"),
+            "{text}"
+        );
+        let json = render_json(&analysis, "main..HEAD");
+        assert_eq!(json["nodes"][1]["edge"], "refers to `sum`");
     }
 
     #[test]

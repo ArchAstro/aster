@@ -51,6 +51,23 @@ pub struct TestSelection {
     pub names: BTreeSet<String>,
     /// Why the file was selected.
     pub reasons: Vec<String>,
+    /// Under explain mode, the shortest chain of graph edges from a changed
+    /// definition to a selected test of the file, change first.
+    pub chain: Vec<Hop>,
+}
+
+/// One step of a chain from a change to a selected test.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Hop {
+    /// The definition (`name`), or the file for code outside every
+    /// definition.
+    pub node: String,
+    pub file: PathBuf,
+    /// `0` for the code of a file outside every definition.
+    pub line: usize,
+    /// For the first hop, what changed. For the others, how the hop before
+    /// it reaches this one.
+    pub edge: String,
 }
 
 /// What a change means for one project.
@@ -141,6 +158,9 @@ pub struct GraphNode {
     /// Index of the definition this one uses, which is how the change
     /// reaches it.
     pub via: Option<usize>,
+    /// Under explain mode, how the definition it was reached through
+    /// reaches this one.
+    pub edge: Option<String>,
 }
 
 const TOP: u32 = u32::MAX;
@@ -235,6 +255,8 @@ struct Index<'a> {
     lib_roots: HashMap<PathBuf, Vec<PathBuf>>,
     /// Files of each unit: one file, or every Go file of a directory.
     unit_files: Vec<Vec<u32>>,
+    /// Record why each definition is reached (see [`Hop`]).
+    explain: bool,
     /// Definitions that use each unit.
     users: Vec<Vec<DefId>>,
     /// Definitions that load each unit through `import()` or `require()`
@@ -333,6 +355,10 @@ struct Run<'a, 'b> {
     /// What each unit uses, however indirectly, itself included.
     closures: HashMap<u32, HashSet<u32>>,
     edges: usize,
+    /// Under explain mode, how each reach came about, by `(from, to)`.
+    kinds: HashMap<(DefId, DefId), std::sync::Arc<str>>,
+    /// How the reaches marked next come about; read by [`Run::mark`].
+    label: Option<std::sync::Arc<str>>,
 }
 
 /// Analyse `changes` against the workspace at `root`.
@@ -345,6 +371,20 @@ pub fn analyse(
     graph: &ProjectGraph,
     changes: &[Change],
     cache_dir: Option<&Path>,
+) -> Related {
+    analyse_with(root, projects, graph, changes, cache_dir, false)
+}
+
+/// [`analyse`], recording under `explain` how each selected test and each
+/// graph node was reached (see [`Hop`]). That costs memory proportional to
+/// the edges walked, so it is off unless asked for.
+pub fn analyse_with(
+    root: &Path,
+    projects: &[DiscoveredProject],
+    graph: &ProjectGraph,
+    changes: &[Change],
+    cache_dir: Option<&Path>,
+    explain: bool,
 ) -> Related {
     let started = std::time::Instant::now();
     let (paths, mut facts, reused) = scan(root, cache_dir.map(FactsCache::open));
@@ -392,7 +432,8 @@ pub fn analyse(
         }
     }
     let files_analysed = facts.len();
-    let index = Index::build(root, projects, graph, &paths, facts, &ghosts);
+    let mut index = Index::build(root, projects, graph, &paths, facts, &ghosts);
+    index.explain = explain;
     let indexed = started.elapsed();
     let mut related = index.select(changes);
     related.files_analysed = files_analysed;
@@ -1624,6 +1665,7 @@ impl<'a> Index<'a> {
 
         let lib_roots = resolvers.rust.lib_roots();
         Index {
+            explain: false,
             projects,
             consumes: consumers::load(projects),
             imports,
@@ -1779,6 +1821,30 @@ impl<'a> Index<'a> {
             }
         }
         def.bare.iter().any(modules) || source.imports.contains(&unit) || !called
+    }
+
+    /// Whether `user` names a module of `unit` only as a value (a list,
+    /// map, struct or argument) and never calls into it. Only Elixir tells
+    /// the two apart.
+    fn names_as_data(&self, user: DefId, unit: u32) -> bool {
+        let source = &self.sources[user.0 as usize];
+        let def = self.def(user);
+        if def.bare.is_empty() {
+            return false;
+        }
+        let index = if user.1 == TOP {
+            source.facts.defs.len()
+        } else {
+            user.1 as usize
+        };
+        let named = self.unit_files[unit as usize].iter().any(|&f| {
+            let modules = &self.sources[f as usize].facts.modules;
+            def.bare.iter().any(|name| modules.contains(name))
+        });
+        named
+            && !source.calls[index]
+                .iter()
+                .any(|(called, _)| *called == unit)
     }
 
     /// Whether definition `id` refers to `name` of `unit`. The caller has
@@ -1953,6 +2019,49 @@ impl<'a> Index<'a> {
             parts.push(last);
         }
         parts.join(" ← ")
+    }
+
+    /// The chain from the change to `id`, change first, as [`Hop`]s.
+    fn chain(&self, run: &Run, id: DefId) -> Vec<Hop> {
+        // From `id` back to the change.
+        let mut path = vec![id];
+        let mut changed = String::new();
+        while path.len() < 4096 {
+            match run.affected.get(path.last().unwrap_or(&id)) {
+                Some(Why::Changed(what)) => {
+                    changed.clone_from(what);
+                    break;
+                }
+                Some(Why::Via(parent)) if *parent != NO_DEF => path.push(*parent),
+                _ => break,
+            }
+        }
+        path.reverse();
+        let mut hops = Vec::with_capacity(path.len());
+        for (position, node) in path.iter().enumerate() {
+            let source = &self.sources[node.0 as usize];
+            let (name, line) = if node.1 == TOP {
+                (source.path.display().to_string(), 0)
+            } else {
+                let def = self.def(*node);
+                (def.name.clone(), def.lines.0)
+            };
+            let edge = match position {
+                0 => changed.clone(),
+                _ => run
+                    .kinds
+                    .get(&(path[position - 1], *node))
+                    .map(|kind| kind.to_string())
+                    .unwrap_or_default(),
+            };
+            hops.push(Hop {
+                node: name,
+                file: source.path.clone(),
+                line,
+                edge,
+            });
+        }
+        hops
     }
 
     fn select(&self, changes: &[Change]) -> Related {
@@ -2260,6 +2369,7 @@ impl<'a> Index<'a> {
                 // The nearest definition above this one that is shown.
                 let mut above = *id;
                 let mut steps = 0;
+                let mut edge = None;
                 let (changed, via) = loop {
                     steps += 1;
                     if steps > 64 {
@@ -2268,7 +2378,10 @@ impl<'a> Index<'a> {
                     match &run.affected[&above] {
                         Why::Changed(what) => break (Some(what.clone()), None),
                         Why::Via(parent) => match position.get(parent) {
-                            Some(parent) => break (None, Some(*parent)),
+                            Some(shown) => {
+                                edge = run.kinds.get(&(*parent, above)).map(|k| k.to_string());
+                                break (None, Some(*shown));
+                            }
                             None if run.affected.contains_key(parent) => above = *parent,
                             None => break (Some("names a removed definition".to_string()), None),
                         },
@@ -2292,6 +2405,7 @@ impl<'a> Index<'a> {
                     test: self.is_test(*id) && !source.ghost,
                     changed,
                     via,
+                    edge,
                 }
             })
             .collect()
@@ -2367,6 +2481,12 @@ impl<'a> Index<'a> {
             let reason = self.explain(run, *id);
             if !reason.is_empty() && !selection.reasons.contains(&reason) {
                 selection.reasons.push(reason);
+            }
+            if run.ix.explain {
+                let chain = self.chain(run, *id);
+                if selection.chain.is_empty() || chain.len() < selection.chain.len() {
+                    selection.chain = chain;
+                }
             }
         }
         for outcome in outcomes.iter_mut() {
@@ -3029,6 +3149,8 @@ impl<'a, 'b> Run<'a, 'b> {
             validated: None,
             closures: HashMap::new(),
             edges: 0,
+            kinds: HashMap::new(),
+            label: None,
         }
     }
 
@@ -3257,9 +3379,24 @@ impl<'a, 'b> Run<'a, 'b> {
         })
     }
 
+    /// Say how the reaches marked from here on come about. Costs nothing
+    /// unless the run explains.
+    fn because(&mut self, label: impl FnOnce() -> String) {
+        if self.ix.explain {
+            self.label = Some(label().into());
+        }
+    }
+
     fn mark(&mut self, id: DefId, why: Why) {
         match &why {
-            Why::Via(from) if *from != NO_DEF => self.edge(*from, id),
+            Why::Via(from) if *from != NO_DEF => {
+                if let Some(label) = &self.label {
+                    self.kinds
+                        .entry((*from, id))
+                        .or_insert_with(|| label.clone());
+                }
+                self.edge(*from, id)
+            }
             _ => {
                 self.roots.push((id, self.seeding));
                 self.seeded.extend(self.seeding);
@@ -3401,6 +3538,10 @@ impl<'a, 'b> Run<'a, 'b> {
             let ix = self.ix;
             let source = &ix.sources[id.0 as usize];
             if id.1 == TOP {
+                self.because(|| {
+                    "code outside any definition may run in each of its file's definitions"
+                        .to_string()
+                });
                 for d in 0..source.facts.defs.len() {
                     self.mark((id.0, d as u32), Why::Via(id));
                 }
@@ -3488,6 +3629,7 @@ impl<'a, 'b> Run<'a, 'b> {
     /// Returns whether any definition does.
     fn requests(&mut self, route: &str, from: DefId) -> bool {
         let ix = self.ix;
+        self.because(|| format!("holds a path literal that requests route `{route}`"));
         let origin = &ix.sources[from.0 as usize];
         let reach = origin.project.map(|p| &ix.downstream[p]);
         let mut found = false;
@@ -3527,6 +3669,10 @@ impl<'a, 'b> Run<'a, 'b> {
     /// struct, a list or a child specification sends nothing.
     fn senders(&mut self, unit: u32, from: DefId, tag: Option<&str>) {
         let ix = self.ix;
+        self.because(|| match tag {
+            Some(tag) => format!("may send the message `{tag}` this clause accepts"),
+            None => "may send a message this clause accepts".to_string(),
+        });
         let from_test = ix.is_test(from);
         let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
             let defs = ix.sources[f as usize].facts.defs.len() as u32;
@@ -3553,6 +3699,7 @@ impl<'a, 'b> Run<'a, 'b> {
     /// every user of it (see [`Index::may_start`]).
     fn starters(&mut self, unit: u32, from: DefId) {
         let ix = self.ix;
+        self.because(|| "may start a process of this module".to_string());
         let from_test = ix.is_test(from);
         let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
             let defs = ix.sources[f as usize].facts.defs.len() as u32;
@@ -3580,6 +3727,7 @@ impl<'a, 'b> Run<'a, 'b> {
     /// already names the definition: the loader does not have to.
     fn dynamic_users(&mut self, unit: u32, from: DefId) {
         let ix = self.ix;
+        self.because(|| "loads the module dynamically".to_string());
         let from_test = ix.is_test(from);
         for &user in &ix.dynamic_users[unit as usize] {
             if user != from && (!from_test || ix.is_test(user)) {
@@ -3603,6 +3751,15 @@ impl<'a, 'b> Run<'a, 'b> {
         for &user in ix.users[unit as usize].iter().chain(&beside) {
             if user != from && (!from_test || ix.is_test(user)) {
                 self.edge(node, user);
+                self.because(|| {
+                    if ix.names_as_data(user, unit) {
+                        "names the module as data (a list, map, struct or argument), not a call"
+                            .to_string()
+                    } else {
+                        "uses the module, and nothing names what changed, so every user is reached"
+                            .to_string()
+                    }
+                });
                 self.mark(user, Why::Via(from));
             }
         }
@@ -3631,6 +3788,10 @@ impl<'a, 'b> Run<'a, 'b> {
             return true;
         }
         let ix = self.ix;
+        self.because(|| match member {
+            Some(_) => format!("calls the method `{name}`"),
+            None => format!("refers to `{name}`"),
+        });
         let origin = &ix.sources[file as usize];
         let mut found = false;
         // Nothing but other tests builds on a test file.
