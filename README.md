@@ -1174,6 +1174,14 @@ aster affected test-ci --base=main --related --explain --explain-limit 0   # eve
   dynamically`, and `code outside any definition may run in each of its
   file's definitions`. The chains come from the walk that selects the tests,
   so they cover every language `--related` reads.
+- **A module named as data stays a dependency.** A definition that lists a
+  module in a map, list or argument (a registry of handlers) is reached when
+  that module has a callback or function nothing names, because the value it
+  returns may be dispatched on at run time (`module.run(...)`, `apply(module,
+  :init, args)`) by a caller the source graph cannot tie to the module. The
+  chain labels such hops ``names the module as data``. Dropping them would
+  miss those callers, so `--related` keeps them; the label is how to see when
+  a registry is what widens a selection.
 - **Output.** In text the explanation follows each requested target. In
   JSON it is `explain` on that target (`project`, `reasons`,
   `selected_tests`, `tests[]` with `file`, `whole`, `names` and `chain[]` of
