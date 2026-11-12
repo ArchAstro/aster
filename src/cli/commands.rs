@@ -179,12 +179,24 @@ impl Cli {
         test_results_from_env(std::env::var("ASTER_TEST_RESULTS").ok().as_deref())
     }
 
+    /// Whether `ASTER_REQUIRE_TEST_RESULTS` makes a test target that records
+    /// no tests fail instead of warn.
+    pub fn require_test_results(&self) -> bool {
+        require_test_results_from_env(std::env::var("ASTER_REQUIRE_TEST_RESULTS").ok().as_deref())
+    }
+
     /// How many times to rerun a failed target's failing tests, from
     /// `--retry-failed` or else `ASTER_RETRY_FAILED`. 0 turns retries off.
     pub fn retry_failed(&self) -> u32 {
         self.retry_failed
             .unwrap_or_else(|| retry_from_env(std::env::var("ASTER_RETRY_FAILED").ok().as_deref()))
     }
+}
+
+/// `ASTER_REQUIRE_TEST_RESULTS`: `1`, `true` or `on` makes a test target that
+/// passes while recording no tests fail.
+pub fn require_test_results_from_env(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "on"))
 }
 
 fn retry_from_env(value: Option<&str>) -> u32 {
@@ -1221,6 +1233,15 @@ mod tests {
         let cli = Cli::try_parse_from(["aster", "list"]).unwrap();
         assert_eq!(cli.retry_failed, None);
         assert!(Cli::try_parse_from(["aster", "--retry-failed=x", "list"]).is_err());
+    }
+
+    #[test]
+    fn require_test_results_env_value() {
+        assert!(require_test_results_from_env(Some("1")));
+        assert!(require_test_results_from_env(Some(" on ")));
+        assert!(!require_test_results_from_env(Some("0")));
+        assert!(!require_test_results_from_env(Some("")));
+        assert!(!require_test_results_from_env(None));
     }
 
     #[test]

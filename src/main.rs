@@ -1744,6 +1744,7 @@ fn run() -> Result<()> {
                 .with_test_capture(test_results.is_some())
                 .with_results_hook(recorder_hook(&recorder))
                 .with_retry_failed(cli.retry_failed())
+                .with_require_test_results(cli.require_test_results())
                 .with_wrappers(&workspace_config.affected.related.wrappers)
                 .with_no_replay(cli.no_replay)
                 .with_quarantine(quarantine);
@@ -1889,6 +1890,7 @@ fn run() -> Result<()> {
                     .with_test_capture(test_results.is_some())
                     .with_results_hook(recorder_hook(&recorder))
                     .with_retry_failed(cli.retry_failed())
+                    .with_require_test_results(cli.require_test_results())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
                             .affected
@@ -2250,6 +2252,7 @@ fn run() -> Result<()> {
                     .with_test_capture(test_results.is_some())
                     .with_results_hook(recorder_hook(&recorder))
                     .with_retry_failed(cli.retry_failed())
+                    .with_require_test_results(cli.require_test_results())
                     .with_wrappers(
                         &WorkspaceConfig::load(&workspace_root)?
                             .affected
