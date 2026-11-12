@@ -672,12 +672,13 @@ fn run() -> Result<()> {
             let graph = build_graph(&projects)?;
             let facts_cache =
                 (!cli.no_cache).then(|| aster::cache::resolve_cache_dir(&workspace_root));
-            let analysis = aster::related::analyse(
+            let analysis = aster::related::analyse_with(
                 &workspace_root,
                 &projects,
                 &graph,
                 &changes,
                 facts_cache.as_deref(),
+                true,
             );
             let range = source_graph::describe_range(commit.as_deref());
             if output_mode == OutputMode::Json {
@@ -936,12 +937,15 @@ fn run() -> Result<()> {
             lang,
             all,
             matrix: matrix_rows,
+            explain,
+            explain_limit,
             plan_out,
             plan_in,
         } => {
             validate_lang_filter(&lang)?;
-            // --matrix plans every lane and prints JSON only.
-            let dry_run = dry_run || matrix_rows;
+            // --matrix plans every lane and prints JSON only. --explain
+            // explains a plan, so it does not run one.
+            let dry_run = dry_run || matrix_rows || explain;
             if plan_out.is_some() && !dry_run {
                 return Err(anyhow::anyhow!(
                     "--plan-out writes a plan without running it: add --dry-run or --matrix"
@@ -1128,12 +1132,13 @@ fn run() -> Result<()> {
                 changes.sort_by(|a, b| a.path.cmp(&b.path));
                 let facts_cache =
                     (!cli.no_cache).then(|| aster::cache::resolve_cache_dir(&workspace_root));
-                let analysis = aster::related::analyse(
+                let analysis = aster::related::analyse_with(
                     &workspace_root,
                     &projects,
                     &graph,
                     &changes,
                     facts_cache.as_deref(),
+                    explain,
                 );
                 if output_mode == OutputMode::Verbose {
                     errln!(
@@ -1177,6 +1182,9 @@ fn run() -> Result<()> {
                 toolchains: Vec<String>,
                 #[serde(flatten)]
                 matrix: toml::Table,
+                /// `--explain`: why each project of the lane is selected.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                explain: Option<Vec<aster::cli::explain::ProjectWhy>>,
             }
             // Several lanes are planned from the one analysis above; running
             // them is one invocation per lane, each on its own runner.
@@ -1562,6 +1570,23 @@ fn run() -> Result<()> {
                         "target dependency"
                     };
 
+                    // `--explain`: why a project runs the requested target.
+                    let explain_directly: HashSet<String> = directly_affected_addrs.clone();
+                    let explain_ctx = aster::cli::explain::Context {
+                        related: related_analysis.as_ref(),
+                        graph: &graph,
+                        directly_affected: &explain_directly,
+                        files_per_project: &files_per_project,
+                        declared_inputs: &declared_addrs,
+                        limit: explain_limit,
+                    };
+                    let explain_project = |project_addr: &str| {
+                        let relative = all_project_map
+                            .get(project_addr)
+                            .map(|project| project.relative_path.clone())
+                            .unwrap_or_default();
+                        aster::cli::explain::explain_project(project_addr, &relative, &explain_ctx)
+                    };
                     if output_mode == OutputMode::Json || recorder.is_some() {
                         let mut all_targets = Vec::new();
                         for level in &levels {
@@ -1588,12 +1613,15 @@ fn run() -> Result<()> {
                                 let mut selection =
                                     target_notes.get(target_addr).cloned().unwrap_or_default();
                                 selection.extend(joined_runs(target_addr));
+                                let explanation = (explain && reason != "target dependency")
+                                    .then(|| explain_project(&project_addr));
                                 all_targets.push(DryRunTarget {
                                     address: target_addr.clone(),
                                     reason,
                                     files,
                                     commands,
                                     selection,
+                                    explain: explanation,
                                 });
                             }
                         }
@@ -1620,6 +1648,14 @@ fn run() -> Result<()> {
                                 target: target.clone(),
                                 toolchains: output.toolchains.clone(),
                                 matrix: config.matrix.clone(),
+                                explain: explain.then(|| {
+                                    let mut projects: Vec<&String> = primary_addrs.iter().collect();
+                                    projects.sort();
+                                    projects
+                                        .into_iter()
+                                        .map(|addr| explain_project(addr))
+                                        .collect()
+                                }),
                             });
                         }
                         if let Some(recorder) = recorder.as_mut() {
@@ -1630,7 +1666,15 @@ fn run() -> Result<()> {
                                     &affected_addrs,
                                     missing_among_affected,
                                     command_plan.as_ref(),
-                                    output.clone(),
+                                    {
+                                        // A stored plan replays a selection;
+                                        // the explanation is not part of it.
+                                        let mut stored = output.clone();
+                                        for target in &mut stored.targets {
+                                            target.explain = None;
+                                        }
+                                        stored
+                                    },
                                 ),
                             );
                         }
@@ -1703,6 +1747,16 @@ fn run() -> Result<()> {
                                 }
                                 for line in target_notes.get(target_addr).into_iter().flatten() {
                                     outln!("    > {line}");
+                                }
+                                if explain && reason != "target dependency" {
+                                    if let Some((project_addr, _)) =
+                                        parse_target_address(target_addr)
+                                    {
+                                        let why = explain_project(&project_addr);
+                                        for line in aster::cli::explain::render_lines(&why) {
+                                            outln!("    {line}");
+                                        }
+                                    }
                                 }
                             }
                         }

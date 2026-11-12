@@ -47,7 +47,7 @@ mod resolve;
 mod rust;
 mod sites;
 
-pub use engine::{analyse, Change, GraphNode, Outcome, Related, TestSelection};
+pub use engine::{analyse, analyse_with, Change, GraphNode, Hop, Outcome, Related, TestSelection};
 pub use facts::Family;
 pub use lint::{
     bad_consumes, stale_annotations, suspicious_path_literals, Finding as SourceFinding, Sources,

@@ -336,6 +336,9 @@ pub struct DryRunTarget {
     /// How the target's command was chosen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selection: Vec<String>,
+    /// Why the target's project is selected (`--explain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<crate::cli::explain::ProjectWhy>,
 }
 
 /// The `--dry-run --json` document of one lane.

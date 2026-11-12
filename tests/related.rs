@@ -773,8 +773,8 @@ fn graph_source_prints_what_a_change_reaches() {
         working,
         "Source graph for the working tree: 1 changed, 2 reached, 1 in test files\n\
          \nsum (shop/lib/shop/pricing.ex:3)  [shop/lib/shop/pricing.ex:3 changed]\n\
-         └─ total (shop/lib/shop/cart.ex:4)\n   \
-         └─ total (shop/test/shop/cart_test.exs:5)  [test]\n"
+         └─ total (shop/lib/shop/cart.ex:4)  <- refers to `sum`\n   \
+         └─ total (shop/test/shop/cart_test.exs:5)  <- refers to `total`  [test]\n"
     );
 
     ws.git(&["commit", "-qam", "change"]);

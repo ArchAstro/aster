@@ -549,6 +549,20 @@ pub enum Commands {
         #[arg(long)]
         matrix: bool,
 
+        /// Say why each project, lane and test is selected
+        ///
+        /// Implies --dry-run. Under each target prints the rules that put its
+        /// project in the run and, under --related, the shortest chain of
+        /// graph edges from a changed definition to each selected test file
+        /// (the first ones; see --explain-limit). In JSON the same appears as
+        /// `explain` on each target and, with --matrix, on each lane row.
+        #[arg(long)]
+        explain: bool,
+
+        /// Test files listed per project by --explain (0 lists all)
+        #[arg(long, value_name = "N", default_value_t = crate::cli::explain::DEFAULT_TEST_LIMIT, requires = "explain")]
+        explain_limit: usize,
+
         /// Write the plan of every lane planned to FILE (needs --dry-run or --matrix)
         ///
         /// The file holds each lane's dry-run plan, with the commands that

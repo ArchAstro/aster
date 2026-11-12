@@ -5,6 +5,7 @@
 pub mod affected_files;
 pub mod cache_plan;
 pub mod commands;
+pub mod explain;
 pub mod output;
 pub mod phases;
 pub mod plan_replay;

@@ -1134,6 +1134,60 @@ than every edge. Projects that run in full for a reason the graph cannot show
 are listed after it. Files the change does not touch are read from the
 working tree, so check out the head of a range for an exact answer.
 
+#### Seeing why a project, lane or test is selected
+
+`--explain` on `aster affected` says which rule selected each project and, for
+the tests the source graph reaches, how the change gets to them. It implies
+`--dry-run`.
+
+```console
+aster affected test-ci --base=main --related --explain --lane services-platform
+aster --json affected test-ci --base=main --related --explain
+aster affected test-ci --base=main --related --matrix --explain   # rows gain `explain`
+aster affected test-ci --base=main --related --explain --explain-limit 0   # every test
+```
+
+```text
+  //shop:test  (affected)
+    why selected:
+      - owns 1 changed file: shop/lib/shop/pricing.ex
+      - the source graph reaches 1 test file from the change
+      shop/test/shop/cart_test.exs (1 test(s), 2 hops)
+        0. sum (shop/lib/shop/pricing.ex:2)  changed: shop/lib/shop/pricing.ex:2 changed
+        1. total (shop/lib/shop/cart.ex:4)  <- refers to `sum`
+        2. total (shop/test/shop/cart_test.exs:5)  <- refers to `total`
+```
+
+- **Projects.** The reasons are the rules that select a project: it owns
+  changed files, a changed file is a declared input of the target, it depends
+  on a project that does (the dependency path is shown), it runs in full and
+  why, or it runs the tests of another selected project.
+- **Tests.** Under `--related` each selected test file carries the shortest
+  chain of graph edges from a changed definition (hop 0, with what changed) to
+  the test. Every later hop says how the hop before it reaches it:
+  ``refers to `name` ``, ``calls the method `name` ``, `names the module as data
+  (a list, map, struct or argument), not a call`, `uses the module, and
+  nothing names what changed, so every user is reached` (a framework
+  callback, macro or unnamed function reaches every user of its module or
+  file), `may send the message ...`, `may start a process of this module`,
+  `holds a path literal that requests route ...`, `loads the module
+  dynamically`, and `code outside any definition may run in each of its
+  file's definitions`. The chains come from the walk that selects the tests,
+  so they cover every language `--related` reads.
+- **Output.** In text the explanation follows each requested target. In
+  JSON it is `explain` on that target (`project`, `reasons`,
+  `selected_tests`, `tests[]` with `file`, `whole`, `names` and `chain[]` of
+  `node`, `file`, `line`, `edge`). With `--matrix` each lane row has `explain`:
+  one entry per project of the lane. Without `--explain` no output changes.
+- **Size.** Chains are listed for the `--explain-limit` shortest-chain test
+  files per project (20 by default, `0` for all); `selected_tests` always
+  counts every one. Recording the chains costs memory proportional to the
+  edges the walk visits, so it is off unless the flag is given.
+- **Stored plans.** `--plan-out` does not store the explanation.
+
+`aster graph --source` shows the same edge label after each definition
+(`edge` in its JSON).
+
 ### Dependencies that are built or run, not imported
 
 A project can depend on another one it never imports: its tests launch the
