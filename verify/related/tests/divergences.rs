@@ -104,24 +104,36 @@ fn editing_only_a_trailing_comment_selects_tests() {
 
 /// D2a. Top-level code fans out to every user of the module.
 ///
-/// The test calls `other/0`, which does not read the attribute.
+/// The test calls `other/0`, which does not read the attribute. An attribute
+/// no function reads is read at compile time by a macro, so it is code of the
+/// whole file and fans out; one a function reads reaches only its readers.
 #[test]
 fn editing_top_level_code_selects_users_of_functions_that_do_not_read_it() {
-    let files = [
-        MIX,
-        (
-            "shop/lib/limits.ex",
-            "defmodule Shop.Limits do\n  @limit 5\n\n  def limit, do: @limit\n  def other, do: :ok\nend\n",
-        ),
-        (
-            "shop/test/limits_test.exs",
-            "defmodule Shop.LimitsTest do\n  use ExUnit.Case\n\n  test \"other\" do\n    assert Shop.Limits.other() == :ok\n  end\nend\n",
-        ),
-    ];
-    let ws = Workspace::from_files(&files).unwrap();
+    let files = |limits: &'static str| {
+        [
+            MIX,
+            ("shop/lib/limits.ex", limits),
+            (
+                "shop/test/limits_test.exs",
+                "defmodule Shop.LimitsTest do\n  use ExUnit.Case\n\n  test \"other\" do\n    assert Shop.Limits.other() == :ok\n  end\nend\n",
+            ),
+        ]
+    };
+    let ws = Workspace::from_files(&files(
+        "defmodule Shop.Limits do\n  @limit 5\n\n  def limit, do: 5\n  def other, do: :ok\nend\n",
+    ))
+    .unwrap();
     ws.edit("shop/lib/limits.ex", "@limit 5", "@limit 6")
         .unwrap();
     assert_eq!(narrow(&ws.plan().unwrap()), ["test/limits_test.exs"]);
+
+    let ws = Workspace::from_files(&files(
+        "defmodule Shop.Limits do\n  @limit 5\n\n  def limit, do: @limit\n  def other, do: :ok\nend\n",
+    ))
+    .unwrap();
+    ws.edit("shop/lib/limits.ex", "@limit 5", "@limit 6")
+        .unwrap();
+    assert_eq!(ws.plan().unwrap(), Plan::default());
 }
 
 const ROUTER_REPO: [(&str, &str); 5] = [
@@ -157,9 +169,9 @@ fn a_route_nothing_requests_selects_users_of_the_router_module() {
 
 /// D5 (fixed by #354). A reflecting test counts as reaching a change.
 ///
-/// The test that lists the application's modules is reached by any change to
-/// non-test code; before #354 `unused` still "reached no test" and the project
-/// ran in full instead of that one test.
+/// The test that lists the application's modules, and the functions of each,
+/// is reached by any change to non-test code; before #354 `unused` still
+/// "reached no test" and the project ran in full instead of that one test.
 #[test]
 fn a_change_only_a_reflecting_test_reaches_selects_that_test() {
     let files = [
@@ -170,7 +182,7 @@ fn a_change_only_a_reflecting_test_reaches_selects_that_test() {
         ),
         (
             "shop/test/modules_test.exs",
-            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert is_list(modules)\n  end\nend\n",
+            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert Enum.all?(modules, &is_list(&1.__info__(:functions)))\n  end\nend\n",
         ),
         (
             "shop/test/other_test.exs",
