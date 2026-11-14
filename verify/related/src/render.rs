@@ -71,7 +71,11 @@ fn items(repo: &Repo, def: i64) -> Vec<String> {
         out.push(path_literal(path));
     }
     if repo.reflects.contains(&def) {
-        out.push("Application.spec(:shop, :modules)".to_string());
+        // Lists every module and the functions of each: it may call any of
+        // them, as the model's `reflect` edges say.
+        out.push(
+            "Enum.map(Application.spec(:shop, :modules), &&1.__info__(:functions))".to_string(),
+        );
     }
     for (_, unit) in repo.preloads.iter().filter(|(from, _)| *from == def) {
         out.push(format!("Repo.preload(x, :assoc{unit})"));
