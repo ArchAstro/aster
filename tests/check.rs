@@ -182,6 +182,38 @@ fn stale_annotations_are_errors() {
 }
 
 #[test]
+fn related_rules_that_match_nothing_are_reported() {
+    let ws = Workspace::new(&[
+        (
+            "aster.toml",
+            "[affected.related]\npacks = [\"oban\", \"ecto\"]\ninert_uses = [\"Gone.Dsl\"]\ncompile_attributes = [\"gone_attr\"]\n\n[[affected.related.boundary]]\nfiles = [\"shop/lib/hub.ex\", \"shop/lib/gone.ex\"]\nreason = \"hub_test covers it\"\n",
+        ),
+        ("shop/mix.exs", MIX),
+        ("shop/lib/hub.ex", "defmodule Hub do\n  def keys, do: []\nend\n"),
+        // Uses one entry of the `ecto` pack: a pack used in part is fine.
+        (
+            "shop/lib/item.ex",
+            "defmodule Item do\n  @primary_key false\n  def a, do: 1\nend\n",
+        ),
+    ]);
+    let (status, report) = ws.check(&["--rule", "bad-related-rule"]);
+    assert_eq!(status, 1, "{report}");
+    let messages: Vec<&str> = findings(&report, "bad-related-rule")
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    // The removed file, the pack whose behaviour nothing uses, the module
+    // nothing uses and the attribute nothing sets.
+    assert_eq!(messages.len(), 4, "{report}");
+    assert!(messages.iter().any(|m| m.contains("`Gone.Dsl`")));
+    assert!(messages.iter().any(|m| m.contains("`gone_attr`")));
+    assert!(messages.iter().any(|m| m.contains("shop/lib/gone.ex")));
+    assert!(messages
+        .iter()
+        .any(|m| m.contains("pack `oban`") && m.contains("`Oban.Worker`")));
+}
+
+#[test]
 fn consumes_entries_must_match_sources() {
     let ws = Workspace::new(&[
         ("aster.toml", ""),

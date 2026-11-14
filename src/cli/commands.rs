@@ -432,6 +432,12 @@ pub enum Commands {
         /// e.g. "ex,exs")
         #[arg(long, value_delimiter = ',', requires = "source")]
         ext: Vec<String>,
+
+        /// Print the N files the most reached tests are reached through,
+        /// instead of the graph: candidates for an
+        /// `[[affected.related.boundary]]`
+        #[arg(long, value_name = "N", requires = "source")]
+        hubs: Option<usize>,
     },
 
     /// Lint the configuration and annotations that `--related` depends on

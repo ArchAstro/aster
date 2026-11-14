@@ -25,6 +25,7 @@ use std::time::Instant;
 pub const UNNARROWABLE: &str = "unnarrowable-test-command";
 pub const SUSPICIOUS: &str = "suspicious-path-literal";
 pub const BAD_CONSUMES: &str = "bad-consumes";
+pub const BAD_RELATED_RULE: &str = "bad-related-rule";
 pub const ORPHAN: &str = "orphan-test-target";
 pub const STALE: &str = "stale-annotation";
 pub const STALE_ALLOW: &str = "stale-allow-orphan";
@@ -35,10 +36,11 @@ pub const UNQUARANTINABLE: &str = "unquarantinable-test-results";
 pub const UNRETRYABLE: &str = "unretryable-test-target";
 
 /// Every rule id, in the order findings are listed.
-pub const RULES: [&str; 11] = [
+pub const RULES: [&str; 12] = [
     UNNARROWABLE,
     SUSPICIOUS,
     BAD_CONSUMES,
+    BAD_RELATED_RULE,
     ORPHAN,
     STALE,
     STALE_ALLOW,
@@ -58,9 +60,12 @@ pub enum Severity {
 
 fn severity(rule: &str) -> Severity {
     match rule {
-        BAD_CONSUMES | STALE | STALE_ALLOW | STALE_ALLOW_UNNARROWABLE | STALE_ALLOW_NO_RESULTS => {
-            Severity::Error
-        }
+        BAD_CONSUMES
+        | BAD_RELATED_RULE
+        | STALE
+        | STALE_ALLOW
+        | STALE_ALLOW_UNNARROWABLE
+        | STALE_ALLOW_NO_RESULTS => Severity::Error,
         _ => Severity::Warning,
     }
 }
@@ -242,7 +247,7 @@ pub fn run(
     }
 
     // Rules about sources and their configuration.
-    let source_rules = [SUSPICIOUS, BAD_CONSUMES, STALE];
+    let source_rules = [SUSPICIOUS, BAD_CONSUMES, BAD_RELATED_RULE, STALE];
     if source_rules.iter().any(|rule| enabled(rule)) {
         let sources = Sources::load(root, options.cache_dir.as_deref());
         report.stats.source_files = sources.facts.len();
@@ -259,6 +264,13 @@ pub fn run(
                 related::bad_consumes(projects, &sources)
                     .into_iter()
                     .map(|f| located(BAD_CONSUMES, f)),
+            );
+        }
+        if enabled(BAD_RELATED_RULE) {
+            report.findings.extend(
+                related::bad_related_rules(&config.affected.related.rules(), &sources)
+                    .into_iter()
+                    .map(|f| located(BAD_RELATED_RULE, f)),
             );
         }
         if enabled(STALE) {

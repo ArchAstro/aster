@@ -33,9 +33,31 @@ const INERT_ATTRIBUTES: &[&str] = &[
     "callback",
     "macrocallback",
 ];
-/// Modules whose `use` brings in no call to a function of the using module:
-/// a verification DSL, a schema DSL, generated protobuf code.
-const INERT_USES: &[&str] = &["ExVerify", "Ecto.Schema", "Protobuf", "Bitwise"];
+/// Module attributes the compiler or ExUnit reads, whatever reads them in
+/// the module's own code: they count as code of the whole file. A library's
+/// (Ecto's `@primary_key`) come from `[affected.related] compile_attributes`
+/// or a pack.
+const COMPILE_ATTRIBUTES: &[&str] = &[
+    "behaviour",
+    "impl",
+    "derive",
+    "before_compile",
+    "after_compile",
+    "after_verify",
+    "on_definition",
+    "on_load",
+    "compile",
+    "external_resource",
+    "dialyzer",
+    "vsn",
+    "tag",
+    "moduletag",
+    "describetag",
+];
+/// Standard-library modules whose `use` brings in no call to a function of
+/// the using module. A library's come from `[affected.related] inert_uses`
+/// or a pack.
+pub const INERT_USES: &[&str] = &["Bitwise"];
 /// Calls that take a module without sending to it: they name modules, start
 /// processes or build child specifications.
 const HANDS_NOTHING: &[&str] = &[
@@ -119,6 +141,20 @@ struct Walker<'a> {
     route_scopes: Vec<(String, Option<String>)>,
     /// The file registers a callback module or expands into calls.
     hooks: bool,
+    /// What the module being walked `use`s or names in `@behaviour`.
+    behaviours: Vec<String>,
+    /// Modules defined at the top of the file. With more than one, each
+    /// module's body is a definition of its own (see [`Def::body`]).
+    top_modules: usize,
+    /// The module being walked marks a definition `@impl`.
+    saw_impl: bool,
+    /// Definitions of the module being walked that count as callbacks by
+    /// their name alone. Once the module uses `@impl`, the compiler warns
+    /// about a callback without it, so they are ordinary functions.
+    named_callbacks: Vec<usize>,
+    /// Names of the module's functions marked `@impl`. The mark covers
+    /// every clause of the function, not only the one under it.
+    impl_names: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +189,16 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
         impl_of: Vec::new(),
         route_scopes: Vec::new(),
         hooks: false,
+        behaviours: Vec::new(),
+        top_modules: 0,
+        saw_impl: false,
+        named_callbacks: Vec::new(),
+        impl_names: Vec::new(),
     };
+    walker.top_modules = children(tree.root_node())
+        .into_iter()
+        .filter(|node| call_name(*node, source) == Some("defmodule"))
+        .count();
     walker.collect_aliases(tree.root_node());
     let scope = Scope {
         owner: Owner::Top,
@@ -163,10 +208,36 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     };
     walker.block(tree.root_node(), scope, None);
     walker.facts.unnamed_is_dead = !walker.hooks && !walker.facts.parse_error;
+    walker.facts.probes = probes(&walker.facts);
     let mut facts = walker.facts;
     facts.classify_lines(source, &walker.inert);
     super::annotations::apply(&mut facts, &tree, source);
     facts
+}
+
+/// The function names code that lists modules may look for on them (see
+/// [`FileFacts::probes`]).
+fn probes(facts: &FileFacts) -> Option<std::collections::BTreeSet<String>> {
+    let defs = || facts.defs.iter().chain([&facts.top]);
+    if !defs().any(|def| def.reflects.is_some()) {
+        return None;
+    }
+    let atoms: std::collections::BTreeSet<String> =
+        defs().flat_map(|def| def.atoms.iter().cloned()).collect();
+    // `apply(mod, fun, args)` with a computed function, or a module's own
+    // list of functions, can reach a function of any name.
+    let applies = defs().any(|def| {
+        def.refs.contains("apply")
+            || def
+                .calls
+                .iter()
+                .any(|(m, f)| f == "apply" && ["Kernel", ":erlang"].contains(&m.as_str()))
+    });
+    let lists_functions = ["__info__", "module_info"]
+        .iter()
+        .any(|f| atoms.contains(*f))
+        && ["functions", "exports"].iter().any(|f| atoms.contains(*f));
+    (!applies && !lists_functions).then_some(atoms)
 }
 
 /// Whether a remote call lists modules at run time: every module of an
@@ -354,6 +425,15 @@ impl Walker<'_> {
         }
     }
 
+    /// Whether `owner` stands for module-level code: the file's, or a
+    /// module body's (see [`Def::body`]).
+    fn in_body(&self, owner: Owner) -> bool {
+        match owner {
+            Owner::Top => true,
+            Owner::Def(i) => self.facts.defs[i].body,
+        }
+    }
+
     fn mention(&mut self, owner: Owner, module: &str) {
         if module.starts_with("__") {
             return;
@@ -373,14 +453,46 @@ impl Walker<'_> {
                 if attribute.is_some_and(|a| ["behaviour", "impl", "derive"].contains(&a)) {
                     self.hooks = true;
                 }
+                if attribute == Some("behaviour") {
+                    let declared = child
+                        .child_by_field_name("operand")
+                        .and_then(|operand| arguments(operand).first().copied())
+                        .filter(|arg| arg.kind() == "alias");
+                    if let Some(declared) = declared {
+                        let full = self.expand(text(declared, self.source));
+                        self.behaviours.push(full);
+                    }
+                }
                 if attribute == Some("impl") {
                     pending_impl = true;
+                    self.saw_impl = true;
                     self.inert.push((child.start_byte(), child.end_byte()));
                     continue;
                 }
                 if attribute.is_some_and(|a| INERT_ATTRIBUTES.contains(&a)) {
                     self.inert.push((child.start_byte(), child.end_byte()));
                     continue;
+                }
+                // `@name value` in a module: a definition of its own, which
+                // the functions that read `@name` use.
+                let operand = child.child_by_field_name("operand");
+                if let (Some(name), Some(operand), Some(_)) = (attribute, operand, module) {
+                    if scope.module_level && !COMPILE_ATTRIBUTES.contains(&name) {
+                        let mut def = Def::new(format!("@{name}"), DefKind::Const, span(child));
+                        def.attribute = true;
+                        let owner = self.facts.push(def);
+                        let inner = Scope {
+                            owner,
+                            in_impl: false,
+                            module_level: false,
+                            pattern: false,
+                        };
+                        for arg in arguments(operand) {
+                            self.node(arg, inner, module);
+                        }
+                        pending_impl = false;
+                        continue;
+                    }
                 }
             }
             let is_def = call_name(child, self.source).is_some_and(|n| DEFINERS.contains(&n));
@@ -415,6 +527,17 @@ impl Walker<'_> {
             }
             "identifier" => {
                 let name = text(node, self.source).to_string();
+                self.facts.owner(scope.owner).refs.insert(name);
+                return;
+            }
+            // `@name`: a read of the module attribute.
+            "unary_operator"
+                if text(node, self.source).starts_with('@')
+                    && node
+                        .child_by_field_name("operand")
+                        .is_some_and(|operand| operand.kind() == "identifier") =>
+            {
+                let name = format!("@{}", text(node, self.source)[1..].trim());
                 self.facts.owner(scope.owner).refs.insert(name);
                 return;
             }
@@ -503,7 +626,7 @@ impl Walker<'_> {
         };
 
         if scope.module_level
-            && scope.owner == Owner::Top
+            && self.in_body(scope.owner)
             && module.is_some()
             && self.route(node, scope, module)
         {
@@ -527,6 +650,10 @@ impl Walker<'_> {
                 (None, outer) => outer.unwrap_or("").to_string(),
             };
             let outer_impl = std::mem::take(&mut self.impl_of);
+            let outer_behaviours = std::mem::take(&mut self.behaviours);
+            let outer_saw_impl = std::mem::take(&mut self.saw_impl);
+            let outer_named = std::mem::take(&mut self.named_callbacks);
+            let outer_impl_names = std::mem::take(&mut self.impl_names);
             if name == "defimpl" {
                 // Implementing a protocol uses it and the type it is for;
                 // their users reach the implementation through dispatch.
@@ -547,8 +674,21 @@ impl Walker<'_> {
             } else if !full.is_empty() {
                 self.facts.modules.push(full.clone());
             }
+            // A module that shares its file keeps its body's code apart, so
+            // that a change to it runs that module's definitions and what
+            // names the module, not everything in the file.
+            let shares_file = name == "defmodule"
+                && !full.is_empty()
+                && (module.is_some() || self.top_modules > 1);
+            let owner = if shares_file {
+                let mut body = Def::new(full.clone(), DefKind::Type, span(node));
+                body.body = true;
+                self.facts.push(body)
+            } else {
+                Owner::Top
+            };
             let inner = Scope {
-                owner: Owner::Top,
+                owner,
                 in_impl: name == "defimpl",
                 module_level: true,
                 pattern: false,
@@ -558,7 +698,18 @@ impl Walker<'_> {
                     self.block(child, inner, Some(&full));
                 }
             }
+            if self.saw_impl {
+                for &i in &self.named_callbacks {
+                    if !self.impl_names.contains(&self.facts.defs[i].name) {
+                        self.facts.defs[i].callback = false;
+                    }
+                }
+            }
             self.impl_of = outer_impl;
+            self.behaviours = outer_behaviours;
+            self.saw_impl = outer_saw_impl;
+            self.named_callbacks = outer_named;
+            self.impl_names = outer_impl_names;
             return;
         }
 
@@ -595,8 +746,27 @@ impl Walker<'_> {
             if !private {
                 def.via = self.impl_of.clone();
                 def.protocol = self.impl_of.first().cloned();
+                def.behaviours = self.behaviours.clone();
+            }
+            // Supervisors and the compiler call these by convention; they
+            // are no behaviour's callbacks, so they never carry `@impl`.
+            let conventional = [
+                "start_link",
+                "start",
+                "child_spec",
+                "__using__",
+                "__before_compile__",
+                "__after_compile__",
+            ]
+            .contains(&defined.as_str());
+            let named_only = def.callback && !scope.in_impl && !conventional;
+            if scope.in_impl {
+                self.impl_names.push(defined.clone());
             }
             let owner = self.facts.push(def);
+            if named_only {
+                self.named_callbacks.push(self.facts.defs.len() - 1);
+            }
             let inner = Scope {
                 owner,
                 in_impl: false,
@@ -671,7 +841,11 @@ impl Walker<'_> {
             let used = arguments(node)
                 .first()
                 .map(|arg| self.expand(text(*arg, self.source)));
-            self.hooks |= !used.is_some_and(|used| INERT_USES.contains(&used.as_str()));
+            match &used {
+                Some(used) => self.facts.uses.push(used.clone()),
+                None => self.hooks = true,
+            }
+            self.behaviours.extend(used);
         }
         for child in children(node) {
             if child.kind() != "identifier" {
@@ -1020,6 +1194,77 @@ end
         assert!(callback.uses.contains("Shop.Repo.Query"));
         let traced = facts.defs.iter().find(|d| d.name == "traced").unwrap();
         assert_eq!(traced.kind, DefKind::Macro);
+    }
+
+    #[test]
+    fn a_definition_carries_the_behaviours_of_its_own_module() {
+        let source = "defmodule Shop.Mail do\n  use Oban.Worker, queue: :mail\n  @behaviour Shop.Hook\n\n  def perform(job), do: job\n\n  defmodule Retry do\n    def perform(job), do: job\n  end\n\n  def backoff(_), do: 1\nend\n";
+        let facts = extract(Path::new("lib/shop/mail.ex"), source);
+        let outer: Vec<_> = facts.defs.iter().filter(|d| d.name == "perform").collect();
+        assert_eq!(outer[0].behaviours, ["Oban.Worker", "Shop.Hook"]);
+        // The nested module takes on none of them, and the outer module's
+        // are back once it ends.
+        assert!(outer[1].behaviours.is_empty());
+        let backoff = facts.defs.iter().find(|d| d.name == "backoff").unwrap();
+        assert_eq!(backoff.behaviours, ["Oban.Worker", "Shop.Hook"]);
+    }
+
+    #[test]
+    fn a_module_that_shares_its_file_keeps_its_body_apart() {
+        let source = "defmodule Shop.Tools do\n  use Shop.Outer\n  def list, do: 1\n\n  defmodule Search do\n    use Shop.Inner\n    def name, do: 1\n  end\nend\n\ndefmodule Shop.Other do\n  use Shop.Hooks\n  def run, do: 2\nend\n";
+        let facts = extract(Path::new("lib/shop/tools.ex"), source);
+        let bodies: Vec<_> = facts.defs.iter().filter(|d| d.body).collect();
+        let names: Vec<_> = bodies.iter().map(|d| d.name.as_str()).collect();
+        // Two modules at the top of the file: each has a body. The nested
+        // one has one too.
+        assert_eq!(names, ["Shop.Tools", "Shop.Tools.Search", "Shop.Other"]);
+        let index = |name: &str| facts.defs.iter().position(|d| d.name == name).unwrap() as u32;
+        assert_eq!(facts.class_of(2), LineClass::Def(index("Shop.Tools")));
+        assert_eq!(
+            facts.class_of(6),
+            LineClass::Def(index("Shop.Tools.Search"))
+        );
+        assert_eq!(facts.class_of(7), LineClass::Def(index("name")));
+        assert_eq!(facts.class_of(12), LineClass::Def(index("Shop.Other")));
+    }
+
+    #[test]
+    fn a_module_alone_in_its_file_has_no_body_definition() {
+        let source = "defmodule Shop.Cart do\n  use Shop.Hooks\n  def total, do: 1\nend\n";
+        let facts = extract(Path::new("lib/shop/cart.ex"), source);
+        assert!(facts.defs.iter().all(|d| !d.body));
+        assert_eq!(facts.class_of(2), LineClass::Top);
+    }
+
+    #[test]
+    fn a_module_attribute_is_a_definition_its_readers_refer_to() {
+        let source = "defmodule Shop.Registry do\n  @derive Jason.Encoder\n  @tools %{search: Shop.Search}\n\n  def get(key), do: Map.get(@tools, key)\n  def count, do: 1\nend\n";
+        let facts = extract(Path::new("lib/shop/registry.ex"), source);
+        let tools = facts.defs.iter().find(|d| d.name == "@tools").unwrap();
+        assert!(tools.attribute);
+        assert!(tools.uses.contains("Shop.Search"));
+        assert!(!facts.top.uses.contains("Shop.Search"));
+        let get = facts.defs.iter().find(|d| d.name == "get").unwrap();
+        assert!(get.refs.contains("@tools"));
+        // An attribute the compiler reads stays code of the whole file.
+        assert_eq!(facts.class_of(2), LineClass::Top);
+        assert!(facts.defs.iter().all(|d| d.name != "@derive"));
+    }
+
+    #[test]
+    fn a_callback_name_is_an_ordinary_function_in_a_module_that_uses_impl() {
+        let source = "defmodule Shop.Session do\n  use GenServer\n\n  def handle_event(pid, event), do: GenServer.cast(pid, {:event, event})\n\n  @impl true\n  def handle_cast({:event, e}, state), do: {:noreply, [e | state]}\nend\n\ndefmodule Shop.Live do\n  def handle_event(_, _, socket), do: {:noreply, socket}\nend\n";
+        let facts = extract(Path::new("lib/shop/session.ex"), source);
+        let named: Vec<bool> = facts
+            .defs
+            .iter()
+            .filter(|d| d.name == "handle_event")
+            .map(|d| d.callback)
+            .collect();
+        // Without `@impl` anywhere in its module, the name still counts.
+        assert_eq!(named, [false, true]);
+        let cast = facts.defs.iter().find(|d| d.name == "handle_cast").unwrap();
+        assert!(cast.callback);
     }
 
     #[test]
@@ -1389,9 +1634,14 @@ end
         assert!(!dead(
             "defmodule Shop.A do\n  @impl true\n  def a, do: 1\nend\n"
         ));
-        assert!(!dead(
-            "defmodule Shop.A do\n  use Shop.Macros\n  def a, do: 1\nend\n"
-        ));
+        // A `use` is recorded, and whether it can call back into the module
+        // is config: the engine decides.
+        let used = extract(
+            Path::new("lib/shop/a.ex"),
+            "defmodule Shop.A do\n  use Shop.Macros\n  def a, do: 1\nend\n",
+        );
+        assert!(used.unnamed_is_dead);
+        assert_eq!(used.uses, ["Shop.Macros"]);
         assert!(!dead(
             "defmodule Shop.A do\n  @derive Jason.Encoder\n  defstruct [:a]\nend\n"
         ));

@@ -1008,9 +1008,10 @@ How a change is followed:
     `defimpl` or `defprotocol`, affects nothing. The file registers no
     callback and expands no macro, so no test can run the function; a
     call through a name built at run time (`apply(m, :"set_#{x}", [])`) is
-    not followed. `use ExVerify`, `Ecto.Schema`, `Protobuf` and `Bitwise`
-    do not count as such a registration. An edit to the function itself
-    still affects every definition that uses its file.
+    not followed. A `use` of `Bitwise`, or of a module listed in
+    `[affected.related] inert_uses` (or a pack's), does not count as such a
+    registration. An edit to the function itself still affects every
+    definition that uses its file.
 - An Elixir message clause (`handle_call`, `handle_cast`, `handle_info`,
   `handle_continue`, a channel's `handle_in`, a state machine's
   `handle_event/4`) whose message pattern starts with a literal
@@ -1046,6 +1047,93 @@ How a change is followed:
   message clause above. Other callbacks (`mount`, `render`, `call`,
   `handle_in`, `handle_event/4`) still affect every definition that uses
   their file.
+- **Dispatch rules** say which calls run a framework's callback, in place of
+  every user of its module. A rule names a behaviour (an Elixir module the
+  callback's module `use`s or names in `@behaviour`, or a Rust trait it
+  implements), the callbacks it covers, and two kinds of call:
+  - `callers` run the callback of the module they are handed. A definition
+    that uses the module and makes one of these calls reaches the callback.
+  - `runners` run the callback of any module the rule covers. A definition
+    that makes one reaches every covered callback in its own project and
+    the projects downstream. So does a `callers` call that names no module:
+    a helper handed the worker by its caller, or `perform_job(@worker, args)`.
+
+  A bare name (`perform_job`) matches the function however it is
+  qualified; `Oban.drain_queue` matches only that module's. A call to the
+  callback by its own name still reaches it. A rule is checked before the
+  message and lifecycle rules above.
+- **Framework rules** in `[affected.related]` hold what aster cannot see in
+  a library's code. Aster's own code knows the language (OTP callbacks,
+  `@behaviour`, `@derive`, ExUnit's `@tag`), not any library:
+  - `dispatch`: the rules above.
+  - `inert_uses`: modules whose `use` calls nothing of the module that uses
+    it (a schema or verification DSL); see the dead-code exception above.
+  - `compile_attributes`: module attributes a library's macro reads at
+    compile time (`primary_key`, without `@`). A change to one counts as
+    code of its module's body, even where the module's own code reads it.
+  - `packs`: built-in sets of these same keys, one per framework, shipped
+    as TOML files (`src/related/packs/`). Adding one needs no code.
+  - Upgrading: aster up to 0.33 treated `use Ecto.Schema`, `use Protobuf`
+    and `use ExVerify` as inert, and Ecto's schema attributes as compile
+    attributes, with no config. To keep that selection, set
+    `packs = ["ecto", "protobuf"]` and `inert_uses = ["ExVerify"]`. Without
+    them, selection is wider, never narrower.
+
+    | Pack | Holds |
+    |---|---|
+    | `oban` | dispatch for `Oban.Worker`'s `perform`, `timeout` and `backoff`: `perform_job` as a caller; `drain_queue`, `drain_jobs`, `run_jobs` and `with_testing_mode` as runners. Assumes tests run Oban with `testing: :manual`; with `testing: :inline`, leave it off. |
+    | `ecto` | `Ecto.Schema` as an inert use; `primary_key`, `foreign_key_type`, `schema_prefix`, `timestamps_opts` and `field_source_mapper` as compile attributes. |
+    | `protobuf` | `Protobuf` as an inert use. |
+
+  ```toml
+  [affected.related]
+  packs = ["oban", "ecto"]
+  inert_uses = ["MyApp.Verify"]
+
+  [[affected.related.dispatch]]
+  behaviour = "MyApp.Handler"
+  callbacks = ["handle"]
+  callers = ["MyApp.Dispatcher.run"]
+  runners = ["MyApp.Dispatcher.flush"]
+  ```
+- **Boundaries** stop the walk at a hub: a registry, an allowlist, or a
+  process most code goes through, whose callers reach most of the workspace.
+  Past a boundary the walk marks only test code (test files and test
+  support such as `test/support`): the tests that use the hub directly.
+  The boundary's own file is walked as usual, and a change elsewhere that
+  reaches the hub stops there too. Each boundary needs a `reason` that says
+  which tests still cover it. A boundary trades coverage for speed on
+  purpose: code that uses the hub indirectly is no longer selected, so keep
+  full runs (on `main`, say) to catch what it hides. `aster check` reports a
+  boundary whose files match nothing (`bad-related-rule`). To find
+  candidates, `aster graph --source --commit <range> --hubs 10` lists the
+  files the most reached tests go through.
+
+  ```toml
+  [[affected.related.boundary]]
+  files = ["src/elixir/core/lib/events/event_series/dims.ex"]
+  reason = "dims_test.exs checks every allowlist entry"
+  ```
+- An Elixir module that shares its file (a nested `defmodule`, or one of
+  several modules at the top of a file) keeps the code of its body (`use`,
+  `defstruct`, other calls outside its functions) apart from the
+  file's. A change there affects the module's own definitions and the
+  definitions that name the module, not every definition of the file and
+  every user of it. A module alone in its file keeps the rule for code
+  outside every definition.
+- An Elixir module attribute (`@registry %{search: SearchTool}`) is a
+  definition of its own. A change to it, or to a module it names, affects
+  the functions that read `@registry`, not every function of the file. An
+  attribute nothing in the file reads is read by a macro at compile time,
+  and so are `@before_compile`, `@derive`, `@tag` and the other attributes
+  the compiler or ExUnit reads, and a library's `compile_attributes`: they
+  count as code of the module's body.
+- In an Elixir module that marks any function `@impl`, a function counts as
+  a callback only when it is marked: the compiler warns about a callback
+  without `@impl` there. A public `handle_event/3` that other code calls by
+  name is then an ordinary function. The mark covers every clause of the
+  function. `start_link`, `start`, `child_spec`, `__using__` and the
+  compile hooks are called by convention and keep counting as callbacks.
 - A module name that more than one project defines (two `Shop.Fixtures`)
   resolves, for a file, to the copy in its own project; failing that, to the
   copy in a project it depends on. The copy in a project it does not depend
@@ -1054,8 +1142,16 @@ How a change is followed:
 - Elixir code that lists modules at run time
   (`:application.get_key(app, :modules)`, `Application.spec(app, :modules)`,
   `:code.all_loaded()`) can call into any of them, so it is affected by
-  every source change in its own project and in the projects that one
-  depends on.
+  source changes in its own project and in the projects that one depends
+  on. What it finds changes only when a module is added or removed, when
+  code outside a module's functions or a macro changes (where `use` and
+  macros generate functions), or when a function changes whose name the
+  file holds as an atom or calls on a value
+  (`function_exported?(mod, :public_id_prefix, 0)`, `mod.__log_name__()`),
+  or which had that name before the change (a rename). An edit to the body
+  of any other function does not reach it. A file that
+  calls `apply` or reads a module's list of functions (`__info__(:functions)`)
+  may look for any name, and keeps the wider rule.
 - A file that is not source maps to the definitions whose string literals
   name it (by path where the path resolves, by bare file name within its own
   project), to the Go declaration that embeds it (`//go:embed`), to the Go
@@ -1463,6 +1559,7 @@ configuration findings.
 | --- | --- | --- |
 | `unnarrowable-test-command` | warning | A test target whose command contains a test runner Aster can narrow, but whose shape Aster refuses to narrow, so `--related` runs the whole target whenever it selects it. This includes a package script that contains a runner Aster cannot narrow ("package script test-ci contains vitest run, which Aster cannot narrow"), and an entry target (`--entry`, `[check] entries`, a lane's `target`) whose command is not inert and not narrowable: a script file (`./test-ci.sh`, `bash tools/run.sh`), which Aster does not read, or a package script with no runner. These are the targets `--related` reports as "not a test command Aster can narrow; running as written". The reason is the one the narrowing computes: a substitution (`$(...)`, backticks, `{files}`), a shell operator, an interpreter running a script it cannot read to the end (`bash -c 'a && mix test && b'`), an expansion in the program position, a runner of another language than the project's, or a program in front of the runner that is not listed in `[affected.related] wrappers` (`mise exec node@24 -- vitest run`). Configured wrappers are honoured. |
 | `suspicious-path-literal` | warning | A literal in a test that names an existing workspace path, carries no `not-a-read` or covering `reads` annotation, and is an argument of a write-like call (write, mkdir, touch, the destination of a copy or rename) or a non-first argument of a path join whose base is not a workspace root expression. Not reported when an `aster: reads` entry in the same definition declares the path (see [Correcting which paths a test reads](#correcting-which-paths-a-test-reads)). Suggests `aster: not-a-read` if the code does not read the repository path, or `aster: reads` / leaving it if it does. |
+| `bad-related-rule` | error | An `[affected.related]` rule that no longer matches the workspace: a `[[affected.related.boundary]]` glob that matches no source file, a dispatch rule (written out or from a pack) whose behaviour no module takes on, an `inert_uses` module no module uses, or a `compile_attributes` name no module sets. Each silently does nothing. |
 | `bad-consumes` | error | A `[consumes."//x"]` key that is not a project, or a `files` glob that matches no source file. (A key that is missing from `depends_on` is already a configuration error, exit `2`.) |
 | `orphan-test-target` | warning | A test target that no entry target reaches through `depends_on` or `selected_by`, so CI never runs it. A target is not reported when a reached target runs the same runner over the project's whole suite (including a shard that `cd`s into the project) and the target only names some of its test files without picking tests by `--include`, `--only`, `--tag` or the like. A target whose command is a package script that a reached target calls (`pnpm <script>`, `pnpm run <script>`, `npm run <script>`, `yarn <script>`, through nested scripts), or whose script only calls such scripts, is reached too. A whole-suite run through a package script (`pnpm test`, `npm run test:ci`, `yarn test`, `bun run test`) counts as its script's runner (vitest, jest, mocha, `bun test`, `node --test`), following `&&` chains into other scripts; `pre`/`post` hooks are not followed. `pnpm exec vitest run` and `vitest run` are the same runner. An `alias` entry reaches the target it aliases. A reached `cargo test` or `cargo nextest run` with `--workspace` (or `--all`) covers `cargo test` and `cargo nextest run` in every project below that project's directory, unless that command picks packages, targets or tests (`-p`, `--test`, `--`, `-E`). `go test ./...` is a whole suite, `.venv/bin/python -m pytest` is `python -m pytest`. A `--config <file>` is not a test file, and a target that passes `--config` is covered only by a whole-suite run with the same `--config`. |
 | `stale-annotation` | error | An `aster: not-a-read` whose line holds no path-naming literal, an `aster: reads` path that matches nothing, or an unknown `aster:` directive. |

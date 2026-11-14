@@ -567,6 +567,27 @@ pub struct AffectedRelatedConfig {
     /// enough to be sharded, so a packed lane is never the slowest one.
     #[serde(default = "default_pack_shards_up_to")]
     pub pack_shards_up_to: usize,
+    /// How frameworks reach callbacks nothing calls by name: which calls
+    /// run them, in place of every user of their module.
+    #[serde(default)]
+    pub dispatch: Vec<crate::related::DispatchRule>,
+    /// Modules whose `use` calls no function of the module that uses it
+    /// (a schema or verification DSL). Unnamed functions of a file whose only
+    /// `use`s are these are dead code.
+    #[serde(default)]
+    pub inert_uses: Vec<String>,
+    /// Module attributes a library reads at compile time, without `@`. A
+    /// change to one counts as a change to its whole module, even where the
+    /// module's own code also reads it.
+    #[serde(default)]
+    pub compile_attributes: Vec<String>,
+    /// Built-in packs by name (`oban`, `ecto`): sets of these same rules
+    /// for one framework, shipped as data with aster.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// Hub files where the walk from a change stops.
+    #[serde(default)]
+    pub boundary: Vec<crate::related::Boundary>,
 }
 
 /// Default for [`AffectedRelatedConfig::pack_shards_up_to`].
@@ -581,6 +602,11 @@ impl Default for AffectedRelatedConfig {
         Self {
             wrappers: Vec::new(),
             pack_shards_up_to: DEFAULT_PACK_SHARDS_UP_TO,
+            dispatch: Vec::new(),
+            inert_uses: Vec::new(),
+            compile_attributes: Vec::new(),
+            packs: Vec::new(),
+            boundary: Vec::new(),
         }
     }
 }
@@ -615,7 +641,48 @@ impl RelatedWrapperConfig {
 }
 
 impl AffectedRelatedConfig {
+    /// The rules written here followed by those of each named pack.
+    pub fn rules(&self) -> crate::related::Rules {
+        let own = crate::related::Pack {
+            dispatch: self.dispatch.clone(),
+            inert_uses: self.inert_uses.clone(),
+            compile_attributes: self.compile_attributes.clone(),
+        };
+        let packs = self
+            .packs
+            .iter()
+            .filter_map(|name| Some((name.clone(), crate::related::pack(name)?)))
+            .collect();
+        crate::related::Rules::new(self.boundary.clone(), own, packs)
+    }
+
     fn validate(&self) -> Result<()> {
+        for rule in &self.dispatch {
+            if let Err(problem) = rule.validate() {
+                bail!("dispatch: {problem}");
+            }
+        }
+        let own = crate::related::Pack {
+            dispatch: Vec::new(),
+            inert_uses: self.inert_uses.clone(),
+            compile_attributes: self.compile_attributes.clone(),
+        };
+        if let Err(problem) = own.validate() {
+            bail!("{problem}");
+        }
+        for boundary in &self.boundary {
+            if let Err(problem) = boundary.validate() {
+                bail!("boundary: {problem}");
+            }
+        }
+        for name in &self.packs {
+            if crate::related::pack(name).is_none() {
+                bail!(
+                    "packs: unknown pack {name:?} (known: {})",
+                    crate::related::pack_names().join(", ")
+                );
+            }
+        }
         for wrapper in &self.wrappers {
             let (program, until) = wrapper.parts();
             if program.trim().is_empty() || program.contains(char::is_whitespace) {

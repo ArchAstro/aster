@@ -17,7 +17,8 @@
 //!    file that defines it. Methods are matched by name alone within the
 //!    projects downstream of their own, since callers reach them through a
 //!    value. A definition nothing names (a framework callback, a macro)
-//!    affects every user of its file.
+//!    affects every user of its file, unless a dispatch rule says which
+//!    calls run it (see `dispatch`).
 //! 4. The affected tests, grouped by project, are what runs.
 //!
 //! The analysis is syntactic, so it over-approximates, and where it cannot
@@ -35,6 +36,7 @@
 mod annotations;
 mod cache;
 mod consumers;
+mod dispatch;
 mod elixir;
 mod engine;
 mod facts;
@@ -47,8 +49,10 @@ mod resolve;
 mod rust;
 mod sites;
 
+pub use dispatch::{pack, pack_names, Boundary, DispatchRule, Pack, Rules};
 pub use engine::{analyse, analyse_with, Change, GraphNode, Hop, Outcome, Related, TestSelection};
 pub use facts::Family;
 pub use lint::{
-    bad_consumes, stale_annotations, suspicious_path_literals, Finding as SourceFinding, Sources,
+    bad_consumes, bad_related_rules, stale_annotations, suspicious_path_literals,
+    Finding as SourceFinding, Sources,
 };

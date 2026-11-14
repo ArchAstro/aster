@@ -1,0 +1,5 @@
+# Generated protobuf-elixir modules (https://hexdocs.pm/protobuf).
+
+# `use Protobuf` defines encoding functions; it calls no function of the
+# module that uses it by a name the workspace does not write.
+inert_uses = ["Protobuf"]

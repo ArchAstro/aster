@@ -260,6 +260,418 @@ fn framework_callback_change_selects_users_of_the_module() {
     );
 }
 
+/// An Oban worker, a signup that enqueues it, and four tests: one that only
+/// checks the job was enqueued, one that performs it with `perform_job`, one
+/// that drains the queue, and one that calls `perform` by name.
+const OBAN: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/mailer_job.ex",
+        "defmodule Shop.MailerJob do\n  use Oban.Worker, queue: :mail\n\n  @impl Oban.Worker\n  def perform(%Oban.Job{args: args}), do: {:ok, args}\nend\n",
+    ),
+    (
+        "shop/lib/shop/signup.ex",
+        "defmodule Shop.Signup do\n  def register(email), do: %{email: email} |> Shop.MailerJob.new() |> Oban.insert()\nend\n",
+    ),
+    (
+        "shop/test/shop/enqueue_test.exs",
+        "defmodule Shop.EnqueueTest do\n  use ExUnit.Case\n  use Oban.Testing, repo: Shop.Repo\n\n  test \"enqueues\" do\n    Shop.Signup.register(\"a\")\n    assert_enqueued worker: Shop.MailerJob\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/perform_test.exs",
+        "defmodule Shop.PerformTest do\n  use ExUnit.Case\n  use Oban.Testing, repo: Shop.Repo\n\n  test \"performs\" do\n    assert {:ok, _} = perform_job(Shop.MailerJob, %{})\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/drain_test.exs",
+        "defmodule Shop.DrainTest do\n  use ExUnit.Case\n\n  test \"drains\" do\n    Shop.Signup.register(\"a\")\n    assert %{success: 1} = Oban.drain_queue(queue: :mail)\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/direct_test.exs",
+        "defmodule Shop.DirectTest do\n  use ExUnit.Case\n\n  test \"calls perform\" do\n    assert {:ok, _} = Shop.MailerJob.perform(%Oban.Job{args: %{}})\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn an_oban_perform_runs_for_what_performs_or_drains_the_job_not_for_what_only_enqueues_it() {
+    // Without a rule, `perform` is a callback nothing names, so every user
+    // of the worker module runs: `register` enqueues the job, so both tests
+    // that sign up run, the enqueue-only one included.
+    let ws = Workspace::new(OBAN);
+    ws.edit(
+        "shop/lib/shop/mailer_job.ex",
+        "{:ok, args}",
+        "{:ok, Map.new(args)}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/direct_test.exs test/shop/drain_test.exs test/shop/enqueue_test.exs test/shop/perform_test.exs"]
+    );
+
+    // The `oban` pack says what runs `perform`: `perform_job` handed the
+    // worker, a queue drain, or a call by name. Enqueueing the job and
+    // asserting it was enqueued does not.
+    let ws = Workspace::with_config("[affected.related]\npacks = [\"oban\"]\n", OBAN);
+    ws.edit(
+        "shop/lib/shop/mailer_job.ex",
+        "{:ok, args}",
+        "{:ok, Map.new(args)}",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/direct_test.exs test/shop/drain_test.exs test/shop/perform_test.exs"]
+    );
+    let notes = plan.notes("//shop:test");
+    assert!(!notes.contains("enqueue_test"), "{notes}");
+}
+
+#[test]
+fn a_perform_job_handed_the_worker_by_its_caller_still_runs_the_worker() {
+    // `perform_job` is made by a helper that takes the worker, and by a test
+    // that holds it in `@worker`: neither call names the worker module, so
+    // each may run any worker.
+    let files: &[(&str, &str)] = &[
+        OBAN[0],
+        OBAN[1],
+        (
+            "shop/test/support/worker_case.ex",
+            "defmodule Shop.WorkerCase do\n  use Oban.Testing, repo: Shop.Repo\n  def run(worker, args), do: perform_job(worker, args)\nend\n",
+        ),
+        (
+            "shop/test/shop/helper_test.exs",
+            "defmodule Shop.HelperTest do\n  use ExUnit.Case\n  import Shop.WorkerCase\n\n  test \"helper\" do\n    assert {:ok, _} = run(Shop.MailerJob, %{})\n  end\nend\n",
+        ),
+        (
+            "shop/test/shop/attr_test.exs",
+            "defmodule Shop.AttrTest do\n  use ExUnit.Case\n  @worker Shop.MailerJob\n\n  test \"attr\" do\n    assert {:ok, _} = Oban.Testing.perform_job(@worker, %{})\n  end\nend\n",
+        ),
+    ];
+    let ws = Workspace::with_config("[affected.related]\npacks = [\"oban\"]\n", files);
+    ws.edit(
+        "shop/lib/shop/mailer_job.ex",
+        "{:ok, args}",
+        "{:ok, Map.new(args)}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/attr_test.exs test/shop/helper_test.exs"]
+    );
+}
+
+#[test]
+fn a_dispatch_rule_written_in_config_narrows_a_callback_like_a_pack() {
+    let config = "[affected.related]\n\n[[affected.related.dispatch]]\nbehaviour = \"Oban.Worker\"\ncallbacks = [\"perform\"]\ncallers = [\"perform_job\"]\n";
+    let ws = Workspace::with_config(config, OBAN);
+    ws.edit(
+        "shop/lib/shop/mailer_job.ex",
+        "{:ok, args}",
+        "{:ok, Map.new(args)}",
+    );
+    // No runners: the drain test, which never names the worker, is not reached.
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/direct_test.exs test/shop/perform_test.exs"]
+    );
+}
+
+#[test]
+fn an_unknown_dispatch_pack_is_a_config_error() {
+    let ws = Workspace::with_config("[affected.related]\npacks = [\"sidekiq\"]\n", OBAN);
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown pack \"sidekiq\""), "{stderr}");
+}
+
+/// A module built with a DSL it `use`s, whose `build` nothing names and
+/// calls a helper, a test of another of its functions, and a test of the
+/// helper.
+const DSL: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/helper.ex",
+        "defmodule Shop.Helper do\n  def h(x), do: x\nend\n",
+    ),
+    (
+        "shop/lib/shop/order.ex",
+        "defmodule Shop.Order do\n  use Shop.Dsl\n\n  def build(x), do: Shop.Helper.h(x)\n\n  def total, do: 1\nend\n",
+    ),
+    (
+        "shop/test/shop/order_test.exs",
+        "defmodule Shop.OrderTest do\n  use ExUnit.Case\n\n  test \"total\" do\n    assert Shop.Order.total() == 1\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/helper_test.exs",
+        "defmodule Shop.HelperTest do\n  use ExUnit.Case\n\n  test \"h\" do\n    assert Shop.Helper.h(1) == 1\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_use_named_inert_in_config_cannot_call_the_unnamed_functions_of_its_module() {
+    // `use Shop.Dsl` may inject code that calls `build`, so a change `build`
+    // reaches selects every test of `Shop.Order`.
+    let ws = Workspace::new(DSL);
+    ws.edit("shop/lib/shop/helper.ex", "do: x", "do: x + 0");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/helper_test.exs test/shop/order_test.exs"]
+    );
+
+    // Config says the DSL calls nothing back: `build` is dead code.
+    let ws = Workspace::with_config("[affected.related]\ninert_uses = [\"Shop.Dsl\"]\n", DSL);
+    ws.edit("shop/lib/shop/helper.ex", "do: x", "do: x + 0");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/helper_test.exs"]
+    );
+}
+
+/// An Ecto-style schema that also reads `@primary_key` itself, and a test of
+/// each of its functions.
+const SCHEMA: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/item.ex",
+        "defmodule Shop.Item do\n  @primary_key false\n\n  def key, do: @primary_key\n\n  def name, do: \"item\"\nend\n",
+    ),
+    (
+        "shop/test/shop/key_test.exs",
+        "defmodule Shop.KeyTest do\n  use ExUnit.Case\n\n  test \"key\" do\n    assert Shop.Item.key() == false\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/name_test.exs",
+        "defmodule Shop.NameTest do\n  use ExUnit.Case\n\n  test \"name\" do\n    assert Shop.Item.name() == \"item\"\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_compile_attribute_from_a_pack_is_code_of_its_whole_module_even_where_the_module_reads_it() {
+    // Without the pack, `@primary_key` reaches only `key`, its reader.
+    let ws = Workspace::new(SCHEMA);
+    ws.edit(
+        "shop/lib/shop/item.ex",
+        "@primary_key false",
+        "@primary_key {:id, :id, []}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/key_test.exs"]
+    );
+
+    // The `ecto` pack says Ecto's `schema` macro reads it too, so a change
+    // may change every function the schema generates.
+    let ws = Workspace::with_config("[affected.related]\npacks = [\"ecto\"]\n", SCHEMA);
+    ws.edit(
+        "shop/lib/shop/item.ex",
+        "@primary_key false",
+        "@primary_key {:id, :id, []}",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/key_test.exs test/shop/name_test.exs"]
+    );
+}
+
+#[test]
+fn a_compile_attribute_written_with_its_at_sign_is_a_config_error() {
+    let ws = Workspace::with_config(
+        "[affected.related]\ncompile_attributes = [\"@primary_key\"]\n",
+        SCHEMA,
+    );
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("without `@`"), "{stderr}");
+}
+
+/// A registry that lists tool modules in a module attribute, a tool whose
+/// `run` the registry's callers reach through a value, and a test of each
+/// registry function.
+const REGISTRY: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/search_tool.ex",
+        "defmodule Shop.SearchTool do\n  @behaviour Shop.Tool\n\n  @impl true\n  def run(query), do: [query]\nend\n",
+    ),
+    (
+        "shop/lib/shop/registry.ex",
+        "defmodule Shop.Registry do\n  @tools %{search: Shop.SearchTool}\n\n  def get(key), do: Map.fetch!(@tools, key)\n\n  def count, do: 1\nend\n",
+    ),
+    (
+        "shop/test/shop/get_test.exs",
+        "defmodule Shop.GetTest do\n  use ExUnit.Case\n\n  test \"runs\" do\n    assert Shop.Registry.get(:search).run(\"a\") == [\"a\"]\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/count_test.exs",
+        "defmodule Shop.CountTest do\n  use ExUnit.Case\n\n  test \"counts\" do\n    assert Shop.Registry.count() == 1\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_module_listed_in_an_attribute_reaches_the_functions_that_read_it_not_the_whole_registry() {
+    let ws = Workspace::new(REGISTRY);
+    // `run` is a callback nothing names: every user of the tool is reached,
+    // and the registry uses it only in `@tools`.
+    ws.edit("shop/lib/shop/search_tool.ex", "[query]", "[query, query]");
+    let plan = ws.plan("test");
+    // `get` reads `@tools`; `count` shares the file and reads nothing.
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/get_test.exs"]
+    );
+}
+
+/// An allowlist most code goes through, a pipeline built on it, and a test
+/// of each, plus a test helper that calls the allowlist.
+const HUB: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/allowlist.ex",
+        "defmodule Shop.Allowlist do\n  @keys %{\"order\" => ~w(id total)}\n\n  def keys(type), do: Map.get(@keys, type)\nend\n",
+    ),
+    (
+        "shop/lib/shop/pipeline.ex",
+        "defmodule Shop.Pipeline do\n  def ingest(type, event), do: Map.take(event, Shop.Allowlist.keys(type))\nend\n",
+    ),
+    (
+        "shop/test/support/events.ex",
+        "defmodule Shop.Events do\n  def keys, do: Shop.Allowlist.keys(\"order\")\nend\n",
+    ),
+    (
+        "shop/test/shop/allowlist_test.exs",
+        "defmodule Shop.AllowlistTest do\n  use ExUnit.Case\n\n  test \"keys\" do\n    assert Shop.Allowlist.keys(\"order\") == [\"id\", \"total\"]\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/helper_test.exs",
+        "defmodule Shop.HelperTest do\n  use ExUnit.Case\n\n  test \"helper\" do\n    assert Shop.Events.keys() != []\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/pipeline_test.exs",
+        "defmodule Shop.PipelineTest do\n  use ExUnit.Case\n\n  test \"ingest\" do\n    assert Shop.Pipeline.ingest(\"order\", %{\"id\" => 1}) == %{\"id\" => 1}\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_boundary_stops_the_walk_at_a_hub_except_for_the_tests_that_use_it() {
+    // Without a boundary, a new allowlist entry reaches the pipeline and its
+    // test as well.
+    let ws = Workspace::new(HUB);
+    ws.edit(
+        "shop/lib/shop/allowlist.ex",
+        "~w(id total)",
+        "~w(id total currency)",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/allowlist_test.exs test/shop/helper_test.exs test/shop/pipeline_test.exs"]
+    );
+
+    // With the allowlist declared a boundary, the walk stops there: the
+    // test that uses it, and the one that uses it through a test helper,
+    // run; the pipeline's does not.
+    let config = "[affected.related]\n\n[[affected.related.boundary]]\nfiles = [\"shop/lib/shop/allowlist.ex\"]\nreason = \"allowlist_test covers every entry\"\n";
+    let ws = Workspace::with_config(config, HUB);
+    ws.edit(
+        "shop/lib/shop/allowlist.ex",
+        "~w(id total)",
+        "~w(id total currency)",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/allowlist_test.exs test/shop/helper_test.exs"]
+    );
+
+    // A boundary without a reason is a config error.
+    let ws = Workspace::with_config(
+        "[affected.related]\n\n[[affected.related.boundary]]\nfiles = [\"shop/lib/shop/allowlist.ex\"]\nreason = \"\"\n",
+        HUB,
+    );
+    let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs a `reason`"));
+}
+
+#[test]
+fn graph_source_hubs_ranks_the_files_reached_tests_go_through() {
+    let ws = Workspace::new(HUB);
+    ws.edit(
+        "shop/lib/shop/allowlist.ex",
+        "~w(id total)",
+        "~w(id total currency)",
+    );
+    let output = ws.aster(&["--json", "graph", "--source", "--hubs", "2"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hubs: Vec<(String, u64, bool)> = json["hubs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["file"].as_str().unwrap().to_string(),
+                h["tests"].as_u64().unwrap(),
+                h["changed"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    // Every test goes through the changed allowlist; one through the
+    // pipeline, one through the test helper.
+    assert_eq!(hubs[0], ("shop/lib/shop/allowlist.ex".to_string(), 3, true));
+    assert_eq!(hubs[1].1, 1);
+}
+
+/// A module with a nested module, and a test for each of their functions.
+const NESTED: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/tools.ex",
+        "defmodule Shop.Tools do\n  def list, do: [Search.name()]\n\n  def count, do: 2\n\n  defmodule Search do\n    @limit 10\n\n    def name, do: \"search \\#{@limit}\"\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/list_test.exs",
+        "defmodule Shop.ListTest do\n  use ExUnit.Case\n\n  test \"list\" do\n    assert length(Shop.Tools.list()) == 1\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/count_test.exs",
+        "defmodule Shop.CountTest do\n  use ExUnit.Case\n\n  test \"count\" do\n    assert Shop.Tools.count() == 2\n  end\nend\n",
+    ),
+    (
+        "shop/test/shop/search_test.exs",
+        "defmodule Shop.SearchTest do\n  use ExUnit.Case\n\n  test \"name\" do\n    assert Shop.Tools.Search.name() =~ \"search\"\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_nested_module_body_change_runs_what_reaches_that_module_not_its_whole_file() {
+    let ws = Workspace::new(NESTED);
+    // The nested module's attribute is code of its body, not of the file.
+    ws.edit("shop/lib/shop/tools.ex", "@limit 10", "@limit 20");
+    let plan = ws.plan("test");
+    // `list` calls into the nested module; `count` only shares its file.
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/list_test.exs test/shop/search_test.exs"]
+    );
+}
+
 /// A protocol with an implementation beside the struct it is for, a module
 /// that only builds the struct, one that prices it through the protocol, one
 /// that calls the implementation by its module name, and an implementation of
@@ -533,14 +945,14 @@ fn changing_one_handle_call_clause_selects_only_the_tests_that_send_its_message(
         ["mix test test/shop/dynamic_test.exs test/shop/reset_test.exs"]
     );
 
-    // Phase 3: code outside the clauses still propagates. A module
-    // attribute belongs to the whole module, so every sender is reached.
+    // Phase 3: a module attribute reaches the clauses that read it. Only
+    // the `{:bump, n}` clause reads `@step`, so the reset test stays out.
     let ws = Workspace::new(COUNTER);
     ws.edit("shop/lib/shop/counter.ex", "@step 1", "@step 2");
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//shop:test"),
-        ["mix test test/shop/bump_test.exs test/shop/dynamic_test.exs test/shop/reset_test.exs"]
+        ["mix test test/shop/bump_test.exs test/shop/dynamic_test.exs"]
     );
 
     // Phase 4: a clause that matches every message is reached by every
@@ -734,23 +1146,93 @@ fn a_core_test_does_not_run_the_web_fixture_that_shares_its_module_name() {
     );
 }
 
-#[test]
-fn a_test_that_lists_modules_at_run_time_runs_for_any_module_change() {
-    let mut files = ELIXIR.to_vec();
-    // Reaches every module's functions without naming one of them.
+/// A test that lists the application's modules and checks each one, and the
+/// name it checks them by.
+fn listing(check: &str) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&str, String)> = ELIXIR.iter().map(|(p, c)| (*p, c.to_string())).collect();
     files.push((
         "shop/test/shop/modules_test.exs",
-        "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"every module answers\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    for module <- modules, do: assert(module.module_info(:module) == module)\n  end\nend\n",
+        format!("defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"every module answers\" do\n    {{:ok, modules}} = :application.get_key(:shop, :modules)\n    for module <- modules, do: assert({check})\n  end\nend\n"),
     ));
-    let ws = Workspace::new(&files);
+    files
+}
+
+fn workspace(files: &[(&str, String)]) -> Workspace {
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    Workspace::new(&files)
+}
+
+#[test]
+fn a_test_that_lists_modules_runs_when_a_change_can_alter_what_it_finds() {
+    // The lister asks every module for `module_info(:module)`. Editing the
+    // body of `tax` changes neither which modules exist nor what that
+    // returns, so only the test that calls `tax` runs.
+    let ws = workspace(&listing("module.module_info(:module) == module"));
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/tax_test.exs"]
+    );
+
+    // A lister that looks for `tax` on each module does see that edit.
+    let ws = workspace(&listing(
+        "not function_exported?(module, :tax, 1) or module.tax(10) > 0",
+    ));
     ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
     let plan = ws.plan("test");
     assert_eq!(
         plan.commands("//shop:test"),
         ["mix test test/shop/modules_test.exs test/shop/tax_test.exs"]
     );
-    let notes = plan.notes("//shop:test");
-    assert!(notes.contains("lists modules at run time"), "{notes}");
+    assert!(plan
+        .notes("//shop:test")
+        .contains("lists modules at run time"));
+
+    // Code outside every function (where `use` and macros generate
+    // functions) can change what any lister finds.
+    let ws = workspace(&listing("module.module_info(:module) == module"));
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "defmodule Shop.Pricing do\n",
+        "defmodule Shop.Pricing do\n  @moduledoc false\n  use Shop.Hooks\n",
+    );
+    assert!(ws.plan("test").commands("//shop:test")[0].contains("test/shop/modules_test.exs"));
+
+    // A lister that can call a function by a computed name reaches any edit.
+    let ws = workspace(&listing("apply(module, :module_info, [:module]) == module"));
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/modules_test.exs test/shop/tax_test.exs"]
+    );
+}
+
+#[test]
+fn renaming_a_function_a_lister_looks_for_reaches_the_lister() {
+    // The lister keeps modules that export `run/1`. Renaming `run` removes
+    // the name it looks for, which an edit of the new name alone would not
+    // show.
+    let files: &[(&str, &str)] = &[
+        ELIXIR[0],
+        (
+            "shop/lib/shop/registry.ex",
+            "defmodule Shop.Registry do\n  def plugins do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    Enum.filter(modules, &function_exported?(&1, :run, 1))\n  end\nend\n",
+        ),
+        (
+            "shop/lib/shop/plugin.ex",
+            "defmodule Shop.Plugin do\n  def run(x), do: x\nend\n",
+        ),
+        (
+            "shop/test/shop/registry_test.exs",
+            "defmodule Shop.RegistryTest do\n  use ExUnit.Case\n\n  test \"plugins\" do\n    assert Shop.Registry.plugins() != []\n  end\nend\n",
+        ),
+    ];
+    let ws = Workspace::new(files);
+    ws.edit("shop/lib/shop/plugin.ex", "def run(x)", "def go(x)");
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        ["mix test test/shop/registry_test.exs"]
+    );
 }
 
 #[test]
@@ -3039,7 +3521,7 @@ fn cross_language_dependent_runs_only_the_tests_that_consume_the_dependency() {
         "{notes}"
     );
     assert!(
-        notes.contains("assets.ex ← names gateway/configs in //gateway, which changed"),
+        notes.contains("@dir (platform/lib/platform/assets.ex:2) ← names gateway/configs in //gateway, which changed"),
         "{notes}"
     );
     assert!(
@@ -4123,8 +4605,8 @@ fn a_change_that_reaches_no_test_selects_nothing_and_never_more_than_a_smaller_c
 
 #[test]
 fn a_reflecting_test_counts_as_reaching_the_change() {
-    // Setup: a test lists the application's modules, so any code change
-    // reaches it; `unused` is named by no test.
+    // Setup: a test lists the application's modules and looks for `unused`
+    // on them, so a change to it reaches the test though no test names it.
     let files = [
         PIPELINE[0],
         (
@@ -4133,7 +4615,7 @@ fn a_reflecting_test_counts_as_reaching_the_change() {
         ),
         (
             "shop/test/modules_test.exs",
-            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert is_list(modules)\n  end\nend\n",
+            "defmodule Shop.ModulesTest do\n  use ExUnit.Case\n\n  test \"modules\" do\n    {:ok, modules} = :application.get_key(:shop, :modules)\n    assert Enum.any?(modules, &function_exported?(&1, :unused, 1))\n  end\nend\n",
         ),
         PIPELINE[4],
     ];

@@ -1,0 +1,14 @@
+# Ecto schemas (https://hexdocs.pm/ecto).
+
+# `use Ecto.Schema` imports the schema macros; it calls no function of the
+# module that uses it.
+inert_uses = ["Ecto.Schema"]
+
+# The `schema` macro reads these at compile time.
+compile_attributes = [
+  "primary_key",
+  "foreign_key_type",
+  "schema_prefix",
+  "timestamps_opts",
+  "field_source_mapper",
+]
