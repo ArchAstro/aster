@@ -102,6 +102,85 @@ fn branch(out: &mut String, nodes: &[GraphNode], children: &[Vec<usize>], at: us
     }
 }
 
+/// One file that reached tests go through, and how many.
+pub struct Hub {
+    pub file: std::path::PathBuf,
+    /// Reached test definitions whose chain from the change passes through
+    /// a definition of the file.
+    pub tests: usize,
+    /// The file holds a changed definition.
+    pub changed: bool,
+}
+
+/// The `count` non-test files the most reached tests are reached through,
+/// following each test's chain back to the change. Cutting the walk at one
+/// (`[[affected.related.boundary]]`) drops the tests that only it leads to.
+pub fn hubs(analysis: &Related, count: usize) -> Vec<Hub> {
+    let nodes = &analysis.graph;
+    let mut through: BTreeMap<&Path, usize> = BTreeMap::new();
+    for node in nodes.iter().filter(|node| node.test) {
+        let mut seen = std::collections::HashSet::new();
+        let mut at = node.via;
+        let mut steps = 0;
+        while let Some(index) = at {
+            let hop = &nodes[index];
+            if !hop.test && seen.insert(hop.file.as_path()) {
+                *through.entry(hop.file.as_path()).or_default() += 1;
+            }
+            at = hop.via;
+            steps += 1;
+            if steps > nodes.len() {
+                break;
+            }
+        }
+    }
+    let changed: std::collections::HashSet<&Path> = nodes
+        .iter()
+        .filter(|node| node.changed.is_some() && node.via.is_none())
+        .map(|node| node.file.as_path())
+        .collect();
+    let mut hubs: Vec<Hub> = through
+        .into_iter()
+        .map(|(file, tests)| Hub {
+            file: file.to_path_buf(),
+            tests,
+            changed: changed.contains(file),
+        })
+        .collect();
+    hubs.sort_by(|a, b| b.tests.cmp(&a.tests).then_with(|| a.file.cmp(&b.file)));
+    hubs.truncate(count);
+    hubs
+}
+
+pub fn render_hubs(hubs: &[Hub], analysis: &Related, range: &str) -> String {
+    let tests = analysis.graph.iter().filter(|node| node.test).count();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Files the {tests} reached test definitions of {range} go through:"
+    );
+    for hub in hubs {
+        let _ = writeln!(
+            out,
+            "  {:>7}  {}{}",
+            hub.tests,
+            hub.file.display(),
+            if hub.changed { "  (changed)" } else { "" }
+        );
+    }
+    out
+}
+
+pub fn render_hubs_json(hubs: &[Hub], range: &str) -> Value {
+    json!({
+        "range": range,
+        "hubs": hubs
+            .iter()
+            .map(|hub| json!({ "file": hub.file, "tests": hub.tests, "changed": hub.changed }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The graph as nodes and edges; an edge runs from a definition to one
 /// that uses it.
 pub fn render_json(analysis: &Related, range: &str) -> Value {

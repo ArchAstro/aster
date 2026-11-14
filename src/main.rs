@@ -660,6 +660,7 @@ fn run() -> Result<()> {
             commit,
             dir,
             ext,
+            hubs,
             ..
         } => {
             let detector = AffectedDetector::new(&workspace_root)
@@ -672,6 +673,10 @@ fn run() -> Result<()> {
             let graph = build_graph(&projects)?;
             let facts_cache =
                 (!cli.no_cache).then(|| aster::cache::resolve_cache_dir(&workspace_root));
+            let rules = WorkspaceConfig::load(&workspace_root)?
+                .affected
+                .related
+                .rules();
             let analysis = aster::related::analyse_with(
                 &workspace_root,
                 &projects,
@@ -679,9 +684,18 @@ fn run() -> Result<()> {
                 &changes,
                 facts_cache.as_deref(),
                 true,
+                &rules,
             );
             let range = source_graph::describe_range(commit.as_deref());
-            if output_mode == OutputMode::Json {
+            if let Some(count) = hubs {
+                let hubs = source_graph::hubs(&analysis, count);
+                if output_mode == OutputMode::Json {
+                    let value = source_graph::render_hubs_json(&hubs, &range);
+                    outln!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    out!("{}", source_graph::render_hubs(&hubs, &analysis, &range));
+                }
+            } else if output_mode == OutputMode::Json {
                 let value = source_graph::render_json(&analysis, &range);
                 outln!("{}", serde_json::to_string_pretty(&value)?);
             } else {
@@ -1139,6 +1153,7 @@ fn run() -> Result<()> {
                     &changes,
                     facts_cache.as_deref(),
                     explain,
+                    &workspace_config.affected.related.rules(),
                 );
                 if output_mode == OutputMode::Verbose {
                     errln!(

@@ -371,6 +371,102 @@ pub fn stale_annotations(projects: &[DiscoveredProject], src: &Sources) -> Vec<F
 
 /// `[consumes]` entries that name something that is not a project, or list
 /// a `files` pattern that matches no source file.
+/// `[affected.related]` rules that no longer match the workspace: a
+/// boundary glob that matches no source file, and a dispatch rule whose
+/// behaviour no source file takes on. Each is config that silently does
+/// nothing, which is how a hand-kept list rots.
+pub fn bad_related_rules(rules: &super::Rules, src: &Sources) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut report = |message: String| {
+        findings.push(Finding {
+            file: PathBuf::from("aster.toml"),
+            line: None,
+            project: None,
+            message,
+        });
+    };
+    for boundary in &rules.boundaries {
+        for pattern in &boundary.files {
+            let Ok(glob) = globset::Glob::new(pattern) else {
+                continue;
+            };
+            let matcher = glob.compile_matcher();
+            if !src.facts.keys().any(|source| matcher.is_match(source)) {
+                report(format!(
+                    "[[affected.related.boundary]] lists `{pattern}`, which matches no source \
+                     file; the boundary stops nothing"
+                ));
+            }
+        }
+    }
+    let behaviour_taken = |behaviour: &str| {
+        src.facts.values().any(|facts| {
+            facts.defs.iter().any(|def| {
+                def.behaviours.iter().any(|b| b == behaviour)
+                    || def.implements.as_deref() == Some(behaviour)
+            })
+        })
+    };
+    let used = |module: &str| {
+        src.facts
+            .values()
+            .any(|facts| facts.uses.iter().any(|m| m == module))
+    };
+    let set = |attribute: &str| {
+        let name = format!("@{attribute}");
+        src.facts.values().any(|facts| {
+            facts
+                .defs
+                .iter()
+                .any(|def| def.attribute && def.name == name)
+        })
+    };
+    for (origin, pack) in &rules.origins {
+        let stale_rules = pack
+            .dispatch
+            .iter()
+            .filter(|rule| !behaviour_taken(&rule.behaviour))
+            .map(|rule| {
+                format!(
+                    "the dispatch rule for `{}` (no module takes on that behaviour)",
+                    rule.behaviour
+                )
+            });
+        let stale_uses = pack
+            .inert_uses
+            .iter()
+            .filter(|module| !used(module))
+            .map(|module| format!("`inert_uses` entry `{module}` (no module uses it)"));
+        let stale_attributes = pack
+            .compile_attributes
+            .iter()
+            .filter(|attribute| !set(attribute))
+            .map(|attribute| {
+                format!("`compile_attributes` entry `{attribute}` (no module sets it)")
+            });
+        let stale: Vec<String> = stale_rules
+            .chain(stale_uses)
+            .chain(stale_attributes)
+            .collect();
+        let entries = pack.dispatch.len() + pack.inert_uses.len() + pack.compile_attributes.len();
+        match origin {
+            None => {
+                for entry in stale {
+                    report(format!("{entry} matches nothing; the entry does nothing"));
+                }
+            }
+            // A repo uses part of a framework: the pack is stale only when
+            // none of it matches.
+            Some(name) if entries > 0 && stale.len() == entries => report(format!(
+                "pack `{name}` matches nothing in the workspace: {}",
+                stale.join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    findings
+}
+
 pub fn bad_consumes(projects: &[DiscoveredProject], src: &Sources) -> Vec<Finding> {
     let addresses: HashSet<String> = projects
         .iter()

@@ -169,6 +169,25 @@ pub struct Def {
     /// Modules named other than as the receiver of a call (`%Mod{}`, an
     /// argument, a child spec). Only Elixir fills this.
     pub bare: BTreeSet<String>,
+    /// The behaviours the definition's module takes on: what an Elixir
+    /// module `use`s or declares with `@behaviour`. A dispatch rule (see
+    /// [`DispatchRule`]) matches a callback by these and by
+    /// [`Self::implements`].
+    #[serde(default)]
+    pub behaviours: Vec<String>,
+    /// The code of a module body outside its definitions, for a module that
+    /// does not hold its whole file (a nested `defmodule`, or one of several
+    /// in a file). [`Self::name`] is the module. It runs in each definition
+    /// inside its lines, and its users are those that name the module, not
+    /// every user of the file.
+    #[serde(default)]
+    pub body: bool,
+    /// An Elixir module attribute (`@name value`); [`Self::name`] is
+    /// `@name`. The definitions that read `@name` reach it. One nothing in
+    /// its file reads is read at compile time by a macro, and counts as
+    /// code of the whole file.
+    #[serde(default)]
+    pub attribute: bool,
 }
 
 /// A fixed explanation. An alias keeps serde from tying the lifetime of
@@ -216,6 +235,9 @@ impl Def {
             sends_any: false,
             hands_over: BTreeSet::new(),
             bare: BTreeSet::new(),
+            behaviours: Vec::new(),
+            body: false,
+            attribute: false,
         }
     }
 
@@ -337,10 +359,25 @@ pub struct FileFacts {
     pub parse_error: bool,
     /// A definition nothing in the workspace names is never called: nothing
     /// in this file registers a module as a callback module or expands
-    /// into calls (Elixir, with no `use`, `@behaviour`, `@impl`, `@derive`,
-    /// `defimpl` or `defprotocol`).
+    /// into calls (Elixir, with no `@behaviour`, `@impl`, `@derive`,
+    /// `defimpl` or `defprotocol`), and each module in [`Self::uses`] is
+    /// inert (`[affected.related] inert_uses`).
     #[serde(default)]
     pub unnamed_is_dead: bool,
+    /// Modules the file's modules `use` (Elixir). Whether a `use` can call
+    /// back into the module is config, so it is decided when the facts are
+    /// read, not when they are extracted and cached.
+    #[serde(default)]
+    pub uses: Vec<String>,
+    /// For a file whose code lists modules at run time (see
+    /// [`Def::reflects`]), the function names it may look for on the
+    /// modules it finds: every atom the file holds and every function it
+    /// calls on a value. A change elsewhere that edits only functions of
+    /// other names cannot change what it finds. `None` when it may look
+    /// for any name (`apply` with a computed function, a module's list of
+    /// functions), or when nothing in the file lists modules.
+    #[serde(default)]
+    pub probes: Option<BTreeSet<String>>,
 }
 
 impl FileFacts {
@@ -372,6 +409,8 @@ impl FileFacts {
             embeds: Vec::new(),
             parse_error: false,
             unnamed_is_dead: false,
+            uses: Vec::new(),
+            probes: None,
         }
     }
 

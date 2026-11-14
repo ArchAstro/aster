@@ -4,6 +4,7 @@
 use super::annotations;
 use super::cache::FactsCache;
 use super::consumers::{self, Consume};
+use super::dispatch::{DispatchRule, Rules};
 use super::facts::{DefKind, Family, FileFacts, LineClass};
 use super::pnpm_lock;
 use super::resolve::{Resolvers, Workspace};
@@ -303,6 +304,16 @@ struct Index<'a> {
     native_imports: HashSet<(usize, usize)>,
     /// Each project's `[consumes]` entries by dependency.
     consumes: Vec<HashMap<usize, Consume>>,
+    /// How frameworks reach callbacks nothing names (see `dispatch`).
+    dispatch: Vec<DispatchRule>,
+    /// For each rule, the definitions that make one of its `runners` calls.
+    runners: Vec<Vec<DefId>>,
+    /// For each source, the boundary reason when it is a boundary.
+    boundary: Vec<Option<std::sync::Arc<str>>>,
+    /// Modules whose `use` calls nothing of the using module.
+    inert_uses: HashSet<String>,
+    /// Module attributes a library reads at compile time, without `@`.
+    compile_attributes: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -372,12 +383,21 @@ pub fn analyse(
     changes: &[Change],
     cache_dir: Option<&Path>,
 ) -> Related {
-    analyse_with(root, projects, graph, changes, cache_dir, false)
+    analyse_with(
+        root,
+        projects,
+        graph,
+        changes,
+        cache_dir,
+        false,
+        &Rules::default(),
+    )
 }
 
 /// [`analyse`], recording under `explain` how each selected test and each
 /// graph node was reached (see [`Hop`]). That costs memory proportional to
-/// the edges walked, so it is off unless asked for.
+/// the edges walked, so it is off unless asked for. `dispatch` says how
+/// frameworks reach callbacks nothing names (see [`DispatchRule`]).
 pub fn analyse_with(
     root: &Path,
     projects: &[DiscoveredProject],
@@ -385,6 +405,7 @@ pub fn analyse_with(
     changes: &[Change],
     cache_dir: Option<&Path>,
     explain: bool,
+    rules: &Rules,
 ) -> Related {
     let started = std::time::Instant::now();
     let (paths, mut facts, reused) = scan(root, cache_dir.map(FactsCache::open));
@@ -434,6 +455,14 @@ pub fn analyse_with(
     let files_analysed = facts.len();
     let mut index = Index::build(root, projects, graph, &paths, facts, &ghosts);
     index.explain = explain;
+    index.set_dispatch(&rules.dispatch);
+    index.set_boundaries(&rules.boundaries);
+    index.inert_uses = super::elixir::INERT_USES
+        .iter()
+        .map(|m| m.to_string())
+        .chain(rules.inert_uses.iter().cloned())
+        .collect();
+    index.compile_attributes = rules.compile_attributes.iter().cloned().collect();
     let indexed = started.elapsed();
     let mut related = index.select(changes);
     related.files_analysed = files_analysed;
@@ -445,6 +474,13 @@ pub fn analyse_with(
         started.elapsed() - indexed
     );
     related
+}
+
+/// The facts of a changed file before the change, when lines were removed.
+fn changed_old_facts(change: &Change, now: &Source) -> Option<FileFacts> {
+    change.old_lines.as_ref().filter(|l| !l.is_empty())?;
+    let old = change.old_source.as_deref()?;
+    Some(extract(now.facts.family, &change.path, old))
 }
 
 fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
@@ -1688,7 +1724,87 @@ impl<'a> Index<'a> {
             mentions,
             path_defs,
             downstream,
+            dispatch: Vec::new(),
+            inert_uses: HashSet::new(),
+            compile_attributes: HashSet::new(),
+            runners: Vec::new(),
+            boundary: Vec::new(),
         }
+    }
+
+    /// Mark the sources that `boundaries` name.
+    fn set_boundaries(&mut self, boundaries: &[super::dispatch::Boundary]) {
+        let sets: Vec<(globset::GlobSet, std::sync::Arc<str>)> = boundaries
+            .iter()
+            .filter_map(|b| {
+                let mut set = globset::GlobSetBuilder::new();
+                for glob in &b.files {
+                    set.add(globset::Glob::new(glob).ok()?);
+                }
+                Some((set.build().ok()?, b.reason.as_str().into()))
+            })
+            .collect();
+        self.boundary = self
+            .sources
+            .iter()
+            .map(|source| {
+                sets.iter()
+                    .find(|(set, _)| set.is_match(&source.path))
+                    .map(|(_, reason)| reason.clone())
+            })
+            .collect();
+    }
+
+    /// Whether the walk stops at the edge `from` → `to`: `from` is in a
+    /// boundary file, and `to` is code of another file that is not test code.
+    fn stops(&self, from: DefId, to: DefId) -> bool {
+        if from == NO_DEF || from.0 == USERS || from.0 == to.0 || to.0 == USERS {
+            return false;
+        }
+        self.boundary
+            .get(from.0 as usize)
+            .is_some_and(Option::is_some)
+            && !self.is_test(to)
+            && !self.test_side(&self.sources[to.0 as usize])
+    }
+
+    /// Take on `rules`, and find the definitions that make each one's
+    /// `runners` calls.
+    fn set_dispatch(&mut self, rules: &[DispatchRule]) {
+        self.runners = rules
+            .iter()
+            .map(|rule| {
+                let mut found = Vec::new();
+                // A `callers` call that names no module is handed one by
+                // its own caller (a helper taking the worker, `@worker`):
+                // it may run any covered callback, like a runner.
+                let runs = |def: &super::facts::Def| {
+                    DispatchRule::makes(&rule.runners, def)
+                        || (def.bare.is_empty() && DispatchRule::makes(&rule.callers, def))
+                };
+                for (f, source) in self.sources.iter().enumerate() {
+                    for (d, def) in source.facts.defs.iter().enumerate() {
+                        if runs(def) {
+                            found.push((f as u32, d as u32));
+                        }
+                    }
+                    if runs(&source.facts.top) {
+                        found.push((f as u32, TOP));
+                    }
+                }
+                found
+            })
+            .collect();
+        self.dispatch = rules.to_vec();
+    }
+
+    /// The first rule that covers definition `def`, a callback nothing
+    /// names.
+    fn rule_for(&self, def: &super::facts::Def) -> Option<usize> {
+        if def.kind == DefKind::Macro {
+            return None;
+        }
+        self.dispatch.iter().position(|rule| rule.covers(def))
     }
 
     /// Whether `id` is test code: a definition of a test file, or one
@@ -2319,12 +2435,61 @@ impl<'a> Index<'a> {
         let Some(project) = changed.project else {
             return;
         };
+        // What the change itself touched in the file. A lister finds the
+        // same modules, exporting the same functions, unless the change
+        // touches module-level code (where `use` and macros generate
+        // functions), a macro, or a function of a name it looks for.
+        let seeded: Vec<DefId> = run
+            .affected
+            .iter()
+            .filter(|(id, why)| id.0 == file && matches!(why, Why::Changed(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        let shape = change.deleted
+            || seeded.is_empty()
+            || seeded.iter().any(|&id| {
+                id.1 == TOP || {
+                    let def = self.def(id);
+                    def.body || def.kind == DefKind::Macro
+                }
+            });
+        let names: Vec<String> = seeded
+            .iter()
+            .flat_map(|&id| {
+                let def = self.def(id);
+                std::iter::once(def.name.as_str())
+                    .chain(def.aliases.iter().map(String::as_str))
+                    // A module attribute is looked for by its bare name
+                    // (`__info__(:attributes)`).
+                    .map(|name| name.trim_start_matches('@').to_string())
+            })
+            .collect();
+        // The names the removed lines belonged to: a renamed function no
+        // longer has the name a lister looks for.
+        let mut names = names;
+        if let (Some(old), Some(spans)) = (&changed_old_facts(change, changed), &change.old_lines) {
+            for def in &old.defs {
+                if spans
+                    .iter()
+                    .any(|&(a, b)| a <= def.lines.1 && def.lines.0 <= b)
+                {
+                    names.push(def.name.trim_start_matches('@').to_string());
+                }
+            }
+        }
         for (other, source) in self.sources.iter().enumerate() {
             let reaches = source.facts.family == changed.facts.family
                 && source
                     .project
                     .is_some_and(|p| self.downstream[project].contains(&p));
             if !reaches {
+                continue;
+            }
+            let looks_for = |probes: &BTreeSet<String>| names.iter().any(|n| probes.contains(n));
+            if !shape
+                && source.facts.family == Family::Elixir
+                && source.facts.probes.as_ref().is_some_and(|p| !looks_for(p))
+            {
                 continue;
             }
             let defs = source.facts.defs.iter().enumerate();
@@ -3388,6 +3553,11 @@ impl<'a, 'b> Run<'a, 'b> {
     }
 
     fn mark(&mut self, id: DefId, why: Why) {
+        if let Why::Via(from) = &why {
+            if self.ix.stops(*from, id) {
+                return;
+            }
+        }
         match &why {
             Why::Via(from) if *from != NO_DEF => {
                 if let Some(label) = &self.label {
@@ -3549,6 +3719,46 @@ impl<'a, 'b> Run<'a, 'b> {
                 continue;
             }
             let def = &source.facts.defs[id.1 as usize];
+            if def.attribute {
+                // A module attribute reaches what reads it. Read by nothing
+                // in the module's code, or named as one a library reads, it
+                // is read at compile time by a macro: code of the whole file.
+                let library = ix
+                    .compile_attributes
+                    .contains(def.name.trim_start_matches('@'));
+                if library || !self.symbol(source.unit, &def.name, None, id, id.0) {
+                    self.because(|| "a macro may read the module attribute".to_string());
+                    // The body of the module it is in: the innermost
+                    // module body around it, or the file's top.
+                    let (first, last) = def.lines;
+                    let body = source
+                        .facts
+                        .defs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.body && d.lines.0 <= first && last <= d.lines.1)
+                        .min_by_key(|(_, d)| d.lines.1 - d.lines.0)
+                        .map_or(TOP, |(d, _)| d as u32);
+                    self.mark((id.0, body), Why::Via(id));
+                }
+                continue;
+            }
+            if def.body {
+                // A module body that shares its file: it runs in each
+                // definition of the module, and what names the module
+                // reaches it.
+                self.because(|| {
+                    "code of a module body may run in each of the module's definitions".to_string()
+                });
+                let (first, last) = def.lines;
+                for (d, inner) in source.facts.defs.iter().enumerate() {
+                    if d as u32 != id.1 && first <= inner.lines.0 && inner.lines.1 <= last {
+                        self.mark((id.0, d as u32), Why::Via(id));
+                    }
+                }
+                self.module_users(source.unit, id, &def.name);
+                continue;
+            }
             if let Some(route) = &def.route {
                 // A route is reached by requests for its path. When no code
                 // names the path, anything that goes through the router
@@ -3578,7 +3788,9 @@ impl<'a, 'b> Run<'a, 'b> {
             // than reaching no test. One that only calls what changed, and
             // that nothing calls, runs in no test.
             let edited = matches!(self.affected.get(&id), Some(Why::Changed(_)));
-            let dead = source.facts.unnamed_is_dead && !edited;
+            let dead = source.facts.unnamed_is_dead
+                && source.facts.uses.iter().all(|m| ix.inert_uses.contains(m))
+                && !edited;
             let unnamed = !referenced && !def.is_test() && !ix.is_test(id) && !dead;
             // A function of an implementation is reached by calls to the
             // protocol's function of that name, not by every user of the
@@ -3590,7 +3802,13 @@ impl<'a, 'b> Run<'a, 'b> {
                     dispatched |= self.symbol(*unit, &def.name, None, id, id.0);
                 }
             }
-            if !dispatched && (def.callback || def.kind == DefKind::Macro || unnamed) {
+            let rule = (def.callback || unnamed)
+                .then(|| ix.rule_for(def))
+                .flatten();
+            if let Some(rule) = rule.filter(|_| !dispatched) {
+                // A rule says which calls run the callback.
+                self.dispatched(source.unit, id, rule);
+            } else if !dispatched && (def.callback || def.kind == DefKind::Macro || unnamed) {
                 match def.accepts.as_deref().filter(|_| def.callback) {
                     // A message clause is reached by what can send its message.
                     Some(tag) => self.senders(source.unit, id, Some(tag)),
@@ -3690,6 +3908,109 @@ impl<'a, 'b> Run<'a, 'b> {
                 continue;
             }
             if ix.may_send(user, unit, tag) || (tag.is_none() && ix.may_start(user, unit)) {
+                self.mark(user, Why::Via(from));
+            }
+        }
+    }
+
+    /// Mark the definitions that run callback `from` of `unit` as dispatch
+    /// rule `rule` says, instead of every user of the unit: those that use
+    /// the unit and make a `callers` call, and those that make a `runners`
+    /// call in the projects that can load the callback.
+    fn dispatched(&mut self, unit: u32, from: DefId, rule: usize) {
+        let ix = self.ix;
+        let rule_of = &ix.dispatch[rule];
+        let from_test = ix.is_test(from);
+        if !rule_of.callers.is_empty() {
+            self.because(|| {
+                format!(
+                    "hands the module to {}, which runs its `{}`",
+                    rule_of.callers.join(" or "),
+                    ix.def(from).name
+                )
+            });
+            let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
+                let defs = ix.sources[f as usize].facts.defs.len() as u32;
+                (0..defs).map(move |d| (f, d))
+            });
+            let candidates: Vec<DefId> = ix.users[unit as usize]
+                .iter()
+                .copied()
+                .chain(local)
+                .chain(ix.beside(unit))
+                .collect();
+            let mut seen: HashSet<DefId> = HashSet::new();
+            for user in candidates {
+                if user == from || (from_test && !ix.is_test(user)) || !seen.insert(user) {
+                    continue;
+                }
+                if DispatchRule::makes(&rule_of.callers, ix.def(user)) {
+                    self.mark(user, Why::Via(from));
+                }
+            }
+        }
+        if !ix.runners[rule].is_empty() {
+            self.because(|| {
+                format!(
+                    "calls {}, which runs any `{}` callback",
+                    rule_of.runners.join(" or "),
+                    rule_of.behaviour
+                )
+            });
+            let reach = ix.sources[from.0 as usize]
+                .project
+                .map(|p| &ix.downstream[p]);
+            for &runner in &ix.runners[rule] {
+                let in_reach = match (reach, ix.sources[runner.0 as usize].project) {
+                    (Some(reach), Some(project)) => reach.contains(&project),
+                    _ => true,
+                };
+                if runner != from && in_reach && (!from_test || ix.is_test(runner)) {
+                    self.mark(runner, Why::Via(from));
+                }
+            }
+        }
+    }
+
+    /// Mark the definitions that name `module`, one of the modules of
+    /// `unit`: its users that name it, and the definitions of its own files
+    /// that do.
+    fn module_users(&mut self, unit: u32, from: DefId, module: &str) {
+        let ix = self.ix;
+        self.because(|| format!("names `{module}`, whose module body changed"));
+        let from_test = ix.is_test(from);
+        let short = module.rsplit('.').next().unwrap_or(module);
+        let local = ix.unit_files[unit as usize].iter().flat_map(|&f| {
+            let defs = ix.sources[f as usize].facts.defs.len() as u32;
+            (0..defs).map(move |d| (f, d)).chain([(f, TOP)])
+        });
+        let candidates: Vec<DefId> = ix.users[unit as usize]
+            .iter()
+            .copied()
+            .chain(ix.beside(unit))
+            .collect();
+        let names = |def: &super::facts::Def, name: &str| {
+            def.uses.contains(name)
+                || def.bare.contains(name)
+                || def.calls.iter().any(|(m, _)| m == name)
+        };
+        let mut seen: HashSet<DefId> = HashSet::new();
+        for user in candidates {
+            if user != from
+                && (!from_test || ix.is_test(user))
+                && seen.insert(user)
+                && names(ix.def(user), module)
+            {
+                self.mark(user, Why::Via(from));
+            }
+        }
+        // Inside the outer module, the nested one goes by its last segment.
+        for user in local {
+            if user != from
+                && (!from_test || ix.is_test(user))
+                && seen.insert(user)
+                && (names(ix.def(user), module) || names(ix.def(user), short))
+            {
                 self.mark(user, Why::Via(from));
             }
         }

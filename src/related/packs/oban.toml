@@ -1,0 +1,10 @@
+# Oban workers (https://hexdocs.pm/oban).
+#
+# Assumes tests run Oban with `testing: :manual`: inserting a job does not
+# run it. `with_testing_mode(:inline, ...)` does, so it counts as a runner.
+
+[[dispatch]]
+behaviour = "Oban.Worker"
+callbacks = ["perform", "timeout", "backoff"]
+callers = ["perform_job"]
+runners = ["drain_queue", "drain_jobs", "run_jobs", "with_testing_mode"]
