@@ -3107,7 +3107,7 @@ fn a_small_selection_runs_whole_in_the_first_shard_and_the_other_shards_start_no
 }
 
 #[test]
-fn a_selection_over_the_threshold_still_fans_out_to_every_shard() {
+fn a_selection_that_needs_every_shard_still_fans_out_to_every_shard() {
     // Setup: the threshold is one file, and two are selected.
     let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 1\n", &sharded());
     ws.edit(
@@ -3140,6 +3140,56 @@ fn a_selection_over_the_threshold_still_fans_out_to_every_shard() {
     let plan = ws.plan("test-ci");
     assert!(
         !plan.runs().iter().any(|addr| addr.contains("shop-shard-2")),
+        "{plan:#?}"
+    );
+}
+
+/// The sharded fixture with three shards instead of two.
+fn three_shards() -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = sharded()
+        .into_iter()
+        .map(|(path, body)| (path, body.replace("--partitions 2", "--partitions 3")))
+        .collect();
+    files.push((
+        "shop-shard-3/package.json",
+        r#"{"name":"shop-shard-3","private":true}"#.to_string(),
+    ));
+    files.push((
+        "shop-shard-3/aster.toml",
+        "depends_on = [\"//shop\"]\n\n[targets.test-ci]\ncommand = \"bash -c 'cd ../shop && MIX_TEST_PARTITION=3 exec mix test --warnings-as-errors --partitions 3'\"\ndepends_on = [\"//shop:deps\"]\n".to_string(),
+    ));
+    files
+}
+
+#[test]
+fn a_selection_runs_in_as_few_shards_as_the_threshold_allows() {
+    // Setup: three shards, a threshold of one file, and two files selected.
+    let files = three_shards();
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
+    let ws = Workspace::with_config("[affected.related]\npack_shards_up_to = 1\n", &files);
+    ws.edit(
+        "shop/lib/shop/pricing.ex",
+        "Enum.sum(items)",
+        "Enum.sum(items) + 0",
+    );
+    ws.edit("shop/lib/shop/pricing.ex", "amount * 0.2", "amount * 0.25");
+
+    // Plan: two files need two shards. Shards 1 and 2 deal them out as two
+    // partitions; shard 3 does not start a cold boot for nothing.
+    let plan = ws.plan("test-ci");
+    for shard in ["1", "2"] {
+        let commands = plan.commands(&format!("//shop-shard-{shard}:test-ci"));
+        assert_eq!(commands.len(), 1, "{plan:#?}");
+        assert_eq!(
+            shell_words::split(&commands[0]).unwrap()[2],
+            format!(
+                "cd ../shop && MIX_TEST_PARTITION={shard} exec mix test --warnings-as-errors \
+                 test/shop/cart_test.exs test/shop/tax_test.exs --partitions 2"
+            )
+        );
+    }
+    assert!(
+        plan.skipped.contains(&"//shop-shard-3:test-ci".to_string()),
         "{plan:#?}"
     );
 }

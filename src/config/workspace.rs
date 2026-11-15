@@ -559,8 +559,9 @@ pub struct AffectedRelatedConfig {
     #[serde(default)]
     pub wrappers: Vec<RelatedWrapperConfig>,
     /// A sharded suite (`MIX_TEST_PARTITION=K mix test --partitions N`)
-    /// whose selection has at most this many test files runs them all in
-    /// shard 1, and the other shards are skipped. Each shard that starts
+    /// runs its selection in as few shards as hold this many test files
+    /// each: shards 1 to ceil(files / this) deal the files out among
+    /// themselves, and the other shards are skipped. Each shard that starts
     /// pays a cold boot (checkout, dependencies, compile, database), which
     /// a handful of files does not repay. 0 turns packing off. The default
     /// stays under the share a shard carries in a full run of a suite big

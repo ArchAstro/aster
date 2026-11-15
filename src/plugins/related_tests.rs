@@ -855,23 +855,33 @@ pub(super) fn mix_packing(
     // partition K of fewer than K files gets none: Mix then fails, saying
     // the paths match nothing.
     let mut unpartition = Vec::new();
-    if let Some(partition) = mix_partition(&argv, test) {
-        let given: BTreeSet<&String> = keep.iter().collect();
-        if pack_up_to > 0 && given.len() <= pack_up_to {
-            // Too few files to repay a cold boot per partition: partition 1
-            // runs them all, so it must not deal them out again.
-            if partition > 1 {
-                return plan(Vec::new());
-            }
-            unpartition = partition_flags(&argv, test + 1);
-        } else if given.len() < partition {
+    let mut repartition = Vec::new();
+    if let Some((partition, total)) = mix_partition(&argv, test) {
+        let given = keep.iter().collect::<BTreeSet<&String>>().len();
+        // Each partition pays a cold boot, which a few files do not repay:
+        // the selection runs in as few partitions as hold `pack_up_to`
+        // files each, and the rest are skipped.
+        let wanted = if pack_up_to > 0 {
+            given.div_ceil(pack_up_to).clamp(1, total)
+        } else {
+            total
+        };
+        if partition > wanted || given < partition {
             return plan(Vec::new());
+        }
+        if wanted < total {
+            unpartition = partition_flags(&argv, test + 1);
+            // One partition runs every file; more deal them out again.
+            if wanted > 1 {
+                repartition = vec!["--partitions".to_string(), wanted.to_string()];
+            }
         }
     }
     let (mut drop, mut add) = MIX_COVERAGE.edit(&argv, test + 1);
     drop.extend(&listed);
     drop.extend(unpartition);
     add.splice(0..0, keep);
+    add.extend(repartition);
     plan(vec![argv.render(&drop, &add)])
 }
 
@@ -892,8 +902,8 @@ pub(super) fn partition_flags(argv: &Argv, from: usize) -> Vec<usize> {
 }
 
 /// Which partition a `mix test --partitions N` command runs, when
-/// `MIX_TEST_PARTITION` is written in front of it.
-fn mix_partition(argv: &Argv, test: usize) -> Option<usize> {
+/// `MIX_TEST_PARTITION` is written in front of it, and N.
+fn mix_partition(argv: &Argv, test: usize) -> Option<(usize, usize)> {
     let arguments = &argv.parts[test + 1..];
     let total: usize = arguments.iter().enumerate().find_map(|(i, part)| {
         match part.strip_prefix("--partitions") {
@@ -908,7 +918,7 @@ fn mix_partition(argv: &Argv, test: usize) -> Option<usize> {
         .find_map(|part| part.strip_prefix("MIX_TEST_PARTITION="))?
         .parse()
         .ok()?;
-    (total > 1 && (1..=total).contains(&partition)).then_some(partition)
+    (total > 1 && (1..=total).contains(&partition)).then_some((partition, total))
 }
 
 const JS_RUNNERS: &[&str] = &["vitest", "jest", "mocha"];
@@ -2159,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_within_the_limit_runs_whole_in_partition_one() {
+    fn a_selection_runs_in_as_few_partitions_as_the_limit_allows() {
         let dir = TempDir::new().unwrap();
         let tests = tests_of(&[
             ("test/a_test.exs", &[]),
@@ -2186,12 +2196,22 @@ mod tests {
         for k in 2..=4 {
             assert_eq!(shard(k, "--partitions 4", 3), Some(FilesListPlan::Nothing));
         }
-        // One file over the limit: the partitions deal the files out.
+        // Over the limit: as few partitions as hold the limit each deal the
+        // files out (3 files, 2 each: 2 of the 4), and the rest are skipped.
+        for k in 1..=2 {
+            assert_eq!(
+                commands(shard(k, "--partitions 4", 2)),
+                [format!("MIX_TEST_PARTITION={k} mix test --warnings-as-errors test/a_test.exs test/b_test.exs test/c_test.exs --partitions 2")]
+            );
+        }
+        for k in 3..=4 {
+            assert_eq!(shard(k, "--partitions 4", 2), Some(FilesListPlan::Nothing));
+        }
+        // A selection that fills every partition keeps the command's own.
         assert_eq!(
-            commands(shard(1, "--partitions 4", 2)),
-            ["MIX_TEST_PARTITION=1 mix test --warnings-as-errors --partitions 4 test/a_test.exs test/b_test.exs test/c_test.exs"]
+            commands(shard(3, "--partitions 3", 1)),
+            ["MIX_TEST_PARTITION=3 mix test --warnings-as-errors --partitions 3 test/a_test.exs test/b_test.exs test/c_test.exs"]
         );
-        assert_eq!(shard(4, "--partitions 4", 2), Some(FilesListPlan::Nothing));
         // Limit 0 never packs: partition 3 of 3 files still has its file.
         assert_eq!(
             commands(shard(3, "--partitions 4", 0)),
