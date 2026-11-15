@@ -775,10 +775,10 @@ impl<'a> RelatedPlanner<'a> {
                     let (note, skip) = match packed {
                         Some(count) => (
                             format!(
-                                "skipped: its {count} selected tests are small enough to \
-                                 run together in partition 1 (pack_shards_up_to)"
+                                "skipped: its {count} selected tests fit in fewer \
+                                 partitions (pack_shards_up_to)"
                             ),
-                            "the selection runs together in partition 1 (--related)".to_string(),
+                            "the selection fits in fewer partitions (--related)".to_string(),
                         ),
                         None => (
                             "skipped: no test it runs reaches the change".to_string(),
