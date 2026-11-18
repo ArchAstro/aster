@@ -3979,6 +3979,149 @@ fn cargo_nextest_is_narrowed_to_the_tests_a_change_reaches() {
     assert!(ws.plan("test").commands("//shop:test").is_empty());
 }
 
+/// Stands in for a toolchain wrapper running `cargo nextest run`: writes the
+/// one JUnit file nextest's default profile writes, for the test binary the
+/// arguments select, and fails the binary named by `FAIL_BINARY`.
+const FAKE_NEXTEST: &str = r#"#!/bin/sh
+case "$*" in
+  *--lib*) binary=lib; tests="cart::tests::totals pricing::tests::sums" ;;
+  *"--test api"*) binary=api; tests="total_of_a_cart" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+mkdir -p target/nextest/default
+{
+  echo "<testsuites><testsuite name=\"shop::$binary\">"
+  for t in $tests; do
+    if [ "$binary" = "$FAIL_BINARY" ]; then
+      echo "<testcase classname=\"shop::$binary\" name=\"$t\"><failure message=\"boom\"/></testcase>"
+    else
+      echo "<testcase classname=\"shop::$binary\" name=\"$t\"/>"
+    fi
+  done
+  echo "</testsuite></testsuites>"
+} > target/nextest/default/junit.xml
+[ "$binary" != "$FAIL_BINARY" ]
+"#;
+
+/// The tests one `--related --test-results` run of `//shop:test` recorded,
+/// and whether the target's results are complete.
+fn recorded_shop_tests(
+    ws: &Workspace,
+    fail_binary: &str,
+) -> (Vec<String>, Option<aster_results_model::Confidence>) {
+    use aster_results_model::{parse_ndjson, Record, TestOutcome};
+    let results = ws.root().join("results.ndjson");
+    let _ = fs::remove_file(&results);
+    let output = ws.aster_with(
+        &[
+            "--no-cache",
+            &format!("--test-results={}", results.display()),
+            "affected",
+            "test",
+            "--base=HEAD",
+            "--related",
+        ],
+        &[("FAIL_BINARY", Path::new(fail_binary))],
+    );
+    assert_eq!(
+        output.status.success(),
+        fail_binary.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = parse_ndjson(&fs::read_to_string(&results).unwrap()).unwrap();
+    let mut names = Vec::new();
+    let mut confidence = None;
+    for record in records {
+        match record {
+            Record::Target(target) if target.address == "//shop:test" => {
+                confidence = target.confidence;
+            }
+            Record::Test(test) => {
+                let outcome = if test.outcome == TestOutcome::Fail {
+                    "fail"
+                } else {
+                    "pass"
+                };
+                names.push(format!("{} {outcome}", test.name));
+            }
+            _ => {}
+        }
+    }
+    (names, confidence)
+}
+
+/// `--related` splits a nextest target into one command per test binary,
+/// and each writes the same declared JUnit file. Every command's report is
+/// read, and a failing command's tests are recorded although the commands
+/// after it never run, so the failure can be retried, tracked or
+/// quarantined.
+#[cfg(unix)]
+#[test]
+fn a_split_target_records_each_commands_fixed_path_report() {
+    // A nextest target behind a toolchain wrapper that declares the JUnit
+    // file nextest writes at a fixed path in the project.
+    let ws = Workspace::with_config(
+        "[affected.related]\nwrappers = [\"fake-nextest\"]\n",
+        &with(
+            RUST,
+            &[
+                // As in a real repository: what one run writes (reports,
+                // results, the lockfile `deps` resolves) is not a change the
+                // next run must run in full for.
+                (".gitignore", "target/\nCargo.lock\nresults.ndjson\n"),
+                ("scripts/fake-nextest", FAKE_NEXTEST),
+                (
+                    "shop/aster.toml",
+                    "[targets.test]\ncommand = \"../scripts/fake-nextest cargo nextest run --locked\"\n\n\
+                     [targets.test.report]\nformat = \"junit\"\nfiles = [\"target/nextest/default/junit.xml\"]\n",
+                ),
+            ],
+        ),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        ws.root().join("scripts/fake-nextest"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    ws.git(&["add", "-A"]);
+    ws.git(&["commit", "-q", "-m", "executable"]);
+    ws.edit(
+        "shop/src/pricing.rs",
+        "items.iter().sum()",
+        "items.iter().sum::<u32>() + 0",
+    );
+    assert_eq!(
+        ws.plan("test").commands("//shop:test"),
+        [
+            "../scripts/fake-nextest cargo nextest run --locked --no-tests pass --lib -- --exact cart::tests::totals pricing::tests::sums",
+            "../scripts/fake-nextest cargo nextest run --locked --no-tests pass --test api -- --exact total_of_a_cart",
+        ]
+    );
+
+    // Both binaries pass: both commands' reports are read.
+    let (tests, confidence) = recorded_shop_tests(&ws, "");
+    assert_eq!(
+        tests,
+        [
+            "cart::tests::totals pass",
+            "pricing::tests::sums pass",
+            "total_of_a_cart pass"
+        ]
+    );
+    assert_eq!(confidence, Some(aster_results_model::Confidence::Complete));
+
+    // The first binary fails, so the second never runs: the failing
+    // command's tests are still recorded, and the results are partial.
+    let (tests, confidence) = recorded_shop_tests(&ws, "lib");
+    assert_eq!(
+        tests,
+        ["cart::tests::totals fail", "pricing::tests::sums fail"]
+    );
+    assert_eq!(confidence, Some(aster_results_model::Confidence::Partial));
+}
+
 #[test]
 fn configured_wrapper_programs_stay_in_front_of_the_narrowed_command() {
     let files = with(

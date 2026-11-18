@@ -1277,7 +1277,7 @@ impl<'a> Executor<'a> {
         } else {
             None
         };
-        let captures = if chain.is_some() {
+        let mut captures = if chain.is_some() {
             Vec::new()
         } else if capturing {
             plugin_registry
@@ -1301,14 +1301,7 @@ impl<'a> Executor<'a> {
         } else {
             Vec::new()
         };
-        let invocations: Vec<Invocation> = commands
-            .iter()
-            .enumerate()
-            .map(|(index, command)| match captures.get(index) {
-                Some(Some((plan, _))) => Invocation::planned(command, plan),
-                _ => Invocation::plain(command),
-            })
-            .collect();
+        let invocations = invocations_for(&commands, &mut captures);
         let excluded_dirs_for_rehash = excluded_dirs.clone();
         let tx_clone = ctx.tx.clone();
         let computed_hashes_clone = Arc::clone(computed_hashes);
@@ -2880,6 +2873,86 @@ struct Invocation {
     keep_output: bool,
     /// How to render the raw console output for the log.
     rewrite: Option<OutputRewrite>,
+    /// A report at a path the target's other commands also write, copied
+    /// aside as soon as this command finishes.
+    shared: Option<SharedReport>,
+}
+
+/// A report one command of a split target writes where the target's other
+/// commands write theirs: a declared `files` glob, or `target/nextest`. The
+/// next command would replace it before it is read, so the files this
+/// command wrote are copied into `into`, which its plan reads instead.
+struct SharedReport {
+    /// Where the runner writes the report.
+    files: ReportFiles,
+    /// This command's copy, inside its own report directory.
+    into: PathBuf,
+}
+
+/// The directory in a command's report directory that holds its copy of a
+/// [`SharedReport`]. Named so a declared report's command, which may write
+/// anything into `$ASTER_TEST_REPORT_DIR`, does not write into it by chance.
+const SHARED_REPORT_COPY: &str = ".aster-shared-report";
+
+impl SharedReport {
+    /// Copy what the command that started at `started` wrote, judged
+    /// against `before`, the files listed just before it ran. A copy that
+    /// fails is dropped whole, so the command reads as having no report
+    /// (partial) rather than as complete with some files missing.
+    fn keep(&self, address: &str, started: SystemTime, before: &test_results::ReportListing) {
+        if let Err(error) =
+            test_results::copy_fresh_reports(&self.files, started, before, &self.into)
+        {
+            let _ = std::fs::remove_dir_all(&self.into);
+            errln!("[aster] Warning: test results for {address} are incomplete: {error:#}");
+        }
+    }
+}
+
+/// The invocations of a target's commands, each with its capture plan.
+///
+/// When several commands write their reports to the same place, each plan
+/// is changed to read its command's copy (see [`SharedReport`]), so every
+/// command's report is read, including a failing command's when the
+/// commands after it never run.
+fn invocations_for(
+    commands: &[String],
+    captures: &mut [Option<(ReportPlan, PathBuf)>],
+) -> Vec<Invocation> {
+    let split = commands.len() > 1;
+    commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| match captures.get_mut(index) {
+            Some(Some((plan, dir))) => {
+                let shared = (split && writes_outside(&plan.files, dir)).then(|| {
+                    let into = dir.join(SHARED_REPORT_COPY);
+                    let files = std::mem::replace(
+                        &mut plan.files,
+                        ReportFiles::Globs {
+                            root: into.clone(),
+                            patterns: vec!["**/*".to_string()],
+                        },
+                    );
+                    SharedReport { files, into }
+                });
+                let mut invocation = Invocation::planned(command, plan);
+                invocation.shared = shared;
+                invocation
+            }
+            _ => Invocation::plain(command),
+        })
+        .collect()
+}
+
+/// Whether a report is written anywhere but the command's own report
+/// directory, where another command of the target may write it too.
+fn writes_outside(files: &ReportFiles, report_dir: &Path) -> bool {
+    match files {
+        ReportFiles::Stdout => false,
+        ReportFiles::Paths(paths) => paths.iter().any(|path| !path.starts_with(report_dir)),
+        ReportFiles::Globs { root, .. } => !root.starts_with(report_dir),
+    }
 }
 
 impl Invocation {
@@ -2890,6 +2963,7 @@ impl Invocation {
             env: Vec::new(),
             keep_output: false,
             rewrite: None,
+            shared: None,
         }
     }
 
@@ -2900,6 +2974,7 @@ impl Invocation {
             env: plan.env.clone(),
             keep_output: plan.files == ReportFiles::Stdout || plan.format.reads_console(),
             rewrite: plan.rewrite,
+            shared: None,
         }
     }
 
@@ -2913,6 +2988,10 @@ impl Invocation {
         log_cap: usize,
         permit: Option<&Permit>,
     ) -> (ExecutionResult, Option<String>) {
+        let before = self
+            .shared
+            .as_ref()
+            .map(|shared| (test_results::list_reports(&shared.files), SystemTime::now()));
         let mut result = run_command(
             address,
             &self.command,
@@ -2922,6 +3001,11 @@ impl Invocation {
             log_cap,
             permit,
         );
+        // Before the next command can replace the report, whether this one
+        // passed or not.
+        if let (Some(shared), Some((listing, started))) = (&self.shared, &before) {
+            shared.keep(address, *started, listing);
+        }
         let raw = self.rewrite.map(|rewrite| {
             let rendered = test_results::rewrite_output(rewrite, &result.output);
             let previous = std::mem::replace(&mut result.output, rendered);
@@ -2989,7 +3073,9 @@ pub(crate) fn plan_chain(
 }
 
 /// Ask the plugin how to capture test results from each command. Each
-/// planned command gets its own empty report directory.
+/// planned command gets its own empty report directory. A report the
+/// commands all write at one path (declared `files`, nextest's JUnit) is
+/// copied aside after each command by [`invocations_for`].
 pub(crate) fn plan_captures(
     plugin: &dyn LanguagePlugin,
     declared: Option<&crate::config::ReportConfig>,
@@ -2999,18 +3085,9 @@ pub(crate) fn plan_captures(
     commands: &[String],
     wrappers: &Wrappers,
 ) -> Vec<Option<(ReportPlan, PathBuf)>> {
-    let last = commands.len().saturating_sub(1);
     commands
         .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            // Declared report files at fixed paths in the project are
-            // overwritten by each command of a split target, so only the
-            // last command's are read; the earlier commands go unread and
-            // the results are partial.
-            if declared.is_some_and(|report| !report.files.is_empty()) && index != last {
-                return None;
-            }
+        .map(|command| {
             let report_dir = match test_results::new_report_dir() {
                 Ok(dir) => dir,
                 Err(error) => {
@@ -5100,6 +5177,7 @@ mod tests {
                 env: vec![("ASTER_TEST_REPORT".to_string(), "on".to_string())],
                 keep_output: true,
                 rewrite: None,
+                shared: None,
             },
         ];
         let (result, raw) = run_invocations(
@@ -5131,6 +5209,7 @@ mod tests {
             env: Vec::new(),
             keep_output: true,
             rewrite: Some(OutputRewrite::GoTestJson { verbose: false }),
+            shared: None,
         };
         let (result, raw) = run_invocations(
             "//a:test",
@@ -5197,23 +5276,25 @@ mod tests {
         tmp: &Path,
         commands: &[String],
     ) -> (ExecutionResult, Vec<Option<(ReportPlan, PathBuf)>>) {
-        let captures = plan_captures(
+        capture_and_run_declared(tmp, None, commands)
+    }
+
+    /// Plan, run and read a target's commands as the executor does.
+    fn capture_and_run_declared(
+        tmp: &Path,
+        declared: Option<&crate::config::ReportConfig>,
+        commands: &[String],
+    ) -> (ExecutionResult, Vec<Option<(ReportPlan, PathBuf)>>) {
+        let mut captures = plan_captures(
             &JunitPlugin,
-            None,
+            declared,
             tmp,
             tmp,
             "test",
             commands,
             &Wrappers::default(),
         );
-        let invocations: Vec<Invocation> = commands
-            .iter()
-            .zip(&captures)
-            .map(|(command, capture)| match capture {
-                Some((plan, _)) => Invocation::planned(command, plan),
-                None => Invocation::plain(command),
-            })
-            .collect();
+        let invocations = invocations_for(commands, &mut captures);
         let started = SystemTime::now();
         let (mut result, raw) = run_invocations(
             "//a:test",
@@ -5266,17 +5347,158 @@ mod tests {
         assert!(report.cases.is_empty());
     }
 
-    #[test]
-    fn a_split_target_reads_a_fixed_declared_report_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let commands = ["run a".to_string(), "run b".to_string()];
-        let at_path = crate::config::ReportConfig {
+    fn junit_at_fixed_path() -> crate::config::ReportConfig {
+        crate::config::ReportConfig {
             format: crate::config::ReportConfigFormat::Junit,
             files: vec!["target/junit.xml".to_string()],
-        };
-        // Both commands write the same file: only the last one's is read,
-        // and the unread first command makes the results partial.
-        let captures = plan_captures(
+        }
+    }
+
+    /// A command that writes `target/junit.xml` with one test, then exits.
+    fn write_fixed_junit(test: &str, outcome: &str, exit: i32) -> String {
+        format!(
+            r#"sh -c 'mkdir -p target && printf "%s" "<testsuite><testcase classname=\"S\" name=\"{test}\">{outcome}</testcase></testsuite>" > target/junit.xml; exit {exit}'"#
+        )
+    }
+
+    fn case_names(report: &TestReport) -> Vec<&str> {
+        report.cases.iter().map(|case| case.name.as_str()).collect()
+    }
+
+    /// `--related` splits a target with a declared report at a fixed path
+    /// into one command per test binary, each overwriting the file. A
+    /// failing command stops the rest, and its tests must still be recorded
+    /// so the failure can be retried, tracked or quarantined.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_command_of_a_split_target_keeps_its_fixed_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = [
+            write_fixed_junit("lib_ok", "", 0),
+            write_fixed_junit("a_fails", r#"<failure message=\"boom\"/>"#, 1),
+            write_fixed_junit("b_never_runs", "", 0),
+        ];
+        let (result, captures) =
+            capture_and_run_declared(tmp.path(), Some(&junit_at_fixed_path()), &commands);
+        assert!(!result.success);
+        let report = result.tests.expect("a report");
+        assert_eq!(case_names(&report), ["lib_ok", "a_fails"]);
+        assert_eq!(report.failures(), 1);
+        assert_eq!(report.capture, "declared-junit");
+        // The third command never ran.
+        assert_eq!(report.confidence, Confidence::Partial);
+        // The runner's own file is left as the last command wrote it.
+        let on_disk = std::fs::read_to_string(tmp.path().join("target/junit.xml")).unwrap();
+        assert!(on_disk.contains("a_fails"), "{on_disk}");
+        for (_, dir) in captures.iter().flatten() {
+            assert!(!dir.exists(), "report directory is cleaned up");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_command_of_a_passing_split_target_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = [
+            write_fixed_junit("lib", "", 0),
+            write_fixed_junit("a", "", 0),
+            write_fixed_junit("b", "", 0),
+        ];
+        let (result, _) =
+            capture_and_run_declared(tmp.path(), Some(&junit_at_fixed_path()), &commands);
+        assert!(result.success, "{}", result.output);
+        let report = result.tests.expect("a report");
+        assert_eq!(case_names(&report), ["lib", "a", "b"]);
+        assert_eq!(report.confidence, Confidence::Complete);
+    }
+
+    /// A file at the fixed path from before the run, or from an earlier
+    /// command, is not read as a command's own report, even within the
+    /// coarse-timestamp slack.
+    #[cfg(unix)]
+    #[test]
+    fn a_split_target_ignores_a_fixed_report_it_did_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::write(
+            tmp.path().join("target/junit.xml"),
+            r#"<testsuite><testcase classname="S" name="stale"/></testsuite>"#,
+        )
+        .unwrap();
+        let commands = [
+            "sh -c 'true'".to_string(),
+            write_fixed_junit("mine", "", 0),
+            "sh -c 'true'".to_string(),
+        ];
+        let (result, _) =
+            capture_and_run_declared(tmp.path(), Some(&junit_at_fixed_path()), &commands);
+        assert!(result.success, "{}", result.output);
+        let report = result.tests.expect("a report");
+        assert_eq!(case_names(&report), ["mine"]);
+        // Two commands wrote no report.
+        assert_eq!(report.confidence, Confidence::Partial);
+    }
+
+    #[test]
+    fn only_reports_outside_the_commands_directory_are_shared() {
+        let dir = Path::new("/tmp/aster-reports/1");
+        assert!(!writes_outside(&ReportFiles::Stdout, dir));
+        assert!(!writes_outside(
+            &ReportFiles::Paths(vec![dir.join("junit.xml")]),
+            dir
+        ));
+        assert!(!writes_outside(
+            &ReportFiles::Globs {
+                root: dir.to_path_buf(),
+                patterns: vec!["**/*".to_string()],
+            },
+            dir
+        ));
+        // `cargo nextest run`: `target/nextest/<profile>/*.xml`.
+        assert!(writes_outside(
+            &ReportFiles::Globs {
+                root: PathBuf::from("/work/target"),
+                patterns: vec!["nextest/*/*.xml".to_string()],
+            },
+            dir
+        ));
+    }
+
+    #[test]
+    fn a_single_command_reads_a_fixed_declared_report_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = ["run a".to_string()];
+        let mut captures = plan_captures(
+            &JunitPlugin,
+            Some(&junit_at_fixed_path()),
+            tmp.path(),
+            tmp.path(),
+            "test",
+            &commands,
+            &Wrappers::default(),
+        );
+        let invocations = invocations_for(&commands, &mut captures);
+        assert!(invocations[0].shared.is_none());
+        let (plan, _) = captures[0].as_ref().unwrap();
+        assert_eq!(
+            plan.files,
+            ReportFiles::Globs {
+                root: tmp.path().to_path_buf(),
+                patterns: vec!["target/junit.xml".to_string()],
+            }
+        );
+        for (_, dir) in captures.iter().flatten() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_split_target_plans_each_command_of_a_declared_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = ["run a".to_string(), "run b".to_string()];
+        let at_path = junit_at_fixed_path();
+        // Every command is planned; each reads its own copy of the file.
+        let mut captures = plan_captures(
             &JunitPlugin,
             Some(&at_path),
             tmp.path(),
@@ -5285,18 +5507,24 @@ mod tests {
             &commands,
             &Wrappers::default(),
         );
-        assert!(captures[0].is_none());
-        assert!(captures[1].as_ref().is_some_and(|(plan, _)| plan.declared));
+        let invocations = invocations_for(&commands, &mut captures);
+        for (invocation, capture) in invocations.iter().zip(&captures) {
+            let (plan, dir) = capture.as_ref().expect("planned");
+            assert!(plan.declared);
+            let shared = invocation.shared.as_ref().expect("copied aside");
+            assert!(shared.into.starts_with(dir));
+            assert!(matches!(&plan.files, ReportFiles::Globs { root, .. } if root == &shared.into));
+        }
         for (_, dir) in captures.iter().flatten() {
             let _ = std::fs::remove_dir_all(dir);
         }
 
-        // Into the report directory, each command has its own.
+        // Into the report directory, each command has its own, read in place.
         let into_dir = crate::config::ReportConfig {
             files: Vec::new(),
             ..at_path
         };
-        let captures = plan_captures(
+        let mut captures = plan_captures(
             &JunitPlugin,
             Some(&into_dir),
             tmp.path(),
@@ -5305,6 +5533,8 @@ mod tests {
             &commands,
             &Wrappers::default(),
         );
+        let invocations = invocations_for(&commands, &mut captures);
+        assert!(invocations.iter().all(|i| i.shared.is_none()));
         let dirs: Vec<&PathBuf> = captures.iter().flatten().map(|(_, dir)| dir).collect();
         assert_eq!(dirs.len(), 2);
         assert_ne!(dirs[0], dirs[1]);
