@@ -427,22 +427,119 @@ fn report_files(files: &ReportFiles, started: SystemTime) -> Result<Vec<PathBuf>
                 builder.add(Glob::new(pattern)?);
             }
             let set = builder.build()?;
-            let mut found: Vec<PathBuf> = WalkDir::new(root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_file())
-                .map(|entry| entry.into_path())
-                .filter(|path| {
-                    path.strip_prefix(root)
-                        .is_ok_and(|relative| set.is_match(relative))
+            // Walk only the directories the patterns can match under:
+            // `nextest/*/*.xml` under a Cargo `target` never needs the rest
+            // of `target`, which a split target lists once per command.
+            let mut bases: Vec<PathBuf> = patterns.iter().map(|p| literal_dir(p)).collect();
+            bases.sort();
+            bases.dedup();
+            let outermost: Vec<&PathBuf> = bases
+                .iter()
+                .filter(|base| {
+                    !bases
+                        .iter()
+                        .any(|other| other != *base && base.starts_with(other))
                 })
-                .filter(|path| fresh(path))
                 .collect();
+            let mut found: Vec<PathBuf> = Vec::new();
+            for base in outermost {
+                found.extend(
+                    WalkDir::new(root.join(base))
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| entry.file_type().is_file())
+                        .map(|entry| entry.into_path())
+                        .filter(|path| {
+                            path.strip_prefix(root)
+                                .is_ok_and(|relative| set.is_match(relative))
+                        })
+                        .filter(|path| fresh(path)),
+                );
+            }
             found.sort();
+            found.dedup();
             Ok(found)
         }
     }
+}
+
+/// The leading directories of a glob that hold no glob syntax: `nextest`
+/// for `nextest/*/*.xml`, empty for `**/*.xml`. The last component is never
+/// included, and neither is anything from a `.` or `..` component on.
+fn literal_dir(pattern: &str) -> PathBuf {
+    let mut parts: Vec<&str> = pattern.split('/').collect();
+    parts.pop();
+    parts
+        .into_iter()
+        .take_while(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && !part.contains(['*', '?', '[', ']', '{', '}', '\\'])
+        })
+        .collect()
+}
+
+/// The report files that exist now, each with its modification time and
+/// size. Taken before a command runs, so [`copy_fresh_reports`] can tell a
+/// file the command rewrote from one an earlier command left.
+pub type ReportListing = std::collections::HashMap<PathBuf, (Option<SystemTime>, u64)>;
+
+/// List the report files `files` names that exist now.
+pub fn list_reports(files: &ReportFiles) -> ReportListing {
+    report_files(files, SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(&path).ok()?;
+            Some((path, (meta.modified().ok(), meta.len())))
+        })
+        .collect()
+}
+
+/// Copy the report files one command wrote into `into`, keeping their
+/// paths below the glob root, before a later command that writes the same
+/// paths replaces them. A file counts when it was modified at or after
+/// `started` (the command's start) and differs from its entry in `before`,
+/// the listing taken just before the command ran: a coarse timestamp alone
+/// cannot tell an earlier command's file from this one's. Returns how many
+/// files were copied.
+pub fn copy_fresh_reports(
+    files: &ReportFiles,
+    started: SystemTime,
+    before: &ReportListing,
+    into: &Path,
+) -> Result<usize> {
+    let mut copied = 0;
+    for (index, path) in report_files(files, started)?.into_iter().enumerate() {
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("cannot read test report {}", path.display()))?;
+        if before.get(&path) == Some(&(meta.modified().ok(), meta.len())) {
+            continue;
+        }
+        let relative = match files {
+            ReportFiles::Globs { root, .. } => path.strip_prefix(root).ok().map(Path::to_path_buf),
+            _ => None,
+        }
+        .unwrap_or_else(|| {
+            PathBuf::from(index.to_string()).join(path.file_name().unwrap_or_default())
+        });
+        let target = into.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        std::fs::copy(&path, &target).with_context(|| {
+            format!(
+                "cannot copy test report {} to {}",
+                path.display(),
+                target.display()
+            )
+        })?;
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 #[cfg(test)]
@@ -513,6 +610,72 @@ mod tests {
         .unwrap()
         .cases;
         assert!(cases.is_empty());
+    }
+
+    #[test]
+    fn globs_walk_only_their_literal_directories() {
+        assert_eq!(literal_dir("nextest/*/*.xml"), PathBuf::from("nextest"));
+        assert_eq!(
+            literal_dir("target/nextest/default/junit.xml"),
+            PathBuf::from("target/nextest/default")
+        );
+        assert_eq!(literal_dir("**/*.xml"), PathBuf::new());
+        assert_eq!(literal_dir("junit.xml"), PathBuf::new());
+        assert_eq!(literal_dir("a/{b,c}/x.xml"), PathBuf::from("a"));
+        assert_eq!(literal_dir("../x/y.xml"), PathBuf::new());
+
+        // Overlapping bases are walked once; a missing base finds nothing.
+        let tmp = TempDir::new().unwrap();
+        let reports = tmp.path().join("nextest/default");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("junit.xml"), REPORT).unwrap();
+        let found = report_files(
+            &ReportFiles::Globs {
+                root: tmp.path().to_path_buf(),
+                patterns: vec![
+                    "nextest/*/*.xml".into(),
+                    "nextest/default/junit.xml".into(),
+                    "absent/*.xml".into(),
+                ],
+            },
+            SystemTime::now() - Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(found, vec![reports.join("junit.xml")]);
+    }
+
+    #[test]
+    fn copies_only_reports_the_command_rewrote() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        let files = ReportFiles::Globs {
+            root: root.clone(),
+            patterns: vec!["out/*.xml".into()],
+        };
+        // Left by an earlier command just now: fresh by time, unchanged.
+        std::fs::write(root.join("out/earlier.xml"), REPORT).unwrap();
+        let before = list_reports(&files);
+        assert_eq!(before.len(), 1);
+        let started = SystemTime::now();
+        std::fs::write(root.join("out/mine.xml"), REPORT).unwrap();
+
+        let into = tmp.path().join("copy");
+        assert_eq!(
+            copy_fresh_reports(&files, started, &before, &into).unwrap(),
+            1
+        );
+        assert!(into.join("out/mine.xml").is_file());
+        assert!(!into.join("out/earlier.xml").exists());
+
+        // Exact paths are copied under their position in the list.
+        let paths = ReportFiles::Paths(vec![root.join("out/mine.xml")]);
+        let into = tmp.path().join("paths");
+        assert_eq!(
+            copy_fresh_reports(&paths, started, &ReportListing::new(), &into).unwrap(),
+            1
+        );
+        assert!(into.join("0/mine.xml").is_file());
     }
 
     #[test]

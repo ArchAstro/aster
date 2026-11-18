@@ -140,9 +140,17 @@ command writes there (`go test -json ./... > "$ASTER_TEST_REPORT_DIR/go.json"`).
 With `files`, it reads those globs under the project directory. Either way only
 files written while the command ran count, so an old report is never read as
 this run's. Prefer `ASTER_TEST_REPORT_DIR`: a fixed path can be read by
-another target that writes the same file, and when `--only-affected-files`
-splits a target into several commands only the last command's file is read
-(the results are then partial). `files` are relative to the project
+another target that writes the same file.
+
+When `--related` or `--only-affected-files` splits a target into several
+commands that each write the same fixed path (one `cargo nextest run` per
+test binary), Aster copies the files a command wrote as soon as it exits,
+before the next command replaces them, and reads every command's copy. A
+file counts for a command only when that command changed it. A failing
+command's tests are recorded although the commands after it do not run; the
+results are then partial. The JUnit file Aster reads under
+`target/nextest/<profile>/` for a recognised `cargo nextest run` is handled
+the same way. `files` are relative to the project
 directory, not a target's `working_dir`. A declared report wins over
 recognising the command. `libtest` (saved `cargo test` console output) is
 partial; the others are complete, and the capture is recorded as
