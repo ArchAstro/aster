@@ -3,7 +3,8 @@
 //! The main source is the JSON lines written by Aster's own formatter,
 //! `exunit_formatter.exs`, which Aster loads into `mix test`. Those results
 //! are complete only when they agree with the summary ExUnit prints
-//! (`4 tests, 1 failure`), so a test the formatter missed, or a run that
+//! (`4 tests, 1 failure` up to Elixir 1.19, `Result: 3/4 passed` from 1.20),
+//! so a test the formatter missed, or a run that
 //! crashed before its summary, is never taken for a full picture.
 //!
 //! Without the formatter (the project configures its own formatters, or
@@ -38,6 +39,12 @@ static ANSI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").un
 /// `1 doctest, 4 tests, 1 failure, 2 invalid, 1 skipped (3 excluded)`.
 static SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\d+ (?:doctests?|properties|property|tests?)\b.*?(\d+) failures?").unwrap()
+});
+/// Elixir 1.20: `Result: 447/455 passed (53/54 doctests, 393/403 tests), 1 skipped`
+/// when a test failed, `Result: 455 passed (70 tests)` when none did, and
+/// `Result: 0 tests` for an empty run. Failures are the total minus the passed.
+static RESULT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^Result: (?:(\d+)/(\d+) passed|\d+ passed|0 tests)(?:\W|$)").unwrap()
 });
 static INVALID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) invalid").unwrap());
 /// `  1) test creates an agent (Platform.AgentsTest)`.
@@ -97,10 +104,20 @@ fn summary_failures(stdout: &str) -> Option<usize> {
     let mut total = None;
     for line in stdout.lines() {
         let line = line.trim();
-        let Some(captures) = SUMMARY.captures(line) else {
+        let failures: usize = if let Some(captures) = SUMMARY.captures(line) {
+            captures[1].parse().ok()?
+        } else if let Some(captures) = RESULT.captures(line) {
+            match (captures.get(1), captures.get(2)) {
+                (Some(passed), Some(total)) => {
+                    let passed: usize = passed.as_str().parse().ok()?;
+                    let total: usize = total.as_str().parse().ok()?;
+                    total.checked_sub(passed)?
+                }
+                _ => 0,
+            }
+        } else {
             continue;
         };
-        let failures: usize = captures[1].parse().ok()?;
         let invalid: usize = INVALID
             .captures(line)
             .and_then(|c| c[1].parse().ok())
@@ -202,6 +219,38 @@ mod tests {
             + r#"{"suite":"Other","name":"test x","outcome":"error","message":"setup_all failed for this module"}"#;
         let stdout =
             "\x1b[31m2 tests, 1 failure\x1b[0m\n...\n1 doctest, 2 tests, 0 failures, 1 invalid\n";
+        assert!(collect(Some(&report), Some(stdout)).complete);
+    }
+
+    /// Summaries recorded from `mix test` on Elixir 1.20.5.
+    #[test]
+    fn elixir_1_20_result_summary_agreeing_with_the_report_is_complete() {
+        let stdout = "Finished in 0.02 seconds (0.00s async, 0.02s sync)\n\n\
+                      \x1b[32mResult: 2/3 passed, 1 skipped, 6 excluded\x1b[0m\n\x1b[31mFailed: 1 test\x1b[0m\n";
+        assert!(collect(Some(REPORT), Some(stdout)).complete);
+
+        let breakdown =
+            "Result: 3182/3183 passed (1/1 property, 3181/3182 tests), 1 skipped\nFailed: 1 test\n";
+        assert!(collect(Some(REPORT), Some(breakdown)).complete);
+    }
+
+    #[test]
+    fn elixir_1_20_result_summary_disagreeing_with_the_report_is_partial() {
+        let two_failed = "Result: 1/3 passed\nFailed: 2 tests\n";
+        assert!(!collect(Some(REPORT), Some(two_failed)).complete);
+        let all_passed = "Result: 3 passed (3 tests)\n";
+        assert!(!collect(Some(REPORT), Some(all_passed)).complete);
+    }
+
+    #[test]
+    fn elixir_1_20_result_summaries_add_up_and_count_invalid_tests() {
+        let passing = r#"{"suite":"A","name":"test a","outcome":"pass"}"#;
+        assert!(collect(Some(passing), Some("Result: 1 passed\n")).complete);
+        assert!(collect(Some(""), Some("Result: 0 tests\n")).complete);
+
+        let report = REPORT.to_string()
+            + r#"{"suite":"Other","name":"test x","outcome":"error","message":"setup_all failed for this module"}"#;
+        let stdout = "Result: 1/2 passed\nFailed: 1 test\n...\nResult: 2 passed (1 doctest, 1 test), 1 invalid\n";
         assert!(collect(Some(&report), Some(stdout)).complete);
     }
 
