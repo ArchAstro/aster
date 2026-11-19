@@ -175,7 +175,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     facts.qualified = true;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     facts.is_test_file = name.ends_with("_test.exs");
-    let Some(tree) = parse(tree_sitter_elixir::LANGUAGE.into(), source) else {
+    let Some(tree) = parse(super::facts::grammar(Family::Elixir, path), source) else {
         facts.parse_error = true;
         return facts;
     };

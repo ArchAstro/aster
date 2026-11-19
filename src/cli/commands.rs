@@ -381,6 +381,41 @@ fn positional_tokens(args: &[String]) -> Vec<&str> {
     positionals
 }
 
+/// `aster analyze` subcommands.
+#[derive(Subcommand)]
+pub enum AnalyzeCommands {
+    /// Print the definitions, references and module edges of two revisions
+    /// as one JSON document (schema `aster-change-v1`)
+    ///
+    /// Give two git revisions of the repository at the current directory
+    /// (--base and --head), or two directories that hold the trees
+    /// (--base-tree and --head-tree). Both forms print the same document
+    /// for the same files. The code is only parsed, never built or run, and
+    /// no aster.toml is needed.
+    Change {
+        /// Base revision (any commit-ish)
+        #[arg(long, requires = "head", conflicts_with_all = ["base_tree", "head_tree"])]
+        base: Option<String>,
+
+        /// Changed revision (any commit-ish)
+        #[arg(long, requires = "base")]
+        head: Option<String>,
+
+        /// Directory holding the base tree
+        #[arg(long, value_name = "DIR", requires = "head_tree")]
+        base_tree: Option<std::path::PathBuf>,
+
+        /// Directory holding the changed tree
+        #[arg(long, value_name = "DIR", requires = "base_tree")]
+        head_tree: Option<std::path::PathBuf>,
+
+        /// Report only files under this directory, relative to the tree root
+        /// (repeatable). Specifiers still resolve against the whole tree.
+        #[arg(long = "path", value_name = "DIR")]
+        paths: Vec<String>,
+    },
+}
+
 /// Available commands
 #[derive(Subcommand)]
 pub enum Commands {
@@ -438,6 +473,12 @@ pub enum Commands {
         /// `[[affected.related.boundary]]`
         #[arg(long, value_name = "N", requires = "source")]
         hubs: Option<usize>,
+    },
+
+    /// Describe source code for other tools, as JSON
+    Analyze {
+        #[command(subcommand)]
+        command: AnalyzeCommands,
     },
 
     /// Lint the configuration and annotations that `--related` depends on

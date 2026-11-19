@@ -42,7 +42,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     facts.is_test_file =
         (name.starts_with("test_") && name.ends_with(".py")) || name.ends_with("_test.py");
-    let Some(tree) = parse(tree_sitter_python::LANGUAGE.into(), source) else {
+    let Some(tree) = parse(super::facts::grammar(Family::Python, path), source) else {
         facts.parse_error = true;
         return facts;
     };

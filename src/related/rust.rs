@@ -105,7 +105,7 @@ struct Walker<'a> {
     fields: HashMap<(String, String), Option<String>>,
 }
 
-pub fn extract(_path: &Path, source: &str) -> FileFacts {
+pub fn extract(path: &Path, source: &str) -> FileFacts {
     let mut facts = FileFacts::new(Family::Rust);
     facts.qualified = true;
     facts.members = true;
@@ -113,7 +113,7 @@ pub fn extract(_path: &Path, source: &str) -> FileFacts {
     facts.types_by_import = true;
     facts.macros_by_name = true;
     facts.static_types = true;
-    let Some(tree) = parse(tree_sitter_rust::LANGUAGE.into(), source) else {
+    let Some(tree) = parse(super::facts::grammar(Family::Rust, path), source) else {
         facts.parse_error = true;
         return facts;
     };

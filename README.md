@@ -1231,6 +1231,65 @@ than every edge. Projects that run in full for a reason the graph cannot show
 are listed after it. Files the change does not touch are read from the
 working tree, so check out the head of a range for an exact answer.
 
+#### Describing a change for other tools
+
+`aster analyze change` prints, as one JSON document (`aster-change-v1`), what
+the `--related` extractors and resolvers read from two revisions: each
+file's definitions, what they reference, and the first-party files each one
+draws on. Tools that measure a change (new import cycles, calls into existing
+code, exports nothing uses) read it instead of parsing the code themselves.
+The code is only parsed, never built or run, and no `aster.toml` is needed.
+
+```console
+aster analyze change --base origin/main --head HEAD             # two git revisions
+aster analyze change --base-tree ./before --head-tree ./after   # two plain directories
+aster analyze change --base main --head HEAD --path src/ts/app  # report one directory
+```
+
+Both forms give the same bytes for the same files. Every file under a tree
+except `.git` is read: `.gitignore`, `.ignore`, git's exclude files and
+directory names such as `vendor` or `node_modules` hide nothing, so give
+`--base-tree` and `--head-tree` only the files of the revision. The revision
+form writes each revision's blobs as stored (`git ls-tree` and
+`git cat-file --batch`), so no filter driver, `ident`, line-ending or
+`export-ignore` attribute applies and nothing in the repository's
+configuration runs. Both forms leave out symbolic links; the revision form
+also leaves out submodules. `--path` limits which files are reported;
+specifiers still resolve against the whole tree. The document holds:
+
+- `revisions.base` and `revisions.head`, by file: `family`, `test_file`,
+  `parse_error`, `error_lines` (the parser's error and missing nodes),
+  `imports` (local names, specifiers, resolved `targets`), `reexports`, `top`
+  (the code outside every definition) and `defs`. Each definition has its
+  `name`, `kind`, `lines`, `owner`, `refs`, `members`, `uses`, `loaded`,
+  module-qualified `calls` with their resolved targets, the Elixir `module`
+  it is in, a `hash` of the tokens on its lines (comments left out; in
+  Python, with each line's indentation), and `uncertain` when an error span
+  overlaps it. Definitions that share a line share that line's tokens. A
+  file too large to parse or not UTF-8 is `opaque`: no definitions, and
+  `top.hash` is the hash of its bytes.
+- `edges.base` and `edges.head`: `resolved` file edges, each `import`,
+  `reexport`, `load` (a literal `import()`, `require()` or module mock),
+  `call` (a module-qualified call) or `module` (a Rust `mod name;`), and
+  `unresolved` specifiers, with `internal` set when the specifier names
+  workspace code the tree lacks. Edges only lead to paths inside the tree.
+  A Go package's edges point at its directory.
+- `diff`: per changed file, `status` and the definitions added, removed and
+  changed (by hash, keyed `owner.name` or `Module.name`, `#n` for repeats),
+  `top_changed`, and
+  the edges added and removed.
+- `tool`: the Aster version and the tree-sitter grammar versions.
+
+A file with a syntax error is read from the tree the parser recovered, as
+`--related` reads it, so its definitions are still listed. For example, after
+a change that makes `b.ts` import `a.ts` while `a.ts` already imports `b.ts`:
+
+```json
+{"diff": {"edges_added": [{"from": "src/b.ts", "to": "src/a.ts", "kind": "import"}],
+          "files": {"src/b.ts": {"status": "modified", "defs_added": ["again"],
+                                 "defs_removed": [], "defs_changed": [], "top_changed": true}}}}
+```
+
 #### Seeing why a project, lane or test is selected
 
 `--explain` on `aster affected` says which rule selected each project and, for

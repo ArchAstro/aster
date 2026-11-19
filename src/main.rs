@@ -238,6 +238,10 @@ fn run() -> Result<()> {
     if let Commands::Results { command } = &command {
         return handle_results(command, output_mode);
     }
+    // Reads plain trees or git revisions; needs no workspace.
+    if let Commands::Analyze { command } = &command {
+        return aster::cli::analyze::run(command, &cwd);
+    }
     if let Commands::Srv { command } = &command {
         return handle_srv(command, output_mode);
     }
@@ -562,6 +566,7 @@ fn run() -> Result<()> {
         Commands::Check { .. } => unreachable!("check handled above"),
         Commands::Results { .. } => unreachable!("results handled above"),
         Commands::Srv { .. } => unreachable!("srv handled above"),
+        Commands::Analyze { .. } => unreachable!("analyze handled above"),
         Commands::List { path, lang } => {
             validate_lang_filter(&lang)?;
 
