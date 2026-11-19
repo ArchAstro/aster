@@ -65,9 +65,12 @@ pub struct FileReport {
     pub opaque: bool,
     /// Elixir modules defined here, or the Go package name.
     pub modules: Vec<String>,
-    /// Loads code by a computed name: the edges out of this file are
-    /// incomplete.
+    /// Loads code by a computed name, and how: the edges out of this file
+    /// are incomplete.
     pub dynamic: Option<&'static str>,
+    /// Calls `import()` or `require()` with a name that is not a literal:
+    /// the edges out of this file are incomplete.
+    pub open_loads: bool,
     pub imports: Vec<ImportReport>,
     pub reexports: Vec<String>,
     pub defs: Vec<DefReport>,
@@ -136,8 +139,9 @@ pub struct Edge {
     pub from: String,
     pub to: String,
     /// `import`, `reexport`, `load` (a literal `import()`, `require()` or
-    /// module mock), `call` (a module-qualified call) or `module` (a Rust
-    /// `mod name;`).
+    /// module mock), `call` (a module-qualified call), `module` (a Rust
+    /// `mod name;`) or `path` (a JavaScript string literal that names the
+    /// file, such as a script to spawn).
     pub kind: &'static str,
 }
 
@@ -359,9 +363,25 @@ pub fn describe(root: &Path, scope: &Scope) -> (BTreeMap<String, FileReport>, Ed
                 .map(|m| m.name.clone())
                 .or_else(|| (file.modules.len() == 1).then(|| file.modules[0].clone()))
         };
+        let bound: BTreeSet<&str> = imported
+            .iter()
+            .copied()
+            .chain(file.uses_all.iter().map(String::as_str))
+            .chain(file.reexports.iter().map(String::as_str))
+            .collect();
         let report_def = |def: &Def, hash: Option<String>, uncertain: bool| -> DefReport {
             for spec in &def.uses {
-                link(spec, "import");
+                // A JavaScript definition uses a file through an import, a
+                // literal `import()` or `require()` (a load, below), or a
+                // relative string literal that names it (a path: data, a
+                // file to spawn, not an import).
+                let kind = match file.family {
+                    Family::Js if bound.contains(spec.as_str()) => "import",
+                    Family::Js if def.loaded.contains(spec) => continue,
+                    Family::Js => "path",
+                    _ => "import",
+                };
+                link(spec, kind);
             }
             // The top's `loaded` also holds the static imports.
             for spec in def.loaded.iter().filter(|s| !imported.contains(s.as_str())) {
@@ -455,6 +475,7 @@ pub fn describe(root: &Path, scope: &Scope) -> (BTreeMap<String, FileReport>, Ed
                 opaque: tokens.raw.is_some(),
                 modules: file.modules.clone(),
                 dynamic: file.dynamic,
+                open_loads: file.open_loads,
                 imports,
                 reexports: file.reexports.clone(),
                 defs,

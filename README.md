@@ -1259,6 +1259,8 @@ specifiers still resolve against the whole tree. The document holds:
 
 - `revisions.base` and `revisions.head`, by file: `family`, `test_file`,
   `parse_error`, `error_lines` (the parser's error and missing nodes),
+  `dynamic` and `open_loads` (it loads code by a computed name, such as
+  `import(name)`, so its edges are incomplete),
   `imports` (local names, specifiers, resolved `targets`), `reexports`, `top`
   (the code outside every definition) and `defs`. Each definition has its
   `name`, `kind`, `lines`, `owner`, `refs`, `members`, `uses`, `loaded`,
@@ -1270,7 +1272,9 @@ specifiers still resolve against the whole tree. The document holds:
   `top.hash` is the hash of its bytes.
 - `edges.base` and `edges.head`: `resolved` file edges, each `import`,
   `reexport`, `load` (a literal `import()`, `require()` or module mock),
-  `call` (a module-qualified call) or `module` (a Rust `mod name;`), and
+  `call` (a module-qualified call), `module` (a Rust `mod name;`) or `path`
+  (a JavaScript string literal that names the file, such as a script a test
+  spawns: not an import), and
   `unresolved` specifiers, with `internal` set when the specifier names
   workspace code the tree lacks. Edges only lead to paths inside the tree.
   A Go package's edges point at its directory.
