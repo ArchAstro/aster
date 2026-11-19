@@ -146,7 +146,7 @@ fn analyze_change_reports_a_new_cycle_and_a_reused_helper_across_ts_elixir_and_r
             ),
             (
                 "apps/web/src/a.test.ts",
-                "import { a } from \"./a\";\n\nvi.mock(\"./b\", async (importOriginal) => {\n  const original = await importOriginal<typeof import(\"./b\")>();\n  return { ...original };\n});\n\nexport function checksA() {\n  return a() === 2;\n}\n",
+                "import { a } from \"./a\";\n\nvi.mock(\"./b\", async (importOriginal) => {\n  const original = await importOriginal<typeof import(\"./b\")>();\n  return { ...original };\n});\n\nexport function checksA() {\n  return a() === 2;\n}\n\nexport const script = \"./b.ts\";\n\nexport function lazy(name: string) {\n  return import(name);\n}\n",
             ),
             (
                 "lib/report.ex",
@@ -257,6 +257,23 @@ fn analyze_change_reports_a_new_cycle_and_a_reused_helper_across_ts_elixir_and_r
     assert_eq!(test_file["error_lines"], serde_json::json!([[4, 4]]));
     // The error is in the mock call, code outside every definition.
     assert_eq!(test_file["top"]["uncertain"], true);
+
+    // A string literal naming a file is a `path` edge, not an import; the
+    // mock is a `load`; a computed `import()` marks the file's edges
+    // incomplete.
+    let kinds = |to: &str| -> BTreeSet<String> {
+        report["edges"]["head"]["resolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["from"] == "apps/web/src/a.test.ts" && e["to"] == to)
+            .map(|e| e["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(kinds(b), BTreeSet::from(["load".into(), "path".into()]));
+    assert_eq!(kinds(a), BTreeSet::from(["import".into()]));
+    assert_eq!(test_file["open_loads"], true);
+    assert_eq!(report["revisions"]["head"][a]["open_loads"], false);
     assert!(test_file["defs"]
         .as_array()
         .unwrap()
