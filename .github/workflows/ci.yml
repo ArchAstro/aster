@@ -47,6 +47,7 @@ jobs:
             --test cache_gha \
             --test cache_remote \
             --test related \
+            --test analyze_change_e2e \
             --test test_results \
             --test watch_tests
           cargo test --locked --test dev_services --all-features -- --test-threads=1
