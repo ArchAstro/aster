@@ -32,11 +32,18 @@ aster graph //services/api:test
 aster graph --source                              # what the uncommitted changes reach, down to the tests
 aster graph --source --commit origin/main...HEAD  # the same for a branch or range (read as git diff reads it)
 aster why //services/api:test //libs/core:build
+aster analyze change --base origin/main --head HEAD   # both revisions' definitions and file edges as JSON
 ```
 
 `list` shows discovered projects, languages, build systems, and targets.
 `graph` shows dependencies. `why` explains a dependency path between two target
 addresses. `--json` provides structured output where supported.
+`analyze change` prints, for two git revisions (or two directories with
+`--base-tree` and `--head-tree`), each file's definitions, references and
+resolved first-party edges, plus which definitions and edges the change
+added, removed or changed (schema `aster-change-v1`; see the README). It only
+parses the code and needs no `aster.toml`, so it suits tools that measure an
+untrusted change.
 `graph --json` also lists `workspace_inputs`: each target's
 `[targets.<name>.cache] workspace_include` globs. Declare there any file a
 target reads from another project (an `include_str!`, a schema, a fixture), so

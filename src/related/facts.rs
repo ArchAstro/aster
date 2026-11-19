@@ -549,6 +549,22 @@ pub fn children(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     node.children(&mut cursor).collect()
 }
 
+/// The grammar a file of `family` at `path` is parsed with.
+pub fn grammar(family: Family, path: &Path) -> tree_sitter::Language {
+    match family {
+        Family::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+        // The TSX grammar reads JavaScript and JSX; only `.ts` needs the
+        // plain one, where `<T>value` is a cast rather than an element.
+        Family::Js => match path.extension().and_then(|e| e.to_str()) {
+            Some("ts" | "mts" | "cts") => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            _ => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        },
+        Family::Go => tree_sitter_go::LANGUAGE.into(),
+        Family::Python => tree_sitter_python::LANGUAGE.into(),
+        Family::Rust => tree_sitter_rust::LANGUAGE.into(),
+    }
+}
+
 /// Parse `source` with `language`; `None` if the parser gives up.
 pub fn parse(language: tree_sitter::Language, source: &str) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();

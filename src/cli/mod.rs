@@ -3,6 +3,7 @@
 //! Provides the command-line interface using clap derive macros.
 
 pub mod affected_files;
+pub mod analyze;
 pub mod cache_plan;
 pub mod commands;
 pub mod explain;
@@ -14,9 +15,9 @@ mod skills;
 pub mod source_graph;
 
 pub use commands::{
-    CacheCommands, CiCommands, Cli, Commands, DirCacheRestoreArgs, DirCacheSaveArgs,
-    ProjectCommands, ResultsCommands, ServicesCommands, ServicesDaemonCommands, SrvCommands,
-    SrvTarget, TlsCommands,
+    AnalyzeCommands, CacheCommands, CiCommands, Cli, Commands, DirCacheRestoreArgs,
+    DirCacheSaveArgs, ProjectCommands, ResultsCommands, ServicesCommands, ServicesDaemonCommands,
+    SrvCommands, SrvTarget, TlsCommands,
 };
 pub use output::{
     build_execution_output, build_execution_output_with_cache, output_json, print_summary,

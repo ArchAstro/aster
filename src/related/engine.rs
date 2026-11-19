@@ -25,7 +25,7 @@ const SKIPPED_DIRS: &[&str] = &[
     ".aster",
 ];
 /// Larger files are generated or bundled; they are treated as opaque.
-const MAX_SOURCE_BYTES: u64 = 1_500_000;
+pub(super) const MAX_SOURCE_BYTES: u64 = 1_500_000;
 /// Reasons listed per test before the rest are counted.
 const MAX_REASONS: usize = 1;
 
@@ -428,30 +428,7 @@ pub fn analyse_with(
             ghosts.insert(change.path.clone());
         }
     }
-    // Which Rust files are test code is decided by the module that
-    // declares them, not by the file.
-    let rust = super::resolve::RustIndex::build(
-        root,
-        facts
-            .iter()
-            .filter(|(_, facts)| facts.family == Family::Rust)
-            .map(|(path, _)| path),
-    );
-    for file in rust.test_files(&facts) {
-        if let Some(facts) = facts.get_mut(&file) {
-            facts.is_test_file = true;
-        }
-    }
-    // Only a test runs the package's binary to see what it does; product
-    // code that mentions the same names does not.
-    for facts in facts.values_mut().filter(|f| f.family == Family::Rust) {
-        let test_file = facts.is_test_file;
-        for def in facts.defs.iter_mut().chain([&mut facts.top]) {
-            if !test_file && !def.in_test {
-                def.reflects = None;
-            }
-        }
-    }
+    mark_rust_test_files(root, &mut facts);
     let files_analysed = facts.len();
     let mut index = Index::build(root, projects, graph, &paths, facts, &ghosts);
     index.explain = explain;
@@ -476,6 +453,33 @@ pub fn analyse_with(
     related
 }
 
+/// Mark the Rust files that are test code. That is decided by the module
+/// that declares a file, not by the file, so it needs every file's facts.
+pub(super) fn mark_rust_test_files(root: &Path, facts: &mut HashMap<PathBuf, FileFacts>) {
+    let rust = super::resolve::RustIndex::build(
+        root,
+        facts
+            .iter()
+            .filter(|(_, facts)| facts.family == Family::Rust)
+            .map(|(path, _)| path),
+    );
+    for file in rust.test_files(facts) {
+        if let Some(facts) = facts.get_mut(&file) {
+            facts.is_test_file = true;
+        }
+    }
+    // Only a test runs the package's binary to see what it does; product
+    // code that mentions the same names does not.
+    for facts in facts.values_mut().filter(|f| f.family == Family::Rust) {
+        let test_file = facts.is_test_file;
+        for def in facts.defs.iter_mut().chain([&mut facts.top]) {
+            if !test_file && !def.in_test {
+                def.reflects = None;
+            }
+        }
+    }
+}
+
 /// The facts of a changed file before the change, when lines were removed.
 fn changed_old_facts(change: &Change, now: &Source) -> Option<FileFacts> {
     change.old_lines.as_ref().filter(|l| !l.is_empty())?;
@@ -483,7 +487,7 @@ fn changed_old_facts(change: &Change, now: &Source) -> Option<FileFacts> {
     Some(extract(now.facts.family, &change.path, old))
 }
 
-fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
+pub(super) fn extract(family: Family, path: &Path, source: &str) -> FileFacts {
     match family {
         Family::Elixir => elixir::extract(path, source),
         Family::Js => js::extract(path, source),
@@ -499,17 +503,33 @@ pub(super) fn scan(
     root: &Path,
     cache: Option<FactsCache>,
 ) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>, usize) {
+    scan_files(root, cache, false)
+}
+
+/// [`scan`]; under `plain`, every file under `root` but `.git` counts,
+/// whatever ignore files, git configuration or directory names say, so the
+/// result depends only on the files.
+pub(super) fn scan_files(
+    root: &Path,
+    cache: Option<FactsCache>,
+    plain: bool,
+) -> (HashSet<PathBuf>, HashMap<PathBuf, FileFacts>, usize) {
     let mut paths = HashSet::new();
     let mut sources = Vec::new();
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .filter_entry(|entry| {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(false);
+    if plain {
+        builder.standard_filters(false).hidden(false);
+        builder.filter_entry(|entry| entry.file_name() != ".git");
+    } else {
+        builder.filter_entry(|entry| {
             entry
                 .file_name()
                 .to_str()
                 .is_none_or(|name| !SKIPPED_DIRS.contains(&name))
-        })
-        .build();
+        });
+    }
+    let walker = builder.build();
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;

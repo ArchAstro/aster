@@ -35,6 +35,7 @@
 
 mod annotations;
 mod cache;
+mod change;
 mod consumers;
 mod dispatch;
 mod elixir;
@@ -49,6 +50,7 @@ mod resolve;
 mod rust;
 mod sites;
 
+pub use change::{analyze_change, Report as ChangeReport, Scope as ChangeScope};
 pub use dispatch::{pack, pack_names, Boundary, DispatchRule, Pack, Rules};
 pub use engine::{analyse, analyse_with, Change, GraphNode, Hop, Outcome, Related, TestSelection};
 pub use facts::Family;

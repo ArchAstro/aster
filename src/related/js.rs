@@ -84,15 +84,7 @@ pub fn extract(path: &Path, source: &str) -> FileFacts {
     let mut facts = FileFacts::new(Family::Js);
     facts.members = true;
     facts.loads_by_import = true;
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    // The TSX grammar reads JavaScript and JSX; only `.ts` needs the plain
-    // one, where `<T>value` is a cast rather than an element.
-    let language = if matches!(extension, "ts" | "mts" | "cts") {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT
-    } else {
-        tree_sitter_typescript::LANGUAGE_TSX
-    };
-    let Some(tree) = parse(language.into(), source) else {
+    let Some(tree) = parse(super::facts::grammar(Family::Js, path), source) else {
         facts.parse_error = true;
         return facts;
     };
