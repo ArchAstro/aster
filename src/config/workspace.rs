@@ -589,6 +589,9 @@ pub struct AffectedRelatedConfig {
     /// Hub files where the walk from a change stops.
     #[serde(default)]
     pub boundary: Vec<crate::related::Boundary>,
+    /// Paths that whole files read without their code showing it.
+    #[serde(default)]
+    pub reads: Vec<crate::related::DeclaredReads>,
 }
 
 /// Default for [`AffectedRelatedConfig::pack_shards_up_to`].
@@ -608,6 +611,7 @@ impl Default for AffectedRelatedConfig {
             compile_attributes: Vec::new(),
             packs: Vec::new(),
             boundary: Vec::new(),
+            reads: Vec::new(),
         }
     }
 }
@@ -654,7 +658,9 @@ impl AffectedRelatedConfig {
             .iter()
             .filter_map(|name| Some((name.clone(), crate::related::pack(name)?)))
             .collect();
-        crate::related::Rules::new(self.boundary.clone(), own, packs)
+        let mut rules = crate::related::Rules::new(self.boundary.clone(), own, packs);
+        rules.reads = self.reads.clone();
+        rules
     }
 
     fn validate(&self) -> Result<()> {
@@ -674,6 +680,11 @@ impl AffectedRelatedConfig {
         for boundary in &self.boundary {
             if let Err(problem) = boundary.validate() {
                 bail!("boundary: {problem}");
+            }
+        }
+        for reads in &self.reads {
+            if let Err(problem) = reads.validate() {
+                bail!("reads: {problem}");
             }
         }
         for name in &self.packs {

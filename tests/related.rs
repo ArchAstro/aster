@@ -606,6 +606,164 @@ fn a_boundary_stops_the_walk_at_a_hub_except_for_the_tests_that_use_it() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("needs a `reason`"));
 }
 
+/// A tool that the registry runs by a name built at run time, a journey test
+/// in another project that goes through the registry, and a test that calls
+/// the tool directly.
+const RUN_TIME_ONLY: &[(&str, &str)] = &[
+    (
+        "shop/mix.exs",
+        "defmodule Shop.MixProject do\n  use Mix.Project\n  def project, do: [app: :shop, version: \"0.1.0\"]\nend\n",
+    ),
+    (
+        "shop/lib/shop/registry.ex",
+        "defmodule Shop.Registry do\n  def run(key), do: apply(String.to_existing_atom(\"Elixir.Shop.\" <> key), :answer, [])\nend\n",
+    ),
+    (
+        "shop/lib/shop/search_tool.ex",
+        "defmodule Shop.SearchTool do\n  def answer, do: \"no results\"\nend\n",
+    ),
+    (
+        "shop/test/shop/search_tool_test.exs",
+        "defmodule Shop.SearchToolTest do\n  use ExUnit.Case\n\n  test \"answer\" do\n    assert Shop.SearchTool.answer() == \"no results\"\n  end\nend\n",
+    ),
+    (
+        "web/mix.exs",
+        "defmodule Web.MixProject do\n  use Mix.Project\n  def project, do: [app: :web, version: \"0.1.0\", deps: [{:shop, path: \"../shop\"}]]\nend\n",
+    ),
+    (
+        "web/test/web/tools/search_journey_test.exs",
+        "defmodule Web.Tools.SearchJourneyTest do\n  use ExUnit.Case\n\n  test \"a search with no match says so\" do\n    assert Shop.Registry.run(\"SearchTool\") == \"no results\"\n  end\nend\n",
+    ),
+    (
+        "web/test/web/home_test.exs",
+        "defmodule Web.HomeTest do\n  use ExUnit.Case\n\n  test \"home\" do\n    assert 1 + 1 == 2\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_reads_rule_selects_the_tests_that_reach_a_change_only_at_run_time() {
+    // The tool's answer changes. The journey test asserts that answer, but
+    // reaches the tool through a name the registry builds at run time, so
+    // no reference leads from the change to it: only the direct test runs.
+    let ws = Workspace::new(RUN_TIME_ONLY);
+    ws.edit(
+        "shop/lib/shop/search_tool.ex",
+        "no results",
+        "nothing found",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/search_tool_test.exs"]
+    );
+    assert!(
+        !plan.targets.contains_key("//web:test"),
+        "nothing leads to the journey test: {plan:#?}"
+    );
+
+    // A rule says the tool journeys read the tools. The same change now
+    // also runs the journey test, and no other test of its project.
+    let config = "[affected.related]\n\n[[affected.related.reads]]\nfiles = [\"web/test/web/tools/**\"]\npaths = [\"shop/lib/shop/*_tool.ex\"]\nreason = \"tool journeys run tools through the registry, by name\"\n";
+    let ws = Workspace::with_config(config, RUN_TIME_ONLY);
+    ws.edit(
+        "shop/lib/shop/search_tool.ex",
+        "no results",
+        "nothing found",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//shop:test"),
+        ["mix test test/shop/search_tool_test.exs"]
+    );
+    assert_eq!(
+        plan.commands("//web:test"),
+        ["mix test test/web/tools/search_journey_test.exs"]
+    );
+
+    // `--explain` names the rule, so the selection can be traced to config.
+    let explained = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--explain"]);
+    let explained = String::from_utf8_lossy(&explained.stdout).to_string();
+    assert!(
+        explained.contains(
+            "shop/lib/shop/search_tool.ex changed ([[affected.related.reads]]: tool journeys run \
+             tools through the registry, by name)"
+        ),
+        "{explained}"
+    );
+
+    // A change the rule's paths do not cover selects as before.
+    let ws = Workspace::with_config(config, RUN_TIME_ONLY);
+    ws.edit(
+        "shop/lib/shop/registry.ex",
+        "def run(key)",
+        "def run(key) when is_binary(key)",
+    );
+    let plan = ws.plan("test");
+    assert_eq!(
+        plan.commands("//web:test"),
+        ["mix test test/web/tools/search_journey_test.exs"],
+        "the journey test names the registry, so a reference selects it"
+    );
+    assert!(!plan.targets.contains_key("//shop:test"), "{plan:#?}");
+
+    // A rule without a reason, or without paths, is a config error.
+    for (broken, says) in [
+        (
+            config.replace("tool journeys run tools through the registry, by name", ""),
+            "needs a `reason`",
+        ),
+        (
+            config.replace("paths = [\"shop/lib/shop/*_tool.ex\"]", "paths = []"),
+            "needs `paths`",
+        ),
+        (
+            config.replace("shop/lib/shop/*_tool.ex", "./"),
+            "names nothing",
+        ),
+    ] {
+        let ws = Workspace::with_config(&broken, RUN_TIME_ONLY);
+        let output = ws.aster(&["affected", "test", "--base=HEAD", "--related", "--dry-run"]);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(says),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_reads_rule_in_another_project_keeps_the_owning_projects_full_run() {
+    // A data file that no code of its own project names: the project cannot
+    // tell which of its tests read it, so they all run.
+    let mut files = RUN_TIME_ONLY.to_vec();
+    files.push(("shop/priv/answers.json", "{\"none\": \"no results\"}\n"));
+    let ws = Workspace::new(&files);
+    ws.edit("shop/priv/answers.json", "no results", "nothing found");
+    let plan = ws.plan("test");
+    // A full run keeps the target's own command, so the plan replaces none.
+    assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
+    assert!(plan
+        .notes("//shop:test")
+        .contains("shop/priv/answers.json is not named by any source file"));
+
+    // Another project's tests declare that they read it. They now run too,
+    // and the owning project still runs in full: a reader elsewhere says
+    // nothing about which of the project's own tests read the file.
+    let config = "[affected.related]\n\n[[affected.related.reads]]\nfiles = [\"web/test/web/tools/**\"]\npaths = [\"shop/priv\"]\nreason = \"tool journeys compare against the shop's answers\"\n";
+    let ws = Workspace::with_config(config, &files);
+    ws.edit("shop/priv/answers.json", "no results", "nothing found");
+    let plan = ws.plan("test");
+    assert!(plan.commands("//shop:test").is_empty(), "{plan:#?}");
+    assert!(plan
+        .notes("//shop:test")
+        .contains("shop/priv/answers.json is not named by any source file"));
+    assert_eq!(
+        plan.commands("//web:test"),
+        ["mix test test/web/tools/search_journey_test.exs"]
+    );
+}
+
 #[test]
 fn graph_source_hubs_ranks_the_files_reached_tests_go_through() {
     let ws = Workspace::new(HUB);

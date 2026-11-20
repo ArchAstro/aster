@@ -79,11 +79,64 @@ impl Boundary {
     }
 }
 
+/// Paths that files read without their code showing it:
+/// `[[affected.related.reads]]`.
+///
+/// Each file that `files` matches is treated as if its top-level code
+/// carried `aster: reads <paths>`: a changed file that a path covers selects
+/// it. This is for tests that reach code only at run time, through a process
+/// or a registry that a boundary cuts or that no call names, where one rule
+/// for a directory of tests replaces a comment in every file.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredReads {
+    /// Workspace-relative globs of the files that do the reading.
+    pub files: Vec<String>,
+    /// Workspace-relative paths, directories or globs they read, as after
+    /// `aster: reads`.
+    pub paths: Vec<String>,
+    /// Why no reference shows the read.
+    pub reason: String,
+}
+
+impl DeclaredReads {
+    /// Check what config gives.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.files.is_empty() {
+            return Err("a reads rule needs `files`".to_string());
+        }
+        if self.paths.is_empty() {
+            return Err(format!("the reads rule for {:?} needs `paths`", self.files));
+        }
+        if self.reason.trim().is_empty() {
+            return Err(format!(
+                "the reads rule for {:?} needs a `reason`",
+                self.files
+            ));
+        }
+        for glob in &self.files {
+            globset::Glob::new(glob).map_err(|e| format!("reads glob {glob:?}: {e}"))?;
+        }
+        for path in &self.paths {
+            let Some(path) = super::annotations::normalise(path) else {
+                return Err(format!(
+                    "the reads rule for {:?} has a path that names nothing: {path:?}",
+                    self.files
+                ));
+            };
+            globset::Glob::new(&path).map_err(|e| format!("reads path {path:?}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Everything `[affected.related]` says about how the walk goes.
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
     pub dispatch: Vec<DispatchRule>,
     pub boundaries: Vec<Boundary>,
+    /// Reads declared for whole files.
+    pub reads: Vec<DeclaredReads>,
     /// Modules whose `use` calls no function of the module that uses it.
     pub inert_uses: Vec<String>,
     /// Module attributes a library reads at compile time (without `@`).

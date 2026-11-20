@@ -249,7 +249,8 @@ pub fn run(
     // Rules about sources and their configuration.
     let source_rules = [SUSPICIOUS, BAD_CONSUMES, BAD_RELATED_RULE, STALE];
     if source_rules.iter().any(|rule| enabled(rule)) {
-        let sources = Sources::load(root, options.cache_dir.as_deref());
+        let mut sources = Sources::load(root, options.cache_dir.as_deref());
+        sources.declare(&config.affected.related.reads);
         report.stats.source_files = sources.facts.len();
         report.stats.facts_reused = sources.reused;
         if enabled(SUSPICIOUS) {
