@@ -23,6 +23,8 @@ pub struct Sources {
     dirs: HashSet<PathBuf>,
     /// Source files whose facts the cache held.
     pub reused: usize,
+    /// Paths that `[[affected.related.reads]]` rules declare for a file.
+    declared: HashMap<PathBuf, Vec<String>>,
 }
 
 impl Sources {
@@ -55,6 +57,34 @@ impl Sources {
             files,
             dirs,
             reused,
+            declared: HashMap::new(),
+        }
+    }
+
+    /// Take on the reads that `rules` declare for whole files, so that a
+    /// literal they cover is a declared read.
+    pub fn declare(&mut self, rules: &[super::DeclaredReads]) {
+        for rule in rules {
+            let mut set = globset::GlobSetBuilder::new();
+            for glob in &rule.files {
+                if let Ok(glob) = globset::Glob::new(glob) {
+                    set.add(glob);
+                }
+            }
+            let Ok(set) = set.build() else {
+                continue;
+            };
+            let paths: Vec<String> = rule
+                .paths
+                .iter()
+                .filter_map(|path| annotations::normalise(path))
+                .collect();
+            for file in self.facts.keys().filter(|file| set.is_match(file)) {
+                self.declared
+                    .entry(file.clone())
+                    .or_default()
+                    .extend(paths.iter().cloned());
+            }
         }
     }
 
@@ -209,6 +239,8 @@ pub fn suspicious_path_literals(projects: &[DiscoveredProject], src: &Sources) -
                     _ => None,
                 })
                 .flatten()
+                // A rule declares its paths for the whole file.
+                .chain(src.declared.get(path).into_iter().flatten())
                 .collect();
             for (text, line) in def.strings.iter().zip(&def.string_lines) {
                 if def.loaded.contains(text) {
@@ -395,6 +427,29 @@ pub fn bad_related_rules(rules: &super::Rules, src: &Sources) -> Vec<Finding> {
                 report(format!(
                     "[[affected.related.boundary]] lists `{pattern}`, which matches no source \
                      file; the boundary stops nothing"
+                ));
+            }
+        }
+    }
+    for reads in &rules.reads {
+        for pattern in &reads.files {
+            let Ok(glob) = globset::Glob::new(pattern) else {
+                continue;
+            };
+            let matcher = glob.compile_matcher();
+            if !src.facts.keys().any(|source| matcher.is_match(source)) {
+                report(format!(
+                    "[[affected.related.reads]] lists `{pattern}` in `files`, which matches no \
+                     source file; the rule selects nothing"
+                ));
+            }
+        }
+        for path in &reads.paths {
+            let known = annotations::normalise(path).is_some_and(|p| src.matches_any(&p));
+            if !known {
+                report(format!(
+                    "[[affected.related.reads]] lists `{path}` in `paths`, which matches no file \
+                     or directory of the workspace (paths are workspace-relative)"
                 ));
             }
         }

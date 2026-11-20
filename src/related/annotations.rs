@@ -72,7 +72,7 @@ fn parse_line(line: &str) -> Option<Directive> {
     })
 }
 
-fn normalise(path: &str) -> Option<String> {
+pub(super) fn normalise(path: &str) -> Option<String> {
     let path = path.trim_matches(|c| c == ',' || c == '"' || c == '\'');
     let path = path.strip_prefix("//").unwrap_or(path);
     let path = path.trim_start_matches("./").trim_end_matches('/');

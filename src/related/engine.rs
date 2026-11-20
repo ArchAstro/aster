@@ -310,6 +310,9 @@ struct Index<'a> {
     runners: Vec<Vec<DefId>>,
     /// For each source, the boundary reason when it is a boundary.
     boundary: Vec<Option<std::sync::Arc<str>>>,
+    /// The reason of the `[[affected.related.reads]]` rule that gave a
+    /// source's top-level code a path.
+    read_rules: HashMap<(u32, String), std::sync::Arc<str>>,
     /// Modules whose `use` calls nothing of the using module.
     inert_uses: HashSet<String>,
     /// Module attributes a library reads at compile time, without `@`.
@@ -434,6 +437,7 @@ pub fn analyse_with(
     index.explain = explain;
     index.set_dispatch(&rules.dispatch);
     index.set_boundaries(&rules.boundaries);
+    index.set_reads(&rules.reads);
     index.inert_uses = super::elixir::INERT_USES
         .iter()
         .map(|m| m.to_string())
@@ -1749,6 +1753,7 @@ impl<'a> Index<'a> {
             compile_attributes: HashSet::new(),
             runners: Vec::new(),
             boundary: Vec::new(),
+            read_rules: HashMap::new(),
         }
     }
 
@@ -1773,6 +1778,42 @@ impl<'a> Index<'a> {
                     .map(|(_, reason)| reason.clone())
             })
             .collect();
+    }
+
+    /// Give each source that a rule's `files` match the rule's `paths`, as
+    /// an `aster: reads` comment in its top-level code would.
+    fn set_reads(&mut self, rules: &[super::dispatch::DeclaredReads]) {
+        for rule in rules {
+            let mut set = globset::GlobSetBuilder::new();
+            for glob in &rule.files {
+                if let Ok(glob) = globset::Glob::new(glob) {
+                    set.add(glob);
+                }
+            }
+            let Ok(set) = set.build() else {
+                continue;
+            };
+            let paths: Vec<String> = rule
+                .paths
+                .iter()
+                .filter_map(|path| annotations::normalise(path))
+                .collect();
+            let reason: std::sync::Arc<str> = rule.reason.as_str().into();
+            for (file, source) in self.sources.iter_mut().enumerate() {
+                if source.ghost || !set.is_match(&source.path) {
+                    continue;
+                }
+                for path in &paths {
+                    // A path the file's own comment declares stays the
+                    // comment's.
+                    if !source.facts.top.reads.contains(path) {
+                        source.facts.top.reads.push(path.clone());
+                        self.read_rules
+                            .insert((file as u32, path.clone()), reason.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Whether the walk stops at the edge `from` → `to`: `from` is in a
@@ -3068,13 +3109,25 @@ impl<'a> Index<'a> {
             for (id, def) in defs {
                 // Paths the definition declares it reads, in a comment.
                 for pattern in &def.reads {
+                    let rule = (id.1 == TOP)
+                        .then(|| self.read_rules.get(&(id.0, pattern.clone())))
+                        .flatten();
                     for change in changes {
                         if annotations::covers(pattern, &change.path) {
-                            mentioned.insert(change.path.clone());
-                            run.mark(
-                                id,
-                                Why::Changed(format!("{} changed", change.path.display())),
-                            );
+                            // Only the project's own code says how the
+                            // project itself reads the file; a reader
+                            // elsewhere leaves that project's full run.
+                            if source.project == owner(self.projects, &change.path) {
+                                mentioned.insert(change.path.clone());
+                            }
+                            let why = match rule {
+                                Some(reason) => format!(
+                                    "{} changed ([[affected.related.reads]]: {reason})",
+                                    change.path.display()
+                                ),
+                                None => format!("{} changed", change.path.display()),
+                            };
+                            run.mark(id, Why::Changed(why));
                         }
                     }
                 }

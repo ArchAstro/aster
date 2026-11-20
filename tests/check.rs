@@ -182,11 +182,42 @@ fn stale_annotations_are_errors() {
 }
 
 #[test]
+fn a_reads_rule_declares_the_path_literals_of_the_files_it_covers() {
+    let files = |config: &'static str| {
+        [
+            ("aster.toml", config),
+            ("data/fixture.json", "{}\n"),
+            (
+                "tests/shop_test.exs",
+                "defmodule ShopTest do\n  use ExUnit.Case\n\n  test \"w\" do\n    File.write!(Path.join(tmp(), \"data/fixture.json\"), \"{}\")\n  end\nend\n",
+            ),
+        ]
+    };
+    // A write-like call on a literal that names a workspace file is reported.
+    let ws = Workspace::new(&files(""));
+    let (_, report) = ws.check(&["--rule", "suspicious-path-literal"]);
+    assert_eq!(
+        places(&report, "suspicious-path-literal"),
+        ["tests/shop_test.exs:5"],
+        "{report}"
+    );
+    // A rule that says the file reads `data` declares the literal a read.
+    let ws = Workspace::new(&files(
+        "[affected.related]\n\n[[affected.related.reads]]\nfiles = [\"tests/**\"]\npaths = [\"data\"]\nreason = \"fixtures are loaded by a directory walk\"\n",
+    ));
+    let (_, report) = ws.check(&["--rule", "suspicious-path-literal"]);
+    assert!(
+        places(&report, "suspicious-path-literal").is_empty(),
+        "{report}"
+    );
+}
+
+#[test]
 fn related_rules_that_match_nothing_are_reported() {
     let ws = Workspace::new(&[
         (
             "aster.toml",
-            "[affected.related]\npacks = [\"oban\", \"ecto\"]\ninert_uses = [\"Gone.Dsl\"]\ncompile_attributes = [\"gone_attr\"]\n\n[[affected.related.boundary]]\nfiles = [\"shop/lib/hub.ex\", \"shop/lib/gone.ex\"]\nreason = \"hub_test covers it\"\n",
+            "[affected.related]\npacks = [\"oban\", \"ecto\"]\ninert_uses = [\"Gone.Dsl\"]\ncompile_attributes = [\"gone_attr\"]\n\n[[affected.related.boundary]]\nfiles = [\"shop/lib/hub.ex\", \"shop/lib/gone.ex\"]\nreason = \"hub_test covers it\"\n\n[[affected.related.reads]]\nfiles = [\"shop/lib/item.ex\", \"shop/test/journeys/**\"]\npaths = [\"shop/lib/hub.ex\", \"shop/lib/tools/**\"]\nreason = \"journeys run tools by name\"\n",
         ),
         ("shop/mix.exs", MIX),
         ("shop/lib/hub.ex", "defmodule Hub do\n  def keys, do: []\nend\n"),
@@ -203,8 +234,15 @@ fn related_rules_that_match_nothing_are_reported() {
         .map(|f| f["message"].as_str().unwrap())
         .collect();
     // The removed file, the pack whose behaviour nothing uses, the module
-    // nothing uses and the attribute nothing sets.
-    assert_eq!(messages.len(), 4, "{report}");
+    // nothing uses, the attribute nothing sets, and the reads rule's glob
+    // and path that match nothing.
+    assert_eq!(messages.len(), 6, "{report}");
+    assert!(messages
+        .iter()
+        .any(|m| m.contains("`shop/test/journeys/**` in `files`")));
+    assert!(messages
+        .iter()
+        .any(|m| m.contains("`shop/lib/tools/**` in `paths`")));
     assert!(messages.iter().any(|m| m.contains("`Gone.Dsl`")));
     assert!(messages.iter().any(|m| m.contains("`gone_attr`")));
     assert!(messages.iter().any(|m| m.contains("shop/lib/gone.ex")));
