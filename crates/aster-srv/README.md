@@ -107,9 +107,11 @@ the classifier updates `test_results.quarantine`, in this order:
    quarantined.
 2. An entry older than `ASTER_SRV_QUARANTINE_DAYS` (default 30, at most the
    retention period) **expires**.
-3. A test whose final results since it entered end in
+3. A test whose runs since it entered end in
    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` (default 20) consecutive passes is
-   **released**. Any failure resets the count.
+   **released**. A run is a pass when no attempt of the test failed in it.
+   Any failure resets the count, including a failure whose retry passed:
+   that run is the flake the test was quarantined for.
 4. A test that is not broken **enters** once **trusted** definite flake
    events from `ASTER_SRV_QUARANTINE_RUNS` (default 2) different failing runs
    fall within the last 7 days. An event is trusted when both of its runs are
@@ -460,7 +462,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_UI_EMAIL_DOMAINS` | unset | Comma-separated domains (`example.com`, `*.example.com`) whose emails may view the dashboard. Unset allows anyone who passes IAP. |
 | `ASTER_SRV_UI_DEV_EMAIL` | unset | The viewer to trust when no IAP audience is set. Development only. |
 | `ASTER_SRV_QUARANTINE_RUNS` | `2` | Different failing runs with a definite flake in 7 days that quarantine a test; `0` turns automatic quarantine off. |
-| `ASTER_SRV_QUARANTINE_RELEASE_PASSES` | `20` | Consecutive passes that release a quarantined test. |
+| `ASTER_SRV_QUARANTINE_RELEASE_PASSES` | `20` | Consecutive passing runs that release a quarantined test. A run whose retry passed is not a pass. |
 | `ASTER_SRV_QUARANTINE_DAYS` | `30` | The longest a test stays quarantined; at most `ASTER_SRV_RETENTION_DAYS`. |
 | `ASTER_SRV_QUARANTINE_RUN_CAP` | `10` | A run with definite flakes of more tests than this in 7 days counts toward quarantining none of them. |
 | `ASTER_SRV_WEBHOOKS` | unset | Webhook endpoints, as JSON. See [Webhooks](#webhooks). |

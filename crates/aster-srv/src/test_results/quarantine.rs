@@ -8,8 +8,10 @@
 //! 1. A quarantined test that is now `broken` leaves at once: broken tests
 //!    are never quarantined.
 //! 2. An entry older than `ASTER_SRV_QUARANTINE_DAYS` expires.
-//! 3. A test whose final results since it entered end in
+//! 3. A test whose runs since it entered end in
 //!    `ASTER_SRV_QUARANTINE_RELEASE_PASSES` consecutive passes is released.
+//!    A run passes when no attempt of the test failed in it: a run whose
+//!    retry passed is the flake quarantine is for, so it resets the count.
 //!    Skips and cached targets' replayed results do not count.
 //! 4. A test that is not broken enters when trusted definite flake events
 //!    from `ASTER_SRV_QUARANTINE_RUNS` different failing runs fall in the
@@ -135,8 +137,9 @@ pub(super) async fn update(
         )
         .await?);
 
-    // 3. A run of passes since entering releases. Each run's final attempt
-    // counts, with the classifier's rules: cached targets store the results
+    // 3. A run of passes since entering releases. A run counts as a pass
+    // when none of its attempts failed (a pass on a retry is a failure
+    // here), with the classifier's rules: cached targets store the results
     // they replay, and a replayed pass proves nothing. `passes` holds the
     // count up to `window.from`; the window's results (`cls_win`) carry it
     // on. A count kept up to anywhere else is redone from the results.
@@ -154,7 +157,7 @@ pub(super) async fn update(
             &format!(
                 "UPDATE test_results.quarantine q SET passes_through = {from}, \
                      passes = (SELECT count(*) FROM ( \
-                                   SELECT bool_and(NOT f.is_fail) OVER ( \
+                                   SELECT bool_and(NOT f.any_fail) OVER ( \
                                               ORDER BY f.received_at DESC, f.run_id DESC) AS clean \
                                    FROM ({since_entry}) f) s \
                                WHERE s.clean) \
@@ -169,13 +172,13 @@ pub(super) async fn update(
     let counted = |until: &str| {
         format!(
             "SELECT q.repo, q.test_id, q.entered_at, \
-                    CASE WHEN bool_or(c.is_fail) \
+                    CASE WHEN bool_or(c.failed) \
                          THEN count(*) FILTER (WHERE c.fails_after = 0) \
                          ELSE q.passes + count(c.run_id) END AS passes \
              FROM test_results.quarantine q \
              LEFT JOIN ( \
-                 SELECT w.repo, w.test_id, w.run_id, w.is_fail, \
-                        count(*) FILTER (WHERE w.is_fail) OVER ( \
+                 SELECT w.repo, w.test_id, w.run_id, (w.is_fail OR w.retried) AS failed, \
+                        count(*) FILTER (WHERE w.is_fail OR w.retried) OVER ( \
                             PARTITION BY w.repo, w.test_id \
                             ORDER BY w.received_at DESC, w.run_id DESC \
                             ROWS UNBOUNDED PRECEDING) AS fails_after \

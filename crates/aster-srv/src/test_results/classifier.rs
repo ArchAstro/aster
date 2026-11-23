@@ -296,11 +296,15 @@ impl Window {
     }
 
     /// Each run's final result of one test: `filter` picks the test and
-    /// bounds the runs. `strict` leaves out `partial` targets.
+    /// bounds the runs. `strict` leaves out `partial` targets. `any_fail`
+    /// says whether any attempt of the run failed, so it is also true for a
+    /// run whose retry passed.
     pub(super) fn finals(&self, filter: &str, strict: bool) -> String {
         format!(
             "SELECT DISTINCT ON (tr.run_id) tr.run_id, r.sha, r.received_at, \
-                    tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash \
+                    tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash, \
+                    bool_or(tr.outcome IN ('fail', 'error')) \
+                        OVER (PARTITION BY tr.run_id) AS any_fail \
              FROM test_results.test_results tr \
              JOIN test_results.runs r ON r.run_id = tr.run_id \
              JOIN test_results.target_runs t \

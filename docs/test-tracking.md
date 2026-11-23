@@ -405,7 +405,8 @@ runs are both default-branch runs by their credentials (a push, dispatch or
 schedule of the default branch): a pull request job's results score flakes
 but never quarantine. A run that flaked more than 10 tests counts toward none
 of them, and an incident's failures never count. It releases the test after 20
-consecutive passes, when it breaks, or after 30 days; a released test starts
+consecutive passes (runs in which no attempt failed; a pass on a retry
+resets the count), when it breaks, or after 30 days; a released test starts
 afresh. The list is fetched at start and cached in `.aster/quarantine.json`.
 If the server cannot be reached, a cache younger than 24 hours stands in;
 otherwise only the repository file applies, so nothing extra is let through.

@@ -273,6 +273,62 @@ async fn consecutive_passes_release_and_a_release_starts_afresh() {
     server.stop().await;
 }
 
+/// A quarantined flake that keeps failing and passing on its retry stays
+/// quarantined: each such run ends in a pass, but it is the flake itself.
+#[tokio::test]
+async fn passes_on_a_retry_do_not_release() {
+    let Some(server) = start(&[("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "2")]).await else {
+        return;
+    };
+    let now = Utc::now();
+    seed(&server, &retried("r1", "t", ago(now, 100))).await;
+    seed(&server, &retried("r2", "t", ago(now, 90))).await;
+    classify(&server, ago(now, 80)).await;
+    assert_eq!(quarantined(&feed(&server).await), vec!["t"]);
+
+    // Three more runs fail and pass on the retry, on main and on a pull
+    // request branch. Classified in two passes, so both the stored count
+    // and the window's count see them.
+    seed(&server, &retried("r3", "t", ago(now, 70))).await;
+    seed(
+        &server,
+        &Run::new("r4", "feature", ago(now, 65))
+            .attempt("t", "fail", 1, Some("f1"))
+            .attempt("t", "pass", 2, None),
+    )
+    .await;
+    let report = classify(&server, ago(now, 60)).await;
+    assert_eq!(report.quarantine.released, 0);
+    seed(&server, &retried("r5", "t", ago(now, 55))).await;
+    let report = classify(&server, ago(now, 50)).await;
+    assert_eq!(report.quarantine.released, 0);
+    assert_eq!(quarantined(&feed(&server).await), vec!["t"]);
+
+    // One clean pass after a retried run is not two in a row.
+    seed(
+        &server,
+        &Run::new("p1", "main", ago(now, 45))
+            .hash("p1")
+            .result("t", "pass", None),
+    )
+    .await;
+    let report = classify(&server, ago(now, 40)).await;
+    assert_eq!(report.quarantine.released, 0);
+
+    // A second clean pass releases it.
+    seed(
+        &server,
+        &Run::new("p2", "main", ago(now, 35))
+            .hash("p2")
+            .result("t", "pass", None),
+    )
+    .await;
+    let report = classify(&server, ago(now, 30)).await;
+    assert_eq!(report.quarantine.released, 1);
+    assert!(quarantined(&feed(&server).await).is_empty());
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn replayed_passes_from_cached_targets_do_not_release() {
     let Some(server) = start(&[("ASTER_SRV_QUARANTINE_RELEASE_PASSES", "2")]).await else {
