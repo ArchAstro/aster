@@ -54,7 +54,7 @@ failure and a pass on one input hash score 3, not 6.
 |---|---|
 | definite, `retry` | The final attempt passed and an earlier attempt of the test in the same run failed or errored. |
 | definite, `input_hash` | In an earlier run within the retention period, with the same target `input_hash`, the test's outcome (pass against fail or error) differs from this run's. Compared with the nearest earlier run of that hash, on any branch. The event is for whichever of the two runs failed. |
-| likely, `next_main_run` | On the default branch the test passed and its previous default-branch run failed, with any hash, unless that failure ended a broken streak (so fixing a broken test is not flaking). The event is for the failed run; a definite event for that run replaces it. Whether the change between the two runs touched the test is not knowable here. |
+| likely, `next_main_run` | In the main sequence (below) the test passed and its previous main-sequence run failed, with any hash, unless that failure ended a broken streak (so fixing a broken test is not flaking). The event is for the failed run; a definite event for that run replaces it. Whether the change between the two runs touched the test is not knowable here. |
 
 **Incidents**: a target run whose tests failed together failed for one shared
 cause (a crashed shard, a dead database, a test-harness process that died),
@@ -71,19 +71,38 @@ flip however it was captured. They are left out of likely events and broken
 streaks, which judge a failure that console parsing may have missed or
 misattributed.
 
+**Main sequence**: the runs that decide likely events, broken and broken on
+main. By default these are every default-branch run. With
+`ASTER_SRV_REFERENCE_WORKFLOWS` set (for example `Stable CI`), only
+default-branch runs of those workflows count: the run's `workflow`, which the
+client takes from `GITHUB_WORKFLOW`, must equal one of the names exactly. A
+run with no workflow name does not count. A nightly or other secondary suite
+on the default branch then neither breaks a test nor clears one. Its runs
+still count for definite events and are still trusted for quarantine.
+
+A test that only runs in other workflows has no main sequence: it is never
+`broken` or broken on main and never gets a likely event, however often it
+fails. Definite events (retries, same input hash) still score it.
+
+Changing the setting rebuilds each test's carried main-sequence state
+(`test_results.test_main`) at the next classifier pass, and every test in it is
+judged again, so a test listed only because of another workflow's failures
+leaves in that pass without a new run.
+
 **Broken**: the test's last `ASTER_SRV_BROKEN_RUNS` (at least 3, default 3)
-default-branch runs all failed with the same non-null `failure_hash`.
+main-sequence runs all failed with the same non-null `failure_hash`.
 `broken_since_sha` is the sha of the first run of that whole streak. The next
 pass that finds a pass (or a different failure) clears it. A broken test is
 never flaky, even with a positive score.
 
 **Broken on main**: the same streak with a shorter length,
 `ASTER_SRV_MAIN_BROKEN_RUNS` (at least 1, default 2): the test's last
-default-branch runs (final attempts, not `partial`, not cached, from runs
-whose credentials say default branch) all failed with one non-null
-`failure_hash`. The classifier keeps `main_broken_since_sha`,
-`main_broken_failure_hash` and `main_broken_at` on `tests`; a default-branch
-pass, or a different failure, clears them in that pass. It is a separate
+main-sequence runs (final attempts, not `partial`, not cached, from runs
+whose credentials say default branch, of a reference workflow when any are
+set) all failed with one non-null `failure_hash`. The classifier keeps
+`main_broken_since_sha`, `main_broken_failure_hash` and `main_broken_at` on
+`tests`; a main-sequence pass, or a different failure, clears them in that
+pass. A pass in a workflow that is not a reference workflow clears nothing. It is a separate
 signal from `state`: a test can be broken on main without being `broken`, and
 it does not affect flake scores or quarantine. Pull request runs never count.
 
@@ -455,6 +474,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_DEFAULT_BRANCH` | `main` | The branch whose runs decide broken and likely-flaky tests. |
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
 | `ASTER_SRV_MAIN_BROKEN_RUNS` | `2` | Consecutive default-branch runs failing the same way that put a test in the quarantine list's `main_broken`; at least 1. |
+| `ASTER_SRV_REFERENCE_WORKFLOWS` | unset | Comma-separated workflow names (`GITHUB_WORKFLOW`, such as `Stable CI`). When set, only default-branch runs of these workflows count toward broken, broken on main and likely flakes. Names compare exactly. Unset counts every default-branch run. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
 | `ASTER_SRV_MAX_LARGE_BODIES` | `8` | Large request bodies (a cache commit's manifest, a test-results upload) one replica reads at once, 1 to 1024. Past it a request gets `503` with `Retry-After: 1`. |
 | `ASTER_SRV_RAW_BUCKET` | unset | A GCS bucket that keeps each upload as sent, using the pod's Workload Identity. Give the bucket a lifecycle rule that deletes objects after the retention period. |

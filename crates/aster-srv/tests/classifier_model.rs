@@ -5,7 +5,9 @@
 //! every test fails at once), classifies
 //! them in passes at random times, and compares every flake event and test
 //! state with what [`Model`] derives from the whole history at once. The
-//! incremental SQL must agree with the rules however the passes fall.
+//! incremental SQL must agree with the rules however the passes fall, with
+//! every default-branch workflow counting and with one reference workflow
+//! (`ASTER_SRV_REFERENCE_WORKFLOWS`).
 
 mod common;
 
@@ -48,6 +50,10 @@ impl Rng {
 
 const TESTS: &[&str] = &["steady", "flips", "stuck", "rare", "skippy"];
 const BROKEN_RUNS: usize = 3;
+/// `ASTER_SRV_MAIN_BROKEN_RUNS`'s default.
+const MAIN_BROKEN_RUNS: usize = 2;
+/// The reference workflow of the cases that set one.
+const REFERENCE: &str = "Stable CI";
 
 /// One attempt: `(test, outcome, attempt, failure_hash)`.
 type Attempt = (&'static str, &'static str, i32, Option<&'static str>);
@@ -60,6 +66,8 @@ struct GenRun {
     input_hash: &'static str,
     cached: bool,
     partial: bool,
+    /// The workflow's name; `None` for an upload that sent none.
+    workflow: Option<&'static str>,
     attempts: Vec<Attempt>,
 }
 
@@ -129,8 +137,16 @@ fn generate(seed: u64, runs: usize, end: DateTime<Utc>) -> Vec<GenRun> {
             input_hash: rng.pick(&["h1", "h2", "h3", "h4", "h5", "h6"]),
             cached: rng.chance(8),
             partial: rng.chance(10),
+            workflow: None,
             attempts,
         });
+    }
+    // Workflows come from their own generator, so the histories above are
+    // the same with or without them.
+    let mut rng = Rng::new(seed ^ 0x5EF_0F10);
+    for run in &mut out {
+        run.workflow =
+            [Some(REFERENCE), Some(REFERENCE), Some("Nightly"), None][rng.below(4) as usize];
     }
     out
 }
@@ -144,6 +160,9 @@ struct Final {
     failure_hash: Option<String>,
     input_hash: String,
     on_default: bool,
+    /// In the main sequence: on the default branch, and of a reference
+    /// workflow when any are set.
+    in_main: bool,
     partial: bool,
     retried: bool,
 }
@@ -186,12 +205,16 @@ struct Model {
     events: BTreeSet<(String, String, String, String)>,
     /// test → (state, score, since_sha, failure_hash).
     states: BTreeMap<String, (String, i32, Option<String>, Option<String>)>,
+    /// test → (main_broken_since_sha, main_broken_failure_hash), for the
+    /// tests that are broken on main.
+    main_broken: BTreeMap<String, (Option<String>, Option<String>)>,
     /// Runs whose target is an incident.
     incidents: BTreeSet<String>,
 }
 
 impl Model {
-    fn new(runs: &[GenRun]) -> Self {
+    /// The rules with `reference` as the reference workflows (empty: all).
+    fn new(runs: &[GenRun], reference: &[&str]) -> Self {
         let incidents: BTreeSet<String> = runs
             .iter()
             .filter(|r| incident(r))
@@ -209,19 +232,24 @@ impl Model {
                     continue;
                 };
                 let is_fail = last.1 != "pass";
+                let on_default = matches!(run.branch, "main" | "refs/heads/main");
                 finals.entry(test).or_default().push(Final {
                     key: (run.at, run.run_id.clone()),
                     sha: run.run_id.clone(),
                     is_fail,
                     failure_hash: last.3.map(str::to_string),
                     input_hash: run.input_hash.to_string(),
-                    on_default: matches!(run.branch, "main" | "refs/heads/main"),
+                    on_default,
+                    in_main: on_default
+                        && (reference.is_empty()
+                            || run.workflow.is_some_and(|w| reference.contains(&w))),
                     partial: run.partial,
                     retried: !is_fail && tried.iter().any(|a| a.1 != "pass"),
                 });
             }
         }
         let mut events = BTreeSet::new();
+        let mut main_broken = BTreeMap::new();
         // Every test seen gets a row, healthy until shown otherwise.
         let mut states: BTreeMap<String, (String, i32, Option<String>, Option<String>)> = runs
             .iter()
@@ -268,9 +296,10 @@ impl Model {
                     }
                 }
             }
-            // The default-branch, not-partial sequence decides likely
-            // events and broken streaks.
-            let mains: Vec<&Final> = list.iter().filter(|f| f.on_default && !f.partial).collect();
+            // The main sequence (default branch, reference workflows),
+            // without partial results, decides likely events and broken
+            // streaks.
+            let mains: Vec<&Final> = list.iter().filter(|f| f.in_main && !f.partial).collect();
             let streak_at = |end: usize| -> (usize, Option<&str>) {
                 let hash = mains[end].failure_hash.as_deref();
                 let mut length = 0;
@@ -307,6 +336,15 @@ impl Model {
                 streak_at(mains.len() - 1)
             };
             let broken = length >= BROKEN_RUNS;
+            if length >= MAIN_BROKEN_RUNS {
+                main_broken.insert(
+                    test.to_string(),
+                    (
+                        since.map(str::to_string),
+                        mains.last().unwrap().failure_hash.clone(),
+                    ),
+                );
+            }
             let state = if broken {
                 "broken"
             } else if score > 0 {
@@ -327,6 +365,7 @@ impl Model {
         Self {
             events,
             states,
+            main_broken,
             incidents,
         }
     }
@@ -336,6 +375,7 @@ async fn seed_run(server: &Server, run: &GenRun) {
     let mut seeded = Run::new(&run.run_id, run.branch, run.at).hash(run.input_hash);
     seeded.cached = run.cached;
     seeded.confidence = Some(if run.partial { "partial" } else { "complete" });
+    seeded.workflow = run.workflow;
     for (test, outcome, attempt, failure) in &run.attempts {
         seeded = seeded.attempt(test, outcome, *attempt, *failure);
     }
@@ -365,6 +405,17 @@ async fn observed(server: &Server) -> Model {
         .iter()
         .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4))))
         .collect();
+    let main_broken = client
+        .query(
+            "SELECT test_id, main_broken_since_sha, main_broken_failure_hash \
+             FROM test_results.tests WHERE main_broken_failure_hash IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect();
     let incidents = client
         .query("SELECT run_id FROM test_results.target_incidents", &[])
         .await
@@ -375,6 +426,7 @@ async fn observed(server: &Server) -> Model {
     Model {
         events,
         states,
+        main_broken,
         incidents,
     }
 }
@@ -411,7 +463,7 @@ async fn incremental_passes_agree_with_the_rules_on_random_histories() {
         let runs = generate(case, 70, end);
         classify_in_passes(&server, &runs, case, end).await;
         let got = observed(&server).await;
-        let want = Model::new(&runs);
+        let want = Model::new(&runs, &[]);
         assert_eq!(
             got.events,
             want.events,
@@ -420,6 +472,10 @@ async fn incremental_passes_agree_with_the_rules_on_random_histories() {
             got.events.difference(&want.events).collect::<Vec<_>>(),
         );
         assert_eq!(got.states, want.states, "case {case}: states differ");
+        assert_eq!(
+            got.main_broken, want.main_broken,
+            "case {case}: broken on main differs"
+        );
         assert_eq!(
             got.incidents, want.incidents,
             "case {case}: incidents differ"
@@ -450,9 +506,13 @@ async fn one_pass_over_everything_agrees_with_the_rules() {
             .unwrap()
             .unwrap();
         let got = observed(&server).await;
-        let want = Model::new(&runs);
+        let want = Model::new(&runs, &[]);
         assert_eq!(got.events, want.events, "case {case}: events differ");
         assert_eq!(got.states, want.states, "case {case}: states differ");
+        assert_eq!(
+            got.main_broken, want.main_broken,
+            "case {case}: broken on main differs"
+        );
         assert_eq!(
             got.incidents, want.incidents,
             "case {case}: incidents differ"
@@ -463,4 +523,46 @@ async fn one_pass_over_everything_agrees_with_the_rules() {
         );
         server.stop().await;
     }
+}
+
+#[tokio::test]
+async fn incremental_passes_agree_with_the_rules_with_a_reference_workflow() {
+    // The histories of the first cases above, judged with Stable CI as the
+    // only workflow whose default-branch runs make the main sequence.
+    let end = Utc::now();
+    let mut narrowed = false;
+    for case in 0..6u64 {
+        let Some(server) = start(&[("ASTER_SRV_REFERENCE_WORKFLOWS", REFERENCE)]).await else {
+            return;
+        };
+        let runs = generate(case, 70, end);
+        classify_in_passes(&server, &runs, case, end).await;
+        let got = observed(&server).await;
+        let want = Model::new(&runs, &[REFERENCE]);
+        let every = Model::new(&runs, &[]);
+        narrowed |= want.events != every.events
+            || want.states != every.states
+            || want.main_broken != every.main_broken;
+        assert_eq!(
+            got.events,
+            want.events,
+            "case {case}: events differ (missing: {:?}, extra: {:?})",
+            want.events.difference(&got.events).collect::<Vec<_>>(),
+            got.events.difference(&want.events).collect::<Vec<_>>(),
+        );
+        assert_eq!(got.states, want.states, "case {case}: states differ");
+        assert_eq!(
+            got.main_broken, want.main_broken,
+            "case {case}: broken on main differs"
+        );
+        assert_eq!(
+            got.incidents, want.incidents,
+            "case {case}: incidents differ"
+        );
+        server.stop().await;
+    }
+    assert!(
+        narrowed,
+        "no case judged differently with a reference workflow"
+    );
 }

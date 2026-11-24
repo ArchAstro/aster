@@ -77,6 +77,13 @@ pub struct Config {
     /// queue run may let that test fail (`main_broken` in the quarantine
     /// list). At least 1; default 2.
     pub main_broken_runs: u32,
+    /// `ASTER_SRV_REFERENCE_WORKFLOWS`: comma-separated workflow names (the
+    /// run record's `workflow`, GitHub's `GITHUB_WORKFLOW`, such as
+    /// `Stable CI`). When set, only default-branch runs of these workflows
+    /// count toward "broken", "broken on main" and likely flakes; a run with
+    /// no workflow name does not count. Empty (the default) counts every
+    /// default-branch run.
+    pub reference_workflows: Vec<String>,
     /// `ASTER_SRV_MAX_BODY_BYTES`: the largest upload accepted, compressed
     /// or not. Default 64 MiB.
     pub max_body_bytes: usize,
@@ -314,6 +321,7 @@ impl Config {
                 .context("ASTER_SRV_MAIN_BROKEN_RUNS must be a number of runs, at least 1")?,
             None => 2,
         };
+        let reference_workflows = reference_workflows(var("ASTER_SRV_REFERENCE_WORKFLOWS"));
         let max_body_bytes = match var("ASTER_SRV_MAX_BODY_BYTES") {
             Some(bytes) => bytes
                 .parse()
@@ -589,6 +597,7 @@ impl Config {
             default_branch,
             broken_runs,
             main_broken_runs,
+            reference_workflows,
             max_body_bytes,
             max_large_bodies,
             iap_audience,
@@ -718,6 +727,20 @@ fn parse_cli_token_keys(value: &str) -> Result<Vec<CliTokenKey>> {
         bail!("ASTER_SRV_CLI_TOKEN_KEYS lists no key");
     }
     Ok(keys)
+}
+
+/// `ASTER_SRV_REFERENCE_WORKFLOWS` as a sorted list without repeats or empty
+/// entries. Names compare exactly, case included, as GitHub stores them.
+fn reference_workflows(value: Option<String>) -> Vec<String> {
+    let mut names: Vec<String> = value
+        .unwrap_or_default()
+        .split(',')
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Prefixes of the `job_workflow_ref` claim that may write.
@@ -994,6 +1017,7 @@ mod tests {
         assert_eq!(config.default_branch, "main");
         assert_eq!(config.broken_runs, 3);
         assert_eq!(config.main_broken_runs, 2);
+        assert!(config.reference_workflows.is_empty());
         assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
         assert!(config.static_tokens.is_empty());
         assert!(config.raw_bucket.is_none());
@@ -1592,6 +1616,29 @@ mod tests {
             let mut pairs = REQUIRED.to_vec();
             pairs.push(("ASTER_SRV_BROKEN_RUNS", bad));
             assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reads_the_reference_workflows() {
+        let with = |value: &'static str| {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push(("ASTER_SRV_REFERENCE_WORKFLOWS", value));
+            Config::from_env(env_of(&pairs))
+                .unwrap()
+                .reference_workflows
+        };
+        assert_eq!(with("Stable CI"), vec!["Stable CI".to_string()]);
+        // Trimmed, empty entries dropped, repeats folded, sorted.
+        assert_eq!(
+            with(" Stable CI , ,Nightly,Stable CI,"),
+            vec!["Nightly".to_string(), "Stable CI".to_string()]
+        );
+        // Names keep their case and inner spaces: they compare exactly.
+        assert_eq!(with("stable  ci"), vec!["stable  ci".to_string()]);
+        // Empty or only separators means every default-branch workflow.
+        for empty in ["", "   ", ",", " , ,"] {
+            assert!(with(empty).is_empty(), "{empty:?}");
         }
     }
 

@@ -304,6 +304,24 @@ ALTER TABLE test_results.quarantine_log ADD CONSTRAINT quarantine_log_action_che
                       'main_broken', 'main_fixed'));
 "#,
     },
+    Migration {
+        feature: "test_results",
+        version: 9,
+        // Which runs `test_main` was built from: the reference workflows
+        // (`ASTER_SRV_REFERENCE_WORKFLOWS`) as a JSON array, NULL for every
+        // default-branch run, and the `main_through` they were written
+        // with. A pass whose setting differs rebuilds `test_main`, and so
+        // does one with reference workflows set that finds `main_through`
+        // moved by an earlier release, which counts every workflow.
+        // Nullable columns on a one-row table; NULL is the rule every
+        // earlier release used, so nothing is rebuilt until the setting is
+        // changed.
+        sql: r#"
+ALTER TABLE test_results.classifier_state
+    ADD COLUMN main_workflows text,
+    ADD COLUMN main_workflows_through timestamptz;
+"#,
+    },
 ];
 
 /// The day-partitioned tables.

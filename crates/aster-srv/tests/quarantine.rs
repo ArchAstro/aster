@@ -969,3 +969,368 @@ async fn the_main_broken_threshold_and_broken_state_are_independent() {
     assert!(quarantined(&list).is_empty());
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------
+// Reference workflows: only the named workflows' default-branch runs put
+// a test on, or take it off, the `main_broken` array.
+
+const STABLE: &str = "Stable CI";
+const NIGHTLY: &str = "Nightly";
+
+/// One test's attempt in an upload: `(test, outcome, attempt, failure_hash)`.
+type Upload<'a> = (&'a str, &'a str, u32, Option<&'a str>);
+
+/// Upload GitHub run `github_run` of the workflow named `workflow` (`None`
+/// sends no name) as a push to main does: gzipped NDJSON with the job's
+/// OIDC token. One target, `//a:test`, with its own input hash.
+async fn upload_main(
+    server: &Server,
+    github_run: &str,
+    workflow: Option<&str>,
+    attempts: &[Upload<'_>],
+) {
+    use aster_results_model::{
+        to_ndjson, Confidence, Record, RunRecord, TargetRecord, TargetStatus, TestOutcome,
+        TestRecord,
+    };
+    use std::io::Write;
+
+    let failed = attempts.iter().any(|a| a.1 == "fail");
+    let mut records = vec![
+        Record::Run(RunRecord {
+            run_id: format!("gh:{REPO}:{github_run}:1:test:test:ab"),
+            repo: REPO.into(),
+            sha: github_run.into(),
+            branch: Some("main".into()),
+            pr: None,
+            workflow: workflow.map(str::to_string),
+            job: Some("test".into()),
+            attempt: Some(1),
+            lane: None,
+            runner: None,
+            aster_version: "0.36.0".into(),
+            started_at: Utc::now().to_rfc3339(),
+        }),
+        Record::Target(TargetRecord {
+            address: "//a:test".into(),
+            input_hash: Some(format!("inputs-{github_run}")),
+            status: if failed {
+                TargetStatus::Failed
+            } else {
+                TargetStatus::Passed
+            },
+            cached: false,
+            duration_ms: 10,
+            capture: Some("junit".into()),
+            confidence: Some(Confidence::Complete),
+            exit_code: Some(i32::from(failed)),
+        }),
+    ];
+    for (test, outcome, attempt, failure) in attempts {
+        records.push(Record::Test(TestRecord {
+            target: "//a:test".into(),
+            test_id: test.to_string(),
+            file: Some(format!("test/{test}_test.exs")),
+            suite: None,
+            name: test.to_string(),
+            outcome: if *outcome == "fail" {
+                TestOutcome::Fail
+            } else {
+                TestOutcome::Pass
+            },
+            attempt: *attempt,
+            duration_ms: Some(1),
+            failure_hash: failure.map(str::to_string),
+            message: failure.map(|hash| format!("failed with {hash}")),
+            quarantined: false,
+        }));
+    }
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(to_ndjson(&records).as_bytes()).unwrap();
+    let response = aster_srv::http_client()
+        .build()
+        .unwrap()
+        .post(format!("{}/v1/test-results/runs", server.url))
+        .header("Content-Type", "application/x-ndjson")
+        .header("Content-Encoding", "gzip")
+        .bearer_auth(common::token_with_claims(
+            REPO,
+            serde_json::json!({
+                "run_id": github_run,
+                "run_attempt": "1",
+                "sha": github_run,
+                "ref": "refs/heads/main",
+                "event_name": "push",
+            }),
+        ))
+        .body(gz.finish().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 201, "upload refused: {body}");
+}
+
+/// `test`'s `state` in `tests`.
+async fn test_state(server: &Server, test: &str) -> String {
+    server
+        .client()
+        .await
+        .query_one(
+            "SELECT state FROM test_results.tests WHERE test_id = $1",
+            &[&test],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+fn listed(test: &str, hash: &str, since: &str) -> (String, String, Option<String>) {
+    (test.into(), hash.into(), Some(since.into()))
+}
+
+#[tokio::test]
+async fn only_reference_workflow_failures_put_a_test_on_main_broken() {
+    // Setup: Stable CI is the reference workflow. Every upload below is a
+    // push to main, so each run is on the default branch and trusted.
+    let Some(server) = start(&[("ASTER_SRV_REFERENCE_WORKFLOWS", STABLE)]).await else {
+        return;
+    };
+
+    // Two Stable CI runs fail `stable` the same way. A nightly suite fails
+    // `nightly` the same way twice, and an upload with no workflow name
+    // fails `unnamed` twice. Nightly's first run also has `retried`, which
+    // failed and then passed on its retry: a definite flake.
+    for (run, workflow, test) in [
+        ("101", Some(STABLE), "stable"),
+        ("201", Some(NIGHTLY), "nightly"),
+        ("301", None, "unnamed"),
+        ("102", Some(STABLE), "stable"),
+        ("202", Some(NIGHTLY), "nightly"),
+        ("302", None, "unnamed"),
+    ] {
+        let mut attempts = vec![(test, "fail", 1, Some("same"))];
+        if run == "201" {
+            attempts.push(("retried", "fail", 1, Some("x")));
+            attempts.push(("retried", "pass", 2, None));
+        }
+        upload_main(&server, run, workflow, &attempts).await;
+    }
+    classify(&server, Utc::now()).await;
+
+    // Only the reference workflow's failures list a test.
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("stable", "same", "101")]
+    );
+    // The nightly run is still trusted evidence: its retry flake may count
+    // toward quarantine. The setting narrows the main sequence, not trust.
+    let trusted: bool = server
+        .client()
+        .await
+        .query_one(
+            "SELECT trusted FROM test_results.test_flake_events \
+             WHERE test_id = 'retried' AND kind = 'definite'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(trusted);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn only_a_reference_workflow_pass_takes_a_test_off_main_broken() {
+    let Some(server) = start(&[("ASTER_SRV_REFERENCE_WORKFLOWS", STABLE)]).await else {
+        return;
+    };
+    // Stable CI fails `t` the same way twice: listed.
+    upload_main(
+        &server,
+        "101",
+        Some(STABLE),
+        &[("t", "fail", 1, Some("same"))],
+    )
+    .await;
+    upload_main(
+        &server,
+        "102",
+        Some(STABLE),
+        &[("t", "fail", 1, Some("same"))],
+    )
+    .await;
+    classify(&server, Utc::now()).await;
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("t", "same", "101")]
+    );
+
+    // A nightly run on main passes `t`. Stable CI still fails it, so it
+    // stays listed and the list does not change.
+    upload_main(&server, "201", Some(NIGHTLY), &[("t", "pass", 1, None)]).await;
+    classify(&server, Utc::now()).await;
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("t", "same", "101")]
+    );
+    assert_eq!(log(&server).await, vec![entry("t", "main_broken")]);
+
+    // Stable CI passes `t`: off the list in that pass.
+    upload_main(&server, "103", Some(STABLE), &[("t", "pass", 1, None)]).await;
+    classify(&server, Utc::now()).await;
+    assert!(main_broken(&feed(&server).await).is_empty());
+    assert_eq!(
+        log(&server).await,
+        vec![entry("t", "main_broken"), entry("t", "main_fixed")]
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn setting_reference_workflows_rebuilds_main_and_clears_tests_only_other_workflows_fail() {
+    // Setup: no reference workflows, so every default-branch run counts.
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    // Three nightly runs fail `nightly`, three Stable CI runs fail
+    // `stable`, each the same way: both broken and broken on main.
+    for i in 1..=3 {
+        let (nightly, stable) = (format!("20{i}"), format!("10{i}"));
+        upload_main(
+            &server,
+            &nightly,
+            Some(NIGHTLY),
+            &[("nightly", "fail", 1, Some("n"))],
+        )
+        .await;
+        upload_main(
+            &server,
+            &stable,
+            Some(STABLE),
+            &[("stable", "fail", 1, Some("s"))],
+        )
+        .await;
+    }
+    // The pass's clock is an hour on, so these runs are older than its
+    // overlap and move into `test_main`, the state carried between passes.
+    let later = Utc::now() + Duration::hours(1);
+    classify(&server, later).await;
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("nightly", "n", "201"), listed("stable", "s", "101")]
+    );
+    assert_eq!(test_state(&server, "nightly").await, "broken");
+    assert_eq!(test_state(&server, "stable").await, "broken");
+    let carried: i64 = server
+        .client()
+        .await
+        .query_one("SELECT count(*) FROM test_results.test_main", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(carried, 2, "both streaks are carried in test_main");
+
+    // The server restarts with Stable CI as the reference workflow. No new
+    // run arrives; the next pass alone must notice the rule changed.
+    let restarted = server
+        .second(&[("ASTER_SRV_REFERENCE_WORKFLOWS", STABLE)])
+        .await;
+    classify(&restarted, later + Duration::minutes(5)).await;
+    assert_eq!(
+        main_broken(&feed(&restarted).await),
+        vec![listed("stable", "s", "101")]
+    );
+    assert_eq!(test_state(&restarted, "nightly").await, "healthy");
+    assert_eq!(test_state(&restarted, "stable").await, "broken");
+    assert_eq!(
+        log(&restarted).await,
+        vec![
+            entry("nightly", "main_broken"),
+            entry("stable", "main_broken"),
+            entry("nightly", "main_fixed"),
+        ]
+    );
+    let rule: Option<String> = restarted
+        .client()
+        .await
+        .query_one(
+            "SELECT main_workflows FROM test_results.classifier_state",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rule.as_deref(), Some(r#"["Stable CI"]"#));
+    restarted.stop().await;
+
+    // Unsetting it again rebuilds the other way: nightly is back.
+    let unset = server
+        .second(&[("ASTER_SRV_REFERENCE_WORKFLOWS", "")])
+        .await;
+    classify(&unset, later + Duration::minutes(10)).await;
+    assert_eq!(
+        main_broken(&feed(&unset).await),
+        vec![listed("nightly", "n", "201"), listed("stable", "s", "101")]
+    );
+    assert_eq!(test_state(&unset, "nightly").await, "broken");
+    unset.stop().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_pass_by_an_older_release_mid_deploy_makes_the_next_pass_rebuild_main() {
+    // Setup: Stable CI is the reference workflow. Two nightly runs fail
+    // `nightly`; this release's pass lists nothing and carries no row for it.
+    let Some(server) = start(&[("ASTER_SRV_REFERENCE_WORKFLOWS", STABLE)]).await else {
+        return;
+    };
+    for run in ["201", "202"] {
+        upload_main(
+            &server,
+            run,
+            Some(NIGHTLY),
+            &[("nightly", "fail", 1, Some("n"))],
+        )
+        .await;
+    }
+    let later = Utc::now() + Duration::hours(1);
+    classify(&server, later).await;
+    assert!(main_broken(&feed(&server).await).is_empty());
+
+    // A replica still on the previous release (a rolling deploy) runs one
+    // pass. It counts every default-branch workflow, so it carries the
+    // nightly streak, lists the test, and moves the watermark and
+    // `main_through` without knowing `main_workflows_through`. This writes
+    // what that release's pass writes.
+    let client = server.client().await;
+    client
+        .batch_execute(
+            "INSERT INTO test_results.test_main \
+                 (repo, test_id, run_id, received_at, received_on, sha, is_fail, \
+                  failure_hash, streak, streak_since_sha) \
+             SELECT r.repo, 'nightly', r.run_id, r.received_at, r.received_at::date, r.sha, \
+                    true, 'n', 2, '201' \
+             FROM test_results.runs r WHERE r.sha = '202'; \
+             UPDATE test_results.tests SET main_broken_since_sha = '201', \
+                    main_broken_failure_hash = 'n', main_broken_at = now() \
+             WHERE test_id = 'nightly'; \
+             UPDATE test_results.classifier_state \
+             SET watermark = watermark + interval '5 minutes', \
+                 main_through = main_through + interval '5 minutes';",
+        )
+        .await
+        .unwrap();
+    drop(client);
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("nightly", "n", "201")]
+    );
+
+    // This release's next pass sees `main_through` moved by someone who
+    // did not record the rule, rebuilds, and drops the nightly-only test.
+    classify(&server, later + Duration::minutes(10)).await;
+    assert!(main_broken(&feed(&server).await).is_empty());
+    server.stop().await;
+}

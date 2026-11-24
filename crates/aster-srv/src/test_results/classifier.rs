@@ -29,11 +29,20 @@
 //!    run is compared with the nearest earlier run of that hash, so a test
 //!    that keeps flipping keeps producing events but a steady one does not.
 //!
-//! Likely flake events (`kind = 'likely'`), only when the run is on the
-//! default branch (`ASTER_SRV_DEFAULT_BRANCH`):
+//! Main sequence: a test's results in runs on the default branch
+//! (`ASTER_SRV_DEFAULT_BRANCH`). With `ASTER_SRV_REFERENCE_WORKFLOWS` set,
+//! only runs of those workflows (the run's `workflow`, compared exactly)
+//! are in it, so a nightly suite on the default branch neither breaks a
+//! test nor clears one. Rule 3, broken and broken on main read only the
+//! main sequence. Trust (which events quarantine may act on) does not
+//! depend on the workflow: every default-branch run with a known source is
+//! trusted.
+//!
+//! Likely flake events (`kind = 'likely'`), only when the run is in the
+//! main sequence:
 //!
 //! 3. `next_main_run`: the final outcome is a pass and the test's previous
-//!    default-branch run failed, whatever the input hash, unless that failure
+//!    main-sequence run failed, whatever the input hash, unless that failure
 //!    ended a broken streak (so fixing a broken test is not a flake). The
 //!    event is for the failed run; a definite event for that run replaces
 //!    it, whichever is found first. Whether the diff between the two runs
@@ -54,7 +63,7 @@
 //! broken streaks use only results that are not `partial`, because they judge
 //! a failure and `partial` results may miss or misattribute tests.
 //!
-//! Broken: the test's last `ASTER_SRV_BROKEN_RUNS` (at least 3) default-branch
+//! Broken: the test's last `ASTER_SRV_BROKEN_RUNS` (at least 3) main-sequence
 //! runs all failed with the same, non-null `failure_hash`. `broken_since_sha`
 //! is the sha of the first run of that whole streak. The next pass that
 //! leaves it healthy clears it. Broken wins over flaky.
@@ -62,8 +71,8 @@
 //! Broken on main: the same streak at the shorter
 //! `ASTER_SRV_MAIN_BROKEN_RUNS` (at least 1, default 2) is kept as
 //! `main_broken_since_sha`, `main_broken_failure_hash` and `main_broken_at`
-//! on `tests`, independent of `state`. A pass or a different failure on the
-//! default branch clears it in the same pass. Entering and leaving are logged
+//! on `tests`, independent of `state`. A pass or a different failure in the
+//! main sequence clears it in the same pass. Entering and leaving are logged
 //! to `quarantine_log` (`main_broken`, `main_fixed`) so the quarantine list's
 //! version moves with its `main_broken` array.
 //!
@@ -88,11 +97,13 @@
 //! A pass reads the new runs' results, not each test's history. Rule 2
 //! starts from the target runs with the same input hash, which are few.
 //! Rule 3 and broken streaks read `test_main`: each test's last
-//! default-branch result and failure streak up to the window's start
+//! main-sequence result and failure streak up to the window's start
 //! (`classifier_state.main_through`), followed by the window's own results;
 //! a pass then moves results older than its overlap into it. Quarantine
 //! release counts are kept the same way (`quarantine.passes`). A window that
-//! starts anywhere else rebuilds both from the results. Rule 2 compares runs
+//! starts anywhere else rebuilds both from the results, and so does a pass
+//! whose reference workflows differ from those `test_main` was built with
+//! (`classifier_state.main_workflows`). Rule 2 compares runs
 //! of the same target address, and a failure streak longer than the
 //! retention period keeps counting past it.
 
@@ -231,6 +242,9 @@ pub(super) struct Window {
     history_from: NaiveDate,
     /// The branch names that mean the default branch.
     on_default: String,
+    /// The workflows whose default-branch runs make the main sequence;
+    /// empty for every workflow.
+    reference_workflows: Vec<String>,
     broken_runs: u32,
     main_broken_runs: u32,
     quarantine: QuarantineRules,
@@ -275,7 +289,7 @@ impl Window {
     /// whatever branch its record names, and `pull_request_target` runs on
     /// the default branch's ref but for a pull request. A static token's
     /// runs, and runs stored before sources were recorded, go by `branch`.
-    pub(super) fn on_default(&self, r: &str) -> String {
+    fn on_default(&self, r: &str) -> String {
         format!(
             "(CASE WHEN {r}.source = 'oidc' \
                    THEN COALESCE({r}.git_ref = {git_ref} \
@@ -293,6 +307,31 @@ impl Window {
     /// but not that they are true.
     pub(super) fn trusted(&self, r: &str) -> String {
         format!("({r}.source IS NOT NULL AND {})", self.on_default(r))
+    }
+
+    /// Whether the run `r` is in each test's main sequence, the runs that
+    /// decide broken streaks, broken on main and likely flakes: a
+    /// default-branch run, of a reference workflow when any are set. A run
+    /// with no workflow name is in no reference workflow.
+    pub(super) fn in_main_sequence(&self, r: &str) -> String {
+        if self.reference_workflows.is_empty() {
+            return self.on_default(r);
+        }
+        let names: Vec<String> = self.reference_workflows.iter().map(|w| text(w)).collect();
+        format!(
+            "({} AND COALESCE({r}.workflow IN ({}), false))",
+            self.on_default(r),
+            names.join(", ")
+        )
+    }
+
+    /// The main-sequence rule as `classifier_state.main_workflows` keeps
+    /// it: `None` for every default-branch run, else the reference
+    /// workflows as a JSON array. `test_main` built under another rule is
+    /// rebuilt.
+    fn main_workflows(&self) -> Option<String> {
+        (!self.reference_workflows.is_empty())
+            .then(|| serde_json::to_string(&self.reference_workflows).expect("strings serialize"))
     }
 
     /// Each run's final result of one test: `filter` picks the test and
@@ -348,6 +387,7 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
         to,
         history_from: now.date_naive() - chrono::Days::new(u64::from(app.config.retention_days)),
         on_default: app.config.default_branch.clone(),
+        reference_workflows: app.config.reference_workflows.clone(),
         broken_runs: app.config.broken_runs,
         main_broken_runs: app.config.main_broken_runs,
         quarantine: app.config.quarantine,
@@ -377,12 +417,28 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
     // from its watermark if `now` is later still.
     let state = transaction
         .query_opt(
-            "SELECT watermark, main_through FROM test_results.classifier_state",
+            "SELECT watermark, main_through, main_workflows, main_workflows_through \
+             FROM test_results.classifier_state",
             &[],
         )
         .await?;
     let committed: Option<DateTime<Utc>> = state.as_ref().map(|row| row.get(0));
-    let main_through: Option<DateTime<Utc>> = state.as_ref().and_then(|row| row.get(1));
+    // `test_main` built under another main-sequence rule is valid nowhere:
+    // rebuild it. That is so when the reference workflows changed since it
+    // was built, and, while reference workflows are set, when a release
+    // that knows nothing of them (a replica not yet replaced in a rolling
+    // deploy) moved `main_through` without `main_workflows_through`: it
+    // added every workflow's results.
+    let main_workflows = window.main_workflows();
+    let rule_changed = state.as_ref().is_some_and(|row| {
+        row.get::<_, Option<String>>(2) != main_workflows
+            || (main_workflows.is_some()
+                && row.get::<_, Option<DateTime<Utc>>>(3) != row.get::<_, Option<DateTime<Utc>>>(1))
+    });
+    let main_through: Option<DateTime<Utc>> = match &state {
+        Some(row) if !rule_changed => row.get(1),
+        _ => None,
+    };
     if let Some(committed) = committed.filter(|committed| *committed > window.to) {
         transaction.rollback().await?;
         return Ok(Some((Report::default(), committed >= now)));
@@ -393,16 +449,19 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
         transaction.rollback().await?;
         return Ok(Some((Report::default(), false)));
     }
-    let report = classify(&transaction, &window, main_through).await?;
+    let report = classify(&transaction, &window, main_through, rule_changed).await?;
     transaction
         .execute(
-            "INSERT INTO test_results.classifier_state (id, watermark, main_through) \
-             VALUES (1, $1, $2) \
+            "INSERT INTO test_results.classifier_state \
+                 (id, watermark, main_through, main_workflows, main_workflows_through) \
+             VALUES (1, $1, $2, $3, $2) \
              ON CONFLICT (id) DO UPDATE SET \
                  watermark = GREATEST(test_results.classifier_state.watermark, EXCLUDED.watermark), \
                  main_through = EXCLUDED.main_through, \
+                 main_workflows = EXCLUDED.main_workflows, \
+                 main_workflows_through = EXCLUDED.main_workflows_through, \
                  updated_at = now()",
-            &[&window.to, &window.through()],
+            &[&window.to, &window.through(), &main_workflows],
         )
         .await?;
     transaction.commit().await?;
@@ -417,6 +476,7 @@ async fn classify(
     transaction: &tokio_postgres::Transaction<'_>,
     window: &Window,
     main_through: Option<DateTime<Utc>>,
+    rule_changed: bool,
 ) -> Result<Report> {
     let from_day = window.from.date_naive();
     let to_day = window.to.date_naive();
@@ -429,7 +489,7 @@ async fn classify(
                  WITH attempts AS ( \
                      SELECT tr.repo, tr.run_id, tr.test_id, tr.target, tr.outcome, \
                             tr.failure_hash, tr.received_on, r.received_at, r.sha, \
-                            {on_default} AS on_default, {trusted} AS trusted, \
+                            {in_main} AS in_main, {trusted} AS trusted, \
                             t.input_hash, t.confidence, \
                             row_number() OVER w AS rn, \
                             bool_or(tr.outcome IN ('fail', 'error')) OVER (\
@@ -444,11 +504,11 @@ async fn classify(
                        AND tr.outcome <> 'skip' AND NOT t.cached \
                      WINDOW w AS (PARTITION BY tr.run_id, tr.test_id ORDER BY tr.attempt DESC)) \
                  SELECT repo, run_id, test_id, target, outcome IN ('fail', 'error') AS is_fail, \
-                        failure_hash, received_on, received_at, sha, on_default, trusted, \
+                        failure_hash, received_on, received_at, sha, in_main, trusted, \
                         input_hash, confidence IS NOT DISTINCT FROM 'partial' AS partial, \
                         any_fail AND outcome = 'pass' AS retried \
                  FROM attempts WHERE rn = 1",
-                on_default = window.on_default("r"),
+                in_main = window.in_main_sequence("r"),
                 trusted = window.trusted("r"),
                 from = at(window.from),
                 to = at(window.to),
@@ -528,6 +588,15 @@ async fn classify(
     if main_through != Some(window.from) {
         rebuild_main(transaction, window).await?;
     }
+    // After the main-sequence rule changed, a healthy test with no new run
+    // may now be broken or broken on main (its old main sequence passed, its
+    // new one fails): every test in the rebuilt `test_main` is re-derived,
+    // not only those already unhealthy or in the window.
+    let rejudged = if rule_changed {
+        "UNION SELECT repo, test_id FROM test_results.test_main"
+    } else {
+        ""
+    };
 
     // Rule 2: the same input hash gave a different outcome than the nearest
     // earlier run of that hash. Runs of one target with one hash are few
@@ -660,11 +729,12 @@ async fn classify(
                            UNION \
                            SELECT repo, test_id FROM test_results.tests \
                            WHERE state <> 'healthy' OR flake_score > 0 \
-                              OR main_broken_failure_hash IS NOT NULL) \
+                              OR main_broken_failure_hash IS NOT NULL \
+                           {rejudged}) \
                      UNION ALL \
                      SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
                             failure_hash, false, 0, NULL::text \
-                     FROM cls_win WHERE on_default AND NOT partial"
+                     FROM cls_win WHERE in_main AND NOT partial"
                 ))
             ),
             &[],
@@ -678,7 +748,7 @@ async fn classify(
         .batch_execute("CREATE INDEX ON cls_main (repo, test_id); ANALYZE cls_main")
         .await?;
 
-    // Rule 3: a default-branch pass right after a default-branch failure
+    // Rule 3: a main-sequence pass right after a main-sequence failure
     // that did not end a broken streak. The event is the failed run's,
     // unless that run already has a definite one.
     events += transaction
@@ -699,7 +769,7 @@ async fn classify(
                  LEFT JOIN test_results.target_runs t \
                       ON t.run_id = m.prev_run_id AND t.address = f.target \
                      AND t.received_on = m.prev_received_on \
-                 WHERE w.on_default AND NOT w.partial AND NOT w.is_fail \
+                 WHERE w.in_main AND NOT w.partial AND NOT w.is_fail \
                    AND m.prev_is_fail AND m.prev_streak < {k} \
                    AND NOT EXISTS (SELECT 1 FROM test_results.test_flake_events e \
                                    WHERE e.repo = w.repo AND e.test_id = w.test_id \
@@ -726,7 +796,8 @@ async fn classify(
                      UNION \
                      SELECT repo, test_id FROM test_results.tests \
                      WHERE state <> 'healthy' OR flake_score > 0 \
-                        OR main_broken_failure_hash IS NOT NULL), \
+                        OR main_broken_failure_hash IS NOT NULL \
+                     {rejudged}), \
                  scores AS ( \
                      SELECT a.repo, a.test_id, \
                             COALESCE(sum(CASE e.kind WHEN 'definite' THEN 3 ELSE 1 END) \
@@ -933,7 +1004,7 @@ fn streaks(rows: &str) -> String {
     )
 }
 
-/// Refill `test_main` from the results: each test's last default-branch
+/// Refill `test_main` from the results: each test's last main-sequence
 /// result up to `window.from` and its streak, within the retention period.
 async fn rebuild_main(
     transaction: &tokio_postgres::Transaction<'_>,
@@ -960,7 +1031,7 @@ async fn rebuild_main(
         history = day(window.history_from),
         through_day = day(window.from.date_naive()),
         through = at(window.from),
-        main = window.on_default("r"),
+        main = window.in_main_sequence("r"),
     );
     transaction
         .execute(
@@ -980,6 +1051,50 @@ async fn rebuild_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(reference_workflows: &[&str]) -> Window {
+        Window {
+            from: Utc::now(),
+            to: Utc::now(),
+            history_from: Utc::now().date_naive(),
+            on_default: "main".into(),
+            reference_workflows: reference_workflows.iter().map(|w| w.to_string()).collect(),
+            broken_runs: 3,
+            main_broken_runs: 2,
+            quarantine: QuarantineRules {
+                runs: 2,
+                release_passes: 20,
+                days: 30,
+                run_cap: 10,
+            },
+            webhooks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_main_sequence_is_the_default_branch_unless_reference_workflows_are_set() {
+        // Unset: exactly the default-branch rule, and no fingerprint, which
+        // is what every release before the setting stored.
+        let all = window(&[]);
+        assert_eq!(all.in_main_sequence("r"), all.on_default("r"));
+        assert_eq!(all.main_workflows(), None);
+
+        // Set: the default-branch rule and the workflow, quoted. Trust is
+        // the default-branch rule either way.
+        let some = window(&["Nightly", "Stable CI's"]);
+        assert_eq!(
+            some.in_main_sequence("r"),
+            format!(
+                "({} AND COALESCE(r.workflow IN ('Nightly', 'Stable CI''s'), false))",
+                some.on_default("r")
+            )
+        );
+        assert_eq!(some.trusted("r"), all.trusted("r"));
+        assert_eq!(
+            some.main_workflows().as_deref(),
+            Some(r#"["Nightly","Stable CI's"]"#)
+        );
+    }
 
     #[test]
     fn literals_are_quoted() {
