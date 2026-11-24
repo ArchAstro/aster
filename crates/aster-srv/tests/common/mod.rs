@@ -472,6 +472,8 @@ pub struct Run<'a> {
     pub source: Option<&'a str>,
     pub git_ref: Option<&'a str>,
     pub event_name: Option<&'a str>,
+    /// The workflow's name (`GITHUB_WORKFLOW`); `None` by default.
+    pub workflow: Option<&'a str>,
     /// `(test_id, outcome, attempt, failure_hash)`.
     pub results: Vec<(&'a str, &'a str, i32, Option<&'a str>)>,
 }
@@ -493,6 +495,7 @@ impl<'a> Run<'a> {
             source: Some("static"),
             git_ref: None,
             event_name: None,
+            workflow: None,
             results: Vec::new(),
         }
     }
@@ -502,6 +505,12 @@ impl<'a> Run<'a> {
         self.source = Some("oidc");
         self.git_ref = Some(git_ref);
         self.event_name = Some(event_name);
+        self
+    }
+
+    /// Run by the workflow named `workflow`.
+    pub fn workflow(mut self, workflow: &'a str) -> Self {
+        self.workflow = Some(workflow);
         self
     }
 
@@ -547,8 +556,8 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
         .execute(
             "INSERT INTO test_results.runs \
              (run_id, repo, sha, branch, job, lane, attempt, runner, aster_version, \
-              started_at, received_at, source, git_ref, event_name) \
-             VALUES ($1, $2, $3, $4, $6, $7, $8, $9, '0', $5, $5, $10, $11, $12)",
+              started_at, received_at, source, git_ref, event_name, workflow) \
+             VALUES ($1, $2, $3, $4, $6, $7, $8, $9, '0', $5, $5, $10, $11, $12, $13)",
             &[
                 &run.run_id,
                 &run.repo,
@@ -562,6 +571,7 @@ pub async fn seed(server: &Server, run: &Run<'_>) {
                 &run.source,
                 &run.git_ref,
                 &run.event_name,
+                &run.workflow,
             ],
         )
         .await

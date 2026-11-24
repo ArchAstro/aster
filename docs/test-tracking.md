@@ -333,7 +333,9 @@ database), the server records one **incident** for the target run instead of
 a flake per test. A test is **broken** when its last 3 default-branch runs
 failed the same way; broken tests are never quarantined. A test failing the same way in the last 2
 default-branch runs is **broken on main**, which a repository may opt in to
-letting pull requests fail (see [section 5](#broken-on-main)).
+letting pull requests fail (see [section 5](#broken-on-main)). With
+`ASTER_SRV_REFERENCE_WORKFLOWS` set on the server, only those workflows'
+default-branch runs count toward broken and broken on main.
 The details are in the [server README](../crates/aster-srv/README.md#flaky-and-broken-tests).
 
 ## 5. Quarantine
@@ -461,8 +463,17 @@ quarantined only when all of these hold, on top of the rules above:
    list stands in for the flaky list for up to 24 hours, but its
    `main_broken` part is ignored after 1 hour.
 
-The first default-branch pass of the test removes it from the list at the
-server's next classifier pass (every 5 minutes), and a run that fetches the
+When the default branch runs more than one workflow, the server can be told
+which one decides: `ASTER_SRV_REFERENCE_WORKFLOWS=Stable CI` (a comma-separated
+list of workflow names, as `GITHUB_WORKFLOW` gives them). Then only that
+workflow's default-branch runs put a test on the list or take it off, so a
+nightly suite failing on main lists nothing, and its passes do not clear what
+Stable CI still fails. A test that only runs in other workflows is never on
+the list. Unset, every default-branch run counts.
+
+The first default-branch pass of the test (of a reference workflow, when they
+are set) removes it from the list at the server's next classifier pass (every
+5 minutes), and a run that fetches the
 list after that no longer excuses it. A run already in flight keeps the list
 it fetched at start. Default-branch runs are never excused. The start line
 counts these separately and the test's source reads `broken on main since
