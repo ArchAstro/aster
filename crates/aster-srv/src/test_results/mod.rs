@@ -322,6 +322,22 @@ ALTER TABLE test_results.classifier_state
     ADD COLUMN main_workflows_through timestamptz;
 "#,
     },
+    Migration {
+        feature: "test_results",
+        version: 10,
+        // A rebuild of `test_main` in steps (see `classifier`): the rows
+        // built so far, the rule they are built under and how far they go,
+        // and the span of results the last step that worked read. A new
+        // table and nullable columns on a one-row table; NULL means no
+        // rebuild is under way (or, for the span, the longest).
+        sql: r#"
+CREATE TABLE test_results.test_main_rebuild (LIKE test_results.test_main INCLUDING ALL);
+ALTER TABLE test_results.classifier_state
+    ADD COLUMN rebuild_workflows text,
+    ADD COLUMN rebuild_through timestamptz,
+    ADD COLUMN rebuild_span_seconds integer;
+"#,
+    },
 ];
 
 /// The day-partitioned tables.

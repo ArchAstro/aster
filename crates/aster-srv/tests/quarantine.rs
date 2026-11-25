@@ -1334,3 +1334,120 @@ async fn a_pass_by_an_older_release_mid_deploy_makes_the_next_pass_rebuild_main(
     assert!(main_broken(&feed(&server).await).is_empty());
     server.stop().await;
 }
+
+#[tokio::test]
+async fn passes_go_on_under_the_old_rule_while_the_rebuild_cannot_finish() {
+    // Setup: no reference workflows. Nightly fails `nightly` and Stable CI
+    // fails `stable` three times each, the same way: both broken and broken
+    // on main, carried in `test_main`.
+    let Some(server) = start(&[]).await else {
+        return;
+    };
+    let now = Utc::now();
+    for (i, (nightly, stable)) in [("201", "101"), ("202", "102"), ("203", "103")]
+        .into_iter()
+        .enumerate()
+    {
+        let at = ago(now, 90 - 2 * i as i64);
+        seed(
+            &server,
+            &failing(nightly, "main", at, "nightly", "n").workflow(NIGHTLY),
+        )
+        .await;
+        seed(
+            &server,
+            &failing(stable, "main", at + Duration::seconds(30), "stable", "s").workflow(STABLE),
+        )
+        .await;
+    }
+    classify(&server, ago(now, 30)).await;
+    assert_eq!(
+        main_broken(&feed(&server).await),
+        vec![listed("nightly", "n", "201"), listed("stable", "s", "101")]
+    );
+
+    // Fault: the server restarts with Stable CI as the reference workflow,
+    // but every rebuild step fails. Another session holds the rebuild's
+    // table, and the classifier's statements give up waiting for a lock
+    // after 100 ms.
+    let client = server.client().await;
+    let database: String = client
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .batch_execute(&format!(
+            "ALTER DATABASE {database} SET lock_timeout = '100ms'"
+        ))
+        .await
+        .unwrap();
+    let (holder, connection) = tokio_postgres::connect(
+        &std::env::var("ASTER_SRV_TEST_DATABASE_URL")
+            .unwrap()
+            .rsplit_once('/')
+            .map(|(base, _)| format!("{base}/{database}"))
+            .unwrap(),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(connection);
+    holder
+        .batch_execute("BEGIN; LOCK TABLE test_results.test_main_rebuild IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let restarted = server
+        .second(&[("ASTER_SRV_REFERENCE_WORKFLOWS", STABLE)])
+        .await;
+
+    // Meanwhile Nightly fails a new test, `fresh`, twice the same way.
+    for (run, minutes) in [("211", 20), ("212", 19)] {
+        seed(
+            &restarted,
+            &failing(run, "main", ago(now, minutes), "fresh", "f").workflow(NIGHTLY),
+        )
+        .await;
+    }
+    let report = classify(&restarted, now).await;
+
+    // Outcome: the pass still ran and committed, under the rule `test_main`
+    // was built with (every workflow): `fresh` is listed, nothing left, and
+    // the rule is unchanged until the rebuild is swapped in.
+    assert_eq!(report.results, 2);
+    assert_eq!(
+        main_broken(&feed(&restarted).await),
+        vec![
+            listed("fresh", "f", "211"),
+            listed("nightly", "n", "201"),
+            listed("stable", "s", "101")
+        ]
+    );
+    let state = restarted
+        .client()
+        .await
+        .query_one(
+            "SELECT watermark, main_workflows, rebuild_through FROM test_results.classifier_state",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.get::<_, DateTime<Utc>>(0), now);
+    assert_eq!(state.get::<_, Option<String>>(1), None);
+    assert_eq!(state.get::<_, Option<DateTime<Utc>>>(2), None);
+
+    // Action: the table is free again, and the next pass runs.
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    classify(&restarted, now + Duration::minutes(5)).await;
+
+    // Outcome: rebuilt, swapped in and every test judged again. Only Stable
+    // CI's failure is still listed.
+    assert_eq!(
+        main_broken(&feed(&restarted).await),
+        vec![listed("stable", "s", "101")]
+    );
+    assert_eq!(test_state(&restarted, "nightly").await, "healthy");
+    assert_eq!(test_state(&restarted, "stable").await, "broken");
+    restarted.stop().await;
+    server.stop().await;
+}

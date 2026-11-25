@@ -77,6 +77,11 @@ pub struct Config {
     /// queue run may let that test fail (`main_broken` in the quarantine
     /// list). At least 1; default 2.
     pub main_broken_runs: u32,
+    /// `ASTER_SRV_REBUILD_BUDGET_SECONDS`: how long each classifier tick
+    /// spends rebuilding `test_main` after its passes; the rebuild goes on
+    /// in the next tick. A step that has started finishes. 0 runs one step
+    /// a tick. Default 120.
+    pub rebuild_budget: std::time::Duration,
     /// `ASTER_SRV_REFERENCE_WORKFLOWS`: comma-separated workflow names (the
     /// run record's `workflow`, GitHub's `GITHUB_WORKFLOW`, such as
     /// `Stable CI`). When set, only default-branch runs of these workflows
@@ -321,6 +326,13 @@ impl Config {
                 .context("ASTER_SRV_MAIN_BROKEN_RUNS must be a number of runs, at least 1")?,
             None => 2,
         };
+        let rebuild_budget =
+            std::time::Duration::from_secs(match var("ASTER_SRV_REBUILD_BUDGET_SECONDS") {
+                Some(seconds) => seconds
+                    .parse()
+                    .context("ASTER_SRV_REBUILD_BUDGET_SECONDS must be a number of seconds")?,
+                None => 120,
+            });
         let reference_workflows = reference_workflows(var("ASTER_SRV_REFERENCE_WORKFLOWS"));
         let max_body_bytes = match var("ASTER_SRV_MAX_BODY_BYTES") {
             Some(bytes) => bytes
@@ -597,6 +609,7 @@ impl Config {
             default_branch,
             broken_runs,
             main_broken_runs,
+            rebuild_budget,
             reference_workflows,
             max_body_bytes,
             max_large_bodies,
@@ -1017,6 +1030,7 @@ mod tests {
         assert_eq!(config.default_branch, "main");
         assert_eq!(config.broken_runs, 3);
         assert_eq!(config.main_broken_runs, 2);
+        assert_eq!(config.rebuild_budget.as_secs(), 120);
         assert!(config.reference_workflows.is_empty());
         assert_eq!(config.max_body_bytes, 64 * 1024 * 1024);
         assert!(config.static_tokens.is_empty());
@@ -1603,13 +1617,20 @@ mod tests {
         pairs.push(("ASTER_SRV_DEFAULT_BRANCH", "trunk"));
         pairs.push(("ASTER_SRV_BROKEN_RUNS", "5"));
         pairs.push(("ASTER_SRV_MAIN_BROKEN_RUNS", "1"));
+        pairs.push(("ASTER_SRV_REBUILD_BUDGET_SECONDS", "0"));
         let config = Config::from_env(env_of(&pairs)).unwrap();
+        assert_eq!(config.rebuild_budget.as_secs(), 0);
         assert_eq!(config.default_branch, "trunk");
         assert_eq!(config.broken_runs, 5);
         assert_eq!(config.main_broken_runs, 1);
         for bad in ["0", "many"] {
             let mut pairs = REQUIRED.to_vec();
             pairs.push(("ASTER_SRV_MAIN_BROKEN_RUNS", bad));
+            assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
+        }
+        for bad in ["-1", "soon"] {
+            let mut pairs = REQUIRED.to_vec();
+            pairs.push(("ASTER_SRV_REBUILD_BUDGET_SECONDS", bad));
             assert!(Config::from_env(env_of(&pairs)).is_err(), "{bad}");
         }
         for bad in ["2", "0", "many"] {

@@ -100,12 +100,55 @@
 //! main-sequence result and failure streak up to the window's start
 //! (`classifier_state.main_through`), followed by the window's own results;
 //! a pass then moves results older than its overlap into it. Quarantine
-//! release counts are kept the same way (`quarantine.passes`). A window that
-//! starts anywhere else rebuilds both from the results, and so does a pass
-//! whose reference workflows differ from those `test_main` was built with
-//! (`classifier_state.main_workflows`). Rule 2 compares runs
+//! release counts are kept the same way (`quarantine.passes`, recounted from
+//! the results for a window that starts anywhere else). Rule 2 compares runs
 //! of the same target address, and a failure streak longer than the
 //! retention period keeps counting past it.
+//!
+//! # Rebuilding `test_main`
+//!
+//! `test_main` is rebuilt from the results when it was built under other
+//! reference workflows than the configured ones
+//! (`classifier_state.main_workflows`), when a release that knows nothing
+//! of them moved it while some were set (`main_workflows_through`), and
+//! when it does not end where the next window starts (`main_through`, for
+//! example after an upgrade from a release that did not keep it).
+//!
+//! A rebuild reads the whole retention period, more than one statement can
+//! sort: in v0.37.0 it was one statement in the pass, and 30 days of
+//! main-sequence results did not fit in production's 5 GB of temporary
+//! files, so every pass failed and rolled back. It is built beside `test_main`, in
+//! `test_main_rebuild`, by steps of [`REBUILD_SPAN`] of results: each step
+//! is its own transaction under the classifier's lock, carries the rows
+//! built so far forward the way a pass carries `test_main`, and records how
+//! far it got (`classifier_state.rebuild_through`, under the rule it builds
+//! for, `rebuild_workflows`). Steps run after a tick's passes, for at most
+//! `ASTER_SRV_REBUILD_BUDGET_SECONDS`, and go on in the next tick. When the
+//! rebuild reaches the next window's start, that pass swaps it in and judges
+//! every test in it again, so a test listed only under the old rule leaves
+//! without a new run. A swap that fails rolls back; the tick's next pass
+//! carries the old `test_main` instead, and the next tick swaps again. A
+//! step that fails is retried at half the span, down to
+//! [`REBUILD_MIN_SPAN`]; the span that worked is kept
+//! (`rebuild_span_seconds`) and lengthens again by a quarter each tick
+//! whose steps all worked. A step reads only its
+//! span's main-sequence runs and their results, so its sorts are bounded
+//! by the span, not by the retention period; so is the swap, which copies
+//! one row per test, and the pass after it, which judges every test once.
+//!
+//! Until the swap, passes go on with the `test_main` they have, under the
+//! rule it was built with: the old reference workflows keep deciding
+//! streaks for a few more passes, and nothing waits on the rebuild. Only a
+//! `test_main` that does not end where the window starts cannot carry a
+//! pass; those passes wait for the rebuild (it reads only results older than
+//! the window, which no upload changes).
+//!
+//! Replicas: steps and passes take the same lock, and each step reads where
+//! the next window starts under it. A rebuild depends only on results older
+//! than that, so a pass by another replica, or by a release that knows
+//! nothing of rebuilds, only moves its target. A replica configured with
+//! other reference workflows starts the rebuild over for its own; one that
+//! needs none leaves it.
 
 use std::time::Duration;
 
@@ -129,6 +172,17 @@ const OVERLAP: chrono::Duration = chrono::Duration::minutes(15);
 /// The longest span of runs one transaction takes, so a first pass over a
 /// full retention period works in pieces.
 const CHUNK: chrono::Duration = chrono::Duration::hours(6);
+
+/// The span of results one step of a `test_main` rebuild reads. A step's
+/// largest statement wrote about 140 bytes of temporary file per main-sequence
+/// result with short ids (`tests/main_rebuild.rs`, `rebuild_scale`); with
+/// production's longer test, run and commit ids, say 250. Six hours of a
+/// main sequence of 175,000 results an hour is then about 0.3 GB, against
+/// Cloud SQL's 5 GB `temp_file_limit`.
+const REBUILD_SPAN: chrono::Duration = chrono::Duration::hours(6);
+
+/// The shortest span a failing rebuild step is retried at.
+const REBUILD_MIN_SPAN: chrono::Duration = chrono::Duration::minutes(5);
 
 /// Days of events that count toward the score.
 const SCORE_DAYS: i64 = 7;
@@ -165,21 +219,71 @@ pub struct Report {
 /// earlier pass has not covered. Safe to run again.
 pub async fn run_once(app: &App, now: DateTime<Utc>) -> Result<Option<Report>> {
     let mut report = Report::default();
+    let mut locked = false;
+    let mut rebuilt = false;
+    // Whether a pass may swap a finished rebuild in. A swap that fails is not
+    // tried again this tick: the pass after it carries the old `test_main`,
+    // which is still right for its rule, and the next tick swaps.
+    let mut swap = true;
     loop {
-        let Some((chunk, done)) = pass(app, now).await? else {
-            return Ok(None);
+        let mut swapping = false;
+        let outcome = match pass(app, now, swap, &mut swapping).await {
+            Err(error) if swapping => {
+                crate::log::error(
+                    "test_main rebuild swap failed; passes go on under the old rule",
+                    json!({"error": format!("{error:#}")}),
+                );
+                swap = false;
+                continue;
+            }
+            outcome => outcome?,
         };
-        report.results += chunk.results;
-        report.events += chunk.events;
-        report.incidents += chunk.incidents;
-        report.tests_updated += chunk.tests_updated;
-        report.quarantine.quarantined += chunk.quarantine.quarantined;
-        report.quarantine.released += chunk.quarantine.released;
-        report.quarantine.expired += chunk.quarantine.expired;
-        report.quarantine.broken += chunk.quarantine.broken;
-        report.deliveries += chunk.deliveries;
-        if done {
+        let rebuild = match outcome {
+            None if !locked => return Ok(None),
+            None => return Ok(Some(report)),
+            Some(Pass::Classified {
+                report: chunk,
+                done,
+                rebuild,
+            }) => {
+                locked = true;
+                report.results += chunk.results;
+                report.events += chunk.events;
+                report.incidents += chunk.incidents;
+                report.tests_updated += chunk.tests_updated;
+                report.quarantine.quarantined += chunk.quarantine.quarantined;
+                report.quarantine.released += chunk.quarantine.released;
+                report.quarantine.expired += chunk.quarantine.expired;
+                report.quarantine.broken += chunk.quarantine.broken;
+                report.deliveries += chunk.deliveries;
+                if !done {
+                    continue;
+                }
+                rebuild
+            }
+            Some(Pass::Waiting) => {
+                locked = true;
+                true
+            }
+        };
+        // Once a tick: the rebuild's steps are bounded by its budget, and a
+        // pass that still finds it unfinished waits for the next tick.
+        if !rebuild || rebuilt {
             return Ok(Some(report));
+        }
+        rebuilt = true;
+        match rebuild_main(app, now).await {
+            // The next pass swaps it in, unless a swap failed this tick.
+            Ok(Step::Ready) if swap => continue,
+            Ok(_) => return Ok(Some(report)),
+            // Passes do not depend on it, so one failing does not stop them.
+            Err(error) => {
+                crate::log::error(
+                    "test_main rebuild failed",
+                    json!({"error": format!("{error:#}")}),
+                );
+                return Ok(Some(report));
+            }
         }
     }
 }
@@ -252,6 +356,29 @@ pub(super) struct Window {
 }
 
 impl Window {
+    /// Runs received in `(from, to]`, as of `now`, with the main sequence
+    /// made of `reference_workflows`' runs (every workflow's when empty).
+    fn new(
+        app: &App,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        now: DateTime<Utc>,
+        reference_workflows: Vec<String>,
+    ) -> Self {
+        Window {
+            from,
+            to,
+            history_from: now.date_naive()
+                - chrono::Days::new(u64::from(app.config.retention_days)),
+            on_default: app.config.default_branch.clone(),
+            reference_workflows,
+            broken_runs: app.config.broken_runs,
+            main_broken_runs: app.config.main_broken_runs,
+            quarantine: app.config.quarantine,
+            webhooks: app.config.webhooks.clone(),
+        }
+    }
+
     /// `to` as a SQL literal.
     pub(super) fn to_literal(&self) -> String {
         at(self.to)
@@ -330,8 +457,7 @@ impl Window {
     /// workflows as a JSON array. `test_main` built under another rule is
     /// rebuilt.
     fn main_workflows(&self) -> Option<String> {
-        (!self.reference_workflows.is_empty())
-            .then(|| serde_json::to_string(&self.reference_workflows).expect("strings serialize"))
+        rule(&self.reference_workflows)
     }
 
     /// Each run's final result of one test: `filter` picks the test and
@@ -360,9 +486,136 @@ impl Window {
     }
 }
 
-/// One transaction: classify the next chunk of runs. Returns what it did
-/// and whether it reached `now`, or `None` when the lock is held.
-async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
+/// The main-sequence rule as `classifier_state` keeps it: `None` for every
+/// default-branch run, else the reference workflows as a JSON array.
+fn rule(reference_workflows: &[String]) -> Option<String> {
+    (!reference_workflows.is_empty())
+        .then(|| serde_json::to_string(reference_workflows).expect("strings serialize"))
+}
+
+/// What `classifier_state` says about `test_main` and its rebuild.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Carried {
+    watermark: DateTime<Utc>,
+    /// Where `test_main` ends.
+    main_through: Option<DateTime<Utc>>,
+    /// The rule `test_main` was built under.
+    main_workflows: Option<String>,
+    /// The `main_through` this release last wrote with `main_workflows`.
+    main_workflows_through: Option<DateTime<Utc>>,
+    /// The rule `test_main_rebuild` is built under.
+    rebuild_workflows: Option<String>,
+    /// Where `test_main_rebuild` ends; `None` when no rebuild is under way.
+    rebuild_through: Option<DateTime<Utc>>,
+}
+
+const CARRIED: &str = "SELECT watermark, main_through, main_workflows, main_workflows_through, \
+                              rebuild_workflows, rebuild_through \
+                       FROM test_results.classifier_state";
+
+impl Carried {
+    fn read(row: &tokio_postgres::Row) -> Self {
+        Carried {
+            watermark: row.get(0),
+            main_through: row.get(1),
+            main_workflows: row.get(2),
+            main_workflows_through: row.get(3),
+            rebuild_workflows: row.get(4),
+            rebuild_through: row.get(5),
+        }
+    }
+
+    /// A release that knows nothing of reference workflows (a replica not
+    /// yet replaced in a rolling deploy) moved `main_through` while some
+    /// were set: it added every workflow's results to the tests it saw.
+    fn tainted(&self) -> bool {
+        self.main_workflows.is_some() && self.main_workflows_through != self.main_through
+    }
+
+    /// Whether `test_main` should be rebuilt for a window starting at
+    /// `from` under the rule `configured`.
+    fn stale(&self, from: DateTime<Utc>, configured: &Option<String>) -> bool {
+        self.main_through != Some(from)
+            || self.main_workflows != *configured
+            || self.tainted()
+            || self.rule().is_none()
+    }
+
+    /// The reference workflows `test_main` was built with, or `None` when
+    /// what is stored is not a list of names.
+    fn rule(&self) -> Option<Vec<String>> {
+        match &self.main_workflows {
+            None => Some(Vec::new()),
+            Some(rule) => serde_json::from_str(rule).ok(),
+        }
+    }
+
+    /// What a pass over a window starting at `from` does with `test_main`;
+    /// `swap` says whether it may swap a finished rebuild in.
+    fn plan(&self, from: DateTime<Utc>, configured: &Option<String>, swap: bool) -> Plan {
+        if !self.stale(from, configured) {
+            return Plan::Carry {
+                rule: self.rule().expect("stale when not a list"),
+                rebuild: false,
+            };
+        }
+        if swap && self.rebuild_through == Some(from) && self.rebuild_workflows == *configured {
+            return Plan::Swap;
+        }
+        // Under the rule it was built with, which may not be the configured
+        // one: `test_main` stays valid for that rule until the swap.
+        if self.main_through == Some(from) {
+            if let Some(rule) = self.rule() {
+                return Plan::Carry {
+                    rule,
+                    rebuild: true,
+                };
+            }
+        }
+        Plan::Wait
+    }
+}
+
+/// What a pass does with `test_main`.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// No pass has run: the window starts before the oldest run, so
+    /// `test_main` starts empty under the configured rule.
+    Empty,
+    /// `test_main` ends where the window starts: carry it under `rule`, the
+    /// reference workflows it was built with. `rebuild` says it is due to be
+    /// replaced.
+    Carry { rule: Vec<String>, rebuild: bool },
+    /// The rebuild ends where the window starts: swap it in and judge every
+    /// test in it again.
+    Swap,
+    /// Nothing ends where the window starts: classify nothing until the
+    /// rebuild does.
+    Wait,
+}
+
+/// What one transaction did.
+enum Pass {
+    /// It classified a window: what it did, whether it reached `now`, and
+    /// whether `test_main` is due a rebuild.
+    Classified {
+        report: Report,
+        done: bool,
+        rebuild: bool,
+    },
+    /// It found nothing to carry the window and classified nothing.
+    Waiting,
+}
+
+/// One transaction: classify the next chunk of runs, or `None` when the
+/// lock is held. `swap` says whether it may swap a finished rebuild in;
+/// `swapping` is set when it tries to, so a failure can be told apart.
+async fn pass(
+    app: &App,
+    now: DateTime<Utc>,
+    swap: bool,
+    swapping: &mut bool,
+) -> Result<Option<Pass>> {
     let mut client = app.pool.get().await?;
     // Read without the lock; another replica that moves the watermark first
     // only makes this pass redo work, which is harmless.
@@ -382,17 +635,13 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
     };
     let to = now.min(watermark + CHUNK);
     let done = to >= now;
-    let window = Window {
-        from: watermark - OVERLAP,
+    let mut window = Window::new(
+        app,
+        watermark - OVERLAP,
         to,
-        history_from: now.date_naive() - chrono::Days::new(u64::from(app.config.retention_days)),
-        on_default: app.config.default_branch.clone(),
-        reference_workflows: app.config.reference_workflows.clone(),
-        broken_runs: app.config.broken_runs,
-        main_broken_runs: app.config.main_broken_runs,
-        quarantine: app.config.quarantine,
-        webhooks: app.config.webhooks.clone(),
-    };
+        now,
+        app.config.reference_workflows.clone(),
+    );
 
     // Event partitions for the days being classified. Another replica may
     // race to create one; that is fine.
@@ -415,57 +664,405 @@ async fn pass(app: &App, now: DateTime<Utc>) -> Result<Option<(Report, bool)>> {
     // earlier time: a broken test could turn healthy and be announced as
     // breaking again. That replica covered this window: skip it, and go on
     // from its watermark if `now` is later still.
-    let state = transaction
-        .query_opt(
-            "SELECT watermark, main_through, main_workflows, main_workflows_through \
-             FROM test_results.classifier_state",
-            &[],
-        )
-        .await?;
-    let committed: Option<DateTime<Utc>> = state.as_ref().map(|row| row.get(0));
-    // `test_main` built under another main-sequence rule is valid nowhere:
-    // rebuild it. That is so when the reference workflows changed since it
-    // was built, and, while reference workflows are set, when a release
-    // that knows nothing of them (a replica not yet replaced in a rolling
-    // deploy) moved `main_through` without `main_workflows_through`: it
-    // added every workflow's results.
-    let main_workflows = window.main_workflows();
-    let rule_changed = state.as_ref().is_some_and(|row| {
-        row.get::<_, Option<String>>(2) != main_workflows
-            || (main_workflows.is_some()
-                && row.get::<_, Option<DateTime<Utc>>>(3) != row.get::<_, Option<DateTime<Utc>>>(1))
-    });
-    let main_through: Option<DateTime<Utc>> = match &state {
-        Some(row) if !rule_changed => row.get(1),
-        _ => None,
-    };
+    let carried = transaction
+        .query_opt(CARRIED, &[])
+        .await?
+        .map(|row| Carried::read(&row));
+    let committed = carried.as_ref().map(|carried| carried.watermark);
     if let Some(committed) = committed.filter(|committed| *committed > window.to) {
         transaction.rollback().await?;
-        return Ok(Some((Report::default(), committed >= now)));
+        return Ok(Some(Pass::Classified {
+            report: Report::default(),
+            done: committed >= now,
+            rebuild: false,
+        }));
     }
     // Another replica moved the watermark between the read above and the
     // lock: this window no longer starts where `test_main` ends. Read again.
     if committed.is_some_and(|committed| committed != watermark) {
         transaction.rollback().await?;
-        return Ok(Some((Report::default(), false)));
+        return Ok(Some(Pass::Classified {
+            report: Report::default(),
+            done: false,
+            rebuild: false,
+        }));
     }
-    let report = classify(&transaction, &window, main_through, rule_changed).await?;
+    let configured = window.main_workflows();
+    let plan = match &carried {
+        Some(carried) => carried.plan(window.from, &configured, swap),
+        None => Plan::Empty,
+    };
+    let mut swapped = None;
+    let (rule_changed, rebuild) = match &plan {
+        Plan::Empty => {
+            transaction
+                .batch_execute("DELETE FROM test_results.test_main")
+                .await?;
+            (false, false)
+        }
+        Plan::Carry { rule, rebuild } => {
+            window.reference_workflows = rule.clone();
+            (false, *rebuild)
+        }
+        // After the rule changed, a healthy test with no new run may now be
+        // broken or broken on main (its old main sequence passed, its new
+        // one fails): every test in the rebuilt `test_main` is judged again.
+        Plan::Swap => {
+            *swapping = true;
+            transaction
+                .batch_execute("DELETE FROM test_results.test_main")
+                .await?;
+            let tests = transaction
+                .execute(
+                    &format!(
+                        "INSERT INTO test_results.test_main ({MAIN_COLUMNS}) \
+                         SELECT {MAIN_COLUMNS} FROM test_results.test_main_rebuild"
+                    ),
+                    &[],
+                )
+                .await?;
+            transaction
+                .batch_execute("DELETE FROM test_results.test_main_rebuild")
+                .await?;
+            swapped = Some((tests, std::time::Instant::now()));
+            (true, false)
+        }
+        Plan::Wait => {
+            transaction.rollback().await?;
+            return Ok(Some(Pass::Waiting));
+        }
+    };
+    let report = classify(&transaction, &window, rule_changed).await?;
+    // A taint stays until a rebuild replaces it: `main_workflows_through`
+    // is moved with `main_through` only when `test_main` is clean.
+    let tainted =
+        matches!(plan, Plan::Carry { .. }) && carried.as_ref().is_some_and(Carried::tainted);
+    let main_workflows_through = if tainted {
+        carried.as_ref().and_then(|c| c.main_workflows_through)
+    } else {
+        Some(window.through())
+    };
+    // A rebuild is dropped only once swapped in. One this pass does not need
+    // (the rule was changed back, or it is another replica's) is left: it is
+    // still right for its rule up to where it got, and a replica that wants
+    // that rule goes on from there.
     transaction
         .execute(
             "INSERT INTO test_results.classifier_state \
                  (id, watermark, main_through, main_workflows, main_workflows_through) \
-             VALUES (1, $1, $2, $3, $2) \
+             VALUES (1, $1, $2, $3, $4) \
              ON CONFLICT (id) DO UPDATE SET \
                  watermark = GREATEST(test_results.classifier_state.watermark, EXCLUDED.watermark), \
                  main_through = EXCLUDED.main_through, \
                  main_workflows = EXCLUDED.main_workflows, \
                  main_workflows_through = EXCLUDED.main_workflows_through, \
+                 rebuild_workflows = CASE WHEN NOT $5 \
+                     THEN test_results.classifier_state.rebuild_workflows END, \
+                 rebuild_through = CASE WHEN NOT $5 \
+                     THEN test_results.classifier_state.rebuild_through END, \
                  updated_at = now()",
-            &[&window.to, &window.through(), &main_workflows],
+            &[
+                &window.to,
+                &window.through(),
+                &window.main_workflows(),
+                &main_workflows_through,
+                &(plan == Plan::Swap),
+            ],
         )
         .await?;
     transaction.commit().await?;
-    Ok(Some((report, done)))
+    if let Some((tests, started)) = swapped {
+        crate::log::info(
+            "test_main rebuild swapped in",
+            json!({
+                "tests": tests,
+                "tests_updated": report.tests_updated,
+                "seconds": started.elapsed().as_secs_f64(),
+                "rule": window.main_workflows(),
+            }),
+        );
+    }
+    Ok(Some(Pass::Classified {
+        report,
+        done,
+        rebuild,
+    }))
+}
+
+/// What a rebuild step found.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Nothing to do now: no rebuild is due, or another replica holds the
+    /// lock.
+    Idle,
+    /// It built up to `through`, short of `target`, where the next window
+    /// starts.
+    Advanced {
+        through: DateTime<Utc>,
+        target: DateTime<Utc>,
+    },
+    /// The rebuild ends where the next window starts.
+    Ready,
+}
+
+/// Rebuild steps for up to the configured budget
+/// (`ASTER_SRV_REBUILD_BUDGET_SECONDS`).
+///
+/// Steps start at the span the last one that worked read
+/// (`classifier_state.rebuild_span_seconds`, shared by replicas and kept
+/// across restarts). A step that fails is retried at half its span, however
+/// long it took, down to [`REBUILD_MIN_SPAN`]; the shorter span is stored at
+/// once, so the next tick does not start with a step that fails. A tick whose
+/// steps all worked lengthens the span by a quarter, up to [`REBUILD_SPAN`].
+async fn rebuild_main(app: &App, now: DateTime<Utc>) -> Result<Step> {
+    let started = std::time::Instant::now();
+    let mut span = rebuild_span(app).await?;
+    let mut failed = false;
+    let mut steps = 0;
+    loop {
+        match rebuild_step(app, now, span).await {
+            Ok(Step::Advanced { through, target }) => {
+                steps += 1;
+                if started.elapsed() >= app.config.rebuild_budget {
+                    if !failed {
+                        store_rebuild_span(app, (span * 5 / 4).min(REBUILD_SPAN)).await?;
+                    }
+                    crate::log::info(
+                        "test_main rebuild continues next pass",
+                        json!({
+                            "steps": steps,
+                            "through": through.to_rfc3339(),
+                            "target": target.to_rfc3339(),
+                            "seconds": started.elapsed().as_secs(),
+                        }),
+                    );
+                    return Ok(Step::Advanced { through, target });
+                }
+            }
+            Ok(Step::Ready) => {
+                if !failed {
+                    store_rebuild_span(app, (span * 5 / 4).min(REBUILD_SPAN)).await?;
+                }
+                crate::log::info(
+                    "test_main rebuild caught up",
+                    json!({"steps": steps + 1, "seconds": started.elapsed().as_secs()}),
+                );
+                return Ok(Step::Ready);
+            }
+            Ok(Step::Idle) => return Ok(Step::Idle),
+            Err(error) if span > REBUILD_MIN_SPAN => {
+                failed = true;
+                span = (span / 2).max(REBUILD_MIN_SPAN);
+                store_rebuild_span(app, span).await?;
+                crate::log::warn(
+                    "test_main rebuild step failed; trying a shorter span",
+                    json!({"error": format!("{error:#}"), "minutes": span.num_minutes()}),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The span the next rebuild step reads: the stored one, within
+/// [`REBUILD_MIN_SPAN`] and [`REBUILD_SPAN`].
+async fn rebuild_span(app: &App) -> Result<chrono::Duration> {
+    let stored: Option<i32> = app
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT rebuild_span_seconds FROM test_results.classifier_state",
+            &[],
+        )
+        .await?
+        .and_then(|row| row.get(0));
+    Ok(stored.map_or(REBUILD_SPAN, |seconds| {
+        chrono::Duration::seconds(i64::from(seconds)).clamp(REBUILD_MIN_SPAN, REBUILD_SPAN)
+    }))
+}
+
+/// Keep `span` for the next rebuild step. Outside the classifier's lock: it
+/// is a hint, and two replicas storing one each leave a span that worked.
+async fn store_rebuild_span(app: &App, span: chrono::Duration) -> Result<()> {
+    let seconds = i32::try_from(span.num_seconds()).expect("a span of hours");
+    app.pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE test_results.classifier_state SET rebuild_span_seconds = $1",
+            &[&seconds],
+        )
+        .await?;
+    Ok(())
+}
+
+/// One transaction: add up to `span` of results to `test_main_rebuild`.
+async fn rebuild_step(app: &App, now: DateTime<Utc>, span: chrono::Duration) -> Result<Step> {
+    let mut client = app.pool.get().await?;
+    let transaction = client.transaction().await?;
+    let locked: bool = transaction
+        .query_one("SELECT pg_try_advisory_xact_lock($1)", &[&CLASSIFIER_LOCK])
+        .await?
+        .get(0);
+    if !locked {
+        return Ok(Step::Idle);
+    }
+    let Some(carried) = transaction
+        .query_opt(CARRIED, &[])
+        .await?
+        .map(|row| Carried::read(&row))
+    else {
+        return Ok(Step::Idle);
+    };
+    let configured = app.config.reference_workflows.clone();
+    let rule = rule(&configured);
+    // The next pass's window starts here.
+    let target = carried.watermark - OVERLAP;
+    if !carried.stale(target, &rule) {
+        return Ok(Step::Idle);
+    }
+    let from = match carried.rebuild_through {
+        Some(through) if carried.rebuild_workflows == rule && through <= target => through,
+        // Start over: from the first day kept, or nothing when the next
+        // window starts before it.
+        _ => {
+            crate::log::info(
+                "test_main rebuild starts",
+                json!({
+                    "rule": rule,
+                    "replaces_rule": carried.rebuild_through.map(|_| &carried.rebuild_workflows),
+                    "target": target.to_rfc3339(),
+                }),
+            );
+            transaction
+                .batch_execute("DELETE FROM test_results.test_main_rebuild")
+                .await?;
+            let history =
+                now.date_naive() - chrono::Days::new(u64::from(app.config.retention_days));
+            let first = history.and_hms_opt(0, 0, 0).expect("midnight").and_utc()
+                - chrono::Duration::microseconds(1);
+            first.min(target)
+        }
+    };
+    // A span with no runs is skipped: the step starts at the next run.
+    let next: Option<DateTime<Utc>> = transaction
+        .query_one(
+            "SELECT min(received_at) FROM test_results.runs \
+             WHERE received_at > $1 AND received_at <= $2",
+            &[&from, &target],
+        )
+        .await?
+        .get(0);
+    let to = match next {
+        Some(next) => {
+            let from = from.max(next - chrono::Duration::microseconds(1));
+            let to = (from + span).min(target);
+            rebuild_chunk(&transaction, &Window::new(app, from, to, now, configured)).await?;
+            to
+        }
+        None => target,
+    };
+    transaction
+        .execute(
+            "UPDATE test_results.classifier_state \
+             SET rebuild_workflows = $1, rebuild_through = $2",
+            &[&rule, &to],
+        )
+        .await?;
+    transaction.commit().await?;
+    Ok(if to >= target {
+        Step::Ready
+    } else {
+        Step::Advanced {
+            through: to,
+            target,
+        }
+    })
+}
+
+/// Carry `test_main_rebuild` over the main-sequence results received in
+/// `window`: each test's last one and its streak, the way a pass carries
+/// `test_main`.
+async fn rebuild_chunk(
+    transaction: &tokio_postgres::Transaction<'_>,
+    window: &Window,
+) -> Result<()> {
+    // The window's main runs, then each run's results and target runs by
+    // `run_id`: a step reads only main-sequence rows, not whole days of
+    // every run (a span shorter than a day would read each day again). The
+    // `OFFSET 0` keeps each lookup per run; a plain join was planned as a
+    // scan of the day, or as one index scan of the run per target. Tables,
+    // not CTEs, so the planner knows how many rows each holds.
+    let days = format!(
+        "BETWEEN {} AND {}",
+        day(window.from.date_naive()),
+        day(window.to.date_naive())
+    );
+    transaction
+        .batch_execute(&format!(
+            "CREATE TEMP TABLE cls_rebuild_runs ON COMMIT DROP AS \
+             SELECT r.run_id, r.received_at, r.sha FROM test_results.runs r \
+             WHERE r.received_at > {from} AND r.received_at <= {to} AND {main}; \
+             ANALYZE cls_rebuild_runs; \
+             CREATE TEMP TABLE cls_rebuild_results ON COMMIT DROP AS \
+             SELECT tr.* FROM cls_rebuild_runs r CROSS JOIN LATERAL ( \
+                 SELECT tr.repo, tr.test_id, tr.run_id, tr.target, tr.received_on, \
+                        tr.attempt, tr.outcome, tr.failure_hash \
+                 FROM test_results.test_results tr \
+                 WHERE tr.run_id = r.run_id AND tr.received_on {days} \
+                   AND tr.outcome <> 'skip' OFFSET 0) tr; \
+             ANALYZE cls_rebuild_results; \
+             CREATE TEMP TABLE cls_rebuild_targets ON COMMIT DROP AS \
+             SELECT t.* FROM cls_rebuild_runs r CROSS JOIN LATERAL ( \
+                 SELECT t.run_id, t.address, t.received_on \
+                 FROM test_results.target_runs t \
+                 WHERE t.run_id = r.run_id AND t.received_on {days} \
+                   AND NOT t.cached AND t.confidence IS DISTINCT FROM 'partial' OFFSET 0) t; \
+             ANALYZE cls_rebuild_targets; \
+             CREATE TEMP TABLE cls_rebuild ON COMMIT DROP AS \
+             SELECT DISTINCT ON (tr.run_id, tr.test_id) \
+                    tr.repo, tr.test_id, tr.run_id, r.received_at, tr.received_on, r.sha, \
+                    tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash, \
+                    false AS is_seed, 0 AS seed_streak, NULL::text AS seed_since \
+             FROM cls_rebuild_results tr \
+             JOIN cls_rebuild_runs r ON r.run_id = tr.run_id \
+             JOIN cls_rebuild_targets t \
+                  ON t.run_id = tr.run_id AND t.address = tr.target \
+                 AND t.received_on = tr.received_on \
+             ORDER BY tr.run_id, tr.test_id, tr.attempt DESC;",
+            from = at(window.from),
+            to = at(window.to),
+            main = window.in_main_sequence("r"),
+        ))
+        .await?;
+    transaction.batch_execute("ANALYZE cls_rebuild").await?;
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO test_results.test_main_rebuild ({MAIN_COLUMNS}) \
+                 SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
+                        failure_hash, streak, since \
+                 FROM {} s WHERE is_last AND NOT is_seed \
+                 ON CONFLICT (repo, test_id) DO UPDATE SET {MAIN_UPDATE}",
+                // A seed older than the retention period no longer counts,
+                // as in a pass.
+                streaks(&format!(
+                    "SELECT m.repo, m.test_id, m.run_id, m.received_at, m.received_on, m.sha, \
+                            m.is_fail, m.failure_hash, true AS is_seed, \
+                            m.streak AS seed_streak, m.streak_since_sha AS seed_since \
+                     FROM test_results.test_main_rebuild m \
+                     WHERE m.received_on >= {history} \
+                       AND (m.repo, m.test_id) IN (SELECT repo, test_id FROM cls_rebuild) \
+                     UNION ALL \
+                     SELECT * FROM cls_rebuild",
+                    history = day(window.history_from),
+                ))
+            ),
+            &[],
+        )
+        .await?;
+    Ok(())
 }
 
 const EVENT_COLUMNS: &str = "observed_on, repo, test_id, kind, reason, run_id, prev_run_id, \
@@ -475,7 +1072,6 @@ const EVENT_KEY: &str = "(repo, test_id, kind, run_id, observed_on)";
 async fn classify(
     transaction: &tokio_postgres::Transaction<'_>,
     window: &Window,
-    main_through: Option<DateTime<Utc>>,
     rule_changed: bool,
 ) -> Result<Report> {
     let from_day = window.from.date_naive();
@@ -582,16 +1178,9 @@ async fn classify(
         )
         .await?;
 
-    // `test_main` holds each test's main sequence up to `window.from`. A
-    // window that starts elsewhere (the first pass, or one after another
-    // replica's) rebuilds it from the results.
-    if main_through != Some(window.from) {
-        rebuild_main(transaction, window).await?;
-    }
-    // After the main-sequence rule changed, a healthy test with no new run
-    // may now be broken or broken on main (its old main sequence passed, its
-    // new one fails): every test in the rebuilt `test_main` is re-derived,
-    // not only those already unhealthy or in the window.
+    // `test_main` holds each test's main sequence up to `window.from` (see
+    // `pass`). After it was rebuilt, every test in it is re-derived, not only
+    // those already unhealthy or in the window.
     let rejudged = if rule_changed {
         "UNION SELECT repo, test_id FROM test_results.test_main"
     } else {
@@ -1004,50 +1593,6 @@ fn streaks(rows: &str) -> String {
     )
 }
 
-/// Refill `test_main` from the results: each test's last main-sequence
-/// result up to `window.from` and its streak, within the retention period.
-async fn rebuild_main(
-    transaction: &tokio_postgres::Transaction<'_>,
-    window: &Window,
-) -> Result<()> {
-    transaction
-        .batch_execute("DELETE FROM test_results.test_main")
-        .await?;
-    let finals = format!(
-        "SELECT DISTINCT ON (tr.run_id, tr.test_id) \
-                tr.repo, tr.test_id, tr.run_id, r.received_at, tr.received_on, r.sha, \
-                tr.outcome IN ('fail', 'error') AS is_fail, tr.failure_hash, \
-                false AS is_seed, 0 AS seed_streak, NULL::text AS seed_since \
-         FROM test_results.test_results tr \
-         JOIN test_results.runs r ON r.run_id = tr.run_id \
-         JOIN test_results.target_runs t \
-              ON t.run_id = tr.run_id AND t.address = tr.target \
-             AND t.received_on = tr.received_on \
-         WHERE tr.received_on BETWEEN {history} AND {through_day} \
-           AND r.received_at <= {through} AND {main} \
-           AND tr.outcome <> 'skip' AND NOT t.cached \
-           AND t.confidence IS DISTINCT FROM 'partial' \
-         ORDER BY tr.run_id, tr.test_id, tr.attempt DESC",
-        history = day(window.history_from),
-        through_day = day(window.from.date_naive()),
-        through = at(window.from),
-        main = window.in_main_sequence("r"),
-    );
-    transaction
-        .execute(
-            &format!(
-                "INSERT INTO test_results.test_main ({MAIN_COLUMNS}) \
-                 SELECT repo, test_id, run_id, received_at, received_on, sha, is_fail, \
-                        failure_hash, streak, since \
-                 FROM {} s WHERE is_last",
-                streaks(&finals)
-            ),
-            &[],
-        )
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1638,105 @@ mod tests {
         assert_eq!(
             some.main_workflows().as_deref(),
             Some(r#"["Nightly","Stable CI's"]"#)
+        );
+    }
+
+    #[test]
+    fn a_pass_carries_test_main_under_its_own_rule_until_a_rebuild_reaches_the_window() {
+        let from: DateTime<Utc> = "2026-11-24T10:00:00Z".parse().unwrap();
+        let earlier = from - chrono::Duration::hours(1);
+        let stable = Some(r#"["Stable CI"]"#.to_string());
+        let current = Carried {
+            watermark: from + OVERLAP,
+            main_through: Some(from),
+            main_workflows: None,
+            main_workflows_through: Some(from),
+            ..Carried::default()
+        };
+        // Same rule, ending at the window: carried, nothing to rebuild.
+        assert_eq!(
+            current.plan(from, &None, true),
+            Plan::Carry {
+                rule: vec![],
+                rebuild: false
+            }
+        );
+        // The configured rule changed: carried under the rule it was built
+        // with until a rebuild for the new one reaches the window.
+        assert_eq!(
+            current.plan(from, &stable, true),
+            Plan::Carry {
+                rule: vec![],
+                rebuild: true
+            }
+        );
+        let behind = Carried {
+            rebuild_workflows: stable.clone(),
+            rebuild_through: Some(earlier),
+            ..current.clone()
+        };
+        assert!(matches!(
+            behind.plan(from, &stable, true),
+            Plan::Carry { rebuild: true, .. }
+        ));
+        let caught_up = Carried {
+            rebuild_through: Some(from),
+            ..behind.clone()
+        };
+        assert_eq!(caught_up.plan(from, &stable, true), Plan::Swap);
+        // After a swap failed, the old `test_main` carries the pass.
+        assert!(matches!(
+            caught_up.plan(from, &stable, false),
+            Plan::Carry { rebuild: true, .. }
+        ));
+        // A rebuild for another rule is not swapped in.
+        assert!(matches!(
+            caught_up.plan(from, &Some(r#"["Nightly"]"#.into()), true),
+            Plan::Carry { rebuild: true, .. }
+        ));
+
+        // An older release moved `main_through` while a rule was set: carried
+        // under that rule, and due a rebuild even though the rule is the same.
+        let tainted = Carried {
+            main_workflows: stable.clone(),
+            main_workflows_through: Some(earlier),
+            ..current.clone()
+        };
+        assert!(tainted.tainted());
+        assert_eq!(
+            tainted.plan(from, &stable, true),
+            Plan::Carry {
+                rule: vec!["Stable CI".into()],
+                rebuild: true
+            }
+        );
+
+        // `test_main` ends somewhere else, or was never kept: nothing can
+        // carry the window until the rebuild reaches it.
+        for main_through in [None, Some(earlier)] {
+            let lost = Carried {
+                main_through,
+                ..current.clone()
+            };
+            assert_eq!(lost.plan(from, &None, true), Plan::Wait);
+            let rebuilt = Carried {
+                rebuild_workflows: None,
+                rebuild_through: Some(from),
+                ..lost
+            };
+            assert_eq!(rebuilt.plan(from, &None, true), Plan::Swap);
+            assert_eq!(rebuilt.plan(from, &None, false), Plan::Wait);
+        }
+        // A stored rule that is not a list of names is rebuilt, not trusted.
+        let garbled = Carried {
+            main_workflows: Some("Stable CI".into()),
+            main_workflows_through: Some(from),
+            ..current
+        };
+        assert!(garbled.stale(from, &Some("Stable CI".into())));
+        assert_eq!(
+            garbled.plan(from, &Some("Stable CI".into()), true),
+            Plan::Wait
         );
     }
 
