@@ -37,11 +37,14 @@ const MIX_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// `mix.exs` settings that change which files `mix test` runs.
+///
+/// `test_ignore_filters` is not one of them: it only names files under the
+/// test paths that match no load filter and should not be warned about. Mix
+/// loads the files that pass `test_load_filters` whether or not it is set.
 const SELECTION_SETTINGS: &[&str] = &[
     "test_paths",
     "test_pattern",
     "test_load_filters",
-    "test_ignore_filters",
     "apps_path",
 ];
 
@@ -308,6 +311,21 @@ mod tests {
         assert_eq!(
             listed.render(&["test/a/z_test.exs".into()]),
             "MIX_TEST_PARTITION=1 mix test --only slow test/a/z_test.exs"
+        );
+    }
+
+    #[test]
+    fn ignore_filters_do_not_change_the_listed_files() {
+        // The project keeps a non-ExUnit script under test/ and silences
+        // Mix's "matches no test pattern" warning for it.
+        let dir = project(
+            &["test/a_test.exs", "test/b_test.exs", "test/laws/model.exs"],
+            "[app: :demo, test_ignore_filters: [~r{(^|/)test/laws/}]]",
+        );
+        let found = parse(dir.path(), "MIX_TEST_PARTITION=1 mix test --partitions 2").unwrap();
+        assert_eq!(
+            found.files().unwrap(),
+            ["test/a_test.exs", "test/b_test.exs"]
         );
     }
 
