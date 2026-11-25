@@ -1,4 +1,4 @@
-.PHONY: all build build-release install test test-all clean release-check setup
+.PHONY: all build build-release install test test-all clean release-check setup notices
 
 # Default target
 all: build
@@ -22,6 +22,10 @@ release-check:
 	RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
 	cargo test --locked --workspace --all-targets --all-features
 	cargo audit
+
+# Regenerate THIRD_PARTY_NOTICES.md (needs: cargo install --locked cargo-about --features cli)
+notices:
+	cargo about generate --workspace --locked --fail about.hbs -o THIRD_PARTY_NOTICES.md
 
 # Run all tests
 test:

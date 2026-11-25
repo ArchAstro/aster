@@ -41,6 +41,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-targets --all-features
+      - uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: cargo-about@0.9.3
+      - name: Third-party notices match Cargo.lock
+        run: |
+          cargo about generate --workspace --locked --fail about.hbs -o THIRD_PARTY_NOTICES.md
+          git diff --exit-code -- THIRD_PARTY_NOTICES.md
       # cargo-audit's own dependencies may require a newer compiler than Aster's
       # MSRV. Keep Aster validation on 1.88, then install and run the audit tool
       # with the current stable toolchain.
@@ -93,8 +100,8 @@ jobs:
         shell: bash
         run: |
           mkdir dist stage
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" LICENSE stage/
-          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C stage "${{ matrix.binary }}" LICENSE
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md stage/
+          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C stage "${{ matrix.binary }}" LICENSE THIRD_PARTY_NOTICES.md
       - name: Install nFPM
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |

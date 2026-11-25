@@ -1,0 +1,59 @@
+# Configuration for cargo-about, which generates THIRD_PARTY_NOTICES.md.
+# Regenerate with:
+#   cargo about generate --workspace --locked --fail about.hbs -o THIRD_PARTY_NOTICES.md
+
+# Licenses we accept, in order of preference when a crate offers a choice.
+# Only licenses that appear in the shipped dependency graph are listed; a new
+# license makes generation fail until it is reviewed and added here.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-2.0-only WITH GCC-exception-2.0",
+]
+
+# The release build targets in .github/workflows/release.yml.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Only code that is compiled into the shipped binaries.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# Skip unpublished workspace crates (aster-results-model, aster-srv); the
+# template also skips the aster crate itself, which is covered by LICENSE.
+private = { ignore = true }
+
+workarounds = ["ring"]
+
+# libgit2-sys statically links a vendored copy of libgit2. The crate's own
+# manifest only covers the Rust bindings; libgit2/COPYING carries libgit2's
+# license (GPLv2 with the linking exception) and the licenses of the C code
+# it bundles.
+[libgit2-sys.clarify]
+license = "(MIT OR Apache-2.0) AND GPL-2.0-only WITH GCC-exception-2.0"
+
+[[libgit2-sys.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+
+[[libgit2-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[libgit2-sys.clarify.files]]
+path = "libgit2/COPYING"
+license = "GPL-2.0-only WITH GCC-exception-2.0"
+checksum = "e0938121c0554985fe17196ac38fc590d149268e9c46e0c0e7a2eae1354fae71"

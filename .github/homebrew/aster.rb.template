@@ -29,6 +29,7 @@ class Aster < Formula
 
   def install
     bin.install "aster"
+    prefix.install "THIRD_PARTY_NOTICES.md"
   end
 
   test do

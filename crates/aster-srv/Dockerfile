@@ -7,5 +7,6 @@ RUN cargo build --locked --release -p aster-srv
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/aster-srv /usr/local/bin/aster-srv
+COPY --from=build /src/LICENSE /src/THIRD_PARTY_NOTICES.md /usr/share/doc/aster-srv/
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/aster-srv"]

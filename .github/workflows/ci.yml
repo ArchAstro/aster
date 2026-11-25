@@ -210,6 +210,23 @@ jobs:
       - name: The server follows the model
         run: cargo test --locked
 
+  third-party-notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: cargo-about@0.9.3
+      - name: THIRD_PARTY_NOTICES.md matches Cargo.lock
+        run: |
+          cargo about generate --workspace --locked --fail about.hbs -o THIRD_PARTY_NOTICES.md
+          if ! git diff --exit-code -- THIRD_PARTY_NOTICES.md; then
+            echo "THIRD_PARTY_NOTICES.md is stale; run 'make notices' and commit the result" >&2
+            exit 1
+          fi
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
@@ -297,7 +314,7 @@ jobs:
           repo_root="${PWD}"
           tar -czf dist/aster-linux-x64.tar.gz \
             -C target/release aster \
-            -C "${repo_root}" LICENSE
+            -C "${repo_root}" LICENSE THIRD_PARTY_NOTICES.md
           archive_sha256="$(sha256sum dist/aster-linux-x64.tar.gz | cut -d' ' -f1)"
           scripts/render-aur-package "${version}" "${archive_sha256}" aur-package aster-linux-x64.tar.gz
           cp dist/aster-linux-x64.tar.gz "aur-package/aster-${version}.tar.gz"

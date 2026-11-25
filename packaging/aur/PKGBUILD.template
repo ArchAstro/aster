@@ -16,4 +16,5 @@ sha256sums=('__SHA256__')
 package() {
   install -Dm755 "${srcdir}/aster" "${pkgdir}/usr/bin/aster"
   install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/aster/LICENSE"
+  install -Dm644 "${srcdir}/THIRD_PARTY_NOTICES.md" "${pkgdir}/usr/share/licenses/aster/THIRD_PARTY_NOTICES.md"
 }
