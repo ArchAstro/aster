@@ -1432,7 +1432,11 @@ async fn passes_go_on_under_the_old_rule_while_the_rebuild_cannot_finish() {
         )
         .await
         .unwrap();
-    assert_eq!(state.get::<_, DateTime<Utc>>(0), now);
+    // Postgres keeps microseconds; the clock may carry nanoseconds.
+    assert_eq!(
+        state.get::<_, DateTime<Utc>>(0).timestamp_micros(),
+        now.timestamp_micros()
+    );
     assert_eq!(state.get::<_, Option<String>>(1), None);
     assert_eq!(state.get::<_, Option<DateTime<Utc>>>(2), None);
 

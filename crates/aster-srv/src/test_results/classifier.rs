@@ -118,7 +118,7 @@
 //! sort: in v0.37.0 it was one statement in the pass, and 30 days of
 //! main-sequence results did not fit in production's 5 GB of temporary
 //! files, so every pass failed and rolled back. It is built beside `test_main`, in
-//! `test_main_rebuild`, by steps of [`REBUILD_SPAN`] of results: each step
+//! `test_main_rebuild`, by steps of `REBUILD_SPAN` of results: each step
 //! is its own transaction under the classifier's lock, carries the rows
 //! built so far forward the way a pass carries `test_main`, and records how
 //! far it got (`classifier_state.rebuild_through`, under the rule it builds
@@ -129,7 +129,7 @@
 //! without a new run. A swap that fails rolls back; the tick's next pass
 //! carries the old `test_main` instead, and the next tick swaps again. A
 //! step that fails is retried at half the span, down to
-//! [`REBUILD_MIN_SPAN`]; the span that worked is kept
+//! `REBUILD_MIN_SPAN`; the span that worked is kept
 //! (`rebuild_span_seconds`) and lengthens again by a quarter each tick
 //! whose steps all worked. A step reads only its
 //! span's main-sequence runs and their results, so its sorts are bounded
