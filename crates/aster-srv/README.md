@@ -85,9 +85,10 @@ A test that only runs in other workflows has no main sequence: it is never
 fails. Definite events (retries, same input hash) still score it.
 
 Changing the setting rebuilds each test's carried main-sequence state
-(`test_results.test_main`) at the next classifier pass, and every test in it is
-judged again, so a test listed only because of another workflow's failures
-leaves in that pass without a new run.
+(`test_results.test_main`) from the retained results, and every test in it is
+judged again when the rebuild is swapped in, so a test listed only because of
+another workflow's failures leaves in that pass without a new run. See
+[Rebuilding the main sequence](#rebuilding-the-main-sequence).
 
 **Broken**: the test's last `ASTER_SRV_BROKEN_RUNS` (at least 3, default 3)
 main-sequence runs all failed with the same non-null `failure_hash`.
@@ -116,6 +117,54 @@ branch matches it as `main` or `refs/heads/main`.
 `test_results.failure_clusters` is a view over the retained failures: per
 (repo, `failure_hash`) the `failures` and distinct `tests` counts, `first_seen`
 and `last_seen` days, and an example message and test.
+
+### Rebuilding the main sequence
+
+A pass carries `test_main` (each test's last main-sequence result and failure
+streak) from the pass before it. It is rebuilt from the results when the
+reference workflows differ from the ones it was built with, when a release
+that does not know them moved it while some were set (a rolling deploy), and
+when it does not end where the next window starts (an upgrade from a release
+that did not keep it).
+
+A rebuild reads 30 days of main-sequence results, too many to sort in one
+statement: in v0.37.0 it was one, and in production every pass failed on
+`temporary file size exceeds temp_file_limit` and rolled back. It is now built
+beside `test_main`, in `test_results.test_main_rebuild`, in steps of six hours
+of results. Each step is its own transaction under the classifier's lock,
+reads only the main-sequence runs of its span and their results by run, and
+records how far it got in `classifier_state.rebuild_through` (with the rule in
+`rebuild_workflows`). A step's temporary files are bounded by its span, not by
+the retention period. Steps run after each tick's passes, for at most
+`ASTER_SRV_REBUILD_BUDGET_SECONDS` (two minutes), and go on in the next tick.
+Thirty days is 120 steps; at a few seconds a step, a rebuild takes about half
+an hour to an hour.
+
+A step that fails (`test_main rebuild step failed; trying a shorter span`) is
+retried at once at half its span, down to five minutes. The span that worked
+is stored (`classifier_state.rebuild_span_seconds`), so the next tick, on any
+replica, starts there instead of with a step that fails again; each tick whose
+steps all worked lengthens it by a quarter, back up to six hours. A step that
+fails at five minutes ends the tick's rebuild (`test_main rebuild failed`).
+
+A rebuild that runs across a UTC midnight carries streaks from the day that
+just left the retention period, as passes do with `test_main`. A rebuild left
+unfinished because the setting was changed back is kept, and resumes from
+`rebuild_through` if that rule is configured again; a rebuild for another rule
+starts over.
+
+Passes do not wait for it. Until the rebuild reaches the next window's start,
+they go on with the `test_main` they have, under the rule it was built with
+(after a change of `ASTER_SRV_REFERENCE_WORKFLOWS`, the old reference
+workflows decide streaks for those passes). The pass the rebuild reaches swaps
+it in, stores the new rule and judges every test again
+(`test_main rebuild swapped in`). If that pass fails
+(`test_main rebuild swap failed; passes go on under the old rule`), it rolls
+back, the next pass of the tick carries the old `test_main` instead, and the
+next tick swaps again. Only a `test_main`
+that does not end where the window starts cannot carry a pass; those passes
+classify nothing until the rebuild reaches the window, and say so in the logs
+(`test_main rebuild continues next pass`).
 
 ## Quarantine
 
@@ -474,6 +523,7 @@ Pages are sent with a strict `Content-Security-Policy`, `nosniff`,
 | `ASTER_SRV_DEFAULT_BRANCH` | `main` | The branch whose runs decide broken and likely-flaky tests. |
 | `ASTER_SRV_BROKEN_RUNS` | `3` | Consecutive default-branch runs failing the same way that make a test broken; at least 3. |
 | `ASTER_SRV_MAIN_BROKEN_RUNS` | `2` | Consecutive default-branch runs failing the same way that put a test in the quarantine list's `main_broken`; at least 1. |
+| `ASTER_SRV_REBUILD_BUDGET_SECONDS` | `120` | How long each classifier tick spends rebuilding `test_main` (see [Rebuilding the main sequence](#rebuilding-the-main-sequence)) after its passes; a step that has started finishes. `0` runs one step a tick. |
 | `ASTER_SRV_REFERENCE_WORKFLOWS` | unset | Comma-separated workflow names (`GITHUB_WORKFLOW`, such as `Stable CI`). When set, only default-branch runs of these workflows count toward broken, broken on main and likely flakes. Names compare exactly. Unset counts every default-branch run. |
 | `ASTER_SRV_MAX_BODY_BYTES` | 64 MiB | Largest upload, before and after decompression. |
 | `ASTER_SRV_MAX_LARGE_BODIES` | `8` | Large request bodies (a cache commit's manifest, a test-results upload) one replica reads at once, 1 to 1024. Past it a request gets `503` with `Retry-After: 1`. |
@@ -629,6 +679,7 @@ Monitoring with a log-based metric on
 |---|---|---|
 | Uploads fail | `/readyz`; logs with `"severity":"ERROR"` | Uploads never fail CI, so results are only missing. Fix the database or the allowlist (`403`). |
 | Classification stalls | `SELECT watermark FROM test_results.classifier_state` should be minutes old; `classifier pass failed` in the logs | A pass is safe to rerun; restarting a pod starts one at once. |
+| A reference-workflow change has not taken effect | `SELECT main_workflows, main_through, rebuild_workflows, rebuild_through, rebuild_span_seconds FROM test_results.classifier_state`; `test_main rebuild` in the logs | `rebuild_through` moves toward `main_through` with each tick; when it gets there the next pass stores the new `main_workflows`. If `test_main rebuild failed` or `test_main rebuild swap failed` repeats, passes go on under the old rule: fix the cause in the error, or set the setting back to stop rebuilding. |
 | A real regression is being let through | `/ui/quarantine`, the test's page | In CI set `ASTER_QUARANTINE=off` for the job to fail it at once. On the server, delete its row: `DELETE FROM test_results.quarantine WHERE repo = '…' AND test_id = '…'` (it can re-enter on new flakes after now). Set `ASTER_SRV_QUARANTINE_RUNS=0` to stop new entries. |
 | Too many or too few tests quarantined | `SELECT action, count(*) FROM test_results.quarantine_log WHERE at > now() - interval '1 day' GROUP BY 1` | Tune `ASTER_SRV_QUARANTINE_RUNS` and `ASTER_SRV_QUARANTINE_RELEASE_PASSES`; they apply from the next pass. |
 | Many tests flaked at once | `SELECT run_id, target, failures, tests, failure_hash, shared FROM test_results.target_incidents ORDER BY received_at DESC LIMIT 20` | An incident is one shared cause in one target run: find it from the run's log and the shared failure hash. Its tests are not scored or quarantined. |
