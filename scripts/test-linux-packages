@@ -38,6 +38,7 @@ docker run --rm \
     apt-get update
     apt-get install --yes "/packages/aster_${ASTER_VERSION}_amd64.deb"
     test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    test -s /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
     dpkg --status aster
   '
 
@@ -52,6 +53,7 @@ docker run --rm \
     dnf --assumeyes --setopt=localpkg_gpgcheck=True \
       install "/packages/aster-${ASTER_VERSION}-1.x86_64.rpm"
     test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    test -s /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
     rpm --query --info aster
   '
 
@@ -62,5 +64,6 @@ docker run --rm \
   bash -euc '
     pacman --noconfirm --upgrade "/packages/aster-${ASTER_VERSION}-1-x86_64.pkg.tar.zst"
     test "$(aster --version)" = "aster ${ASTER_VERSION}"
+    test -s /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
     pacman --query --info aster
   '

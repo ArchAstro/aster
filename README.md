@@ -143,8 +143,9 @@ tar -xzf aster-linux-arm64.tar.gz aster
 sudo install -m 0755 aster /usr/local/bin/aster
 ```
 
-The archive also contains `LICENSE`. Extract only `aster`, as above, so a
-checkout's `LICENSE` is not overwritten. On macOS, keep the line for the
+The archive also contains `LICENSE` and `THIRD_PARTY_NOTICES.md` (licenses of
+the bundled dependencies). Extract only `aster`, as above, so a checkout's
+copies are not overwritten. On macOS, keep the line for the
 archive you downloaded and run `shasum -a 256 -c SHA256SUMS`, then install
 that `aster` binary the same way.
 
