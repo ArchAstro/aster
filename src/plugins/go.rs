@@ -690,6 +690,146 @@ fn join_workspace_relative(root: &str, child: &str) -> String {
     }
 }
 
+/// Module path from `module example.com/lib`, ignoring a leading comment.
+pub(crate) fn module_path(content: &str) -> Option<String> {
+    MODULE_REGEX
+        .captures(content)
+        .and_then(|caps| caps.get(1))
+        .map(|module| module.as_str().trim_matches('"').to_string())
+}
+
+/// `use` paths from a go.work file, in file order.
+///
+/// Accepts `use ./x` and both multiline and single-line `use ( ... )` blocks.
+/// `//` comments are ignored. go.work `replace` directives are not uses.
+pub(crate) fn parse_go_work_uses(content: &str) -> Vec<String> {
+    let tokens = go_file_tokens(content);
+    let mut uses = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] != "use" {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if tokens.get(index).is_some_and(|token| token == "(") {
+            index += 1;
+            while index < tokens.len() && tokens[index] != ")" {
+                uses.push(tokens[index].clone());
+                index += 1;
+            }
+            if index < tokens.len() && tokens[index] == ")" {
+                index += 1;
+            }
+            continue;
+        }
+        if index < tokens.len() {
+            uses.push(tokens[index].clone());
+            index += 1;
+        }
+    }
+    uses
+}
+
+/// Module paths from `require` directives, including block form.
+///
+/// Versions and `// indirect` comments are dropped. `exclude`, `replace`,
+/// and commented-out requires are not requirements.
+pub(crate) fn parse_go_mod_requires(content: &str) -> Vec<String> {
+    let tokens = go_file_tokens(content);
+    let mut requires = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] != "require" {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if tokens.get(index).is_some_and(|token| token == "(") {
+            index += 1;
+            while index < tokens.len() && tokens[index] != ")" {
+                let module = tokens[index].clone();
+                index += 1;
+                if index < tokens.len() && tokens[index] != ")" {
+                    index += 1;
+                }
+                requires.push(module);
+            }
+            if index < tokens.len() && tokens[index] == ")" {
+                index += 1;
+            }
+            continue;
+        }
+        if index < tokens.len() {
+            requires.push(tokens[index].clone());
+            index += 1;
+            if index < tokens.len() {
+                index += 1;
+            }
+        }
+    }
+    requires
+}
+
+/// Tokens of a go.mod or go.work file. Parentheses are their own tokens,
+/// quotes are unwrapped, and `//` comments are dropped.
+fn go_file_tokens(content: &str) -> Vec<String> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'/') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '(' || ch == ')' {
+            tokens.push(ch.to_string());
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            index += 1;
+            let mut quoted = String::new();
+            while index < chars.len() && chars[index] != '"' {
+                if chars[index] == '\\' && index + 1 < chars.len() {
+                    index += 1;
+                }
+                quoted.push(chars[index]);
+                index += 1;
+            }
+            if index < chars.len() && chars[index] == '"' {
+                index += 1;
+            }
+            tokens.push(quoted);
+            continue;
+        }
+        let mut token = String::new();
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch.is_whitespace() || ch == '(' || ch == ')' || ch == '"' {
+                break;
+            }
+            if ch == '/' && chars.get(index + 1) == Some(&'/') {
+                break;
+            }
+            token.push(ch);
+            index += 1;
+        }
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,5 +1666,71 @@ go 1.21
         assert!(caches[1].key_files.is_empty());
         assert_eq!(caches[1].key_runtime.as_deref(), Some("go version"));
         assert!(caches[1].shared);
+    }
+
+    #[test]
+    fn test_parse_module_path() {
+        assert_eq!(
+            module_path("module ex.com/lib\n\ngo 1.21\n").as_deref(),
+            Some("ex.com/lib")
+        );
+        assert_eq!(
+            module_path("module \"ex.com/lib\"\n").as_deref(),
+            Some("ex.com/lib")
+        );
+        assert_eq!(
+            module_path("// module ex.com/nope\nmodule ex.com/lib\n").as_deref(),
+            Some("ex.com/lib")
+        );
+        assert_eq!(module_path("go 1.21\n"), None);
+    }
+
+    #[test]
+    fn test_parse_go_work_uses() {
+        let block = "go 1.21\n\nuse (\n\t./lib\n\t// skipped\n\t./other\n)\n";
+        assert_eq!(
+            parse_go_work_uses(block),
+            vec!["./lib".to_string(), "./other".to_string()]
+        );
+        assert_eq!(
+            parse_go_work_uses("use ./lib\nuse ./other\n"),
+            vec!["./lib".to_string(), "./other".to_string()]
+        );
+        assert_eq!(
+            parse_go_work_uses("use ( ./lib ./other )\n"),
+            vec!["./lib".to_string(), "./other".to_string()]
+        );
+        assert_eq!(
+            parse_go_work_uses("use \"./my lib\"\nreplace ex.com/x => ./x\n"),
+            vec!["./my lib".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_go_mod_requires() {
+        let content = r#"
+module ex.com/other
+
+go 1.21
+
+require ex.com/lib v0.0.0
+
+require (
+    ex.com/block v1.2.3
+    ex.com/indirect v1.0.0 // indirect
+)
+
+// require ex.com/comment v1.0.0
+exclude ex.com/lib v0.9.0
+replace ex.com/lib => ../lib
+"#;
+        assert_eq!(
+            parse_go_mod_requires(content),
+            vec![
+                "ex.com/lib".to_string(),
+                "ex.com/block".to_string(),
+                "ex.com/indirect".to_string(),
+            ]
+        );
     }
 }
