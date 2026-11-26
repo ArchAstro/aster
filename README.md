@@ -312,6 +312,12 @@ env = ["CI"]
 outputs = ["coverage/summary.json"]
 ```
 
+A project-level `depends_on` is applied as `<project>:build` to that project's
+`build`, `test`, and `lint` targets, and to every target defined or overridden
+in this file, except `deps`. It is kept alongside each target's own
+`depends_on`. A detected-only target such as `format` or `clean` is unchanged
+unless this file overrides it.
+
 Run `aster project init` to generate a starter file.
 
 Target commands are parsed like a shell command line for quoting, escaping, and

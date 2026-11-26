@@ -12,7 +12,7 @@ use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::{find_aster_toml, parse_aster_toml, WorkspaceConfig};
+use crate::config::{find_aster_toml, parse_aster_toml, TargetConfig, WorkspaceConfig};
 use crate::plugins::{
     LanguagePlugin, LocalDependency, PluginRegistry, ProjectMetadata, Target, TargetContext,
 };
@@ -354,12 +354,17 @@ pub fn discover_projects(
     resolve_name_collisions(&mut projects);
 
     validate_project_addresses(&projects)?;
-    let sparse = is_sparse_checkout(workspace_root);
-    normalize_target_dependencies(
+    let sparse_root = is_sparse_checkout(workspace_root).then_some(workspace_root);
+    // Plugins attach project `depends_on` only to targets they detect. Union
+    // the same `<dep>:build` edge onto configured targets after aliases and
+    // Cargo ownership have produced the final target set.
+    apply_project_level_depends_on(
         &mut projects,
+        &alias_configs,
         &explicit_target_dependencies,
-        sparse.then_some(workspace_root),
-    )?;
+        sparse_root,
+    );
+    normalize_target_dependencies(&mut projects, &explicit_target_dependencies, sparse_root)?;
 
     // Every command discovers projects before it runs targets. A target
     // cycle, including a self-edge, is an error here so build/test/affected/
@@ -458,6 +463,62 @@ fn outside_sparse_cone(sparse_root: Option<&Path>, dependency: &str) -> bool {
         .and_then(|rest| rest.split(':').next())
         .unwrap_or_default();
     !project.is_empty() && !root.join(project).exists()
+}
+
+/// Union each project-level `depends_on` (`<dep>:build`) onto the targets it orders.
+///
+/// Detected `build`, `test`, and `lint` already receive the edge from the
+/// language plugin. A target that exists only in aster.toml starts with an
+/// empty list, and a rich target with its own `depends_on` replaces the
+/// detected list. Put the project edge back on `build`, `test`, `lint`, and
+/// every target named in that project's aster.toml, except `deps`. Leave
+/// detected-only targets such as `format` and `clean` alone so a project
+/// with no target override is unchanged. Skip a target's own address and
+/// edges already present. Do not attach an edge outside a sparse cone: a
+/// dependency-only target would fail discovery instead of dropping it.
+fn apply_project_level_depends_on(
+    projects: &mut [DiscoveredProject],
+    custom_targets: &HashMap<PathBuf, HashMap<String, TargetConfig>>,
+    explicit_dependencies: &[(String, String)],
+    sparse_root: Option<&Path>,
+) {
+    for project in projects.iter_mut() {
+        let project_address = format!("//{}", project.relative_path.display());
+        let source = format!("project {project_address}");
+        let edges: Vec<&str> = explicit_dependencies
+            .iter()
+            .filter(|(from, dependency)| {
+                from == &source && !outside_sparse_cone(sparse_root, dependency)
+            })
+            .map(|(_, dependency)| dependency.as_str())
+            .collect();
+        if edges.is_empty() {
+            continue;
+        }
+
+        let configured = custom_targets.get(&project.relative_path);
+        let mut names: Vec<String> = project.targets.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let configured_target = configured.is_some_and(|targets| targets.contains_key(&name));
+            let standard = matches!(name.as_str(), "build" | "test" | "lint");
+            if name == "deps" || !(standard || configured_target) {
+                continue;
+            }
+            let Some(target) = project.targets.get_mut(&name) else {
+                continue;
+            };
+            let self_address = format!("{project_address}:{name}");
+            for edge in &edges {
+                if *edge == self_address
+                    || target.depends_on.iter().any(|existing| existing == *edge)
+                {
+                    continue;
+                }
+                target.depends_on.push((*edge).to_string());
+            }
+        }
+    }
 }
 
 fn normalize_target_dependencies(
@@ -2223,5 +2284,215 @@ testpaths = ["tests"]
             "resolved workspace dependency did not become a target edge: {:?}",
             pkg_project.targets["test"].depends_on
         );
+    }
+
+    fn project<'a>(projects: &'a [DiscoveredProject], path: &str) -> &'a DiscoveredProject {
+        projects
+            .iter()
+            .find(|project| project.relative_path == Path::new(path))
+            .unwrap_or_else(|| panic!("missing project {path}"))
+    }
+
+    fn edge_count(target: &Target, edge: &str) -> usize {
+        target
+            .depends_on
+            .iter()
+            .filter(|dependency| dependency == &edge)
+            .count()
+    }
+
+    #[test]
+    fn project_level_depends_on_unions_onto_configured_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let write = |path: &str, content: &str| {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+        };
+        write(
+            "a/package.json",
+            r#"{"name":"a","scripts":{"build":"echo a"}}"#,
+        );
+        write(
+            "b/package.json",
+            r#"{"name":"b","scripts":{"build":"echo b","test":"echo test","lint":"echo lint","format":"echo format"}}"#,
+        );
+        write(
+            "b/aster.toml",
+            r#"
+depends_on = ["//a:build"]
+
+[targets.build]
+command = "echo overridden"
+depends_on = ["//b:lint"]
+
+[targets.only]
+command = "echo only"
+
+[targets.deps]
+command = "echo deps"
+
+[targets.format]
+command = "echo format-override"
+"#,
+        );
+        write(
+            "c/package.json",
+            r#"{"name":"c","scripts":{"build":"echo c","test":"echo test","format":"echo format"}}"#,
+        );
+        write(
+            "c/aster.toml",
+            r#"
+[targets.build]
+command = "echo c-override"
+depends_on = ["//c:test"]
+
+[targets.extra]
+command = "echo extra"
+"#,
+        );
+        write(
+            "e/package.json",
+            r#"{"name":"e","scripts":{"build":"echo e","format":"echo format"}}"#,
+        );
+        write("e/aster.toml", "depends_on = [\"//a:build\"]\n");
+        write(
+            "selfish/package.json",
+            r#"{"name":"selfish","scripts":{"build":"echo selfish"}}"#,
+        );
+        write(
+            "selfish/aster.toml",
+            r#"
+depends_on = ["//selfish", "//a"]
+
+[targets.build]
+command = "echo selfish"
+depends_on = ["//a:build"]
+
+[targets.only]
+command = "echo only"
+"#,
+        );
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let b = project(&projects, "b");
+        assert_eq!(
+            b.targets["build"].depends_on,
+            vec!["//b:lint".to_string(), "//a:build".to_string()],
+            "rich depends_on must keep the project edge"
+        );
+        assert_eq!(b.targets["only"].depends_on, vec!["//a:build".to_string()]);
+        assert!(
+            b.targets["deps"].depends_on.is_empty(),
+            "deps must not gain the project edge: {:?}",
+            b.targets["deps"].depends_on
+        );
+        assert_eq!(edge_count(&b.targets["test"], "//a:build"), 1);
+        assert_eq!(edge_count(&b.targets["lint"], "//a:build"), 1);
+        assert!(
+            b.targets["format"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "a configured format override must gain the project edge: {:?}",
+            b.targets["format"].depends_on
+        );
+        assert!(
+            !b.targets["clean"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "detected-only clean must stay unchanged: {:?}",
+            b.targets["clean"].depends_on
+        );
+
+        let c = project(&projects, "c");
+        assert_eq!(c.targets["build"].depends_on, vec!["//c:test".to_string()]);
+        assert!(c.targets["extra"].depends_on.is_empty());
+        assert!(
+            c.targets.values().all(|target| {
+                !target
+                    .depends_on
+                    .iter()
+                    .any(|dependency| dependency == "//a:build")
+            }),
+            "a project without project depends_on must gain no edge: {:?}",
+            c.targets
+        );
+
+        let e = project(&projects, "e");
+        assert_eq!(edge_count(&e.targets["build"], "//a:build"), 1);
+        assert!(
+            !e.targets["format"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "detected-only format must stay unchanged: {:?}",
+            e.targets["format"].depends_on
+        );
+        assert!(!e.targets["clean"]
+            .depends_on
+            .contains(&"//a:build".to_string()));
+
+        let selfish = project(&projects, "selfish");
+        assert_eq!(
+            selfish.targets["build"].depends_on,
+            vec!["//a:build".to_string()],
+            "a target must not depend on its own address"
+        );
+        assert!(selfish.targets["only"]
+            .depends_on
+            .contains(&"//selfish:build".to_string()));
+        assert!(selfish.targets["only"]
+            .depends_on
+            .contains(&"//a:build".to_string()));
+    }
+
+    #[test]
+    fn sparse_checkout_does_not_attach_project_depends_on_outside_the_cone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"echo app"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("aster.toml"),
+            r#"
+depends_on = ["//outside"]
+
+[targets.build]
+command = "echo app"
+depends_on = ["//app:gate"]
+
+[targets.gate]
+depends_on = ["//app:deps"]
+"#,
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.sparseCheckout", "true"]);
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let app = project(&projects, "app");
+        assert_eq!(
+            app.targets["gate"].depends_on,
+            vec!["//app:deps".to_string()],
+            "an outside-cone project edge must not be attached: {:?}",
+            app.targets["gate"].depends_on
+        );
+        assert!(!app.targets["build"]
+            .depends_on
+            .contains(&"//outside:build".to_string()));
     }
 }

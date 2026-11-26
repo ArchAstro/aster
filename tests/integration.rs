@@ -6767,3 +6767,129 @@ fn relative_and_glob_selectors_select_expected_projects() {
         "{outside_err}"
     );
 }
+
+#[test]
+fn project_depends_on_orders_configured_targets() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    for name in ["a", "b", "e"] {
+        write_package_json(
+            &tmp,
+            &format!("{name}/package.json"),
+            &format!(r#"{{"name":"{name}","scripts":{{"build":"echo {name}"}}}}"#),
+        );
+    }
+    // `deps` is a no-op so the ordering proof does not need npm.
+    write_aster_toml(
+        &tmp,
+        "a/aster.toml",
+        r#"
+[targets.build]
+command = "sh -c 'sleep 0.3 && printf finished-after-sleep > out.txt'"
+
+[targets.deps]
+command = "true"
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "b/aster.toml",
+        r#"
+depends_on = ["//a:build"]
+
+[targets.build]
+command = "sh -c 'cat ../a/out.txt'"
+
+[targets.deps]
+command = "true"
+"#,
+    );
+    write_aster_toml(&tmp, "e/aster.toml", "depends_on = [\"//a:build\"]\n");
+
+    let aster = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let graph = aster(&["graph", "//b:build", "--json"]);
+    let graph_stdout = String::from_utf8_lossy(&graph.stdout);
+    assert!(
+        graph.status.success(),
+        "graph failed: {graph_stdout} stderr={}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    let graph_json: serde_json::Value = serde_json::from_slice(&graph.stdout).expect("graph json");
+    let b_edges = graph_json["edges"]["//b:build"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing //b:build edges: {graph_json}"));
+    assert!(
+        b_edges.iter().any(|edge| edge == "//a:build"),
+        "expected //a:build on //b:build: {graph_json}"
+    );
+
+    let why = aster(&["why", "//b:build", "//a:build"]);
+    let why_stdout = String::from_utf8_lossy(&why.stdout);
+    assert!(
+        why.status.success(),
+        "why failed: {why_stdout} stderr={}",
+        String::from_utf8_lossy(&why.stderr)
+    );
+    assert!(
+        why_stdout.contains("//b:build -> //a:build"),
+        "expected a dependency path, got {why_stdout}"
+    );
+    assert!(
+        !why_stdout.contains("No dependency path found"),
+        "{why_stdout}"
+    );
+
+    let e_graph = aster(&["graph", "//e:build", "--json"]);
+    assert!(
+        e_graph.status.success(),
+        "e graph failed: {}",
+        String::from_utf8_lossy(&e_graph.stderr)
+    );
+    let e_json: serde_json::Value = serde_json::from_slice(&e_graph.stdout).expect("e graph json");
+    let e_edges = e_json["edges"]["//e:build"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing //e:build edges: {e_json}"));
+    assert!(
+        e_edges.iter().any(|edge| edge == "//a:build"),
+        "e with no target override must keep //a:build: {e_json}"
+    );
+
+    let a_graph = aster(&["graph", "//a:build", "--json"]);
+    assert!(
+        a_graph.status.success(),
+        "{}",
+        String::from_utf8_lossy(&a_graph.stderr)
+    );
+    let a_json: serde_json::Value = serde_json::from_slice(&a_graph.stdout).expect("a graph json");
+    let a_edges = a_json["edges"]["//a:build"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        a_edges
+            .iter()
+            .all(|edge| edge != "//b:build" && edge != "//e:build"),
+        "a project without project depends_on must gain no cross-project edge: {a_json}"
+    );
+
+    let build = aster(&["build", "//b"]);
+    assert!(
+        build.status.success(),
+        "build //b failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let logs = aster(&["logs", "//b:build"]);
+    let log = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs.status.success() && log.contains("finished-after-sleep"),
+        "b's output should show it ran after a finished: {log} stderr={}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+}
