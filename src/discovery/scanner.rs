@@ -280,6 +280,7 @@ pub fn discover_projects(
     resolve_umbrella_dependencies_partial(&mut partial_projects);
     resolve_uv_workspace_dependencies_partial(&mut partial_projects);
     resolve_ruby_workspace_dependencies_partial(&mut partial_projects);
+    resolve_go_workspace_dependencies_partial(&mut partial_projects, workspace_root)?;
     let cargo_owners = cargo_workspace::prepare(&mut partial_projects, workspace_root)?;
 
     // Phase 3: Detect targets with resolved dependencies
@@ -674,6 +675,214 @@ fn resolve_ruby_workspace_dependencies_partial(projects: &mut [PartialProject]) 
                 false
             }
         });
+    }
+}
+
+/// A Go module discovered before target detection.
+struct GoWorkspaceMember {
+    index: usize,
+    module: String,
+    requires: Vec<String>,
+    address: String,
+    root: PathBuf,
+}
+
+/// Add edges between go.work members when one `require`s another's module path.
+///
+/// The nearest `go.work` at or above a module, and not above the workspace
+/// root, is the only file consulted. Both modules must be in that file's
+/// `use` list. The edge is stored as a `//` address: a relative member path
+/// is dropped by `strip_prefix` when the workspace root is not canonical.
+/// A `replace` that canonicalizes to the same member is rewritten to that
+/// address so the member is not depended on twice. A replace that points at
+/// a missing or different directory does not hide the use member.
+fn resolve_go_workspace_dependencies_partial(
+    projects: &mut [PartialProject],
+    workspace_root: &Path,
+) -> Result<()> {
+    let nearest: Vec<Option<PathBuf>> = projects
+        .iter()
+        .map(|project| {
+            if project.plugin_name == "go" {
+                nearest_go_work(&project.root, workspace_root)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if nearest.iter().all(Option::is_none) {
+        return Ok(());
+    }
+
+    let mut members = Vec::new();
+    for (index, project) in projects.iter().enumerate() {
+        if project.plugin_name != "go" {
+            continue;
+        }
+        let content = std::fs::read_to_string(&project.config_path)
+            .with_context(|| format!("Failed to read {}", project.config_path.display()))?;
+        let module = crate::plugins::go::module_path(&content).with_context(|| {
+            format!(
+                "Could not find module declaration in {}",
+                project.config_path.display()
+            )
+        })?;
+        members.push(GoWorkspaceMember {
+            index,
+            requires: crate::plugins::go::parse_go_mod_requires(&content),
+            address: format!("//{}", project.relative_path.display()),
+            root: project.root.clone(),
+            module,
+        });
+    }
+
+    let mut parsed_uses: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut additions = Vec::new();
+    for member in &members {
+        let Some(go_work) = nearest[member.index].as_ref() else {
+            continue;
+        };
+        if !parsed_uses.contains_key(go_work) {
+            let content = std::fs::read_to_string(go_work)
+                .with_context(|| format!("Failed to read {}", go_work.display()))?;
+            parsed_uses.insert(
+                go_work.clone(),
+                crate::plugins::go::parse_go_work_uses(&content),
+            );
+        }
+        let uses = &parsed_uses[go_work];
+        let Some(go_work_dir) = go_work.parent() else {
+            continue;
+        };
+        let listed: Vec<&GoWorkspaceMember> = members
+            .iter()
+            .filter(|candidate| {
+                uses.iter()
+                    .any(|use_path| paths_match(&go_work_dir.join(use_path), &candidate.root))
+            })
+            .collect();
+        if !listed
+            .iter()
+            .any(|candidate| candidate.index == member.index)
+        {
+            continue;
+        }
+        for other in listed {
+            if other.index == member.index {
+                continue;
+            }
+            if !member
+                .requires
+                .iter()
+                .any(|required| required == &other.module)
+            {
+                continue;
+            }
+            additions.push((
+                member.index,
+                other.module.clone(),
+                other.address.clone(),
+                other.root.clone(),
+            ));
+        }
+    }
+
+    for (index, module, address, root) in additions {
+        let project_root = projects[index].root.clone();
+        ensure_go_member_edge(
+            &mut projects[index].dependencies,
+            &project_root,
+            &module,
+            &address,
+            &root,
+        );
+    }
+    Ok(())
+}
+
+/// Nearest `go.work` at or above `project_dir`, stopping at `workspace_root`.
+fn nearest_go_work(project_dir: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let mut current = project_dir.to_path_buf();
+    loop {
+        if !current.starts_with(workspace_root) {
+            return None;
+        }
+        let candidate = current.join("go.work");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if current == workspace_root || !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn paths_match(candidate: &Path, project_root: &Path) -> bool {
+    if lexical_normalize(candidate) == lexical_normalize(project_root) {
+        return true;
+    }
+    match (candidate.canonicalize(), project_root.canonicalize()) {
+        (Ok(candidate), Ok(project_root)) => candidate == project_root,
+        _ => false,
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Keep one edge to `address`. Rewrite a replace whose path canonicalizes
+/// to that member; leave a missing or different replace in place.
+fn ensure_go_member_edge(
+    dependencies: &mut Vec<LocalDependency>,
+    project_root: &Path,
+    module: &str,
+    address: &str,
+    member_root: &Path,
+) {
+    if let Some(existing) = dependencies
+        .iter_mut()
+        .find(|dependency| go_dependency_is_member(dependency, address, project_root, member_root))
+    {
+        if !existing.path.to_string_lossy().starts_with("//") {
+            existing.path = PathBuf::from(address);
+        }
+        return;
+    }
+    dependencies.push(LocalDependency {
+        name: module.to_string(),
+        path: PathBuf::from(address),
+    });
+}
+
+fn go_dependency_is_member(
+    dependency: &LocalDependency,
+    address: &str,
+    project_root: &Path,
+    member_root: &Path,
+) -> bool {
+    let path = dependency.path.to_string_lossy();
+    if path.starts_with("//") {
+        return path.split(':').next() == Some(address);
+    }
+    let resolved = if dependency.path.is_absolute() {
+        dependency.path.clone()
+    } else {
+        project_root.join(&dependency.path)
+    };
+    match (resolved.canonicalize(), member_root.canonicalize()) {
+        (Ok(resolved), Ok(member)) => resolved == member,
+        _ => false,
     }
 }
 
@@ -2223,5 +2432,349 @@ testpaths = ["tests"]
             "resolved workspace dependency did not become a target edge: {:?}",
             pkg_project.targets["test"].depends_on
         );
+    }
+
+    fn write_go_module(root: &Path, rel: &str, go_mod: &str) {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), go_mod).unwrap();
+    }
+
+    fn go_project<'a>(projects: &'a [DiscoveredProject], rel: &str) -> &'a DiscoveredProject {
+        projects
+            .iter()
+            .find(|project| project.relative_path == Path::new(rel))
+            .unwrap_or_else(|| panic!("missing //{rel} in {projects:?}"))
+    }
+
+    fn assert_member_edge(project: &DiscoveredProject, module: &str, address: &str) {
+        assert!(
+            project.dependencies.iter().any(|dependency| {
+                dependency.name == module && dependency.path == Path::new(address)
+            }),
+            "missing {module} -> {address}: {:?}",
+            project.dependencies
+        );
+        let build = format!("{address}:build");
+        for target in ["build", "test"] {
+            assert!(
+                project.targets[target]
+                    .depends_on
+                    .iter()
+                    .any(|edge| edge == &build),
+                "{target} missing {build}: {:?}",
+                project.targets[target].depends_on
+            );
+        }
+    }
+
+    #[test]
+    fn go_work_require_depends_on_the_used_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./other\n)\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            tmp.path(),
+            "other",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\nrequire ex.com/external v1.2.3\n",
+        );
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        let other = go_project(&projects, "other");
+        assert_eq!(other.dependencies.len(), 1, "{:?}", other.dependencies);
+        assert_member_edge(other, "ex.com/lib", "//lib");
+        assert!(go_project(&projects, "lib").dependencies.is_empty());
+    }
+
+    #[test]
+    fn go_work_member_without_require_has_no_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse ./lib\nuse ./other\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(tmp.path(), "other", "module ex.com/other\n\ngo 1.21\n");
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        let other = go_project(&projects, "other");
+        assert!(other.dependencies.is_empty(), "{:?}", other.dependencies);
+        assert!(
+            !other.targets["build"]
+                .depends_on
+                .iter()
+                .any(|edge| edge.contains("lib")),
+            "{:?}",
+            other.targets["build"].depends_on
+        );
+        assert!(
+            !other.targets["test"]
+                .depends_on
+                .iter()
+                .any(|edge| edge.contains("lib")),
+            "{:?}",
+            other.targets["test"].depends_on
+        );
+    }
+
+    #[test]
+    fn go_module_outside_go_work_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("go")).unwrap();
+        std::fs::write(
+            tmp.path().join("go/go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./other\n)\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "go/lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            tmp.path(),
+            "go/other",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "solo",
+            "module ex.com/solo\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ../go/lib\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "go/unlisted",
+            "module ex.com/unlisted\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n",
+        );
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        assert_member_edge(go_project(&projects, "go/other"), "ex.com/lib", "//go/lib");
+
+        let solo = go_project(&projects, "solo");
+        assert_eq!(solo.dependencies.len(), 1, "{:?}", solo.dependencies);
+        assert_eq!(solo.dependencies[0].name, "ex.com/lib");
+        assert_eq!(solo.dependencies[0].path, PathBuf::from("../go/lib"));
+
+        let unlisted = go_project(&projects, "go/unlisted");
+        assert!(
+            unlisted.dependencies.is_empty(),
+            "a module omitted from use must not gain an edge: {:?}",
+            unlisted.dependencies
+        );
+    }
+
+    #[test]
+    fn go_work_rewrites_replace_that_points_at_the_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./other\n)\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            tmp.path(),
+            "other",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ../lib\n",
+        );
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        let other = go_project(&projects, "other");
+        assert_eq!(other.dependencies.len(), 1, "{:?}", other.dependencies);
+        assert_member_edge(other, "ex.com/lib", "//lib");
+        assert_eq!(
+            other.targets["build"]
+                .depends_on
+                .iter()
+                .filter(|edge| edge.as_str() == "//lib:build")
+                .count(),
+            1,
+            "{:?}",
+            other.targets["build"].depends_on
+        );
+    }
+
+    #[test]
+    fn go_work_replace_that_misses_the_member_does_not_hide_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./missing-replace\n\t./other-dir\n)\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "lib", "module ex.com/lib\n\ngo 1.21\n");
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        write_go_module(
+            tmp.path(),
+            "missing-replace",
+            "module ex.com/missing\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ../missing\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "other-dir",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ../elsewhere\n",
+        );
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+
+        let missing = go_project(&projects, "missing-replace");
+        assert!(
+            missing
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.path == Path::new("../missing")),
+            "missing replace was dropped: {:?}",
+            missing.dependencies
+        );
+        assert_member_edge(missing, "ex.com/lib", "//lib");
+
+        let other = go_project(&projects, "other-dir");
+        assert!(
+            other
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.path == Path::new("../elsewhere")),
+            "different replace was dropped: {:?}",
+            other.dependencies
+        );
+        assert_member_edge(other, "ex.com/lib", "//lib");
+    }
+
+    #[test]
+    fn nearest_go_work_shadows_a_parent_use_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./other\n\t./nested/app\n)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("nested")).unwrap();
+        std::fs::write(
+            tmp.path().join("nested/go.work"),
+            "go 1.21\n\nuse (\n\t./app\n\t./helper\n)\n",
+        )
+        .unwrap();
+        write_go_module(tmp.path(), "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            tmp.path(),
+            "other",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "nested/helper",
+            "module ex.com/helper\n\ngo 1.21\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "nested/app",
+            "module ex.com/app\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\nrequire ex.com/helper v0.0.0\n",
+        );
+
+        let projects = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap();
+        assert_member_edge(go_project(&projects, "other"), "ex.com/lib", "//lib");
+        let app = go_project(&projects, "nested/app");
+        assert_member_edge(app, "ex.com/helper", "//nested/helper");
+        assert!(
+            !app.dependencies
+                .iter()
+                .any(|dependency| dependency.path == Path::new("//lib")),
+            "parent use list leaked through the nearer go.work: {:?}",
+            app.dependencies
+        );
+        assert!(
+            !app.targets["test"]
+                .depends_on
+                .iter()
+                .any(|edge| edge == "//lib:build"),
+            "{:?}",
+            app.targets["test"].depends_on
+        );
+    }
+
+    #[test]
+    fn go_work_above_the_workspace_root_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./child/lib\n\t./child/app\n)\n",
+        )
+        .unwrap();
+        let child = tmp.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        write_go_module(&child, "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            &child,
+            "app",
+            "module ex.com/app\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n",
+        );
+
+        let projects = discover_projects(&child, &PluginRegistry::with_all_plugins()).unwrap();
+        let app = go_project(&projects, "app");
+        assert!(
+            app.dependencies.is_empty(),
+            "go.work above the workspace root added an edge: {:?}",
+            app.dependencies
+        );
+    }
+
+    #[test]
+    fn go_work_mutual_require_is_a_dependency_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n",
+        )
+        .unwrap();
+        write_go_module(
+            tmp.path(),
+            "a",
+            "module ex.com/a\n\ngo 1.21\n\nrequire ex.com/b v0.0.0\n",
+        );
+        write_go_module(
+            tmp.path(),
+            "b",
+            "module ex.com/b\n\ngo 1.21\n\nrequire ex.com/a v0.0.0\n",
+        );
+
+        let error = discover_projects(tmp.path(), &PluginRegistry::with_all_plugins()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Dependency cycle detected"), "{message}");
+        assert!(message.contains("//a:build"), "{message}");
+        assert!(message.contains("//b:build"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_work_edge_is_kept_when_the_workspace_root_is_not_canonical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir(real.join(".git")).unwrap();
+        std::fs::write(
+            real.join("go.work"),
+            "go 1.21\n\nuse (\n\t./lib\n\t./other\n)\n",
+        )
+        .unwrap();
+        write_go_module(&real, "lib", "module ex.com/lib\n\ngo 1.21\n");
+        write_go_module(
+            &real,
+            "other",
+            "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n\nreplace ex.com/lib => ../lib\n",
+        );
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let projects = discover_projects(&link, &PluginRegistry::with_all_plugins()).unwrap();
+        let other = go_project(&projects, "other");
+        assert_member_edge(other, "ex.com/lib", "//lib");
     }
 }

@@ -6767,3 +6767,202 @@ fn relative_and_glob_selectors_select_expected_projects() {
         "{outside_err}"
     );
 }
+
+/// Drop CSI color sequences so graph text assertions see the target names.
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        plain.push(ch);
+    }
+    plain
+}
+
+/// go.work members that require each other order and invalidate like replace edges.
+///
+/// The test command reads lib.go so the failure is visible without a Go
+/// toolchain. lib.go is outside //go/other, so the cache miss is the
+/// dependency hash of //go/lib:build, not //go/other's own cache inputs.
+#[test]
+fn go_work_members_depend_on_required_members_and_invalidate_cache() {
+    let tmp = TempDir::new().unwrap();
+    setup_workspace(&tmp);
+    write_fixture(
+        &tmp,
+        "go/go.work",
+        "go 1.21\n\nuse (\n\t./lib\n\t./other\n)\n",
+    );
+    write_fixture(&tmp, "go/lib/go.mod", "module ex.com/lib\n\ngo 1.21\n");
+    write_fixture(
+        &tmp,
+        "go/lib/lib.go",
+        "package lib\n\nfunc Value() int { return 1 }\n",
+    );
+    write_fixture(
+        &tmp,
+        "go/other/go.mod",
+        "module ex.com/other\n\ngo 1.21\n\nrequire ex.com/lib v0.0.0\n",
+    );
+    write_fixture(
+        &tmp,
+        "go/other/check-lib.sh",
+        "cat ../lib/lib.go\ngrep -q 'return 1' ../lib/lib.go\n",
+    );
+    write_aster_toml(
+        &tmp,
+        "go/lib/aster.toml",
+        r#"
+[targets.deps]
+command = "true"
+
+[targets.deps.cache]
+runtime = []
+
+[targets.build]
+command = "true"
+
+[targets.build.cache]
+runtime = []
+"#,
+    );
+    write_aster_toml(
+        &tmp,
+        "go/other/aster.toml",
+        r#"
+[targets.deps]
+command = "true"
+
+[targets.deps.cache]
+runtime = []
+
+[targets.build]
+command = "true"
+
+[targets.build.cache]
+runtime = []
+
+[targets.test]
+command = "sh check-lib.sh"
+
+[targets.test.cache]
+runtime = []
+"#,
+    );
+
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+            .current_dir(tmp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status, stdout, stderr)
+    };
+
+    let (graph_status, graph_text, graph_err) = run(&["graph"]);
+    assert!(graph_status.success(), "aster graph failed: {graph_err}");
+    let graph_plain = strip_ansi(&graph_text);
+    let depends_on_lib = |name: &str| {
+        graph_plain.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with(&format!(":{name} ")) && line.contains("//go/lib:build")
+        })
+    };
+    assert!(
+        depends_on_lib("build"),
+        "//go/other:build should depend on //go/lib:build:\n{graph_plain}"
+    );
+    assert!(
+        depends_on_lib("test"),
+        "//go/other:test should depend on //go/lib:build:\n{graph_plain}"
+    );
+
+    let (json_status, graph_json, json_err) = run(&["graph", "--json"]);
+    assert!(
+        json_status.success(),
+        "aster graph --json failed: {json_err}"
+    );
+    let graph: serde_json::Value =
+        serde_json::from_str(&graph_json).expect("graph --json must be JSON");
+    for target in ["//go/other:build", "//go/other:test"] {
+        let edges = graph["edges"][target]
+            .as_array()
+            .unwrap_or_else(|| panic!("{target} missing from {graph_json}"));
+        assert!(
+            edges.iter().any(|edge| edge == "//go/lib:build"),
+            "{target} missing //go/lib:build: {graph_json}"
+        );
+    }
+
+    let result = |json: &serde_json::Value, address: &str| -> serde_json::Value {
+        json["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("results missing: {json}"))
+            .iter()
+            .find(|result| result["address"] == address)
+            .unwrap_or_else(|| panic!("missing {address} in {json}"))
+            .clone()
+    };
+
+    let (first_status, first_stdout, first_err) = run(&["test", "//go/other", "--json"]);
+    assert!(
+        first_status.success(),
+        "first test failed: {first_err}\n{first_stdout}"
+    );
+    let first: serde_json::Value = serde_json::from_str(&first_stdout).expect("test json");
+    let first_test = result(&first, "//go/other:test");
+    assert_eq!(first_test["cached"], false, "{first_test}");
+    assert_eq!(first_test["status"], "passed", "{first_test}");
+    assert!(
+        first_test["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("return 1"),
+        "{first_test}"
+    );
+
+    let (second_status, second_stdout, second_err) = run(&["test", "//go/other", "--json"]);
+    assert!(
+        second_status.success(),
+        "second test failed: {second_err}\n{second_stdout}"
+    );
+    let second: serde_json::Value = serde_json::from_str(&second_stdout).expect("test json");
+    assert_eq!(
+        result(&second, "//go/other:test")["cached"],
+        true,
+        "second run must be cached: {second}"
+    );
+
+    write_fixture(
+        &tmp,
+        "go/lib/lib.go",
+        "package lib\n\nfunc Value() int { return 2 }\n",
+    );
+    let (third_status, third_stdout, third_err) = run(&["test", "//go/other", "--json"]);
+    assert!(
+        !third_status.success(),
+        "edited lib must fail the dependent test: {third_err}\n{third_stdout}"
+    );
+    let third: serde_json::Value =
+        serde_json::from_str(&third_stdout).expect("failed test must still print JSON");
+    let third_test = result(&third, "//go/other:test");
+    assert_eq!(third_test["cached"], false, "{third_test}");
+    assert_eq!(third_test["status"], "failed", "{third_test}");
+    assert!(
+        third_test["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("return 2"),
+        "cache miss must show the new lib.go: {third_test}"
+    );
+}
