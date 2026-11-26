@@ -465,6 +465,11 @@ fn outside_sparse_cone(sparse_root: Option<&Path>, dependency: &str) -> bool {
     !project.is_empty() && !root.join(project).exists()
 }
 
+/// Project address of a `//project:target` selector, or the address itself.
+fn address_project(address: &str) -> &str {
+    address.split(':').next().unwrap_or(address)
+}
+
 /// Union each project-level `depends_on` (`<dep>:build`) onto the targets it orders.
 ///
 /// Detected `build`, `test`, and `lint` already receive the edge from the
@@ -476,6 +481,11 @@ fn outside_sparse_cone(sparse_root: Option<&Path>, dependency: &str) -> bool {
 /// with no target override is unchanged. Skip a target's own address and
 /// edges already present. Do not attach an edge outside a sparse cone: a
 /// dependency-only target would fail discovery instead of dropping it.
+///
+/// Do not attach `<dep>:build` to a target that joins `<dep>` through
+/// `selected_by`, or to a target that runs that joiner. `selected_by` is not
+/// an edge: collecting the joiner would otherwise pull `<dep>:build` into the
+/// selector's run, and into the joiner's own run.
 fn apply_project_level_depends_on(
     projects: &mut [DiscoveredProject],
     custom_targets: &HashMap<PathBuf, HashMap<String, TargetConfig>>,
@@ -496,6 +506,18 @@ fn apply_project_level_depends_on(
             continue;
         }
 
+        // Names of targets that join each dependency project. Owned so the
+        // later mutable pass can attach edges without overlapping borrows.
+        let mut joiners_of: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, target) in &project.targets {
+            for selector in &target.selected_by {
+                joiners_of
+                    .entry(address_project(selector).to_string())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+
         let configured = custom_targets.get(&project.relative_path);
         let mut names: Vec<String> = project.targets.keys().cloned().collect();
         names.sort();
@@ -509,10 +531,23 @@ fn apply_project_level_depends_on(
                 continue;
             };
             let self_address = format!("{project_address}:{name}");
+            let own_deps = target.depends_on.clone();
             for edge in &edges {
-                if *edge == self_address
-                    || target.depends_on.iter().any(|existing| existing == *edge)
-                {
+                if *edge == self_address || own_deps.iter().any(|existing| existing == *edge) {
+                    continue;
+                }
+                let dep_project = address_project(edge);
+                let joins_dep = joiners_of
+                    .get(dep_project)
+                    .is_some_and(|joiners| joiners.iter().any(|joiner| joiner == &name));
+                let runs_joiner = joiners_of.get(dep_project).is_some_and(|joiners| {
+                    own_deps.iter().any(|dependency| {
+                        dependency
+                            .strip_prefix(&format!("{project_address}:"))
+                            .is_some_and(|dep_name| joiners.iter().any(|joiner| joiner == dep_name))
+                    })
+                });
+                if joins_dep || runs_joiner {
                     continue;
                 }
                 target.depends_on.push((*edge).to_string());
@@ -2444,6 +2479,72 @@ command = "echo only"
         assert!(selfish.targets["only"]
             .depends_on
             .contains(&"//a:build".to_string()));
+    }
+
+    #[test]
+    fn project_level_depends_on_skips_a_selected_by_join_of_that_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let write = |path: &str, content: &str| {
+            let full = tmp.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+        };
+        write(
+            "a/package.json",
+            r#"{"name":"a","scripts":{"build":"echo a","test":"echo test"}}"#,
+        );
+        write(
+            "b/package.json",
+            r#"{"name":"b","scripts":{"build":"echo b","test":"echo test"}}"#,
+        );
+        write(
+            "b/aster.toml",
+            r#"
+depends_on = ["//a"]
+
+[targets.reads]
+command = "echo reads"
+selected_by = ["//a:test"]
+
+[targets.test-ci]
+command = "echo ci"
+depends_on = ["//self:reads"]
+
+[targets.ship]
+command = "echo ship"
+"#,
+        );
+
+        let projects = discover_projects(tmp.path(), &setup_registry()).unwrap();
+        let b = project(&projects, "b");
+        assert!(
+            !b.targets["reads"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "a selected_by joiner must not gain the joined project's build edge: {:?}",
+            b.targets["reads"].depends_on
+        );
+        assert!(
+            !b.targets["test-ci"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "a target that runs the joiner must not gain that edge: {:?}",
+            b.targets["test-ci"].depends_on
+        );
+        assert_eq!(
+            b.targets["test-ci"].depends_on,
+            vec!["//b:reads".to_string()]
+        );
+        assert!(
+            b.targets["ship"]
+                .depends_on
+                .contains(&"//a:build".to_string()),
+            "an unrelated configured target still gains the project edge: {:?}",
+            b.targets["ship"].depends_on
+        );
+        assert_eq!(edge_count(&b.targets["build"], "//a:build"), 1);
+        assert_eq!(edge_count(&b.targets["test"], "//a:build"), 1);
     }
 
     #[test]

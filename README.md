@@ -316,7 +316,9 @@ A project-level `depends_on` is applied as `<project>:build` to that project's
 `build`, `test`, and `lint` targets, and to every target defined or overridden
 in this file, except `deps`. It is kept alongside each target's own
 `depends_on`. A detected-only target such as `format` or `clean` is unchanged
-unless this file overrides it.
+unless this file overrides it. A target that joins `<project>` with
+`selected_by`, and a target that runs that joiner, do not gain the edge:
+`selected_by` would otherwise pull `<project>:build` into the joined run.
 
 Run `aster project init` to generate a starter file.
 
