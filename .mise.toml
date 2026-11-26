@@ -1,0 +1,15 @@
+# Toolchains for local work and for ArchDev's cloud Factory nodes.
+#
+# A Factory node carries no language toolchains of its own. Before each
+# pipeline step the ArchDev daemon runs `mise env` in the job checkout and
+# installs any missing pin, so `cargo`, `go` and `node` below are what the
+# branch-validation steps in archdev.json run. Without this file every step
+# failed with `spawn cargo ENOENT`.
+#
+# Keep in step with .github/workflows/ci.yml: Rust >= rust-version in
+# Cargo.toml with clippy and rustfmt, Go 1.26 (integration tests launch it),
+# Node 22 (verify/related).
+[tools]
+rust = { version = "1.95.0", components = "clippy,rustfmt" }
+go = "1.26.11"
+node = "22"
