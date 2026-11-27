@@ -19,7 +19,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 serde = { version = "1.0", features = ["derive"] }
